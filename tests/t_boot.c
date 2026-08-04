@@ -21,6 +21,7 @@
 #include "../runtime/kl_jni.h"
 #include "../runtime/kl_egl.h"
 #include "../runtime/kl_opensl.h"
+#include "../runtime/kl_ovrp.h"
 
 static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
 
@@ -65,9 +66,14 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // SIGALRM means the guest is still alive and blocked, which is a different
     // question from a crash — the surface reports say how far it got and what it
     // was waiting on, so emit them here too.
-    if (sig == SIGABRT || sig == SIGALRM) {
+    // Print on every fatal signal, not just the orderly ones. A SIGSEGV loses
+    // the surface reports otherwise, and under KL_PERMISSIVE a crash is the
+    // *expected* end of a scouting run — the guest carries on with answers we
+    // invented and eventually walks into one.
+    if (sig == SIGABRT || sig == SIGALRM || sig == SIGSEGV || sig == SIGBUS) {
         kl_egl_report(stderr);
         kl_opensl_report(stderr);
+        kl_ovrp_report(stderr);
     }
 
     // Die of the original signal, so the parent still reports it as one.
@@ -187,10 +193,34 @@ int main(int argc, char **argv) {
                 alarm(0);
                 if (ran) printf("  drained %u posted task%s\n", ran, ran == 1 ? "" : "s");
             }
+
+            // One nativeRender is the engine's first frame and it is almost all
+            // setup — no scene is loaded and nothing is drawn yet, which is why
+            // the GL surface looked so small. KL_FRAMES pumps the render loop
+            // the way UnityPlayer's own thread would, draining the posted-task
+            // queue between frames as the UI thread's looper does.
+            const char *fenv = getenv("KL_FRAMES");
+            unsigned frames = fenv ? (unsigned)strtoul(fenv, NULL, 10) : 0;
+            if (frames) {
+                void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
+                printf("\n=== recon: pumping %u frames ===\n", frames);
+                fflush(NULL);
+                const char *aenv2 = getenv("KL_ALARM");
+                unsigned budget = aenv2 ? (unsigned)strtoul(aenv2, NULL, 10) : 60;
+                alarm(budget);
+                unsigned i;
+                for (i = 0; i < frames && fn; i++) {
+                    ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2);
+                    kl_jni_drain_ui_tasks();
+                }
+                alarm(0);
+                printf("  pumped %u frames\n", i);
+            }
         }
 
         kl_jni_report(stdout);
         kl_egl_report(stdout);
+        kl_ovrp_report(stdout);
         fflush(NULL);   // _exit does not flush stdio, and the report is the point
         _exit(0);
     }

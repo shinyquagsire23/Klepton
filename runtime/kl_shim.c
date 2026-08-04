@@ -50,6 +50,7 @@
 #include "kl_ndk.h"
 #include "kl_egl.h"
 #include "kl_opensl.h"
+#include "kl_ovrp.h"
 #include "kl_jni.h"
 
 // ---------- S0.1: bionic stack-guard canary in Darwin TSD slot 5 ----------
@@ -73,6 +74,7 @@ void kl_fatal_prepare(void) {
     // already printed it are unaffected.
     kl_egl_report(stderr);
     kl_opensl_report(stderr);
+    kl_ovrp_report(stderr);
     static const int sigs[] = {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP};
     for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) signal(sigs[i], SIG_DFL);
     fflush(NULL);
