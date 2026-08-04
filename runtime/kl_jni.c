@@ -5,11 +5,13 @@
 // (so overrides are written by *name* and the compiler resolves the index) and
 // one named abort stub per slot. Nothing here hardcodes a slot number, which is
 // what keeps this immune to the off-by-one class of bug.
+#include <ctype.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include "klepton.h"
@@ -603,7 +605,10 @@ typedef klj_val (*klj_field_fn)(void);   // for values only known at runtime
 typedef struct {
     const char  *cls, *name, *sig;
     const char  *sval;    // for object fields — String constants
-    int64_t      ival;    // for primitive fields
+    int64_t      ival;    // for integral primitive fields
+    double       dval;    // for float/double fields — a separate slot, because
+                          // klj_val is a union and the caller's `want` decides
+                          // which half of it is read
     klj_field_fn fn;      // takes precedence: paths and other configured values
 } klj_field;
 static const klj_field g_fields[];
@@ -622,13 +627,63 @@ static klj_val klj_appinfo_dataDir(void);
 static klj_val klj_appinfo_splitSourceDirs(void);
 static klj_val klj_metaData_field(void);
 
-static klj_val klj_field_value(void *fid, char want) {
+// ---- written fields ----
+// g_fields describes the device, and a description does not change. But some
+// objects we hand out are genuinely mutable: Java's idiom for window attributes
+// is to fetch the live LayoutParams, assign to a field and hand it back, so a
+// write that went nowhere would read back as the default and silently undo the
+// caller's intent. Writes are therefore recorded per (object, field) and take
+// precedence on read — which also makes a field the guest writes before it ever
+// reads legal, without it having to be declared in g_fields at all.
+//
+// Statics work through the same table: the "object" is then the jclass, which is
+// interned and so just as stable an identity.
+#define KLJ_MAX_FIELD_WRITES 128
+static struct { void *obj, *fid; klj_val v; } g_field_writes[KLJ_MAX_FIELD_WRITES];
+static unsigned g_nfield_writes;
+
+static klj_val *klj_find_write(void *obj, void *fid) {
+    for (unsigned i = 0; i < g_nfield_writes; i++)
+        if (g_field_writes[i].obj == obj && g_field_writes[i].fid == fid)
+            return &g_field_writes[i].v;
+    return NULL;
+}
+
+static void klj_field_store(void *obj, void *fid, klj_val v) {
+    klj_wanted *w = fid;
+    if (!w || w < g_wanted || w >= g_wanted + KLJ_MAX_WANTED) {
+        KLJ_LOG("Set*Field with a jfieldID we never issued (%p)", fid);
+        kl_jni_report(stderr);
+        kl_fatal_prepare(); abort();
+    }
+    klj_val *slot = klj_find_write(obj, fid);
+    if (!slot) {
+        if (g_nfield_writes == KLJ_MAX_FIELD_WRITES) {
+            KLJ_LOG("field write table full at %s.%s", w->cls, w->name);
+            kl_fatal_prepare(); abort();
+        }
+        g_field_writes[g_nfield_writes] = (typeof(g_field_writes[0])){obj, fid, v};
+        slot = &g_field_writes[g_nfield_writes++].v;
+        KLJ_LOG("Set %s.%s%s = 0x%llx", w->cls, w->name, w->sig, (unsigned long long)v.j);
+    }
+    *slot = v;
+}
+
+static void klj_SetObjectField(void *e, void *o, void *f, void *v)   { (void)e; klj_field_store(o, f, (klj_val){.l = v}); }
+static void klj_SetIntField(void *e, void *o, void *f, kl_jint v)    { (void)e; klj_field_store(o, f, (klj_val){.j = (uint64_t)(int64_t)v}); }
+static void klj_SetLongField(void *e, void *o, void *f, int64_t v)   { (void)e; klj_field_store(o, f, (klj_val){.j = (uint64_t)v}); }
+static void klj_SetBooleanField(void *e, void *o, void *f, uint8_t v){ (void)e; klj_field_store(o, f, (klj_val){.j = v}); }
+static void klj_SetFloatField(void *e, void *o, void *f, float v)    { (void)e; klj_field_store(o, f, (klj_val){.d = v}); }
+
+static klj_val klj_field_value(void *obj, void *fid, char want) {
     klj_wanted *w = fid;
     if (!w || w < g_wanted || w >= g_wanted + KLJ_MAX_WANTED) {
         KLJ_LOG("Get*Field with a jfieldID we never issued (%p)", fid);
         kl_jni_report(stderr);
         kl_fatal_prepare(); abort();
     }
+    const klj_val *written = klj_find_write(obj, fid);
+    if (written) return *written;
     for (const klj_field *f = g_fields; f->cls; f++) {
         if (strcmp(f->cls, w->cls) || strcmp(f->name, w->name) || strcmp(f->sig, w->sig))
             continue;
@@ -641,6 +696,7 @@ static klj_val klj_field_value(void *fid, char want) {
             }
             return (klj_val){.l = kl_jni_new_string(f->sval)};
         }
+        if (want == 'F' || want == 'D') return (klj_val){.d = f->dval};
         return (klj_val){.j = (uint64_t)f->ival};
     }
     KLJ_LOG("no host value for field %s.%s %s", w->cls, w->name, w->sig);
@@ -652,20 +708,51 @@ static klj_val klj_field_value(void *fid, char want) {
     return (klj_val){0};
 }
 
-// Static and instance forms are the same lookup: our field values are constants,
-// so there is no per-instance state to distinguish.
-static void   *klj_GetStaticObjectField(void *e, void *c, void *f) { (void)e; (void)c; return klj_field_value(f, 'L').l; }
-static void   *klj_GetObjectField(void *e, void *o, void *f)       { (void)e; (void)o; return klj_field_value(f, 'L').l; }
-static kl_jint klj_GetStaticIntField(void *e, void *c, void *f)    { (void)e; (void)c; return (kl_jint)klj_field_value(f, 'I').j; }
-static kl_jint klj_GetIntField(void *e, void *o, void *f)          { (void)e; (void)o; return (kl_jint)klj_field_value(f, 'I').j; }
-static uint8_t klj_GetStaticBooleanField(void *e, void *c, void *f){ (void)e; (void)c; return (uint8_t)klj_field_value(f, 'Z').j; }
-static uint8_t klj_GetBooleanField(void *e, void *o, void *f)      { (void)e; (void)o; return (uint8_t)klj_field_value(f, 'Z').j; }
+// Static and instance forms run the same lookup — the only difference is that
+// the "object" is the jclass, which the write table keys on just as well.
+static void   *klj_GetStaticObjectField(void *e, void *c, void *f) { (void)e; return klj_field_value(c, f, 'L').l; }
+static void   *klj_GetObjectField(void *e, void *o, void *f)       { (void)e; return klj_field_value(o, f, 'L').l; }
+static kl_jint klj_GetStaticIntField(void *e, void *c, void *f)    { (void)e; return (kl_jint)klj_field_value(c, f, 'I').j; }
+static kl_jint klj_GetIntField(void *e, void *o, void *f)          { (void)e; return (kl_jint)klj_field_value(o, f, 'I').j; }
+static uint8_t klj_GetStaticBooleanField(void *e, void *c, void *f){ (void)e; return (uint8_t)klj_field_value(c, f, 'Z').j; }
+static uint8_t klj_GetBooleanField(void *e, void *o, void *f)      { (void)e; return (uint8_t)klj_field_value(o, f, 'Z').j; }
+static float   klj_GetStaticFloatField(void *e, void *c, void *f)  { (void)e; return (float)klj_field_value(c, f, 'F').d; }
+static float   klj_GetFloatField(void *e, void *o, void *f)        { (void)e; return (float)klj_field_value(o, f, 'F').d; }
 
 // Documented Android platform constants — fixed values, not choices.
 #define KLJ_FSTR(c, n, v)     {.cls = c, .name = n, .sig = "Ljava/lang/String;", .sval = v}
 #define KLJ_FINT(c, n, v)     {.cls = c, .name = n, .sig = "I", .ival = v}
+#define KLJ_FFLT(c, n, v)     {.cls = c, .name = n, .sig = "F", .dval = v}
 #define KLJ_FFN(c, n, s, f)   {.cls = c, .name = n, .sig = s, .fn = f}
 #define KLJ_CTX_SVC(field, name) KLJ_FSTR("android/content/Context", field, name)
+
+// ---- the presented display ----
+// One description of the screen, read by everything that asks about it: the
+// Display, the DisplayMetrics fields, and Resources. Deciding it in one place is
+// the point — Unity derives its render target size, its UI scale and its frame
+// pacing from these numbers, and answering each call on its own terms would let
+// them disagree with each other and with the ANativeWindow in kl_ndk.c.
+//
+// The geometry is a Quest 2's per-eye panel, matching that window, and for the
+// same reason Build.MODEL is a Quest 2's below: this title branches on Oculus
+// hardware. It is a placeholder in the same sense kl_ndk.c's is — in VR the eye
+// buffers come from the XR runtime (M6) rather than from the Android display,
+// and this exists to give Unity a coherent non-zero screen at startup. 72 Hz is
+// the Quest 2's default mode; 90 is opt-in, and claiming it would have Unity
+// pace to a rate M5 cannot yet deliver. Density is a choice rather than a
+// measurement — it only scales 2D UI — and xhdpi suits a panel this fine.
+//
+// Macros rather than a struct because g_fields is a static initialiser and a
+// const object is not a constant expression in C.
+#define KLJ_DISPLAY_W        1832
+#define KLJ_DISPLAY_H        1920
+#define KLJ_DISPLAY_DPI      320
+#define KLJ_DISPLAY_DENSITY  2.0     /* xhdpi: densityDpi / 160 */
+#define KLJ_DISPLAY_XDPI     320.0
+#define KLJ_DISPLAY_YDPI     320.0
+#define KLJ_DISPLAY_REFRESH  72.0f
+#define KLJ_DISPLAY_ROTATION 0       /* Surface.ROTATION_0 */
+
 static const klj_field g_fields[] = {
     KLJ_FSTR("android/content/Intent", "ACTION_MAIN", "android.intent.action.MAIN"),
 
@@ -725,6 +812,47 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/content/pm/PackageManager", "GET_ACTIVITIES",     0x0001),
     KLJ_FINT("android/content/pm/PackageManager", "GET_INTENT_FILTERS", 0x0020),
     KLJ_FINT("android/content/pm/PackageManager", "GET_META_DATA",      0x0080),
+
+    // The whole documented ActivityInfo orientation table. Transcribed rather
+    // than trimmed to what the trace forced: the guest reads these to compare
+    // against a value it is about to pass to setRequestedOrientation, so a
+    // missing one would show up as a wrong branch rather than as a lookup.
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_UNSPECIFIED",       -1),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_LANDSCAPE",          0),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_PORTRAIT",           1),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_USER",               2),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_BEHIND",             3),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_SENSOR",             4),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_NOSENSOR",           5),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_SENSOR_LANDSCAPE",   6),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_SENSOR_PORTRAIT",    7),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_REVERSE_LANDSCAPE",  8),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_REVERSE_PORTRAIT",   9),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_FULL_SENSOR",       10),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_USER_LANDSCAPE",    11),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_USER_PORTRAIT",     12),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_FULL_USER",         13),
+    KLJ_FINT("android/content/pm/ActivityInfo", "SCREEN_ORIENTATION_LOCKED",            14),
+
+    // Cutout modes. DEFAULT means "do not extend into the cutout", which is the
+    // only sensible answer for a display we describe as having none.
+    KLJ_FINT("android/view/WindowManager$LayoutParams", "LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT",     0),
+    KLJ_FINT("android/view/WindowManager$LayoutParams", "LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES", 1),
+    KLJ_FINT("android/view/WindowManager$LayoutParams", "LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER",       2),
+
+    KLJ_FINT("android/view/Display", "DEFAULT_DISPLAY", 0),
+
+    // DisplayMetrics is read field-by-field off an instance, and our field
+    // dispatch is per (class, name, signature) rather than per object — which is
+    // exactly right here, because there is one display and every DisplayMetrics
+    // the guest fills from it describes that same screen.
+    KLJ_FINT("android/util/DisplayMetrics", "widthPixels",    KLJ_DISPLAY_W),
+    KLJ_FINT("android/util/DisplayMetrics", "heightPixels",   KLJ_DISPLAY_H),
+    KLJ_FINT("android/util/DisplayMetrics", "densityDpi",     KLJ_DISPLAY_DPI),
+    KLJ_FFLT("android/util/DisplayMetrics", "density",        KLJ_DISPLAY_DENSITY),
+    KLJ_FFLT("android/util/DisplayMetrics", "scaledDensity",  KLJ_DISPLAY_DENSITY),
+    KLJ_FFLT("android/util/DisplayMetrics", "xdpi",           KLJ_DISPLAY_XDPI),
+    KLJ_FFLT("android/util/DisplayMetrics", "ydpi",           KLJ_DISPLAY_YDPI),
     {.cls = NULL},
 };
 
@@ -1208,6 +1336,213 @@ static klj_val klj_Process_myTid(void *env, void *self, const klj_val *a, int n)
     uint64_t tid = 0;
     pthread_threadid_np(NULL, &tid);
     return (klj_val){.j = (uint32_t)tid};
+}
+
+// ---- the presented display ----
+// The screen itself is described up at KLJ_DISPLAY_*, next to g_fields, since
+// most of it is read as DisplayMetrics fields rather than through a method.
+
+// Display.DEFAULT_DISPLAY is 0. There is exactly one display here, so any other
+// id has no Display — which is Android's own answer, not a shortcut.
+static klj_val klj_DisplayManager_getDisplay(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int32_t id = n > 0 ? (int32_t)a[0].j : 0;
+    if (id != 0) {
+        KLJ_LOG("DisplayManager.getDisplay(%d) -> null (only display 0 exists)", id);
+        return (klj_val){.l = NULL};
+    }
+    static void *display;
+    return klj_singleton("android/view/Display", &display);
+}
+
+// registerDisplayListener is a host->guest callback, and it lands in the same
+// gap runOnUiThread does: we can record the listener but nothing will ever fire
+// it, because calling into the proxy needs JNIBridge.invoke. Our display never
+// changes, so no callback is *owed* — but that is a property of the display we
+// chose, not of the mechanism, so it is logged rather than left silent.
+static klj_val klj_DisplayManager_registerDisplayListener(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("DisplayManager.registerDisplayListener(%p) — recorded; the presented "
+            "display never changes, so nothing is owed a callback",
+            n > 0 ? a[0].l : NULL);
+    return (klj_val){0};
+}
+static klj_val klj_DisplayManager_unregisterDisplayListener(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};
+}
+
+// Everything below reads straight off KLJ_DISPLAY_*. getWidth/getHeight are the
+// deprecated pair and getRealMetrics the modern one; they agree here because our
+// display has no system decor to subtract, which is the whole reason the two
+// exist separately on Android.
+static klj_val klj_Display_getDisplayId(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_Display_getWidth(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = KLJ_DISPLAY_W};
+}
+static klj_val klj_Display_getHeight(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = KLJ_DISPLAY_H};
+}
+static klj_val klj_Display_getRotation(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = KLJ_DISPLAY_ROTATION};
+}
+static klj_val klj_Display_getRefreshRate(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.d = KLJ_DISPLAY_REFRESH};
+}
+// The DisplayMetrics the guest passes is already answered from the same
+// constants by the field dispatch, so there is nothing to write into it — one
+// display means every DisplayMetrics describes it. Logged once so the no-op is
+// visible if the metrics ever stop matching what Unity then computes.
+static klj_val klj_Display_getMetrics(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++) KLJ_LOG("Display.get*Metrics: %dx%d @ %ddpi, %.0f Hz (fields are constants)",
+                         KLJ_DISPLAY_W, KLJ_DISPLAY_H, KLJ_DISPLAY_DPI, (double)KLJ_DISPLAY_REFRESH);
+    return (klj_val){0};
+}
+// Frame-pacing numbers. Unity's FrameTiming asks for these to decide when to
+// submit; they have to be consistent with the refresh rate we claim or it will
+// pace against a period that does not exist. The vsync offset is 0 on nearly
+// every real device, and the presentation deadline is surfaceflinger's default
+// of one refresh period plus a millisecond.
+static klj_val klj_Display_getAppVsyncOffsetNanos(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_Display_getPresentationDeadlineNanos(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)(1e9 / KLJ_DISPLAY_REFRESH) + 1000000};
+}
+// sRGB, not wide gamut — which is what the panel description above says, and
+// claiming otherwise would have Unity pick a colour space it then renders into.
+static klj_val klj_Display_isWideColorGamut(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// Resources.getIdentifier looks a name up in the APK's resource table. We have
+// no resource table, and 0 is Android's own "no such resource" — the caller must
+// already handle it, since a name that is not in the APK returns the same thing.
+// Logged, because it names what the guest expected to find.
+static klj_val klj_Resources_getIdentifier(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("Resources.getIdentifier(\"%s\", \"%s\", \"%s\") -> 0 (no resource table)",
+            n > 0 ? klj_str(a[0].l) : "", n > 1 ? klj_str(a[1].l) : "",
+            n > 2 ? klj_str(a[2].l) : "");
+    return (klj_val){.j = 0};
+}
+
+// Window.getAttributes returns the live LayoutParams — the same object every
+// time, because on Android the caller mutates it and hands it back through
+// setAttributes. One instance is what makes that round trip mean anything.
+static klj_val klj_Window_getAttributes(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *lp;
+    return klj_singleton("android/view/WindowManager$LayoutParams", &lp);
+}
+
+// Resources and Window are identities: Unity holds them to reach the display
+// metrics and the window flags, both of which we answer from KLJ_DISPLAY_*.
+static klj_val klj_Context_getResources(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *resources;
+    return klj_singleton("android/content/res/Resources", &resources);
+}
+static klj_val klj_Activity_getWindow(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *window;
+    return klj_singleton("android/view/Window", &window);
+}
+
+// setRequestedOrientation is recorded, not applied — there is no window manager
+// to rotate anything. It is worth naming in the log because it says which way
+// round the engine believes the screen is, which is the first thing to check if
+// the render target ever comes out transposed.
+static klj_val klj_Activity_setRequestedOrientation(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    static const char *names[] = {
+        "LANDSCAPE", "PORTRAIT", "USER", "BEHIND", "SENSOR", "NOSENSOR",
+        "SENSOR_LANDSCAPE", "SENSOR_PORTRAIT", "REVERSE_LANDSCAPE",
+        "REVERSE_PORTRAIT", "FULL_SENSOR", "USER_LANDSCAPE", "USER_PORTRAIT",
+        "FULL_USER", "LOCKED",
+    };
+    int32_t o = n > 0 ? (int32_t)a[0].j : -1;
+    const char *name = (o >= 0 && o < (int32_t)(sizeof names / sizeof names[0]))
+                       ? names[o] : (o == -1 ? "UNSPECIFIED" : "?");
+    KLJ_LOG("Activity.setRequestedOrientation(%d /* %s */) — recorded, not applied", o, name);
+    return (klj_val){0};
+}
+
+// ---- odds and ends the same batch reached for ----
+void *klb_dlopen(const char *path, int flags);   // kl_dl.c — the guest's own dlopen
+
+// UnityPlayer.loadLibrary(name) is Unity's System.loadLibrary wrapper. Routing it
+// through the guest dlopen rather than kl_load keeps one image registry: the
+// library may already be open (libil2cpp arrives this way *and* through
+// ClassLoader.findLibrary), and klb_dlopen returns the existing image for that.
+static klj_val klj_UnityPlayer_loadLibrary(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *name = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!name || !*name) return (klj_val){.j = 0};
+    char   path[1024];
+    size_t len = strlen(name);
+    if (strncmp(name, "lib", 3) == 0 && len > 3 && strcmp(name + len - 3, ".so") == 0)
+        snprintf(path, sizeof path, "%s/%s", g_native_lib_dir, name);
+    else
+        snprintf(path, sizeof path, "%s/lib%s.so", g_native_lib_dir, name);
+    void *h = klb_dlopen(path, 0x00002 /* RTLD_NOW */);
+    KLJ_LOG("UnityPlayer.loadLibrary(\"%s\") -> %s", name, h ? "loaded" : "failed");
+    return (klj_val){.j = h != NULL};
+}
+
+// new String(bytes, charsetName). Our jstrings are NUL-terminated byte buffers
+// because we define the representation, so for a UTF-8 charset this is a copy
+// with a terminator. Any other charset would need a real transcode, so it is
+// reported rather than silently mangled.
+static klj_val klj_String_init_bytes(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_array  *arr     = n > 0 && a[0].l ? klj_arr(a[0].l) : NULL;
+    const char *charset = n > 1 ? klj_str(a[1].l) : NULL;
+    if (charset && strcasecmp(charset, "UTF-8") && strcasecmp(charset, "UTF8") &&
+        strcasecmp(charset, "US-ASCII") && strcasecmp(charset, "ISO-8859-1"))
+        KLJ_LOG("new String(byte[], \"%s\") — treated as UTF-8, not transcoded", charset);
+    if (!arr || arr->kind != 'B') return (klj_val){.l = kl_jni_new_string("")};
+    char *buf = malloc((size_t)arr->len + 1);
+    memcpy(buf, arr->data, (size_t)arr->len);
+    buf[arr->len] = '\0';
+    void *s = kl_jni_new_string(buf);
+    free(buf);
+    return (klj_val){.l = s};
+}
+
+// Uri.encode(s): percent-encode everything outside the unreserved set. The set
+// is the Android API's, not a guess — it keeps the RFC 3986 unreserved
+// characters plus the sub-delims Uri leaves alone, and a space becomes %20
+// rather than '+', which is the difference from form encoding.
+static klj_val klj_Uri_encode(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *s = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!s) return (klj_val){.l = NULL};
+    static const char *keep = "_-!.~'()*";
+    size_t len = strlen(s);
+    char  *out = malloc(len * 3 + 1);
+    size_t w   = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (isalnum(c) || strchr(keep, c)) out[w++] = (char)c;
+        else w += (size_t)sprintf(out + w, "%%%02X", c);
+    }
+    out[w] = '\0';
+    void *r = kl_jni_new_string(out);
+    free(out);
+    return (klj_val){.l = r};
 }
 
 // ---- AlertDialog ----
@@ -1984,6 +2319,44 @@ static const klj_binding g_bindings[] = {
 
     {"android/app/Activity",   "getIntent",  "()Landroid/content/Intent;", klj_Activity_getIntent},
     {"android/app/Activity",   "runOnUiThread", "(Ljava/lang/Runnable;)V", klj_Activity_runOnUiThread},
+    {"android/app/Activity",   "getWindow", "()Landroid/view/Window;",     klj_Activity_getWindow},
+    {"android/app/Activity",   "setRequestedOrientation", "(I)V", klj_Activity_setRequestedOrientation},
+
+    // ---- display, window and orientation ----
+    {"android/hardware/display/DisplayManager", "getDisplay",
+     "(I)Landroid/view/Display;", klj_DisplayManager_getDisplay},
+    {"android/hardware/display/DisplayManager", "registerDisplayListener",
+     "(Landroid/hardware/display/DisplayManager$DisplayListener;Landroid/os/Handler;)V",
+     klj_DisplayManager_registerDisplayListener},
+    {"android/hardware/display/DisplayManager", "unregisterDisplayListener",
+     "(Landroid/hardware/display/DisplayManager$DisplayListener;)V",
+     klj_DisplayManager_unregisterDisplayListener},
+    {"android/util/DisplayMetrics", "<init>", "()V", klj_generic_init},
+    {"android/view/Display", "getDisplayId",   "()I", klj_Display_getDisplayId},
+    {"android/view/Display", "getWidth",       "()I", klj_Display_getWidth},
+    {"android/view/Display", "getHeight",      "()I", klj_Display_getHeight},
+    {"android/view/Display", "getRotation",    "()I", klj_Display_getRotation},
+    {"android/view/Display", "getRefreshRate", "()F", klj_Display_getRefreshRate},
+    {"android/view/Display", "getMetrics",     "(Landroid/util/DisplayMetrics;)V", klj_Display_getMetrics},
+    {"android/view/Display", "getRealMetrics", "(Landroid/util/DisplayMetrics;)V", klj_Display_getMetrics},
+    {"android/view/Display", "getAppVsyncOffsetNanos",        "()J", klj_Display_getAppVsyncOffsetNanos},
+    {"android/view/Display", "getPresentationDeadlineNanos",  "()J", klj_Display_getPresentationDeadlineNanos},
+    {"android/view/Display", "isWideColorGamut",              "()Z", klj_Display_isWideColorGamut},
+    {"android/view/Window",  "getAttributes",
+     "()Landroid/view/WindowManager$LayoutParams;", klj_Window_getAttributes},
+    {"android/content/res/Resources", "getIdentifier",
+     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I", klj_Resources_getIdentifier},
+    // getResources is declared on Context and reached through the theme wrapper
+    // in between; the guest resolves the id against whichever it named.
+    {"android/view/ContextThemeWrapper", "getResources",
+     "()Landroid/content/res/Resources;", klj_Context_getResources},
+    {"android/content/Context", "getResources",
+     "()Landroid/content/res/Resources;", klj_Context_getResources},
+
+    {"android/net/Uri", "encode", "(Ljava/lang/String;)Ljava/lang/String;", klj_Uri_encode},
+    {"java/lang/String", "<init>", "([BLjava/lang/String;)V", klj_String_init_bytes},
+    {"com/unity3d/player/UnityPlayer", "loadLibrary", "(Ljava/lang/String;)Z", klj_UnityPlayer_loadLibrary},
+
     {"android/app/AlertDialog$Builder", "<init>", "(Landroid/content/Context;)V", klj_AlertBuilder_init},
     {"android/app/AlertDialog$Builder", "setTitle",
      "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;", klj_AlertBuilder_setTitle},
@@ -2224,6 +2597,13 @@ static void klj_build_tables(void) {
     ENV(GetIntField,           klj_GetIntField);
     ENV(GetStaticBooleanField, klj_GetStaticBooleanField);
     ENV(GetBooleanField,       klj_GetBooleanField);
+    ENV(GetStaticFloatField,   klj_GetStaticFloatField);
+    ENV(GetFloatField,         klj_GetFloatField);
+    ENV(SetObjectField,        klj_SetObjectField);
+    ENV(SetIntField,           klj_SetIntField);
+    ENV(SetLongField,          klj_SetLongField);
+    ENV(SetBooleanField,       klj_SetBooleanField);
+    ENV(SetFloatField,         klj_SetFloatField);
 #undef ENV
 
 #define VM(name, fn) g_vm_vtable[KLJ_VM_##name] = (void *)(fn)
