@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include "klepton.h"
 #include "kl_egl.h"
+#include "kl_opensl.h"
 
 #define KL_MAX_IMAGES 64
 typedef struct { char soname[128]; kl_image *img; } entry;
@@ -67,6 +68,8 @@ void *klb_dlopen(const char *path, int flags) {
     // and hand the guest a NULL it goes on to call.
     void *gl = kl_egl_dlopen(path);
     if (gl) return gl;
+    void *sl = kl_opensl_dlopen(path);
+    if (sl) return sl;
     pthread_mutex_lock(&g_lock);
     kl_image *found = kl_find_image(path);           // already loaded? refcount is coarse
     pthread_mutex_unlock(&g_lock);
@@ -90,6 +93,7 @@ void *klb_dlopen(const char *path, int flags) {
 
 void *klb_dlsym(void *handle, const char *name) {
     if (kl_egl_is_handle(handle)) return kl_egl_sym(name);
+    if (kl_opensl_is_handle(handle)) return kl_opensl_sym(name);
     if (handle == NULL || handle == (void *)-1) {    // RTLD_DEFAULT / RTLD_NEXT
         void *s = kl_shim_lookup(name);
         if (s) return s;

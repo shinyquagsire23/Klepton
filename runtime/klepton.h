@@ -71,6 +71,11 @@ const char *kl_addr_image(const void *addr, size_t *offset);
 // through this — Unity reads its CPU and memory configuration out of procfs.
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
 
+// errno numbering diverges above 34 between Linux and Darwin, and guest code
+// compares against Linux's values (see kl_libc.c).
+int kl_errno_to_linux(int e);
+int kl_errno_from_linux(int e);
+
 // KL_TRACE_FS reporting for guest file operations (see kl_libc.c).
 void kl_fs_trace_open(const char *path, int flags, int fd);
 

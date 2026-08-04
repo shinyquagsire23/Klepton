@@ -20,6 +20,7 @@
 #include "../runtime/klepton.h"
 #include "../runtime/kl_jni.h"
 #include "../runtime/kl_egl.h"
+#include "../runtime/kl_opensl.h"
 
 static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
 
@@ -61,7 +62,13 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // touch kl_fatal_prepare(), so this is the only place the graphics surface
     // report can still be emitted. Not async-signal-safe, but nothing after this
     // point is going to run anyway.
-    if (sig == SIGABRT) kl_egl_report(stderr);
+    // SIGALRM means the guest is still alive and blocked, which is a different
+    // question from a crash — the surface reports say how far it got and what it
+    // was waiting on, so emit them here too.
+    if (sig == SIGABRT || sig == SIGALRM) {
+        kl_egl_report(stderr);
+        kl_opensl_report(stderr);
+    }
 
     // Die of the original signal, so the parent still reports it as one.
     signal(sig, SIG_DFL);
@@ -77,6 +84,7 @@ static void install_fault_reporter(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS,  &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGALRM, &sa, NULL);
 }
 
 int main(int argc, char **argv) {

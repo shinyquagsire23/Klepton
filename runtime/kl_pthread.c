@@ -219,13 +219,26 @@ int klb_sem_init(int *s, int pshared, unsigned value) {
     (void)pshared;
     int i = atomic_fetch_add(&g_nsems, 1);
     if (i >= KL_MAX_SEMS) { errno = ENOSPC; return -1; }
+    // Fill the slot BEFORE publishing the index. The old order bumped g_nsems
+    // first, which made sem_of's range check pass while g_sems[i] was still
+    // NULL — a waiter on another thread then got EINVAL from a semaphore that
+    // had, as far as its owner was concerned, been initialised.
     g_sems[i] = dispatch_semaphore_create(value);
+    atomic_thread_fence(memory_order_release);
     *s = i;
     return 0;
 }
 static dispatch_semaphore_t sem_of(int *s) {
     int i = *s;
-    return (i > 0 && i < atomic_load(&g_nsems)) ? g_sems[i] : NULL;
+    if (i > 0 && i < KL_MAX_SEMS) {
+        dispatch_semaphore_t d = g_sems[i];
+        if (d) return d;
+    }
+    static _Atomic int logged;
+    if (atomic_fetch_add(&logged, 1) < 8)
+        fprintf(stderr, "  [klepton] sem: no semaphore for slot %d (*sem=%d) — "
+                        "the guest is waiting on one it never initialised here\n", i, *s);
+    return NULL;
 }
 int klb_sem_destroy(int *s)  { *s = 0; return 0; }
 int klb_sem_post(int *s)     { dispatch_semaphore_t d = sem_of(s);
@@ -237,6 +250,16 @@ int klb_sem_wait(int *s)     { dispatch_semaphore_t d = sem_of(s);
 int klb_sem_timedwait(int *s, const struct timespec *ts) {
     dispatch_semaphore_t d = sem_of(s);
     if (!d) { errno = EINVAL; return -1; }
+    static _Atomic int logged;
+    if (ts && atomic_fetch_add(&logged, 1) < 4) {
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        fprintf(stderr, "  [klepton] sem_timedwait deadline %lld.%09ld, realtime now "
+                        "%lld.%09ld (delta %lld s)\n",
+                (long long)ts->tv_sec, ts->tv_nsec,
+                (long long)now.tv_sec, now.tv_nsec,
+                (long long)(ts->tv_sec - now.tv_sec));
+    }
     dispatch_time_t when = dispatch_walltime(ts, 0);
     if (dispatch_semaphore_wait(d, when) != 0) { errno = ETIMEDOUT; return -1; }
     return 0;

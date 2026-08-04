@@ -32,7 +32,90 @@ static void warn_once(const char *what) {
 }
 
 // ---------- errno / environ ----------
-int  *klb_errno(void) { return __error(); }          // bionic spells it __errno()
+// errno numbering diverges above 34, and the guest compares against Linux's
+// constants. This finally bit at IL2CPP's semaphores: sem_timedwait timed out
+// legitimately, we set Darwin's ETIMEDOUT (60), IL2CPP tested for Linux's (110),
+// did not recognise it as a timeout and took its fatal path — "sem_wait failed",
+// abort, with the real cause four layers down. PLANNING listed this as a
+// silent-wrong-answer waiting to happen; this is it happening.
+//
+// Only the codes that actually differ are listed. Everything <= 34 is identical
+// on both platforms and falls through unchanged.
+static const struct { int darwin, linux_; } g_errno_map[] = {
+    {11,  35},   // EDEADLK
+    {35,  11},   // EAGAIN / EWOULDBLOCK
+    {36,  115},  // EINPROGRESS
+    {37,  114},  // EALREADY
+    {38,  88},   // ENOTSOCK
+    {39,  89},   // EDESTADDRREQ
+    {40,  90},   // EMSGSIZE
+    {41,  91},   // EPROTOTYPE
+    {42,  92},   // ENOPROTOOPT
+    {43,  93},   // EPROTONOSUPPORT
+    {44,  94},   // ESOCKTNOSUPPORT
+    {45,  95},   // ENOTSUP / EOPNOTSUPP
+    {46,  96},   // EPFNOSUPPORT
+    {47,  97},   // EAFNOSUPPORT
+    {48,  98},   // EADDRINUSE
+    {49,  99},   // EADDRNOTAVAIL
+    {50,  100},  // ENETDOWN
+    {51,  101},  // ENETUNREACH
+    {52,  102},  // ENETRESET
+    {53,  103},  // ECONNABORTED
+    {54,  104},  // ECONNRESET
+    {55,  105},  // ENOBUFS
+    {56,  106},  // EISCONN
+    {57,  107},  // ENOTCONN
+    {58,  108},  // ESHUTDOWN
+    {59,  109},  // ETOOMANYREFS
+    {60,  110},  // ETIMEDOUT   <- the one that bit
+    {61,  111},  // ECONNREFUSED
+    {62,  40},   // ELOOP
+    {63,  36},   // ENAMETOOLONG
+    {64,  112},  // EHOSTDOWN
+    {65,  113},  // EHOSTUNREACH
+    {66,  39},   // ENOTEMPTY
+    {68,  122},  // EDQUOT
+    {69,  116},  // ESTALE
+    {77,  37},   // ENOLCK
+    {78,  38},   // ENOSYS
+    {84,  75},   // EOVERFLOW
+    {89,  125},  // ECANCELED
+    {90,  43},   // EIDRM
+    {91,  42},   // ENOMSG
+    {92,  84},   // EILSEQ
+    {93,  61},   // ENOATTR / ENODATA
+    {96,  87},   // EUSERS
+    {100, 71},   // EPROTO
+    {101, 74},   // EBADMSG
+    {102, 95},   // EOPNOTSUPP
+    {104, 76},   // EMULTIHOP
+    {105, 72},   // ENOLINK
+    {106, 62},   // ETIME
+};
+
+int kl_errno_to_linux(int e) {
+    for (size_t i = 0; i < sizeof g_errno_map / sizeof g_errno_map[0]; i++)
+        if (g_errno_map[i].darwin == e) return g_errno_map[i].linux_;
+    return e;
+}
+int kl_errno_from_linux(int e) {
+    for (size_t i = 0; i < sizeof g_errno_map / sizeof g_errno_map[0]; i++)
+        if (g_errno_map[i].linux_ == e) return g_errno_map[i].darwin;
+    return e;
+}
+
+// bionic spells it __errno(), and it returns the *location* rather than the
+// value — so the translation has to be staged through a per-thread slot that is
+// refreshed on every call. Reads are what matter and they are always fresh; a
+// guest that writes here (errno = 0 before a call) sets the slot, and the next
+// read re-derives from Darwin's real errno anyway.
+static _Thread_local int g_guest_errno;
+int *klb_errno(void) {
+    g_guest_errno = kl_errno_to_linux(*__error());
+    return &g_guest_errno;
+}
+
 extern char **environ;
 char ***klb_environ_ptr(void) { return &environ; }   // registered as data below
 
