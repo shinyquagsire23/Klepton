@@ -64,9 +64,11 @@ int main(int argc, char **argv) {
     pid_t pid = fork();
     if (pid == 0) {
         // Strict: an unimplemented *call* is fatal. Lookups are not, so this
-        // stops only where the surface genuinely ends. Flip to permissive when
-        // pushing into new territory and you want the whole batch in one run.
-        kl_jni_set_permissive(0);
+        // stops only where the surface genuinely ends. KL_PERMISSIVE=1 flips it
+        // to a zero return, which collects a whole batch in one run when pushing
+        // into new territory — scouting only, since the guest then carries on
+        // with answers we made up.
+        kl_jni_set_permissive(getenv("KL_PERMISSIVE") != NULL);
         // load() takes the *directory* — it appends "/libunity.so" itself.
         int8_t ok = ((nativeloader_load_fn)load)(kl_jni_env(), NULL,
                                                  kl_jni_new_string(LIBDIR));
@@ -103,7 +105,10 @@ int main(int argc, char **argv) {
                 if (!fn) { printf("  %s: not registered\n", seq[i].name); continue; }
                 printf("\n=== recon: UnityPlayer.%s ===\n", seq[i].name);
                 fflush(NULL);
-                alarm(20);   // the render loop may block; do not hang the sweep
+                // The render loop may block; do not hang the sweep. KL_ALARM
+                // widens the window when the question is what it is waiting on.
+                const char *aenv = getenv("KL_ALARM");
+                alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : 20);
                 if (seq[i].kind == 2)
                     ((void (*)(void *, void *, int, void *))fn)(kl_jni_env(), thiz2, 0, surface);
                 else if (seq[i].kind == 1)
@@ -122,7 +127,15 @@ int main(int argc, char **argv) {
     int st = 0;
     waitpid(pid, &st, 0);
     if (WIFSIGNALED(st) || WEXITSTATUS(st) != 0) {
-        printf("\n  (recon stopped — see the JNI surface report above)\n");
+        // How it stopped is the first question every time: an unimplemented JNI
+        // slot aborts (SIGABRT after the report), SIGALRM means the guest
+        // blocked, and anything else is a real fault in guest code.
+        if (WIFSIGNALED(st))
+            printf("\n  (recon stopped on signal %d — %s)\n", WTERMSIG(st),
+                   strsignal(WTERMSIG(st)));
+        else
+            printf("\n  (recon child exited %d)\n", WEXITSTATUS(st));
+        printf("  (see the JNI surface report above)\n");
         return fail("guest init did not complete: an unimplemented JNI call was reached");
     }
     printf("\n=== M4 (partial): initJni completed with no unimplemented JNI calls ===\n");

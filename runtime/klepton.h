@@ -54,4 +54,13 @@ void      kl_set_library_path(const char *dir);
 void      kl_register_image(const char *soname, kl_image *img);
 kl_image *kl_find_image(const char *soname);
 
+
+// Rewrite a guest file path into the synthetic /proc and /sys tree when we serve
+// it; returns `path` unchanged otherwise. Every guest file entry point goes
+// through this — Unity reads its CPU and memory configuration out of procfs.
+const char *kl_guest_path(const char *path, char *buf, size_t cap);
+
+// KL_TRACE_FS reporting for guest file operations (see kl_libc.c).
+void kl_fs_trace_open(const char *path, int flags, int fd);
+
 #endif

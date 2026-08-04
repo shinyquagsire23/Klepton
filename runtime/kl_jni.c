@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include "klepton.h"
 #include "kl_jni.h"
@@ -827,8 +828,30 @@ static klj_val klj_SB_append_S(void *env, void *self, const klj_val *a, int n) {
 // This is the path the M3 measurement predicted: with no AAssetManager_* import,
 // assets reach Unity over JNI instead — Context.getAssets() -> AssetManager.open()
 // -> InputStream -> Scanner. We serve it from the unpacked APK on disk.
+// Every path we hand the guest must be absolute. Android's are — getPackageCodePath
+// returns /data/app/<pkg>/base.apk and getFilesDir /data/data/<pkg>/files — and
+// Unity relies on it: it mounts the APK into its VFS under the path it was given
+// and later resolves entries by concatenating onto that mount point. A relative
+// mount point survives the mount and then fails to match, so the lookup falls
+// through to a raw open() of "beatsaber.apk/assets/..." — which is not a
+// directory, and Unity reports it as "Not enough storage space to install
+// required resources."
+//
+// realpath() is not usable here: several of these name directories we have not
+// created yet. Prefixing the cwd is enough, since that is what a relative path
+// already meant.
+static const char *klj_abspath(const char *p) {
+    if (!p || p[0] == '/') return p;
+    char cwd[1024];
+    if (!getcwd(cwd, sizeof cwd)) return p;
+    size_t n = strlen(cwd) + strlen(p) + 2;
+    char  *out = malloc(n);
+    snprintf(out, n, "%s/%s", cwd, p);
+    return out;
+}
+
 static const char *g_assets_dir = "beatsaber/assets";
-void kl_jni_set_assets_dir(const char *dir) { g_assets_dir = dir; }
+void kl_jni_set_assets_dir(const char *dir) { g_assets_dir = klj_abspath(dir); }
 
 static klj_val klj_singleton(const char *cls, void **slot) {
     if (!*slot) *slot = kl_jni_new_object(cls);
@@ -919,6 +942,13 @@ static klj_val klj_PM_queryIntentActivities(void *env, void *self, const klj_val
         list     = klj_new_list(items, 1);
     }
     return (klj_val){.l = list};
+}
+
+// Object.getClass() is GetObjectClass reached the other way round — the guest
+// calls it as a Java method on classes it has no jclass for yet.
+static klj_val klj_Object_getClass(void *env, void *self, const klj_val *a, int n) {
+    (void)a; (void)n;
+    return (klj_val){.l = klj_GetObjectClass(env, self)};
 }
 
 // A constructor whose only job is to produce an identity. `self` is the jclass
@@ -1022,12 +1052,12 @@ static klj_val klj_String_length(void *env, void *self, const klj_val *a, int n)
 // real, writable directories — a stub path would make the first write fail deep
 // inside the engine rather than here.
 static const char *g_files_dir = "build/android-files";
-void kl_jni_set_files_dir(const char *dir) { g_files_dir = dir; }
+void kl_jni_set_files_dir(const char *dir) { g_files_dir = klj_abspath(dir); }
 
 // The APK itself. Unity opens this as a zip to read streaming assets, so it has
 // to be a real file — the unpacked tree under beatsaber/ is not a substitute.
 static const char *g_apk_path = "beatsaber.apk";
-void kl_jni_set_apk_path(const char *path) { g_apk_path = path; }
+void kl_jni_set_apk_path(const char *path) { g_apk_path = klj_abspath(path); }
 
 static klj_val klj_Context_getPackageCodePath(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -1038,7 +1068,7 @@ static klj_val klj_Context_getPackageCodePath(void *env, void *self, const klj_v
 // Where the guest's own .so files live. Unity reads this to dlopen further
 // libraries, and our guest dlopen resolves against the same directory.
 static const char *g_native_lib_dir = "beatsaber/lib/arm64-v8a";
-void kl_jni_set_native_lib_dir(const char *dir) { g_native_lib_dir = dir; }
+void kl_jni_set_native_lib_dir(const char *dir) { g_native_lib_dir = klj_abspath(dir); }
 
 // ApplicationInfo is a plain data holder — Unity reads its fields directly
 // rather than calling accessors, so these are field getters, not methods.
@@ -1052,6 +1082,26 @@ static klj_val klj_appinfo_splitSourceDirs(void) {
     static void *empty;
     if (!empty) empty = klj_new_array('L', "java/lang/String", 0);
     return (klj_val){.l = empty};
+}
+
+// ClassLoader.findLibrary(name) turns a System.loadLibrary() name into the
+// absolute path of the .so inside the APK's native library directory, so a
+// caller need not know the path layout. Null is Android's own answer for a
+// library that is not there, so a miss needs nothing invented.
+static klj_val klj_ClassLoader_findLibrary(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *name = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!name || !*name) return (klj_val){.l = NULL};
+    char   path[1024];
+    size_t len = strlen(name);
+    if (strncmp(name, "lib", 3) == 0 && len > 3 && strcmp(name + len - 3, ".so") == 0)
+        snprintf(path, sizeof path, "%s/%s", g_native_lib_dir, name);
+    else
+        snprintf(path, sizeof path, "%s/lib%s.so", g_native_lib_dir, name);
+    struct stat st;
+    int found = stat(path, &st) == 0;
+    KLJ_LOG("ClassLoader.findLibrary(\"%s\") -> %s", name, found ? path : "null");
+    return (klj_val){.l = found ? kl_jni_new_string(path) : NULL};
 }
 
 // No OBB expansion files: this APK carries its assets inline, and there is no
@@ -1084,17 +1134,115 @@ static klj_val klj_Context_getObbDir(void *env, void *self, const klj_val *a, in
 // to host. The count is exposed so the gap shows up as a number rather than as
 // silently skipped work.
 #define KLJ_MAX_UI_TASKS 64
-static void    *g_ui_tasks[KLJ_MAX_UI_TASKS];
+static struct { void *runnable; int64_t delay_ms; } g_ui_tasks[KLJ_MAX_UI_TASKS];
 static unsigned g_ui_task_n;
 
 unsigned kl_jni_pending_ui_tasks(void) { return g_ui_task_n; }
 
+// One queue behind both posting routes — runOnUiThread and Handler.post* target
+// the same main-thread looper on Android, so splitting them would only hide half
+// the backlog from kl_jni_pending_ui_tasks().
+static void klj_ui_enqueue(const char *via, void *runnable, int64_t delay_ms) {
+    if (runnable && g_ui_task_n < KLJ_MAX_UI_TASKS) {
+        g_ui_tasks[g_ui_task_n].runnable = runnable;
+        g_ui_tasks[g_ui_task_n].delay_ms = delay_ms;
+        g_ui_task_n++;
+    }
+    KLJ_LOG("%s: queued (+%lldms, %u pending, nothing drains them yet)",
+            via, (long long)delay_ms, g_ui_task_n);
+}
+
 static klj_val klj_Activity_runOnUiThread(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
-    if (n > 0 && g_ui_task_n < KLJ_MAX_UI_TASKS) g_ui_tasks[g_ui_task_n++] = a[0].l;
-    KLJ_LOG("runOnUiThread: queued (%u pending, nothing drains them yet)", g_ui_task_n);
+    klj_ui_enqueue("runOnUiThread", n > 0 ? a[0].l : NULL, 0);
     return (klj_val){0};
 }
+
+// The main Looper is an identity, not a mechanism: Unity holds it to build a
+// Handler and to ask whether it is already on that thread.
+static klj_val klj_Looper_getMainLooper(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *main_looper;
+    return klj_singleton("android/os/Looper", &main_looper);
+}
+// new Handler() binds to the calling thread's Looper; new Handler(looper) to the
+// one given. We have a single queue, so the Looper is recorded and not acted on.
+static klj_val klj_Handler_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env;
+    void *obj = kl_jni_new_object(klj_class_name(clazz));
+    klj_as_object(obj)->data = n > 0 ? a[0].l : NULL;
+    return (klj_val){.l = obj};
+}
+// postDelayed returns whether the message made it into the queue — which it did.
+// The delay is recorded rather than honoured; there is no clock driving this
+// queue until something drains it.
+static klj_val klj_Handler_postDelayed(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_ui_enqueue("Handler.postDelayed", n > 0 ? a[0].l : NULL,
+                   n > 1 ? (int64_t)a[1].j : 0);
+    return (klj_val){.j = 1};
+}
+static klj_val klj_Handler_post(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_ui_enqueue("Handler.post", n > 0 ? a[0].l : NULL, 0);
+    return (klj_val){.j = 1};
+}
+
+// ---- android.os.Process ----
+// setThreadPriority(tid, priority) is a no-op we can only record. Android's
+// priority is a Linux nice value applied to another thread by tid; Darwin has no
+// equivalent — scheduling is set through pthread QoS classes on the thread
+// itself, so honouring this would mean intercepting it at thread creation. It is
+// logged rather than silently dropped because it names which of the engine's
+// threads expect to run below normal.
+static klj_val klj_Process_setThreadPriority(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n > 1) KLJ_LOG("Process.setThreadPriority(tid=%d, %d) — not applied on Darwin",
+                       (int)a[0].j, (int)a[1].j);
+    else if (n > 0) KLJ_LOG("Process.setThreadPriority(%d) — not applied on Darwin",
+                            (int)a[0].j);
+    return (klj_val){0};
+}
+static klj_val klj_Process_myTid(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    return (klj_val){.j = (uint32_t)tid};
+}
+
+// ---- AlertDialog ----
+// This is a measurement instrument before it is a UI shim. Unity only reaches
+// for a dialog when it has something to say, and the title and message it sets
+// are the engine's own diagnosis — far more useful logged than drawn. Nothing
+// here renders anything; the builder records and reports.
+typedef struct { char *title, *message; } klj_dialog;
+
+static klj_dialog *klj_dlg(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o ? o->data : NULL;
+}
+static klj_val klj_AlertBuilder_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    void *obj = kl_jni_new_object(klj_class_name(clazz));
+    klj_as_object(obj)->data = calloc(1, sizeof(klj_dialog));
+    KLJ_LOG("AlertDialog.Builder: the guest is raising a dialog");
+    return (klj_val){.l = obj};
+}
+// Every Builder setter returns `this`; that is what the guest's chained calls
+// depend on.
+#define KLJ_ALERT_SET(Sfx, field)                                                 \
+    static klj_val klj_AlertBuilder_set##Sfx(void *env, void *self,               \
+                                             const klj_val *a, int n) {           \
+        (void)env;                                                                \
+        klj_dialog *d = klj_dlg(self);                                            \
+        const char *s = n > 0 ? klj_str(a[0].l) : NULL;                           \
+        if (d) { free(d->field); d->field = s ? strdup(s) : NULL; }               \
+        KLJ_LOG("AlertDialog." #field ": %s", s ? s : "(null)");                  \
+        return (klj_val){.l = self};                                              \
+    }
+KLJ_ALERT_SET(Title,   title)
+KLJ_ALERT_SET(Message, message)
+#undef KLJ_ALERT_SET
 
 // ---- manifest meta-data ----
 // PackageItemInfo.metaData is the <meta-data> block from AndroidManifest.xml,
@@ -1335,9 +1483,494 @@ static klj_val klj_Scanner_next(void *env, void *self, const klj_val *a, int n) 
     return (klj_val){.l = s};
 }
 
+// ---- SharedPreferences ----
+// Unity's PlayerPrefs. This one has to persist: a value written this run must
+// read back the next, so it is a real file rather than an in-memory map. The
+// file is Android's own shared_prefs/<name>.xml, which costs a small serialiser
+// and buys inspectability — and a prefs file pulled off a Quest drops straight
+// in. Set<String> is absent because nothing has asked for it; the primitive
+// types are all one shape, so they come as a group.
+typedef struct {
+    char   *key;
+    char    kind;     // 'S' string, 'I' 'J' 'Z' integral, 'F' float, '-' pending removal
+    char   *sval;
+    int64_t ival;
+    float   fval;
+} klj_pref;
+
+typedef struct { klj_pref *v; unsigned n, cap; } klj_pref_set;
+
+typedef struct {
+    char         name[128];
+    char         path[1024];
+    klj_pref_set kv;
+} klj_prefs;
+
+// An Editor batches: Android does not publish a put until commit()/apply(), and
+// a read through the SharedPreferences in between still sees the old value.
+typedef struct {
+    klj_prefs   *store;
+    klj_pref_set pending;
+    int          clear;
+} klj_editor;
+
+static klj_pref *klj_pref_find(klj_pref_set *s, const char *key) {
+    for (unsigned i = 0; i < s->n; i++)
+        if (strcmp(s->v[i].key, key) == 0) return &s->v[i];
+    return NULL;
+}
+
+// Find or create, and reset whatever value was there — every caller is about to
+// overwrite it.
+static klj_pref *klj_pref_slot(klj_pref_set *s, const char *key) {
+    klj_pref *p = klj_pref_find(s, key);
+    if (p) { free(p->sval); p->sval = NULL; p->ival = 0; p->fval = 0; return p; }
+    if (s->n == s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 16;
+        s->v   = realloc(s->v, s->cap * sizeof *s->v);
+    }
+    p = &s->v[s->n++];
+    memset(p, 0, sizeof *p);
+    p->key = strdup(key);
+    return p;
+}
+
+static void klj_pref_erase(klj_pref_set *s, const char *key) {
+    klj_pref *p = klj_pref_find(s, key);
+    if (!p) return;
+    free(p->key);
+    free(p->sval);
+    *p = s->v[--s->n];   // order is not part of the API
+}
+
+static void klj_pref_clear(klj_pref_set *s) {
+    for (unsigned i = 0; i < s->n; i++) { free(s->v[i].key); free(s->v[i].sval); }
+    s->n = 0;
+}
+
+// Only the five entities Android's XmlSerializer emits — which is exactly the
+// set our own reader has to understand, since we write every file we read.
+static void klj_xml_escape(FILE *f, const char *s) {
+    for (; s && *s; s++) switch (*s) {
+    case '&':  fputs("&amp;",  f); break;
+    case '<':  fputs("&lt;",   f); break;
+    case '>':  fputs("&gt;",   f); break;
+    case '"':  fputs("&quot;", f); break;
+    case '\'': fputs("&apos;", f); break;
+    default:   fputc(*s, f);
+    }
+}
+static char *klj_xml_unescape(const char *s, size_t len) {
+    static const char *const ent[] = {"&amp;", "&lt;", "&gt;", "&quot;", "&apos;"};
+    static const char        rep[] = {'&', '<', '>', '"', '\''};
+    char *out = malloc(len + 1), *w = out;
+    for (size_t i = 0; i < len; ) {
+        if (s[i] != '&') { *w++ = s[i++]; continue; }
+        unsigned k = 0;
+        for (; k < sizeof rep; k++) {
+            size_t el = strlen(ent[k]);
+            if (i + el <= len && strncmp(s + i, ent[k], el) == 0) { *w++ = rep[k]; i += el; break; }
+        }
+        if (k == sizeof rep) *w++ = s[i++];   // not an entity we emit — take it literally
+    }
+    *w = '\0';
+    return out;
+}
+
+static const struct { const char *tag; char kind; } g_pref_tags[] = {
+    {"string", 'S'}, {"int", 'I'}, {"long", 'J'}, {"float", 'F'}, {"boolean", 'Z'}, {NULL, 0},
+};
+
+static void klj_prefs_save(klj_prefs *p) {
+    FILE *f = fopen(p->path, "wb");
+    if (!f) { KLJ_LOG("SharedPreferences[%s]: cannot write %s", p->name, p->path); return; }
+    fputs("<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n", f);
+    for (unsigned i = 0; i < p->kv.n; i++) {
+        klj_pref *e = &p->kv.v[i];
+        if (e->kind == 'S') {
+            fputs("    <string name=\"", f);
+            klj_xml_escape(f, e->key);
+            fputs("\">", f);
+            klj_xml_escape(f, e->sval ? e->sval : "");
+            fputs("</string>\n", f);
+            continue;
+        }
+        const char *tag = "boolean";
+        for (int t = 0; g_pref_tags[t].tag; t++)
+            if (g_pref_tags[t].kind == e->kind) { tag = g_pref_tags[t].tag; break; }
+        char val[64];
+        if (e->kind == 'F')      snprintf(val, sizeof val, "%.9g", (double)e->fval);
+        else if (e->kind == 'Z') snprintf(val, sizeof val, "%s", e->ival ? "true" : "false");
+        else                     snprintf(val, sizeof val, "%lld", (long long)e->ival);
+        fprintf(f, "    <%s name=\"", tag);
+        klj_xml_escape(f, e->key);
+        fprintf(f, "\" value=\"%s\" />\n", val);
+    }
+    fputs("</map>\n", f);
+    fclose(f);
+}
+
+// A reader for exactly the subset above, not an XML parser. Every '<' that is
+// not one of our five tags is skipped, so the prolog and <map> need no cases.
+static void klj_prefs_load(klj_prefs *p) {
+    FILE *f = fopen(p->path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); return; }
+    char  *buf = malloc((size_t)sz + 1);
+    size_t len = fread(buf, 1, (size_t)sz, f);
+    buf[len] = '\0';
+    fclose(f);
+
+    for (char *q = buf; (q = strchr(q, '<')) != NULL; ) {
+        q++;
+        char kind = 0;
+        for (int i = 0; g_pref_tags[i].tag; i++) {
+            size_t tl = strlen(g_pref_tags[i].tag);
+            if (strncmp(q, g_pref_tags[i].tag, tl) == 0 && (q[tl] == ' ' || q[tl] == '\t')) {
+                kind = g_pref_tags[i].kind;
+                break;
+            }
+        }
+        if (!kind) continue;
+        char *close = strchr(q, '>');
+        char *nm    = strstr(q, "name=\"");
+        if (!close || !nm || nm > close) continue;
+        nm += 6;
+        char *ne = strchr(nm, '"');
+        if (!ne || ne > close) continue;
+        char *key = klj_xml_unescape(nm, (size_t)(ne - nm));
+
+        if (kind == 'S') {
+            // <string name="k" /> is how a null value is written; that is
+            // indistinguishable from absent to every reader, so drop it.
+            char *end = close[-1] == '/' ? NULL : strstr(close + 1, "</string>");
+            if (end) {
+                char     *val = klj_xml_unescape(close + 1, (size_t)(end - close - 1));
+                klj_pref *e   = klj_pref_slot(&p->kv, key);
+                e->kind = 'S';
+                e->sval = val;
+            }
+        } else {
+            char *vs = strstr(q, "value=\"");
+            char *ve = vs && vs < close ? strchr(vs + 7, '"') : NULL;
+            if (ve) {
+                char val[64];
+                size_t vl = (size_t)(ve - vs - 7);
+                if (vl >= sizeof val) vl = sizeof val - 1;
+                memcpy(val, vs + 7, vl);
+                val[vl] = '\0';
+                klj_pref *e = klj_pref_slot(&p->kv, key);
+                e->kind = kind;
+                if (kind == 'F')      e->fval = strtof(val, NULL);
+                else if (kind == 'Z') e->ival = strcmp(val, "true") == 0;
+                else                  e->ival = strtoll(val, NULL, 10);
+            }
+        }
+        free(key);
+        q = close;
+    }
+    free(buf);
+}
+
+// One SharedPreferences object per name, as Android does — callers hold on to
+// the reference and expect writes through one to be visible through another.
+#define KLJ_MAX_PREF_FILES 8
+static klj_prefs g_prefs_files[KLJ_MAX_PREF_FILES];
+static void     *g_prefs_objs[KLJ_MAX_PREF_FILES];
+static unsigned  g_nprefs_files;
+
+static klj_val klj_Context_getSharedPreferences(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *name = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!name) name = "default";
+    for (unsigned i = 0; i < g_nprefs_files; i++)
+        if (strcmp(g_prefs_files[i].name, name) == 0) return (klj_val){.l = g_prefs_objs[i]};
+    if (g_nprefs_files == KLJ_MAX_PREF_FILES) {
+        KLJ_LOG("SharedPreferences: file table full, refusing \"%s\"", name);
+        return (klj_val){.l = NULL};
+    }
+    klj_prefs *p = &g_prefs_files[g_nprefs_files];
+    snprintf(p->name, sizeof p->name, "%s", name);
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s/shared_prefs", g_files_dir);
+    klj_mkdir_p(dir);
+    snprintf(p->path, sizeof p->path, "%s/%s.xml", dir, name);
+    klj_prefs_load(p);
+    // The mode is ignored: MODE_PRIVATE is the only one not deprecated, and
+    // there is no second process here to share with.
+    KLJ_LOG("getSharedPreferences(\"%s\", %d) -> %s (%u entries)",
+            name, n > 1 ? (int)a[1].j : 0, p->path, p->kv.n);
+    void *obj = kl_jni_new_object("android/content/SharedPreferences");
+    klj_as_object(obj)->data = p;
+    g_prefs_objs[g_nprefs_files++] = obj;
+    return (klj_val){.l = obj};
+}
+
+static klj_prefs *klj_prefs_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o ? o->data : NULL;
+}
+
+static klj_pref *klj_prefs_lookup(void *self, const klj_val *a, int n, char kind) {
+    klj_prefs  *p   = klj_prefs_of(self);
+    const char *key = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!p || !key) return NULL;
+    klj_pref *e = klj_pref_find(&p->kv, key);
+    // Android throws ClassCastException on a type mismatch. Nothing here can
+    // throw, so a mismatch reads as absent — the caller gets its own default,
+    // which is the closest non-throwing answer. Logged, because it means the
+    // file disagrees with the code that wrote it.
+    if (e && e->kind != kind) {
+        KLJ_LOG("SharedPreferences[%s]: \"%s\" is '%c' but was read as '%c' — using the default",
+                p->name, key, e->kind, kind);
+        return NULL;
+    }
+    return e;
+}
+
+static klj_val klj_SP_getString(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_pref *e = klj_prefs_lookup(self, a, n, 'S');
+    if (!e) return (klj_val){.l = n > 1 ? a[1].l : NULL};
+    return (klj_val){.l = kl_jni_new_string(e->sval ? e->sval : "")};
+}
+#define KLJ_SP_GET(Sfx, kind, Field, Slot)                                        \
+    static klj_val klj_SP_get##Sfx(void *env, void *self, const klj_val *a, int n) { \
+        (void)env;                                                                \
+        klj_pref *e = klj_prefs_lookup(self, a, n, kind);                         \
+        if (!e) return (klj_val){.Slot = n > 1 ? a[1].Slot : 0};                  \
+        return (klj_val){.Slot = e->Field};                                       \
+    }
+KLJ_SP_GET(Int,     'I', ival, j)
+KLJ_SP_GET(Long,    'J', ival, j)
+KLJ_SP_GET(Boolean, 'Z', ival, j)
+KLJ_SP_GET(Float,   'F', fval, d)
+#undef KLJ_SP_GET
+
+static klj_val klj_SP_contains(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_prefs  *p   = klj_prefs_of(self);
+    const char *key = n > 0 ? klj_str(a[0].l) : NULL;
+    return (klj_val){.j = p && key && klj_pref_find(&p->kv, key) != NULL};
+}
+
+// getAll() hands back a *copy* in Android, and that is not incidental here: the
+// path that calls it is Unity migrating one prefs file into another, so a live
+// alias would be read while its source is being written.
+static klj_pref_set *klj_pref_snapshot(const klj_pref_set *src) {
+    klj_pref_set *s = calloc(1, sizeof *s);
+    for (unsigned i = 0; i < src->n; i++) {
+        klj_pref *d = klj_pref_slot(s, src->v[i].key);
+        d->kind = src->v[i].kind;
+        d->ival = src->v[i].ival;
+        d->fval = src->v[i].fval;
+        d->sval = src->v[i].sval ? strdup(src->v[i].sval) : NULL;
+    }
+    return s;
+}
+
+static klj_val klj_SP_getAll(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_prefs *p = klj_prefs_of(self);
+    void      *obj = kl_jni_new_object("java/util/Map");
+    klj_as_object(obj)->data = p ? klj_pref_snapshot(&p->kv) : calloc(1, sizeof(klj_pref_set));
+    KLJ_LOG("SharedPreferences[%s]: getAll() -> %u entries",
+            p ? p->name : "?", p ? p->kv.n : 0);
+    return (klj_val){.l = obj};
+}
+
+static klj_val klj_SP_edit(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_editor *ed = calloc(1, sizeof *ed);
+    ed->store = klj_prefs_of(self);
+    void *obj = kl_jni_new_object("android/content/SharedPreferences$Editor");
+    klj_as_object(obj)->data = ed;
+    return (klj_val){.l = obj};
+}
+
+static klj_editor *klj_editor_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o ? o->data : NULL;
+}
+
+// Every Editor mutator returns `this` — that is what makes the chaining Unity
+// writes work, not a convenience.
+static klj_val klj_editor_put(void *self, const klj_val *a, int n, char kind) {
+    klj_editor *ed  = klj_editor_of(self);
+    const char *key = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!ed || !key) return (klj_val){.l = self};
+    klj_pref *e = klj_pref_slot(&ed->pending, key);
+    e->kind = kind;
+    if (kind == 'S') {
+        const char *v = n > 1 ? klj_str(a[1].l) : NULL;
+        if (v) e->sval = strdup(v);
+        else   e->kind = '-';     // putString(key, null) is documented to remove
+    } else if (kind == 'F') {
+        e->fval = n > 1 ? (float)a[1].d : 0.0f;
+    } else {
+        e->ival = n > 1 ? (int64_t)a[1].j : 0;
+    }
+    return (klj_val){.l = self};
+}
+#define KLJ_ED_PUT(Sfx, kind)                                                     \
+    static klj_val klj_ED_put##Sfx(void *env, void *self, const klj_val *a, int n) { \
+        (void)env; return klj_editor_put(self, a, n, kind);                       \
+    }
+KLJ_ED_PUT(String, 'S') KLJ_ED_PUT(Int,   'I') KLJ_ED_PUT(Long, 'J')
+KLJ_ED_PUT(Float,  'F') KLJ_ED_PUT(Boolean, 'Z')
+#undef KLJ_ED_PUT
+
+static klj_val klj_ED_remove(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_editor *ed  = klj_editor_of(self);
+    const char *key = n > 0 ? klj_str(a[0].l) : NULL;
+    if (ed && key) klj_pref_slot(&ed->pending, key)->kind = '-';
+    return (klj_val){.l = self};
+}
+static klj_val klj_ED_clear(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_editor *ed = klj_editor_of(self);
+    if (ed) ed->clear = 1;
+    return (klj_val){.l = self};
+}
+
+// clear() runs before the puts in the same Editor regardless of call order —
+// that ordering is the documented contract, not an implementation detail.
+// commit() writes synchronously and apply() does not; with no other process to
+// race, both reduce to the same flush.
+static void klj_editor_flush(void *self) {
+    klj_editor *ed = klj_editor_of(self);
+    if (!ed || !ed->store) return;
+    klj_prefs *p = ed->store;
+    if (ed->clear) klj_pref_clear(&p->kv);
+    for (unsigned i = 0; i < ed->pending.n; i++) {
+        klj_pref *s = &ed->pending.v[i];
+        if (s->kind == '-') { klj_pref_erase(&p->kv, s->key); continue; }
+        klj_pref *d = klj_pref_slot(&p->kv, s->key);
+        d->kind = s->kind;
+        d->ival = s->ival;
+        d->fval = s->fval;
+        d->sval = s->sval ? strdup(s->sval) : NULL;
+    }
+    KLJ_LOG("SharedPreferences[%s]: %s%u change%s -> %u entries in %s", p->name,
+            ed->clear ? "clear + " : "", ed->pending.n,
+            ed->pending.n == 1 ? "" : "s", p->kv.n, p->path);
+    klj_prefs_save(p);
+    klj_pref_clear(&ed->pending);
+    ed->clear = 0;
+}
+static klj_val klj_ED_commit(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_editor_flush(self);
+    return (klj_val){.j = 1};
+}
+static klj_val klj_ED_apply(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_editor_flush(self);
+    return (klj_val){0};
+}
+
+// ---- the collection view getAll() forces ----
+// entrySet() -> iterator() -> Map.Entry is the only route out of a Map over JNI,
+// so the whole chain follows from getAll() rather than being speculative. It is
+// read-only throughout: nothing mutates one of our snapshots, so there is no
+// remove() or setValue() here.
+typedef struct { klj_pref_set *set; unsigned pos; } klj_iter;
+
+static klj_pref_set *klj_pset(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o ? o->data : NULL;
+}
+
+static klj_val klj_Map_entrySet(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    void *obj = kl_jni_new_object("java/util/Set");
+    klj_as_object(obj)->data = klj_pset(self);
+    return (klj_val){.l = obj};
+}
+static klj_val klj_Coll_size(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_pref_set *s = klj_pset(self);
+    return (klj_val){.j = s ? s->n : 0};
+}
+static klj_val klj_Coll_isEmpty(void *env, void *self, const klj_val *a, int n) {
+    return (klj_val){.j = klj_Coll_size(env, self, a, n).j == 0};
+}
+static klj_val klj_Set_iterator(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_iter *it = calloc(1, sizeof *it);
+    it->set = klj_pset(self);
+    void *obj = kl_jni_new_object("java/util/Iterator");
+    klj_as_object(obj)->data = it;
+    return (klj_val){.l = obj};
+}
+static klj_val klj_Iterator_hasNext(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o  = klj_as_object(self);
+    klj_iter   *it = o ? o->data : NULL;
+    return (klj_val){.j = it && it->set && it->pos < it->set->n};
+}
+static klj_val klj_Iterator_next(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o  = klj_as_object(self);
+    klj_iter   *it = o ? o->data : NULL;
+    if (!it || !it->set || it->pos >= it->set->n) return (klj_val){.l = NULL};
+    void *obj = kl_jni_new_object("java/util/Map$Entry");
+    klj_as_object(obj)->data = &it->set->v[it->pos++];
+    return (klj_val){.l = obj};
+}
+
+// Boxed primitives. getValue() returns Object, so the caller's only way back to
+// the number is the box's own accessor — and the box's *class* is how it decides
+// which one to call, which is what makes IsInstanceOf's name match sufficient.
+static void *klj_box(const klj_pref *e) {
+    if (!e) return NULL;
+    if (e->kind == 'S') return kl_jni_new_string(e->sval ? e->sval : "");
+    const char *cls = e->kind == 'I' ? "java/lang/Integer"
+                    : e->kind == 'J' ? "java/lang/Long"
+                    : e->kind == 'F' ? "java/lang/Float"
+                    :                  "java/lang/Boolean";
+    klj_pref *copy = malloc(sizeof *copy);
+    *copy      = *e;
+    copy->key  = NULL;      // the box holds the value, not the mapping
+    copy->sval = NULL;
+    void *obj = kl_jni_new_object(cls);
+    klj_as_object(obj)->data = copy;
+    return obj;
+}
+static klj_val klj_Entry_getKey(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    klj_pref   *e = o ? o->data : NULL;
+    return (klj_val){.l = kl_jni_new_string(e && e->key ? e->key : "")};
+}
+static klj_val klj_Entry_getValue(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    return (klj_val){.l = klj_box(o ? o->data : NULL)};
+}
+// int, long and boolean all unbox from the same integral field; only float
+// comes out of the FP bank.
+static klj_val klj_Box_integral(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    klj_pref   *e = o ? o->data : NULL;
+    return (klj_val){.j = e ? (uint64_t)e->ival : 0};
+}
+static klj_val klj_Box_floatValue(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    klj_pref   *e = o ? o->data : NULL;
+    return (klj_val){.d = e ? (double)e->fval : 0.0};
+}
+
 static const klj_binding g_bindings[] = {
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},
+    {"java/lang/ClassLoader", "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", klj_ClassLoader_findLibrary},
 
     {"java/lang/StringBuilder", "<init>",   "()V",                  klj_SB_init},
     {"java/lang/StringBuilder", "toString", "()Ljava/lang/String;", klj_SB_toString},
@@ -1351,6 +1984,21 @@ static const klj_binding g_bindings[] = {
 
     {"android/app/Activity",   "getIntent",  "()Landroid/content/Intent;", klj_Activity_getIntent},
     {"android/app/Activity",   "runOnUiThread", "(Ljava/lang/Runnable;)V", klj_Activity_runOnUiThread},
+    {"android/app/AlertDialog$Builder", "<init>", "(Landroid/content/Context;)V", klj_AlertBuilder_init},
+    {"android/app/AlertDialog$Builder", "setTitle",
+     "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;", klj_AlertBuilder_setTitle},
+    {"android/app/AlertDialog$Builder", "setMessage",
+     "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;", klj_AlertBuilder_setMessage},
+
+    {"android/os/Process", "setThreadPriority", "(II)V", klj_Process_setThreadPriority},
+    {"android/os/Process", "setThreadPriority", "(I)V",  klj_Process_setThreadPriority},
+    {"android/os/Process", "myTid",             "()I",   klj_Process_myTid},
+
+    {"android/os/Looper",  "getMainLooper", "()Landroid/os/Looper;",  klj_Looper_getMainLooper},
+    {"android/os/Handler", "<init>", "()V",                        klj_Handler_init},
+    {"android/os/Handler", "<init>", "(Landroid/os/Looper;)V",     klj_Handler_init},
+    {"android/os/Handler", "post",        "(Ljava/lang/Runnable;)Z",  klj_Handler_post},
+    {"android/os/Handler", "postDelayed", "(Ljava/lang/Runnable;J)Z", klj_Handler_postDelayed},
     {"android/content/Intent", "getExtras",  "()Landroid/os/Bundle;",      klj_Intent_getExtras},
     {"android/content/Intent", "<init>",     "(Ljava/lang/String;)V",      klj_Intent_init},
     {"android/content/Intent", "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_addCategory},
@@ -1367,6 +2015,48 @@ static const klj_binding g_bindings[] = {
     {"android/content/Context", "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", klj_Context_getApplicationInfo},
     {"android/content/Context", "getObbDirs", "()[Ljava/io/File;", klj_Context_getObbDirs},
     {"android/content/Context", "getObbDir",  "()Ljava/io/File;",  klj_Context_getObbDir},
+    {"android/content/Context", "getSharedPreferences",
+     "(Ljava/lang/String;I)Landroid/content/SharedPreferences;", klj_Context_getSharedPreferences},
+
+    {"android/content/SharedPreferences", "getString",
+     "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", klj_SP_getString},
+    {"android/content/SharedPreferences", "getInt",     "(Ljava/lang/String;I)I", klj_SP_getInt},
+    {"android/content/SharedPreferences", "getLong",    "(Ljava/lang/String;J)J", klj_SP_getLong},
+    {"android/content/SharedPreferences", "getFloat",   "(Ljava/lang/String;F)F", klj_SP_getFloat},
+    {"android/content/SharedPreferences", "getBoolean", "(Ljava/lang/String;Z)Z", klj_SP_getBoolean},
+    {"android/content/SharedPreferences", "contains",   "(Ljava/lang/String;)Z",  klj_SP_contains},
+    {"android/content/SharedPreferences", "getAll",     "()Ljava/util/Map;",      klj_SP_getAll},
+    {"android/content/SharedPreferences", "edit",
+     "()Landroid/content/SharedPreferences$Editor;", klj_SP_edit},
+
+#define KLJ_ED(name, args, fn) \
+    {"android/content/SharedPreferences$Editor", name, \
+     "(" args ")Landroid/content/SharedPreferences$Editor;", fn}
+    KLJ_ED("putString",  "Ljava/lang/String;Ljava/lang/String;", klj_ED_putString),
+    KLJ_ED("putInt",     "Ljava/lang/String;I",                  klj_ED_putInt),
+    KLJ_ED("putLong",    "Ljava/lang/String;J",                  klj_ED_putLong),
+    KLJ_ED("putFloat",   "Ljava/lang/String;F",                  klj_ED_putFloat),
+    KLJ_ED("putBoolean", "Ljava/lang/String;Z",                  klj_ED_putBoolean),
+    KLJ_ED("remove",     "Ljava/lang/String;",                   klj_ED_remove),
+    KLJ_ED("clear",      "",                                     klj_ED_clear),
+#undef KLJ_ED
+    {"android/content/SharedPreferences$Editor", "commit", "()Z", klj_ED_commit},
+    {"android/content/SharedPreferences$Editor", "apply",  "()V", klj_ED_apply},
+
+    {"java/util/Map", "entrySet", "()Ljava/util/Set;", klj_Map_entrySet},
+    {"java/util/Map", "size",     "()I",               klj_Coll_size},
+    {"java/util/Map", "isEmpty",  "()Z",               klj_Coll_isEmpty},
+    {"java/util/Set", "iterator", "()Ljava/util/Iterator;", klj_Set_iterator},
+    {"java/util/Set", "size",     "()I",               klj_Coll_size},
+    {"java/util/Set", "isEmpty",  "()Z",               klj_Coll_isEmpty},
+    {"java/util/Iterator", "hasNext", "()Z",                  klj_Iterator_hasNext},
+    {"java/util/Iterator", "next",    "()Ljava/lang/Object;", klj_Iterator_next},
+    {"java/util/Map$Entry", "getKey",   "()Ljava/lang/Object;", klj_Entry_getKey},
+    {"java/util/Map$Entry", "getValue", "()Ljava/lang/Object;", klj_Entry_getValue},
+    {"java/lang/Integer", "intValue",     "()I", klj_Box_integral},
+    {"java/lang/Long",    "longValue",    "()J", klj_Box_integral},
+    {"java/lang/Boolean", "booleanValue", "()Z", klj_Box_integral},
+    {"java/lang/Float",   "floatValue",   "()F", klj_Box_floatValue},
     {"android/content/pm/PackageManager", "getPackageInfo",
      "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;", klj_PM_getPackageInfo},
     // Same singleton the Context hands out — there is one application here.
@@ -1381,7 +2071,8 @@ static const klj_binding g_bindings[] = {
     {"android/content/res/AssetManager", "open", "(Ljava/lang/String;)Ljava/io/InputStream;", klj_AssetManager_open},
     {"android/content/pm/PackageManager", "queryIntentActivities",
      "(Landroid/content/Intent;I)Ljava/util/List;", klj_PM_queryIntentActivities},
-    {"java/lang/Object", "<init>", "()V", klj_generic_init},
+    {"java/lang/Object", "<init>",   "()V",                   klj_generic_init},
+    {"java/lang/Object", "getClass", "()Ljava/lang/Class;", klj_Object_getClass},
     {"java/lang/String", "equals", "(Ljava/lang/Object;)Z", klj_String_equals},
     {"java/lang/String", "length", "()I",                   klj_String_length},
     {"com/unity3d/player/UnityPlayer", "initializeGoogleAr", "()Z", klj_UnityPlayer_initializeGoogleAr},
@@ -1420,6 +2111,12 @@ static pthread_key_t  g_env_key;
 static void klj_build_tables(void);
 static void klj_init(void) {
     pthread_key_create(&g_env_key, free);
+    // The defaults are relative literals; the setters resolve what they are
+    // given, so this covers the case where nothing set them.
+    g_assets_dir     = klj_abspath(g_assets_dir);
+    g_files_dir      = klj_abspath(g_files_dir);
+    g_apk_path       = klj_abspath(g_apk_path);
+    g_native_lib_dir = klj_abspath(g_native_lib_dir);
     klj_build_tables();
 }
 

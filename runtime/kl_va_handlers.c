@@ -70,7 +70,11 @@ int kl_open_flags(int lx);          // kl_libc.c
 int klh_open(const char *path, int flags, kl_va *va) {
     // Guest passes Linux O_* values, which differ from Darwin's; translate.
     // The mode argument only matters with O_CREAT, but reading it is harmless.
-    return open(path, kl_open_flags(flags), (int)kl_va_gp(va));
+    // The path goes through the /proc rewrite for the same reason fopen does.
+    char kp[1024];
+    int fd = open(kl_guest_path(path, kp, sizeof kp), kl_open_flags(flags), (int)kl_va_gp(va));
+    kl_fs_trace_open(path, flags, fd);
+    return fd;
 }
 int klh_fcntl(int fd, int cmd, kl_va *va) {
     return fcntl(fd, cmd, (void *)(uintptr_t)kl_va_gp(va));

@@ -148,6 +148,8 @@ X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
 X(klb_stat) X(klb_lstat) X(klb_fstat) X(klb_statfs) X(klb_uname) X(klb_sigaction)
 X(klb_opendir) X(klb_readdir) X(klb_closedir)
 X(klb_FD_ISSET_chk) X(klb_FD_SET_chk) X(klb_ctype_mb_cur_max) X(klb_lseek64)
+X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename)
+X(klh_android_log_print)
 X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_syscall) X(klb_swprintf)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
 X(klb_mmap) X(klb_madvise)
@@ -210,6 +212,9 @@ static const kl_entry g_shim[] = {
     E("__errno", klb_errno), E("environ", &environ), E("gettid", klb_gettid),
     E("stat", klb_stat), E("lstat", klb_lstat), E("fstat", klb_fstat), E("statfs", klb_statfs),
     E("uname", klb_uname), E("sigaction", klb_sigaction),
+    E("sysconf", klb_sysconf),
+    E("fopen", klb_fopen), E("access", klb_access),
+    E("mkdir", klb_mkdir), E("unlink", klb_unlink), E("rename", klb_rename),
     E("opendir", klb_opendir), E("readdir", klb_readdir), E("closedir", klb_closedir),
     E("lseek64", klb_lseek64), E("__ctype_get_mb_cur_max", klb_ctype_mb_cur_max),
     E("getpwuid", klb_getpwuid), E("getpwuid_r", klb_getpwuid_r),
@@ -276,7 +281,13 @@ static const kl_entry g_shim[] = {
 
     // logging / misc
     E("__android_log_write", kl_android_log_write),
-    E("__android_log_vprint", kl_vfprintf),
+    // __android_log_vprint(prio, tag, fmt, va_list) — NOT vfprintf's shape. It
+    // was bound to kl_vfprintf once, which put `prio` in the FILE* slot and
+    // segfaulted in flockfile the first time Unity logged through it. The
+    // variadic handler already has exactly this signature, because an AAPCS64
+    // va_list is a 32-byte descriptor and so arrives by reference — which is
+    // what a kl_va * is.
+    E("__android_log_vprint", klh_android_log_print),
     E("android_set_abort_message", kl_set_abort_message),
     E("openlog", kl_openlog), E("closelog", kl_closelog),
     E("__cxa_atexit", kl_cxa_atexit), E("__cxa_finalize", kl_cxa_finalize),
