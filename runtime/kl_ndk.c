@@ -213,6 +213,12 @@ void kl_ndk_set_window(int32_t w, int32_t h, int32_t format) {
 }
 void *kl_ndk_window(void) { return &g_window; }
 
+void kl_ndk_window_size(const void *win, int32_t *w, int32_t *h) {
+    const kl_native_window *nw = win ? (const kl_native_window *)win : &g_window;
+    if (w) *w = nw->width;
+    if (h) *h = nw->height;
+}
+
 static void    kl_ANativeWindow_acquire(kl_native_window *w) { if (w) __atomic_fetch_add(&w->refs, 1, __ATOMIC_RELAXED); }
 static void    kl_ANativeWindow_release(kl_native_window *w) { if (w) __atomic_fetch_sub(&w->refs, 1, __ATOMIC_RELAXED); }
 static int32_t kl_ANativeWindow_getWidth(kl_native_window *w)  { return w ? w->width  : 0; }

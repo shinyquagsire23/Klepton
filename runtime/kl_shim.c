@@ -48,6 +48,7 @@
 #include "klepton.h"
 #include "kl_va.h"
 #include "kl_ndk.h"
+#include "kl_egl.h"
 #include "kl_jni.h"
 
 // ---------- S0.1: bionic stack-guard canary in Darwin TSD slot 5 ----------
@@ -65,6 +66,11 @@ void kl_thread_init(void) {
 // reports actually terminate the process. Without this every diagnostic below
 // turns into a 20-minute mystery hang.
 void kl_fatal_prepare(void) {
+    // Whatever we are dying of, the graphics surface is context — and unlike the
+    // JNI report, plenty of fatal paths (a failed sem_wait, an unresolved
+    // import) have no reason to know EGL exists. Idempotent, so paths that
+    // already printed it are unaffected.
+    kl_egl_report(stderr);
     static const int sigs[] = {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP};
     for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) signal(sigs[i], SIG_DFL);
     fflush(NULL);
@@ -335,5 +341,9 @@ void *kl_shim_lookup(const char *name) {
         if (strcmp(g_shim[i].name, name) == 0) return g_shim[i].fn;
     // Tier 4: the NDK surface (M3) lives in its own table — it is a different
     // API family with its own lifetimes, not more bionic libc.
-    return kl_ndk_lookup(name);
+    void *ndk = kl_ndk_lookup(name);
+    if (ndk) return ndk;
+    // Tier 5: EGL (M5). Same reasoning again, and it is the door to GLES —
+    // eglGetProcAddress hands out the rest of the graphics surface.
+    return kl_egl_lookup(name);
 }

@@ -104,15 +104,21 @@ const char *const *kl_missing_imports(kl_image *img, unsigned *count) {
 
 void kl_unresolved_named(const char *name);   // kl_shim.c
 
-static struct { char *name; void *stub; } *g_stubs;
+static struct { char *name; void *stub; void *handler; } *g_stubs;
 static unsigned g_stub_n, g_stub_cap;
 static uint8_t *g_stub_pool;
 static size_t   g_stub_off;
 
-static void *unresolved_stub(const char *nm) {
-    if (!nm || !*nm) return kl_shim_lookup("__klepton_unresolved");
+// Build a stub that tail-calls `handler` with `nm` in x0. Shared by anything
+// that has to name what the guest reached for: unresolved ELF imports, and the
+// GL entry points handed out by eglGetProcAddress (kl_egl.c), which have the
+// same problem — one anonymous abort tells you nothing about which of two
+// hundred functions the guest actually called.
+void *kl_named_stub(const char *nm, void *handler) {
+    if (!nm || !*nm || !handler) return kl_shim_lookup("__klepton_unresolved");
     for (unsigned i = 0; i < g_stub_n; i++)             // shared across images
-        if (strcmp(g_stubs[i].name, nm) == 0) return g_stubs[i].stub;
+        if (g_stubs[i].handler == handler && strcmp(g_stubs[i].name, nm) == 0)
+            return g_stubs[i].stub;
 
     if (!g_stub_pool) {
         g_stub_pool = mmap(NULL, KL_STUB_POOL, PROT_READ | PROT_WRITE,
@@ -133,8 +139,7 @@ static void *unresolved_stub(const char *nm) {
     code[2] = 0xD61F0200u;   // br  x16
     code[3] = 0xD503201Fu;   // nop
     memcpy(s + 16, &owned, 8);
-    void (*fn)(const char *) = kl_unresolved_named;
-    memcpy(s + 24, &fn, 8);
+    memcpy(s + 24, &handler, 8);
     mprotect(g_stub_pool, KL_STUB_POOL, PROT_READ | PROT_EXEC);
     sys_icache_invalidate(s, KL_STUB_BYTES);
     g_stub_off += KL_STUB_BYTES;
@@ -145,8 +150,13 @@ static void *unresolved_stub(const char *nm) {
     }
     g_stubs[g_stub_n].name = owned;
     g_stubs[g_stub_n].stub = s;
+    g_stubs[g_stub_n].handler = handler;
     g_stub_n++;
     return s;
+}
+
+static void *unresolved_stub(const char *nm) {
+    return kl_named_stub(nm, (void *)kl_unresolved_named);
 }
 
 static char g_err[512];

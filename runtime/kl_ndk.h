@@ -17,5 +17,10 @@ void *kl_ndk_lookup(const char *name);
 // the host sets the true geometry once it has one.
 void kl_ndk_set_window(int32_t width, int32_t height, int32_t format);
 void *kl_ndk_window(void);
+// Geometry of an ANativeWindow the guest handed us. kl_egl.c sizes its surfaces
+// from this rather than keeping its own copy: Unity derives the render target
+// from whatever eglQuerySurface reports, and a second set of numbers that
+// disagreed with the window would be worse than either alone.
+void kl_ndk_window_size(const void *win, int32_t *w, int32_t *h);
 
 #endif

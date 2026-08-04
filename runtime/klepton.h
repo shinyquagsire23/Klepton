@@ -51,6 +51,10 @@ void  kl_thread_init(void);
 void  kl_fatal_prepare(void);
 // Map a guest FILE* (an offset into our fake bionic __sF block) to a host stream.
 FILE *kl_host_file(void *guest);
+// Build a code stub that tail-calls `handler` with `name` in x0, so whatever the
+// guest reached for names itself instead of arriving as one anonymous abort.
+// Used for unresolved ELF imports and for eglGetProcAddress's GL entry points.
+void *kl_named_stub(const char *name, void *handler);
 
 // ---- image registry (backs guest dlopen/dlsym/dladdr) ----
 void      kl_set_library_path(const char *dir);

@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include "klepton.h"
 #include "kl_jni.h"
+#include "kl_egl.h"
 #include "kl_jni_slots.h"
 #include "kl_va.h"
 
@@ -43,6 +44,7 @@ static __attribute__((noreturn)) void klj_unimpl(const char *table, int idx, con
     fprintf(stderr, "\n[jni] UNIMPLEMENTED %s slot %d: %s\n", table, idx, name);
     fprintf(stderr, "[jni] this is an M4 work item — the guest wants it, so implement it.\n");
     kl_jni_report(stderr);
+    kl_egl_report(stderr);
     kl_fatal_prepare(); abort();
 }
 #define KLJ_STUB_ENV(idx, name) \
@@ -210,6 +212,7 @@ static void *klj_GetObjectClass(void *env, void *obj) {
         KLJ_LOG("GetObjectClass on an untagged pointer %p — every jobject the guest "
                 "holds should have come from us", obj);
         kl_jni_report(stderr);
+    kl_egl_report(stderr);
         kl_fatal_prepare(); abort();
     }
     pthread_mutex_lock(&g_lock);
@@ -227,6 +230,7 @@ static __attribute__((noreturn)) void klj_FatalError(void *env, const char *msg)
     (void)env;
     fprintf(stderr, "\n[jni] FatalError from guest: %s\n", msg ? msg : "(null)");
     kl_jni_report(stderr);
+    kl_egl_report(stderr);
     kl_fatal_prepare(); abort();
 }
 
@@ -430,6 +434,7 @@ static klj_val klj_call(void *env, void *self, void *mid, kl_va *va, char want) 
     if (!w || w < g_wanted || w >= g_wanted + KLJ_MAX_WANTED) {
         KLJ_LOG("Call*Method with a jmethodID we never issued (%p)", mid);
         kl_jni_report(stderr);
+    kl_egl_report(stderr);
         kl_fatal_prepare(); abort();
     }
 
@@ -454,6 +459,7 @@ static klj_val klj_call(void *env, void *self, void *mid, kl_va *va, char want) 
     if (!g_permissive) {
         fprintf(stderr, "[jni] this is an M4 work item — add it to g_bindings.\n");
         kl_jni_report(stderr);
+    kl_egl_report(stderr);
         kl_fatal_prepare(); abort();
     }
     return zero;
@@ -654,6 +660,7 @@ static void klj_field_store(void *obj, void *fid, klj_val v) {
     if (!w || w < g_wanted || w >= g_wanted + KLJ_MAX_WANTED) {
         KLJ_LOG("Set*Field with a jfieldID we never issued (%p)", fid);
         kl_jni_report(stderr);
+    kl_egl_report(stderr);
         kl_fatal_prepare(); abort();
     }
     klj_val *slot = klj_find_write(obj, fid);
@@ -680,6 +687,7 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
     if (!w || w < g_wanted || w >= g_wanted + KLJ_MAX_WANTED) {
         KLJ_LOG("Get*Field with a jfieldID we never issued (%p)", fid);
         kl_jni_report(stderr);
+    kl_egl_report(stderr);
         kl_fatal_prepare(); abort();
     }
     const klj_val *written = klj_find_write(obj, fid);
@@ -703,6 +711,7 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
     if (!g_permissive) {
         fprintf(stderr, "[jni] this is an M4 work item — add it to g_fields.\n");
         kl_jni_report(stderr);
+    kl_egl_report(stderr);
         kl_fatal_prepare(); abort();
     }
     return (klj_val){0};

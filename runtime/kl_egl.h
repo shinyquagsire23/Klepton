@@ -1,0 +1,29 @@
+// M5, first cut — the EGL surface libunity.so imports.
+//
+// Exactly the 19 symbols in the unresolved list and nothing else. Notably that
+// list contains no GL entry points at all: `eglGetProcAddress` is in it, so
+// Unity resolves the whole of GLES through that single function at runtime.
+// That is the entire graphics surface behind one door, which is what makes
+// measuring it cheap — see kl_egl.c.
+#ifndef KL_EGL_H
+#define KL_EGL_H
+#include <stdio.h>
+
+// Resolve an EGL import by name. NULL if we do not provide it.
+void *kl_egl_lookup(const char *name);
+
+// Unity reaches GLES through *two* doors, not one. eglGetProcAddress is the
+// documented one; the other is dlopen("libGLESv2.so") followed by dlsym, and
+// when that dlopen failed Unity called straight through the resulting NULL —
+// a jump to address 0 with nothing on the stack to say why. So the loader hands
+// out a synthetic handle for the GL sonames and resolves symbols on it through
+// the same gateway eglGetProcAddress uses.
+void *kl_egl_dlopen(const char *soname);   // NULL if this is not a GL library
+int   kl_egl_is_handle(const void *h);
+void *kl_egl_sym(const char *name);        // the gateway itself
+
+// What the guest asked eglGetProcAddress for, and which of those it went on to
+// call. This is the M5 work list, in the order the guest wanted it.
+void kl_egl_report(FILE *f);
+
+#endif

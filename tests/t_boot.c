@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include "../runtime/klepton.h"
 #include "../runtime/kl_jni.h"
+#include "../runtime/kl_egl.h"
 
 static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
 
@@ -55,6 +56,13 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                       pthread_main_np() ? " (main)" : " (a guest worker thread)");
     if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
 
+    // SIGABRT here is usually the *guest* dying, not us — Unity's audio thread
+    // aborts outright when FMOD cannot open an output device. Those paths never
+    // touch kl_fatal_prepare(), so this is the only place the graphics surface
+    // report can still be emitted. Not async-signal-safe, but nothing after this
+    // point is going to run anyway.
+    if (sig == SIGABRT) kl_egl_report(stderr);
+
     // Die of the original signal, so the parent still reports it as one.
     signal(sig, SIG_DFL);
     raise(sig);
@@ -68,6 +76,7 @@ static void install_fault_reporter(void) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
 }
 
 int main(int argc, char **argv) {
@@ -167,6 +176,7 @@ int main(int argc, char **argv) {
         }
 
         kl_jni_report(stdout);
+        kl_egl_report(stdout);
         fflush(NULL);   // _exit does not flush stdio, and the report is the point
         _exit(0);
     }
