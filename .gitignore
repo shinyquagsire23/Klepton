@@ -1,0 +1,15 @@
+# app assets
+/beatsaber/*
+*.apk
+
+# claude
+/.claude/*
+CLAUDE.md
+
+# binaries
+*.dSYM/*
+*.dylib
+/build/*
+
+# macOS junk
+.DS_Store
