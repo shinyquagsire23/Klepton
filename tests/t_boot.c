@@ -63,19 +63,42 @@ int main(int argc, char **argv) {
     fflush(NULL);
     pid_t pid = fork();
     if (pid == 0) {
-        kl_jni_set_permissive(1);   // collect the whole batch, not just the first
-        // load() takes the *directory* — it appends "/libunity.so" itself. And a
-        // jstring is ours to define: we never hand one to real Java, so a
-        // NUL-terminated modified-UTF8 buffer is a complete representation.
-        int8_t ok = ((nativeloader_load_fn)load)(kl_jni_env(), NULL, (void *)LIBDIR);
+        // Strict: an unimplemented *call* is fatal. Lookups are not, so this
+        // stops only where the surface genuinely ends. Flip to permissive when
+        // pushing into new territory and you want the whole batch in one run.
+        kl_jni_set_permissive(0);
+        // load() takes the *directory* — it appends "/libunity.so" itself.
+        int8_t ok = ((nativeloader_load_fn)load)(kl_jni_env(), NULL,
+                                                 kl_jni_new_string(LIBDIR));
         printf("  NativeLoader.load returned %d\n", ok);
+
+        // UnityPlayer's constructor calls initJni(Context) first (UnityPlayer.smali
+        // line 372). It is `private final native`, so an instance method: the guest
+        // sees (JNIEnv*, jobject thiz, jobject context). Both objects are opaque to
+        // us — what matters is what libunity asks them for.
+        void *initJni = kl_jni_native("com/unity3d/player/UnityPlayer", "initJni", NULL);
+        if (initJni) {
+            printf("\n=== recon: UnityPlayer.initJni(Context) ===\n");
+            fflush(NULL);
+            void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+            // On device the Context is the Activity — AndroidManifest.xml declares
+            // UnityPlayerActivity — and Unity checks that with IsInstanceOf. Handing
+            // it a bare Context would send it down the no-Activity path.
+            void *context = kl_jni_new_object("com/unity3d/player/UnityPlayerActivity");
+            ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, context);
+            printf("  initJni returned\n");
+        }
+
         kl_jni_report(stdout);
         fflush(NULL);   // _exit does not flush stdio, and the report is the point
         _exit(0);
     }
     int st = 0;
     waitpid(pid, &st, 0);
-    if (WIFSIGNALED(st) || WEXITSTATUS(st) != 0)
-        printf("\n  (recon stopped — see the JNI surface report above; expected at this stage)\n");
+    if (WIFSIGNALED(st) || WEXITSTATUS(st) != 0) {
+        printf("\n  (recon stopped — see the JNI surface report above)\n");
+        return fail("guest init did not complete: an unimplemented JNI call was reached");
+    }
+    printf("\n=== M4 (partial): initJni completed with no unimplemented JNI calls ===\n");
     return 0;
 }

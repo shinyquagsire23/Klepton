@@ -54,11 +54,15 @@ il2cpp: build/t_il2cpp
 	./build/t_il2cpp
 
 # Full regression sweep — run this first when picking work back up.
+#
+# Each test writes to a log and is checked BEFORE the log is filtered. Piping a
+# test straight into tail/grep would hand make the filter's exit status instead
+# of the test's, so a failing test would leave the sweep green.
 check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/t_boot
 	@echo "=== variadic ABI ===" && ./build/t_variadic
-	@echo "=== opus roundtrip ===" && ./build/t_opus $(LIBS)/libunityopus.so | tail -3
+	@echo "=== opus roundtrip ===" && ./build/t_opus $(LIBS)/libunityopus.so > build/opus.log && tail -3 build/opus.log
 	@echo "=== all guest libraries ===" && for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
 	  printf '%-24s' $$f; ./build/t_load $(LIBS)/$$f.so 2>/dev/null | grep -E '^  imports:'; done
-	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so beatsaber/assets/bin/Data/Managed | tail -4
-	@echo "=== guest entry (JNI_OnLoad) ===" && ./build/t_boot $(LIBS) 2>/dev/null \
-	  | grep -E 'JNI_OnLoad returned|registered com|load returned|natives registered:|M3 EXIT'
+	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so beatsaber/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log
+	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/t_boot $(LIBS) > build/boot.log 2>/dev/null && \
+	  grep -E 'JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|M3 EXIT|M4 \(partial\)' build/boot.log

@@ -33,14 +33,26 @@ typedef struct {
 void *kl_jni_vm(void);        // JavaVM*  — hand this to JNI_OnLoad
 void *kl_jni_env(void);       // JNIEnv*  — for the calling thread
 
-// Unknown lookups (FindClass of an unseen class, any GetMethodID/GetFieldID)
-// abort by default so a bring-up run stops exactly where the surface ends.
-// Permissive mode logs and returns a synthetic id instead, which collects the
-// whole surface in one pass rather than one abort-fix-rerun cycle per symbol.
+// Calling a Java method with no host implementation aborts by default, so a
+// bring-up run stops exactly where the surface ends. Method/field *lookups*
+// never abort — the guest resolves ids it may never call, so only a call proves
+// something is genuinely needed. Permissive mode downgrades the failed call to a
+// zero return, which collects a whole batch of gaps in one pass instead of one
+// abort-fix-rerun cycle per method.
 void kl_jni_set_permissive(int on);
 
 // Natives the guest registered, by (class, name, signature). NULL if absent.
 void *kl_jni_native(const char *cls, const char *name, const char *sig);
+
+// Construct the jobjects the host passes *into* guest natives. Every jobject the
+// guest holds must come from here — they carry a type tag, which is what lets
+// GetObjectClass answer truthfully instead of guessing.
+void *kl_jni_new_object(const char *class_name);
+void *kl_jni_new_string(const char *utf8);
+
+// Root for Context.getAssets()/AssetManager.open(). Defaults to "beatsaber/assets".
+// With no AAssetManager_* import, this JNI path is how assets reach Unity.
+void kl_jni_set_assets_dir(const char *dir);
 
 // Everything the guest asked us for: classes found, natives registered, and
 // every method/field id it wanted. This is the M4 work list.
