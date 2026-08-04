@@ -39,7 +39,7 @@ static __attribute__((noreturn)) void klj_unimpl(const char *table, int idx, con
     fprintf(stderr, "\n[jni] UNIMPLEMENTED %s slot %d: %s\n", table, idx, name);
     fprintf(stderr, "[jni] this is an M4 work item — the guest wants it, so implement it.\n");
     kl_jni_report(stderr);
-    abort();
+    kl_fatal_prepare(); abort();
 }
 #define KLJ_STUB_ENV(idx, name) \
     static __attribute__((noreturn)) void klj_env_stub_##name(void) { klj_unimpl("JNIEnv", idx, #name); }
@@ -78,7 +78,7 @@ static unsigned   g_nobjects;
 // Objects are never freed. They are startup-lifetime and there is no GC to
 // coordinate with; a free list here would buy nothing and cost use-after-free.
 static klj_object *klj_alloc_object_locked(const char *cls, void *data) {
-    if (g_nobjects == KLJ_MAX_OBJECTS) { KLJ_LOG("object pool exhausted"); abort(); }
+    if (g_nobjects == KLJ_MAX_OBJECTS) { KLJ_LOG("object pool exhausted"); kl_fatal_prepare(); abort(); }
     klj_object *o = &g_objects[g_nobjects++];
     *o = (klj_object){KLJ_OBJ_MAGIC, cls, data};
     return o;
@@ -115,7 +115,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static klj_class *klj_intern_class_locked(const char *name) {
     for (unsigned i = 0; i < g_nclasses; i++)
         if (strcmp(g_classes[i].name, name) == 0) return &g_classes[i];
-    if (g_nclasses == KLJ_MAX_CLASSES) { KLJ_LOG("class table full at %s", name); abort(); }
+    if (g_nclasses == KLJ_MAX_CLASSES) { KLJ_LOG("class table full at %s", name); kl_fatal_prepare(); abort(); }
     klj_class *c = &g_classes[g_nclasses++];
     snprintf(c->name, sizeof c->name, "%s", name);
     // A jclass is a jobject in JNI, so it gets the same representation as one.
@@ -206,7 +206,7 @@ static void *klj_GetObjectClass(void *env, void *obj) {
         KLJ_LOG("GetObjectClass on an untagged pointer %p — every jobject the guest "
                 "holds should have come from us", obj);
         kl_jni_report(stderr);
-        abort();
+        kl_fatal_prepare(); abort();
     }
     pthread_mutex_lock(&g_lock);
     void *c = klj_intern_class_locked(o->cls)->as_object;
@@ -223,7 +223,7 @@ static __attribute__((noreturn)) void klj_FatalError(void *env, const char *msg)
     (void)env;
     fprintf(stderr, "\n[jni] FatalError from guest: %s\n", msg ? msg : "(null)");
     kl_jni_report(stderr);
-    abort();
+    kl_fatal_prepare(); abort();
 }
 
 static kl_jint klj_PushLocalFrame(void *env, kl_jint cap) { (void)env; (void)cap; return 0; }
@@ -308,8 +308,13 @@ static kl_jint klj_RegisterNatives(void *env, void *clazz, const kl_jni_method *
     const char *cls = klj_class_name(clazz);
     pthread_mutex_lock(&g_lock);
     for (kl_jint i = 0; i < n; i++) {
-        if (g_nnatives == KLJ_MAX_NATIVES) { KLJ_LOG("native table full"); abort(); }
-        g_natives[g_nnatives++] = (klj_native){cls, m[i].name, m[i].signature, m[i].fnPtr};
+        if (g_nnatives == KLJ_MAX_NATIVES) { KLJ_LOG("native table full"); kl_fatal_prepare(); abort(); }
+        // Copy, do not alias. The JNINativeMethod array and its strings belong to
+        // the caller and may be temporary — Unity builds JNIBridge's entries
+        // dynamically, and aliasing them left dangling pointers that printed as
+        // "JNIBridge.d?(?" and would have made lookups match the wrong native.
+        g_natives[g_nnatives++] = (klj_native){
+            cls, strdup(m[i].name), strdup(m[i].signature), m[i].fnPtr};
         KLJ_LOG("RegisterNatives  %s.%s%s -> %p", cls, m[i].name, m[i].signature, m[i].fnPtr);
     }
     pthread_mutex_unlock(&g_lock);
@@ -333,7 +338,7 @@ static void *klj_want(void *clazz, const char *name, const char *sig, char kind)
             pthread_mutex_unlock(&g_lock);
             return &g_wanted[i];
         }
-    if (g_nwanted == KLJ_MAX_WANTED) { KLJ_LOG("id table full"); abort(); }
+    if (g_nwanted == KLJ_MAX_WANTED) { KLJ_LOG("id table full"); kl_fatal_prepare(); abort(); }
     klj_wanted *w = &g_wanted[g_nwanted++];
     w->cls = cls; w->kind = kind;
     snprintf(w->name, sizeof w->name, "%s", name);
@@ -421,7 +426,7 @@ static klj_val klj_call(void *env, void *self, void *mid, kl_va *va, char want) 
     if (!w || w < g_wanted || w >= g_wanted + KLJ_MAX_WANTED) {
         KLJ_LOG("Call*Method with a jmethodID we never issued (%p)", mid);
         kl_jni_report(stderr);
-        abort();
+        kl_fatal_prepare(); abort();
     }
 
     char have = klj_return_kind(w->sig);
@@ -436,7 +441,7 @@ static klj_val klj_call(void *env, void *self, void *mid, kl_va *va, char want) 
         int argc = klj_decode_args(w->sig, va, argv);
         if (argc < 0) {
             KLJ_LOG("cannot decode signature %s for %s.%s", w->sig, w->cls, w->name);
-            abort();
+            kl_fatal_prepare(); abort();
         }
         return b->fn(env, self, argv, argc);
     }
@@ -445,7 +450,7 @@ static klj_val klj_call(void *env, void *self, void *mid, kl_va *va, char want) 
     if (!g_permissive) {
         fprintf(stderr, "[jni] this is an M4 work item — add it to g_bindings.\n");
         kl_jni_report(stderr);
-        abort();
+        kl_fatal_prepare(); abort();
     }
     return zero;
 }
@@ -481,6 +486,62 @@ static void klj_CallStaticVoidMethodV(void *env, void *cls, void *mid, kl_va *va
 static void *klj_NewObjectV(void *env, void *clazz, void *mid, kl_va *va) {
     return klj_call(env, clazz, mid, va, '?').l;
 }
+
+// -------------------------------------------------------- Java field dispatch
+// Fields are simpler than methods: everything the guest reads so far is a
+// compile-time constant off a framework class, so the binding is a value rather
+// than a function. `cached` keeps a constant's jstring identity stable across
+// reads, which is what a real static final String would do.
+typedef struct {
+    const char *cls, *name, *sig;
+    const char *sval;     // for object fields — currently always String constants
+    int64_t     ival;     // for primitive fields
+    void       *cached;
+} klj_field;
+static klj_field g_fields[];
+
+static klj_val klj_field_value(void *fid, char want) {
+    klj_wanted *w = fid;
+    if (!w || w < g_wanted || w >= g_wanted + KLJ_MAX_WANTED) {
+        KLJ_LOG("Get*Field with a jfieldID we never issued (%p)", fid);
+        kl_jni_report(stderr);
+        kl_fatal_prepare(); abort();
+    }
+    for (klj_field *f = g_fields; f->cls; f++) {
+        if (strcmp(f->cls, w->cls) || strcmp(f->name, w->name) || strcmp(f->sig, w->sig))
+            continue;
+        if (want == 'L') {
+            if (!f->cached) f->cached = kl_jni_new_string(f->sval);
+            return (klj_val){.l = f->cached};
+        }
+        return (klj_val){.j = (uint64_t)f->ival};
+    }
+    KLJ_LOG("no host value for field %s.%s %s", w->cls, w->name, w->sig);
+    if (!g_permissive) {
+        fprintf(stderr, "[jni] this is an M4 work item — add it to g_fields.\n");
+        kl_jni_report(stderr);
+        kl_fatal_prepare(); abort();
+    }
+    return (klj_val){0};
+}
+
+// Static and instance forms are the same lookup: our field values are constants,
+// so there is no per-instance state to distinguish.
+static void   *klj_GetStaticObjectField(void *e, void *c, void *f) { (void)e; (void)c; return klj_field_value(f, 'L').l; }
+static void   *klj_GetObjectField(void *e, void *o, void *f)       { (void)e; (void)o; return klj_field_value(f, 'L').l; }
+static kl_jint klj_GetStaticIntField(void *e, void *c, void *f)    { (void)e; (void)c; return (kl_jint)klj_field_value(f, 'I').j; }
+static kl_jint klj_GetIntField(void *e, void *o, void *f)          { (void)e; (void)o; return (kl_jint)klj_field_value(f, 'I').j; }
+static uint8_t klj_GetStaticBooleanField(void *e, void *c, void *f){ (void)e; (void)c; return (uint8_t)klj_field_value(f, 'Z').j; }
+static uint8_t klj_GetBooleanField(void *e, void *o, void *f)      { (void)e; (void)o; return (uint8_t)klj_field_value(f, 'Z').j; }
+
+// Documented Android platform constants — fixed values, not choices.
+static klj_field g_fields[] = {
+    {"android/content/Intent", "ACTION_MAIN", "Ljava/lang/String;", "android.intent.action.MAIN", 0, NULL},
+    {"android/content/pm/PackageManager", "GET_ACTIVITIES",     "I", NULL, 0x0001, NULL},
+    {"android/content/pm/PackageManager", "GET_INTENT_FILTERS", "I", NULL, 0x0020, NULL},
+    {"android/content/pm/PackageManager", "GET_META_DATA",      "I", NULL, 0x0080, NULL},
+    {NULL, NULL, NULL, NULL, 0, NULL},
+};
 
 // ------------------------------------------------------------ Java class impls
 // Host implementations of the Java methods the guest actually calls. This stays
@@ -601,6 +662,92 @@ static klj_val klj_Intent_getExtras(void *env, void *self, const klj_val *a, int
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.l = NULL};
 }
+// new Intent(action). The action string is the only part anything reads so far.
+static klj_val klj_Intent_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *action = n > 0 ? klj_str(a[0].l) : NULL;
+    void       *obj    = kl_jni_new_object("android/content/Intent");
+    klj_as_object(obj)->data = action ? strdup(action) : NULL;
+    KLJ_LOG("new Intent(\"%s\")", action ? action : "(null)");
+    return (klj_val){.l = obj};
+}
+// Intent's builder methods all return `this` — that is the Java contract, not a
+// convenience. Nothing reads the categories back, so they are logged, not stored.
+static klj_val klj_Intent_addCategory(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *c = n > 0 ? klj_str(a[0].l) : NULL;
+    KLJ_LOG("Intent.addCategory(\"%s\")", c ? c : "(null)");
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_setPackage(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *p = n > 0 ? klj_str(a[0].l) : NULL;
+    KLJ_LOG("Intent.setPackage(\"%s\")", p ? p : "(null)");
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_addFlags(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    KLJ_LOG("Intent.addFlags(0x%llx)", n > 0 ? (unsigned long long)a[0].j : 0ULL);
+    return (klj_val){.l = self};
+}
+// A minimal java/util/List. Fixed contents — nothing mutates one of ours.
+typedef struct { void **items; int count; } klj_list;
+
+static void *klj_new_list(void **items, int count) {
+    klj_list *l = calloc(1, sizeof *l);
+    l->items = items;
+    l->count = count;
+    void *obj = kl_jni_new_object("java/util/List");
+    klj_as_object(obj)->data = l;
+    return obj;
+}
+static klj_val klj_List_size(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    klj_list   *l = o ? o->data : NULL;
+    return (klj_val){.j = l ? (uint64_t)l->count : 0};
+}
+static klj_val klj_List_isEmpty(void *env, void *self, const klj_val *a, int n) {
+    return (klj_val){.j = klj_List_size(env, self, a, n).j == 0};
+}
+static klj_val klj_List_get(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_object *o = klj_as_object(self);
+    klj_list   *l = o ? o->data : NULL;
+    int         i = n > 0 ? (int)a[0].j : -1;
+    if (!l || i < 0 || i >= l->count) return (klj_val){.l = NULL};
+    return (klj_val){.l = l->items[i]};
+}
+
+// Unity asks whether its *own* activity is registered under the VR category —
+// ACTION_MAIN + com.oculus.intent.category.VR, setPackage(our package). Our
+// AndroidManifest.xml does declare exactly that on UnityPlayerActivity, so the
+// truthful answer is one match. An empty list would read as "this is not a VR
+// app" and is the kind of convenient lie that disables the path under test.
+static klj_val klj_PM_queryIntentActivities(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void  *ri;
+    static void  *items[1];
+    static void  *list;
+    if (!list) {
+        ri       = kl_jni_new_object("android/content/pm/ResolveInfo");
+        items[0] = ri;
+        list     = klj_new_list(items, 1);
+    }
+    return (klj_val){.l = list};
+}
+
+static klj_val klj_Context_getPackageManager(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *pm;
+    return klj_singleton("android/content/pm/PackageManager", &pm);
+}
+// The APK's real package name, from AndroidManifest.xml. Unity uses it to look
+// itself up through the PackageManager and to derive storage paths.
+static klj_val klj_Context_getPackageName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("com.beatgames.beatsaber")};
+}
 static klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *am;
@@ -708,8 +855,20 @@ static const klj_binding g_bindings[] = {
 
     {"android/app/Activity",   "getIntent",  "()Landroid/content/Intent;", klj_Activity_getIntent},
     {"android/content/Intent", "getExtras",  "()Landroid/os/Bundle;",      klj_Intent_getExtras},
+    {"android/content/Intent", "<init>",     "(Ljava/lang/String;)V",      klj_Intent_init},
+    {"android/content/Intent", "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_addCategory},
+    {"android/content/Intent", "setPackage",  "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_setPackage},
+    {"android/content/Intent", "addFlags",    "(I)Landroid/content/Intent;",                 klj_Intent_addFlags},
     {"android/content/Context", "getAssets", "()Landroid/content/res/AssetManager;", klj_Context_getAssets},
+    {"android/content/Context", "getPackageManager", "()Landroid/content/pm/PackageManager;", klj_Context_getPackageManager},
+    {"android/content/Context", "getPackageName", "()Ljava/lang/String;", klj_Context_getPackageName},
     {"android/content/res/AssetManager", "open", "(Ljava/lang/String;)Ljava/io/InputStream;", klj_AssetManager_open},
+    {"android/content/pm/PackageManager", "queryIntentActivities",
+     "(Landroid/content/Intent;I)Ljava/util/List;", klj_PM_queryIntentActivities},
+    {"java/util/List", "size",    "()I",                 klj_List_size},
+    {"java/util/List", "isEmpty", "()Z",                 klj_List_isEmpty},
+    {"java/util/List", "get",  "(I)Ljava/lang/Object;",  klj_List_get},
+
     {"java/util/Scanner", "<init>",        "(Ljava/io/InputStream;Ljava/lang/String;)V", klj_Scanner_init},
     {"java/util/Scanner", "useDelimiter",  "(Ljava/lang/String;)Ljava/util/Scanner;",    klj_Scanner_useDelimiter},
     {"java/util/Scanner", "next",          "()Ljava/lang/String;",                       klj_Scanner_next},
@@ -817,6 +976,12 @@ static void klj_build_tables(void) {
     ENVCALL(Double); ENVCALL(Void);
 #undef ENVCALL
     ENV(NewObjectV, klj_NewObjectV);
+    ENV(GetStaticObjectField,  klj_GetStaticObjectField);
+    ENV(GetObjectField,        klj_GetObjectField);
+    ENV(GetStaticIntField,     klj_GetStaticIntField);
+    ENV(GetIntField,           klj_GetIntField);
+    ENV(GetStaticBooleanField, klj_GetStaticBooleanField);
+    ENV(GetBooleanField,       klj_GetBooleanField);
 #undef ENV
 
 #define VM(name, fn) g_vm_vtable[KLJ_VM_##name] = (void *)(fn)

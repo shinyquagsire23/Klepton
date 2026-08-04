@@ -89,6 +89,32 @@ int main(int argc, char **argv) {
             printf("  initJni returned\n");
         }
 
+        // Lifecycle, in the order UnityPlayerActivity drives it: attach a
+        // surface, resume, then pump one frame. This is where M4 runs into M5 —
+        // nativeRecreateGfxState is what reaches for EGL.
+        if (getenv("KL_LIFECYCLE")) {
+            void *surface = kl_jni_new_object("android/view/Surface");
+            void *thiz2   = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+            struct { const char *name; int kind; } seq[] = {
+                {"nativeRecreateGfxState", 2}, {"nativeResume", 0}, {"nativeRender", 1},
+            };
+            for (unsigned i = 0; i < sizeof seq / sizeof seq[0]; i++) {
+                void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", seq[i].name, NULL);
+                if (!fn) { printf("  %s: not registered\n", seq[i].name); continue; }
+                printf("\n=== recon: UnityPlayer.%s ===\n", seq[i].name);
+                fflush(NULL);
+                alarm(20);   // the render loop may block; do not hang the sweep
+                if (seq[i].kind == 2)
+                    ((void (*)(void *, void *, int, void *))fn)(kl_jni_env(), thiz2, 0, surface);
+                else if (seq[i].kind == 1)
+                    printf("  -> %d\n", ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2));
+                else
+                    ((void (*)(void *, void *))fn)(kl_jni_env(), thiz2);
+                alarm(0);
+                printf("  %s returned\n", seq[i].name);
+            }
+        }
+
         kl_jni_report(stdout);
         fflush(NULL);   // _exit does not flush stdio, and the report is the point
         _exit(0);

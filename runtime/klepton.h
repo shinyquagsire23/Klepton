@@ -42,6 +42,10 @@ void *kl_shim_lookup(const char *name);
 // Install the bionic stack-guard canary into Darwin TSD slot 5 for this thread.
 // Must be called on every thread that will execute guest code. (S0.1)
 void  kl_thread_init(void);
+// Restore default fatal-signal disposition and flush stdio. Call before abort()
+// in any diagnostic path: the guest installs handlers that expect a Linux
+// ucontext_t, and they swallow our abort and hang instead of dying.
+void  kl_fatal_prepare(void);
 // Map a guest FILE* (an offset into our fake bionic __sF block) to a host stream.
 FILE *kl_host_file(void *guest);
 

@@ -57,8 +57,22 @@ void kl_thread_init(void) {
     ((uint64_t *)tp)[TLS_SLOT_STACK_GUARD] = g_canary;
 }
 
+// The guest installs its own fatal-signal handlers — IL2CPP does this for crash
+// reporting — and they expect a Linux `ucontext_t`. Ours hands them a Darwin one,
+// so a diagnostic abort() is caught by guest code that then wanders off and hangs
+// instead of dying. Restoring the default disposition first means our own failure
+// reports actually terminate the process. Without this every diagnostic below
+// turns into a 20-minute mystery hang.
+void kl_fatal_prepare(void) {
+    static const int sigs[] = {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP};
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) signal(sigs[i], SIG_DFL);
+    fflush(NULL);
+}
+
 __attribute__((noreturn)) static void die(const char *what) {
-    fprintf(stderr, "[klepton] fatal: %s\n", what); abort();
+    fprintf(stderr, "[klepton] fatal: %s\n", what);
+    kl_fatal_prepare();
+    abort();
 }
 __attribute__((noreturn)) static void kl_unresolved(void) { die("called an unresolved import"); }
 __attribute__((noreturn)) static void kl_stack_chk_fail(void) { die("stack smashing detected"); }
