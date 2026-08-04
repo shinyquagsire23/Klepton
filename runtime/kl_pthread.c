@@ -196,9 +196,46 @@ int   klb_pthread_detach(pthread_t t)          { return pthread_detach(t); }
 void  klb_pthread_exit(void *r)                { pthread_exit(r); }
 pthread_t klb_pthread_self(void)               { return pthread_self(); }
 int   klb_pthread_equal(pthread_t a, pthread_t b) { return pthread_equal(a, b); }
-int   klb_pthread_kill(pthread_t t, int sig)   { return pthread_kill(t, sig); }
-int   klb_pthread_sigmask(int how, const sigset_t *s, sigset_t *o) {
-    return pthread_sigmask(how, s, o);
+int   klb_pthread_kill(pthread_t t, int sig)   {
+    int r = pthread_kill(t, sig);
+    if (getenv("KL_TRACE_SIG"))
+        fprintf(stderr, "  [sig] pthread_kill(%p, %d) -> %d%s\n", (void *)t, sig, r,
+                r ? " FAILED" : "");
+    return r;
+}
+// Same names, different numbers, and the consequence is invisible: Linux
+// numbers SIG_BLOCK/UNBLOCK/SETMASK 0/1/2, Darwin 1/2/3. Forwarded raw, a guest
+// asking to UNBLOCK a signal (1) is asking Darwin to BLOCK it, and the only
+// symptom is a signal that pthread_kill accepts and the handler never sees.
+// That is how Boehm's GC suspend stalled: handler installed, 163 signals sent,
+// zero acknowledgements, and the collector spinning on sem_getvalue forever.
+//
+// bionic's sigset_t is 8 bytes on LP64 against Darwin's 4, but both number bit
+// (sig-1), so reading the low word is correct for signals 1..32 — which is all
+// Darwin has.
+#define KL_LINUX_SIG_BLOCK   0
+#define KL_LINUX_SIG_UNBLOCK 1
+#define KL_LINUX_SIG_SETMASK 2
+
+static int kl_sigmask_how(int linux_how) {
+    switch (linux_how) {
+    case KL_LINUX_SIG_BLOCK:   return SIG_BLOCK;
+    case KL_LINUX_SIG_UNBLOCK: return SIG_UNBLOCK;
+    case KL_LINUX_SIG_SETMASK: return SIG_SETMASK;
+    default:                   return linux_how;
+    }
+}
+
+int klb_pthread_sigmask(int how, const uint64_t *s, uint64_t *o) {
+    sigset_t din, dout;
+    if (s) din = (sigset_t)(*s & 0xFFFFFFFFu);
+    int r = pthread_sigmask(kl_sigmask_how(how), s ? &din : NULL, o ? &dout : NULL);
+    if (!r && o) *o = dout;
+    return r;
+}
+
+int klb_sigprocmask(int how, const uint64_t *s, uint64_t *o) {
+    return klb_pthread_sigmask(how, s, o);
 }
 // bionic takes the thread; Darwin's only names the *current* thread.
 int klb_pthread_setname_np(pthread_t t, const char *nm) {
@@ -212,7 +249,19 @@ int klb_pthread_atfork(void (*p)(void), void (*c)(void), void (*ch)(void)) {
 // bionic sem_t is 4 bytes -- too small for a pointer, so it holds a table index.
 // Darwin's POSIX sem_init is deprecated/unimplemented, so back them with GCD.
 #define KL_MAX_SEMS 1024
-static dispatch_semaphore_t g_sems[KL_MAX_SEMS];
+
+// The count is tracked alongside the dispatch semaphore rather than left to GCD.
+// It has to be: sem_getvalue used to return a constant 0 because "GCD gives no
+// way to read the count", and IL2CPP polls it. The loop at libil2cpp+0x12d57d4
+// is a barrier — usleep(3000), sem_getvalue, compare against a target of
+// initial+N, repeat — so a value that never changes is an infinite spin with the
+// main thread apparently just asleep. Trap 6d again: a silent zero read as an
+// answer rather than as "unknown".
+typedef struct {
+    dispatch_semaphore_t d;
+    _Atomic int          count;
+} kl_sem;
+static kl_sem g_sems[KL_MAX_SEMS];
 static _Atomic int g_nsems = 1;                 // index 0 means "uninitialised"
 
 int klb_sem_init(int *s, int pshared, unsigned value) {
@@ -220,51 +269,74 @@ int klb_sem_init(int *s, int pshared, unsigned value) {
     int i = atomic_fetch_add(&g_nsems, 1);
     if (i >= KL_MAX_SEMS) { errno = ENOSPC; return -1; }
     // Fill the slot BEFORE publishing the index. The old order bumped g_nsems
-    // first, which made sem_of's range check pass while g_sems[i] was still
-    // NULL — a waiter on another thread then got EINVAL from a semaphore that
-    // had, as far as its owner was concerned, been initialised.
-    g_sems[i] = dispatch_semaphore_create(value);
+    // first, which made the range check pass while the slot was still empty — a
+    // waiter on another thread then got EINVAL from a semaphore that had, as far
+    // as its owner was concerned, been initialised.
+    atomic_store(&g_sems[i].count, (int)value);
+    g_sems[i].d = dispatch_semaphore_create(value);
     atomic_thread_fence(memory_order_release);
     *s = i;
     return 0;
 }
-static dispatch_semaphore_t sem_of(int *s) {
+
+static kl_sem *sem_of(int *s) {
     int i = *s;
-    if (i > 0 && i < KL_MAX_SEMS) {
-        dispatch_semaphore_t d = g_sems[i];
-        if (d) return d;
-    }
+    if (i > 0 && i < KL_MAX_SEMS && g_sems[i].d) return &g_sems[i];
     static _Atomic int logged;
     if (atomic_fetch_add(&logged, 1) < 8)
-        fprintf(stderr, "  [klepton] sem: no semaphore for slot %d (*sem=%d) — "
-                        "the guest is waiting on one it never initialised here\n", i, *s);
+        fprintf(stderr, "  [klepton] sem: no semaphore for slot %d — the guest is "
+                        "waiting on one it never initialised here\n", i);
     return NULL;
 }
+
 int klb_sem_destroy(int *s)  { *s = 0; return 0; }
-int klb_sem_post(int *s)     { dispatch_semaphore_t d = sem_of(s);
-                               if (!d) { errno = EINVAL; return -1; }
-                               dispatch_semaphore_signal(d); return 0; }
-int klb_sem_wait(int *s)     { dispatch_semaphore_t d = sem_of(s);
-                               if (!d) { errno = EINVAL; return -1; }
-                               dispatch_semaphore_wait(d, DISPATCH_TIME_FOREVER); return 0; }
-int klb_sem_timedwait(int *s, const struct timespec *ts) {
-    dispatch_semaphore_t d = sem_of(s);
-    if (!d) { errno = EINVAL; return -1; }
-    static _Atomic int logged;
-    if (ts && atomic_fetch_add(&logged, 1) < 4) {
-        struct timespec now;
-        clock_gettime(CLOCK_REALTIME, &now);
-        fprintf(stderr, "  [klepton] sem_timedwait deadline %lld.%09ld, realtime now "
-                        "%lld.%09ld (delta %lld s)\n",
-                (long long)ts->tv_sec, ts->tv_nsec,
-                (long long)now.tv_sec, now.tv_nsec,
-                (long long)(ts->tv_sec - now.tv_sec));
+
+int klb_sem_post(int *s) {
+    kl_sem *k = sem_of(s);
+    if (!k) { errno = EINVAL; return -1; }
+    if (getenv("KL_TRACE_SIG")) {
+        static _Atomic int n;
+        if (atomic_fetch_add(&n, 1) < 12)
+            fprintf(stderr, "  [sig] sem_post slot %d (count now %d)\n",
+                    *s, atomic_load(&k->count) + 1);
     }
-    dispatch_time_t when = dispatch_walltime(ts, 0);
-    if (dispatch_semaphore_wait(d, when) != 0) { errno = ETIMEDOUT; return -1; }
+    atomic_fetch_add(&k->count, 1);
+    dispatch_semaphore_signal(k->d);
     return 0;
 }
+
+int klb_sem_wait(int *s) {
+    kl_sem *k = sem_of(s);
+    if (!k) { errno = EINVAL; return -1; }
+    dispatch_semaphore_wait(k->d, DISPATCH_TIME_FOREVER);
+    atomic_fetch_sub(&k->count, 1);
+    return 0;
+}
+
+int klb_sem_trywait(int *s) {
+    kl_sem *k = sem_of(s);
+    if (!k) { errno = EINVAL; return -1; }
+    if (dispatch_semaphore_wait(k->d, DISPATCH_TIME_NOW) != 0) { errno = EAGAIN; return -1; }
+    atomic_fetch_sub(&k->count, 1);
+    return 0;
+}
+
+int klb_sem_timedwait(int *s, const struct timespec *ts) {
+    kl_sem *k = sem_of(s);
+    if (!k) { errno = EINVAL; return -1; }
+    dispatch_time_t when = dispatch_walltime(ts, 0);
+    if (dispatch_semaphore_wait(k->d, when) != 0) { errno = ETIMEDOUT; return -1; }
+    atomic_fetch_sub(&k->count, 1);
+    return 0;
+}
+
+// POSIX lets an implementation report 0 rather than a negative count when there
+// are waiters, which is what Linux does — so clamp rather than exposing our
+// internal debt.
 int klb_sem_getvalue(int *s, int *out) {
-    (void)s; *out = 0;                 // GCD gives no way to read the count
+    kl_sem *k = sem_of(s);
+    if (!k) { errno = EINVAL; return -1; }
+    int v = atomic_load(&k->count);
+    *out = v > 0 ? v : 0;
     return 0;
 }

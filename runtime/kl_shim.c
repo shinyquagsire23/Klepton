@@ -210,6 +210,7 @@ X(klb_pthread_key_create) X(klb_pthread_key_delete) X(klb_pthread_getspecific)
 X(klb_pthread_setspecific) X(klb_pthread_once)
 X(klb_pthread_create) X(klb_pthread_join) X(klb_pthread_detach) X(klb_pthread_exit)
 X(klb_pthread_self) X(klb_pthread_equal) X(klb_pthread_kill) X(klb_pthread_sigmask)
+X(klb_sigprocmask)
 X(klb_pthread_setname_np) X(klb_pthread_atfork)
 X(klb_sem_init) X(klb_sem_destroy) X(klb_sem_post) X(klb_sem_wait)
 X(klb_sem_timedwait) X(klb_sem_getvalue)
@@ -312,6 +313,7 @@ static const kl_entry g_shim[] = {
     E("pthread_detach", klb_pthread_detach), E("pthread_exit", klb_pthread_exit),
     E("pthread_self", klb_pthread_self), E("pthread_equal", klb_pthread_equal),
     E("pthread_kill", klb_pthread_kill), E("pthread_sigmask", klb_pthread_sigmask),
+    E("sigprocmask", klb_sigprocmask),
     E("pthread_setname_np", klb_pthread_setname_np), E("pthread_atfork", klb_pthread_atfork),
     E("sem_init", klb_sem_init), E("sem_destroy", klb_sem_destroy),
     E("sem_post", klb_sem_post), E("sem_wait", klb_sem_wait),

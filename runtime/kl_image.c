@@ -349,6 +349,9 @@ kl_image *kl_load(const char *path) {
                     (unsigned long)s, (unsigned long)(e - s), prot, strerror(errno));
     }
 
+    if (getenv("KL_TRACE_IMAGES"))
+        fprintf(stderr, "  [klepton] image %s base %p span %#zx\n",
+                path, (void *)img->base, img->span);
     munmap(file, (size_t)sb.st_size);
     return img;
 }

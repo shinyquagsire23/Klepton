@@ -444,10 +444,49 @@ void *klb_readdir(void *d) {
 }
 
 // ---------- sigaction ----------
-// bionic/LP64: { handler; unsigned long mask; int flags; void (*restorer)(void); } = 32B
-// Darwin     : { handler; uint32 mask; int flags; }                                = 16B
-typedef struct { void *handler; uint64_t mask; int32_t flags; int32_t _pad;
-                 void *restorer; } bionic_sigaction;
+// bionic/LP64 puts sa_flags FIRST, ahead of the handler union. That is specific
+// to __LP64__; the 32-bit layout does lead with the handler, which is what this
+// struct used to assume. The cost of getting it backwards was invisible for a
+// long time: `handler` read the flags word instead, so every guest handler was
+// installed at address 0x18000004 — which is not an address, it is Linux's
+// SA_RESTART|SA_ONSTACK|SA_SIGINFO. Boehm's GC suspend handler among them.
+//
+//   bionic/LP64: { int flags; <pad>; handler; unsigned long mask; restorer; } 32B
+//   Darwin     : { handler; sigset_t mask; int flags; }                       16B
+typedef struct { int32_t flags; int32_t _pad; void *handler;
+                 uint64_t mask; void *restorer; } bionic_sigaction;
+
+// Same names, different numbers — trap 4 again, and these are far apart.
+#define KL_SA_NOCLDSTOP 0x00000001u
+#define KL_SA_NOCLDWAIT 0x00000002u
+#define KL_SA_SIGINFO   0x00000004u
+#define KL_SA_ONSTACK   0x08000000u
+#define KL_SA_RESTART   0x10000000u
+#define KL_SA_NODEFER   0x40000000u
+#define KL_SA_RESETHAND 0x80000000u
+
+static int kl_sa_flags(uint32_t linux_flags) {
+    int f = 0;
+    if (linux_flags & KL_SA_NOCLDSTOP) f |= SA_NOCLDSTOP;
+    if (linux_flags & KL_SA_NOCLDWAIT) f |= SA_NOCLDWAIT;
+    if (linux_flags & KL_SA_SIGINFO)   f |= SA_SIGINFO;
+    if (linux_flags & KL_SA_ONSTACK)   f |= SA_ONSTACK;
+    if (linux_flags & KL_SA_RESTART)   f |= SA_RESTART;
+    if (linux_flags & KL_SA_NODEFER)   f |= SA_NODEFER;
+    if (linux_flags & KL_SA_RESETHAND) f |= SA_RESETHAND;
+    return f;
+}
+static uint32_t kl_sa_flags_back(int darwin_flags) {
+    uint32_t f = 0;
+    if (darwin_flags & SA_NOCLDSTOP) f |= KL_SA_NOCLDSTOP;
+    if (darwin_flags & SA_NOCLDWAIT) f |= KL_SA_NOCLDWAIT;
+    if (darwin_flags & SA_SIGINFO)   f |= KL_SA_SIGINFO;
+    if (darwin_flags & SA_ONSTACK)   f |= KL_SA_ONSTACK;
+    if (darwin_flags & SA_RESTART)   f |= KL_SA_RESTART;
+    if (darwin_flags & SA_NODEFER)   f |= KL_SA_NODEFER;
+    if (darwin_flags & SA_RESETHAND) f |= KL_SA_RESETHAND;
+    return f;
+}
 
 // A guest handler for a *fatal* signal cannot work here, and that is structural
 // rather than a bug we might fix: it expects a Linux ucontext_t, and Darwin's
@@ -469,6 +508,9 @@ static int klb_fatal_signal(int sig) {
 
 int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
     struct sigaction d, o;
+    if (getenv("KL_TRACE_SIG"))
+        fprintf(stderr, "  [sig] sigaction(%d, handler=%p)\n", sig,
+                in ? in->handler : NULL);
     static int allow_guest = -1;
     if (allow_guest < 0) allow_guest = getenv("KL_GUEST_SIGNALS") != NULL;
     if (in && in->handler && in->handler != (void *)SIG_DFL &&
@@ -481,14 +523,14 @@ int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
     if (in) {
         memset(&d, 0, sizeof d);
         d.sa_handler = (void (*)(int))in->handler;
-        d.sa_flags   = in->flags;
+        d.sa_flags   = kl_sa_flags((uint32_t)in->flags);
         d.sa_mask    = (sigset_t)(in->mask & 0xFFFFFFFFu);
     }
     int r = sigaction(sig, in ? &d : NULL, old ? &o : NULL);
     if (!r && old) {
         memset(old, 0, sizeof *old);
         old->handler = (void *)o.sa_handler;
-        old->flags   = o.sa_flags;
+        old->flags   = (int32_t)kl_sa_flags_back(o.sa_flags);
         old->mask    = o.sa_mask;
     }
     return r;
