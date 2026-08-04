@@ -10,6 +10,7 @@
 // Phase 1 is the assertion. Phase 2 is reconnaissance: it drives the registered
 // NativeLoader.load() to find out what the *next* milestone has to answer for,
 // and runs in a forked child because an unimplemented JNI slot aborts by design.
+#include <dlfcn.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -49,6 +50,14 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
 
     size_t      off = 0;
     const char *img = kl_addr_image(pc, &off);
+    // Not a guest image, so it is ours or the system's — dladdr names it, which
+    // turns "<host>+0x0" into something actionable. Only safe-ish because we are
+    // already dying; it is not async-signal-safe.
+    Dl_info di;
+    if (!img && pc && dladdr(pc, &di) && di.dli_sname) {
+        img = di.dli_sname;
+        off = (size_t)((const char *)pc - (const char *)di.dli_saddr);
+    }
 
     char buf[256];
     int  n = snprintf(buf, sizeof buf,
@@ -57,6 +66,30 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                       (unsigned long long)tid,
                       pthread_main_np() ? " (main)" : " (a guest worker thread)");
     if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+
+    // Walk the frame chain. The faulting pc is usually in libsystem — memmove
+    // with a null pointer says nothing about who passed it — so what matters is
+    // the first guest frame above it. AAPCS64 keeps x29 as the frame pointer and
+    // stores {fp, lr} at [fp], which both the guest and our own code honour.
+    void **fp = uc ? (void **)uc->uc_mcontext->__ss.__fp : NULL;
+    for (int depth = 0; fp && depth < 12; depth++) {
+        void *ret = fp[1];
+        if (!ret) break;
+        size_t roff = 0;
+        const char *rimg = kl_addr_image(ret, &roff);
+        Dl_info rdi;
+        if (rimg)
+            n = snprintf(buf, sizeof buf, "    #%-2d %s+0x%zx\n", depth, rimg, roff);
+        else if (dladdr(ret, &rdi) && rdi.dli_sname)
+            n = snprintf(buf, sizeof buf, "    #%-2d %s+0x%tx\n", depth, rdi.dli_sname,
+                         (const char *)ret - (const char *)rdi.dli_saddr);
+        else
+            n = snprintf(buf, sizeof buf, "    #%-2d %p\n", depth, ret);
+        if (n > 0) { ssize_t w2 = write(2, buf, (size_t)n); (void)w2; }
+        void **next = (void **)fp[0];
+        if (next <= fp) break;                  // stacks grow down; anything else is junk
+        fp = next;
+    }
 
     // SIGABRT here is usually the *guest* dying, not us — Unity's audio thread
     // aborts outright when FMOD cannot open an output device. Those paths never
@@ -215,6 +248,8 @@ int main(int argc, char **argv) {
                 }
                 alarm(0);
                 printf("  pumped %u frames\n", i);
+                const char *sd = getenv("KL_DUMP_SHADERS");
+                if (sd) kl_egl_dump_shaders(sd);
             }
         }
 

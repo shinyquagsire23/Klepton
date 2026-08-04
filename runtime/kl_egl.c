@@ -221,6 +221,17 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
     {0x86A2 /* NUM_COMPRESSED_TEXTURE_FORMATS */, 0},
     {0x9122 /* MAX_VERTEX_OUTPUT_COMPONENTS*/, 64},
     {0x9125 /* MAX_FRAGMENT_INPUT_COMPONENTS */, 60},
+    // The default framebuffer's actual depths. These must agree with the EGL
+    // config eglGetConfigAttrib reports — Unity asks both and compares.
+    {0x0D50 /* SUBPIXEL_BITS */, 4},
+    {0x0D52 /* RED_BITS     */, 8},
+    {0x0D53 /* GREEN_BITS   */, 8},
+    {0x0D54 /* BLUE_BITS    */, 8},
+    {0x0D55 /* ALPHA_BITS   */, 8},
+    {0x0D56 /* DEPTH_BITS   */, 24},
+    {0x0D57 /* STENCIL_BITS */, 8},
+    {0x80A8 /* SAMPLE_BUFFERS */, 0},
+    {0x80A9 /* SAMPLES        */, 0},
 };
 
 static void klgl_GetIntegerv(uint32_t pname, int32_t *params) {
@@ -236,11 +247,224 @@ static void klgl_GetIntegerv(uint32_t pname, int32_t *params) {
     params[0] = 0;
 }
 
+
+// The indexed and typed state queries. Same rule as glGetIntegerv: answer what
+// we know, and *say* when we do not rather than writing a zero the caller reads
+// as a limit. A zero max-work-group-count is a renderer that silently declines
+// to dispatch anything.
+static void klgl_GetIntegeri_v(uint32_t target, uint32_t index, int32_t *data) {
+    if (!data) return;
+    switch (target) {
+    case 0x91BE /* MAX_COMPUTE_WORK_GROUP_COUNT */: data[0] = 65535; return;
+    case 0x91BF /* MAX_COMPUTE_WORK_GROUP_SIZE  */: data[0] = index == 2 ? 64 : 1024; return;
+    case 0x8A28 /* UNIFORM_BUFFER_BINDING */:
+    case 0x8A29 /* UNIFORM_BUFFER_START   */:
+    case 0x8A2A /* UNIFORM_BUFFER_SIZE    */: data[0] = 0; return;
+    case 0x8C8C /* TRANSFORM_FEEDBACK_BUFFER_START */:
+    case 0x8C8D /* TRANSFORM_FEEDBACK_BUFFER_SIZE  */:
+    case 0x8C8F /* TRANSFORM_FEEDBACK_BUFFER_BINDING */: data[0] = 0; return;
+    case 0x8E51 /* SAMPLE_MASK_VALUE */: data[0] = ~0; return;
+    }
+    fprintf(stderr, "  [gl] glGetIntegeri_v: unhandled target 0x%x (index %u)\n",
+            target, index);
+    data[0] = 0;
+}
+
+// Which sample counts a format supports. Answered as 4x only, to agree with
+// GL_MAX_SAMPLES and with the MSAA config eglChooseConfig hands out — three
+// places that have to describe the same device.
+static void klgl_GetInternalformativ(uint32_t target, uint32_t internalformat,
+                                     uint32_t pname, int32_t bufSize, int32_t *params) {
+    (void)target; (void)internalformat;
+    if (!params || bufSize <= 0) return;
+    switch (pname) {
+    case 0x9380 /* NUM_SAMPLE_COUNTS */: params[0] = 1; return;
+    case 0x80A9 /* SAMPLES */:           params[0] = 4; return;
+    }
+    fprintf(stderr, "  [gl] glGetInternalformativ: unhandled pname 0x%x\n", pname);
+    params[0] = 0;
+}
+
+static void klgl_GetFloatv(uint32_t pname, float *data) {
+    if (!data) return;
+    switch (pname) {
+    case 0x846D /* ALIASED_POINT_SIZE_RANGE */: data[0] = 1.0f; data[1] = 1024.0f; return;
+    case 0x846E /* ALIASED_LINE_WIDTH_RANGE */: data[0] = 1.0f; data[1] = 1.0f; return;
+    case 0x0B21 /* LINE_WIDTH */:               data[0] = 1.0f; return;
+    case 0x84FF /* MAX_TEXTURE_MAX_ANISOTROPY */:data[0] = 16.0f; return;
+    case 0x0B71 /* DEPTH_RANGE (2 values) */:    data[0] = 0.0f; data[1] = 1.0f; return;
+    }
+    fprintf(stderr, "  [gl] glGetFloatv: unhandled pname 0x%x\n", pname);
+    data[0] = 0.0f;
+}
+
+static void klgl_GetBooleanv(uint32_t pname, uint8_t *data) {
+    if (!data) return;
+    // Every boolean piece of GL state we could be asked about starts false, and
+    // nothing here has turned any of it on.
+    fprintf(stderr, "  [gl] glGetBooleanv: unhandled pname 0x%x\n", pname);
+    data[0] = 0;
+}
+
+static void klgl_GetInteger64v(uint32_t pname, int64_t *data) {
+    if (!data) return;
+    switch (pname) {
+    case 0x9111 /* MAX_SERVER_WAIT_TIMEOUT */: data[0] = 0; return;
+    case 0x821B /* MAJOR_VERSION */: data[0] = 3; return;
+    case 0x821C /* MINOR_VERSION */: data[0] = 2; return;
+    }
+    fprintf(stderr, "  [gl] glGetInteger64v: unhandled pname 0x%x\n", pname);
+    data[0] = 0;
+}
+
+
+// ---------------------------------------------------------- the null driver
+//
+// Names, not rendering. Nothing here draws: the point is to get the frame far
+// enough to see the shader and draw calls, which is what actually sizes the
+// Metal backend. Two things must be real for that to work at all.
+//
+// First, object names. GL reserves 0 for "no object", so a permissive zero from
+// glGenTextures is not a harmless stub — it is every texture aliasing the
+// default one. Names are handed out from a single counter because GL only
+// requires them unique within a type and nothing here cares which type.
+//
+// Second, shader sources: they are captured rather than discarded, because they
+// are the input to the GLSL ES -> SPIR-V -> MSL pipeline the backend will need
+// (PLANNING M5), and this is the only place they exist in plain text.
+static uint32_t g_gl_name = 1;
+
+static void klgl_gen(int32_t n, uint32_t *names) {
+    for (int32_t i = 0; i < n && names; i++) names[i] = g_gl_name++;
+}
+static void klgl_delete(int32_t n, const uint32_t *names) { (void)n; (void)names; }
+static uint8_t klgl_is(uint32_t name) { return name && name < g_gl_name; }
+
+static uint32_t klgl_CreateShader(uint32_t type) {
+    (void)type;
+    return g_gl_name++;
+}
+static uint32_t klgl_CreateProgram(void) { return g_gl_name++; }
+
+#define KL_GL_MAX_SHADERS 512
+static struct { uint32_t name; char *src; } g_shaders[KL_GL_MAX_SHADERS];
+static unsigned g_nshaders;
+
+static void klgl_ShaderSource(uint32_t shader, int32_t count,
+                              const char *const *strings, const int32_t *lengths) {
+    if (!strings || count <= 0 || g_nshaders >= KL_GL_MAX_SHADERS) return;
+    size_t total = 0;
+    for (int32_t i = 0; i < count; i++)
+        total += lengths && lengths[i] >= 0 ? (size_t)lengths[i]
+                                            : (strings[i] ? strlen(strings[i]) : 0);
+    char *buf = malloc(total + 1);
+    if (!buf) return;
+    size_t off = 0;
+    for (int32_t i = 0; i < count; i++) {
+        size_t len = lengths && lengths[i] >= 0 ? (size_t)lengths[i]
+                                                : (strings[i] ? strlen(strings[i]) : 0);
+        if (strings[i] && len) { memcpy(buf + off, strings[i], len); off += len; }
+    }
+    buf[off] = 0;
+    g_shaders[g_nshaders].name = shader;
+    g_shaders[g_nshaders].src  = buf;
+    g_nshaders++;
+}
+
+// Compilation and linking "succeed" because there is nothing here to reject a
+// shader — and a reported failure would send Unity down an error path over a
+// verdict we did not actually reach.
+#define GL_COMPILE_STATUS 0x8B81
+#define GL_LINK_STATUS    0x8B82
+#define GL_INFO_LOG_LENGTH 0x8B84
+static void klgl_GetShaderiv(uint32_t s, uint32_t pname, int32_t *p) {
+    (void)s;
+    if (!p) return;
+    *p = (pname == GL_COMPILE_STATUS) ? 1 : 0;
+}
+static void klgl_GetProgramiv(uint32_t prog, uint32_t pname, int32_t *p) {
+    (void)prog;
+    if (!p) return;
+    *p = (pname == GL_LINK_STATUS) ? 1 : 0;
+}
+static void klgl_GetInfoLog(uint32_t obj, int32_t bufSize, int32_t *length, char *log) {
+    (void)obj;
+    if (length) *length = 0;
+    if (log && bufSize > 0) log[0] = 0;
+}
+
+// Uniform and attribute locations come from a per-name counter for the same
+// reason object names do: -1 means "not found" and 0 is a legitimate location,
+// so a zeroed stub would collapse every uniform onto slot 0.
+static int32_t g_gl_loc;
+static int32_t klgl_GetLocation(uint32_t program, const char *name) {
+    (void)program; (void)name;
+    return g_gl_loc++;
+}
+
+unsigned kl_egl_shader_count(void) { return g_nshaders; }
+
+void kl_egl_dump_shaders(const char *dir) {
+    if (!dir || !g_nshaders) return;
+    for (unsigned i = 0; i < g_nshaders; i++) {
+        char path[512];
+        snprintf(path, sizeof path, "%s/shader_%03u_%u.glsl", dir, i, g_shaders[i].name);
+        FILE *f = fopen(path, "w");
+        if (!f) continue;
+        fputs(g_shaders[i].src ? g_shaders[i].src : "", f);
+        fclose(f);
+    }
+    fprintf(stderr, "  [gl] wrote %u shader sources to %s\n", g_nshaders, dir);
+}
+
 static const struct { const char *name; void *fn; } g_gl_impl[] = {
     {"glGetString",   (void *)klgl_GetString},
     {"glGetStringi",  (void *)klgl_GetStringi},
     {"glGetError",    (void *)klgl_GetError},
     {"glGetIntegerv", (void *)klgl_GetIntegerv},
+    {"glGetIntegeri_v", (void *)klgl_GetIntegeri_v},
+    {"glGetFloatv",     (void *)klgl_GetFloatv},
+    {"glGetBooleanv",   (void *)klgl_GetBooleanv},
+    {"glGetInteger64v", (void *)klgl_GetInteger64v},
+    {"glGetInternalformativ", (void *)klgl_GetInternalformativ},
+    {"glGenBuffers", (void *)klgl_gen},
+    {"glGenTextures", (void *)klgl_gen},
+    {"glGenFramebuffers", (void *)klgl_gen},
+    {"glGenRenderbuffers", (void *)klgl_gen},
+    {"glGenVertexArrays", (void *)klgl_gen},
+    {"glGenSamplers", (void *)klgl_gen},
+    {"glGenQueries", (void *)klgl_gen},
+    {"glGenTransformFeedbacks", (void *)klgl_gen},
+    {"glGenProgramPipelines", (void *)klgl_gen},
+    {"glDeleteBuffers", (void *)klgl_delete},
+    {"glDeleteTextures", (void *)klgl_delete},
+    {"glDeleteFramebuffers", (void *)klgl_delete},
+    {"glDeleteRenderbuffers", (void *)klgl_delete},
+    {"glDeleteVertexArrays", (void *)klgl_delete},
+    {"glDeleteSamplers", (void *)klgl_delete},
+    {"glDeleteQueries", (void *)klgl_delete},
+    {"glDeleteTransformFeedbacks", (void *)klgl_delete},
+    {"glDeleteProgramPipelines", (void *)klgl_delete},
+    {"glIsBuffer", (void *)klgl_is},
+    {"glIsTexture", (void *)klgl_is},
+    {"glIsFramebuffer", (void *)klgl_is},
+    {"glIsRenderbuffer", (void *)klgl_is},
+    {"glIsVertexArray", (void *)klgl_is},
+    {"glIsSampler", (void *)klgl_is},
+    {"glIsQuery", (void *)klgl_is},
+    {"glIsProgram", (void *)klgl_is},
+    {"glIsShader", (void *)klgl_is},
+    {"glCreateShader",  (void *)klgl_CreateShader},
+    {"glCreateProgram", (void *)klgl_CreateProgram},
+    {"glShaderSource",  (void *)klgl_ShaderSource},
+    {"glGetShaderiv",   (void *)klgl_GetShaderiv},
+    {"glGetProgramiv",  (void *)klgl_GetProgramiv},
+    {"glGetShaderInfoLog",  (void *)klgl_GetInfoLog},
+    {"glGetProgramInfoLog", (void *)klgl_GetInfoLog},
+    {"glGetUniformLocation", (void *)klgl_GetLocation},
+    {"glGetAttribLocation",  (void *)klgl_GetLocation},
+    {"glGetUniformBlockIndex", (void *)klgl_GetLocation},
+
 };
 
 // ---------- EGL ----------

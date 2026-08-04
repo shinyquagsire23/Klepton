@@ -168,6 +168,7 @@ typedef struct kl_sl_player {
 
     struct { const void *buf; SLuint32 size; } q[KL_SL_QUEUE];
     unsigned head, tail, count;
+    unsigned generation;                    // bumped on every re-creation
 
     unsigned rate, channels, bits;          // from the PCM format
     unsigned long consumed;
@@ -183,6 +184,8 @@ static kl_sl_engine g_engine;
 static kl_sl_mix    g_mix;
 static kl_sl_player g_player;
 static unsigned long g_buffers_consumed;
+
+static void player_stop(kl_sl_player *p);
 
 // ---- the feeder ----
 //
@@ -211,14 +214,23 @@ static void *feeder(void *arg) {
         if (!frame) frame = 4;
         unsigned rate = p->rate ? p->rate : 48000;
         useconds_t us = (useconds_t)((uint64_t)(size / frame) * 1000000ull / rate);
+        // Snapshot the callback under the lock. Reading p->cb after unlocking
+        // races a teardown that clears it, and the window is not theoretical:
+        // FMOD stops and re-creates the whole device at least once per run.
+        void (*cb)(SLBufferQueueItf, void *) = p->cb;
+        void *cb_ctx = p->cb_ctx;
+        unsigned generation = p->generation;
         pthread_mutex_unlock(&p->lock);
 
         if (us) usleep(us > 100000 ? 100000 : us);   // cap, so a bogus size cannot wedge us
         p->consumed++;
         g_buffers_consumed++;
-        if (p->cb) p->cb((SLBufferQueueItf)&p->bq_vt, p->cb_ctx);
+        if (cb) cb((SLBufferQueueItf)&p->bq_vt, cb_ctx);
 
         pthread_mutex_lock(&p->lock);
+        // If the device was torn down while we were outside the lock, this
+        // thread is the previous generation and must not touch the queue again.
+        if (generation != p->generation) break;
     }
     pthread_mutex_unlock(&p->lock);
     return NULL;
@@ -245,14 +257,7 @@ static SLresult obj_RegisterCallback(SLObjectItf s, void *cb, void *ctx) {
 }
 static void obj_AbortAsyncOperation(SLObjectItf s) { (void)s; }
 static void obj_Destroy(SLObjectItf self) {
-    if ((void *)self == (void *)&g_player) {
-        pthread_mutex_lock(&g_player.lock);
-        g_player.running = 0;
-        pthread_cond_signal(&g_player.wake);
-        pthread_mutex_unlock(&g_player.lock);
-        if (g_player.started) pthread_join(g_player.thread, NULL);
-        g_player.started = 0;
-    }
+    if ((void *)self == (void *)&g_player) player_stop(&g_player);
 }
 static SLresult obj_SetPriority(SLObjectItf s, int32_t p, SLboolean e) {
     (void)s; (void)p; (void)e; return SL_RESULT_SUCCESS;
@@ -358,12 +363,33 @@ static SLresult eng_CreateOutputMix(SLEngineItf self, SLObjectItf *out, SLuint32
     return SL_RESULT_SUCCESS;
 }
 
+// Stop and join the feeder, if one is running. Must happen before the player is
+// reinitialised: FMOD destroys and re-creates the device, and memset-ing the
+// struct out from under a live feeder zeroes the mutex it is holding and the
+// callback it is about to call. That crashed inside FMOD's callback as a
+// memmove through a null pointer, several layers from the actual mistake.
+static void player_stop(kl_sl_player *p) {
+    if (!p->started) return;
+    pthread_mutex_lock(&p->lock);
+    p->running = 0;
+    p->generation++;
+    pthread_cond_signal(&p->wake);
+    pthread_mutex_unlock(&p->lock);
+    pthread_join(p->thread, NULL);
+    p->started = 0;
+    pthread_mutex_destroy(&p->lock);
+    pthread_cond_destroy(&p->wake);
+}
+
 static SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *out,
                                       void *src, void *snk, SLuint32 n,
                                       const SLInterfaceID *ids, const SLboolean *req) {
     (void)self; (void)snk; (void)n; (void)ids; (void)req;
     kl_sl_player *p = &g_player;
+    player_stop(p);
+    unsigned gen = p->generation;
     memset(p, 0, sizeof *p);
+    p->generation = gen;
     p->obj_vt = &g_obj_vt;
     p->play_vt = &g_play_vt;
     p->bq_vt = &g_bq_vt;

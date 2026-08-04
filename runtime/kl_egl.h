@@ -26,4 +26,10 @@ void *kl_egl_sym(const char *name);        // the gateway itself
 // call. This is the M5 work list, in the order the guest wanted it.
 void kl_egl_report(FILE *f);
 
+// Shader sources the guest handed to glShaderSource. They are the input to the
+// GLSL ES -> SPIR-V -> MSL pipeline M5 needs, and this is the only place they
+// exist in plain text — the APK stores them compressed inside Unity's assets.
+unsigned kl_egl_shader_count(void);
+void     kl_egl_dump_shaders(const char *dir);
+
 #endif
