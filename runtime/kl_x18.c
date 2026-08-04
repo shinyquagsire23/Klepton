@@ -25,6 +25,7 @@
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include "kl_x18.h"
@@ -421,9 +422,21 @@ static void note_refusal(uint32_t word) {
         g_refused[g_nrefused_kinds++] = (typeof(g_refused[0])){word, 1};
 }
 
+// KL_X18=0 disables the rewrite but NOT the survey. Counting has to stay
+// unconditional so that "how many x18 sites does this image have" means the same
+// thing in both arms of an A/B — otherwise the control run of tests/t_guest.c
+// reports zero sites and refuses to compare anything, which looks like a pass.
+static int veneer_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("KL_X18");
+        cached = !(v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N'));
+    }
+    return cached;
+}
+
 int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
     memset(st, 0, sizeof *st);
-    if (g_slot < 0 && kl_x18_init() != 0) return -1;
 
     uint32_t *w = (uint32_t *)code;
     size_t    n = size / 4;
@@ -433,10 +446,10 @@ int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
         klx_info in;
         klx_decode(w[i], &in);
         if (in.nfields) want++;
-        else if (!in.ok) { /* not an x18 site as far as we can tell; ignore */ }
     }
     st->sites = want;
-    if (!want) return 0;
+    if (!want || !veneer_enabled()) return 0;
+    if (g_slot < 0 && kl_x18_init() != 0) return -1;
 
     // The pool goes immediately after the code so that `b` reaches it from
     // anywhere in the range. mmap treats the address as a hint, so the result

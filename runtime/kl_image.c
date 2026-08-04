@@ -13,12 +13,6 @@
 #include "klepton.h"
 #include "kl_x18.h"
 
-// An env knob that is on unless explicitly switched off, so the safe behaviour
-// is the default and A/B testing it costs one variable.
-static int kl_env_off(const char *name) {
-    const char *v = getenv(name);
-    return v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N');
-}
 
 // ---------- ELF64 subset ----------
 typedef struct { uint8_t e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version;
@@ -302,7 +296,8 @@ kl_image *kl_load(const char *path) {
     // branches rather than flipping one bit, so it would corrupt it loudly.
     const Elf64_Shdr *sh = (eh->e_shoff && eh->e_shnum)
                          ? (const Elf64_Shdr *)(file + eh->e_shoff) : NULL;
-    int veneer = sh && !kl_env_off("KL_X18");
+    int veneer = sh != NULL;      // KL_X18 is honoured inside kl_x18_patch, which
+                                  // still counts sites when the rewrite is off
     if (!sh)
         fprintf(stderr, "  [klepton] %s: no section headers — cannot separate code "
                         "from rodata; x18 veneering disabled (see trap 0)\n", path);
