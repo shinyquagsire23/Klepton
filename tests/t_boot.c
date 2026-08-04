@@ -180,6 +180,12 @@ int main(int argc, char **argv) {
                     ((void (*)(void *, void *))fn)(kl_jni_env(), thiz2);
                 alarm(0);
                 printf("  %s returned\n", seq[i].name);
+                // Android's UI thread runs its looper between callbacks; here
+                // the host has to pump it, or the queue only ever grows.
+                alarm(10);
+                unsigned ran = kl_jni_drain_ui_tasks();
+                alarm(0);
+                if (ran) printf("  drained %u posted task%s\n", ran, ran == 1 ? "" : "s");
             }
         }
 

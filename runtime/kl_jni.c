@@ -71,6 +71,15 @@ typedef struct klj_object {
     void       *data;   // java/lang/String -> char*; java/lang/Class -> klj_class*
 } klj_object;
 
+// The two object kinds the *host* constructs rather than merely hands back: a
+// bitter/jnibridge proxy, and the java.lang.reflect.Method describing what to
+// invoke on it. Declared here because FromReflectedMethod needs the Method
+// description long before the JNIBridge block that builds one.
+#define KLJ_CLASS_PROXY  "bitter/jnibridge/JNIBridge$Proxy"
+#define KLJ_CLASS_METHOD "java/lang/reflect/Method"
+typedef struct { const char *cls, *name, *sig; } klj_method_obj;
+static void *klj_class_object(const char *class_name);
+
 static const char KLJ_CLASS_CLASS[]  = "java/lang/Class";
 static const char KLJ_CLASS_STRING[] = "java/lang/String";
 
@@ -143,6 +152,29 @@ void *kl_jni_new_object(const char *class_name) {
     pthread_mutex_lock(&g_lock);
     klj_class  *c = klj_intern_class_locked(class_name);
     klj_object *o = klj_alloc_object_locked(c->name, NULL);
+    pthread_mutex_unlock(&g_lock);
+    return o;
+}
+
+
+// Same as kl_jni_new_object, but carries a payload. Used for the two object
+// kinds the host has to *construct* rather than merely hand back: JNIBridge
+// proxies and the java.lang.reflect.Method objects that describe what to call
+// on them.
+static void *klj_new_object_data(const char *class_name, void *data) {
+    pthread_once(&g_init_once, klj_init);
+    pthread_mutex_lock(&g_lock);
+    klj_class  *c = klj_intern_class_locked(class_name);
+    klj_object *o = klj_alloc_object_locked(c->name, data);
+    pthread_mutex_unlock(&g_lock);
+    return o;
+}
+
+static void *klj_class_object(const char *class_name) {
+    pthread_once(&g_init_once, klj_init);
+    pthread_mutex_lock(&g_lock);
+    klj_class *c = klj_intern_class_locked(class_name);
+    void *o = c->as_object;
     pthread_mutex_unlock(&g_lock);
     return o;
 }
@@ -367,6 +399,24 @@ static void *klj_GetMethodID(void *e, void *c, const char *n, const char *s)    
 static void *klj_GetStaticMethodID(void *e, void *c, const char *n, const char *s) { (void)e; return klj_want(c, n, s, 'M'); }
 static void *klj_GetFieldID(void *e, void *c, const char *n, const char *s)        { (void)e; return klj_want(c, n, s, 'f'); }
 static void *klj_GetStaticFieldID(void *e, void *c, const char *n, const char *s)  { (void)e; return klj_want(c, n, s, 'F'); }
+
+
+// FromReflectedMethod: the guest's JNIBridge.invoke hands back the very
+// java.lang.reflect.Method we synthesised and asks for its jmethodID. Since a
+// jmethodID here *is* the interned (class, name, signature) record, this is just
+// klj_want on the description the Method object was built from — the round trip
+// closes exactly because both directions agree on what identity means.
+static void *klj_FromReflectedMethod(void *env, void *method) {
+    (void)env;
+    klj_object *o = klj_as_object(method);
+    if (!o || strcmp(o->cls, KLJ_CLASS_METHOD) != 0) {
+        KLJ_LOG("FromReflectedMethod: %s is not a Method", o ? o->cls : "(not an object)");
+        return NULL;
+    }
+    klj_method_obj *m = o->data;
+    if (!m) return NULL;
+    return klj_want(klj_class_object(m->cls), m->name, m->sig, 'm');
+}
 
 // ------------------------------------------------------- Java method dispatch
 // The guest calls Java through Call<Type>Method[V|A]. It is C++, so its inline
@@ -1275,12 +1325,11 @@ static klj_val klj_Context_getObbDir(void *env, void *self, const klj_val *a, in
 // Runnable inline unless already on that thread. Queuing is therefore the
 // faithful behaviour, not a shortcut.
 //
-// What *is* missing: nothing drains this queue. Draining it means calling back
-// into the guest through the proxy's JNIBridge.invoke(ptr, Class, Method,
-// Object[]), which needs synthetic java.lang.reflect.Method objects — a distinct
-// piece of work from anything above, since every JNI call so far has been guest
-// to host. The count is exposed so the gap shows up as a number rather than as
-// silently skipped work.
+// kl_jni_drain_ui_tasks() runs them, which is the host->guest direction and the
+// only one in this file: every other call here answers something the guest
+// started. The delay is recorded but not honoured — a posted task runs at the
+// next drain regardless of its delay, which is wrong in the same way a
+// zero-latency looper is wrong, and has not mattered yet.
 #define KLJ_MAX_UI_TASKS 64
 static struct { void *runnable; int64_t delay_ms; } g_ui_tasks[KLJ_MAX_UI_TASKS];
 static unsigned g_ui_task_n;
@@ -1296,8 +1345,7 @@ static void klj_ui_enqueue(const char *via, void *runnable, int64_t delay_ms) {
         g_ui_tasks[g_ui_task_n].delay_ms = delay_ms;
         g_ui_task_n++;
     }
-    KLJ_LOG("%s: queued (+%lldms, %u pending, nothing drains them yet)",
-            via, (long long)delay_ms, g_ui_task_n);
+    KLJ_LOG("%s: queued (+%lldms, %u pending)", via, (long long)delay_ms, g_ui_task_n);
 }
 
 static klj_val klj_Activity_runOnUiThread(void *env, void *self, const klj_val *a, int n) {
@@ -1469,6 +1517,94 @@ static klj_val klj_Integer_parseInt(void *env, void *self, const klj_val *a, int
     long v = t ? strtol(t, NULL, 10) : 0;
     if (!t) KLJ_LOG("Integer.parseInt(null) -> 0");
     return (klj_val){.j = (uint64_t)(int64_t)(int32_t)v};
+}
+
+
+// ---------------------------------------------------------------- JNIBridge
+//
+// This is the only direction that runs host -> guest. Everything else in this
+// file answers a call the guest made; here we originate one.
+//
+// Unity's bitter/jnibridge represents a Java object implementing some interface
+// as a *proxy*: the guest calls JNIBridge.newInterfaceProxy(nativePtr,
+// Class[]) — which is ours to implement — and gets back an object it can hand
+// to anything expecting, say, a Runnable. Invoking a method on that proxy means
+// calling the guest's own registered native
+//
+//   JNIBridge.invoke(long ptr, Class declaringClass, Method method, Object[] args)
+//
+// so the proxy has to remember the pointer, and we have to be able to
+// manufacture a java.lang.reflect.Method describing what is being called.
+// Neither object exists anywhere until we make it.
+// A java.lang.reflect.Method the guest never created. What its native invoke
+// actually reads off this is not knowable up front, so the accessors below are
+// added as the trace demands them — same rule as every other Java class here.
+static void *klj_new_method(const char *cls, const char *name, const char *sig) {
+    klj_method_obj *m = calloc(1, sizeof *m);
+    if (!m) return NULL;
+    m->cls = cls; m->name = name; m->sig = sig;
+    return klj_new_object_data(KLJ_CLASS_METHOD, m);
+}
+
+static klj_val klj_Method_getName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    klj_method_obj *m = o ? o->data : NULL;
+    return (klj_val){.l = kl_jni_new_string(m ? m->name : "")};
+}
+
+static klj_val klj_Method_getDeclaringClass(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    klj_method_obj *m = o ? o->data : NULL;
+    return (klj_val){.l = m ? klj_class_object(m->cls) : NULL};
+}
+
+// Call one method on a JNIBridge proxy. Returns the guest's return value, or
+// NULL if there is nothing to call — which is not an error here: a queue can
+// legitimately hold something that is not a proxy, and refusing loudly at drain
+// time would turn a diagnostic into a crash.
+static void *klj_proxy_invoke(void *proxy, const char *iface,
+                              const char *name, const char *sig, void *args) {
+    klj_object *o = klj_as_object(proxy);
+    if (!o || strcmp(o->cls, KLJ_CLASS_PROXY) != 0) {
+        KLJ_LOG("drain: %s is not a JNIBridge proxy — skipped",
+                o ? o->cls : "(not an object)");
+        return NULL;
+    }
+    void *fn = kl_jni_native("bitter/jnibridge/JNIBridge", "invoke", NULL);
+    if (!fn) {
+        KLJ_LOG("drain: the guest has not registered JNIBridge.invoke — skipped");
+        return NULL;
+    }
+    klj_proxy *p = o->data;
+    // A static native is (JNIEnv*, jclass, args...).
+    void *(*invoke)(void *, void *, int64_t, void *, void *, void *) = fn;
+    return invoke(kl_jni_env(), klj_class_object("bitter/jnibridge/JNIBridge"),
+                  p->native_ptr, klj_class_object(iface),
+                  klj_new_method(iface, name, sig), args);
+}
+
+// Run everything the guest posted to the main looper. On Android this is what
+// Looper.loop() does on the UI thread; here the host has to call it, because
+// there is no looper thread and the queue would otherwise only ever grow.
+//
+// The queue is snapshotted and cleared before anything runs: a Runnable is guest
+// code and is free to post more work, and draining in place would either miss
+// those or spin on them forever.
+unsigned kl_jni_drain_ui_tasks(void) {
+    void *batch[KLJ_MAX_UI_TASKS];
+    unsigned n;
+    pthread_mutex_lock(&g_lock);
+    n = g_ui_task_n;
+    for (unsigned i = 0; i < n; i++) batch[i] = g_ui_tasks[i].runnable;
+    g_ui_task_n = 0;
+    pthread_mutex_unlock(&g_lock);
+
+    if (n) KLJ_LOG("draining %u posted task%s", n, n == 1 ? "" : "s");
+    for (unsigned i = 0; i < n; i++)
+        klj_proxy_invoke(batch[i], "java/lang/Runnable", "run", "()V", NULL);
+    return n;
 }
 
 // ---------------------------------------------------------------- audio
@@ -2383,6 +2519,8 @@ static klj_val klj_Box_floatValue(void *env, void *self, const klj_val *a, int n
 }
 
 static const klj_binding g_bindings[] = {
+    {"java/lang/reflect/Method", "getName", "()Ljava/lang/String;", klj_Method_getName},
+    {"java/lang/reflect/Method", "getDeclaringClass", "()Ljava/lang/Class;", klj_Method_getDeclaringClass},
     {"java/lang/Integer", "parseInt", "(Ljava/lang/String;)I", klj_Integer_parseInt},
     {"android/media/AudioManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", klj_AudioManager_getProperty},
     {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
@@ -2646,6 +2784,7 @@ static void klj_build_tables(void) {
     ENV(RegisterNatives,      klj_RegisterNatives);
     ENV(UnregisterNatives,    klj_UnregisterNatives);
     ENV(GetJavaVM,            klj_GetJavaVM);
+    ENV(FromReflectedMethod,  klj_FromReflectedMethod);
     ENV(GetMethodID,          klj_GetMethodID);
     ENV(GetStaticMethodID,    klj_GetStaticMethodID);
     ENV(GetFieldID,           klj_GetFieldID);

@@ -67,4 +67,11 @@ void kl_jni_report(FILE *out);
 // means the guest is waiting on a UI-thread callback we do not yet deliver.
 unsigned kl_jni_pending_ui_tasks(void);
 
+// Run them. This is the host->guest direction: each queued Runnable is a
+// bitter/jnibridge proxy, and running it means calling the guest's own
+// JNIBridge.invoke native with a synthetic java.lang.reflect.Method. On Android
+// this is Looper.loop() on the UI thread; there is no looper thread here, so the
+// host pumps it. Returns how many ran.
+unsigned kl_jni_drain_ui_tasks(void);
+
 #endif
