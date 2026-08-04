@@ -30,6 +30,9 @@ typedef struct {
     unsigned tls_rewrites;                           // mrs tpidr_el0 -> tpidrro_el0
     unsigned svc_sites;                              // inline syscalls found
     unsigned imports_bound, imports_missing;
+    // S0.5: guest instructions naming x18, and how many were redirected to a
+    // veneer. Anything refused is still exposed to trap 0.
+    unsigned x18_sites, x18_patched, x18_refused;
 } kl_stats;
 const kl_stats *kl_get_stats(kl_image *img);
 

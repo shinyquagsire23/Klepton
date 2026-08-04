@@ -43,6 +43,8 @@ int main(int argc, char **argv) {
     printf("  relocations: %u  (RELATIVE=%u ABS64=%u GLOB_DAT=%u JUMP_SLOT=%u)\n",
            total, st->relative, st->abs64, st->glob_dat, st->jump_slot);
     printf("  TLS rewrites: %u    inline svc #0: %u\n", st->tls_rewrites, st->svc_sites);
+    printf("  x18 sites: %u    veneered: %u    refused: %u\n",
+           st->x18_sites, st->x18_patched, st->x18_refused);
     printf("  imports: %u bound, %u unresolved sites\n", st->imports_bound, st->imports_missing);
 
     unsigned nm = 0;

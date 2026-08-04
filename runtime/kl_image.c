@@ -11,6 +11,14 @@
 #include <sys/stat.h>
 #include <libkern/OSCacheControl.h>
 #include "klepton.h"
+#include "kl_x18.h"
+
+// An env knob that is on unless explicitly switched off, so the safe behaviour
+// is the default and A/B testing it costs one variable.
+static int kl_env_off(const char *name) {
+    const char *v = getenv(name);
+    return v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N');
+}
 
 // ---------- ELF64 subset ----------
 typedef struct { uint8_t e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version;
@@ -22,7 +30,11 @@ typedef struct { uint64_t d_tag; uint64_t d_val; } Elf64_Dyn;
 typedef struct { uint32_t st_name; uint8_t st_info, st_other; uint16_t st_shndx;
     uint64_t st_value, st_size; } Elf64_Sym;
 typedef struct { uint64_t r_offset, r_info; int64_t r_addend; } Elf64_Rela;
+typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offset,
+    sh_size; uint32_t sh_link, sh_info; uint64_t sh_addralign, sh_entsize; } Elf64_Shdr;
 
+#define SHT_PROGBITS  1
+#define SHF_EXECINSTR 0x4
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
 #define PF_X 1
@@ -279,11 +291,43 @@ kl_image *kl_load(const char *path) {
         munmap(file, sb.st_size); return NULL;
     }
 
-    // ---- S0.1 TLS rewrite, then lock down permissions per segment ----
-    for (int i = 0; i < eh->e_phnum; i++) {
-        if (ph[i].p_type != PT_LOAD) continue;
-        uint8_t *segp = img->base + ph[i].p_vaddr - lo;
-        if (ph[i].p_flags & PF_X) rewrite_tls(segp, (size_t)ph[i].p_filesz, &img->stats);
+    // ---- rewrite guest text: S0.1 TLS, then S0.5 x18 ----
+    //
+    // Executable *sections*, not the executable segment. The r-x LOAD segment of
+    // these libraries starts at file offset 0 and runs to the end of
+    // .gcc_except_table, so it also spans .hash, .dynsym, .rela.dyn, .rodata and
+    // .eh_frame — for libunity that is 1.5 MB of read-only data and 720 KB of
+    // relocations sitting behind PF_X. Rewriting a word that merely looks like
+    // an instruction in there would corrupt data, and the x18 pass patches
+    // branches rather than flipping one bit, so it would corrupt it loudly.
+    const Elf64_Shdr *sh = (eh->e_shoff && eh->e_shnum)
+                         ? (const Elf64_Shdr *)(file + eh->e_shoff) : NULL;
+    int veneer = sh && !kl_env_off("KL_X18");
+    if (!sh)
+        fprintf(stderr, "  [klepton] %s: no section headers — cannot separate code "
+                        "from rodata; x18 veneering disabled (see trap 0)\n", path);
+
+    for (int i = 0; i < eh->e_phnum && !sh; i++) {
+        // Fallback for a stripped image: the old whole-segment scan. Narrower
+        // than it should be is not an option for TLS — an unrewritten
+        // tpidr_el0 read is a wrong answer on every thread.
+        if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
+        rewrite_tls(img->base + ph[i].p_vaddr - lo, (size_t)ph[i].p_filesz, &img->stats);
+    }
+    for (int i = 0; sh && i < eh->e_shnum; i++) {
+        if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
+        uint8_t *p = img->base + sh[i].sh_addr - lo;
+        rewrite_tls(p, (size_t)sh[i].sh_size, &img->stats);
+        if (!veneer) continue;
+        kl_x18_stats xs;
+        if (kl_x18_patch(p, (size_t)sh[i].sh_size, &xs) != 0) {
+            fprintf(stderr, "  [klepton] %s: x18 veneering failed to start\n", path);
+            veneer = 0;
+            continue;
+        }
+        img->stats.x18_sites   += xs.sites;
+        img->stats.x18_patched += xs.patched;
+        img->stats.x18_refused += xs.refused;
     }
     sys_icache_invalidate(img->base, img->span);
 
