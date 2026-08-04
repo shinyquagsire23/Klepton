@@ -76,6 +76,73 @@ const char *const *kl_missing_imports(kl_image *img, unsigned *count) {
     return img->missing;
 }
 
+// ---------- unresolved-import stubs ----------
+// Every unresolved import used to resolve to one shared abort stub, so calling
+// one reported "called an unresolved import" and nothing else — the single
+// place in this runtime where an unimplemented thing did not fail by name. That
+// name is exactly where the next milestone starts, so each missing symbol now
+// gets its own 32-byte trampoline that loads it and tail-calls the reporter:
+//
+//   0:  ldr x0, #16     // the reporter's argument: the symbol name
+//   4:  ldr x16, #20    // x16 is the intra-procedure-call scratch register,
+//   8:  br  x16         //   which is precisely what it is reserved for
+//   12: nop             // padding, so the two literals land 8-byte aligned
+//   16: .quad name
+//   24: .quad kl_unresolved_named
+//
+// Data imports get one too. They are not called, so the guest dereferences the
+// trampoline instead — but a wild pointer into a known page beats a wild
+// pointer into nothing, and the name is right there next to the code.
+#define KL_STUB_BYTES 32
+#define KL_STUB_POOL  (64 * 1024)          /* 2048 stubs; no image is close */
+
+void kl_unresolved_named(const char *name);   // kl_shim.c
+
+static struct { char *name; void *stub; } *g_stubs;
+static unsigned g_stub_n, g_stub_cap;
+static uint8_t *g_stub_pool;
+static size_t   g_stub_off;
+
+static void *unresolved_stub(const char *nm) {
+    if (!nm || !*nm) return kl_shim_lookup("__klepton_unresolved");
+    for (unsigned i = 0; i < g_stub_n; i++)             // shared across images
+        if (strcmp(g_stubs[i].name, nm) == 0) return g_stubs[i].stub;
+
+    if (!g_stub_pool) {
+        g_stub_pool = mmap(NULL, KL_STUB_POOL, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (g_stub_pool == MAP_FAILED) { g_stub_pool = NULL; return kl_shim_lookup("__klepton_unresolved"); }
+    }
+    if (g_stub_off + KL_STUB_BYTES > KL_STUB_POOL) return kl_shim_lookup("__klepton_unresolved");
+
+    // The name lives in the image's strtab, which kl_unload would take with it.
+    char *owned = strdup(nm);
+    if (!owned) return kl_shim_lookup("__klepton_unresolved");
+
+    uint8_t *s = g_stub_pool + g_stub_off;
+    if (mprotect(g_stub_pool, KL_STUB_POOL, PROT_READ | PROT_WRITE) != 0) { free(owned); return kl_shim_lookup("__klepton_unresolved"); }
+    uint32_t *code = (uint32_t *)s;
+    code[0] = 0x58000080u;   // ldr x0,  #16
+    code[1] = 0x580000B0u;   // ldr x16, #20
+    code[2] = 0xD61F0200u;   // br  x16
+    code[3] = 0xD503201Fu;   // nop
+    memcpy(s + 16, &owned, 8);
+    void (*fn)(const char *) = kl_unresolved_named;
+    memcpy(s + 24, &fn, 8);
+    mprotect(g_stub_pool, KL_STUB_POOL, PROT_READ | PROT_EXEC);
+    sys_icache_invalidate(s, KL_STUB_BYTES);
+    g_stub_off += KL_STUB_BYTES;
+
+    if (g_stub_n == g_stub_cap) {
+        g_stub_cap = g_stub_cap ? g_stub_cap * 2 : 64;
+        g_stubs = realloc(g_stubs, g_stub_cap * sizeof *g_stubs);
+    }
+    g_stubs[g_stub_n].name = owned;
+    g_stubs[g_stub_n].stub = s;
+    g_stub_n++;
+    return s;
+}
+
 static char g_err[512];
 static void err(const char *fmt, ...) {
     va_list a; va_start(a, fmt); vsnprintf(g_err, sizeof g_err, fmt, a); va_end(a);
@@ -126,7 +193,7 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
                 // Dedupe: libil2cpp has 711k relocations; per-site logging would flood.
                 img->stats.imports_missing++;
                 record_missing(img, nm);
-                v = (uint64_t)(uintptr_t)kl_shim_lookup("__klepton_unresolved");
+                v = (uint64_t)(uintptr_t)unresolved_stub(nm);
             } else if (img->symtab[sidx].st_shndx == 0) {
                 img->stats.imports_bound++;
             }

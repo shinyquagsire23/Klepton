@@ -53,6 +53,10 @@ FILE *kl_host_file(void *guest);
 void      kl_set_library_path(const char *dir);
 void      kl_register_image(const char *soname, kl_image *img);
 kl_image *kl_find_image(const char *soname);
+// Which guest image an address is in, and its offset within it. NULL if none.
+// Guest libraries land wherever the kernel put them, so this is what makes a
+// raw pc from a fault mean anything.
+const char *kl_addr_image(const void *addr, size_t *offset);
 
 
 // Rewrite a guest file path into the synthetic /proc and /sys tree when we serve

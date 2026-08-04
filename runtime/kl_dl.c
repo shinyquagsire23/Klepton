@@ -39,6 +39,25 @@ kl_image *kl_find_image(const char *soname) {
     return NULL;
 }
 
+// Which guest image an address falls in, and how far into it. Guest libraries
+// are mapped at whatever address the kernel picked, so a raw pc from a fault is
+// unusable on its own — this is what turns it into a "libil2cpp+0x1234" that can
+// be disassembled. Takes no lock: the callers are diagnostic paths running in an
+// already-broken process, where blocking on a mutex some dead thread holds would
+// lose the report entirely.
+const char *kl_addr_image(const void *addr, size_t *offset) {
+    for (int i = 0; i < g_nimgs; i++) {
+        const char *base = (const char *)kl_base(g_imgs[i].img);
+        if (!base) continue;
+        if ((const char *)addr >= base && (const char *)addr < base + kl_span(g_imgs[i].img)) {
+            if (offset) *offset = (size_t)((const char *)addr - base);
+            return g_imgs[i].soname;
+        }
+    }
+    if (offset) *offset = 0;
+    return NULL;
+}
+
 void *klb_dlopen(const char *path, int flags) {
     (void)flags;
     if (!path) return (void *)-1;                    // RTLD_DEFAULT-ish: whole process

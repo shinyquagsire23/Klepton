@@ -10,6 +10,8 @@
 // Phase 1 is the assertion. Phase 2 is reconnaissance: it drives the registered
 // NativeLoader.load() to find out what the *next* milestone has to answer for,
 // and runs in a forked child because an unimplemented JNI slot aborts by design.
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +26,49 @@ typedef int  (*jni_onload_fn)(void *vm, void *reserved);
 typedef int8_t (*nativeloader_load_fn)(void *env, void *clazz, void *path);
 
 static int fail(const char *msg) { fprintf(stderr, "FAIL: %s\n", msg); return 1; }
+
+// A fault in guest code is the one stop the parent can only name by number, and
+// by then the child is gone. Reporting it from inside says the three things that
+// identify it: where it touched, where it was executing, and — the question a
+// signal number cannot answer — whether it was even the main thread. A crash on
+// an engine worker lands at whatever point the main thread's log had reached,
+// which reads as a different bug on every run.
+//
+// This has to survive being called in a broken process, so it uses write(2)
+// rather than stdio and does not attempt a symbolised backtrace.
+static void report_fault(int sig, siginfo_t *si, void *uctx) {
+    // Our own handler, so this is a Darwin ucontext_t and reading it is safe —
+    // the mismatch in trap 5 is about the *guest's* handlers seeing one.
+    ucontext_t *uc = uctx;
+    void *pc = uc ? (void *)uc->uc_mcontext->__ss.__pc : NULL;
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+
+    size_t      off = 0;
+    const char *img = kl_addr_image(pc, &off);
+
+    char buf[256];
+    int  n = snprintf(buf, sizeof buf,
+                      "\n[t_boot] fault: signal %d at %p, pc %s+0x%zx (%p), thread %llu%s\n",
+                      sig, si ? si->si_addr : NULL, img ? img : "<host>", off, pc,
+                      (unsigned long long)tid,
+                      pthread_main_np() ? " (main)" : " (a guest worker thread)");
+    if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+
+    // Die of the original signal, so the parent still reports it as one.
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void install_fault_reporter(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = report_fault;
+    sa.sa_flags     = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+}
 
 int main(int argc, char **argv) {
     if (argc > 1) LIBDIR = argv[1];
@@ -63,6 +108,7 @@ int main(int argc, char **argv) {
     fflush(NULL);
     pid_t pid = fork();
     if (pid == 0) {
+        install_fault_reporter();
         // Strict: an unimplemented *call* is fatal. Lookups are not, so this
         // stops only where the surface genuinely ends. KL_PERMISSIVE=1 flips it
         // to a zero return, which collects a whole batch in one run when pushing

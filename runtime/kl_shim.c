@@ -48,6 +48,7 @@
 #include "klepton.h"
 #include "kl_va.h"
 #include "kl_ndk.h"
+#include "kl_jni.h"
 
 // ---------- S0.1: bionic stack-guard canary in Darwin TSD slot 5 ----------
 #define TLS_SLOT_STACK_GUARD 5
@@ -71,10 +72,23 @@ void kl_fatal_prepare(void) {
 
 __attribute__((noreturn)) static void die(const char *what) {
     fprintf(stderr, "[klepton] fatal: %s\n", what);
+    // Whatever we died of, the JNI surface is the context: it says how far the
+    // guest got and what it had asked for by then. Without it these paths print
+    // one line and lose the whole run, which reads as a much earlier failure.
+    kl_jni_report(stderr);
     kl_fatal_prepare();
     abort();
 }
 __attribute__((noreturn)) static void kl_unresolved(void) { die("called an unresolved import"); }
+
+// The named form, reached through the per-symbol trampolines kl_image.c builds.
+// Only imports that never got a stub — an allocation failure — still land on the
+// anonymous kl_unresolved above.
+__attribute__((noreturn)) void kl_unresolved_named(const char *name) {
+    char msg[256];
+    snprintf(msg, sizeof msg, "called unresolved import '%s'", name ? name : "?");
+    die(msg);
+}
 __attribute__((noreturn)) static void kl_stack_chk_fail(void) { die("stack smashing detected"); }
 
 // ---------- bionic FILE ----------
@@ -84,6 +98,27 @@ __attribute__((noreturn)) static void kl_stack_chk_fail(void) { die("stack smash
 static char g_sF[4096] __attribute__((aligned(16)));
 FILE *kl_host_file(void *guest) {
     if ((char *)guest >= g_sF && (char *)guest < g_sF + sizeof g_sF) return stderr;
+    // A FILE * small enough to be a page-zero offset is not a FILE * — it is an
+    // argument that landed in the wrong slot (trap 6b) or an uninitialised one.
+    // Passing it through means dying inside flockfile with no idea who called,
+    // so it is named here instead and the call is dropped.
+    // A FILE * small enough to be a page-zero offset is not a FILE * — it is an
+    // argument that landed in the wrong slot (trap 6b) or an uninitialised one.
+    // Passing it through dies inside flockfile with no clue who called; naming it
+    // and routing to stderr keeps the run going, and a write that lands in the
+    // log is a better outcome than a dropped one. Reads simply fail, which is
+    // the honest answer for a handle that was never valid.
+    if ((uintptr_t)guest < 0x10000) {
+        static void *seen[8];
+        static unsigned n;
+        unsigned i = 0;
+        for (; i < n; i++) if (seen[i] == guest) break;
+        if (i == n && n < 8) {
+            seen[n++] = guest;
+            fprintf(stderr, "[klepton] bogus guest FILE * %p — routed to stderr\n", guest);
+        }
+        return stderr;
+    }
     return (FILE *)guest;
 }
 static int kl_fputc(int c, void *f)                { return fputc(c, kl_host_file(f)); }
