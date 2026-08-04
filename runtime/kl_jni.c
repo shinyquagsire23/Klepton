@@ -820,6 +820,18 @@ static const klj_field g_fields[] = {
     KLJ_FSTR("android/media/AudioManager", "PROPERTY_OUTPUT_FRAMES_PER_BUFFER",
              "android.media.property.OUTPUT_FRAMES_PER_BUFFER"),
     KLJ_FINT("android/media/AudioManager", "GET_DEVICES_OUTPUTS", 2),
+    KLJ_FINT("android/media/AudioManager", "STREAM_MUSIC", 3),
+
+    // View.SYSTEM_UI_FLAG_* and the window flag behind them. Real Android
+    // values: Unity ORs these together and hands the result straight back to
+    // setSystemUiVisibility, so a wrong bit here is a wrong request there.
+    KLJ_FINT("android/view/View", "SYSTEM_UI_FLAG_FULLSCREEN",            0x00000004),
+    KLJ_FINT("android/view/View", "SYSTEM_UI_FLAG_HIDE_NAVIGATION",       0x00000002),
+    KLJ_FINT("android/view/View", "SYSTEM_UI_FLAG_LAYOUT_STABLE",         0x00000100),
+    KLJ_FINT("android/view/View", "SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION",0x00000200),
+    KLJ_FINT("android/view/View", "SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN",     0x00000400),
+    KLJ_FINT("android/view/View", "SYSTEM_UI_FLAG_IMMERSIVE_STICKY",      0x00001000),
+    KLJ_FINT("android/view/WindowManager$LayoutParams", "FLAG_KEEP_SCREEN_ON", 0x00000080),
     KLJ_FSTR("android/content/pm/PackageManager", "FEATURE_AUDIO_LOW_LATENCY",
              "android.hardware.audio.low_latency"),
     KLJ_FINT("android/content/pm/PackageManager", "PERMISSION_GRANTED", 0),
@@ -1605,6 +1617,98 @@ unsigned kl_jni_drain_ui_tasks(void) {
     for (unsigned i = 0; i < n; i++)
         klj_proxy_invoke(batch[i], "java/lang/Runnable", "run", "()V", NULL);
     return n;
+}
+
+
+
+// The system-UI visibility group. Answered as a pair rather than call by call:
+// Unity sets a flag word and reads it straight back to confirm, so a setter that
+// discarded the value would make it retry forever.
+static int32_t g_system_ui_visibility;
+
+static klj_val klj_View_setSystemUiVisibility(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    g_system_ui_visibility = n > 0 ? (int32_t)a[0].j : 0;
+    KLJ_LOG("View.setSystemUiVisibility(0x%x) — recorded; there is no navigation "
+            "bar here to hide", g_system_ui_visibility);
+    return (klj_val){.j = 0};
+}
+
+static klj_val klj_View_getSystemUiVisibility(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)(int64_t)g_system_ui_visibility};
+}
+
+static klj_val klj_View_setSysUiListener(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // Recorded, and nothing is owed a callback: our visibility only ever changes
+    // because the guest changed it, and Android does not report those back.
+    KLJ_LOG("View.setOnSystemUiVisibilityChangeListener — recorded, never fires");
+    return (klj_val){.j = 0};
+}
+
+// ------------------------------------------------------ window flags / input
+//
+// The batch nativeRender reaches after audio. Mostly constants, and the methods
+// that consume them are recorded rather than applied: there is no window manager
+// here to keep a screen on or hide a navigation bar, and pretending otherwise
+// would be inventing behaviour rather than reporting it.
+static klj_val klj_Window_getDecorView(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *view;
+    return klj_singleton("android/view/View", &view);
+}
+
+static klj_val klj_Window_setFlags(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("Window.setFlags(0x%llx, mask 0x%llx) — recorded, not applied",
+            n > 0 ? (unsigned long long)a[0].j : 0ull,
+            n > 1 ? (unsigned long long)a[1].j : 0ull);
+    return (klj_val){.j = 0};
+}
+
+static klj_val klj_PowerManager_sustainedPerf(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // Answered false because it is true: nothing here honours a sustained
+    // performance request, and claiming it would have Unity size its frame
+    // budget against a guarantee we do not make.
+    return (klj_val){.j = 0};
+}
+
+static klj_val klj_InputDevice_getDeviceIds(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // Empty: no controllers are attached, which is the truth until M7 binds
+    // GameController. An invented id would have Unity poll a device that cannot
+    // answer.
+    static void *empty;
+    if (!empty) empty = klj_new_array('I', NULL, 0);
+    KLJ_LOG("InputDevice.getDeviceIds() -> [] (no input devices until M7)");
+    return (klj_val){.l = empty};
+}
+
+static klj_val klj_InputManager_registerListener(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // Same shape as registerDisplayListener: recorded, and nothing is owed a
+    // callback because our device set never changes.
+    KLJ_LOG("InputManager.registerInputDeviceListener — recorded; the device set never changes");
+    return (klj_val){.j = 0};
+}
+
+static klj_val klj_AudioManager_getStreamVolume(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    // Android's music stream runs 0..15 and Unity scales its mixer against it.
+    // Full volume is the honest answer for a host that has no volume control of
+    // its own to report.
+    KLJ_LOG("AudioManager.getStreamVolume(%lld) -> 15 (of 15)",
+            n > 0 ? (long long)(int32_t)a[0].j : -1);
+    return (klj_val){.j = 15};
+}
+
+static klj_val klj_UnityPlayer_getLaunchURL(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // null, and that is the answer rather than a placeholder: the app was not
+    // launched from a deep link, and Unity checks for null explicitly.
+    return (klj_val){.l = NULL};
 }
 
 // ---------------------------------------------------------------- audio
@@ -2521,6 +2625,19 @@ static klj_val klj_Box_floatValue(void *env, void *self, const klj_val *a, int n
 static const klj_binding g_bindings[] = {
     {"java/lang/reflect/Method", "getName", "()Ljava/lang/String;", klj_Method_getName},
     {"java/lang/reflect/Method", "getDeclaringClass", "()Ljava/lang/Class;", klj_Method_getDeclaringClass},
+    {"android/view/View", "setSystemUiVisibility", "(I)V", klj_View_setSystemUiVisibility},
+    {"android/view/View", "getSystemUiVisibility", "()I", klj_View_getSystemUiVisibility},
+    {"android/view/View", "setOnSystemUiVisibilityChangeListener",
+     "(Landroid/view/View$OnSystemUiVisibilityChangeListener;)V", klj_View_setSysUiListener},
+    {"android/view/Window", "getDecorView", "()Landroid/view/View;", klj_Window_getDecorView},
+    {"android/view/Window", "setFlags", "(II)V", klj_Window_setFlags},
+    {"android/os/PowerManager", "isSustainedPerformanceModeSupported", "()Z", klj_PowerManager_sustainedPerf},
+    {"android/view/InputDevice", "getDeviceIds", "()[I", klj_InputDevice_getDeviceIds},
+    {"android/hardware/input/InputManager", "registerInputDeviceListener",
+     "(Landroid/hardware/input/InputManager$InputDeviceListener;Landroid/os/Handler;)V",
+     klj_InputManager_registerListener},
+    {"android/media/AudioManager", "getStreamVolume", "(I)I", klj_AudioManager_getStreamVolume},
+    {"com/unity3d/player/UnityPlayer", "getLaunchURL", "()Ljava/lang/String;", klj_UnityPlayer_getLaunchURL},
     {"java/lang/Integer", "parseInt", "(Ljava/lang/String;)I", klj_Integer_parseInt},
     {"android/media/AudioManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", klj_AudioManager_getProperty},
     {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
