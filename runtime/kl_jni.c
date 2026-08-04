@@ -763,6 +763,17 @@ static float   klj_GetFloatField(void *e, void *o, void *f)        { (void)e; re
 #define KLJ_DISPLAY_ROTATION 0       /* Surface.ROTATION_0 */
 
 static const klj_field g_fields[] = {
+    // Audio. The PROPERTY_* values are the real Android key strings, so the
+    // getProperty implementation can match on them rather than on our own names.
+    KLJ_FSTR("android/media/AudioManager", "PROPERTY_OUTPUT_SAMPLE_RATE",
+             "android.media.property.OUTPUT_SAMPLE_RATE"),
+    KLJ_FSTR("android/media/AudioManager", "PROPERTY_OUTPUT_FRAMES_PER_BUFFER",
+             "android.media.property.OUTPUT_FRAMES_PER_BUFFER"),
+    KLJ_FINT("android/media/AudioManager", "GET_DEVICES_OUTPUTS", 2),
+    KLJ_FSTR("android/content/pm/PackageManager", "FEATURE_AUDIO_LOW_LATENCY",
+             "android.hardware.audio.low_latency"),
+    KLJ_FINT("android/content/pm/PackageManager", "PERMISSION_GRANTED", 0),
+
     KLJ_FSTR("android/content/Intent", "ACTION_MAIN", "android.intent.action.MAIN"),
 
     KLJ_FSTR("android/os/Environment", "MEDIA_MOUNTED", "mounted"),
@@ -1446,6 +1457,66 @@ static klj_val klj_Resources_getIdentifier(void *env, void *self, const klj_val 
             n > 0 ? klj_str(a[0].l) : "", n > 1 ? klj_str(a[1].l) : "",
             n > 2 ? klj_str(a[2].l) : "");
     return (klj_val){.j = 0};
+}
+
+static klj_val klj_Integer_parseInt(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *t = n > 0 ? klj_str(a[0].l) : NULL;
+    // Java throws NumberFormatException on garbage; nothing here can throw, and
+    // the only caller is FMOD reading back the audio properties we just handed
+    // it, so the input is our own string. strtol's 0 is the right answer for
+    // anything else and the log says when that happened.
+    long v = t ? strtol(t, NULL, 10) : 0;
+    if (!t) KLJ_LOG("Integer.parseInt(null) -> 0");
+    return (klj_val){.j = (uint64_t)(int64_t)(int32_t)v};
+}
+
+// ---------------------------------------------------------------- audio
+//
+// Answered as one description of an audio device rather than call by call, for
+// the same reason as the display group: Unity's FMOD asks for the sample rate
+// and the buffer size separately and then sizes its mixer from both, so two
+// answers that disagree are worse than either alone. 48 kHz / 256 frames is the
+// low-latency configuration a Quest 2 reports, and it is what the engine had
+// already inferred from the driver before it got this far.
+#define KLJ_AUDIO_RATE   48000
+#define KLJ_AUDIO_FRAMES 256
+
+static klj_val klj_AudioManager_getProperty(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *k = n > 0 ? klj_str(a[0].l) : "";
+    // The keys are the values of AudioManager.PROPERTY_* below; match on the
+    // documented strings so the two cannot drift apart.
+    if (strstr(k, "OUTPUT_SAMPLE_RATE")) {
+        KLJ_LOG("AudioManager.getProperty(OUTPUT_SAMPLE_RATE) -> %d", KLJ_AUDIO_RATE);
+        return (klj_val){.l = kl_jni_new_string("48000")};
+    }
+    if (strstr(k, "OUTPUT_FRAMES_PER_BUFFER")) {
+        KLJ_LOG("AudioManager.getProperty(OUTPUT_FRAMES_PER_BUFFER) -> %d", KLJ_AUDIO_FRAMES);
+        return (klj_val){.l = kl_jni_new_string("256")};
+    }
+    // Android returns null for an unknown property, and FMOD handles that.
+    KLJ_LOG("AudioManager.getProperty(\"%s\") -> null (unknown property)", k);
+    return (klj_val){.l = NULL};
+}
+
+static klj_val klj_PackageManager_hasSystemFeature(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *f = n > 0 ? klj_str(a[0].l) : "";
+    // Truthfully, for the device we present: a Quest 2 reports low-latency audio
+    // and it is the branch FMOD wants. Anything else is answered no rather than
+    // guessed yes — claiming a feature is a promise, same rule as the EGL and GL
+    // extension strings.
+    int has = strstr(f, "audio.low_latency") != NULL;
+    KLJ_LOG("PackageManager.hasSystemFeature(\"%s\") -> %s", f, has ? "true" : "false");
+    return (klj_val){.j = (uint64_t)has};
+}
+
+static klj_val klj_Context_checkPermission(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("Context.checkCallingOrSelfPermission(\"%s\") -> GRANTED",
+            n > 0 ? klj_str(a[0].l) : "");
+    return (klj_val){.j = 0};      // PackageManager.PERMISSION_GRANTED
 }
 
 // Window.getAttributes returns the live LayoutParams — the same object every
@@ -2312,6 +2383,11 @@ static klj_val klj_Box_floatValue(void *env, void *self, const klj_val *a, int n
 }
 
 static const klj_binding g_bindings[] = {
+    {"java/lang/Integer", "parseInt", "(Ljava/lang/String;)I", klj_Integer_parseInt},
+    {"android/media/AudioManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", klj_AudioManager_getProperty},
+    {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
+    {"android/content/Context", "checkCallingOrSelfPermission", "(Ljava/lang/String;)I", klj_Context_checkPermission},
+
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},
     {"java/lang/ClassLoader", "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", klj_ClassLoader_findLibrary},
