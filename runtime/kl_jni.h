@@ -53,9 +53,18 @@ void *kl_jni_new_string(const char *utf8);
 // Root for Context.getAssets()/AssetManager.open(). Defaults to "beatsaber/assets".
 // With no AAssetManager_* import, this JNI path is how assets reach Unity.
 void kl_jni_set_assets_dir(const char *dir);
+// Writable root behind getExternalFilesDir/getFilesDir/getCacheDir — where
+// Application.persistentDataPath lands. Created on demand. Default "build/android-files".
+void kl_jni_set_files_dir(const char *dir);
+// The APK, which Unity opens as a zip via getPackageCodePath(). Default "beatsaber.apk".
+void kl_jni_set_apk_path(const char *path);
 
 // Everything the guest asked us for: classes found, natives registered, and
 // every method/field id it wanted. This is the M4 work list.
 void kl_jni_report(FILE *out);
+
+// Runnables queued by Activity.runOnUiThread that nothing has run yet. Non-zero
+// means the guest is waiting on a UI-thread callback we do not yet deliver.
+unsigned kl_jni_pending_ui_tasks(void);
 
 #endif

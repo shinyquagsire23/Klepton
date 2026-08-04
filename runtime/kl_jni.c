@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include "klepton.h"
 #include "kl_jni.h"
 #include "kl_jni_slots.h"
@@ -487,18 +488,138 @@ static void *klj_NewObjectV(void *env, void *clazz, void *mid, kl_va *va) {
     return klj_call(env, clazz, mid, va, '?').l;
 }
 
+// ----------------------------------------------------------------- Java arrays
+// One representation for both flavours: object arrays hold jobjects, primitive
+// arrays hold a raw buffer. `kind` is the JNI type character, so the array's
+// class name is "[" + kind (or "[L<elem>;"), which is exactly what the guest
+// would see from GetObjectClass.
+typedef struct {
+    int    len;
+    char   kind;    // 'L' object, else 'Z' 'B' 'C' 'S' 'I' 'J' 'F' 'D'
+    size_t elem;    // element size in bytes (primitive arrays)
+    void  *data;    // void** when kind=='L', else a raw buffer
+} klj_array;
+
+static size_t klj_prim_size(char kind) {
+    switch (kind) {
+    case 'Z': case 'B': return 1;
+    case 'C': case 'S': return 2;
+    case 'I': case 'F': return 4;
+    case 'J': case 'D': return 8;
+    default:            return 0;
+    }
+}
+
+static void *klj_new_array(char kind, const char *elem_cls, int len) {
+    if (len < 0) len = 0;
+    klj_array *arr = calloc(1, sizeof *arr);
+    arr->len  = len;
+    arr->kind = kind;
+    if (kind == 'L') {
+        arr->data = calloc((size_t)len, sizeof(void *));
+    } else {
+        arr->elem = klj_prim_size(kind);
+        arr->data = calloc((size_t)len, arr->elem ? arr->elem : 1);
+    }
+    char cls[256];
+    if (kind == 'L') snprintf(cls, sizeof cls, "[L%s;", elem_cls ? elem_cls : "java/lang/Object");
+    else             snprintf(cls, sizeof cls, "[%c", kind);
+    void *obj = kl_jni_new_object(cls);
+    klj_as_object(obj)->data = arr;
+    return obj;
+}
+
+static klj_array *klj_arr(void *a) {
+    klj_object *o = klj_as_object(a);
+    return o ? o->data : NULL;
+}
+
+static kl_jint klj_GetArrayLength(void *env, void *a) {
+    (void)env;
+    klj_array *arr = klj_arr(a);
+    return arr ? arr->len : 0;
+}
+
+static void *klj_NewObjectArray(void *env, kl_jint len, void *elemClass, void *init) {
+    (void)env;
+    void      *obj = klj_new_array('L', klj_class_name(elemClass), len);
+    klj_array *arr = klj_arr(obj);
+    if (init)
+        for (int i = 0; i < arr->len; i++) ((void **)arr->data)[i] = init;
+    return obj;
+}
+static void *klj_GetObjectArrayElement(void *env, void *a, kl_jint i) {
+    (void)env;
+    klj_array *arr = klj_arr(a);
+    if (!arr || arr->kind != 'L' || i < 0 || i >= arr->len) return NULL;
+    return ((void **)arr->data)[i];
+}
+static void klj_SetObjectArrayElement(void *env, void *a, kl_jint i, void *v) {
+    (void)env;
+    klj_array *arr = klj_arr(a);
+    if (!arr || arr->kind != 'L' || i < 0 || i >= arr->len) return;
+    ((void **)arr->data)[i] = v;
+}
+
+// Primitive arrays. New<T>Array / Get<T>ArrayElements / Release / Get-SetRegion
+// all reduce to the same four shapes, so they are generated rather than typed
+// out nine times — the same reasoning as the JNI slot table.
+#define KLJ_PRIM_ARRAY(Name, kind)                                                    \
+    static void *klj_New##Name##Array(void *env, kl_jint len) {                       \
+        (void)env; return klj_new_array(kind, NULL, len);                             \
+    }                                                                                 \
+    static void *klj_Get##Name##ArrayElements(void *env, void *a, uint8_t *isCopy) {  \
+        (void)env; if (isCopy) *isCopy = 0;                                           \
+        klj_array *arr = klj_arr(a); return arr ? arr->data : NULL;                   \
+    }                                                                                 \
+    static void klj_Release##Name##ArrayElements(void *env, void *a, void *p, kl_jint m) { \
+        (void)env; (void)a; (void)p; (void)m;   /* never a copy, nothing to write back */ \
+    }                                                                                 \
+    static void klj_Get##Name##ArrayRegion(void *env, void *a, kl_jint start,         \
+                                           kl_jint len, void *buf) {                  \
+        (void)env; klj_array *arr = klj_arr(a);                                       \
+        if (!arr || start < 0 || len < 0 || start + len > arr->len) return;           \
+        memcpy(buf, (char *)arr->data + (size_t)start * arr->elem, (size_t)len * arr->elem); \
+    }                                                                                 \
+    static void klj_Set##Name##ArrayRegion(void *env, void *a, kl_jint start,         \
+                                           kl_jint len, const void *buf) {            \
+        (void)env; klj_array *arr = klj_arr(a);                                       \
+        if (!arr || start < 0 || len < 0 || start + len > arr->len) return;           \
+        memcpy((char *)arr->data + (size_t)start * arr->elem, buf, (size_t)len * arr->elem); \
+    }
+KLJ_PRIM_ARRAY(Boolean, 'Z') KLJ_PRIM_ARRAY(Byte,  'B') KLJ_PRIM_ARRAY(Char,   'C')
+KLJ_PRIM_ARRAY(Short,   'S') KLJ_PRIM_ARRAY(Int,   'I') KLJ_PRIM_ARRAY(Long,   'J')
+KLJ_PRIM_ARRAY(Float,   'F') KLJ_PRIM_ARRAY(Double,'D')
+#undef KLJ_PRIM_ARRAY
+
 // -------------------------------------------------------- Java field dispatch
 // Fields are simpler than methods: everything the guest reads so far is a
 // compile-time constant off a framework class, so the binding is a value rather
 // than a function. `cached` keeps a constant's jstring identity stable across
 // reads, which is what a real static final String would do.
+typedef klj_val (*klj_field_fn)(void);   // for values only known at runtime
+
 typedef struct {
-    const char *cls, *name, *sig;
-    const char *sval;     // for object fields — currently always String constants
-    int64_t     ival;     // for primitive fields
-    void       *cached;
+    const char  *cls, *name, *sig;
+    const char  *sval;    // for object fields — String constants
+    int64_t      ival;    // for primitive fields
+    klj_field_fn fn;      // takes precedence: paths and other configured values
 } klj_field;
-static klj_field g_fields[];
+static const klj_field g_fields[];
+
+// Interned jstrings for constant object fields, parallel to g_fields so the
+// table itself stays const. A static final String read twice is the same object
+// in Java, and some callers do compare identity.
+#define KLJ_MAX_FIELDS 128
+static void *g_field_cache[KLJ_MAX_FIELDS];
+
+// Defined further down with the rest of the Java implementations.
+static void   *klj_new_file(const char *path);
+static klj_val klj_appinfo_sourceDir(void);
+static klj_val klj_appinfo_nativeLibraryDir(void);
+static klj_val klj_appinfo_dataDir(void);
+static klj_val klj_appinfo_splitSourceDirs(void);
+static klj_val klj_metaData_field(void);
 
 static klj_val klj_field_value(void *fid, char want) {
     klj_wanted *w = fid;
@@ -507,12 +628,17 @@ static klj_val klj_field_value(void *fid, char want) {
         kl_jni_report(stderr);
         kl_fatal_prepare(); abort();
     }
-    for (klj_field *f = g_fields; f->cls; f++) {
+    for (const klj_field *f = g_fields; f->cls; f++) {
         if (strcmp(f->cls, w->cls) || strcmp(f->name, w->name) || strcmp(f->sig, w->sig))
             continue;
+        if (f->fn) return f->fn();
         if (want == 'L') {
-            if (!f->cached) f->cached = kl_jni_new_string(f->sval);
-            return (klj_val){.l = f->cached};
+            size_t idx = (size_t)(f - g_fields);
+            if (idx < KLJ_MAX_FIELDS) {
+                if (!g_field_cache[idx]) g_field_cache[idx] = kl_jni_new_string(f->sval);
+                return (klj_val){.l = g_field_cache[idx]};
+            }
+            return (klj_val){.l = kl_jni_new_string(f->sval)};
         }
         return (klj_val){.j = (uint64_t)f->ival};
     }
@@ -535,12 +661,70 @@ static uint8_t klj_GetStaticBooleanField(void *e, void *c, void *f){ (void)e; (v
 static uint8_t klj_GetBooleanField(void *e, void *o, void *f)      { (void)e; (void)o; return (uint8_t)klj_field_value(f, 'Z').j; }
 
 // Documented Android platform constants — fixed values, not choices.
-static klj_field g_fields[] = {
-    {"android/content/Intent", "ACTION_MAIN", "Ljava/lang/String;", "android.intent.action.MAIN", 0, NULL},
-    {"android/content/pm/PackageManager", "GET_ACTIVITIES",     "I", NULL, 0x0001, NULL},
-    {"android/content/pm/PackageManager", "GET_INTENT_FILTERS", "I", NULL, 0x0020, NULL},
-    {"android/content/pm/PackageManager", "GET_META_DATA",      "I", NULL, 0x0080, NULL},
-    {NULL, NULL, NULL, NULL, 0, NULL},
+#define KLJ_FSTR(c, n, v)     {.cls = c, .name = n, .sig = "Ljava/lang/String;", .sval = v}
+#define KLJ_FINT(c, n, v)     {.cls = c, .name = n, .sig = "I", .ival = v}
+#define KLJ_FFN(c, n, s, f)   {.cls = c, .name = n, .sig = s, .fn = f}
+#define KLJ_CTX_SVC(field, name) KLJ_FSTR("android/content/Context", field, name)
+static const klj_field g_fields[] = {
+    KLJ_FSTR("android/content/Intent", "ACTION_MAIN", "android.intent.action.MAIN"),
+
+    KLJ_FSTR("android/os/Environment", "MEDIA_MOUNTED", "mounted"),
+
+    // ApplicationInfo is read field-by-field, and these depend on runtime
+    // configuration rather than being compile-time constants.
+    KLJ_FFN("android/content/pm/ApplicationInfo", "sourceDir",        "Ljava/lang/String;", klj_appinfo_sourceDir),
+    KLJ_FFN("android/content/pm/ApplicationInfo", "publicSourceDir",  "Ljava/lang/String;", klj_appinfo_sourceDir),
+    KLJ_FFN("android/content/pm/ApplicationInfo", "nativeLibraryDir", "Ljava/lang/String;", klj_appinfo_nativeLibraryDir),
+    KLJ_FFN("android/content/pm/ApplicationInfo", "dataDir",          "Ljava/lang/String;", klj_appinfo_dataDir),
+    KLJ_FFN("android/content/pm/ApplicationInfo", "splitSourceDirs",       "[Ljava/lang/String;", klj_appinfo_splitSourceDirs),
+    KLJ_FFN("android/content/pm/ApplicationInfo", "splitPublicSourceDirs", "[Ljava/lang/String;", klj_appinfo_splitSourceDirs),
+    KLJ_FINT("android/content/pm/ApplicationInfo", "flags", 0),
+
+    KLJ_FSTR("android/content/pm/PackageInfo", "versionName", "1.28.0_4124311467"),
+    KLJ_FINT("android/content/pm/PackageInfo", "versionCode", 545),
+    KLJ_FSTR("android/content/pm/PackageInfo", "packageName", "com.beatgames.beatsaber"),
+
+    KLJ_FFN("android/content/pm/PackageItemInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),
+    KLJ_FFN("android/content/pm/ApplicationInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),
+
+    // We present a Quest-shaped device, and that is a deliberate choice rather
+    // than an oversight. The guest's whole VR stack branches on these: Oculus
+    // code checks MANUFACTURER, and AndroidManifest.xml declares
+    // com.oculus.supportedDevices="quest|delmar" (delmar is Quest 2). Reporting
+    // Apple hardware would be more literally true and would fail every one of
+    // those checks. API 29 is what the Quest 2 reported for this build's era —
+    // below the app's targetSdkVersion of 30, so Unity takes the compatibility
+    // paths the title actually shipped against. Revisit if a path needs 30+.
+    KLJ_FINT("android/os/Build$VERSION", "SDK_INT", 29),
+    KLJ_FSTR("android/os/Build$VERSION", "RELEASE", "10"),
+    KLJ_FSTR("android/os/Build", "MANUFACTURER", "Oculus"),
+    KLJ_FSTR("android/os/Build", "BRAND",        "oculus"),
+    KLJ_FSTR("android/os/Build", "MODEL",        "Quest 2"),
+    KLJ_FSTR("android/os/Build", "DEVICE",       "delmar"),
+    KLJ_FSTR("android/os/Build", "PRODUCT",      "delmar"),
+    KLJ_FSTR("android/os/Build", "HARDWARE",     "qcom"),
+
+
+    KLJ_FINT("android/content/Context", "MODE_PRIVATE", 0),
+
+    KLJ_CTX_SVC("LOCATION_SERVICE",     "location"),
+    KLJ_CTX_SVC("AUDIO_SERVICE",        "audio"),
+    KLJ_CTX_SVC("WINDOW_SERVICE",       "window"),
+    KLJ_CTX_SVC("ACTIVITY_SERVICE",     "activity"),
+    KLJ_CTX_SVC("SENSOR_SERVICE",       "sensor"),
+    KLJ_CTX_SVC("POWER_SERVICE",        "power"),
+    KLJ_CTX_SVC("VIBRATOR_SERVICE",     "vibrator"),
+    KLJ_CTX_SVC("CONNECTIVITY_SERVICE", "connectivity"),
+    KLJ_CTX_SVC("WIFI_SERVICE",         "wifi"),
+    KLJ_CTX_SVC("INPUT_SERVICE",        "input"),
+    KLJ_CTX_SVC("DISPLAY_SERVICE",      "display"),
+    KLJ_CTX_SVC("CLIPBOARD_SERVICE",    "clipboard"),
+    KLJ_CTX_SVC("NOTIFICATION_SERVICE", "notification"),
+
+    KLJ_FINT("android/content/pm/PackageManager", "GET_ACTIVITIES",     0x0001),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_INTENT_FILTERS", 0x0020),
+    KLJ_FINT("android/content/pm/PackageManager", "GET_META_DATA",      0x0080),
+    {.cls = NULL},
 };
 
 // ------------------------------------------------------------ Java class impls
@@ -737,6 +921,40 @@ static klj_val klj_PM_queryIntentActivities(void *env, void *self, const klj_val
     return (klj_val){.l = list};
 }
 
+// A constructor whose only job is to produce an identity. `self` is the jclass
+// NewObject was given, so this stays correct for any class that needs no state —
+// unlike the hardcoded class name a per-type <init> would use.
+static klj_val klj_generic_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object(klj_class_name(clazz))};
+}
+
+// Unity's JNIBridge builds a java.lang.reflect.Proxy implementing the given
+// interfaces, backed by a native pointer; when Android later calls a method on
+// it, JNIBridge.invoke(ptr, Class, Method, Object[]) forwards into native code.
+// We are the Java side, so the proxy is just an object remembering the pointer.
+// Nothing calls back into it until we start synthesising Android events, but the
+// interface list is worth logging — it names every callback the engine expects.
+typedef struct { int64_t native_ptr; void *classes; } klj_proxy;
+
+static klj_val klj_JNIBridge_newInterfaceProxy(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    klj_proxy *p = calloc(1, sizeof *p);
+    p->native_ptr = n > 0 ? (int64_t)a[0].j : 0;
+    p->classes    = n > 1 ? a[1].l : NULL;
+
+    klj_array *ifaces = p->classes ? klj_arr(p->classes) : NULL;
+    if (ifaces && ifaces->kind == 'L')
+        for (int i = 0; i < ifaces->len; i++)
+            KLJ_LOG("newInterfaceProxy: implements %s (native 0x%llx)",
+                    klj_class_name(((void **)ifaces->data)[i]),
+                    (unsigned long long)p->native_ptr);
+
+    void *obj = kl_jni_new_object("bitter/jnibridge/JNIBridge$Proxy");
+    klj_as_object(obj)->data = p;
+    return (klj_val){.l = obj};
+}
+
 static klj_val klj_Context_getPackageManager(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *pm;
@@ -748,6 +966,284 @@ static klj_val klj_Context_getPackageName(void *env, void *self, const klj_val *
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.l = kl_jni_new_string("com.beatgames.beatsaber")};
 }
+// getSystemService returns the manager object for a service name. Returning null
+// for an unknown one is legitimate Android — a device need not offer every
+// service — so unknowns are logged rather than fabricated.
+static klj_val klj_Context_getSystemService(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    static const struct { const char *svc, *cls; } services[] = {
+        {"location",     "android/location/LocationManager"},
+        {"audio",        "android/media/AudioManager"},
+        {"window",       "android/view/WindowManager"},
+        {"activity",     "android/app/ActivityManager"},
+        {"sensor",       "android/hardware/SensorManager"},
+        {"power",        "android/os/PowerManager"},
+        {"vibrator",     "android/os/Vibrator"},
+        {"connectivity", "android/net/ConnectivityManager"},
+        {"wifi",         "android/net/wifi/WifiManager"},
+        {"input",        "android/hardware/input/InputManager"},
+        {"display",      "android/hardware/display/DisplayManager"},
+        {"clipboard",    "android/content/ClipboardManager"},
+        {"notification", "android/app/NotificationManager"},
+        {NULL, NULL},
+    };
+    const char *want = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!want) return (klj_val){.l = NULL};
+    // One instance per service, as Android does — callers compare identity.
+    static void *cache[sizeof services / sizeof services[0]];
+    for (unsigned i = 0; services[i].svc; i++) {
+        if (strcmp(services[i].svc, want)) continue;
+        if (!cache[i]) cache[i] = kl_jni_new_object(services[i].cls);
+        KLJ_LOG("getSystemService(\"%s\") -> %s", want, services[i].cls);
+        return (klj_val){.l = cache[i]};
+    }
+    KLJ_LOG("getSystemService(\"%s\") -> null (unknown service)", want);
+    return (klj_val){.l = NULL};
+}
+
+// String.equals compares content, not identity — which matters, because our
+// jstrings are freshly allocated per call and a constant read twice is not the
+// same object. Anything comparing strings must come through here.
+static klj_val klj_String_equals(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *x = klj_str(self);
+    const char *y = n > 0 ? klj_str(a[0].l) : NULL;
+    return (klj_val){.j = (x && y && strcmp(x, y) == 0)};
+}
+static klj_val klj_String_length(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    const char *s = klj_str(self);
+    return (klj_val){.j = s ? strlen(s) : 0};
+}
+
+// ---- storage ----
+// Unity asks the Context where it may write: Application.persistentDataPath comes
+// from getExternalFilesDir, and saves and player prefs land there. These must be
+// real, writable directories — a stub path would make the first write fail deep
+// inside the engine rather than here.
+static const char *g_files_dir = "build/android-files";
+void kl_jni_set_files_dir(const char *dir) { g_files_dir = dir; }
+
+// The APK itself. Unity opens this as a zip to read streaming assets, so it has
+// to be a real file — the unpacked tree under beatsaber/ is not a substitute.
+static const char *g_apk_path = "beatsaber.apk";
+void kl_jni_set_apk_path(const char *path) { g_apk_path = path; }
+
+static klj_val klj_Context_getPackageCodePath(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("getPackageCodePath() -> %s", g_apk_path);
+    return (klj_val){.l = kl_jni_new_string(g_apk_path)};
+}
+
+// Where the guest's own .so files live. Unity reads this to dlopen further
+// libraries, and our guest dlopen resolves against the same directory.
+static const char *g_native_lib_dir = "beatsaber/lib/arm64-v8a";
+void kl_jni_set_native_lib_dir(const char *dir) { g_native_lib_dir = dir; }
+
+// ApplicationInfo is a plain data holder — Unity reads its fields directly
+// rather than calling accessors, so these are field getters, not methods.
+static klj_val klj_appinfo_sourceDir(void)     { return (klj_val){.l = kl_jni_new_string(g_apk_path)}; }
+static klj_val klj_appinfo_nativeLibraryDir(void) { return (klj_val){.l = kl_jni_new_string(g_native_lib_dir)}; }
+static klj_val klj_appinfo_dataDir(void)       { return (klj_val){.l = kl_jni_new_string(g_files_dir)}; }
+// This APK is not a split install, so there are no additional source dirs. An
+// empty array says that unambiguously; Android would say null, and both read as
+// "no splits" to a caller that checks length.
+static klj_val klj_appinfo_splitSourceDirs(void) {
+    static void *empty;
+    if (!empty) empty = klj_new_array('L', "java/lang/String", 0);
+    return (klj_val){.l = empty};
+}
+
+// No OBB expansion files: this APK carries its assets inline, and there is no
+// /Android/obb to point at. An empty array is the real answer for such an app.
+static klj_val klj_Context_getObbDirs(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *empty;
+    if (!empty) empty = klj_new_array('L', "java/io/File", 0);
+    return (klj_val){.l = empty};
+}
+
+// Android returns a File here whether or not the directory exists; ours is
+// created, which is harmless and keeps any later write working.
+static klj_val klj_Context_getObbDir(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/obb", g_files_dir);
+    return (klj_val){.l = klj_new_file(path)};
+}
+
+// ---- UI thread queue ----
+// runOnUiThread posts to the main looper and returns; it does not run the
+// Runnable inline unless already on that thread. Queuing is therefore the
+// faithful behaviour, not a shortcut.
+//
+// What *is* missing: nothing drains this queue. Draining it means calling back
+// into the guest through the proxy's JNIBridge.invoke(ptr, Class, Method,
+// Object[]), which needs synthetic java.lang.reflect.Method objects — a distinct
+// piece of work from anything above, since every JNI call so far has been guest
+// to host. The count is exposed so the gap shows up as a number rather than as
+// silently skipped work.
+#define KLJ_MAX_UI_TASKS 64
+static void    *g_ui_tasks[KLJ_MAX_UI_TASKS];
+static unsigned g_ui_task_n;
+
+unsigned kl_jni_pending_ui_tasks(void) { return g_ui_task_n; }
+
+static klj_val klj_Activity_runOnUiThread(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n > 0 && g_ui_task_n < KLJ_MAX_UI_TASKS) g_ui_tasks[g_ui_task_n++] = a[0].l;
+    KLJ_LOG("runOnUiThread: queued (%u pending, nothing drains them yet)", g_ui_task_n);
+    return (klj_val){0};
+}
+
+// ---- manifest meta-data ----
+// PackageItemInfo.metaData is the <meta-data> block from AndroidManifest.xml,
+// and it is real configuration rather than boilerplate: Unity reads its splash
+// settings from here and the Oculus layer reads focus-awareness and the
+// supported-device list. Returning a null Bundle would silently drop all of it,
+// so the values are transcribed from the APK's own manifest.
+static const struct { const char *key, *val; } g_metadata[] = {
+    {"unity.splash-mode",                   "0"},
+    {"unity.splash-enable",                 "false"},
+    {"unity.build-id",                      "7a1e012b-c456-4b79-b3d2-b878d039f91e"},
+    {"unityplayer.SkipPermissionsDialog",   "false"},
+    {"com.oculus.ossplash",                 "true"},
+    {"com.oculus.vr.focusaware",            "true"},
+    {"com.oculus.supportedDevices",         "quest|delmar"},
+    {"com.samsung.android.vr.application.mode", "vr_only"},
+    {NULL, NULL},
+};
+
+static const char *klj_meta(const char *key) {
+    for (int i = 0; g_metadata[i].key; i++)
+        if (key && strcmp(g_metadata[i].key, key) == 0) return g_metadata[i].val;
+    return NULL;
+}
+
+static klj_val klj_metaData_field(void) {
+    static void *bundle;
+    if (!bundle) bundle = kl_jni_new_object("android/os/Bundle");
+    return (klj_val){.l = bundle};
+}
+
+// Bundle accessors. The two-argument forms take a default, which is what Android
+// returns for a missing key; the one-argument forms return the type's zero.
+static klj_val klj_Bundle_getString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *v = klj_meta(n > 0 ? klj_str(a[0].l) : NULL);
+    if (!v && n > 1) return (klj_val){.l = a[1].l};
+    return (klj_val){.l = v ? kl_jni_new_string(v) : NULL};
+}
+static klj_val klj_Bundle_getBoolean(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *v = klj_meta(n > 0 ? klj_str(a[0].l) : NULL);
+    if (!v) return (klj_val){.j = n > 1 ? a[1].j : 0};
+    return (klj_val){.j = strcmp(v, "true") == 0};
+}
+static klj_val klj_Bundle_getInt(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *v = klj_meta(n > 0 ? klj_str(a[0].l) : NULL);
+    if (!v) return (klj_val){.j = n > 1 ? a[1].j : 0};
+    return (klj_val){.j = (uint64_t)(int64_t)strtol(v, NULL, 10)};
+}
+static klj_val klj_Bundle_containsKey(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return (klj_val){.j = klj_meta(n > 0 ? klj_str(a[0].l) : NULL) != NULL};
+}
+
+// PackageInfo, like ApplicationInfo, is read field-by-field. Values come from
+// the APK's own manifest (apktool.yml: versionCode 545, versionName 1.28.0_...).
+static klj_val klj_PM_getPackageInfo(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *pi;
+    return klj_singleton("android/content/pm/PackageInfo", &pi);
+}
+
+static klj_val klj_Context_getApplicationInfo(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *ai;
+    return klj_singleton("android/content/pm/ApplicationInfo", &ai);
+}
+
+static void klj_mkdir_p(const char *path) {
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    for (char *p = tmp + 1; *p; p++)
+        if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+    mkdir(tmp, 0755);
+}
+
+// java/io/File carries its path as the payload; that is all anything reads.
+static void *klj_new_file(const char *path) {
+    klj_mkdir_p(path);
+    void *obj = kl_jni_new_object("java/io/File");
+    klj_as_object(obj)->data = strdup(path);
+    return obj;
+}
+static klj_val klj_File_getPath(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    return (klj_val){.l = kl_jni_new_string(o && o->data ? o->data : "")};
+}
+// java.io.File.getParent() returns null, not "", when there is no parent.
+static klj_val klj_File_getParent(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o    = klj_as_object(self);
+    const char *path = o ? o->data : NULL;
+    const char *cut  = path ? strrchr(path, '/') : NULL;
+    if (!cut) return (klj_val){.l = NULL};
+    char parent[1024];
+    size_t len = (size_t)(cut - path);
+    if (len == 0) len = 1;                       // "/x" -> "/"
+    if (len >= sizeof parent) len = sizeof parent - 1;
+    memcpy(parent, path, len);
+    parent[len] = '\0';
+    return (klj_val){.l = kl_jni_new_string(parent)};
+}
+
+// getExternalFilesDir(type): type selects a subdirectory ("music", "pictures"),
+// and null means the root — which is what Unity passes.
+static klj_val klj_Context_getExternalFilesDir(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *type = n > 0 && a[0].l ? klj_str(a[0].l) : NULL;
+    char path[1024];
+    if (type && *type) snprintf(path, sizeof path, "%s/files/%s", g_files_dir, type);
+    else               snprintf(path, sizeof path, "%s/files", g_files_dir);
+    KLJ_LOG("getExternalFilesDir(%s) -> %s", type ? type : "null", path);
+    return (klj_val){.l = klj_new_file(path)};
+}
+static klj_val klj_Context_getFilesDir(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/files", g_files_dir);
+    return (klj_val){.l = klj_new_file(path)};
+}
+static klj_val klj_Context_getCacheDir(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/cache", g_files_dir);
+    return (klj_val){.l = klj_new_file(path)};
+}
+
+// Our storage is a plain writable directory, so "mounted" is the honest state.
+// Any other value sends Unity down a read-only or unavailable-storage path.
+static klj_val klj_Environment_getExternalStorageState(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("mounted")};
+}
+static klj_val klj_Environment_getExternalStorageDirectory(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = klj_new_file(g_files_dir)};
+}
+
+// There is no ARCore here and there never will be — Vision Pro's world sensing
+// arrives through ARKit under our own ovrp_* layer (M6), not through Google AR.
+// False is the truthful answer, and Unity has a supported no-AR path.
+static klj_val klj_UnityPlayer_initializeGoogleAr(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
 static klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *am;
@@ -854,6 +1350,7 @@ static const klj_binding g_bindings[] = {
     {"java/lang/StringBuilder", "append", "(F)Ljava/lang/StringBuilder;", klj_SB_append_F},
 
     {"android/app/Activity",   "getIntent",  "()Landroid/content/Intent;", klj_Activity_getIntent},
+    {"android/app/Activity",   "runOnUiThread", "(Ljava/lang/Runnable;)V", klj_Activity_runOnUiThread},
     {"android/content/Intent", "getExtras",  "()Landroid/os/Bundle;",      klj_Intent_getExtras},
     {"android/content/Intent", "<init>",     "(Ljava/lang/String;)V",      klj_Intent_init},
     {"android/content/Intent", "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_addCategory},
@@ -862,9 +1359,44 @@ static const klj_binding g_bindings[] = {
     {"android/content/Context", "getAssets", "()Landroid/content/res/AssetManager;", klj_Context_getAssets},
     {"android/content/Context", "getPackageManager", "()Landroid/content/pm/PackageManager;", klj_Context_getPackageManager},
     {"android/content/Context", "getPackageName", "()Ljava/lang/String;", klj_Context_getPackageName},
+    {"android/content/Context", "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", klj_Context_getSystemService},
+    {"android/content/Context", "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;", klj_Context_getExternalFilesDir},
+    {"android/content/Context", "getFilesDir", "()Ljava/io/File;", klj_Context_getFilesDir},
+    {"android/content/Context", "getCacheDir", "()Ljava/io/File;", klj_Context_getCacheDir},
+    {"android/content/Context", "getPackageCodePath", "()Ljava/lang/String;", klj_Context_getPackageCodePath},
+    {"android/content/Context", "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", klj_Context_getApplicationInfo},
+    {"android/content/Context", "getObbDirs", "()[Ljava/io/File;", klj_Context_getObbDirs},
+    {"android/content/Context", "getObbDir",  "()Ljava/io/File;",  klj_Context_getObbDir},
+    {"android/content/pm/PackageManager", "getPackageInfo",
+     "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;", klj_PM_getPackageInfo},
+    // Same singleton the Context hands out — there is one application here.
+    {"android/content/pm/PackageManager", "getApplicationInfo",
+     "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;", klj_Context_getApplicationInfo},
+    {"android/os/Environment", "getExternalStorageState", "()Ljava/lang/String;", klj_Environment_getExternalStorageState},
+    {"android/os/Environment", "getExternalStorageDirectory", "()Ljava/io/File;", klj_Environment_getExternalStorageDirectory},
+    {"java/io/File", "getAbsolutePath", "()Ljava/lang/String;", klj_File_getPath},
+    {"java/io/File", "getPath",         "()Ljava/lang/String;", klj_File_getPath},
+    {"java/io/File", "getCanonicalPath","()Ljava/lang/String;", klj_File_getPath},
+    {"java/io/File", "getParent",       "()Ljava/lang/String;", klj_File_getParent},
     {"android/content/res/AssetManager", "open", "(Ljava/lang/String;)Ljava/io/InputStream;", klj_AssetManager_open},
     {"android/content/pm/PackageManager", "queryIntentActivities",
      "(Landroid/content/Intent;I)Ljava/util/List;", klj_PM_queryIntentActivities},
+    {"java/lang/Object", "<init>", "()V", klj_generic_init},
+    {"java/lang/String", "equals", "(Ljava/lang/Object;)Z", klj_String_equals},
+    {"java/lang/String", "length", "()I",                   klj_String_length},
+    {"com/unity3d/player/UnityPlayer", "initializeGoogleAr", "()Z", klj_UnityPlayer_initializeGoogleAr},
+
+    {"bitter/jnibridge/JNIBridge", "newInterfaceProxy",
+     "(J[Ljava/lang/Class;)Ljava/lang/Object;", klj_JNIBridge_newInterfaceProxy},
+
+    {"android/os/Bundle", "getString",  "(Ljava/lang/String;)Ljava/lang/String;", klj_Bundle_getString},
+    {"android/os/Bundle", "getString",  "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", klj_Bundle_getString},
+    {"android/os/Bundle", "getBoolean", "(Ljava/lang/String;)Z",  klj_Bundle_getBoolean},
+    {"android/os/Bundle", "getBoolean", "(Ljava/lang/String;Z)Z", klj_Bundle_getBoolean},
+    {"android/os/Bundle", "getInt",     "(Ljava/lang/String;)I",  klj_Bundle_getInt},
+    {"android/os/Bundle", "getInt",     "(Ljava/lang/String;I)I", klj_Bundle_getInt},
+    {"android/os/Bundle", "containsKey","(Ljava/lang/String;)Z",  klj_Bundle_containsKey},
+
     {"java/util/List", "size",    "()I",                 klj_List_size},
     {"java/util/List", "isEmpty", "()Z",                 klj_List_isEmpty},
     {"java/util/List", "get",  "(I)Ljava/lang/Object;",  klj_List_get},
@@ -976,6 +1508,19 @@ static void klj_build_tables(void) {
     ENVCALL(Double); ENVCALL(Void);
 #undef ENVCALL
     ENV(NewObjectV, klj_NewObjectV);
+    ENV(GetArrayLength,          klj_GetArrayLength);
+    ENV(NewObjectArray,          klj_NewObjectArray);
+    ENV(GetObjectArrayElement,   klj_GetObjectArrayElement);
+    ENV(SetObjectArrayElement,   klj_SetObjectArrayElement);
+#define ENVARR(Name) \
+    ENV(New##Name##Array, klj_New##Name##Array); \
+    ENV(Get##Name##ArrayElements, klj_Get##Name##ArrayElements); \
+    ENV(Release##Name##ArrayElements, klj_Release##Name##ArrayElements); \
+    ENV(Get##Name##ArrayRegion, klj_Get##Name##ArrayRegion); \
+    ENV(Set##Name##ArrayRegion, klj_Set##Name##ArrayRegion)
+    ENVARR(Boolean); ENVARR(Byte);  ENVARR(Char);   ENVARR(Short);
+    ENVARR(Int);     ENVARR(Long);  ENVARR(Float);  ENVARR(Double);
+#undef ENVARR
     ENV(GetStaticObjectField,  klj_GetStaticObjectField);
     ENV(GetObjectField,        klj_GetObjectField);
     ENV(GetStaticIntField,     klj_GetStaticIntField);
