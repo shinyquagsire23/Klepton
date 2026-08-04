@@ -1,0 +1,257 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		KLEPT0N0023BSWFT00000000 /* app.swift in Sources */ = {isa = PBXBuildFile; fileRef = KLEPT0N0017FSWFT00000000; };
+		KLEPT0N0024BC00000000000 /* probes.c in Sources */ = {isa = PBXBuildFile; fileRef = KLEPT0N0018FC00000000000; };
+		KLEPT0N0025BLNKA00000000 /* A in Frameworks */ = {isa = PBXBuildFile; fileRef = KLEPT0N0021FFWA000000000; };
+		KLEPT0N0026BLNKB00000000 /* B in Frameworks */ = {isa = PBXBuildFile; fileRef = KLEPT0N0022FFWB000000000; };
+		KLEPT0N0027BEMBA00000000 /* A in Embed */ = {isa = PBXBuildFile; fileRef = KLEPT0N0021FFWA000000000; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		KLEPT0N0028BEMBB00000000 /* B in Embed */ = {isa = PBXBuildFile; fileRef = KLEPT0N0022FFWB000000000; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		KLEPT0N0003PROD000000000 /* KleptonProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KleptonProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		KLEPT0N0017FSWFT00000000 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KleptonProbeApp.swift; sourceTree = "<group>"; };
+		KLEPT0N0018FC00000000000 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = probes.c; sourceTree = "<group>"; };
+		KLEPT0N0019FH00000000000 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = probes.h; sourceTree = "<group>"; };
+		KLEPT0N0020FBRDG00000000 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "KleptonProbe-Bridging-Header.h"; sourceTree = "<group>"; };
+		KLEPT0N0021FFWA000000000 = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = KleptonProbeA.xcframework; path = Frameworks/KleptonProbeA.xcframework; sourceTree = "<group>"; };
+		KLEPT0N0022FFWB000000000 = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = KleptonProbeB.xcframework; path = Frameworks/KleptonProbeB.xcframework; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		KLEPT0N0009BPFRM00000000 = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				KLEPT0N0025BLNKA00000000,
+				KLEPT0N0026BLNKB00000000,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		KLEPT0N0010BPEMB00000000 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				KLEPT0N0027BEMBA00000000,
+				KLEPT0N0028BEMBB00000000,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXGroup section */
+		KLEPT0N0004GROOT00000000 = {
+			isa = PBXGroup;
+			children = (
+				KLEPT0N0005GSRC000000000,
+				KLEPT0N0006GFW0000000000,
+				KLEPT0N0007GPRODS0000000,
+			);
+			sourceTree = "<group>";
+		};
+		KLEPT0N0005GSRC000000000 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				KLEPT0N0017FSWFT00000000,
+				KLEPT0N0018FC00000000000,
+				KLEPT0N0019FH00000000000,
+				KLEPT0N0020FBRDG00000000,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		KLEPT0N0006GFW0000000000 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				KLEPT0N0021FFWA000000000,
+				KLEPT0N0022FFWB000000000,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		KLEPT0N0007GPRODS0000000 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				KLEPT0N0003PROD000000000,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		KLEPT0N0002TGT0000000000 /* KleptonProbe */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = KLEPT0N0012CLTGT00000000;
+			buildPhases = (
+				KLEPT0N0008BPSRC00000000,
+				KLEPT0N0009BPFRM00000000,
+				KLEPT0N0010BPEMB00000000,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = KleptonProbe;
+			productName = KleptonProbe;
+			productReference = KLEPT0N0003PROD000000000;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		KLEPT0N0001PROJ000000000 = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					KLEPT0N0002TGT0000000000 = { CreatedOnToolsVersion = 16.0; };
+				};
+			};
+			buildConfigurationList = KLEPT0N0011CLPRJ00000000;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base, );
+			mainGroup = KLEPT0N0004GROOT00000000;
+			productRefGroup = KLEPT0N0007GPRODS0000000;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				KLEPT0N0002TGT0000000000,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		KLEPT0N0008BPSRC00000000 = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				KLEPT0N0023BSWFT00000000,
+				KLEPT0N0024BC00000000000,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		KLEPT0N0013CPRJD00000000 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = ( "DEBUG=1", "$(inherited)", );
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		KLEPT0N0014CPRJR00000000 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		KLEPT0N0015CTGTD00000000 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = A2R992S5N3;
+				ENABLE_PREVIEWS = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Klepton Probe";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.klepton.probe;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = xros;
+				SUPPORTED_PLATFORMS = "xros xrsimulator";
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/KleptonProbe-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 7;
+				XROS_DEPLOYMENT_TARGET = 2.0;
+			};
+			name = Debug;
+		};
+		KLEPT0N0016CTGTR00000000 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = A2R992S5N3;
+				ENABLE_PREVIEWS = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Klepton Probe";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.klepton.probe;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = xros;
+				SUPPORTED_PLATFORMS = "xros xrsimulator";
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/KleptonProbe-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 7;
+				XROS_DEPLOYMENT_TARGET = 2.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		KLEPT0N0011CLPRJ00000000 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				KLEPT0N0013CPRJD00000000,
+				KLEPT0N0014CPRJR00000000,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		KLEPT0N0012CLTGT00000000 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				KLEPT0N0015CTGTD00000000,
+				KLEPT0N0016CTGTR00000000,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = KLEPT0N0001PROJ000000000;
+}
