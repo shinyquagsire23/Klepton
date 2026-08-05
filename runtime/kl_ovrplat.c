@@ -131,6 +131,10 @@ static uint64_t klplat_void(const char *name) {
 static const char *const g_plat_unity[] = {
     "UnityPluginLoad", "UnityPluginUnload", "UnitySetEventQueue",
     "UnitySetGraphicsDevice", "UnityShaderCompilerExtEvent", "UnityRenderEvent",
+    // The rendering-extension pair. UnityRenderingExtEvent is void; the Query
+    // returns int, and 0 is the truthful answer — this plugin wants no
+    // render-thread extension events, so Unity will never issue them.
+    "UnityRenderingExtEvent", "UnityRenderingExtQuery",
     // Message lifecycle. ovr_PopMessage never hands out a message, so there is
     // never anything to free — and a free of nothing is genuinely nothing to do,
     // not a stub standing in for something.
@@ -179,6 +183,21 @@ static int plat_is_init(const char *name) {
     return 0;
 }
 
+// Request-returning calls with the same truthful answer as init: 0, "the
+// request could not be made", because there is no platform service to make it
+// of. Answering with a fabricated request id would have the caller polling
+// ovr_PopMessage for a completion that cannot come.
+static const char *const g_plat_request[] = {
+    "ovr_RichPresence_Clear", "ovr_RichPresence_Set",
+    "ovr_RichPresence_SetDestination", "ovr_RichPresence_SetIsJoinable",
+};
+
+static int plat_is_request(const char *name) {
+    for (size_t i = 0; i < sizeof g_plat_request / sizeof g_plat_request[0]; i++)
+        if (strcmp(g_plat_request[i], name) == 0) return 1;
+    return 0;
+}
+
 static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_IsPlatformInitialized", (void *)klplat_IsPlatformInitialized},
     {"ovr_PopMessage",            (void *)klplat_PopMessage},
@@ -215,7 +234,7 @@ void *kl_ovrplat_sym(const char *name) {
         if (strcmp(g_plat_impl[i].name, name) == 0) return g_plat_impl[i].fn;
     if (plat_is_unity_hook(name))
         return kl_named_stub(name, (void *)klplat_void);
-    if (plat_is_init(name))
+    if (plat_is_init(name) || plat_is_request(name))
         return kl_named_stub(name, (void *)klplat_init_fails);
     return kl_named_stub(name, (void *)klplat_called);
 }

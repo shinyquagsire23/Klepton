@@ -151,6 +151,17 @@ static unsigned (*a_eglMakeCurrent)(void *, void *, void *, void *);
 
 static void klfb_selftest(void);
 
+// KL_GLFB_DEBUG_CB=1 registers this with glDebugMessageCallback and prints
+// every message. The vendored debug ANGLE speaks KHR_debug fluently, so a
+// guest call failing silently (the "0 lit" frame was one) comes with its
+// reason here instead of needing an error-code probe per call site.
+static void klfb_debug_cb(uint32_t source, uint32_t type, uint32_t id,
+                          uint32_t severity, int32_t length, const char *msg,
+                          const void *user) {
+    (void)source; (void)type; (void)id; (void)severity; (void)user;
+    fprintf(stderr, "  [glcb] %.*s\n", length, msg ? msg : "");
+}
+
 int kl_glfb_init(void) {
     if (!kl_glfb_enabled() || g_ready) return g_ready;
 
@@ -239,6 +250,24 @@ int kl_glfb_init(void) {
     a_glGetIntegerv = asym("glGetIntegerv");
     a_glGetString  = asym("glGetString");
     g_ready = 1;
+
+    // KL_GLFB_DEBUG_CB=1: register a KHR_debug callback and print every
+    // message. The vendored debug ANGLE speaks KHR_debug fluently, so a guest
+    // call failing silently (the "0 lit" frame was one) comes with its reason
+    // here instead of needing an error-code probe per call site.
+    if (getenv("KL_GLFB_DEBUG_CB")) {
+        void (*glDebugMessageCallback)(const void *, const void *) =
+            asym("glDebugMessageCallback");
+        void (*glEnable)(uint32_t) = asym("glEnable");
+        if (glDebugMessageCallback) {
+            glDebugMessageCallback((const void *)klfb_debug_cb, NULL);
+            // GL_DEBUG_OUTPUT 0x92E0 — synchronous delivery.
+            if (glEnable) glEnable(0x92E0);
+            fprintf(stderr, "  [glfb] KHR_debug callback registered\n");
+        } else {
+            fprintf(stderr, "  [glfb] no glDebugMessageCallback in this ANGLE\n");
+        }
+    }
     fprintf(stderr, "  [glfb] ANGLE %dx%d — %s\n", g_w, g_h,
             a_glGetString ? (const char *)a_glGetString(GL_RENDERER) : "?");
     fprintf(stderr, "  [glfb] %s\n",
@@ -276,7 +305,7 @@ int kl_glfb_init(void) {
 static pthread_key_t g_tls_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
-typedef struct { void *ctx, *surf; int probed; } klfb_thread_gl;
+typedef struct { void *ctx, *surf; int probed; int debug_cb; } klfb_thread_gl;
 
 static void klfb_tls_free(void *p) { free(p); }
 static void klfb_tls_init(void) { pthread_key_create(&g_tls_key, klfb_tls_free); }
@@ -365,6 +394,17 @@ void kl_glfb_make_current(void) {
             said = 1;
             fprintf(stderr, "  [glfb] eglMakeCurrent failed even with a per-thread "
                             "context (egl error 0x%x)\n", eglGetError ? eglGetError() : 0);
+        }
+    } else if (getenv("KL_GLFB_DEBUG_CB") && !t->debug_cb) {
+        // The debug callback is per-context state, so the root-context
+        // registration in kl_glfb_init does not cover this thread's context.
+        t->debug_cb = 1;
+        void (*glDebugMessageCallback)(const void *, const void *) =
+            asym("glDebugMessageCallback");
+        void (*glEnable)(uint32_t) = asym("glEnable");
+        if (glDebugMessageCallback) {
+            glDebugMessageCallback((const void *)klfb_debug_cb, NULL);
+            if (glEnable) glEnable(0x92E0);
         }
     }
 }
@@ -584,12 +624,16 @@ void kl_glfb_report_formats(void) {
 static void (*g_real_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t, int32_t,
                                       int32_t, int32_t, int32_t, uint32_t, uint32_t);
 
+static void klfb_errprobe(const char *what, const char *detail);
+
 static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1,
                                  int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1,
                                  int64_t mask, int64_t filter) {
+    klfb_errprobe("glBlitFramebuffer(before)", NULL);
     if (g_real_BlitFramebuffer)
         g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
                                (uint32_t)mask, (uint32_t)filter);
+    klfb_errprobe("glBlitFramebuffer(after)", NULL);
 }
 
 static void (*g_real_TexSubImage3D)(uint32_t, int32_t, int32_t, int32_t, int32_t,
@@ -630,39 +674,92 @@ static void klfb_CompressedTexSubImage3D(uint32_t target, int32_t level, int32_t
 // outright: draws on framebuffer 0 mean a flat frame we are failing to capture,
 // draws only on other framebuffers mean the eye-buffer path and a different job.
 #define KLFB_MAX_FBS 16
-static struct { int32_t fb; unsigned draws; } g_draw_fbs[KLFB_MAX_FBS];
+static struct { int32_t fb; unsigned draws; uint64_t tid; } g_draw_fbs[KLFB_MAX_FBS];
 static unsigned g_ndraw_fbs;
 
 static void klfb_note_draw(void) {
     int32_t fb = -1;
     if (a_glGetIntegerv) a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
+    uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
     for (unsigned i = 0; i < g_ndraw_fbs; i++)
-        if (g_draw_fbs[i].fb == fb) { g_draw_fbs[i].draws++; return; }
+        if (g_draw_fbs[i].fb == fb && g_draw_fbs[i].tid == tid) {
+            g_draw_fbs[i].draws++;
+            return;
+        }
     if (g_ndraw_fbs < KLFB_MAX_FBS) {
         g_draw_fbs[g_ndraw_fbs].fb = fb;
         g_draw_fbs[g_ndraw_fbs].draws = 1;
+        g_draw_fbs[g_ndraw_fbs].tid = tid;
         g_ndraw_fbs++;
     }
 }
 
 static void (*g_real_DrawElements)(uint32_t, int32_t, uint32_t, const void *);
 static void (*g_real_DrawArrays)(uint32_t, int32_t, int32_t);
+static void klfb_service_capture(void);
+
+// KL_GLFB_ERRPROBE=1: check the GL error after each draw and print the first
+// few with the state around them. The guest accumulates errors it never reads
+// (the capture keeps meeting them as pre-existing), so one of its own calls is
+// failing silently — this names it. Consumes the error; the guest demonstrably
+// was not reading them anyway.
+static void klfb_errprobe(const char *what, const char *detail) {
+    static int on = -1, said;
+    if (on < 0) on = getenv("KL_GLFB_ERRPROBE") != NULL;
+    if (!on || !a_glGetError) return;
+    // Consumes the pending error. Called before and after the real call:
+    // "pre=0xN" on the BEFORE line is an earlier unwrapped call's leftover, on
+    // the AFTER line it is provably this call's own error.
+    uint32_t err = a_glGetError();
+    if (!err || said >= 20) return;
+    said++;
+    int32_t fb = -1, prog = -1, vp[4] = {0,0,0,0};
+    if (a_glGetIntegerv) {
+        a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
+        a_glGetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &prog);
+        a_glGetIntegerv(0x0BA2 /* VIEWPORT */, vp);
+    }
+    fprintf(stderr, "  [glfb] ERRPROBE %s: pre=0x%x fb=%d program=%d viewport %dx%d%s\n",
+            what, err, fb, prog, vp[2], vp[3], detail ? detail : "");
+    if (err == 0x506 /* INVALID_FRAMEBUFFER_OPERATION */) {
+        static uint32_t (*ck)(uint32_t);
+        if (!ck) ck = asym("glCheckFramebufferStatus");
+        if (ck)
+            fprintf(stderr, "  [glfb] ERRPROBE %s: CheckFramebufferStatus(DRAW)=0x%x\n",
+                    what, ck(0x8CA9));
+    }
+}
+
+static void klfb_errprobe(const char *what, const char *detail);
+#define klfb_errprobe0(w) klfb_errprobe((w), NULL)
 
 static void klfb_DrawElements(uint32_t mode, int32_t count, uint32_t type,
                               const void *indices) {
+    // A pending capture first: it runs on THIS thread, which is the one that
+    // draws, so it reads the pbuffer the frame actually landed in — not the
+    // swap thread's, which is empty by construction.
+    klfb_service_capture();
     klfb_note_draw();
+    klfb_errprobe0("glDrawElements(before)");
     if (g_real_DrawElements) g_real_DrawElements(mode, count, type, indices);
+    char d[64];
+    snprintf(d, sizeof d, " mode=0x%x count=%d type=0x%x", mode, count, type);
+    klfb_errprobe("glDrawElements(after)", d);
 }
 static void klfb_DrawArrays(uint32_t mode, int32_t first, int32_t count) {
+    klfb_service_capture();
     klfb_note_draw();
+    klfb_errprobe0("glDrawArrays(before)");
     if (g_real_DrawArrays) g_real_DrawArrays(mode, first, count);
+    klfb_errprobe0("glDrawArrays(after)");
 }
 
 static void klfb_report_draws(void) {
     if (!g_ndraw_fbs) { fprintf(stderr, "  [glfb] no draws seen at all\n"); return; }
     fprintf(stderr, "  [glfb] draws by target framebuffer:");
     for (unsigned i = 0; i < g_ndraw_fbs; i++)
-        fprintf(stderr, " fb%d=%u", g_draw_fbs[i].fb, g_draw_fbs[i].draws);
+        fprintf(stderr, " fb%d=%u(t%llu)", g_draw_fbs[i].fb, g_draw_fbs[i].draws,
+                (unsigned long long)g_draw_fbs[i].tid);
     fprintf(stderr, "\n");
 }
 
@@ -897,14 +994,28 @@ static void chunk(FILE *f, const char *t, const uint8_t *d, uint32_t n) {
     be32(h, (uint32_t)c); fwrite(h, 1, 4, f);
 }
 
-// Called from the guest's eglSwapBuffers — on whatever thread that happens to be,
-// which is measurably *not* the one that owns the context. So this only records
-// the request; klfb_service_capture does the work from a call the GL thread makes
-// itself. Reading pixels with no current context is not an error, it is silence,
-// which is exactly how this presented: a perfectly black frame with the
-// framebuffer queries writing nothing at all.
+// Called from the guest's eglSwapBuffers. The swap does not arrive on the GL
+// thread — measured — and under KL_GLFB_SHARED each thread's pbuffer is its
+// own, so capturing on the swap thread reads a framebuffer nothing was ever
+// drawn into (0 lit, by construction). The swap only *requests* a capture;
+// klfb_service_capture does the work from a call the GL thread makes itself:
+// glFlush/glFinish, and the draw wrappers, which by definition run where the
+// drawing did. Reading pixels with no current context is not an error, it is
+// silence, which is exactly how that presented: a perfectly black frame with
+// the framebuffer queries writing nothing at all.
+//
+// KL_GLFB_OUT_EVERY=N throttles to every Nth swap (default 1) — a 300-frame
+// pump otherwise writes 300 full-size PNGs.
 unsigned kl_glfb_present(const char *dir) {
     if (!g_ready || !dir) return g_presented;
+    static int every = -1;
+    if (every < 0) {
+        const char *e = getenv("KL_GLFB_OUT_EVERY");
+        every = e ? atoi(e) : 1;
+        if (every < 1) every = 1;
+    }
+    static unsigned swap_n;
+    if (swap_n++ % (unsigned)every) return g_presented;
     snprintf(g_capture_dir, sizeof g_capture_dir, "%s", dir);
     g_capture_pending = 1;
     return g_presented;
@@ -921,15 +1032,27 @@ static unsigned glfb_capture_now(const char *dir) {
     // the default framebuffer means either nothing was drawn or it was drawn
     // somewhere else, and those need different fixes.
     int32_t draw_fb = -1, read_fb = -1, vp[4] = {0,0,0,0};
+    int32_t fb_status = -1;
+    static uint32_t (*a_glCheckFramebufferStatus)(uint32_t);
+    if (!a_glCheckFramebufferStatus)
+        a_glCheckFramebufferStatus = asym("glCheckFramebufferStatus");
     if (a_glGetIntegerv) {
         a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &draw_fb);
         a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &read_fb);
         a_glGetIntegerv(0x0BA2 /* VIEWPORT */, vp);
     }
+    if (a_glCheckFramebufferStatus)
+        fb_status = (int32_t)a_glCheckFramebufferStatus(0x8CA9 /* GL_DRAW_FRAMEBUFFER */);
+    uint32_t pre_err = a_glGetError ? a_glGetError() : 0;
     a_glReadPixels(0, 0, g_w, g_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    // The error could be the readback's own or one the guest left behind —
+    // report both rather than blame the readback. Reading the pre-existing one
+    // does clear it; this is a host-only diagnostic and the guest's errors on
+    // the reference renderer are exactly what we want to see.
     uint32_t err = a_glGetError ? a_glGetError() : 0;
-    char err_buf[48] = "";
-    if (err) snprintf(err_buf, sizeof err_buf, " (GL error 0x%x)", err);
+    char err_buf[64] = "";
+    if (err) snprintf(err_buf, sizeof err_buf, " (GL error 0x%x%s)", err,
+                      pre_err ? " — but pre-existing, not the readback's" : "");
 
     // Say whether anything landed. A frame that is uniformly one colour is a clear
     // with no draw, and that is a different outcome from a frame that drew — a
@@ -967,10 +1090,12 @@ static unsigned glfb_capture_now(const char *dir) {
     chunk(f, "IEND", NULL, 0);
     fclose(f);
     klfb_report_draws();
+    uint64_t cap_tid = 0; pthread_threadid_np(NULL, &cap_tid);
     fprintf(stderr, "  [glfb] %s: %u/%u lit, mean luma %lu%s "
-                    "[draw_fb=%d read_fb=%d viewport %dx%d+%d+%d]\n", path, lit,
+                    "[draw_fb=%d read_fb=%d fb_status=0x%x viewport %dx%d+%d+%d] (captured on t%llu)\n", path, lit,
             (unsigned)(g_w * g_h), sum / ((unsigned long)g_w * g_h * 3),
-            err_buf, draw_fb, read_fb, vp[2], vp[3], vp[0], vp[1]);
+            err_buf, draw_fb, read_fb, fb_status, vp[2], vp[3], vp[0], vp[1],
+            (unsigned long long)cap_tid);
     free(px); free(raw); free(cb);
     return ++g_presented;
 }

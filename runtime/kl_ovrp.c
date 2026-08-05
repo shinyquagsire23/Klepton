@@ -178,6 +178,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
 static const char *const g_ovrp_result_ok[] = {
     // Unity's native plugin interface. All void.
     "UnitySetGraphicsDevice", "UnitySetEventQueue", "UnityShaderCompilerExtEvent",
+    "UnityRenderingExtEvent",
     // Bring-up. This is the decision recorded in PLANNING M6: we answer success
     // and stand behind it, rather than reporting a failure Unity would be right
     // to believe.
@@ -191,7 +192,10 @@ static const char *const g_ovrp_bool_yes[] = {
 };
 
 static const char *const g_ovrp_bool_no[] = {
-    (void *)0,
+    // Unity asks OVRPlugin which rendering-extension hooks it wants (before/after
+    // rendering events, etc.). Our replacement has no render-thread bookkeeping,
+    // so "no" is the truthful answer — Unity then never issues the events.
+    "UnityRenderingExtQuery",
 };
 
 static void *klovrp_shared(const char *name) {
