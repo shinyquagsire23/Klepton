@@ -23,6 +23,7 @@
 #include "../runtime/kl_egl.h"
 #include "../runtime/kl_opensl.h"
 #include "../runtime/kl_ovrp.h"
+#include "../runtime/kl_ovrplat.h"
 
 static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
 
@@ -107,6 +108,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
         kl_egl_report(stderr);
         kl_opensl_report(stderr);
         kl_ovrp_report(stderr);
+        kl_ovrplat_report(stderr);
     }
 
     // Die of the original signal, so the parent still reports it as one.
@@ -126,9 +128,50 @@ static void install_fault_reporter(void) {
     sigaction(SIGALRM, &sa, NULL);
 }
 
+// The entitlement refusal in kl_ovrplat.c is a policy guard, and Beat Saber does
+// not currently reach it — the platform fails to initialise first, so the guard
+// has never fired in a real run. A safety mechanism that has never been exercised
+// is an assumption, not a mechanism, so it is checked here directly.
+//
+// Two properties matter: that an ownership query does not resolve to something
+// callable-and-harmless, and that calling it dies rather than returning a value.
+// The call is made in a child because passing the test means aborting.
+// The resolve happens in the child too, not just the call. kl_ovrplat_sym records
+// what was looked up, and the surface report separates entitlement lookups out
+// specifically so a real one is visible — probing from the parent would leave our
+// own test sitting in that list, indistinguishable from the guest asking.
+static int check_drm_guard(void) {
+    fflush(NULL);
+    pid_t p = fork();
+    if (p == 0) {
+        // The refusal prints a paragraph and a surface report; not wanted here.
+        freopen("/dev/null", "w", stderr);
+        void *drm = kl_ovrplat_sym("ovr_Entitlement_GetIsViewerEntitled");
+        if (!drm) _exit(2);             // resolved to nothing at all
+        ((uint64_t (*)(void))drm)();
+        _exit(3);                       // returned a value == the guard failed
+    }
+    int st = 0;
+    waitpid(p, &st, 0);
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 2)
+        return fail("entitlement guard: the name resolved to nothing");
+    if (!(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT))
+        return fail("entitlement guard did NOT abort — an ownership query would be "
+                    "answered, which is exactly what must not happen");
+    printf("  entitlement/ownership queries refuse and abort (guard verified)\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) LIBDIR = argv[1];
     kl_set_library_path(LIBDIR);
+
+    printf("=== DRM policy guard ===\n");
+    if (check_drm_guard()) return 1;
+
+    // Armed before anything runs: texture uploads happen all through init and the
+    // lifecycle, not just inside the frame pump.
+    kl_egl_dump_textures(getenv("KL_DUMP_TEXTURES"));
 
     char path[1024];
     snprintf(path, sizeof path, "%s/libmain.so", LIBDIR);
@@ -188,7 +231,9 @@ int main(int argc, char **argv) {
             // On device the Context is the Activity — AndroidManifest.xml declares
             // UnityPlayerActivity — and Unity checks that with IsInstanceOf. Handing
             // it a bare Context would send it down the no-Activity path.
-            void *context = kl_jni_new_object("com/unity3d/player/UnityPlayerActivity");
+            // The shared singleton, not a fresh instance: Unity also reads this
+            // back through the static UnityPlayer.currentActivity and compares.
+            void *context = kl_jni_activity();
             ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, context);
             printf("  initJni returned\n");
         }
@@ -243,6 +288,11 @@ int main(int argc, char **argv) {
                 alarm(budget);
                 unsigned i;
                 for (i = 0; i < frames && fn; i++) {
+                    // The frame clock first: on Android the Choreographer's
+                    // doFrame is what wakes the engine for a frame, and
+                    // nativeRender then draws what it decided. Ticking after
+                    // rendering would hand every frame the previous one's time.
+                    kl_jni_tick_choreographer();
                     ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2);
                     kl_jni_drain_ui_tasks();
                 }
@@ -250,12 +300,17 @@ int main(int argc, char **argv) {
                 printf("  pumped %u frames\n", i);
                 const char *sd = getenv("KL_DUMP_SHADERS");
                 if (sd) kl_egl_dump_shaders(sd);
+                if (getenv("KL_DUMP_TEXTURES"))
+                    printf("  wrote %u texture upload%s as PNG\n",
+                           kl_egl_texture_count(),
+                           kl_egl_texture_count() == 1 ? "" : "s");
             }
         }
 
         kl_jni_report(stdout);
         kl_egl_report(stdout);
         kl_ovrp_report(stdout);
+        kl_ovrplat_report(stdout);
         fflush(NULL);   // _exit does not flush stdio, and the report is the point
         _exit(0);
     }

@@ -8,6 +8,7 @@
 #include "kl_egl.h"
 #include "kl_opensl.h"
 #include "kl_ovrp.h"
+#include "kl_ovrplat.h"
 
 #define KL_MAX_IMAGES 64
 typedef struct { char soname[128]; kl_image *img; } entry;
@@ -73,6 +74,10 @@ void *klb_dlopen(const char *path, int flags) {
     if (sl) return sl;
     void *xr = kl_ovrp_dlopen(path);
     if (xr) return xr;
+    // The Oculus Platform loader. Served rather than loaded for the same reason as
+    // OVRPlugin: the real one only forwards to a system service that is not here.
+    void *plat = kl_ovrplat_dlopen(path);
+    if (plat) return plat;
     pthread_mutex_lock(&g_lock);
     kl_image *found = kl_find_image(path);           // already loaded? refcount is coarse
     pthread_mutex_unlock(&g_lock);
@@ -98,6 +103,7 @@ void *klb_dlsym(void *handle, const char *name) {
     if (kl_egl_is_handle(handle)) return kl_egl_sym(name);
     if (kl_opensl_is_handle(handle)) return kl_opensl_sym(name);
     if (kl_ovrp_is_handle(handle)) return kl_ovrp_sym(name);
+    if (kl_ovrplat_is_handle(handle)) return kl_ovrplat_sym(name);
     if (handle == NULL || handle == (void *)-1) {    // RTLD_DEFAULT / RTLD_NEXT
         void *s = kl_shim_lookup(name);
         if (s) return s;
