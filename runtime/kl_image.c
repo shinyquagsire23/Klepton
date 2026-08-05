@@ -158,6 +158,65 @@ void *kl_named_stub(const char *nm, void *handler) {
     return s;
 }
 
+// The other shape of stub: one that logs and then lets the original call proceed
+// untouched. kl_named_stub puts the name in x0 and never returns to the guest,
+// which is right for "you called something unimplemented" and useless for tracing.
+// Here the payload is a descriptor instead of a bare name, and the branch goes to
+// kl_gl_trace_tramp (runtime/kl_gl_trace.S), which saves the argument registers,
+// logs, restores, and tail-branches to the real function.
+//
+//    0: ldr x16, #16    // x16 = descriptor    (the trampoline's one input)
+//    4: ldr x17, #20    // x17 = trampoline
+//    8: br  x17
+//   12: nop             // padding, so the two literals land 8-byte aligned
+//   16: .quad descriptor
+//   24: .quad trampoline
+//
+// Same 32-byte cell and same pool as kl_named_stub, so the two can be mixed
+// freely; dedup is on (trampoline, name) exactly as it is on (handler, name).
+void *kl_trace_stub(const char *nm, void *desc, void *tramp) {
+    if (!nm || !*nm || !desc || !tramp) return NULL;
+    for (unsigned i = 0; i < g_stub_n; i++)
+        if (g_stubs[i].handler == tramp && strcmp(g_stubs[i].name, nm) == 0)
+            return g_stubs[i].stub;
+
+    if (!g_stub_pool) {
+        g_stub_pool = mmap(NULL, KL_STUB_POOL, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (g_stub_pool == MAP_FAILED) { g_stub_pool = NULL; return NULL; }
+    }
+    if (g_stub_off + KL_STUB_BYTES > KL_STUB_POOL) return NULL;
+
+    char *owned = strdup(nm);
+    if (!owned) return NULL;
+
+    uint8_t *s = g_stub_pool + g_stub_off;
+    if (mprotect(g_stub_pool, KL_STUB_POOL, PROT_READ | PROT_WRITE) != 0) {
+        free(owned);
+        return NULL;
+    }
+    uint32_t *code = (uint32_t *)s;
+    code[0] = 0x58000090u;   // ldr x16, #16
+    code[1] = 0x580000B1u;   // ldr x17, #20
+    code[2] = 0xD61F0220u;   // br  x17
+    code[3] = 0xD503201Fu;   // nop
+    memcpy(s + 16, &desc,  8);
+    memcpy(s + 24, &tramp, 8);
+    mprotect(g_stub_pool, KL_STUB_POOL, PROT_READ | PROT_EXEC);
+    sys_icache_invalidate(s, KL_STUB_BYTES);
+    g_stub_off += KL_STUB_BYTES;
+
+    if (g_stub_n == g_stub_cap) {
+        g_stub_cap = g_stub_cap ? g_stub_cap * 2 : 64;
+        g_stubs = realloc(g_stubs, g_stub_cap * sizeof *g_stubs);
+    }
+    g_stubs[g_stub_n].name = owned;
+    g_stubs[g_stub_n].stub = s;
+    g_stubs[g_stub_n].handler = tramp;
+    g_stub_n++;
+    return s;
+}
+
 static void *unresolved_stub(const char *nm) {
     return kl_named_stub(nm, (void *)kl_unresolved_named);
 }

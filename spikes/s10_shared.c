@@ -107,6 +107,16 @@
 #define GL_RED                 0x1903
 #define GL_R8                  0x8229
 #define GL_SRGB8_ALPHA8        0x8C43
+#define GL_ZERO                0x0000
+#define GL_ONE                 0x0001
+#define GL_HALF_FLOAT          0x140B
+#define GL_R16F                0x822D
+#define GL_TEXTURE_BASE_LEVEL  0x813C
+#define GL_TEXTURE_MAX_LEVEL   0x813D
+#define GL_TEXTURE_SWIZZLE_R   0x8E42
+#define GL_TEXTURE_SWIZZLE_G   0x8E43
+#define GL_TEXTURE_SWIZZLE_B   0x8E44
+#define GL_TEXTURE_SWIZZLE_A   0x8E45
 
 #define ANGLE_DEFAULT_DIR \
     "/Applications/Google Chrome.app/Contents/Frameworks/" \
@@ -267,6 +277,71 @@ static void replay_guest_textures(int tid) {
     free(buf);
 }
 
+// ---- the swizzled single-channel texture, which is what the guest was doing ----
+//
+// KL_GLFB_TRACE_TEX caught the guest setting, immediately before the allocation
+// the AGX abort follows:
+//
+//   GL_TEXTURE_SWIZZLE_R = GL_RED    GL_TEXTURE_SWIZZLE_G = GL_ZERO
+//   GL_TEXTURE_SWIZZLE_B = GL_ZERO   GL_TEXTURE_SWIZZLE_A = GL_ONE
+//
+// That is Unity reconstructing GL_LUMINANCE/GL_ALPHA, which GLES 3 removed, out of
+// a one-channel format. Two different runs died on two different such textures —
+// R8 64x64 and R16F 1024x1 — and the swizzle is what they have in common. A Metal
+// backend cannot always set that natively and has to emulate it, and emulation is
+// where a blit compute program would come from.
+//
+// S10_SWIZZLE=1 does only this, so a failure cannot be blamed on anything else.
+static void swizzled_single_channel(int tid) {
+    const struct {
+        uint32_t ifmt, upfmt, uptype;
+        int32_t  w, h;
+        uint32_t sr, sg, sb, sa;
+        const char *what;
+    } CASES[] = {
+        // The exact texture five runs died on, at call #312 every time: an R8 4x4
+        // whose colour channels are all the *constant* zero and whose alpha comes
+        // from red. That is GL_ALPHA rebuilt out of R8 — not the luminance shape
+        // (RED/ZERO/ZERO/ONE) guessed at first, which is also in the guest's trace
+        // but is not what it dies on.
+        { GL_R8,   GL_RED, GL_UNSIGNED_BYTE,    4, 4, GL_ZERO, GL_ZERO, GL_ZERO, GL_RED,
+          "R8 4x4, swizzle ZERO/ZERO/ZERO/RED (the guest's own)" },
+        { GL_R8,   GL_RED, GL_UNSIGNED_BYTE,   64,64, GL_RED,  GL_ZERO, GL_ZERO, GL_ONE,
+          "R8 64x64, swizzle RED/ZERO/ZERO/ONE" },
+        { GL_R16F, GL_RED, GL_HALF_FLOAT,    1024, 1, GL_RED,  GL_ZERO, GL_ZERO, GL_ONE,
+          "R16F 1024x1, swizzle RED/ZERO/ZERO/ONE" },
+    };
+    unsigned char *buf = calloc(1, 1024 * 64 * 8);
+    if (!buf) return;
+
+    for (size_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        uint32_t tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        // The full parameter set the guest applies, in its order: swizzle first,
+        // then filters, then the mip range — all before storage is allocated.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, (int32_t)CASES[i].sr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, (int32_t)CASES[i].sg);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, (int32_t)CASES[i].sb);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, (int32_t)CASES[i].sa);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+
+        fprintf(stderr, "  [t%d]   %s\n", tid, CASES[i].what);
+        glTexStorage2D(GL_TEXTURE_2D, 1, CASES[i].ifmt, CASES[i].w, CASES[i].h);
+        uint32_t e = glGetError();
+        if (e != GL_NO_ERROR)
+            fprintf(stderr, "  [t%d]     storage -> gl 0x%x\n", tid, e);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, CASES[i].w, CASES[i].h,
+                        CASES[i].upfmt, CASES[i].uptype, buf);
+        glFinish();
+        fprintf(stderr, "  [t%d]     uploaded (gl 0x%x)\n", tid, glGetError());
+    }
+    free(buf);
+}
+
 static const char *VS =
     "#version 300 es\n"
     "in vec2 aPos;\n"
@@ -353,6 +428,13 @@ static void *worker(void *arg) {
     // S10_REPLAY_ONLY=1 runs *only* the guest's texture sequence, skipping every
     // other stage. Without this the replay shares a run with the known ANGLE
     // draw race, and a failure cannot be attributed to either.
+    if (getenv("S10_SWIZZLE")) {
+        stage(tid, 12, "swizzled single-channel textures (the guest's actual shape)");
+        swizzled_single_channel(tid);
+        fprintf(stderr, "  [t%d]   swizzle survived (gl 0x%x)\n", tid, glGetError());
+        goto out;
+    }
+
     if (getenv("S10_REPLAY_ONLY")) {
         stage(tid, 10, "replay Beat Saber's texture sequence (isolated)");
         replay_guest_textures(tid);

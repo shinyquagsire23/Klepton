@@ -55,6 +55,11 @@ FILE *kl_host_file(void *guest);
 // guest reached for names itself instead of arriving as one anonymous abort.
 // Used for unresolved ELF imports and for eglGetProcAddress's GL entry points.
 void *kl_named_stub(const char *name, void *handler);
+// The forwarding variant: a stub that branches to `tramp` with `desc` in x16 and
+// nothing else disturbed, so the trampoline can log and then let the original call
+// run with its arguments intact. `desc` must be a stable { const char *name;
+// void *real; } pair. See runtime/kl_gl_trace.S for the register contract.
+void *kl_trace_stub(const char *name, void *desc, void *tramp);
 
 // ---- image registry (backs guest dlopen/dlsym/dladdr) ----
 void      kl_set_library_path(const char *dir);

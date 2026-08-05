@@ -56,6 +56,7 @@
 #include <stdint.h>
 #include <zlib.h>
 #include "kl_glfb.h"
+#include "klepton.h"       // kl_trace_stub, for the per-name GL call trace
 
 // ---- the EGL/GLES constants used here, so there is nothing to include ----
 #define EGL_DEFAULT_DISPLAY  ((void *)0)
@@ -432,6 +433,32 @@ static unsigned g_texcalls;
 static void (*g_real_TexSubImage2D)(uint32_t, int32_t, int32_t, int32_t, int32_t,
                                     int32_t, uint32_t, uint32_t, const void *);
 
+// The parameters set on a texture before it is allocated matter as much as the
+// format: swizzle in particular (GL_TEXTURE_SWIZZLE_R..A, 0x8E42-0x8E45) is a
+// state a Metal backend may have to emulate rather than set natively, and Unity
+// uses it to make an R8 texture behave like the GL_LUMINANCE/GL_ALPHA formats
+// GLES 3 dropped. The trace shows 156 of these calls, a burst of them immediately
+// before the allocation the abort follows, so they are logged with their arguments.
+static void (*g_real_TexParameteri)(uint32_t, uint32_t, int32_t);
+
+// KL_GLFB_NOSWIZZLE=1 drops the four swizzle parameters on the floor. The guest's
+// single-channel textures then sample as plain red instead of as GL_ALPHA, so the
+// picture is wrong — but it answers whether swizzle is *necessary* to the AGX
+// abort, which a standalone repro has so far failed to settle. The abort is
+// deterministic (call #312, five runs of five), so one run each way is conclusive.
+#define GL_TEXTURE_SWIZZLE_R 0x8E42
+#define GL_TEXTURE_SWIZZLE_A 0x8E45
+
+static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
+    if (klfb_trace_tex())
+        fprintf(stderr, "  [glfb] #%u glTexParameteri target=0x%04x pname=0x%04x "
+                        "param=0x%04x\n", g_texcalls++, target, pname, param);
+    static int noswz = -1;
+    if (noswz < 0) noswz = getenv("KL_GLFB_NOSWIZZLE") != NULL;
+    if (noswz && pname >= GL_TEXTURE_SWIZZLE_R && pname <= GL_TEXTURE_SWIZZLE_A) return;
+    if (g_real_TexParameteri) g_real_TexParameteri(target, pname, param);
+}
+
 static void klfb_TexSubImage2D(uint32_t target, int32_t level, int32_t xoff,
                                int32_t yoff, int32_t w, int32_t h, uint32_t format,
                                uint32_t type, const void *pixels) {
@@ -591,6 +618,7 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glTexStorage2D", (void *)klfb_TexStorage2D, (void **)&g_real_TexStorage2D},
     {"glTexStorage3D", (void *)klfb_TexStorage3D, (void **)&g_real_TexStorage3D},
     {"glTexSubImage2D", (void *)klfb_TexSubImage2D, (void **)&g_real_TexSubImage2D},
+    {"glTexParameteri", (void *)klfb_TexParameteri, (void **)&g_real_TexParameteri},
 };
 
 // ---------------------------------------------------------- the gateway
@@ -636,6 +664,54 @@ static int glfb_skipped(const char *name) {
     return 0;
 }
 
+// ---------------------------------------------------------- the call trace
+//
+// KL_GLFB_TRACE=1 routes every entry point the guest resolves through a per-name
+// forwarding stub, so the log names the exact GL call rather than the family a
+// census can reach. This is the instrument the AGX abort needs: the texture trace
+// could only say the crash arrived somewhere after an R8 upload, and "somewhere
+// after" spans every call the engine makes next.
+//
+// It is expensive by construction — a log line per GL call — so it is off unless
+// asked for. KL_GLFB_TRACE_FROM=<n> starts printing only after the nth call, which
+// is how a crash tens of thousands of calls in stays readable.
+typedef struct { const char *name; void *real; } klfb_trace_desc;
+
+extern void kl_gl_trace_tramp(void);       // runtime/kl_gl_trace.S
+
+static unsigned g_trace_calls;
+static unsigned g_trace_from;
+
+// Called from the trampoline with the argument registers already saved. Anything
+// this touches must be safe on any guest thread, so it stays to stderr and a
+// relaxed counter — no allocation, no locks worth deadlocking on.
+void kl_gl_trace_log(const char *name) {
+    unsigned n = __atomic_fetch_add(&g_trace_calls, 1, __ATOMIC_RELAXED);
+    if (n >= g_trace_from)
+        fprintf(stderr, "  [gl] #%u %s\n", n, name);
+}
+
+static int glfb_tracing(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("KL_GLFB_TRACE") != NULL;
+        const char *from = getenv("KL_GLFB_TRACE_FROM");
+        if (from) g_trace_from = (unsigned)strtoul(from, NULL, 0);
+    }
+    return on;
+}
+
+static void *glfb_wrap_traced(const char *name, void *real) {
+    if (!glfb_tracing() || !real) return real;
+    klfb_trace_desc *d = malloc(sizeof *d);
+    if (!d) return real;
+    d->name = strdup(name);
+    d->real = real;
+    if (!d->name) { free(d); return real; }
+    void *stub = kl_trace_stub(name, d, (void *)kl_gl_trace_tramp);
+    return stub ? stub : real;
+}
+
 void *kl_glfb_sym(const char *name) {
     if (!kl_glfb_enabled() || !name) return NULL;
     if (!g_ready && !kl_glfb_init()) return NULL;
@@ -650,9 +726,11 @@ void *kl_glfb_sym(const char *name) {
     for (size_t i = 0; i < sizeof g_thunks / sizeof g_thunks[0]; i++)
         if (strcmp(g_thunks[i].name, name) == 0) {
             *g_thunks[i].real = fn;
-            return g_thunks[i].thunk;
+            // Trace in front of the thunk, so the log reflects what the guest
+            // called and the thunk's own ABI fixups still happen.
+            return glfb_wrap_traced(name, g_thunks[i].thunk);
         }
-    return fn;
+    return glfb_wrap_traced(name, fn);
 }
 
 // ---------------------------------------------------------- present

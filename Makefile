@@ -6,7 +6,7 @@ RUNTIME := runtime/kl_image.c runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_libc.c runtime/kl_pthread.c runtime/kl_dl.c \
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_ovrp.c \
-           runtime/kl_ovrplat.c runtime/kl_glfb.c
+           runtime/kl_ovrplat.c runtime/kl_glfb.c runtime/kl_gl_trace.S
 
 .PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
 all: build/t_opus
@@ -157,3 +157,14 @@ shared: build/s10_shared
 	 run "independent contexts, concurrent" S10_STAGE=7 S10_SHARE=0; \
 	 run "one worker thread (control)" S10_STAGE=7 S10_THREADS=1; \
 	 echo "  (expected: row 1 ~1 in 3, row 2 ~1 in 30, rows 3-5 clean)"
+
+# The GL tracing trampoline's ABI contract (runtime/kl_gl_trace.S). It forwards an
+# unknown signature, so nothing else can check it — and a trampoline that drops a
+# register produces a wrong picture rather than a crash.
+build/t_trace: tests/t_trace.c $(RUNTIME) runtime/klepton.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_trace.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: trace
+trace: build/t_trace
+	@./build/t_trace
