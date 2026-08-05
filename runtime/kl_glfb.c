@@ -105,6 +105,16 @@ int kl_glfb_enabled(void) {
 }
 
 void kl_glfb_set_size(int w, int h) {
+    // KL_GLFB_SIZE=WxH overrides the eye size the guest asked for. Every spike that
+    // failed to reproduce the AGX abort used a 256x256 pbuffer while the guest uses
+    // 1832x1920, and each thread gets its own with depth and stencil — so surface
+    // size is the one resource axis none of them varied. Shrinking it here tests
+    // that without touching anything else.
+    const char *env = getenv("KL_GLFB_SIZE");
+    if (env) {
+        int ew = 0, eh = 0;
+        if (sscanf(env, "%dx%d", &ew, &eh) == 2 && ew > 0 && eh > 0) { w = ew; h = eh; }
+    }
     if (w > 0 && h > 0 && !g_ready) { g_w = w; g_h = h; }
 }
 
@@ -124,8 +134,21 @@ static void     (*a_glGetIntegerv)(uint32_t, int32_t *);
 static const uint8_t *(*a_glGetString)(uint32_t);
 static unsigned (*a_eglMakeCurrent)(void *, void *, void *, void *);
 
+static void klfb_selftest(void);
+
 int kl_glfb_init(void) {
     if (!kl_glfb_enabled() || g_ready) return g_ready;
+
+    // Applied here rather than only in kl_glfb_set_size, which this path never
+    // calls — the eye size stays at its 1832x1920 default unless OVRPlugin says
+    // otherwise, so a setter-only override silently does nothing.
+    const char *size_env = getenv("KL_GLFB_SIZE");
+    if (size_env) {
+        int ew = 0, eh = 0;
+        if (sscanf(size_env, "%dx%d", &ew, &eh) == 2 && ew > 0 && eh > 0) {
+            g_w = ew; g_h = eh;
+        }
+    }
 
     const char *dir = getenv("KL_ANGLE_DIR");
     if (!dir) dir = ANGLE_DEFAULT_DIR;
@@ -214,6 +237,7 @@ int kl_glfb_init(void) {
     // ran with no context: silently, since that is not an error, just nothing.
     // Whoever asks next through kl_glfb_make_current gets it.
     a_eglMakeCurrent(g_dpy, NULL, NULL, NULL);
+    klfb_selftest();
     return 1;
 }
 
@@ -238,7 +262,7 @@ int kl_glfb_init(void) {
 static pthread_key_t g_tls_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
-typedef struct { void *ctx, *surf; } klfb_thread_gl;
+typedef struct { void *ctx, *surf; int probed; } klfb_thread_gl;
 
 static void klfb_tls_free(void *p) { free(p); }
 static void klfb_tls_init(void) { pthread_key_create(&g_tls_key, klfb_tls_free); }
@@ -295,6 +319,31 @@ void kl_glfb_make_current(void) {
                 (unsigned long long)tid, t->ctx == g_ctx ? "root" : "shared");
     }
     if (!t->ctx || !t->surf) return;
+    // KL_GLFB_PROBE=1 runs the self-test's trivial clear+readback on each GUEST
+    // thread as it takes a context, once. The host-thread self-test already passes
+    // in this same process, so this is the discriminator that remains: if the same
+    // three calls fail here, the guest's *thread environment* is at fault (its TLS
+    // slot, its x18 veneers, its stack) and the elaborate GL sequence is a red
+    // herring; if they pass, the environment is fine and it really is the sequence.
+    // It clears the guest's framebuffer, so it is a probe and not a mode.
+    if (getenv("KL_GLFB_PROBE") && !t->probed) {
+        t->probed = 1;
+        if (a_eglMakeCurrent(g_dpy, t->surf, t->surf, t->ctx)) {
+            uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+            void (*cc)(float, float, float, float) = asym("glClearColor");
+            void (*cl)(uint32_t) = asym("glClear");
+            fprintf(stderr, "  [glfb] probe: guest thread %llu about to glClear\n",
+                    (unsigned long long)tid);
+            if (cc) cc(0.25f, 0.5f, 0.75f, 1.0f);
+            if (cl) cl(0x4000);
+            if (a_glFinish) a_glFinish();
+            unsigned char px[16] = {0};
+            if (a_glReadPixels) a_glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            fprintf(stderr, "  [glfb] probe: guest thread %llu readback %u,%u,%u,%u"
+                            " — trivial GL works on a guest thread\n",
+                    (unsigned long long)tid, px[0], px[1], px[2], px[3]);
+        }
+    }
     if (!a_eglMakeCurrent(g_dpy, t->surf, t->surf, t->ctx)) {
         uint32_t (*eglGetError)(void) = asym("eglGetError");
         static int said;
@@ -459,9 +508,33 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     if (g_real_TexParameteri) g_real_TexParameteri(target, pname, param);
 }
 
+// KL_GLFB_TEX_LIMIT=N performs only the first N uploads and drops the rest. The
+// guest's texture stream is deterministic — every perturbation tried so far leaves
+// it at exactly 327 calls — so it can be bisected by index, which is what the
+// standalone replays could not do: they reproduced the calls but not the context
+// around them. Binary-searching N finds the upload the abort actually needs, in
+// situ. Storage allocations are always performed, so the textures still exist and
+// only their contents go missing.
+static int klfb_upload_budget(void) {
+    static int n = -2;
+    if (n == -2) {
+        const char *e = getenv("KL_GLFB_TEX_LIMIT");
+        n = e ? atoi(e) : -1;          // -1 means unlimited
+    }
+    return n;
+}
+static unsigned g_uploads;
+
 static void klfb_TexSubImage2D(uint32_t target, int32_t level, int32_t xoff,
                                int32_t yoff, int32_t w, int32_t h, uint32_t format,
                                uint32_t type, const void *pixels) {
+    int budget = klfb_upload_budget();
+    unsigned idx = g_uploads++;
+    if (budget >= 0 && (int)idx >= budget) {
+        if (klfb_trace_tex())
+            fprintf(stderr, "  [glfb] upload %u DROPPED (budget %d)\n", idx, budget);
+        return;
+    }
     if (klfb_trace_tex())
         fprintf(stderr, "  [glfb] #%u glTexSubImage2D target=0x%04x level=%d "
                         "%dx%d at %d,%d fmt=0x%04x type=0x%04x%s\n",
@@ -662,6 +735,72 @@ static int glfb_skipped(const char *name) {
         p = comma + 1;
     }
     return 0;
+}
+
+// ------------------------------------------------------------- the self-test
+//
+// KL_GLFB_SELFTEST=1 runs a trivially correct piece of GL — create a sharing
+// context, clear it, read it back — on a *host* thread inside the loaded guest
+// process, right after init.
+//
+// The question it settles is which side is broken. Both ANGLE backends fail the
+// same way in this process and neither fails in spikes/s10_shared.c: under Metal
+// AGX cannot build a BlitComputeProgramVariant, and under ANGLE's OpenGL backend
+// Apple's GLD asserts `clearFunction != 0` in getClearShaderFragmentFunction. Two
+// different drivers, both failing to obtain one of their own *built-in* shaders.
+// That is a strange thing for guest GL usage to cause and a very ordinary thing
+// for a poisoned process to cause.
+//
+//   selftest aborts  -> the process is the problem: something the shim does
+//                       globally (signal handlers, TSD, environment, fork state)
+//                       breaks Apple's shader compilation for everyone in it, and
+//                       the guest's GL is incidental.
+//   selftest passes  -> the process is fine and the guest's own GL is doing
+//                       something the drivers dislike; back to bisecting calls.
+//
+// A host thread, not a guest one, and plain pthread_create: no kl_thread_init, no
+// TLS slot, no x18 veneers in the frame. This is deliberately the *most* ordinary
+// GL any thread could ask for.
+static void *klfb_selftest_thread(void *arg) {
+    (void)arg;
+    void *(*mkpb)(void *, void *, const int32_t *) = a_eglCreatePbufferSurface;
+    void *(*mkctx)(void *, void *, void *, const int32_t *) = a_eglCreateContext;
+    if (!mkpb || !mkctx || !a_eglMakeCurrent) return NULL;
+
+    const int32_t surf_attrs[] = { EGL_WIDTH, 256, EGL_HEIGHT, 256, EGL_NONE };
+    const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    void *surf = mkpb(g_dpy, g_cfg, surf_attrs);
+    void *ctx  = mkctx(g_dpy, g_cfg, g_ctx, ctx_attrs);
+    fprintf(stderr, "  [glfb] selftest: surf=%p ctx=%p\n", surf, ctx);
+    if (!surf || !ctx) return NULL;
+    if (!a_eglMakeCurrent(g_dpy, surf, surf, ctx)) {
+        fprintf(stderr, "  [glfb] selftest: eglMakeCurrent failed\n");
+        return NULL;
+    }
+
+    void (*clearcolor)(float, float, float, float) = asym("glClearColor");
+    void (*clear)(uint32_t) = asym("glClear");
+    if (clearcolor) clearcolor(0.25f, 0.5f, 0.75f, 1.0f);
+    fprintf(stderr, "  [glfb] selftest: about to glClear (the driver builds its "
+                    "internal clear shader here)\n");
+    if (clear) clear(0x4000 /* GL_COLOR_BUFFER_BIT */);
+    if (a_glFinish) a_glFinish();
+    fprintf(stderr, "  [glfb] selftest: glClear survived\n");
+
+    unsigned char px[16] = {0};
+    if (a_glReadPixels) a_glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    fprintf(stderr, "  [glfb] selftest: readback %u,%u,%u,%u — PASSED (the process "
+                    "is fine; the guest's own GL is the difference)\n",
+            px[0], px[1], px[2], px[3]);
+    a_eglMakeCurrent(g_dpy, NULL, NULL, NULL);
+    return NULL;
+}
+
+static void klfb_selftest(void) {
+    if (!getenv("KL_GLFB_SELFTEST")) return;
+    pthread_t th;
+    if (pthread_create(&th, NULL, klfb_selftest_thread, NULL) == 0)
+        pthread_join(th, NULL);
 }
 
 // ---------------------------------------------------------- the call trace
