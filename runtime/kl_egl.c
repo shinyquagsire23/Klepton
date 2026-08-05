@@ -26,9 +26,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zlib.h>
 #include "klepton.h"
 #include "kl_egl.h"
 #include "kl_ndk.h"
+#include "kl_glfb.h"
 
 // ---- the subset of EGL/egl.h we actually answer for ----
 #define EGL_FALSE                 0
@@ -102,7 +104,7 @@ static unsigned long g_frames;
 #define DISPLAY ((EGLDisplay)&g_display)
 
 // ---------- the GL gateway ----------
-#define KL_GL_MAX 256
+#define KL_GL_MAX 512
 static struct { const char *name; unsigned calls; int resolved; } g_gl[KL_GL_MAX];
 static unsigned g_ngl;
 
@@ -138,6 +140,17 @@ static uint64_t klgl_called(const char *name) {
     kl_egl_report(stderr);
     kl_fatal_prepare();
     abort();
+}
+
+// The other half of the gateway: the calls a null driver can honestly do nothing
+// for. Reached through the same per-name trampoline as klgl_called — x0 is the
+// function's own name — so one handler serves all of them and kl_egl_report still
+// counts each one separately. That count is the point: this list is the null
+// driver's ledger of everything the Metal backend will eventually have to do.
+static uint64_t klgl_noop(const char *name) {
+    int s = gl_slot(name);
+    if (s >= 0) g_gl[s].calls++;
+    return 0;
 }
 
 // ---------- the GL calls that are already forced ----------
@@ -317,6 +330,41 @@ static void klgl_GetInteger64v(uint32_t pname, int64_t *data) {
     data[0] = 0;
 }
 
+// Texture object state. Every value here is the initial value the GLES 3.2 spec
+// gives a freshly created texture, taken from the guest's own GLES3 headers
+// rather than from memory — so this is a quotation, not a guess.
+//
+// The caveat, and it is a real one: glTexParameter* is in the no-op list, so a
+// write is not recorded and a guest that sets a filter and reads it back gets the
+// initial value instead of what it set. Unity caches its own texture state and has
+// only made a single read so far, so nothing has needed the round trip yet. When
+// something does, the fix is a per-name parameter block, not a wider default.
+static void klgl_GetTexParameteriv(uint32_t target, uint32_t pname, int32_t *params) {
+    (void)target;
+    if (!params) return;
+    switch (pname) {
+    case 0x2800 /* TEXTURE_MAG_FILTER */:     params[0] = 0x2601 /* LINEAR */; return;
+    case 0x2801 /* TEXTURE_MIN_FILTER */:     params[0] = 0x2702 /* NEAREST_MIPMAP_LINEAR */; return;
+    case 0x2802 /* TEXTURE_WRAP_S */:
+    case 0x2803 /* TEXTURE_WRAP_T */:
+    case 0x8072 /* TEXTURE_WRAP_R */:         params[0] = 0x2901 /* REPEAT */; return;
+    case 0x813C /* TEXTURE_BASE_LEVEL */:     params[0] = 0; return;
+    case 0x813D /* TEXTURE_MAX_LEVEL */:      params[0] = 1000; return;
+    case 0x884C /* TEXTURE_COMPARE_MODE */:   params[0] = 0 /* NONE */; return;
+    case 0x884D /* TEXTURE_COMPARE_FUNC */:   params[0] = 0x0203 /* LEQUAL */; return;
+    case 0x8E42 /* TEXTURE_SWIZZLE_R */:      params[0] = 0x1903 /* RED */; return;
+    case 0x8E43 /* TEXTURE_SWIZZLE_G */:      params[0] = 0x1904 /* GREEN */; return;
+    case 0x8E44 /* TEXTURE_SWIZZLE_B */:      params[0] = 0x1905 /* BLUE */; return;
+    case 0x8E45 /* TEXTURE_SWIZZLE_A */:      params[0] = 0x1906 /* ALPHA */; return;
+    case 0x90EA /* DEPTH_STENCIL_TEXTURE_MODE */: params[0] = 0x1902 /* DEPTH_COMPONENT */; return;
+    // Nothing here is allocated with glTexStorage*, so no texture is immutable.
+    case 0x912F /* TEXTURE_IMMUTABLE_FORMAT */: params[0] = 0; return;
+    case 0x82DF /* TEXTURE_IMMUTABLE_LEVELS */: params[0] = 0; return;
+    }
+    fprintf(stderr, "  [gl] glGetTexParameteriv: unhandled pname 0x%x\n", pname);
+    params[0] = 0;
+}
+
 
 // ---------------------------------------------------------- the null driver
 //
@@ -402,6 +450,145 @@ static int32_t klgl_GetLocation(uint32_t program, const char *name) {
     return g_gl_loc++;
 }
 
+// Sync objects. A fence marks a point in the command stream and the guest waits
+// for the GPU to reach it; with no GPU behind this, that point is always already
+// reached, so every wait reports ALREADY_SIGNALED and every query SIGNALED.
+//
+// The handle must be non-NULL and distinct: GLsync is an opaque pointer and 0 is
+// "not a sync object", so a permissive zero would be a fence the guest could
+// neither wait on nor delete. Values are from the guest's own GLES3 headers.
+//
+// glDeleteSync is already in the void list, which is correct — these handles are
+// counters, not allocations, so there is nothing to release.
+#define GL_ALREADY_SIGNALED 0x911A
+#define GL_SIGNALED         0x9119
+#define GL_SYNC_STATUS      0x9114
+static uintptr_t g_gl_sync = 1;
+
+static void *klgl_FenceSync(uint32_t condition, uint32_t flags) {
+    (void)condition; (void)flags;
+    return (void *)(g_gl_sync++);
+}
+
+static uint32_t klgl_ClientWaitSync(void *sync, uint32_t flags, uint64_t timeout) {
+    (void)sync; (void)flags; (void)timeout;
+    return GL_ALREADY_SIGNALED;     // nothing is ever outstanding
+}
+
+static void klgl_WaitSync(void *sync, uint32_t flags, uint64_t timeout) {
+    (void)sync; (void)flags; (void)timeout;   // a server-side wait that returns at once
+}
+
+static void klgl_GetSynciv(void *sync, uint32_t pname, int32_t bufSize,
+                           int32_t *length, int32_t *values) {
+    (void)sync;
+    if (length) *length = 0;
+    if (!values || bufSize <= 0) return;
+    if (pname == GL_SYNC_STATUS) { values[0] = GL_SIGNALED; if (length) *length = 1; return; }
+    fprintf(stderr, "  [gl] glGetSynciv: unhandled pname 0x%x\n", pname);
+    values[0] = 0;
+}
+
+// ---------------------------------------------------------------- texture dump
+//
+// There is no framebuffer to screenshot — nothing renders — but the pixels the
+// guest *uploads* are real, and for a frame that is one textured fullscreen quad
+// they are the frame's entire visible content. Dumping them is the only way to
+// check that what the engine is feeding the pipeline is what we think it is,
+// rather than inferring it from call counts.
+//
+// PNG rather than raw, so it can just be looked at. zlib is already linked (the
+// APK is a zip), so this is a header, one deflate, and three CRCs.
+#define GL_RGBA_FMT      0x1908
+#define GL_RGB_FMT       0x1907
+#define GL_UNSIGNED_BYTE 0x1401
+
+static void png_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+
+static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t len) {
+    uint8_t hdr[4];
+    png_be32(hdr, len);
+    fwrite(hdr, 1, 4, f);
+    fwrite(type, 1, 4, f);
+    if (len) fwrite(data, 1, len, f);
+    uLong crc = crc32(0, (const Bytef *)type, 4);
+    if (len) crc = crc32(crc, (const Bytef *)data, len);
+    png_be32(hdr, (uint32_t)crc);
+    fwrite(hdr, 1, 4, f);
+}
+
+// channels is 3 or 4; `pixels` is tightly packed in GL upload order.
+//
+// The rows are emitted bottom-up. GL's texture origin is bottom-left and PNG's is
+// top-left, so a straight copy comes out vertically mirrored — which is not a
+// guess: the first dump produced Beat Saber's music-pack art with "MUSIC PACK /
+// LINKIN PARK" upside down, which is what settled the orientation.
+static int png_write(const char *path, const uint8_t *pixels,
+                     int w, int h, int channels) {
+    if (w <= 0 || h <= 0 || (channels != 3 && channels != 4)) return 0;
+    size_t  stride = (size_t)w * channels;
+    size_t  raw_n  = (stride + 1) * (size_t)h;      // one filter byte per row
+    uint8_t *raw   = malloc(raw_n);
+    if (!raw) return 0;
+    for (int y = 0; y < h; y++) {
+        raw[(stride + 1) * (size_t)y] = 0;          // filter type 0 (None)
+        memcpy(raw + (stride + 1) * (size_t)y + 1,
+               pixels + stride * (size_t)(h - 1 - y), stride);
+    }
+    uLongf comp_n = compressBound((uLong)raw_n);
+    uint8_t *comp = malloc(comp_n);
+    if (!comp || compress(comp, &comp_n, raw, (uLong)raw_n) != Z_OK) {
+        free(raw); free(comp); return 0;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(raw); free(comp); return 0; }
+    static const uint8_t sig[8] = {0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13];
+    png_be32(ihdr, (uint32_t)w);
+    png_be32(ihdr + 4, (uint32_t)h);
+    ihdr[8]  = 8;                                   // bit depth
+    ihdr[9]  = channels == 4 ? 6 : 2;               // RGBA : RGB
+    ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    png_chunk(f, "IHDR", ihdr, sizeof ihdr);
+    png_chunk(f, "IDAT", comp, (uint32_t)comp_n);
+    png_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    free(raw); free(comp);
+    return 1;
+}
+
+static const char *g_tex_dir;
+static unsigned    g_tex_n;
+
+// glTexSubImage2D is otherwise a no-op; this is the one place the guest's own
+// image data is visible. Only the uncompressed 8-bit paths are written — the
+// compressed uploads (ASTC/ETC2, 335 of them) would need a decoder, and guessing
+// at their block format would produce a convincing-looking wrong picture.
+static void klgl_TexSubImage2D(uint32_t target, int32_t level, int32_t xoff, int32_t yoff,
+                               int32_t w, int32_t h, uint32_t format, uint32_t type,
+                               const void *pixels) {
+    (void)target; (void)xoff; (void)yoff;
+    int s = gl_slot("glTexSubImage2D");
+    if (s >= 0) g_gl[s].calls++;
+    if (!g_tex_dir || !pixels || level != 0) return;
+    if (type != GL_UNSIGNED_BYTE) return;
+    int ch = format == GL_RGBA_FMT ? 4 : format == GL_RGB_FMT ? 3 : 0;
+    if (!ch) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s/tex_%03u_%dx%d.png", g_tex_dir, g_tex_n, w, h);
+    if (png_write(path, pixels, w, h, ch)) {
+        fprintf(stderr, "  [gl] wrote %s (%dx%d, %d channels)\n", path, w, h, ch);
+        g_tex_n++;
+    }
+}
+
+void kl_egl_dump_textures(const char *dir) { g_tex_dir = dir; }
+unsigned kl_egl_texture_count(void) { return g_tex_n; }
+
 unsigned kl_egl_shader_count(void) { return g_nshaders; }
 
 void kl_egl_dump_shaders(const char *dir) {
@@ -427,6 +614,12 @@ static const struct { const char *name; void *fn; } g_gl_impl[] = {
     {"glGetBooleanv",   (void *)klgl_GetBooleanv},
     {"glGetInteger64v", (void *)klgl_GetInteger64v},
     {"glGetInternalformativ", (void *)klgl_GetInternalformativ},
+    {"glGetTexParameteriv", (void *)klgl_GetTexParameteriv},
+    {"glTexSubImage2D",  (void *)klgl_TexSubImage2D},
+    {"glFenceSync",      (void *)klgl_FenceSync},
+    {"glClientWaitSync", (void *)klgl_ClientWaitSync},
+    {"glWaitSync",       (void *)klgl_WaitSync},
+    {"glGetSynciv",      (void *)klgl_GetSynciv},
     {"glGenBuffers", (void *)klgl_gen},
     {"glGenTextures", (void *)klgl_gen},
     {"glGenFramebuffers", (void *)klgl_gen},
@@ -466,6 +659,95 @@ static const struct { const char *name; void *fn; } g_gl_impl[] = {
     {"glGetUniformBlockIndex", (void *)klgl_GetLocation},
 
 };
+
+// The state setters and the draws: every GL entry point the guest resolved that
+// returns void and whose only effect is on state this driver does not model. They
+// share klgl_noop.
+//
+// This is the one place the "only implement what is forced" rule is applied to a
+// *class* rather than a call, and the justification is the same as for the
+// capability set above: there is nothing to invent. A void function that writes no
+// out-parameter has no answer to get wrong, so doing nothing is the whole of the
+// correct behaviour for a driver that does not draw. Contrast the 27 entry points
+// deliberately left out — glCheckFramebufferStatus, glMapBufferRange, glIsEnabled,
+// the glGet* family — each of which hands the guest a value it will act on, and so
+// each of which still aborts by name until the trace shows what it needs.
+//
+// The list is exactly what the guest resolved, not the GLES 3.2 header. A name
+// that shows up later aborts by name, which is a ten-second fix and a fact
+// recorded, rather than a guess baked in ahead of the trace.
+static const char *const g_gl_void[] = {
+    // per-fragment and rasteriser state
+    "glEnable", "glDisable", "glCullFace", "glFrontFace", "glDepthFunc", "glDepthMask",
+    "glColorMask", "glColorMaski", "glStencilMask", "glStencilFuncSeparate",
+    "glStencilOpSeparate", "glPolygonOffset", "glScissor", "glViewport", "glPixelStorei",
+    "glBlendEquation", "glBlendEquationi", "glBlendEquationSeparate",
+    "glBlendEquationSeparatei", "glBlendFuncSeparate", "glBlendFuncSeparatei",
+    "glBlendBarrier",
+    // clears
+    "glClear", "glClearColor", "glClearDepthf", "glClearStencil",
+    "glClearBufferfi", "glClearBufferfv", "glClearBufferuiv",
+    // framebuffers and renderbuffers
+    "glBindFramebuffer", "glBindRenderbuffer", "glFramebufferRenderbuffer",
+    "glFramebufferTexture", "glFramebufferTexture2D", "glFramebufferTexture3D",
+    "glFramebufferTextureLayer", "glRenderbufferStorage",
+    "glRenderbufferStorageMultisample", "glInvalidateFramebuffer", "glBlitFramebuffer",
+    "glDrawBuffers", "glReadBuffer",
+    // buffers
+    "glBindBuffer", "glBindBufferBase", "glBindBufferRange", "glBufferData",
+    "glBufferSubData", "glCopyBufferSubData", "glFlushMappedBufferRange",
+    // textures and samplers
+    "glActiveTexture", "glBindTexture", "glBindSampler", "glBindImageTexture",
+    "glSamplerParameteri", "glTexParameterf", "glTexParameteri", "glTexParameteriv",
+    "glTexImage2D", "glTexImage3D", "glTexImage2DMultisample",
+    "glTexStorage2D", "glTexStorage3D", "glTexStorage2DMultisample",
+    "glTexStorage3DMultisample", "glTexSubImage3D",   // glTexSubImage2D has a real impl (texture dump)
+    "glCompressedTexImage2D", "glCompressedTexSubImage2D", "glCompressedTexSubImage3D",
+    "glCopyTexImage2D", "glCopyTexSubImage2D", "glCopyImageSubData", "glTexBuffer",
+    "glGenerateMipmap",
+    // shaders and programs
+    "glCompileShader", "glAttachShader", "glDetachShader", "glDeleteShader",
+    "glLinkProgram", "glUseProgram", "glValidateProgram", "glDeleteProgram",
+    "glBindAttribLocation", "glProgramParameteri", "glProgramBinary",
+    "glTransformFeedbackVaryings",
+    // uniforms — the values are handed to a program that will never run
+    "glUniform1i", "glUniform1fv", "glUniform2fv", "glUniform3fv", "glUniform4fv",
+    "glUniform1iv", "glUniform2iv", "glUniform3iv", "glUniform4iv",
+    "glUniform1uiv", "glUniform2uiv", "glUniform3uiv", "glUniform4uiv",
+    "glUniformMatrix3fv", "glUniformMatrix4fv", "glUniformBlockBinding",
+    "glProgramUniform1fv", "glProgramUniform2fv", "glProgramUniform3fv",
+    "glProgramUniform4fv", "glProgramUniform1iv", "glProgramUniform2iv",
+    "glProgramUniform3iv", "glProgramUniform4iv", "glProgramUniform1uiv",
+    "glProgramUniform2uiv", "glProgramUniform3uiv", "glProgramUniform4uiv",
+    "glProgramUniformMatrix2fv", "glProgramUniformMatrix3fv", "glProgramUniformMatrix4fv",
+    "glProgramUniformMatrix2x3fv", "glProgramUniformMatrix3x2fv",
+    "glProgramUniformMatrix2x4fv", "glProgramUniformMatrix4x2fv",
+    "glProgramUniformMatrix3x4fv", "glProgramUniformMatrix4x3fv",
+    // vertex state
+    "glBindVertexArray", "glVertexAttribPointer", "glVertexAttribIPointer",
+    "glEnableVertexAttribArray", "glDisableVertexAttribArray",
+    "glVertexAttrib4f", "glVertexAttrib4fv",
+    // the draws — the calls this whole milestone exists to reach
+    "glDrawArrays", "glDrawArraysInstanced", "glDrawArraysIndirect",
+    "glDrawElements", "glDrawElementsInstanced", "glDrawElementsBaseVertex",
+    "glDrawElementsInstancedBaseVertex", "glDrawElementsIndirect",
+    "glDispatchCompute", "glDispatchComputeIndirect", "glMemoryBarrier",
+    "glPatchParameteri",
+    // queries, transform feedback, sync
+    "glBeginQuery", "glEndQuery", "glBeginTransformFeedback", "glEndTransformFeedback",
+    "glBindTransformFeedback", "glDeleteSync",
+    // submission — nothing is queued, so nothing has to be waited on
+    "glFlush", "glFinish",
+    // debug output
+    "glDebugMessageCallback", "glDebugMessageControl", "glDebugMessageInsert",
+    "glObjectLabel", "glPushDebugGroup", "glPopDebugGroup",
+};
+
+static int gl_is_void(const char *name) {
+    for (size_t i = 0; i < sizeof g_gl_void / sizeof g_gl_void[0]; i++)
+        if (strcmp(g_gl_void[i], name) == 0) return 1;
+    return 0;
+}
 
 // ---------- EGL ----------
 static EGLDisplay klegl_GetDisplay(void *native) { (void)native; return DISPLAY; }
@@ -624,7 +906,10 @@ static unsigned klegl_DestroyContext(EGLDisplay dpy, EGLContext c) {
 
 static unsigned klegl_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
                                   EGLSurface read, EGLContext ctx) {
-    (void)dpy; g_draw = draw; g_read = read; g_current = ctx; return EGL_TRUE;
+    (void)dpy; g_draw = draw; g_read = read; g_current = ctx;
+    // Whichever thread this is, it is the one that will now issue GL.
+    if (kl_glfb_enabled()) kl_glfb_make_current();
+    return EGL_TRUE;
 }
 
 static EGLContext klegl_GetCurrentContext(void) { return g_current; }
@@ -635,6 +920,10 @@ static EGLSurface klegl_GetCurrentSurface(int32_t which) {
 static unsigned klegl_SwapBuffers(EGLDisplay dpy, EGLSurface s) {
     (void)dpy; (void)s;
     g_frames++;
+    // A swap is where a frame is finished, so it is where the reference renderer
+    // captures. No-op unless KL_GLFB_OUT names a directory.
+    const char *out = getenv("KL_GLFB_OUT");
+    if (out && kl_glfb_enabled()) kl_glfb_present(out);
     return EGL_TRUE;
 }
 
@@ -649,10 +938,20 @@ void *kl_egl_sym(const char *name) {
     if (!name) return NULL;
     void *own = kl_egl_lookup(name);              // eglXxx resolved through here too
     if (own) return own;
+    // With KL_GLFB=1 the host's real GL answers everything except the capability
+    // queries, which stay ours so the guest keeps believing it drives GLES 3.2.
+    // Still slotted, so the report counts what was resolved either way.
+    void *host = kl_glfb_sym(name);
+    if (host) {
+        int hs = gl_slot(name);
+        if (hs >= 0) g_gl[hs].resolved = 1;
+        return host;
+    }
     for (size_t i = 0; i < sizeof g_gl_impl / sizeof g_gl_impl[0]; i++)
         if (strcmp(g_gl_impl[i].name, name) == 0) return g_gl_impl[i].fn;
     int s = gl_slot(name);
     if (s >= 0) g_gl[s].resolved = 1;
+    if (gl_is_void(name)) return kl_named_stub(name, (void *)klgl_noop);
     return kl_named_stub(name, (void *)klgl_called);
 }
 

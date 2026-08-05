@@ -5,7 +5,8 @@ RUNTIME := runtime/kl_image.c runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_va_handlers.c runtime/kl_va_thunks.S \
            runtime/kl_libc.c runtime/kl_pthread.c runtime/kl_dl.c \
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
-           runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_ovrp.c
+           runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_ovrp.c \
+           runtime/kl_glfb.c
 
 .PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
 all: build/t_opus
@@ -113,3 +114,19 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/t_boot
 	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so beatsaber/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log
 	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/t_boot $(LIBS) > build/boot.log 2>/dev/null && \
 	  grep -E 'JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|M3 EXIT|M4 \(partial\)' build/boot.log
+
+# ---- graphics spikes (host-only, not part of `make check`) ----
+# S0.7/S0.8 probe Apple's desktop GL; S0.9 probes ANGLE. None of them link the
+# runtime — they answer questions about the host, not about the shim.
+build/s07_glfb: spikes/s07_glfb.c
+	$(CC) $(CFLAGS) -o $@ $< -framework OpenGL -lz
+build/s08_glsl: spikes/s08_glsl.c
+	$(CC) $(CFLAGS) -o $@ $< -framework OpenGL
+build/s09_angle: spikes/s09_angle.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+# ANGLE is *borrowed*, not vendored — see PLANNING M5. Point KL_ANGLE_DIR at any
+# Chromium-based app's Libraries directory; the default is Google Chrome's.
+.PHONY: angle
+angle: build/s09_angle
+	@./build/s09_angle

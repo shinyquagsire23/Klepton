@@ -32,4 +32,10 @@ void kl_egl_report(FILE *f);
 unsigned kl_egl_shader_count(void);
 void     kl_egl_dump_shaders(const char *dir);
 
+// Write every uncompressed 8-bit glTexSubImage2D upload to <dir> as a PNG. There
+// is no framebuffer to capture — nothing renders — but for a frame that is one
+// textured quad these uploads are its visible content.
+void kl_egl_dump_textures(const char *dir);
+unsigned kl_egl_texture_count(void);
+
 #endif

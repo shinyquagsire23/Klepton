@@ -126,6 +126,9 @@ void *kl_named_stub(const char *nm, void *handler) {
         if (g_stub_pool == MAP_FAILED) { g_stub_pool = NULL; return kl_shim_lookup("__klepton_unresolved"); }
     }
     if (g_stub_off + KL_STUB_BYTES > KL_STUB_POOL) return kl_shim_lookup("__klepton_unresolved");
+    if (getenv("KL_TRACE_IMAGES"))
+        fprintf(stderr, "  [klepton] stub pool %p..%p (writing '%s' at +0x%zx)\n",
+                (void *)g_stub_pool, (void *)(g_stub_pool + KL_STUB_POOL), nm, g_stub_off);
 
     // The name lives in the image's strtab, which kl_unload would take with it.
     char *owned = strdup(nm);
