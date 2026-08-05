@@ -54,6 +54,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 #include <zlib.h>
 #include "kl_glfb.h"
 #include "klepton.h"       // kl_trace_stub, for the per-name GL call trace
@@ -82,13 +83,27 @@
 
 #define GL_NO_ERROR      0
 #define GL_RGBA          0x1908
+#define GL_TEXTURE_2D    0x0DE1
+#define GL_SRGB8_ALPHA8  0x8C43
+#define GL_RGBA8         0x8058
 #define GL_UNSIGNED_BYTE 0x1401
 #define GL_RENDERER      0x1F01
 #define GL_VERSION       0x1F02
 
+// The vendored debug build (vendor/angle/out/Debug, see Makefile `angle-debug`)
+// is preferred when present; otherwise borrow Chrome's prebuilt.
+#define ANGLE_VENDORED_DIR "vendor/out/Debug"
 #define ANGLE_DEFAULT_DIR \
     "/Applications/Google Chrome.app/Contents/Frameworks/" \
     "Google Chrome Framework.framework/Libraries"
+
+static const char *kl_angle_dir(void) {
+    const char *dir = getenv("KL_ANGLE_DIR");
+    if (dir) return dir;
+    if (access(ANGLE_VENDORED_DIR "/libEGL.dylib", R_OK) == 0)
+        return ANGLE_VENDORED_DIR;
+    return ANGLE_DEFAULT_DIR;
+}
 
 static void *g_egl_lib, *g_gles_lib;
 static void *g_dpy, *g_surf, *g_ctx, *g_cfg;
@@ -150,8 +165,7 @@ int kl_glfb_init(void) {
         }
     }
 
-    const char *dir = getenv("KL_ANGLE_DIR");
-    if (!dir) dir = ANGLE_DEFAULT_DIR;
+    const char *dir = kl_angle_dir();
     char egl_path[1024], gles_path[1024];
     snprintf(egl_path,  sizeof egl_path,  "%s/libEGL.dylib", dir);
     snprintf(gles_path, sizeof gles_path, "%s/libGLESv2.dylib", dir);
@@ -459,8 +473,6 @@ static void klfb_note_format(uint32_t fmt, int32_t w, int32_t h, int32_t d,
 // one-line way to test that without touching anything else; the two are upload- and
 // attachment-compatible, so only the colour transfer function changes. A frame
 // captured with this set is wrong (un-decoded sRGB), which is fine for a probe.
-#define GL_SRGB8_ALPHA8 0x8C43
-#define GL_RGBA8        0x8058
 
 static uint32_t klfb_maybe_unsrgb(uint32_t fmt) {
     static int on = -1;

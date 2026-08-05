@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "../runtime/klepton.h"
+#include "../runtime/kl_glfb.h"
 #include "../runtime/kl_jni.h"
 #include "../runtime/kl_egl.h"
 #include "../runtime/kl_opensl.h"
@@ -111,6 +112,20 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
         kl_ovrplat_report(stderr);
     }
 
+    // KL_FAULT_WAIT=1: park here instead of dying so a debugger can attach and
+    // inspect every thread at the moment of the fault. This exists because the
+    // AGX abort is masked when the guest runs *under* lldb from the start (the
+    // debugger's signal traffic serializes the run enough to avoid the race),
+    // so the only way to get a symbolicated look at it is post-mortem attach.
+    if (getenv("KL_FAULT_WAIT")) {
+        n = snprintf(buf, sizeof buf,
+                     "[t_boot] KL_FAULT_WAIT: pid %d parked on signal %d — "
+                     "attach with `lldb -p %d`, then `bt all`\n", getpid(), sig,
+                     getpid());
+        if (n > 0) { ssize_t w3 = write(2, buf, (size_t)n); (void)w3; }
+        for (;;) pause();
+    }
+
     // Die of the original signal, so the parent still reports it as one.
     signal(sig, SIG_DFL);
     raise(sig);
@@ -162,12 +177,19 @@ static int check_drm_guard(void) {
     return 0;
 }
 
-int main(int argc, char **argv) {
-    if (argc > 1) LIBDIR = argv[1];
-    kl_set_library_path(LIBDIR);
-
-    printf("=== DRM policy guard ===\n");
-    if (check_drm_guard()) return 1;
+// ---- the guest run, in one function ----
+// This is everything from libmain.so entry through the lifecycle recon. It
+// runs either in the re-exec'd child (normal), or in-process (KL_NOFORK=1,
+// for debugging). Returns only on a test failure; success is _exit(0), as
+// before.
+static int recon_run(void) {
+    install_fault_reporter();
+    // Strict: an unimplemented *call* is fatal. Lookups are not, so this
+    // stops only where the surface genuinely ends. KL_PERMISSIVE=1 flips it
+    // to a zero return, which collects a whole batch in one run when pushing
+    // into new territory — scouting only, since the guest then carries on
+    // with answers we made up.
+    kl_jni_set_permissive(getenv("KL_PERMISSIVE") != NULL);
 
     // Armed before anything runs: texture uploads happen all through init and the
     // lifecycle, not just inside the frame pump.
@@ -201,118 +223,148 @@ int main(int argc, char **argv) {
     printf("\n=== M3 EXIT CRITERION MET: guest JNI_OnLoad ran, natives registered ===\n");
 
     // ---- phase 2: reconnaissance, non-fatal ----
-    // Unimplemented JNI slots abort the process on purpose, so this runs in a
-    // child. Whatever it prints before dying is the M4 work list.
     printf("\n=== recon: driving NativeLoader.load(\"libunity.so\") ===\n");
     fflush(NULL);
+    // load() takes the *directory* — it appends "/libunity.so" itself.
+    int8_t ok = ((nativeloader_load_fn)load)(kl_jni_env(), NULL,
+                                             kl_jni_new_string(LIBDIR));
+    printf("  NativeLoader.load returned %d\n", ok);
+
+    // UnityPlayer's constructor calls initJni(Context) first (UnityPlayer.smali
+    // line 372). It is `private final native`, so an instance method: the guest
+    // sees (JNIEnv*, jobject thiz, jobject context). Both objects are opaque to
+    // us — what matters is what libunity asks them for.
+    void *initJni = kl_jni_native("com/unity3d/player/UnityPlayer", "initJni", NULL);
+    if (initJni) {
+        printf("\n=== recon: UnityPlayer.initJni(Context) ===\n");
+        fflush(NULL);
+        void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+        // On device the Context is the Activity — AndroidManifest.xml declares
+        // UnityPlayerActivity — and Unity checks that with IsInstanceOf. Handing
+        // it a bare Context would send it down the no-Activity path.
+        // The shared singleton, not a fresh instance: Unity also reads this
+        // back through the static UnityPlayer.currentActivity and compares.
+        void *context = kl_jni_activity();
+        ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, context);
+        printf("  initJni returned\n");
+    }
+
+    // Lifecycle, in the order UnityPlayerActivity drives it: attach a
+    // surface, resume, then pump one frame. This is where M4 runs into M5 —
+    // nativeRecreateGfxState is what reaches for EGL.
+    if (getenv("KL_LIFECYCLE")) {
+        void *surface = kl_jni_new_object("android/view/Surface");
+        void *thiz2   = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+        struct { const char *name; int kind; } seq[] = {
+            {"nativeRecreateGfxState", 2}, {"nativeResume", 0}, {"nativeRender", 1},
+        };
+        for (unsigned i = 0; i < sizeof seq / sizeof seq[0]; i++) {
+            void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", seq[i].name, NULL);
+            if (!fn) { printf("  %s: not registered\n", seq[i].name); continue; }
+            printf("\n=== recon: UnityPlayer.%s ===\n", seq[i].name);
+            fflush(NULL);
+            // The render loop may block; do not hang the sweep. KL_ALARM
+            // widens the window when the question is what it is waiting on.
+            const char *aenv = getenv("KL_ALARM");
+            alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : 20);
+            if (seq[i].kind == 2)
+                ((void (*)(void *, void *, int, void *))fn)(kl_jni_env(), thiz2, 0, surface);
+            else if (seq[i].kind == 1)
+                printf("  -> %d\n", ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2));
+            else
+                ((void (*)(void *, void *))fn)(kl_jni_env(), thiz2);
+            alarm(0);
+            printf("  %s returned\n", seq[i].name);
+            // Android's UI thread runs its looper between callbacks; here
+            // the host has to pump it, or the queue only ever grows.
+            alarm(10);
+            unsigned ran = kl_jni_drain_ui_tasks();
+            alarm(0);
+            if (ran) printf("  drained %u posted task%s\n", ran, ran == 1 ? "" : "s");
+        }
+
+        // One nativeRender is the engine's first frame and it is almost all
+        // setup — no scene is loaded and nothing is drawn yet, which is why
+        // the GL surface looked so small. KL_FRAMES pumps the render loop
+        // the way UnityPlayer's own thread would, draining the posted-task
+        // queue between frames as the UI thread's looper does.
+        const char *fenv = getenv("KL_FRAMES");
+        unsigned frames = fenv ? (unsigned)strtoul(fenv, NULL, 10) : 0;
+        if (frames) {
+            void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
+            printf("\n=== recon: pumping %u frames ===\n", frames);
+            fflush(NULL);
+            const char *aenv2 = getenv("KL_ALARM");
+            unsigned budget = aenv2 ? (unsigned)strtoul(aenv2, NULL, 10) : 60;
+            alarm(budget);
+            unsigned i;
+            for (i = 0; i < frames && fn; i++) {
+                // The frame clock first: on Android the Choreographer's
+                // doFrame is what wakes the engine for a frame, and
+                // nativeRender then draws what it decided. Ticking after
+                // rendering would hand every frame the previous one's time.
+                kl_jni_tick_choreographer();
+                ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2);
+                kl_jni_drain_ui_tasks();
+            }
+            alarm(0);
+            printf("  pumped %u frames\n", i);
+            const char *sd = getenv("KL_DUMP_SHADERS");
+            if (sd) kl_egl_dump_shaders(sd);
+            if (getenv("KL_DUMP_TEXTURES"))
+                printf("  wrote %u texture upload%s as PNG\n",
+                       kl_egl_texture_count(),
+                       kl_egl_texture_count() == 1 ? "" : "s");
+        }
+    }
+
+    kl_jni_report(stdout);
+    kl_egl_report(stdout);
+    kl_ovrp_report(stdout);
+    kl_ovrplat_report(stdout);
+    fflush(NULL);   // _exit does not flush stdio, and the report is the point
+    _exit(0);
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) LIBDIR = argv[1];
+    kl_set_library_path(LIBDIR);
+
+    // Re-entry of the re-exec'd recon child (see below).
+    if (getenv("KL_RECON_CHILD"))
+        return recon_run();
+
+    printf("=== DRM policy guard ===\n");
+    // Under a debugger the forked child inherits the parent's Mach exception
+    // ports, so its abort is intercepted and never reads as a SIGABRT to
+    // waitpid. KL_SKIP_GUARD_TEST skips this self-test when running under
+    // lldb — the guard itself in kl_ovrplat.c is unaffected.
+    if (!getenv("KL_SKIP_GUARD_TEST") && check_drm_guard()) return 1;
+
+    // ---- phase 2: reconnaissance, in a child ----
+    // Unimplemented JNI slots abort the process on purpose, so this runs in a
+    // child. Whatever it prints before dying is the M4 work list.
+    //
+    // The child is re-EXEC'd, not a bare fork. Metal's shader compiler is an
+    // XPC service that refuses forked children, and AGX treats the resulting
+    // cold-compile failure of one of its OWN internal blit shaders as fatal
+    // (the long-standing "AGX abort"): the failure only showed once the driver
+    // needed a compile — a blit in texture setup — and only ever in the child,
+    // which is why every standalone recipe was clean. exec resets the XPC
+    // state, so the re-exec'd child compiles like any other process.
+    // KL_NOFORK=1 skips the child entirely: macOS lldb does not follow exec
+    // any better than fork, so debugging the guest needs the guest threads in
+    // the traced process, and the debugger becomes the reporter.
+    printf("\n=== recon: spawning child ===\n");
+    fflush(NULL);
+    if (getenv("KL_NOFORK"))
+        return recon_run();
+
     pid_t pid = fork();
     if (pid == 0) {
-        install_fault_reporter();
-        // Strict: an unimplemented *call* is fatal. Lookups are not, so this
-        // stops only where the surface genuinely ends. KL_PERMISSIVE=1 flips it
-        // to a zero return, which collects a whole batch in one run when pushing
-        // into new territory — scouting only, since the guest then carries on
-        // with answers we made up.
-        kl_jni_set_permissive(getenv("KL_PERMISSIVE") != NULL);
-        // load() takes the *directory* — it appends "/libunity.so" itself.
-        int8_t ok = ((nativeloader_load_fn)load)(kl_jni_env(), NULL,
-                                                 kl_jni_new_string(LIBDIR));
-        printf("  NativeLoader.load returned %d\n", ok);
-
-        // UnityPlayer's constructor calls initJni(Context) first (UnityPlayer.smali
-        // line 372). It is `private final native`, so an instance method: the guest
-        // sees (JNIEnv*, jobject thiz, jobject context). Both objects are opaque to
-        // us — what matters is what libunity asks them for.
-        void *initJni = kl_jni_native("com/unity3d/player/UnityPlayer", "initJni", NULL);
-        if (initJni) {
-            printf("\n=== recon: UnityPlayer.initJni(Context) ===\n");
-            fflush(NULL);
-            void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
-            // On device the Context is the Activity — AndroidManifest.xml declares
-            // UnityPlayerActivity — and Unity checks that with IsInstanceOf. Handing
-            // it a bare Context would send it down the no-Activity path.
-            // The shared singleton, not a fresh instance: Unity also reads this
-            // back through the static UnityPlayer.currentActivity and compares.
-            void *context = kl_jni_activity();
-            ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, context);
-            printf("  initJni returned\n");
-        }
-
-        // Lifecycle, in the order UnityPlayerActivity drives it: attach a
-        // surface, resume, then pump one frame. This is where M4 runs into M5 —
-        // nativeRecreateGfxState is what reaches for EGL.
-        if (getenv("KL_LIFECYCLE")) {
-            void *surface = kl_jni_new_object("android/view/Surface");
-            void *thiz2   = kl_jni_new_object("com/unity3d/player/UnityPlayer");
-            struct { const char *name; int kind; } seq[] = {
-                {"nativeRecreateGfxState", 2}, {"nativeResume", 0}, {"nativeRender", 1},
-            };
-            for (unsigned i = 0; i < sizeof seq / sizeof seq[0]; i++) {
-                void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", seq[i].name, NULL);
-                if (!fn) { printf("  %s: not registered\n", seq[i].name); continue; }
-                printf("\n=== recon: UnityPlayer.%s ===\n", seq[i].name);
-                fflush(NULL);
-                // The render loop may block; do not hang the sweep. KL_ALARM
-                // widens the window when the question is what it is waiting on.
-                const char *aenv = getenv("KL_ALARM");
-                alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : 20);
-                if (seq[i].kind == 2)
-                    ((void (*)(void *, void *, int, void *))fn)(kl_jni_env(), thiz2, 0, surface);
-                else if (seq[i].kind == 1)
-                    printf("  -> %d\n", ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2));
-                else
-                    ((void (*)(void *, void *))fn)(kl_jni_env(), thiz2);
-                alarm(0);
-                printf("  %s returned\n", seq[i].name);
-                // Android's UI thread runs its looper between callbacks; here
-                // the host has to pump it, or the queue only ever grows.
-                alarm(10);
-                unsigned ran = kl_jni_drain_ui_tasks();
-                alarm(0);
-                if (ran) printf("  drained %u posted task%s\n", ran, ran == 1 ? "" : "s");
-            }
-
-            // One nativeRender is the engine's first frame and it is almost all
-            // setup — no scene is loaded and nothing is drawn yet, which is why
-            // the GL surface looked so small. KL_FRAMES pumps the render loop
-            // the way UnityPlayer's own thread would, draining the posted-task
-            // queue between frames as the UI thread's looper does.
-            const char *fenv = getenv("KL_FRAMES");
-            unsigned frames = fenv ? (unsigned)strtoul(fenv, NULL, 10) : 0;
-            if (frames) {
-                void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
-                printf("\n=== recon: pumping %u frames ===\n", frames);
-                fflush(NULL);
-                const char *aenv2 = getenv("KL_ALARM");
-                unsigned budget = aenv2 ? (unsigned)strtoul(aenv2, NULL, 10) : 60;
-                alarm(budget);
-                unsigned i;
-                for (i = 0; i < frames && fn; i++) {
-                    // The frame clock first: on Android the Choreographer's
-                    // doFrame is what wakes the engine for a frame, and
-                    // nativeRender then draws what it decided. Ticking after
-                    // rendering would hand every frame the previous one's time.
-                    kl_jni_tick_choreographer();
-                    ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2);
-                    kl_jni_drain_ui_tasks();
-                }
-                alarm(0);
-                printf("  pumped %u frames\n", i);
-                const char *sd = getenv("KL_DUMP_SHADERS");
-                if (sd) kl_egl_dump_shaders(sd);
-                if (getenv("KL_DUMP_TEXTURES"))
-                    printf("  wrote %u texture upload%s as PNG\n",
-                           kl_egl_texture_count(),
-                           kl_egl_texture_count() == 1 ? "" : "s");
-            }
-        }
-
-        kl_jni_report(stdout);
-        kl_egl_report(stdout);
-        kl_ovrp_report(stdout);
-        kl_ovrplat_report(stdout);
-        fflush(NULL);   // _exit does not flush stdio, and the report is the point
-        _exit(0);
+        setenv("KL_RECON_CHILD", "1", 1);
+        execl(argv[0], argv[0], LIBDIR, (char *)NULL);
+        _exit(127);
     }
     int st = 0;
     waitpid(pid, &st, 0);
