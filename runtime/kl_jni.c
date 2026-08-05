@@ -77,7 +77,21 @@ typedef struct klj_object {
 // description long before the JNIBridge block that builds one.
 #define KLJ_CLASS_PROXY  "bitter/jnibridge/JNIBridge$Proxy"
 #define KLJ_CLASS_METHOD "java/lang/reflect/Method"
-typedef struct { const char *cls, *name, *sig; } klj_method_obj;
+#define KLJ_CLASS_FIELD  "java/lang/reflect/Field"
+typedef struct { const char *cls, *name, *sig; int is_static; } klj_method_obj;
+
+// A boxed primitive or a SharedPreferences value — the same shape serves both,
+// because a preference is exactly "a typed scalar with a key". Declared up here
+// rather than beside the preferences code because the Choreographer needs to box
+// a long long before that file section.
+typedef struct {
+    char   *key;
+    char    kind;     // 'S' string, 'I' 'J' 'Z' integral, 'F' float, '-' pending removal
+    char   *sval;
+    int64_t ival;
+    float   fval;
+} klj_pref;
+typedef struct { const char *cls, *name, *sig; int is_static; } klj_field_obj;
 static void *klj_class_object(const char *class_name);
 
 static const char KLJ_CLASS_CLASS[]  = "java/lang/Class";
@@ -343,6 +357,92 @@ static void *klj_NewStringUTF(void *env, const char *s) {
     return s ? kl_jni_new_string(s) : NULL;
 }
 
+// GetStringChars is the other direction, and unlike GetStringUTFChars it cannot
+// be the identity: the guest wants UTF-16 and we store UTF-8. So this one really
+// does copy, isCopy is true, and Release actually frees — the pair has to be
+// implemented together or it silently leaks a buffer per call.
+static uint16_t *klj_utf8_to_utf16(const char *s, kl_jint *out_units) {
+    size_t bytes = s ? strlen(s) : 0;
+    uint16_t *buf = malloc((bytes + 1) * sizeof(uint16_t));   // >= units + NUL
+    if (!buf) return NULL;
+    kl_jint units = 0;
+    for (const unsigned char *p = (const unsigned char *)s; p && *p; ) {
+        uint32_t c;
+        if (*p < 0x80)        { c = *p; p += 1; }
+        else if (*p < 0xE0)   { c = (uint32_t)(*p & 0x1F) << 6  | (p[1] & 0x3F); p += 2; }
+        else if (*p < 0xF0)   { c = (uint32_t)(*p & 0x0F) << 12 | (uint32_t)(p[1] & 0x3F) << 6
+                                  | (p[2] & 0x3F); p += 3; }
+        else                  { c = (uint32_t)(*p & 0x07) << 18 | (uint32_t)(p[1] & 0x3F) << 12
+                                  | (uint32_t)(p[2] & 0x3F) << 6 | (p[3] & 0x3F); p += 4; }
+        if (c >= 0x10000) {                       // split into a surrogate pair
+            c -= 0x10000;
+            buf[units++] = (uint16_t)(0xD800 + (c >> 10));
+            buf[units++] = (uint16_t)(0xDC00 + (c & 0x3FF));
+        } else {
+            buf[units++] = (uint16_t)c;
+        }
+    }
+    buf[units] = 0;
+    if (out_units) *out_units = units;
+    return buf;
+}
+
+static const uint16_t *klj_GetStringChars(void *env, void *jstr, uint8_t *isCopy) {
+    (void)env;
+    if (isCopy) *isCopy = 1;            // it is a copy, and Release must free it
+    return klj_utf8_to_utf16(klj_str(jstr), NULL);
+}
+
+static void klj_ReleaseStringChars(void *env, void *jstr, const uint16_t *chars) {
+    (void)env; (void)jstr;
+    free((void *)chars);
+}
+
+// NewString takes UTF-16, which is the one direction our representation does not
+// get for free. Converted rather than truncated: a cast to bytes would work for
+// ASCII and silently corrupt anything else, and this is on the path Unity uses for
+// text it got back from Java.
+//
+// Surrogate pairs are recombined into a single code point (proper UTF-8) rather
+// than encoded separately (which would be modified UTF-8/CESU-8). Everything that
+// reads these buffers on our side is a Darwin libc function expecting real UTF-8,
+// so this is the encoding that stays consistent with the rest of the shim.
+static void *klj_NewString(void *env, const uint16_t *unicode, kl_jint len) {
+    (void)env;
+    if (!unicode || len < 0) return NULL;
+    // Worst case 3 bytes per unit; a surrogate pair is 2 units -> 4 bytes, so the
+    // per-unit bound still holds.
+    char *out = malloc((size_t)len * 3 + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (kl_jint i = 0; i < len; i++) {
+        uint32_t c = unicode[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len &&
+            unicode[i + 1] >= 0xDC00 && unicode[i + 1] <= 0xDFFF) {
+            c = 0x10000 + ((c - 0xD800) << 10) + (unicode[++i] - 0xDC00);
+        }
+        if (c < 0x80) {
+            out[o++] = (char)c;
+        } else if (c < 0x800) {
+            out[o++] = (char)(0xC0 | (c >> 6));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            out[o++] = (char)(0xE0 | (c >> 12));
+            out[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            out[o++] = (char)(0xF0 | (c >> 18));
+            out[o++] = (char)(0x80 | ((c >> 12) & 0x3F));
+            out[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    out[o] = 0;
+    void *s = kl_jni_new_string(out);
+    free(out);
+    return s;
+}
+
 static kl_jint klj_RegisterNatives(void *env, void *clazz, const kl_jni_method *m, kl_jint n) {
     (void)env;
     const char *cls = klj_class_name(clazz);
@@ -415,7 +515,7 @@ static void *klj_FromReflectedMethod(void *env, void *method) {
     }
     klj_method_obj *m = o->data;
     if (!m) return NULL;
-    return klj_want(klj_class_object(m->cls), m->name, m->sig, 'm');
+    return klj_want(klj_class_object(m->cls), m->name, m->sig, m->is_static ? 'M' : 'm');
 }
 
 // ------------------------------------------------------- Java method dispatch
@@ -478,7 +578,83 @@ static char klj_return_kind(const char *sig) {
     return (*p == '[') ? 'L' : *p;
 }
 
-static klj_val klj_call(void *env, void *self, void *mid, kl_va *va, char want) {
+// The `A` calling convention: arguments arrive as an array of jvalue unions
+// rather than as a va_list. Each jvalue is 8 bytes, but a narrow type only writes
+// its own width into it — so the member has to be read at the *declared* type.
+// Reading .j for a jint would pick up whatever four bytes the caller happened to
+// leave above it, which is a garbage argument that looks like a plausible one.
+typedef union {
+    uint8_t  z;  int8_t  b;  uint16_t c;  int16_t s;
+    kl_jint  i;  int64_t j;  float    f;  double  d;  void *l;
+} klj_jvalue;
+
+static int klj_decode_args_a(const char *sig, const klj_jvalue *args, klj_val *argv) {
+    if (!sig || *sig != '(') return -1;
+    int argc = 0;
+    for (const char *p = sig + 1; *p && *p != ')'; ) {
+        // A NULL array is legitimate for a method that takes nothing — the guest
+        // has no arguments to point at — so it is only an error once there is
+        // something to read. Rejecting it outright turned every zero-argument
+        // A-call into "cannot decode signature".
+        if (argc == KLJ_MAX_ARGS || !args) return -1;
+        while (*p == '[') p++;                       // arrays are references
+        switch (*p) {
+        case 'L':
+            while (*p && *p != ';') p++;
+            if (*p == ';') p++;
+            argv[argc].l = args[argc].l;
+            argc++;
+            break;
+        // Widened the way Java widens them: signed types sign-extend, boolean and
+        // char zero-extend, so a binding reading .j sees the value it expects.
+        case 'Z': argv[argc].j = (uint64_t)args[argc].z; argc++; p++; break;
+        case 'B': argv[argc].j = (uint64_t)(int64_t)args[argc].b; argc++; p++; break;
+        case 'C': argv[argc].j = (uint64_t)args[argc].c; argc++; p++; break;
+        case 'S': argv[argc].j = (uint64_t)(int64_t)args[argc].s; argc++; p++; break;
+        case 'I': argv[argc].j = (uint64_t)(int64_t)args[argc].i; argc++; p++; break;
+        case 'J': argv[argc].j = (uint64_t)args[argc].j; argc++; p++; break;
+        case 'F': argv[argc].d = (double)args[argc].f; argc++; p++; break;
+        case 'D': argv[argc].d = args[argc].d; argc++; p++; break;
+        default:  return -1;
+        }
+    }
+    return argc;
+}
+
+// Bindings are declared against the class that *declares* the method, and the
+// guest looks methods up on the class it actually has. Those differ for anything
+// inherited — Unity calls getClass() on UnityPlayerActivity, and that is declared
+// on java.lang.Object — so resolution walks the same superclass chain
+// IsInstanceOf uses, then falls back to Object. Without this, every inherited
+// method would need re-declaring against every subclass that calls it, and the
+// duplicates would be the thing that drifts.
+static const klj_binding *klj_find_binding(const char *cls, const char *name,
+                                           const char *sig) {
+    for (const klj_binding *b = g_bindings; b->cls; b++)
+        if (strcmp(b->cls, cls) == 0 && strcmp(b->name, name) == 0 &&
+            strcmp(b->sig, sig) == 0)
+            return b;
+    return NULL;
+}
+
+static const klj_binding *klj_resolve_binding(const char *cls, const char *name,
+                                              const char *sig) {
+    for (const char *cur = cls; cur; ) {
+        const klj_binding *b = klj_find_binding(cur, name, sig);
+        if (b) return b;
+        const char *next = NULL;
+        for (int i = 0; g_supers[i].cls; i++)
+            if (strcmp(g_supers[i].cls, cur) == 0) { next = g_supers[i].super; break; }
+        cur = next;
+    }
+    return klj_find_binding("java/lang/Object", name, sig);
+}
+
+// Exactly one of `va` / `args` is non-NULL; everything else about a call is
+// identical between the two conventions, so they share this path rather than
+// duplicating the binding lookup and the diagnostics.
+static klj_val klj_call_common(void *env, void *self, void *mid, char want,
+                               kl_va *va, const klj_jvalue *args) {
     klj_val zero = {0};
     klj_wanted *w = mid;
     if (!w || w < g_wanted || w >= g_wanted + KLJ_MAX_WANTED) {
@@ -493,11 +669,11 @@ static klj_val klj_call(void *env, void *self, void *mid, kl_va *va, char want) 
         KLJ_LOG("WARNING %s.%s%s called through a '%c' slot but returns '%c'",
                 w->cls, w->name, w->sig, want, have);
 
-    for (const klj_binding *b = g_bindings; b->cls; b++) {
-        if (strcmp(b->cls, w->cls) || strcmp(b->name, w->name) || strcmp(b->sig, w->sig))
-            continue;
+    const klj_binding *b = klj_resolve_binding(w->cls, w->name, w->sig);
+    if (b) {
         klj_val argv[KLJ_MAX_ARGS];
-        int argc = klj_decode_args(w->sig, va, argv);
+        int argc = va ? klj_decode_args(w->sig, va, argv)
+                      : klj_decode_args_a(w->sig, args, argv);
         if (argc < 0) {
             KLJ_LOG("cannot decode signature %s for %s.%s", w->sig, w->cls, w->name);
             kl_fatal_prepare(); abort();
@@ -513,6 +689,14 @@ static klj_val klj_call(void *env, void *self, void *mid, kl_va *va, char want) 
         kl_fatal_prepare(); abort();
     }
     return zero;
+}
+
+static klj_val klj_call(void *env, void *self, void *mid, kl_va *va, char want) {
+    return klj_call_common(env, self, mid, want, va, NULL);
+}
+static klj_val klj_call_a(void *env, void *self, void *mid,
+                          const klj_jvalue *args, char want) {
+    return klj_call_common(env, self, mid, want, NULL, args);
 }
 
 // One entry point per return kind. The static forms differ only in that `self`
@@ -539,6 +723,48 @@ static void klj_CallVoidMethodV(void *env, void *self, void *mid, kl_va *va) {
 }
 static void klj_CallStaticVoidMethodV(void *env, void *cls, void *mid, kl_va *va) {
     klj_call(env, cls, mid, va, 'V');
+}
+
+// The same family over the `A` convention. Generated rather than typed out for
+// the reason the V forms are: these differ only in the return kind, and a
+// hand-written set is where a copy-paste picks the wrong one. Nonvirtual is the
+// instance form as far as we are concerned — there is no class hierarchy here to
+// dispatch through, so "call exactly this method" is what every form already does.
+#define KLJ_CALL_A(Name, Ret, Kind, Expr)                                                 \
+    static Ret klj_Call##Name##MethodA(void *env, void *self, void *mid, const klj_jvalue *a) { \
+        klj_val r = klj_call_a(env, self, mid, a, Kind); (void)r; return Expr;              \
+    }                                                                                       \
+    static Ret klj_CallStatic##Name##MethodA(void *env, void *cls, void *mid, const klj_jvalue *a) { \
+        klj_val r = klj_call_a(env, cls, mid, a, Kind); (void)r; return Expr;                \
+    }                                                                                       \
+    static Ret klj_CallNonvirtual##Name##MethodA(void *env, void *self, void *cls,          \
+                                                 void *mid, const klj_jvalue *a) {          \
+        (void)cls;                                                                          \
+        klj_val r = klj_call_a(env, self, mid, a, Kind); (void)r; return Expr;               \
+    }
+KLJ_CALL_A(Object,  void *,   'L', r.l)
+KLJ_CALL_A(Boolean, uint8_t,  'Z', (uint8_t)r.j)
+KLJ_CALL_A(Byte,    int8_t,   'B', (int8_t)r.j)
+KLJ_CALL_A(Char,    uint16_t, 'C', (uint16_t)r.j)
+KLJ_CALL_A(Short,   int16_t,  'S', (int16_t)r.j)
+KLJ_CALL_A(Int,     kl_jint,  'I', (kl_jint)r.j)
+KLJ_CALL_A(Long,    int64_t,  'J', (int64_t)r.j)
+KLJ_CALL_A(Float,   float,    'F', (float)r.d)
+KLJ_CALL_A(Double,  double,   'D', r.d)
+#undef KLJ_CALL_A
+static void klj_CallVoidMethodA(void *env, void *self, void *mid, const klj_jvalue *a) {
+    klj_call_a(env, self, mid, a, 'V');
+}
+static void klj_CallStaticVoidMethodA(void *env, void *cls, void *mid, const klj_jvalue *a) {
+    klj_call_a(env, cls, mid, a, 'V');
+}
+static void klj_CallNonvirtualVoidMethodA(void *env, void *self, void *cls, void *mid,
+                                          const klj_jvalue *a) {
+    (void)cls;
+    klj_call_a(env, self, mid, a, 'V');
+}
+static void *klj_NewObjectA(void *env, void *clazz, void *mid, const klj_jvalue *a) {
+    return klj_call_a(env, clazz, mid, a, '?').l;
 }
 
 // A constructor is just a method named <init>; it returns the new object rather
@@ -682,6 +908,7 @@ static klj_val klj_appinfo_nativeLibraryDir(void);
 static klj_val klj_appinfo_dataDir(void);
 static klj_val klj_appinfo_splitSourceDirs(void);
 static klj_val klj_metaData_field(void);
+static klj_val klj_currentActivity_field(void);
 
 // ---- written fields ----
 // g_fields describes the device, and a description does not change. But some
@@ -854,6 +1081,11 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/content/pm/PackageInfo", "versionCode", 545),
     KLJ_FSTR("android/content/pm/PackageInfo", "packageName", "com.beatgames.beatsaber"),
 
+    // Unity's own static handle on the Activity. Must be the *same* object the
+    // Context was, not another instance of the class — Unity passes one to native
+    // code and reads the other back, then compares them.
+    KLJ_FFN("com/unity3d/player/UnityPlayer", "currentActivity", "Ljava/lang/Object;", klj_currentActivity_field),
+
     KLJ_FFN("android/content/pm/PackageItemInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),
     KLJ_FFN("android/content/pm/ApplicationInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),
 
@@ -867,12 +1099,26 @@ static const klj_field g_fields[] = {
     // paths the title actually shipped against. Revisit if a path needs 30+.
     KLJ_FINT("android/os/Build$VERSION", "SDK_INT", 29),
     KLJ_FSTR("android/os/Build$VERSION", "RELEASE", "10"),
+    // The build-number half of the version. Matches Build.ID so the two halves of
+    // the fingerprint describe one build.
+    KLJ_FSTR("android/os/Build$VERSION", "INCREMENTAL", "SQ3A.220605.009.A1"),
+    KLJ_FSTR("android/os/Build$VERSION", "CODENAME",    "REL"),
     KLJ_FSTR("android/os/Build", "MANUFACTURER", "Oculus"),
     KLJ_FSTR("android/os/Build", "BRAND",        "oculus"),
     KLJ_FSTR("android/os/Build", "MODEL",        "Quest 2"),
     KLJ_FSTR("android/os/Build", "DEVICE",       "delmar"),
     KLJ_FSTR("android/os/Build", "PRODUCT",      "delmar"),
     KLJ_FSTR("android/os/Build", "HARDWARE",     "qcom"),
+    // Build fingerprint pieces, in the shape Android defines and consistent with
+    // the Quest 2 described above. Unity puts these straight into its device
+    // report; nothing branches on them, but they have to parse and to agree with
+    // MODEL/DEVICE rather than describing some other machine.
+    KLJ_FSTR("android/os/Build", "ID",           "SQ3A.220605.009.A1"),
+    KLJ_FSTR("android/os/Build", "DISPLAY",      "SQ3A.220605.009.A1"),
+    KLJ_FSTR("android/os/Build", "TYPE",         "user"),
+    KLJ_FSTR("android/os/Build", "TAGS",         "release-keys"),
+    KLJ_FSTR("android/os/Build", "FINGERPRINT",
+             "oculus/delmar/delmar:10/SQ3A.220605.009.A1/1:user/release-keys"),
 
 
     KLJ_FINT("android/content/Context", "MODE_PRIVATE", 0),
@@ -890,6 +1136,16 @@ static const klj_field g_fields[] = {
     KLJ_CTX_SVC("DISPLAY_SERVICE",      "display"),
     KLJ_CTX_SVC("CLIPBOARD_SERVICE",    "clipboard"),
     KLJ_CTX_SVC("NOTIFICATION_SERVICE", "notification"),
+    KLJ_CTX_SVC("MEDIA_ROUTER_SERVICE", "media_router"),
+
+    // Unity asks the MediaRouter for the live-video route to find out whether it
+    // should be presenting to an external display. Values are from android-34's
+    // android.jar, not from memory.
+    KLJ_FINT("android/media/MediaRouter", "ROUTE_TYPE_LIVE_AUDIO", 1),
+    KLJ_FINT("android/media/MediaRouter", "ROUTE_TYPE_LIVE_VIDEO", 2),
+    KLJ_FINT("android/media/MediaRouter", "ROUTE_TYPE_USER",       8388608),
+
+    KLJ_FSTR("android/provider/Settings$Secure", "ANDROID_ID", "android_id"),
 
     KLJ_FINT("android/content/pm/PackageManager", "GET_ACTIVITIES",     0x0001),
     KLJ_FINT("android/content/pm/PackageManager", "GET_INTENT_FILTERS", 0x0020),
@@ -1225,6 +1481,7 @@ static klj_val klj_Context_getSystemService(void *env, void *self, const klj_val
         {"display",      "android/hardware/display/DisplayManager"},
         {"clipboard",    "android/content/ClipboardManager"},
         {"notification", "android/app/NotificationManager"},
+        {"media_router", "android/media/MediaRouter"},
         {NULL, NULL},
     };
     const char *want = n > 0 ? klj_str(a[0].l) : NULL;
@@ -1342,8 +1599,15 @@ static klj_val klj_Context_getObbDir(void *env, void *self, const klj_val *a, in
 // started. The delay is recorded but not honoured — a posted task runs at the
 // next drain regardless of its delay, which is wrong in the same way a
 // zero-latency looper is wrong, and has not mattered yet.
+// A queue entry is either a Runnable to run or a Message to deliver to its
+// target Handler's callback. One queue, because on Android both land on the same
+// main looper and ordering between them is observable.
 #define KLJ_MAX_UI_TASKS 64
-static struct { void *runnable; int64_t delay_ms; } g_ui_tasks[KLJ_MAX_UI_TASKS];
+static struct {
+    void   *runnable;      // Runnable, or NULL when this entry is a message
+    void   *message;       // android/os/Message, or NULL when it is a runnable
+    int64_t delay_ms;
+} g_ui_tasks[KLJ_MAX_UI_TASKS];
 static unsigned g_ui_task_n;
 
 unsigned kl_jni_pending_ui_tasks(void) { return g_ui_task_n; }
@@ -1354,10 +1618,21 @@ unsigned kl_jni_pending_ui_tasks(void) { return g_ui_task_n; }
 static void klj_ui_enqueue(const char *via, void *runnable, int64_t delay_ms) {
     if (runnable && g_ui_task_n < KLJ_MAX_UI_TASKS) {
         g_ui_tasks[g_ui_task_n].runnable = runnable;
+        g_ui_tasks[g_ui_task_n].message  = NULL;
         g_ui_tasks[g_ui_task_n].delay_ms = delay_ms;
         g_ui_task_n++;
     }
     KLJ_LOG("%s: queued (+%lldms, %u pending)", via, (long long)delay_ms, g_ui_task_n);
+}
+
+static void klj_msg_enqueue(const char *via, void *message) {
+    if (message && g_ui_task_n < KLJ_MAX_UI_TASKS) {
+        g_ui_tasks[g_ui_task_n].runnable = NULL;
+        g_ui_tasks[g_ui_task_n].message  = message;
+        g_ui_tasks[g_ui_task_n].delay_ms = 0;
+        g_ui_task_n++;
+    }
+    KLJ_LOG("%s: queued (%u pending)", via, g_ui_task_n);
 }
 
 static klj_val klj_Activity_runOnUiThread(void *env, void *self, const klj_val *a, int n) {
@@ -1375,11 +1650,29 @@ static klj_val klj_Looper_getMainLooper(void *env, void *self, const klj_val *a,
 }
 // new Handler() binds to the calling thread's Looper; new Handler(looper) to the
 // one given. We have a single queue, so the Looper is recorded and not acted on.
+// The Callback form keeps the callback: sendToTarget() has to find it again, and
+// it is the only thing that gives a Message any meaning.
+typedef struct { void *looper, *callback; } klj_handler;
+
 static klj_val klj_Handler_init(void *env, void *clazz, const klj_val *a, int n) {
     (void)env;
     void *obj = kl_jni_new_object(klj_class_name(clazz));
-    klj_as_object(obj)->data = n > 0 ? a[0].l : NULL;
+    klj_handler *h = calloc(1, sizeof *h);
+    if (h) {
+        h->looper   = n > 0 ? a[0].l : NULL;
+        h->callback = n > 1 ? a[1].l : NULL;
+    }
+    klj_as_object(obj)->data = h;
+    if (h && h->callback) {
+        klj_object *cb = klj_as_object(h->callback);
+        KLJ_LOG("new Handler(looper, callback=%s)", cb ? cb->cls : "(untagged)");
+    }
     return (klj_val){.l = obj};
+}
+
+static klj_handler *klj_as_handler(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    return (o && strcmp(o->cls, "android/os/Handler") == 0) ? o->data : NULL;
 }
 // postDelayed returns whether the message made it into the queue — which it did.
 // The delay is recorded rather than honoured; there is no clock driving this
@@ -1395,6 +1688,230 @@ static klj_val klj_Handler_post(void *env, void *self, const klj_val *a, int n) 
     klj_ui_enqueue("Handler.post", n > 0 ? a[0].l : NULL, 0);
     return (klj_val){.j = 1};
 }
+
+// ---- HandlerThread loopers ----
+//
+// A HandlerThread is a real thread with a real message loop, and here that turns
+// out to be load-bearing rather than a detail worth simplifying away.
+//
+// The first version of this treated a HandlerThread's Looper as the main one and
+// its start() as a no-op, on the reasoning that everything drains through
+// kl_jni_drain_ui_tasks() anyway. That is true for Runnables, and wrong for
+// Messages: the guest sends a message and then *blocks* waiting for the handler to
+// run, which only works if the loop is on another thread. With no such thread the
+// main thread sat in __psynch_cvwait until the watchdog fired — a hang whose cause
+// was two layers away from where it presented, exactly the failure mode a silent
+// no-op produces.
+//
+// So a started HandlerThread gets a host thread and its own queue. The main looper
+// keeps the host-driven drain, because there genuinely is no thread of ours
+// running it.
+#define KLJ_MAX_LOOPER_MSGS 64
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t  wake;
+    pthread_t       thread;
+    int             running, started;
+    void           *q[KLJ_MAX_LOOPER_MSGS];
+    unsigned        head, tail, count;
+} klj_looper;
+
+static void klj_deliver_message(void *message);
+
+// Guest code runs on this thread, so kl_thread_init() before the first delivery is
+// mandatory (S0.1 / trap 1) — without it the stack-protector prologue reads an
+// empty TSD slot and the guest dies a long way from here.
+static void *klj_looper_thread(void *arg) {
+    klj_looper *lp = arg;
+    kl_thread_init();
+    pthread_mutex_lock(&lp->lock);
+    while (lp->running) {
+        if (!lp->count) { pthread_cond_wait(&lp->wake, &lp->lock); continue; }
+        void *msg = lp->q[lp->head];
+        lp->head  = (lp->head + 1) % KLJ_MAX_LOOPER_MSGS;
+        lp->count--;
+        pthread_mutex_unlock(&lp->lock);
+        klj_deliver_message(msg);          // outside the lock: it runs guest code
+        pthread_mutex_lock(&lp->lock);
+    }
+    pthread_mutex_unlock(&lp->lock);
+    return NULL;
+}
+
+static void klj_looper_post(klj_looper *lp, void *message) {
+    pthread_mutex_lock(&lp->lock);
+    if (lp->count < KLJ_MAX_LOOPER_MSGS) {
+        lp->q[lp->tail] = message;
+        lp->tail = (lp->tail + 1) % KLJ_MAX_LOOPER_MSGS;
+        lp->count++;
+    } else {
+        KLJ_LOG("looper queue full — message dropped");
+    }
+    pthread_cond_signal(&lp->wake);
+    pthread_mutex_unlock(&lp->lock);
+}
+
+// A Looper object carries the klj_looper it belongs to, or NULL for the main one.
+static klj_looper *klj_looper_of(void *looper_obj) {
+    klj_object *o = klj_as_object(looper_obj);
+    return (o && strcmp(o->cls, "android/os/Looper") == 0) ? o->data : NULL;
+}
+
+// ---- android.os.Message ----
+//
+// A Message is a Runnable's counterpart on the same queue: post() carries code to
+// run, sendMessage() carries data for the target Handler's callback to interpret.
+// Both end up on the main looper, so they share the queue below rather than
+// getting a second one.
+//
+// What is actually behind this in Beat Saber is Unity's AudioVolumeHandler: it
+// registers for volume-change notifications and turns each one into a Message
+// whose handler calls the guest native onAudioVolumeChanged(int). Nothing on this
+// side changes the volume, so no message is expected to be *sent* — obtainMessage
+// is reached during setup regardless. That is why this is deliberately only as
+// much machinery as the trace forces: the object and its fields, and no delivery
+// path until something is proven to send one.
+typedef struct { int32_t what, arg1, arg2; void *obj, *target; } klj_message;
+
+static klj_message *klj_as_message(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    return (o && strcmp(o->cls, "android/os/Message") == 0) ? o->data : NULL;
+}
+
+// obtainMessage(what) — Android recycles these from a pool; we allocate, because
+// the pool is an allocation optimisation and nothing observable depends on it.
+static klj_val klj_Handler_obtainMessage(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_message *m = calloc(1, sizeof *m);
+    if (!m) return (klj_val){.l = NULL};
+    m->what   = n > 0 ? (int32_t)a[0].j : 0;
+    m->target = self;                       // sendToTarget() needs to find it back
+    void *obj = klj_new_object_data("android/os/Message", m);
+
+    // Message's members are public *fields*, not getters, so the handler reads
+    // msg.what with GetIntField. Publishing them through the same per-object write
+    // table the guest's own Set*Field uses means a read finds them by the ordinary
+    // path — no instance-field special case, and a guest that writes one back gets
+    // the write it expects.
+    klj_field_store(obj, klj_want(klj_class_object("android/os/Message"), "what", "I", 'f'),
+                    (klj_val){.j = (uint64_t)(int64_t)m->what});
+    klj_field_store(obj, klj_want(klj_class_object("android/os/Message"), "arg1", "I", 'f'),
+                    (klj_val){.j = 0});
+    klj_field_store(obj, klj_want(klj_class_object("android/os/Message"), "arg2", "I", 'f'),
+                    (klj_val){.j = 0});
+    KLJ_LOG("Handler.obtainMessage(what=%d)", m->what);
+    return (klj_val){.l = obj};
+}
+
+// sendToTarget() posts the message to the Handler it came from. Never delivered
+// inline: Android returns immediately and the looper delivers later, and the
+// sender here is frequently about to block waiting for that to happen on another
+// thread — delivering inline would run the callback before the sender is ready
+// for it, and on the wrong thread.
+//
+// Which queue depends on the target Handler's Looper. A HandlerThread's looper has
+// a thread of its own to deliver on; the main looper does not, so its messages
+// wait for the host's drain.
+static klj_val klj_Message_sendToTarget(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_message *m = klj_as_message(self);
+    if (!m) {
+        KLJ_LOG("Message.sendToTarget() on something that is not a Message");
+        return (klj_val){.j = 0};
+    }
+    klj_handler *h  = klj_as_handler(m->target);
+    klj_looper  *lp = h ? klj_looper_of(h->looper) : NULL;
+    if (lp && lp->started) {
+        KLJ_LOG("Message.sendToTarget(what=%d) -> HandlerThread looper", m->what);
+        klj_looper_post(lp, self);
+    } else {
+        klj_msg_enqueue("Message.sendToTarget", self);
+    }
+    return (klj_val){.j = 0};
+}
+
+// ---- android.os.HandlerThread ----
+// The thread is not started here — Android requires an explicit start() — so the
+// looper exists but nothing delivers on it until then.
+static klj_val klj_HandlerThread_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    void *obj = kl_jni_new_object(klj_class_name(clazz));
+    klj_looper *lp = calloc(1, sizeof *lp);
+    if (lp) {
+        pthread_mutex_init(&lp->lock, NULL);
+        pthread_cond_init(&lp->wake, NULL);
+    }
+    klj_as_object(obj)->data = lp;
+    return (klj_val){.l = obj};
+}
+
+// getLooper() blocks on Android until the thread is running; ours is ready as
+// soon as start() has spawned it, and callers only use it to build a Handler.
+static klj_val klj_HandlerThread_getLooper(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    void *looper = kl_jni_new_object("android/os/Looper");
+    klj_as_object(looper)->data = o ? o->data : NULL;    // shares the klj_looper
+    return (klj_val){.l = looper};
+}
+
+static klj_val klj_HandlerThread_start(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o  = klj_as_object(self);
+    klj_looper *lp = o ? o->data : NULL;
+    if (!lp) {
+        KLJ_LOG("HandlerThread.start() with no looper — nothing to run");
+        return (klj_val){.j = 0};
+    }
+    if (!lp->started) {
+        lp->started = lp->running = 1;
+        pthread_create(&lp->thread, NULL, klj_looper_thread, lp);
+        KLJ_LOG("HandlerThread.start() — looper thread running");
+    }
+    return (klj_val){.j = 0};
+}
+
+// ---- android.view.Choreographer ----
+//
+// Android's vsync callback, and the engine's frame clock: the guest posts a
+// FrameCallback and gets doFrame(frameTimeNanos) once per display refresh. Beat
+// Saber reaches it through the Android Game SDK, whose ChoreographerCallback
+// registered the native nOnChoreographer(long, long).
+//
+// getInstance() is per-thread on Android. One instance is enough here because
+// nothing distinguishes them: the callback list is what matters, and it is driven
+// from the host's frame pump rather than by a real vsync source.
+static klj_val klj_Choreographer_getInstance(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *instance;
+    return klj_singleton("android/view/Choreographer", &instance);
+}
+
+// A posted frame callback is *one-shot* on Android: it fires at the next frame and
+// is then forgotten, and a caller that wants every frame re-posts from inside
+// doFrame. Keeping that exactly right matters — treating it as persistent would
+// call it twice per frame once the guest re-posts, and the engine derives its
+// delta time from the gap between calls.
+static void *g_frame_callback;
+
+static klj_val klj_Choreographer_postFrameCallback(void *env, void *self,
+                                                   const klj_val *a, int n) {
+    (void)env; (void)self;
+    g_frame_callback = n > 0 ? a[0].l : NULL;
+    if (g_frame_callback) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            klj_object *o = klj_as_object(g_frame_callback);
+            KLJ_LOG("Choreographer.postFrameCallback(%s) — the frame clock is now "
+                    "driven from the host's pump", o ? o->cls : "(untagged)");
+        }
+    }
+    return (klj_val){.j = 0};
+}
+
+// kl_jni_tick_choreographer() lives further down, next to the message delivery —
+// both call into guest proxies, and that machinery is defined there.
 
 // ---- android.os.Process ----
 // setThreadPriority(tid, priority) is a no-op we can only record. Android's
@@ -1565,6 +2082,105 @@ static klj_val klj_Method_getName(void *env, void *self, const klj_val *a, int n
     return (klj_val){.l = kl_jni_new_string(m ? m->name : "")};
 }
 
+// ------------------------------------------------- Unity's ReflectionHelper
+//
+// com/unity3d/player/ReflectionHelper is Unity's own Java helper, and its field
+// half is a three-step round trip: getFieldID(class, name, sig, isStatic) hands
+// back a java.lang.reflect.Field, getFieldSignature reads the signature back off
+// it, and FromReflectedField turns it into the jfieldID the guest actually uses.
+//
+// All three are implemented together because any one alone is inert — a Field you
+// cannot query or convert is not a partial answer, it is a dead end. That is the
+// same reasoning as the other group answers, applied to a round trip rather than
+// to a set of properties.
+//
+// The strings are copied, not aliased: they arrive as guest jstrings and trap 6
+// is exactly this mistake made once already with RegisterNatives.
+static void *klj_new_field(const char *cls, const char *name, const char *sig, int is_static) {
+    klj_field_obj *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    f->cls = cls ? strdup(cls) : NULL;
+    f->name = name ? strdup(name) : NULL;
+    f->sig = sig ? strdup(sig) : NULL;
+    f->is_static = is_static;
+    return klj_new_object_data(KLJ_CLASS_FIELD, f);
+}
+
+static klj_field_obj *klj_as_field(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    return (o && strcmp(o->cls, KLJ_CLASS_FIELD) == 0) ? o->data : NULL;
+}
+
+static klj_val klj_ReflectionHelper_getFieldID(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *cls  = n > 0 ? klj_class_name(a[0].l) : NULL;
+    const char *name = n > 1 ? klj_str(a[1].l) : NULL;
+    const char *sig  = n > 2 ? klj_str(a[2].l) : NULL;
+    int   is_static  = n > 3 ? (int)a[3].j : 0;
+    if (!cls || !name) {
+        KLJ_LOG("ReflectionHelper.getFieldID with no class or name -> null");
+        return (klj_val){.l = NULL};
+    }
+    KLJ_LOG("ReflectionHelper.getFieldID %s.%s%s%s", cls, name, sig ? " " : "",
+            sig ? sig : "");
+    return (klj_val){.l = klj_new_field(cls, name, sig, is_static)};
+}
+
+// The method half of the same round trip. Unity looks a method up by name and
+// signature and gets back a java.lang.reflect.Method it then converts with
+// FromReflectedMethod — which is why is_static is carried on the object rather
+// than assumed: a static method has to come back as a static id.
+static klj_val klj_ReflectionHelper_getMethodID(void *env, void *self,
+                                                const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *cls  = n > 0 ? klj_class_name(a[0].l) : NULL;
+    const char *name = n > 1 ? klj_str(a[1].l) : NULL;
+    const char *sig  = n > 2 ? klj_str(a[2].l) : NULL;
+    int   is_static  = n > 3 ? (int)a[3].j : 0;
+    if (!cls || !name) {
+        KLJ_LOG("ReflectionHelper.getMethodID with no class or name -> null");
+        return (klj_val){.l = NULL};
+    }
+    KLJ_LOG("ReflectionHelper.getMethodID %s.%s%s", cls, name, sig ? sig : "");
+    void *m = klj_new_method(strdup(cls), name ? strdup(name) : NULL,
+                             sig ? strdup(sig) : NULL);
+    klj_object *o = klj_as_object(m);
+    if (o && o->data) ((klj_method_obj *)o->data)->is_static = is_static;
+    return (klj_val){.l = m};
+}
+
+static klj_val klj_ReflectionHelper_getFieldSignature(void *env, void *self,
+                                                      const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_field_obj *f = n > 0 ? klj_as_field(a[0].l) : NULL;
+    if (!f) {
+        KLJ_LOG("ReflectionHelper.getFieldSignature on something that is not a Field");
+        return (klj_val){.l = NULL};
+    }
+    return (klj_val){.l = kl_jni_new_string(f->sig ? f->sig : "")};
+}
+
+// The mirror of FromReflectedMethod: recover the id from the description the
+// Field was built out of, so the round trip lands on the same klj_wanted entry a
+// direct GetFieldID would have produced.
+static void *klj_FromReflectedField(void *env, void *field) {
+    (void)env;
+    klj_field_obj *f = klj_as_field(field);
+    if (!f) {
+        KLJ_LOG("FromReflectedField: not a Field");
+        kl_jni_report(stderr);
+        kl_fatal_prepare(); abort();
+    }
+    return klj_want(klj_class_object(f->cls), f->name, f->sig ? f->sig : "",
+                    f->is_static ? 'F' : 'f');
+}
+
+static klj_val klj_Field_getDeclaringClass(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_field_obj *f = klj_as_field(self);
+    return (klj_val){.l = f ? klj_class_object(f->cls) : NULL};
+}
+
 static klj_val klj_Method_getDeclaringClass(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_object *o = klj_as_object(self);
@@ -1604,18 +2220,103 @@ static void *klj_proxy_invoke(void *proxy, const char *iface,
 // The queue is snapshotted and cleared before anything runs: a Runnable is guest
 // code and is free to post more work, and draining in place would either miss
 // those or spin on them forever.
+// Deliver one Message to its target Handler's callback.
+//
+// Two shapes of callback are possible and they are dispatched differently. A
+// JNIBridge proxy is guest code implementing Handler.Callback, and goes through
+// the usual proxy path. But the callback Unity actually installs here is one of
+// its *own Java* classes — AudioVolumeHandler — which we do not have, so standing
+// in for it means doing what its handleMessage does: forward the message to the
+// native it registered. That native's pointer is already in hand from
+// RegisterNatives, so this is a lookup rather than an invention.
+//
+// Anything else is named and dropped rather than silently discarded: a message
+// that goes nowhere is a notification the guest is still waiting for.
+static void klj_deliver_message(void *message) {
+    klj_message *m = klj_as_message(message);
+    if (!m) return;
+    klj_handler *h  = klj_as_handler(m->target);
+    void       *cb  = h ? h->callback : NULL;
+    klj_object *cbo = cb ? klj_as_object(cb) : NULL;
+
+    if (cbo && strcmp(cbo->cls, KLJ_CLASS_PROXY) == 0) {
+        void *args = klj_new_array('L', "java/lang/Object", 1);
+        ((void **)klj_arr(args)->data)[0] = message;
+        klj_proxy_invoke(cb, "android/os/Handler$Callback", "handleMessage",
+                         "(Landroid/os/Message;)Z", args);
+        return;
+    }
+
+    if (cbo && strcmp(cbo->cls, "com/unity3d/player/AudioVolumeHandler") == 0) {
+        void *fn = kl_jni_native("com/unity3d/player/AudioVolumeHandler",
+                                 "onAudioVolumeChanged", NULL);
+        if (!fn) {
+            KLJ_LOG("message for AudioVolumeHandler, but its native is not registered");
+            return;
+        }
+        KLJ_LOG("delivering message what=%d -> AudioVolumeHandler.onAudioVolumeChanged",
+                m->what);
+        ((void (*)(void *, void *, kl_jint))fn)(kl_jni_env(), cb, (kl_jint)m->what);
+        return;
+    }
+
+    KLJ_LOG("message what=%d has no deliverable callback (target callback is %s) — "
+            "DROPPED. If the guest is waiting on this notification, implement it here.",
+            m->what, cbo ? cbo->cls : "(none)");
+}
+
+// Box a long for JNIBridge.invoke, which takes its arguments as an Object[].
+static void *klj_box_long(int64_t v) {
+    klj_pref *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    e->kind = 'J';
+    e->ival = v;
+    void *obj = kl_jni_new_object("java/lang/Long");
+    klj_as_object(obj)->data = e;
+    return obj;
+}
+
+// Fire one frame's callback, if one is pending. Called from the host's frame pump
+// — there is no vsync source here, so "a frame" is whatever the pump says it is.
+void kl_jni_tick_choreographer(void) {
+    void *cb = g_frame_callback;
+    if (!cb) return;
+    g_frame_callback = NULL;               // one-shot; doFrame may re-post
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t nanos = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+
+    klj_object *o = klj_as_object(cb);
+    if (o && strcmp(o->cls, KLJ_CLASS_PROXY) == 0) {
+        void *args = klj_new_array('L', "java/lang/Object", 1);
+        ((void **)klj_arr(args)->data)[0] = klj_box_long(nanos);
+        klj_proxy_invoke(cb, "android/view/Choreographer$FrameCallback", "doFrame",
+                         "(J)V", args);
+        return;
+    }
+    KLJ_LOG("frame callback is %s, not a proxy — doFrame NOT delivered. The engine "
+            "will see no frame clock; implement this dispatch.",
+            o ? o->cls : "(untagged)");
+}
+
 unsigned kl_jni_drain_ui_tasks(void) {
-    void *batch[KLJ_MAX_UI_TASKS];
+    struct { void *runnable, *message; } batch[KLJ_MAX_UI_TASKS];
     unsigned n;
     pthread_mutex_lock(&g_lock);
     n = g_ui_task_n;
-    for (unsigned i = 0; i < n; i++) batch[i] = g_ui_tasks[i].runnable;
+    for (unsigned i = 0; i < n; i++) {
+        batch[i].runnable = g_ui_tasks[i].runnable;
+        batch[i].message  = g_ui_tasks[i].message;
+    }
     g_ui_task_n = 0;
     pthread_mutex_unlock(&g_lock);
 
     if (n) KLJ_LOG("draining %u posted task%s", n, n == 1 ? "" : "s");
-    for (unsigned i = 0; i < n; i++)
-        klj_proxy_invoke(batch[i], "java/lang/Runnable", "run", "()V", NULL);
+    for (unsigned i = 0; i < n; i++) {
+        if (batch[i].message) klj_deliver_message(batch[i].message);
+        else klj_proxy_invoke(batch[i].runnable, "java/lang/Runnable", "run", "()V", NULL);
+    }
     return n;
 }
 
@@ -1820,6 +2521,337 @@ static klj_val klj_UnityPlayer_loadLibrary(void *env, void *self, const klj_val 
     void *h = klb_dlopen(path, 0x00002 /* RTLD_NOW */);
     KLJ_LOG("UnityPlayer.loadLibrary(\"%s\") -> %s", name, h ? "loaded" : "failed");
     return (klj_val){.j = h != NULL};
+}
+
+// System.load(path) is the absolute-path form of loadLibrary — OVRPlugin's C# side
+// calls it with whatever ClassLoader.findLibrary returned. Routed through the same
+// guest dlopen as UnityPlayer.loadLibrary so there is still one image registry;
+// the library is usually already open by the time this runs, and klb_dlopen
+// returns the existing image rather than loading it twice.
+//
+// Returns void, so a failure here cannot be reported to the guest as a value. Real
+// Android would throw UnsatisfiedLinkError; we log instead, because the guest goes
+// on to dlsym the library and that path already names what it could not resolve.
+static klj_val klj_System_load(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *path = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!path || !*path) return (klj_val){.j = 0};
+    void *h = klb_dlopen(path, 0x00002 /* RTLD_NOW */);
+    KLJ_LOG("System.load(\"%s\") -> %s", path, h ? "loaded" : "failed");
+    return (klj_val){.j = 0};
+}
+
+// The output devices AudioManager knows about. Answered as an empty array, which
+// is the one honest answer available: we do not enumerate host audio hardware, and
+// every field of an AudioDeviceInfo — id, type, sample rates, channel masks —
+// would have to be invented to fill even one entry.
+//
+// Empty is not a silent zero of the trap-6d kind. Unity uses this list to notice
+// device *changes* (headphones, Bluetooth) and to pick a non-default output; with
+// nothing to choose from it stays on the default path, which is the OpenSL device
+// that already works. If something later needs a populated list, the trace will
+// name the AudioDeviceInfo getter it calls rather than leaving us to guess.
+static klj_val klj_AudioManager_getDevices(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AudioManager.getDevices() -> empty (host devices are not enumerated)");
+    return (klj_val){.l = klj_new_array('L', "android/media/AudioDeviceInfo", 0)};
+}
+
+// MediaRouter.getSelectedRoute(type). Android always returns a route here — the
+// default one if nothing else is selected — so null would be the invented answer,
+// not the conservative one. The RouteInfo we hand back has no presentation display
+// attached, which is exactly the ordinary case for a device with nothing plugged
+// into it, and is what sends Unity down its normal single-display path.
+static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *route;
+    if (!route) route = kl_jni_new_object("android/media/MediaRouter$RouteInfo");
+    return (klj_val){.l = route};
+}
+
+// Settings.Secure.getString(resolver, "android_id") is what Unity turns into
+// SystemInfo.deviceUniqueIdentifier. It has to be a real string: a null here is
+// not a harmless blank, it is the guest aborting inside its own string handling —
+// which is exactly how this presented under KL_PERMISSIVE, as a SIGABRT with no
+// JNI call named because the permissive zero *was* the answer.
+//
+// The value is synthetic and constant: Android's own android_id is a per-device,
+// per-app-signing-key random 64-bit value, so any 16-hex-digit string is a
+// well-formed one. Stable across runs because callers cache it and compare.
+#define KLJ_ANDROID_ID "4b6c6570746f6e01"      /* "Klepton\1" as hex */
+
+static klj_val klj_Context_getContentResolver(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *resolver;
+    if (!resolver) resolver = kl_jni_new_object("android/content/ContentResolver");
+    return (klj_val){.l = resolver};
+}
+
+static klj_val klj_Settings_Secure_getString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *key = n > 1 ? klj_str(a[1].l) : NULL;
+    if (key && strcmp(key, "android_id") == 0)
+        return (klj_val){.l = kl_jni_new_string(KLJ_ANDROID_ID)};
+    // Android returns null for a setting that is not present, and callers are
+    // written for it. Naming it keeps an unexpected key from looking like a value.
+    KLJ_LOG("Settings.Secure.getString(\"%s\") -> null (not a setting we serve)",
+            key ? key : "(null)");
+    return (klj_val){.l = NULL};
+}
+
+// Thread.start(). This one is deliberately not a plain no-op, because a no-op
+// here is the one shape that lies: if the thread carried a guest Runnable, doing
+// nothing means its run() never happens and the guest waits forever for work that
+// was never started — a hang with no cause anywhere near it.
+//
+// What we can serve is the case where the "thread" is one of ours: a HandlerThread
+// whose work drains through kl_jni_drain_ui_tasks anyway, so there is genuinely
+// nothing to start. So the receiver's class is logged every time, and anything
+// that is not a HandlerThread is called out as unhandled rather than swallowed.
+static klj_val klj_Thread_start(void *env, void *self, const klj_val *a, int n) {
+    klj_object *o = klj_as_object(self);
+    // Reached through the superclass walk when the guest looks start() up on
+    // java/lang/Thread but the receiver is really a HandlerThread — which does
+    // have something to start, and the first version of this wrongly said it did
+    // not. That produced a guest blocked forever on a message no thread would
+    // ever deliver.
+    if (o && strcmp(o->cls, "android/os/HandlerThread") == 0)
+        return klj_HandlerThread_start(env, self, a, n);
+
+    (void)a; (void)n;
+    KLJ_LOG("Thread.start() on %s — NOT started. If this carried a Runnable, its "
+            "run() will never execute; that would show up as a wait with no cause. "
+            "Implement it here if so.", o ? o->cls : "(not one of our objects)");
+    return (klj_val){.j = 0};
+}
+
+// A void method whose effect is on state we do not model. Shared, but only ever
+// bound to methods that genuinely return void — the arguments are ignored, so
+// binding it to something with a return value would hand the guest a zero it
+// would read as an answer (trap 6b, which was exactly a handler reused for the
+// wrong shape).
+static klj_val klj_void_noop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// Uri.decode — percent-decoding, implemented rather than stubbed because it is a
+// pure function with one right answer.
+//
+// Note it is *not* URLDecoder.decode: Android's Uri.decode leaves '+' alone rather
+// than turning it into a space. Getting that backwards would silently corrupt any
+// path containing a plus, which is the kind of bug that surfaces as a missing file
+// a long way from here.
+static int klj_hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static klj_val klj_Uri_decode(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *s = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!s) return (klj_val){.l = NULL};
+    size_t len = strlen(s);
+    char  *out = malloc(len + 1);
+    if (!out) return (klj_val){.l = NULL};
+    size_t o = 0;
+    for (size_t i = 0; i < len; i++) {
+        int hi, lo;
+        if (s[i] == '%' && i + 2 < len &&
+            (hi = klj_hexval(s[i + 1])) >= 0 && (lo = klj_hexval(s[i + 2])) >= 0) {
+            out[o++] = (char)((hi << 4) | lo);
+            i += 2;
+        } else {
+            out[o++] = s[i];
+        }
+    }
+    out[o] = 0;
+    klj_val r = {.l = kl_jni_new_string(out)};
+    free(out);
+    return r;
+}
+
+// The single UnityPlayerActivity. t_boot hands this same object to initJni as the
+// Context, and Unity reads it back through the static UnityPlayer.currentActivity
+// — so it has to be one instance, not two of the same class. Created lazily
+// because whichever of the two paths runs first should win, and they are the same
+// object either way.
+void *kl_jni_activity(void) {
+    static void *activity;
+    if (!activity) activity = kl_jni_new_object("com/unity3d/player/UnityPlayerActivity");
+    return activity;
+}
+
+static klj_val klj_currentActivity_field(void) {
+    return (klj_val){.l = kl_jni_activity()};
+}
+
+// Oculus's device-config client. The native half of this
+// (libdeviceconfigclient-full-aar.so) is not in the APK — the dlopen for it fails
+// early in every run — so there is no configuration service behind this on a real
+// Quest either unless the system provides one. Doing nothing is what an absent
+// service does; it is a void method, so there is no answer to invent.
+static klj_val klj_OculusDeviceConfig_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("OculusDeviceConfig.init() — no device-config service here");
+    return (klj_val){.j = 0};
+}
+
+// getCurrentState returns a state enum whose values are NOT recoverable here: the
+// class lives in an AAR that is not in the APK, and unlike ovrpSystemHeadset it
+// leaves no trace in global-metadata.dat to read the numbering off. So 0 is a
+// genuine guess, and it is logged as one rather than quietly returned.
+//
+// It is a survivable guess in a way most would not be: the guest carries a
+// "Failed to initialize OculusDeviceConfig." message, so it has a path for this
+// service being unavailable, and landing on that path is a correct outcome for a
+// device where the service really is absent. If the trace later shows it looping
+// or taking a worse branch, this is the first thing to revisit.
+static klj_val klj_OculusDeviceConfig_getCurrentState(void *env, void *self,
+                                                      const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int warned;
+    if (!warned) {
+        warned = 1;
+        KLJ_LOG("OculusDeviceConfig.getCurrentState() -> 0 — UNVERIFIED: the enum is "
+                "not in the APK, so this value is a guess, not a measurement");
+    }
+    return (klj_val){.j = 0};
+}
+
+// Telephony call-state notifications. There is no telephony here, so registering
+// a listener that can never fire is exactly right — Unity only wants to be told
+// to duck audio during a call, and no call will ever arrive.
+static klj_val klj_UnityPlayer_addPhoneCallListener(void *env, void *self,
+                                                    const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// System.nanoTime() — and it must be the *same clock* the Choreographer stamps
+// its frameTimeNanos from. The engine subtracts one from the other to get its
+// frame delta, so two different monotonic clocks would produce a delta made of
+// the offset between them: a garbage frame time that looks like a stall or a
+// negative step, with nothing pointing back here.
+static klj_val klj_System_nanoTime(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (klj_val){.j = (uint64_t)((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec)};
+}
+
+// Wall clock, unlike nanoTime — this one is allowed to be the real date.
+static klj_val klj_System_currentTimeMillis(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (klj_val){.j = (uint64_t)((int64_t)ts.tv_sec * 1000ll + ts.tv_nsec / 1000000)};
+}
+
+// Who installed this package. null is Android's answer for "not installed by a
+// package installer that recorded itself" — a sideloaded build — which is exactly
+// this situation, so it is the true answer rather than a stand-in for one.
+static klj_val klj_PackageManager_getInstallerPackageName(void *env, void *self,
+                                                          const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = NULL};
+}
+
+// There is no vibrator. False is the honest answer and the useful one: it is the
+// documented way to say so, and it keeps Unity from offering haptics it cannot
+// deliver. (Quest controllers have haptics, but those arrive through the XR
+// runtime's own API, not android.os.Vibrator.)
+static klj_val klj_Vibrator_hasVibrator(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// No proxy is configured, and null is how Android says so — the caller is asking
+// "what proxy should I use for this URL", and "none" is a real answer rather than
+// a missing one.
+static klj_val klj_UnityPlayer_getNetworkProxySettings(void *env, void *self,
+                                                       const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = NULL};
+}
+
+// Class.getName() returns the *dotted* binary name, not the slashed internal one
+// we store — "java.lang.String", not "java/lang/String". Unity round-trips this
+// through its reflection helpers and back into FindClass, so getting the
+// separator wrong would produce a class name that never matches anything, with
+// the failure landing wherever the lookup finally happened.
+static klj_val klj_Class_getName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    const char *internal = klj_class_name(self);
+    if (!internal) return (klj_val){.l = NULL};
+    char dotted[256];
+    size_t i = 0;
+    for (; internal[i] && i < sizeof dotted - 1; i++)
+        dotted[i] = internal[i] == '/' ? '.' : internal[i];
+    dotted[i] = 0;
+    return (klj_val){.l = kl_jni_new_string(dotted)};
+}
+
+// Locale.getDefault() and its accessors. Answered as a group for the usual
+// reason: the language and country have to describe one locale, and Unity reads
+// them separately to build Application.systemLanguage.
+//
+// The value is taken from the host's LANG rather than hardcoded, because unlike
+// Build.MODEL this is a user preference and not device identity — the same
+// reasoning that makes the synthetic /proc report the host's real core count.
+// The fallback is en/US, which is what an unset LANG means in practice.
+static void klj_locale_parts(char *lang, size_t lang_sz, char *country, size_t country_sz) {
+    snprintf(lang, lang_sz, "en");
+    snprintf(country, country_sz, "US");
+    const char *env = getenv("LANG");
+    if (!env || !*env || strncmp(env, "C", 2) == 0) return;
+    // "en_US.UTF-8" -> "en" + "US"
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s", env);
+    char *dot = strchr(buf, '.');
+    if (dot) *dot = 0;
+    char *us = strchr(buf, '_');
+    if (us) {
+        *us = 0;
+        snprintf(country, country_sz, "%s", us + 1);
+    }
+    if (*buf) snprintf(lang, lang_sz, "%s", buf);
+}
+
+static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *locale;
+    if (!locale) {
+        char lang[16], country[16];
+        klj_locale_parts(lang, sizeof lang, country, sizeof country);
+        locale = kl_jni_new_object("java/util/Locale");
+        KLJ_LOG("Locale.getDefault() -> %s_%s (from the host LANG)", lang, country);
+    }
+    return (klj_val){.l = locale};
+}
+
+static klj_val klj_Locale_getLanguage(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    char lang[16], country[16];
+    klj_locale_parts(lang, sizeof lang, country, sizeof country);
+    return (klj_val){.l = kl_jni_new_string(lang)};
+}
+
+static klj_val klj_Locale_getCountry(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    char lang[16], country[16];
+    klj_locale_parts(lang, sizeof lang, country, sizeof country);
+    return (klj_val){.l = kl_jni_new_string(country)};
+}
+
+// null means "this route is not presenting to a secondary display", which is the
+// ordinary case and the one Unity is checking for. Documented as nullable, so this
+// is the API's own answer rather than a stub standing in for one.
+static klj_val klj_RouteInfo_getPresentationDisplay(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = NULL};
 }
 
 // new String(bytes, charsetName). Our jstrings are NUL-terminated byte buffers
@@ -2145,14 +3177,6 @@ static klj_val klj_Scanner_next(void *env, void *self, const klj_val *a, int n) 
 // and buys inspectability — and a prefs file pulled off a Quest drops straight
 // in. Set<String> is absent because nothing has asked for it; the primitive
 // types are all one shape, so they come as a group.
-typedef struct {
-    char   *key;
-    char    kind;     // 'S' string, 'I' 'J' 'Z' integral, 'F' float, '-' pending removal
-    char   *sval;
-    int64_t ival;
-    float   fval;
-} klj_pref;
-
 typedef struct { klj_pref *v; unsigned n, cap; } klj_pref_set;
 
 typedef struct {
@@ -2607,6 +3631,26 @@ static klj_val klj_Entry_getValue(void *env, void *self, const klj_val *a, int n
     klj_object *o = klj_as_object(self);
     return (klj_val){.l = klj_box(o ? o->data : NULL)};
 }
+// The boxed constructors — new Boolean(z), new Integer(i) and friends. Boxes have
+// existed here since SharedPreferences needed them, but only ever built from the
+// inside (klj_box); the guest can also build one directly, and it unboxes through
+// the same accessors, so it has to land in the same representation.
+static klj_val klj_Box_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env;
+    const char *cls = klj_class_name(clazz);
+    klj_pref   *e   = calloc(1, sizeof *e);
+    if (!e || !cls) return (klj_val){.l = NULL};
+    if      (strcmp(cls, "java/lang/Integer") == 0) e->kind = 'I';
+    else if (strcmp(cls, "java/lang/Long")    == 0) e->kind = 'J';
+    else if (strcmp(cls, "java/lang/Float")   == 0) e->kind = 'F';
+    else                                            e->kind = 'Z';
+    if (e->kind == 'F') e->fval = n > 0 ? (float)a[0].d : 0.0f;
+    else                e->ival = n > 0 ? (int64_t)a[0].j : 0;
+    void *obj = kl_jni_new_object(cls);
+    klj_as_object(obj)->data = e;
+    return (klj_val){.l = obj};
+}
+
 // int, long and boolean all unbox from the same integral field; only float
 // comes out of the FP bank.
 static klj_val klj_Box_integral(void *env, void *self, const klj_val *a, int n) {
@@ -2623,6 +3667,10 @@ static klj_val klj_Box_floatValue(void *env, void *self, const klj_val *a, int n
 }
 
 static const klj_binding g_bindings[] = {
+    {"com/unity3d/player/ReflectionHelper", "getFieldID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Field;", klj_ReflectionHelper_getFieldID},
+    {"com/unity3d/player/ReflectionHelper", "getMethodID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Method;", klj_ReflectionHelper_getMethodID},
+    {"com/unity3d/player/ReflectionHelper", "getFieldSignature", "(Ljava/lang/reflect/Field;)Ljava/lang/String;", klj_ReflectionHelper_getFieldSignature},
+    {"java/lang/reflect/Field", "getDeclaringClass", "()Ljava/lang/Class;", klj_Field_getDeclaringClass},
     {"java/lang/reflect/Method", "getName", "()Ljava/lang/String;", klj_Method_getName},
     {"java/lang/reflect/Method", "getDeclaringClass", "()Ljava/lang/Class;", klj_Method_getDeclaringClass},
     {"android/view/View", "setSystemUiVisibility", "(I)V", klj_View_setSystemUiVisibility},
@@ -2696,6 +3744,36 @@ static const klj_binding g_bindings[] = {
     {"android/net/Uri", "encode", "(Ljava/lang/String;)Ljava/lang/String;", klj_Uri_encode},
     {"java/lang/String", "<init>", "([BLjava/lang/String;)V", klj_String_init_bytes},
     {"com/unity3d/player/UnityPlayer", "loadLibrary", "(Ljava/lang/String;)Z", klj_UnityPlayer_loadLibrary},
+    {"java/lang/System", "load", "(Ljava/lang/String;)V", klj_System_load},
+    {"java/lang/System", "nanoTime", "()J", klj_System_nanoTime},
+    {"java/lang/System", "currentTimeMillis", "()J", klj_System_currentTimeMillis},
+    // There is no soft keyboard here; Unity calls hide unconditionally while
+    // tearing down text input, so silence is correct rather than a stub.
+    {"com/unity3d/player/UnityPlayer", "hideSoftInput", "()V", klj_void_noop},
+    {"com/unity3d/player/UnityPlayer", "getNetworkProxySettings", "(Ljava/lang/String;)Ljava/lang/String;", klj_UnityPlayer_getNetworkProxySettings},
+    {"com/unity3d/player/UnityPlayer", "addPhoneCallListener", "()V", klj_UnityPlayer_addPhoneCallListener},
+    {"android/content/Context", "getContentResolver", "()Landroid/content/ContentResolver;", klj_Context_getContentResolver},
+    {"android/provider/Settings$Secure", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
+    // Unity's ReflectionHelper spells every reference return as Object, so it asks
+    // for getClass with a signature real Java does not declare. Matching is on the
+    // exact string, so both spellings are registered; the ()Ljava/lang/Class; one
+    // is further down with the rest of the Object methods.
+    {"java/lang/Object", "getClass", "()Ljava/lang/Object;", klj_Object_getClass},
+    {"java/lang/Class",  "getName",  "()Ljava/lang/String;", klj_Class_getName},
+    // Unity builds this signature from Class.getName(), so it is spelled with
+    // dots where a real JNI signature would have slashes. Matched as the string
+    // the guest actually asks for.
+    {"com/oculus/oculusdeviceconfig/OculusDeviceConfig", "init", "(Lcom.unity3d.player.UnityPlayerActivity;)V", klj_OculusDeviceConfig_init},
+    {"com/oculus/oculusdeviceconfig/OculusDeviceConfig", "getCurrentState", "()I", klj_OculusDeviceConfig_getCurrentState},
+    {"android/os/Vibrator", "hasVibrator", "()Z", klj_Vibrator_hasVibrator},
+    {"android/content/pm/PackageManager", "getInstallerPackageName", "(Ljava/lang/String;)Ljava/lang/String;", klj_PackageManager_getInstallerPackageName},
+    {"android/net/Uri", "decode", "(Ljava/lang/String;)Ljava/lang/String;", klj_Uri_decode},
+    {"java/util/Locale", "getDefault",  "()Ljava/util/Locale;",   klj_Locale_getDefault},
+    {"java/util/Locale", "getLanguage", "()Ljava/lang/String;",   klj_Locale_getLanguage},
+    {"java/util/Locale", "getCountry",  "()Ljava/lang/String;",   klj_Locale_getCountry},
+    {"android/media/AudioManager", "getDevices", "(I)[Landroid/media/AudioDeviceInfo;", klj_AudioManager_getDevices},
+    {"android/media/MediaRouter", "getSelectedRoute", "(I)Landroid/media/MediaRouter$RouteInfo;", klj_MediaRouter_getSelectedRoute},
+    {"android/media/MediaRouter$RouteInfo", "getPresentationDisplay", "()Landroid/view/Display;", klj_RouteInfo_getPresentationDisplay},
 
     {"android/app/AlertDialog$Builder", "<init>", "(Landroid/content/Context;)V", klj_AlertBuilder_init},
     {"android/app/AlertDialog$Builder", "setTitle",
@@ -2708,8 +3786,26 @@ static const klj_binding g_bindings[] = {
     {"android/os/Process", "myTid",             "()I",   klj_Process_myTid},
 
     {"android/os/Looper",  "getMainLooper", "()Landroid/os/Looper;",  klj_Looper_getMainLooper},
+    // A HandlerThread is a thread with a Looper on it. We have one queue and one
+    // drain point (kl_jni_drain_ui_tasks) for the main looper — but a
+    // HandlerThread gets a real thread of its own, because the guest blocks
+    // waiting on it. See the looper section above.
+    {"android/os/Handler", "obtainMessage", "(I)Landroid/os/Message;", klj_Handler_obtainMessage},
+    {"android/os/Message", "sendToTarget", "()V", klj_Message_sendToTarget},
+    {"android/view/Choreographer", "getInstance", "()Landroid/view/Choreographer;", klj_Choreographer_getInstance},
+    {"android/view/Choreographer", "postFrameCallback", "(Landroid/view/Choreographer$FrameCallback;)V", klj_Choreographer_postFrameCallback},
+    {"android/os/HandlerThread", "<init>", "(Ljava/lang/String;)V", klj_HandlerThread_init},
+    {"android/os/HandlerThread", "start", "()V", klj_HandlerThread_start},
+    {"android/os/HandlerThread", "getLooper", "()Landroid/os/Looper;", klj_HandlerThread_getLooper},
+    {"java/lang/Thread", "start", "()V", klj_Thread_start},
     {"android/os/Handler", "<init>", "()V",                        klj_Handler_init},
     {"android/os/Handler", "<init>", "(Landroid/os/Looper;)V",     klj_Handler_init},
+    // The Callback form. The callback handles Messages sent through this Handler,
+    // and nothing here sends Messages — the queue only ever carries Runnables from
+    // post/postDelayed — so recording the Looper and dropping the callback is the
+    // same single-queue simplification, not a new one. If a Message ever is sent,
+    // sendMessage is unimplemented and will say so by name.
+    {"android/os/Handler", "<init>", "(Landroid/os/Looper;Landroid/os/Handler$Callback;)V", klj_Handler_init},
     {"android/os/Handler", "post",        "(Ljava/lang/Runnable;)Z",  klj_Handler_post},
     {"android/os/Handler", "postDelayed", "(Ljava/lang/Runnable;J)Z", klj_Handler_postDelayed},
     {"android/content/Intent", "getExtras",  "()Landroid/os/Bundle;",      klj_Intent_getExtras},
@@ -2766,6 +3862,10 @@ static const klj_binding g_bindings[] = {
     {"java/util/Iterator", "next",    "()Ljava/lang/Object;", klj_Iterator_next},
     {"java/util/Map$Entry", "getKey",   "()Ljava/lang/Object;", klj_Entry_getKey},
     {"java/util/Map$Entry", "getValue", "()Ljava/lang/Object;", klj_Entry_getValue},
+    {"java/lang/Boolean", "<init>", "(Z)V", klj_Box_init},
+    {"java/lang/Integer", "<init>", "(I)V", klj_Box_init},
+    {"java/lang/Long",    "<init>", "(J)V", klj_Box_init},
+    {"java/lang/Float",   "<init>", "(F)V", klj_Box_init},
     {"java/lang/Integer", "intValue",     "()I", klj_Box_integral},
     {"java/lang/Long",    "longValue",    "()J", klj_Box_integral},
     {"java/lang/Boolean", "booleanValue", "()Z", klj_Box_integral},
@@ -2893,6 +3993,9 @@ static void klj_build_tables(void) {
     ENV(DeleteWeakGlobalRef,  klj_ref_release);
     ENV(IsSameObject,         klj_IsSameObject);
     ENV(IsInstanceOf,         klj_IsInstanceOf);
+    ENV(NewString,            klj_NewString);
+    ENV(GetStringChars,       klj_GetStringChars);
+    ENV(ReleaseStringChars,   klj_ReleaseStringChars);
     ENV(NewStringUTF,         klj_NewStringUTF);
     ENV(GetStringLength,      klj_GetStringLength);
     ENV(GetStringUTFLength,   klj_GetStringUTFLength);
@@ -2902,6 +4005,7 @@ static void klj_build_tables(void) {
     ENV(UnregisterNatives,    klj_UnregisterNatives);
     ENV(GetJavaVM,            klj_GetJavaVM);
     ENV(FromReflectedMethod,  klj_FromReflectedMethod);
+    ENV(FromReflectedField,   klj_FromReflectedField);
     ENV(GetMethodID,          klj_GetMethodID);
     ENV(GetStaticMethodID,    klj_GetStaticMethodID);
     ENV(GetFieldID,           klj_GetFieldID);
@@ -2918,7 +4022,16 @@ static void klj_build_tables(void) {
     ENVCALL(Short);  ENVCALL(Int);     ENVCALL(Long);  ENVCALL(Float);
     ENVCALL(Double); ENVCALL(Void);
 #undef ENVCALL
+#define ENVCALLA(Name) \
+    ENV(Call##Name##MethodA, klj_Call##Name##MethodA); \
+    ENV(CallStatic##Name##MethodA, klj_CallStatic##Name##MethodA); \
+    ENV(CallNonvirtual##Name##MethodA, klj_CallNonvirtual##Name##MethodA)
+    ENVCALLA(Object); ENVCALLA(Boolean); ENVCALLA(Byte);  ENVCALLA(Char);
+    ENVCALLA(Short);  ENVCALLA(Int);     ENVCALLA(Long);  ENVCALLA(Float);
+    ENVCALLA(Double); ENVCALLA(Void);
+#undef ENVCALLA
     ENV(NewObjectV, klj_NewObjectV);
+    ENV(NewObjectA, klj_NewObjectA);
     ENV(GetArrayLength,          klj_GetArrayLength);
     ENV(NewObjectArray,          klj_NewObjectArray);
     ENV(GetObjectArrayElement,   klj_GetObjectArrayElement);

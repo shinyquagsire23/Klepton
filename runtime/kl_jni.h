@@ -48,6 +48,11 @@ void *kl_jni_native(const char *cls, const char *name, const char *sig);
 // guest holds must come from here — they carry a type tag, which is what lets
 // GetObjectClass answer truthfully instead of guessing.
 void *kl_jni_new_object(const char *class_name);
+
+// The one UnityPlayerActivity instance. A singleton because the guest reaches it
+// two ways — as the Context handed to initJni, and through the static field
+// UnityPlayer.currentActivity — and compares them for identity.
+void *kl_jni_activity(void);
 void *kl_jni_new_string(const char *utf8);
 
 // Root for Context.getAssets()/AssetManager.open(). Defaults to "beatsaber/assets".
@@ -73,5 +78,10 @@ unsigned kl_jni_pending_ui_tasks(void);
 // this is Looper.loop() on the UI thread; there is no looper thread here, so the
 // host pumps it. Returns how many ran.
 unsigned kl_jni_drain_ui_tasks(void);
+
+// Fire the pending Choreographer frame callback, if the guest posted one. There is
+// no vsync source here, so the host's frame pump defines what a frame is. One-shot,
+// matching Android: doFrame re-posts if it wants the next one.
+void kl_jni_tick_choreographer(void);
 
 #endif
