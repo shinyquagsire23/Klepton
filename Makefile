@@ -127,8 +127,28 @@ build/s09_angle: spikes/s09_angle.c
 build/s10_shared: spikes/s10_shared.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-# ANGLE is *borrowed*, not vendored — see PLANNING M5. Point KL_ANGLE_DIR at any
-# Chromium-based app's Libraries directory; the default is Google Chrome's.
+# A *vendored debug build* of ANGLE lives in vendor/ (gitignored) — the Metal
+# backend can be stepped into, which is what the AGX-abort investigation needs
+# (CLAUDE.md "The live problem"). The loaders (kl_glfb.c, s09, s10) prefer
+# vendor/out/Debug when it exists and fall back to Chrome's prebuilt;
+# KL_ANGLE_DIR overrides both.
+#
+# vendor/ is a shallow ANGLE checkout (fetch --no-history) with depot_tools in
+# vendor/depot_tools. This target reproduces the whole thing; it is a one-time
+# setup cost (checkout ~12 GB, build ~30-60 min).
+.PHONY: angle-debug
+angle-debug:
+	@test -d vendor/depot_tools || git clone --depth 1 \
+	  https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+	  vendor/depot_tools
+	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" && \
+	  test -f .gclient || fetch --no-history angle; \
+	  gclient sync --no-history; \
+	  gn gen out/Debug --args='is_debug=true target_cpu="arm64"'; \
+	  autoninja -C out/Debug libEGL libGLESv2
+
+# `make angle` / `make shared` exercise whichever ANGLE the loaders pick
+# (vendored debug build if present, else Chrome's prebuilt).
 .PHONY: angle
 angle: build/s09_angle
 	@./build/s09_angle

@@ -118,9 +118,20 @@
 #define GL_TEXTURE_SWIZZLE_B   0x8E44
 #define GL_TEXTURE_SWIZZLE_A   0x8E45
 
+// The vendored debug build (vendor/angle/out/Debug, see Makefile `angle-debug`)
+// is preferred when present; otherwise borrow Chrome's prebuilt.
+#define ANGLE_VENDORED_DIR "vendor/out/Debug"
 #define ANGLE_DEFAULT_DIR \
     "/Applications/Google Chrome.app/Contents/Frameworks/" \
     "Google Chrome Framework.framework/Libraries"
+
+static const char *kl_angle_dir(void) {
+    const char *dir = getenv("KL_ANGLE_DIR");
+    if (dir) return dir;
+    if (access(ANGLE_VENDORED_DIR "/libEGL.dylib", R_OK) == 0)
+        return ANGLE_VENDORED_DIR;
+    return ANGLE_DEFAULT_DIR;
+}
 
 // ---- ANGLE entry points ------------------------------------------------------
 static void *g_egl_lib, *g_gles_lib;
@@ -633,8 +644,7 @@ int main(void) {
     if ((e = getenv("S10_SERIAL")))  g_serial  = atoi(e);
     if (g_threads < 1) g_threads = 1;
 
-    const char *dir = getenv("KL_ANGLE_DIR");
-    if (!dir) dir = ANGLE_DEFAULT_DIR;
+    const char *dir = kl_angle_dir();
     char egl_path[1024], gles_path[1024];
     snprintf(egl_path,  sizeof egl_path,  "%s/libEGL.dylib", dir);
     snprintf(gles_path, sizeof gles_path, "%s/libGLESv2.dylib", dir);

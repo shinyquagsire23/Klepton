@@ -18,9 +18,10 @@
 //   2. does it accept the ETC2 allocation desktop GL rejected?
 //   3. do the guest's captured shaders compile UNMODIFIED — no #version rewrite?
 //
-// No ANGLE build is vendored. Chromium-based apps ship one; the path is taken from
-// KL_ANGLE_DIR or defaults to Google Chrome's. Everything is dlopen/dlsym so there
-// is nothing to link and no headers to find.
+// ANGLE comes from the vendored debug build in vendor/out/Debug when present
+// (see Makefile `angle-debug`), otherwise from a Chromium-based app — the path
+// is taken from KL_ANGLE_DIR or defaults as above. Everything is dlopen/dlsym
+// so there is nothing to link and no headers to find.
 //
 // Build: clang -o build/s09_angle spikes/s09_angle.c
 #include <dlfcn.h>
@@ -28,6 +29,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
+
+// The vendored debug build (vendor/out/Debug, see Makefile `angle-debug`)
+// is preferred when present; otherwise borrow Chrome's prebuilt.
+#define ANGLE_VENDORED_DIR "vendor/out/Debug"
+#define ANGLE_DEFAULT_DIR \
+    "/Applications/Google Chrome.app/Contents/Frameworks/" \
+    "Google Chrome Framework.framework/Libraries"
+
+static const char *kl_angle_dir(void) {
+    const char *dir = getenv("KL_ANGLE_DIR");
+    if (dir) return dir;
+    if (access(ANGLE_VENDORED_DIR "/libEGL.dylib", R_OK) == 0)
+        return ANGLE_VENDORED_DIR;
+    return ANGLE_DEFAULT_DIR;
+}
 
 // ---- the EGL/GLES constants we need, spelled out so there is nothing to include
 #define EGL_DEFAULT_DISPLAY      ((void *)0)
@@ -86,10 +103,8 @@ static char *slurp(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    const char *dir = getenv("KL_ANGLE_DIR");
+    const char *dir = kl_angle_dir();
     char egl_path[1024], gles_path[1024];
-    if (!dir) dir = "/Applications/Google Chrome.app/Contents/Frameworks/"
-                    "Google Chrome Framework.framework/Libraries";
     snprintf(egl_path,  sizeof egl_path,  "%s/libEGL.dylib", dir);
     snprintf(gles_path, sizeof gles_path, "%s/libGLESv2.dylib", dir);
 
