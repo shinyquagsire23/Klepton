@@ -267,7 +267,13 @@ void kl_glfb_make_current(void) {
             const int32_t surf_attrs[] = { EGL_WIDTH, g_w, EGL_HEIGHT, g_h, EGL_NONE };
             const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
             t->surf = a_eglCreatePbufferSurface(g_dpy, g_cfg, surf_attrs);
-            t->ctx  = a_eglCreateContext(g_dpy, g_cfg, g_ctx, ctx_attrs);  // shares
+            // KL_GLFB_NOSHARE_OBJ=1 gives the thread its own context that shares
+            // *nothing*. The guest then renders with objects it cannot see, so the
+            // picture is meaningless — but it answers one question cleanly: whether
+            // the AGX abort needs object sharing at all, or merely a second thread
+            // issuing GL. Rendering correctness is not the point of this knob.
+            void *share = getenv("KL_GLFB_NOSHARE_OBJ") ? EGL_NO_CONTEXT : g_ctx;
+            t->ctx  = a_eglCreateContext(g_dpy, g_cfg, share, ctx_attrs);
         } else {
             // Default: one context, first claimant wins. Later threads get nothing
             // and their GL calls do nothing — which is why frames are black, and is
@@ -361,6 +367,105 @@ static void klfb_LinkProgram(uint32_t program) {
     pthread_mutex_lock(&g_compile_lock);
     g_real_LinkProgram(program);
     pthread_mutex_unlock(&g_compile_lock);
+}
+
+// ------------------------------------------------------ texture storage census
+//
+// KL_GLFB_SKIP bisected the AGX abort down to this pair: dropping BOTH
+// glTexStorage2D and glTexStorage3D avoids it, and so does dropping both
+// glTexSubImage2D and glTexSubImage3D, while dropping any one of the four alone
+// does not. That is the "allocate immutable storage, then upload into it" pattern,
+// and it says the trigger is a *format*, which is what this prints.
+//
+// Both calls fit in registers (5 and 6 arguments), so the natural signature is
+// safe here — unlike glTexSubImage3D above, whose 11 arguments spill to the stack
+// where Darwin's packing and AAPCS64's 8-byte slots disagree.
+static void (*g_real_TexStorage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
+static void (*g_real_TexStorage3D)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t);
+
+#define KLFB_MAX_FMTS 32
+static struct { uint32_t fmt; unsigned n; } g_fmts[KLFB_MAX_FMTS];
+static unsigned g_nfmts;
+
+static void klfb_note_format(uint32_t fmt, int32_t w, int32_t h, int32_t d,
+                             const char *who) {
+    for (unsigned i = 0; i < g_nfmts; i++)
+        if (g_fmts[i].fmt == fmt) { g_fmts[i].n++; return; }
+    if (g_nfmts < KLFB_MAX_FMTS) {
+        g_fmts[g_nfmts].fmt = fmt;
+        g_fmts[g_nfmts].n = 1;
+        g_nfmts++;
+        // Only the first sighting of each format is printed, so the tail of a
+        // crashing run names the format that was new when it died.
+        fprintf(stderr, "  [glfb] %s: new internalformat 0x%04x (%dx%dx%d)\n",
+                who, fmt, w, h, d);
+    }
+}
+
+// KL_GLFB_NOSRGB=1 substitutes GL_RGBA8 for GL_SRGB8_ALPHA8 at allocation. The
+// census found the guest's eye-sized render target is SRGB8_ALPHA8, and sRGB is a
+// case Metal's fixed-function blit cannot always service — it falls back to a
+// compute blit, which is the AGX family that aborts. Swapping the format is the
+// one-line way to test that without touching anything else; the two are upload- and
+// attachment-compatible, so only the colour transfer function changes. A frame
+// captured with this set is wrong (un-decoded sRGB), which is fine for a probe.
+#define GL_SRGB8_ALPHA8 0x8C43
+#define GL_RGBA8        0x8058
+
+static uint32_t klfb_maybe_unsrgb(uint32_t fmt) {
+    static int on = -1;
+    if (on < 0) on = getenv("KL_GLFB_NOSRGB") != NULL;
+    return (on && fmt == GL_SRGB8_ALPHA8) ? GL_RGBA8 : fmt;
+}
+
+// KL_GLFB_TRACE_TEX=1 logs every texture call rather than only first sightings, so
+// the tail of a crashing run names the exact call it died on. The abort happens on
+// a Metal compiler thread, so the last line is the trigger's neighbourhood rather
+// than provably the trigger itself — but it bounds the search to one call.
+static int klfb_trace_tex(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("KL_GLFB_TRACE_TEX") != NULL;
+    return on;
+}
+static unsigned g_texcalls;
+
+static void (*g_real_TexSubImage2D)(uint32_t, int32_t, int32_t, int32_t, int32_t,
+                                    int32_t, uint32_t, uint32_t, const void *);
+
+static void klfb_TexSubImage2D(uint32_t target, int32_t level, int32_t xoff,
+                               int32_t yoff, int32_t w, int32_t h, uint32_t format,
+                               uint32_t type, const void *pixels) {
+    if (klfb_trace_tex())
+        fprintf(stderr, "  [glfb] #%u glTexSubImage2D target=0x%04x level=%d "
+                        "%dx%d at %d,%d fmt=0x%04x type=0x%04x%s\n",
+                g_texcalls++, target, level, w, h, xoff, yoff, format, type,
+                pixels ? "" : " (NULL)");
+    if (g_real_TexSubImage2D)
+        g_real_TexSubImage2D(target, level, xoff, yoff, w, h, format, type, pixels);
+}
+
+static void klfb_TexStorage2D(uint32_t target, int32_t levels, uint32_t fmt,
+                              int32_t w, int32_t h) {
+    klfb_note_format(fmt, w, h, 1, "glTexStorage2D");
+    if (klfb_trace_tex())
+        fprintf(stderr, "  [glfb] #%u glTexStorage2D target=0x%04x levels=%d "
+                        "fmt=0x%04x %dx%d\n", g_texcalls++, target, levels, fmt, w, h);
+    fmt = klfb_maybe_unsrgb(fmt);
+    if (g_real_TexStorage2D) g_real_TexStorage2D(target, levels, fmt, w, h);
+}
+static void klfb_TexStorage3D(uint32_t target, int32_t levels, uint32_t fmt,
+                              int32_t w, int32_t h, int32_t d) {
+    klfb_note_format(fmt, w, h, d, "glTexStorage3D");
+    fmt = klfb_maybe_unsrgb(fmt);
+    if (g_real_TexStorage3D) g_real_TexStorage3D(target, levels, fmt, w, h, d);
+}
+
+void kl_glfb_report_formats(void) {
+    if (!g_nfmts) return;
+    fprintf(stderr, "  [glfb] immutable texture formats allocated:");
+    for (unsigned i = 0; i < g_nfmts; i++)
+        fprintf(stderr, " 0x%04x=%u", g_fmts[i].fmt, g_fmts[i].n);
+    fprintf(stderr, "\n");
 }
 
 // ---------------------------------------------------------- ABI thunks
@@ -482,6 +587,10 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     // the shared-context compile lock — see the block above s10's numbers
     {"glCompileShader", (void *)klfb_CompileShader, (void **)&g_real_CompileShader},
     {"glLinkProgram",   (void *)klfb_LinkProgram,   (void **)&g_real_LinkProgram},
+    // the texture storage census — which format the AGX abort follows
+    {"glTexStorage2D", (void *)klfb_TexStorage2D, (void **)&g_real_TexStorage2D},
+    {"glTexStorage3D", (void *)klfb_TexStorage3D, (void **)&g_real_TexStorage3D},
+    {"glTexSubImage2D", (void *)klfb_TexSubImage2D, (void **)&g_real_TexSubImage2D},
 };
 
 // ---------------------------------------------------------- the gateway
@@ -501,10 +610,40 @@ static int keep_ours(const char *name) {
     return 0;
 }
 
+// KL_GLFB_SKIP=<comma-separated names> hands the listed entry points back to the
+// caller, which means they fall through to the null driver and do nothing. That
+// makes the ANGLE path *bisectable* by family without a rebuild: no-out the
+// compressed uploads, or the blits, or the draws, and see which one the AGX abort
+// follows. It is a diagnostic, not a mode — the resulting frame is wrong by
+// construction, since whole classes of call have been dropped on the floor.
+//
+// This exists because under KL_GLFB the guest gets ANGLE's real function pointers
+// and kl_egl's call counters never see them: the GL report says "called: 0" on a
+// run that plainly called plenty. A per-name tracing trampoline is the other way
+// to get that visibility and needs hand-written asm to preserve the arguments
+// across the log call; this needed none.
+static int glfb_skipped(const char *name) {
+    const char *list = getenv("KL_GLFB_SKIP");
+    if (!list || !*list) return 0;
+    size_t n = strlen(name);
+    for (const char *p = list; *p; ) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len == n && strncmp(p, name, n) == 0) return 1;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return 0;
+}
+
 void *kl_glfb_sym(const char *name) {
     if (!kl_glfb_enabled() || !name) return NULL;
     if (!g_ready && !kl_glfb_init()) return NULL;
     if (keep_ours(name)) return NULL;              // caller keeps its own answer
+    if (glfb_skipped(name)) {
+        fprintf(stderr, "  [glfb] KL_GLFB_SKIP: %s stays on the null driver\n", name);
+        return NULL;
+    }
 
     void *fn = asym(name);
     if (!fn) return NULL;                          // ANGLE has no such entry point

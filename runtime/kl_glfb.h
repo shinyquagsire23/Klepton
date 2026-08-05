@@ -23,4 +23,9 @@ void kl_glfb_make_current(void);
 // of frames presented so far.
 unsigned kl_glfb_present(const char *dir);
 
+// Print the internalformats the guest allocated immutable texture storage with.
+// KL_GLFB_SKIP bisected the AGX abort to glTexStorage* + glTexSubImage*, which
+// makes this the population that matters. Safe to call when nothing was allocated.
+void kl_glfb_report_formats(void);
+
 #endif

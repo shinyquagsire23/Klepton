@@ -104,6 +104,9 @@
 #define GL_DEPTH24_STENCIL8    0x88F0
 #define GL_DEPTH_ATTACHMENT    0x8D00
 #define GL_COMPRESSED_RGBA8_ETC2_EAC 0x9278
+#define GL_RED                 0x1903
+#define GL_R8                  0x8229
+#define GL_SRGB8_ALPHA8        0x8C43
 
 #define ANGLE_DEFAULT_DIR \
     "/Applications/Google Chrome.app/Contents/Frameworks/" \
@@ -170,6 +173,9 @@ static void (*glRenderbufferStorage)(uint32_t, uint32_t, int32_t, int32_t);
 static void (*glFramebufferRenderbuffer)(uint32_t, uint32_t, uint32_t, uint32_t);
 static void (*glCompressedTexImage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t,
                                       int32_t, int32_t, const void *);
+static void (*glTexStorage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
+static void (*glTexSubImage2D)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
+                               uint32_t, uint32_t, const void *);
 
 #define RESOLVE(f) do {                                                        \
         *(void **)&f = sym(#f);                                                \
@@ -204,6 +210,61 @@ static void on_fault(int sig) {
     backtrace_symbols_fd(fr, n, 2);
     signal(sig, SIG_DFL);
     raise(sig);
+}
+
+// ---- stage 10: Beat Saber's own texture sequence, replayed verbatim -----------
+//
+// KL_GLFB_TRACE_TEX captured every texture call the guest makes before the AGX
+// abort, and there are only 21 of them. This is that list. The abort follows the
+// last entry — an R8 allocation and a GL_RED upload — immediately.
+//
+// Replaying it here is what turns "the guest crashes" into a minimal repro with no
+// Unity, no IL2CPP and no Klepton in the picture at all.
+static const struct {
+    uint32_t ifmt;      // internalformat for glTexStorage2D
+    int32_t  levels, w, h;
+    uint32_t upfmt;     // format for glTexSubImage2D; 0 means no upload at all
+} GUEST_TEXTURES[] = {
+    { GL_SRGB8_ALPHA8, 1, 1832, 1920, 0 },        // the eye-sized render target
+    { GL_RGBA8,        1,    4,    4, GL_RGBA },
+    { GL_SRGB8_ALPHA8, 1,    4,    4, GL_RGBA },
+    { GL_SRGB8_ALPHA8, 1,    4,    4, GL_RGBA },
+    { GL_RGBA8,        1,   16,   16, GL_RGBA },
+    { GL_SRGB8_ALPHA8, 3,    4,    4, GL_RGBA },  // three mip levels uploaded
+    { GL_SRGB8_ALPHA8, 1,    4,    4, GL_RGBA },
+    { GL_RGBA8,        1,    4,    4, GL_RGBA },
+    { GL_RGBA8,        1,  256,    2, GL_RGBA },
+    { GL_R8,           1,   64,   64, GL_RED  },  // <- the abort follows this one
+};
+
+static void replay_guest_textures(int tid) {
+    unsigned char *buf = malloc(1832u * 1920u * 4u);
+    if (!buf) return;
+    memset(buf, 0x7f, 1832u * 1920u * 4u);
+
+    for (size_t i = 0; i < sizeof GUEST_TEXTURES / sizeof GUEST_TEXTURES[0]; i++) {
+        uint32_t tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexStorage2D(GL_TEXTURE_2D, GUEST_TEXTURES[i].levels, GUEST_TEXTURES[i].ifmt,
+                       GUEST_TEXTURES[i].w, GUEST_TEXTURES[i].h);
+        uint32_t e = glGetError();
+        if (e != GL_NO_ERROR)
+            fprintf(stderr, "  [t%d]   storage 0x%04x %dx%d -> gl 0x%x\n", tid,
+                    GUEST_TEXTURES[i].ifmt, GUEST_TEXTURES[i].w, GUEST_TEXTURES[i].h, e);
+        if (!GUEST_TEXTURES[i].upfmt) continue;
+        for (int lv = 0; lv < GUEST_TEXTURES[i].levels; lv++) {
+            int32_t w = GUEST_TEXTURES[i].w >> lv, h = GUEST_TEXTURES[i].h >> lv;
+            if (w < 1) w = 1;
+            if (h < 1) h = 1;
+            fprintf(stderr, "  [t%d]   glTexSubImage2D %dx%d level %d fmt=0x%04x\n",
+                    tid, w, h, lv, GUEST_TEXTURES[i].upfmt);
+            glTexSubImage2D(GL_TEXTURE_2D, lv, 0, 0, w, h, GUEST_TEXTURES[i].upfmt,
+                            GL_UNSIGNED_BYTE, buf);
+        }
+    }
+    glFinish();
+    free(buf);
 }
 
 static const char *VS =
@@ -288,6 +349,60 @@ static void *worker(void *arg) {
     // ES3 core needs a bound VAO for attribute state to be legal.
     uint32_t vao = 0;
     if (glGenVertexArrays) { glGenVertexArrays(1, &vao); glBindVertexArray(vao); }
+
+    // S10_REPLAY_ONLY=1 runs *only* the guest's texture sequence, skipping every
+    // other stage. Without this the replay shares a run with the known ANGLE
+    // draw race, and a failure cannot be attributed to either.
+    if (getenv("S10_REPLAY_ONLY")) {
+        stage(tid, 10, "replay Beat Saber's texture sequence (isolated)");
+        replay_guest_textures(tid);
+        fprintf(stderr, "  [t%d]   replay survived (gl error 0x%x)\n", tid, glGetError());
+        goto out;
+    }
+
+    // S10_EYE=1 — the guest's render target, which the replay above does not
+    // exercise: an eye-sized SRGB8_ALPHA8 texture used as a colour attachment,
+    // drawn into, and then blitted. Isolating the texture *calls* cleared them, so
+    // what is left is the texture being a draw target rather than merely existing.
+    // sRGB is the interesting part: Metal's fixed-function blit cannot always
+    // service an sRGB surface and falls back to the compute blit that AGX aborts
+    // compiling.
+    if (getenv("S10_EYE")) {
+        stage(tid, 11, "draw into an eye-sized SRGB8_ALPHA8 FBO, then blit it");
+        uint32_t prog2 = build_program(tid);
+        uint32_t etex = 0, efbo = 0;
+        glGenTextures(1, &etex);
+        glBindTexture(GL_TEXTURE_2D, etex);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_SRGB8_ALPHA8, 1832, 1920);
+        glGenFramebuffers(1, &efbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, efbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, etex, 0);
+        glViewport(0, 0, 1832, 1920);
+        glClearColor(0.1f, 0.2f, 0.3f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        if (prog2) {
+            static const float quad[] = { -1, -1,  3, -1,  -1, 3 };
+            uint32_t vbo2 = 0;
+            glGenBuffers(1, &vbo2);
+            glBindBuffer(GL_ARRAY_BUFFER, vbo2);
+            glBufferData(GL_ARRAY_BUFFER, (intptr_t)sizeof quad, quad, GL_STATIC_DRAW);
+            glUseProgram(prog2);
+            int32_t l2 = glGetAttribLocation(prog2, "aPos");
+            if (l2 >= 0) {
+                glEnableVertexAttribArray((uint32_t)l2);
+                glVertexAttribPointer((uint32_t)l2, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+            }
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_shared_tex);
+            for (int it = 0; it < g_iters; it++) glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, efbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glBlitFramebuffer(0, 0, 1832, 1920, 0, 0, g_w, g_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glFinish();
+        fprintf(stderr, "  [t%d]   eye FBO survived (gl error 0x%x)\n", tid, glGetError());
+        goto out;
+    }
 
     stage(tid, 3, "glClear + glFinish");
     glViewport(0, 0, g_w, g_h);
@@ -411,6 +526,11 @@ static void *worker(void *arg) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glFinish();
     fprintf(stderr, "  [t%d]   ETC2 sample ok (gl error 0x%x)\n", tid, glGetError());
+    if (g_stage < 10) { free(px); goto out; }
+
+    stage(tid, 10, "replay Beat Saber's own 21-call texture sequence");
+    replay_guest_textures(tid);
+    fprintf(stderr, "  [t%d]   replay survived (gl error 0x%x)\n", tid, glGetError());
     free(px);
 
 out:
@@ -468,6 +588,7 @@ int main(void) {
     RESOLVE(glBindVertexArray);        RESOLVE(glGenRenderbuffers);
     RESOLVE(glBindRenderbuffer);       RESOLVE(glRenderbufferStorage);
     RESOLVE(glFramebufferRenderbuffer);RESOLVE(glCompressedTexImage2D);
+    RESOLVE(glTexStorage2D);           RESOLVE(glTexSubImage2D);
 
     // Metal by name — the default display would select ANGLE's OpenGL backend,
     // which is a different driver stack and would not reproduce anything (S0.9).
