@@ -3930,6 +3930,16 @@ static void klj_init(void) {
     g_files_dir      = klj_abspath(g_files_dir);
     g_apk_path       = klj_abspath(g_apk_path);
     g_native_lib_dir = klj_abspath(g_native_lib_dir);
+    // Raw opens of "<apk>/assets/..." (Unity's split assets) are served from
+    // the unpacked tree: g_assets_dir points at "<unpacked>/assets", so the
+    // tree root is its parent.
+    {
+        char root[1024];
+        snprintf(root, sizeof root, "%s", g_assets_dir);
+        char *slash = strrchr(root, '/');
+        if (slash && strcmp(slash, "/assets") == 0) *slash = 0;
+        kl_guest_path_map(g_apk_path, root);
+    }
     klj_build_tables();
 }
 

@@ -75,6 +75,9 @@ const char *kl_addr_image(const void *addr, size_t *offset);
 // it; returns `path` unchanged otherwise. Every guest file entry point goes
 // through this — Unity reads its CPU and memory configuration out of procfs.
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
+// Register the APK -> unpacked-tree mapping for raw "<apk>/assets/..." opens
+// (split assets). See the implementation comment in kl_libc.c.
+void kl_guest_path_map(const char *apk, const char *unpacked_dir);
 
 // errno numbering diverges above 34 between Linux and Darwin, and guest code
 // compares against Linux's values (see kl_libc.c).

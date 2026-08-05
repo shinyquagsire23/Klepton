@@ -361,8 +361,33 @@ static void proc_build(void) {
 // Rewrite a guest path into the synthetic tree when we serve it. Returns `path`
 // unchanged for everything else, so this is safe to put in front of every file
 // entry point.
+//
+// One more mapping registered from kl_jni: the APK path itself. Unity mounts
+// the APK as a zip for most asset reads, but its *split* assets
+// (sharedassets0.assets.splitN) are read by raw open on "<apk>/assets/..." —
+// concatenated onto the mount point — which is ENOTDIR on a real file, and
+// silently no scene ever loads (the engine pumps frames and draws nothing,
+// exactly what the "black frame" hunt measured). On device those bytes come
+// from inside the zip; the unpacked tree next to the APK has the identical
+// files, so map the prefix there.
+static char g_apk_prefix[1024], g_apk_target[1024];
+
+void kl_guest_path_map(const char *apk, const char *unpacked_dir) {
+    snprintf(g_apk_prefix, sizeof g_apk_prefix, "%s", apk);
+    snprintf(g_apk_target, sizeof g_apk_target, "%s", unpacked_dir);
+}
+
 const char *kl_guest_path(const char *path, char *buf, size_t cap) {
     if (!path || path[0] != '/') return path;
+    size_t alen = strlen(g_apk_prefix);
+    if (alen && strncmp(path, g_apk_prefix, alen) == 0 && path[alen] == '/') {
+        snprintf(buf, cap, "%s%s", g_apk_target, path + alen);
+        struct stat st;
+        if (stat(buf, &st) == 0) return buf;
+        // Not in the unpacked tree: fall through to the raw path, which will
+        // fail the same way it always did — no invented successes.
+        return path;
+    }
     if (strncmp(path, "/proc/", 6) != 0 &&
         strncmp(path, "/sys/devices/system/cpu", 23) != 0) return path;
     static pthread_once_t once = PTHREAD_ONCE_INIT;
