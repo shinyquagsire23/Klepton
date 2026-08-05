@@ -289,19 +289,25 @@ int kl_glfb_init(void) {
 // with no current context dereferences a null dispatch table — which presented as
 // a SIGSEGV at 0x2d8 inside glFlush when this was first wired up. eglMakeCurrent
 // is the guest telling us which thread now owns the context, so it is the hook.
-// One EGL context can be current on exactly one thread, and Unity drives GL from
-// more than one — measured: the thread that won eglMakeCurrent was not the thread
-// issuing draws, so the draws ran with no context at all and silently did nothing
-// (the census reported them against framebuffer -1).
 //
-// The fix is what a multi-threaded GLES app does on Android: a context per thread,
-// all *sharing* objects with the first one created. Textures, buffers and programs
-// are shared; container objects such as FBOs and VAOs are not, which is fine here
-// because each thread builds its own anyway.
+// Default mode: ONE context that migrates. Unity plays by the EGL rules — it
+// releases the context on one thread (eglMakeCurrent(NULL)) before taking it on
+// the next — so the root context simply follows ownership: whichever thread took
+// it most recently owns it, and a release frees it for the next. This is the
+// correct shape, and it is what makes the guest's FBOs work: measured by
+// KL_GLFB_TRACE_FBO, Unity creates its framebuffer objects during setup and
+// draws with them on the render thread, and FBOs are container objects — never
+// shared — so per-thread contexts (KL_GLFB_SHARED) see the setup thread's FBOs
+// as empty objects ("incomplete: no attachments", every draw -> 0x506).
 //
-// Each thread also gets its own eye-sized pbuffer, so whichever thread draws has a
-// real default framebuffer of the right size — and the capture, which runs on that
-// same thread, reads exactly what that thread drew.
+// KL_GLFB_SHARED=1: a context per thread, all sharing objects. Textures,
+// buffers and programs are shared; FBOs and VAOs are not — so this mode renders
+// nothing meaningful with this guest, and it stays only because the instruments
+// built on it (the draw census, the lock trampolines) still answer questions.
+//
+// Each thread also gets its own eye-sized pbuffer in SHARED mode, so whichever
+// thread draws has a real default framebuffer of the right size — and the
+// capture, which runs on that same thread, reads exactly what that thread drew.
 static pthread_key_t g_tls_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
@@ -310,28 +316,39 @@ typedef struct { void *ctx, *surf; int probed; int debug_cb; } klfb_thread_gl;
 static void klfb_tls_free(void *p) { free(p); }
 static void klfb_tls_init(void) { pthread_key_create(&g_tls_key, klfb_tls_free); }
 
+// Owner of the root context in migration mode: the thread id that last took it
+// and has not released it, 0 when free.
+static uint64_t g_root_owner;
+
 void kl_glfb_make_current(void) {
     if (!g_ready || !a_eglMakeCurrent) return;
     pthread_once(&g_tls_once, klfb_tls_init);
 
     klfb_thread_gl *t = pthread_getspecific(g_tls_key);
+    uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
     if (!t) {
         t = calloc(1, sizeof *t);
         if (!t) return;
-        uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
-        static int first = 1;
-        if (first) {
-            first = 0;
-            t->ctx = g_ctx; t->surf = g_surf;      // the root context and eye surface
-        } else if (getenv("KL_GLFB_SHARED")) {
-            // Correct, and currently fatal. Giving each guest thread its own
-            // sharing context is what a multi-threaded GLES app does, and it does
-            // stop the draws running with no context — but it then crashes inside
-            // Apple's *Metal driver* (AGX), building a blit compute program:
-            //   AGX::Device::findOrCreateDriverProgramVariant<BlitComputeProgram...>
-            // That is below ANGLE, so it is not ours to fix from here. Left behind
-            // a knob rather than deleted, because it is the right shape and the
-            // crash is the next thing to investigate.
+        if (!getenv("KL_GLFB_SHARED")) {
+            // Migration mode: take the root context if it is free or already
+            // ours; if another thread is holding it, this thread gets nothing —
+            // same as EGL, which would answer EGL_BAD_ACCESS.
+            if (!g_root_owner || g_root_owner == tid) {
+                t->ctx = g_ctx; t->surf = g_surf;
+                g_root_owner = tid;
+            } else {
+                t->ctx = NULL; t->surf = NULL;
+                static int warned;
+                if (!warned) {
+                    warned = 1;
+                    fprintf(stderr, "  [glfb] thread %llu wants GL while thread %llu "
+                                    "holds the context; its draws will do nothing\n",
+                            (unsigned long long)tid, (unsigned long long)g_root_owner);
+                }
+            }
+        } else {
+            // SHARED: per-thread contexts — see the mode comment above for why
+            // the guest's FBOs break here.
             const int32_t surf_attrs[] = { EGL_WIDTH, g_w, EGL_HEIGHT, g_h, EGL_NONE };
             const int32_t ctx_attrs[]  = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
             t->surf = a_eglCreatePbufferSurface(g_dpy, g_cfg, surf_attrs);
@@ -342,24 +359,15 @@ void kl_glfb_make_current(void) {
             // issuing GL. Rendering correctness is not the point of this knob.
             void *share = getenv("KL_GLFB_NOSHARE_OBJ") ? EGL_NO_CONTEXT : g_ctx;
             t->ctx  = a_eglCreateContext(g_dpy, g_cfg, share, ctx_attrs);
-        } else {
-            // Default: one context, first claimant wins. Later threads get nothing
-            // and their GL calls do nothing — which is why frames are black, and is
-            // recorded here rather than hidden.
-            t->ctx = NULL; t->surf = NULL;
-            static int warned;
-            if (!warned) {
-                warned = 1;
-                fprintf(stderr, "  [glfb] thread %llu wants GL but the single context "
-                                "is taken; its draws will do nothing. "
-                                "KL_GLFB_SHARED=1 gives it its own sharing context "
-                                "(see kl_glfb.c — that path currently crashes in AGX)\n",
-                        (unsigned long long)tid);
-            }
         }
         pthread_setspecific(g_tls_key, t);
         fprintf(stderr, "  [glfb] thread %llu gets its own %s context\n",
                 (unsigned long long)tid, t->ctx == g_ctx ? "root" : "shared");
+    } else if (!getenv("KL_GLFB_SHARED") && !t->ctx &&
+               (!g_root_owner || g_root_owner == tid)) {
+        // Released earlier (by us or never taken) and now free again: retake.
+        t->ctx = g_ctx; t->surf = g_surf;
+        g_root_owner = tid;
     }
     if (!t->ctx || !t->surf) return;
     // KL_GLFB_PROBE=1 runs the self-test's trivial clear+readback on each GUEST
@@ -406,6 +414,24 @@ void kl_glfb_make_current(void) {
             glDebugMessageCallback((const void *)klfb_debug_cb, NULL);
             if (glEnable) glEnable(0x92E0);
         }
+    }
+}
+
+// The guest's eglMakeCurrent(NULL) — the release half of migration mode.
+// Frees the root context for the next thread and detaches it here, so the
+// next claimant's make_current can retake it. Called from klegl_MakeCurrent
+// when the guest makes no context current.
+void kl_glfb_release_current(void) {
+    if (!g_ready || !a_eglMakeCurrent) return;
+    pthread_once(&g_tls_once, klfb_tls_init);
+    klfb_thread_gl *t = pthread_getspecific(g_tls_key);
+    if (!t) return;
+    uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+    if (t->ctx == g_ctx && g_root_owner == tid) {
+        a_eglMakeCurrent(g_dpy, NULL, NULL, NULL);
+        g_root_owner = 0;
+        t->ctx = NULL;
+        t->surf = NULL;
     }
 }
 
@@ -541,6 +567,47 @@ static void (*g_real_TexSubImage2D)(uint32_t, int32_t, int32_t, int32_t, int32_t
 // GLES 3 dropped. The trace shows 156 of these calls, a burst of them immediately
 // before the allocation the abort follows, so they are logged with their arguments.
 static void (*g_real_TexParameteri)(uint32_t, uint32_t, int32_t);
+
+// KL_GLFB_TRACE_FBO=1 logs the framebuffer-object lifecycle with thread ids.
+// FBOs (like VAOs) are NOT shared between contexts, and under KL_GLFB_SHARED
+// the guest runs two of them: an FBO generated on the setup thread's context
+// and drawn with on the render thread's is a different, empty object there —
+// "incomplete: no attachments and default size is zero", which is exactly
+// what the blank frame's 0x506s report (caught via ErrorSet::validationError).
+// This trace shows who made each FBO and who uses it.
+static void (*g_real_GenFramebuffers)(int32_t, uint32_t *);
+static void (*g_real_BindFramebuffer)(uint32_t, uint32_t);
+static void (*g_real_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t, uint32_t,
+                                           int32_t);
+
+static int klfb_trace_fbo(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("KL_GLFB_TRACE_FBO") != NULL;
+    return on;
+}
+static uint64_t klfb_tid(void) { uint64_t t = 0; pthread_threadid_np(NULL, &t); return t; }
+
+static void klfb_GenFramebuffers(int32_t n, uint32_t *ids) {
+    if (g_real_GenFramebuffers) g_real_GenFramebuffers(n, ids);
+    if (klfb_trace_fbo() && ids)
+        fprintf(stderr, "  [glfb] t%llu glGenFramebuffers(%d) -> %u\n",
+                (unsigned long long)klfb_tid(), n, ids[0]);
+}
+static void klfb_BindFramebuffer(uint32_t target, uint32_t fb) {
+    if (klfb_trace_fbo())
+        fprintf(stderr, "  [glfb] t%llu glBindFramebuffer(0x%x, %u)\n",
+                (unsigned long long)klfb_tid(), target, fb);
+    if (g_real_BindFramebuffer) g_real_BindFramebuffer(target, fb);
+}
+static void klfb_FramebufferTexture2D(uint32_t target, uint32_t attachment,
+                                      uint32_t textarget, uint32_t texture,
+                                      int32_t level) {
+    if (klfb_trace_fbo())
+        fprintf(stderr, "  [glfb] t%llu glFramebufferTexture2D(att=0x%x, tex=%u)\n",
+                (unsigned long long)klfb_tid(), attachment, texture);
+    if (g_real_FramebufferTexture2D)
+        g_real_FramebufferTexture2D(target, attachment, textarget, texture, level);
+}
 
 // KL_GLFB_NOSWIZZLE=1 drops the four swizzle parameters on the floor. The guest's
 // single-channel textures then sample as plain red instead of as GL_ALPHA, so the
@@ -696,6 +763,11 @@ static void klfb_note_draw(void) {
 
 static void (*g_real_DrawElements)(uint32_t, int32_t, uint32_t, const void *);
 static void (*g_real_DrawArrays)(uint32_t, int32_t, int32_t);
+static void (*g_real_DrawElementsInstanced)(uint32_t, int32_t, uint32_t, const void *,
+                                            int32_t);
+static void (*g_real_DrawElementsBaseVertex)(uint32_t, int32_t, uint32_t, const void *,
+                                             int32_t);
+static void (*g_real_DrawArraysInstanced)(uint32_t, int32_t, int32_t, int32_t);
 static void klfb_service_capture(void);
 
 // KL_GLFB_ERRPROBE=1: check the GL error after each draw and print the first
@@ -733,6 +805,34 @@ static void klfb_errprobe(const char *what, const char *detail) {
 static void klfb_errprobe(const char *what, const char *detail);
 #define klfb_errprobe0(w) klfb_errprobe((w), NULL)
 
+// KL_GLFB_DRAW_PROBE=1: after each of the first few draws, read back the
+// middle 64x64 and say whether the draw emitted anything. Distinguishes
+// "draws run but output black" from "content drawn but lost before the
+// capture" — the readback happens inside the same command stream, so there
+// is no timing or thread question left.
+static void klfb_draw_probe(int verts) {
+    static int on = -1, said;
+    if (on < 0) on = getenv("KL_GLFB_DRAW_PROBE") != NULL;
+    if (!on || said >= 12 || !a_glReadPixels) return;
+    if (verts < 32) return;   // skip the post-processing passes, keep scene draws
+    int32_t fb = -1;
+    if (a_glGetIntegerv) a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
+    if (a_glFinish) a_glFinish();
+    said++;
+    uint8_t px[64 * 64 * 4];
+    memset(px, 0, sizeof px);
+    a_glReadPixels(g_w / 2 - 32, g_h / 2 - 32, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    unsigned long lit = 0, sum = 0;
+    for (int i = 0; i < 64 * 64; i++) {
+        unsigned lum = px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2];
+        sum += lum;
+        if (lum > 12) lit++;
+    }
+    uint32_t err = a_glGetError ? a_glGetError() : 0;
+    fprintf(stderr, "  [glfb] DRAW_PROBE fb=%d: %lu/4096 lit, mean luma %lu, err 0x%x\n",
+            fb, lit, sum / (4096 * 3), err);
+}
+
 static void klfb_DrawElements(uint32_t mode, int32_t count, uint32_t type,
                               const void *indices) {
     // A pending capture first: it runs on THIS thread, which is the one that
@@ -742,6 +842,7 @@ static void klfb_DrawElements(uint32_t mode, int32_t count, uint32_t type,
     klfb_note_draw();
     klfb_errprobe0("glDrawElements(before)");
     if (g_real_DrawElements) g_real_DrawElements(mode, count, type, indices);
+    klfb_draw_probe(count);
     char d[64];
     snprintf(d, sizeof d, " mode=0x%x count=%d type=0x%x", mode, count, type);
     klfb_errprobe("glDrawElements(after)", d);
@@ -751,7 +852,32 @@ static void klfb_DrawArrays(uint32_t mode, int32_t first, int32_t count) {
     klfb_note_draw();
     klfb_errprobe0("glDrawArrays(before)");
     if (g_real_DrawArrays) g_real_DrawArrays(mode, first, count);
+    klfb_draw_probe(count);
     klfb_errprobe0("glDrawArrays(after)");
+}
+// The instanced/basevertex variants: Unity's actual scene geometry goes
+// through these, not the plain two — the first census wrapped only those and
+// was blind to the scene entirely.
+static void klfb_DrawElementsInstanced(uint32_t mode, int32_t count, uint32_t type,
+                                       const void *indices, int32_t instances) {
+    klfb_note_draw();
+    if (g_real_DrawElementsInstanced)
+        g_real_DrawElementsInstanced(mode, count, type, indices, instances);
+    klfb_draw_probe(count * instances);
+}
+static void klfb_DrawElementsBaseVertex(uint32_t mode, int32_t count, uint32_t type,
+                                        const void *indices, int32_t basevertex) {
+    klfb_note_draw();
+    if (g_real_DrawElementsBaseVertex)
+        g_real_DrawElementsBaseVertex(mode, count, type, indices, basevertex);
+    klfb_draw_probe(count);
+}
+static void klfb_DrawArraysInstanced(uint32_t mode, int32_t first, int32_t count,
+                                     int32_t instances) {
+    klfb_note_draw();
+    if (g_real_DrawArraysInstanced)
+        g_real_DrawArraysInstanced(mode, first, count, instances);
+    klfb_draw_probe(count * instances);
 }
 
 static void klfb_report_draws(void) {
@@ -789,6 +915,9 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glFlush",  (void *)klfb_Flush,  (void **)&g_real_Flush},
     {"glDrawElements", (void *)klfb_DrawElements, (void **)&g_real_DrawElements},
     {"glDrawArrays",   (void *)klfb_DrawArrays,   (void **)&g_real_DrawArrays},
+    {"glDrawElementsInstanced", (void *)klfb_DrawElementsInstanced, (void **)&g_real_DrawElementsInstanced},
+    {"glDrawElementsBaseVertex", (void *)klfb_DrawElementsBaseVertex, (void **)&g_real_DrawElementsBaseVertex},
+    {"glDrawArraysInstanced", (void *)klfb_DrawArraysInstanced, (void **)&g_real_DrawArraysInstanced},
     {"glFinish", (void *)klfb_Finish, (void **)&g_real_Finish},
     {"glBlitFramebuffer",         (void *)klfb_BlitFramebuffer,         (void **)&g_real_BlitFramebuffer},
     {"glTexSubImage3D",           (void *)klfb_TexSubImage3D,           (void **)&g_real_TexSubImage3D},
@@ -801,6 +930,9 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glTexStorage3D", (void *)klfb_TexStorage3D, (void **)&g_real_TexStorage3D},
     {"glTexSubImage2D", (void *)klfb_TexSubImage2D, (void **)&g_real_TexSubImage2D},
     {"glTexParameteri", (void *)klfb_TexParameteri, (void **)&g_real_TexParameteri},
+    {"glGenFramebuffers", (void *)klfb_GenFramebuffers, (void **)&g_real_GenFramebuffers},
+    {"glBindFramebuffer", (void *)klfb_BindFramebuffer, (void **)&g_real_BindFramebuffer},
+    {"glFramebufferTexture2D", (void *)klfb_FramebufferTexture2D, (void **)&g_real_FramebufferTexture2D},
 };
 
 // ---------------------------------------------------------- the gateway
@@ -926,6 +1058,32 @@ static void klfb_selftest(void) {
 typedef struct { const char *name; void *real; } klfb_trace_desc;
 
 extern void kl_gl_trace_tramp(void);       // runtime/kl_gl_trace.S
+extern void kl_gl_lock_tramp(void);        // runtime/kl_gl_lock.S
+
+// KL_GLFB_LOCK=1 wraps every resolved GL entry point in a process-wide lock,
+// held ACROSS the call (kl_gl_lock.S). It tests whether the transient
+// INVALID_FRAMEBUFFER_OPERATION under KL_GLFB_SHARED is Bug 1 — ANGLE's
+// shared-context thread safety — at draw granularity: if the frame renders
+// with this on, it is. It serialises all guest GL, so it is a probe, not a
+// mode.
+//
+// The trampoline cannot keep the guest's return address in a register across
+// the call (x30 dies at every bl, and any callee-saved register is the
+// guest's own — clobbering x19 with it once presented as a SIGBUS in guest
+// code, the guest writing through its own ra). It is parked here on a
+// per-thread stack instead.
+static pthread_mutex_t g_gl_lock = PTHREAD_MUTEX_INITIALIZER;
+#define KLGL_LOCK_MAXDEPTH 8
+static _Thread_local uint64_t g_ra_stack[KLGL_LOCK_MAXDEPTH];
+static _Thread_local unsigned g_ra_depth;
+void kl_gl_lock_acquire(uint64_t ra) {
+    if (g_ra_depth < KLGL_LOCK_MAXDEPTH) g_ra_stack[g_ra_depth++] = ra;
+    pthread_mutex_lock(&g_gl_lock);
+}
+uint64_t kl_gl_lock_release(void) {
+    pthread_mutex_unlock(&g_gl_lock);
+    return g_ra_depth ? g_ra_stack[--g_ra_depth] : 0;
+}
 
 static unsigned g_trace_calls;
 static unsigned g_trace_from;
@@ -949,14 +1107,24 @@ static int glfb_tracing(void) {
     return on;
 }
 
+static int glfb_locking(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("KL_GLFB_LOCK") != NULL;
+    return on;
+}
+
 static void *glfb_wrap_traced(const char *name, void *real) {
-    if (!glfb_tracing() || !real) return real;
+    if (!real) return real;
+    void *tramp = glfb_locking() ? (void *)kl_gl_lock_tramp
+                : glfb_tracing() ? (void *)kl_gl_trace_tramp
+                : NULL;
+    if (!tramp) return real;
     klfb_trace_desc *d = malloc(sizeof *d);
     if (!d) return real;
     d->name = strdup(name);
     d->real = real;
     if (!d->name) { free(d); return real; }
-    void *stub = kl_trace_stub(name, d, (void *)kl_gl_trace_tramp);
+    void *stub = kl_trace_stub(name, d, tramp);
     return stub ? stub : real;
 }
 
@@ -1017,6 +1185,13 @@ unsigned kl_glfb_present(const char *dir) {
     static unsigned swap_n;
     if (swap_n++ % (unsigned)every) return g_presented;
     snprintf(g_capture_dir, sizeof g_capture_dir, "%s", dir);
+    // If the swap arrived on a thread that owns a context — in migration mode
+    // the render thread, which is exactly where the frame was drawn — capture
+    // NOW, before the next frame's clears overwrite it. (Capturing later, from
+    // the next draw call, measured black even where the frame rendered.)
+    pthread_once(&g_tls_once, klfb_tls_init);
+    klfb_thread_gl *t = pthread_getspecific(g_tls_key);
+    if (t && t->ctx) return glfb_capture_now(dir);
     g_capture_pending = 1;
     return g_presented;
 }
@@ -1090,6 +1265,35 @@ static unsigned glfb_capture_now(const char *dir) {
     chunk(f, "IEND", NULL, 0);
     fclose(f);
     klfb_report_draws();
+    // fb0 has been measured black with every draw landing on FBOs instead
+    // (the VR frame goes to eye textures, not the backbuffer). Census the
+    // FBOs: bind each as READ, and if complete, count lit pixels — this names
+    // the framebuffer the picture is actually in.
+    {
+        static void (*a_glBindFramebuffer)(uint32_t, uint32_t);
+        if (!a_glBindFramebuffer) a_glBindFramebuffer = asym("glBindFramebuffer");
+        if (a_glBindFramebuffer) {
+            int32_t save_fb = read_fb >= 0 ? read_fb : 0;
+            for (uint32_t i = 1; i <= 8; i++) {
+                a_glBindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, i);
+                if (a_glCheckFramebufferStatus &&
+                    a_glCheckFramebufferStatus(0x8CA8) != 0x8CD5) continue;
+                memset(px, 0, stride * 4);
+                a_glReadPixels(0, 0, g_w, g_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                unsigned long fsum = 0, flit = 0;
+                for (size_t p2 = 0; p2 < (size_t)g_w * g_h; p2++) {
+                    unsigned lum = px[p2 * 4] + px[p2 * 4 + 1] + px[p2 * 4 + 2];
+                    fsum += lum;
+                    if (lum > 12) flit++;
+                }
+                if (flit || i <= 4)
+                    fprintf(stderr, "  [glfb] census fbo%u: %lu/%u lit, mean luma %lu\n",
+                            i, flit, (unsigned)(g_w * g_h),
+                            fsum / ((unsigned long)g_w * g_h * 3));
+            }
+            a_glBindFramebuffer(0x8CA8, (uint32_t)save_fb);
+        }
+    }
     uint64_t cap_tid = 0; pthread_threadid_np(NULL, &cap_tid);
     fprintf(stderr, "  [glfb] %s: %u/%u lit, mean luma %lu%s "
                     "[draw_fb=%d read_fb=%d fb_status=0x%x viewport %dx%d+%d+%d] (captured on t%llu)\n", path, lit,

@@ -19,6 +19,10 @@ void *kl_glfb_sym(const char *name);
 // is per-thread, and the guest's render thread is not the one that created it.
 void kl_glfb_make_current(void);
 
+// The release half: call from eglMakeCurrent when the guest makes no context
+// current. Migration mode frees the root context for the next thread.
+void kl_glfb_release_current(void);
+
 // Read the eye framebuffer back and write <dir>/frame_NNN.png. Returns the number
 // of frames presented so far.
 unsigned kl_glfb_present(const char *dir);

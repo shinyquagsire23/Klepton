@@ -907,8 +907,13 @@ static unsigned klegl_DestroyContext(EGLDisplay dpy, EGLContext c) {
 static unsigned klegl_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
                                   EGLSurface read, EGLContext ctx) {
     (void)dpy; g_draw = draw; g_read = read; g_current = ctx;
-    // Whichever thread this is, it is the one that will now issue GL.
-    if (kl_glfb_enabled()) kl_glfb_make_current();
+    // Whichever thread this is, it is the one that will now issue GL — or, when
+    // the guest releases the context (NULL), the one giving it up; migration
+    // mode needs both halves.
+    if (kl_glfb_enabled()) {
+        if (ctx) kl_glfb_make_current();
+        else     kl_glfb_release_current();
+    }
     return EGL_TRUE;
 }
 
