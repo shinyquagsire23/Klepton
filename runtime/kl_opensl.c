@@ -159,8 +159,10 @@ typedef struct kl_sl_player {
 
     pthread_mutex_t lock;
     pthread_cond_t  wake;
+    pthread_cond_t  cb_done;                // signalled when in_cb drops to 0
     pthread_t       thread;
     int             running, started;
+    int             in_cb;                  // a guest callback is on the stack
     SLuint32        state;
 
     void (*cb)(SLBufferQueueItf, void *);
@@ -186,6 +188,7 @@ static kl_sl_player g_player;
 static unsigned long g_buffers_consumed;
 
 static void player_stop(kl_sl_player *p);
+static void player_wait_cb(kl_sl_player *p);   // caller must hold p->lock
 
 // ---- the feeder ----
 //
@@ -214,20 +217,40 @@ static void *feeder(void *arg) {
         if (!frame) frame = 4;
         unsigned rate = p->rate ? p->rate : 48000;
         useconds_t us = (useconds_t)((uint64_t)(size / frame) * 1000000ull / rate);
-        // Snapshot the callback under the lock. Reading p->cb after unlocking
-        // races a teardown that clears it, and the window is not theoretical:
-        // FMOD stops and re-creates the whole device at least once per run.
-        void (*cb)(SLBufferQueueItf, void *) = p->cb;
-        void *cb_ctx = p->cb_ctx;
         unsigned generation = p->generation;
         pthread_mutex_unlock(&p->lock);
 
         if (us) usleep(us > 100000 ? 100000 : us);   // cap, so a bogus size cannot wedge us
+
+        // Re-check *after* the sleep and take the callback then, not before it.
+        //
+        // Snapshotting the callback before sleeping is not enough, and this cost a
+        // crash that looked like it belonged to something else entirely. A buffer's
+        // worth of sleep is milliseconds during which the guest can call
+        // SetPlayState(STOPPED) — which is exactly what Unity does when XR comes up
+        // and it reconfigures audio. Real OpenSL stops delivering buffer-queue
+        // callbacks at that point; we went on to call one, and FMOD, having already
+        // released its mixer buffers, took a memmove through a null base + offset.
+        // It presented as a fault in _platform_memmove on a guest worker thread,
+        // three layers from the mistake, and it was previously read as a missing
+        // Oculus spatializer rather than as our own race.
+        pthread_mutex_lock(&p->lock);
+        if (!p->running || generation != p->generation) break;
+        if (p->state != SL_PLAYSTATE_PLAYING) continue;   // stopped or paused mid-buffer
+        void (*cb)(SLBufferQueueItf, void *) = p->cb;
+        void *cb_ctx = p->cb_ctx;
+        // Held across the callback so a concurrent SetPlayState(STOPPED) or
+        // Destroy waits for it to return rather than freeing underneath it.
+        p->in_cb = 1;
+        pthread_mutex_unlock(&p->lock);
+
         p->consumed++;
         g_buffers_consumed++;
         if (cb) cb((SLBufferQueueItf)&p->bq_vt, cb_ctx);
 
         pthread_mutex_lock(&p->lock);
+        p->in_cb = 0;
+        pthread_cond_broadcast(&p->cb_done);
         // If the device was torn down while we were outside the lock, this
         // thread is the previous generation and must not touch the queue again.
         if (generation != p->generation) break;
@@ -283,6 +306,9 @@ static SLresult play_SetPlayState(SLPlayItf self, SLuint32 state) {
     pthread_mutex_lock(&g_player.lock);
     g_player.state = state;
     pthread_cond_signal(&g_player.wake);
+    // Stopping is synchronous: do not return until the guest's callback is off
+    // the stack, or it will run against buffers the guest is about to release.
+    if (state != SL_PLAYSTATE_PLAYING) player_wait_cb(&g_player);
     pthread_mutex_unlock(&g_player.lock);
     fprintf(stderr, "  [sl] play state -> %s\n",
             state == SL_PLAYSTATE_PLAYING ? "PLAYING" :
@@ -379,6 +405,19 @@ static void player_stop(kl_sl_player *p) {
     p->started = 0;
     pthread_mutex_destroy(&p->lock);
     pthread_cond_destroy(&p->wake);
+    pthread_cond_destroy(&p->cb_done);
+}
+
+// Wait for any buffer-queue callback already on the stack to return. Real OpenSL
+// makes a stop synchronous with respect to callbacks, so the guest is entitled to
+// free what the callback touches the moment this returns.
+//
+// The self-check is not hypothetical politeness: the guest may well call
+// SetPlayState from inside the callback, and waiting for ourselves there would
+// hang rather than crash — which is the harder failure to read (trap 5).
+static void player_wait_cb(kl_sl_player *p) {
+    if (p->started && !pthread_equal(pthread_self(), p->thread))
+        while (p->in_cb) pthread_cond_wait(&p->cb_done, &p->lock);
 }
 
 static SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *out,
@@ -398,6 +437,7 @@ static SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *out,
     p->rate = 48000; p->channels = 2; p->bits = 16;
     pthread_mutex_init(&p->lock, NULL);
     pthread_cond_init(&p->wake, NULL);
+    pthread_cond_init(&p->cb_done, NULL);
 
     // Take the real format if it is there: the feeder's pacing depends on it, and
     // samplesPerSec is milliHz, so a raw copy would be 1000x wrong.
