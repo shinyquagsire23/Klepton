@@ -124,9 +124,36 @@ build/s08_glsl: spikes/s08_glsl.c
 	$(CC) $(CFLAGS) -o $@ $< -framework OpenGL
 build/s09_angle: spikes/s09_angle.c
 	$(CC) $(CFLAGS) -o $@ $<
+build/s10_shared: spikes/s10_shared.c
+	$(CC) $(CFLAGS) -o $@ $<
 
 # ANGLE is *borrowed*, not vendored — see PLANNING M5. Point KL_ANGLE_DIR at any
 # Chromium-based app's Libraries directory; the default is Google Chrome's.
 .PHONY: angle
 angle: build/s09_angle
 	@./build/s09_angle
+
+# S1.0 — shared ANGLE contexts across threads. Runs the matrix that separates
+# "shared contexts" from "concurrent use"; see the spike's header for the S10_*
+# knobs.
+#
+# THE FAILURE IS INTERMITTENT, so every cell is repeated and what is reported is a
+# rate, not a verdict. A single run of the failing configuration passes better than
+# half the time — it did on the first attempt, and read as an exoneration. Set
+# S10_RUNS to change the sample.
+S10_RUNS ?= 20
+.PHONY: shared
+shared: build/s10_shared
+	@printf '  %-46s %s\n' "configuration" "failures (of $(S10_RUNS))"; \
+	 run() { desc="$$1"; shift; fail=0; \
+	   for i in $$(seq 1 $(S10_RUNS)); do \
+	     rc=$$(sh -c 'env "$$@" ./build/s10_shared >/dev/null 2>&1; echo $$?' \
+	             _ "$$@" 2>/dev/null); \
+	     [ "$$rc" = 0 ] || fail=$$((fail+1)); done; \
+	   printf '  %-46s %d\n' "$$desc" "$$fail"; }; \
+	 run "shared + concurrent (the KL_GLFB_SHARED shape)" S10_STAGE=7; \
+	 run "shared, lock around compile+link" S10_STAGE=7 S10_SERIAL=2; \
+	 run "shared, serialised entirely" S10_STAGE=7 S10_SERIAL=1; \
+	 run "independent contexts, concurrent" S10_STAGE=7 S10_SHARE=0; \
+	 run "one worker thread (control)" S10_STAGE=7 S10_THREADS=1; \
+	 echo "  (expected: row 1 ~1 in 3, row 2 ~1 in 30, rows 3-5 clean)"

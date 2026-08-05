@@ -299,6 +299,70 @@ void kl_glfb_make_current(void) {
     }
 }
 
+// ------------------------------------------------- the shared-context compile lock
+//
+// THIS DOES NOT FIX THE AGX ABORT. Read that first, because the numbers below are
+// persuasive about a different bug and it would be easy to file them against the
+// wrong one. Under KL_GLFB_SHARED the guest still dies in
+// findOrCreateDriverProgramVariant<BlitComputeProgramVariant>, lock or no lock —
+// measured after this went in. What the lock fixes is a *second*, independent
+// defect that s10 turned up while hunting the first.
+//
+// That second defect: shared contexts are correct, and this build of ANGLE is not
+// thread-safe across them. spikes/s10_shared.c reproduces it with no guest at all
+// — three host threads, shared ANGLE contexts, nothing of Klepton linked — and the
+// failure rate is the measurement that matters:
+//
+//   no lock                        10/30 runs crash
+//   lock around compile + link      2/60      <- ~10x better, but NOT a fix
+//   lock around the draws only      1/30
+//   serialised entirely             0/40
+//   one thread only                 0/40
+//   concurrency without sharing     1/20      <- so it is not concurrency as such
+//
+// Neither sharing nor concurrency alone, then: it is the combination. The race
+// presents two ways from one code path — a SIGSEGV inside libGLESv2, and a
+// libmalloc "pointer being freed was not allocated" abort, i.e. heap corruption in
+// ANGLE's own state. Both arrive via GL_DrawArrays and share interior frames.
+//
+// Serialising compile and link is where most of the risk lives, ANGLE doing its
+// heavy shared-object work at link time, and the improvement is real rather than
+// thread skew: it survives making the draws overlap heavily afterwards (30 draw
+// iterations per thread, 7/15 crashes without the lock and 0/15 with).
+//
+// But read row two honestly. Its first samples came back 0/30 and then 0/15, which
+// looked like a clean fix; a 60-run sample found two failures. An order of
+// magnitude, not a cure. The only configurations measured clean at 40 runs are the
+// ones that never use shared contexts concurrently — which is exactly the thing
+// the renderer has to do.
+//
+// So this is kept as a mitigation, not a resolution: partial, fixing nothing
+// currently visible, but guarding a real race that is latent on precisely the path
+// the renderer needs and would surface the moment the AGX problem is out of the
+// way. It is cheap, compilation not being hot. It is not a licence to call the
+// sharing path safe.
+//
+// And it is a workaround for the host driver, not a translation decision — nothing
+// about the guest needs it. It lives here, in the host-only reference renderer,
+// and must not be mistaken for something a real backend would inherit.
+static pthread_mutex_t g_compile_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void (*g_real_CompileShader)(uint32_t);
+static void (*g_real_LinkProgram)(uint32_t);
+
+static void klfb_CompileShader(uint32_t shader) {
+    if (!g_real_CompileShader) return;
+    pthread_mutex_lock(&g_compile_lock);
+    g_real_CompileShader(shader);
+    pthread_mutex_unlock(&g_compile_lock);
+}
+static void klfb_LinkProgram(uint32_t program) {
+    if (!g_real_LinkProgram) return;
+    pthread_mutex_lock(&g_compile_lock);
+    g_real_LinkProgram(program);
+    pthread_mutex_unlock(&g_compile_lock);
+}
+
 // ---------------------------------------------------------- ABI thunks
 static void (*g_real_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t, int32_t,
                                       int32_t, int32_t, int32_t, uint32_t, uint32_t);
@@ -415,6 +479,9 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glBlitFramebuffer",         (void *)klfb_BlitFramebuffer,         (void **)&g_real_BlitFramebuffer},
     {"glTexSubImage3D",           (void *)klfb_TexSubImage3D,           (void **)&g_real_TexSubImage3D},
     {"glCompressedTexSubImage3D", (void *)klfb_CompressedTexSubImage3D, (void **)&g_real_CompressedTexSubImage3D},
+    // the shared-context compile lock — see the block above s10's numbers
+    {"glCompileShader", (void *)klfb_CompileShader, (void **)&g_real_CompileShader},
+    {"glLinkProgram",   (void *)klfb_LinkProgram,   (void **)&g_real_LinkProgram},
 };
 
 // ---------------------------------------------------------- the gateway
