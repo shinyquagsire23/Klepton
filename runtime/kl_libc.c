@@ -658,6 +658,62 @@ static void ts_normalise(struct timespec *t) {
     while (t->tv_nsec < 0)            { t->tv_nsec += 1000000000L; t->tv_sec--; }
 }
 
+// KL_TRACE_TIME=1: log the guest-visible answers of the wall-clock family.
+// Diagnostic for the class-init deadlock: the abstime the guest feeds
+// pthread_cond_timedwait lands ~9.5 hours out, so either its clock source is
+// wrong going in (this trace) or its arithmetic corrupts it after (disasm).
+static int t_time(void) { static int t = -1; if (t < 0) t = getenv("KL_TRACE_TIME") != NULL; return t; }
+
+// bionic clock ids differ from Darwin's; forwarding them verbatim makes
+// clock_gettime(CLOCK_MONOTONIC=1) fail EINVAL, and libunity reads the
+// (unwritten) output buffer anyway — poisoning every monotonic-time consumer.
+//   bionic: 0 REALTIME 1 MONOTONIC 2 PROCESS_CPUTIME 3 THREAD_CPUTIME
+//           4 MONOTONIC_RAW 5 REALTIME_COARSE 6 MONOTONIC_COARSE 7 BOOTTIME
+//           8 REALTIME_ALARM 9 BOOTTIME_ALARM
+//   Darwin: 0 REALTIME 4 MONOTONIC_RAW 6 MONOTONIC 8 UPTIME_RAW
+//           12 PROCESS_CPUTIME_ID
+static int kl_clock_to_darwin(int clk) {
+    switch (clk) {
+    case 0: case 5: case 8: return 0;    // realtime (coarse/alarm degrade to it)
+    case 1: case 6:         return 6;    // monotonic (coarse degrades)
+    case 2: case 3:         return 12;   // cpu-time ids degrade to process
+    case 4:                 return 4;    // monotonic raw
+    case 7: case 9:         return 8;    // boottime ~ uptime raw
+    }
+    return -1;
+}
+
+int klb_clock_getres(int clk, struct timespec *ts) {
+    int dclk = kl_clock_to_darwin(clk);
+    return dclk < 0 ? (errno = EINVAL, -1) : clock_getres(dclk, ts);
+}
+
+int klb_clock_gettime(int clk, struct timespec *ts) {
+    int dclk = kl_clock_to_darwin(clk);
+    int r = dclk < 0 ? (errno = EINVAL, -1) : clock_gettime(dclk, ts);
+    if (t_time()) {
+        static _Atomic int n;
+        if (atomic_fetch_add(&n, 1) < 40)
+            fprintf(stderr, "  [klb] clock_gettime(%d->%d) ra=%p -> %d: %lld.%09ld\n",
+                    clk, dclk, __builtin_return_address(0), r,
+                    (long long)ts->tv_sec, ts->tv_nsec);
+    }
+    return r;
+}
+
+int klb_gettimeofday(struct timeval *tv, void *tz) {
+    int r = gettimeofday(tv, tz);
+    if (t_time()) {
+        static _Atomic int n;
+        if (atomic_fetch_add(&n, 1) < 40)
+            fprintf(stderr, "  [klb] gettimeofday ra=%p -> %d: %lld.%06ld\n",
+                    __builtin_return_address(0), r,
+                    (long long)tv->tv_sec, (long)tv->tv_usec);
+    }
+    return r;
+}
+
+
 static long kl_futex_impl(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts);
 static long kl_futex(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;

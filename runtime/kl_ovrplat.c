@@ -190,6 +190,10 @@ static int plat_is_init(const char *name) {
 static const char *const g_plat_request[] = {
     "ovr_RichPresence_Clear", "ovr_RichPresence_Set",
     "ovr_RichPresence_SetDestination", "ovr_RichPresence_SetIsJoinable",
+    // Asking who is logged in is not an ownership question; with no platform
+    // service the request cannot be made, which is what 0 says. Beat Saber
+    // 1.28 takes its offline path from there (~swap 34k of the boot).
+    "ovr_User_GetLoggedInUser",
 };
 
 static int plat_is_request(const char *name) {

@@ -7,7 +7,8 @@ RUNTIME := runtime/kl_image.c runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S \
-           runtime/kl_ovrplat.c runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S
+           runtime/kl_ovrplat.c runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
+           runtime/kl_il2cpp.c runtime/kl_sample.c
 
 .PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
 all: build/t_opus

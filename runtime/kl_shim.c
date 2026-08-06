@@ -495,6 +495,7 @@ X(klb_pthread_setname_np) X(klb_pthread_atfork)
 X(klb_sem_init) X(klb_sem_destroy) X(klb_sem_post) X(klb_sem_wait)
 X(klb_sem_timedwait) X(klb_sem_getvalue)
 X(klb_dlopen) X(klb_dlsym) X(klb_dlclose) X(klb_dlerror) X(klb_dladdr)
+X(klb_clock_gettime) X(klb_clock_getres) X(klb_gettimeofday)
 #undef X
 extern char **environ;
 

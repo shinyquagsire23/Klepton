@@ -84,4 +84,13 @@ unsigned kl_jni_drain_ui_tasks(void);
 // matching Android: doFrame re-posts if it wants the next one.
 void kl_jni_tick_choreographer(void);
 
+// Local-ref hygiene at the host->guest boundary. On Android the JVM pops the
+// local frame when a native method returns; our guest entries return to the
+// host instead, so without this every local the guest allocates inside
+// nativeRender & co. leaks (~3 objects/frame — observed exhausting the
+// 131072-slot pool at swap 43582). The host wraps each guest entry in a
+// push/pop pair, playing the JVM's half.
+void kl_jni_local_frame_push(void);
+void kl_jni_local_frame_pop(void);
+
 #endif

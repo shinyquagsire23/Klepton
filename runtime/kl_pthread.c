@@ -24,6 +24,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <dispatch/dispatch.h>
 #include "klepton.h"
 
@@ -39,17 +40,30 @@
 //   pthread_cond_t     48 B / 4    (int32_t[12])
 //   pthread_rwlock_t   56 B / 4    (int32_t[14])
 #define KL_MAX_SYNC 65536
+// Table slots recycle: with the JNI pool leak fixed, long runs otherwise die
+// here — Unity creates and destroys a mutex or two per frame, and a leaked
+// slot per destroy is 65536 creates at ~frame 40k (observed). The kind object
+// behind a recycled slot is replaced, not shared; the old one leaks (a
+// destroy is the guest saying nobody holds it).
 #define SYNC_TABLE(kind, tab, count, init_expr)                                  \
     static kind *tab[KL_MAX_SYNC];                                               \
     static _Atomic uint32_t count = 1;              /* 0 means uninitialised */  \
+    static uint32_t tab##_free[KL_MAX_SYNC];                                     \
+    static _Atomic uint32_t tab##_nfree;                                         \
     static kind *tab##_get(void *g) {                                            \
         _Atomic uint32_t *slot = (_Atomic uint32_t *)(g);                        \
         uint32_t idx = atomic_load(slot);                                        \
         if (idx) return tab[idx];                                                \
         kind *fresh = malloc(sizeof *fresh);                                     \
         init_expr;                                                               \
-        uint32_t mine = atomic_fetch_add(&count, 1);                             \
-        if (mine >= KL_MAX_SYNC) abort();                                        \
+        uint32_t mine;                                                           \
+        uint32_t nf = atomic_load(&tab##_nfree);                                 \
+        if (nf && atomic_compare_exchange_strong(&tab##_nfree, &nf, nf - 1))     \
+            mine = tab##_free[nf - 1];                                           \
+        else {                                                                   \
+            mine = atomic_fetch_add(&count, 1);                                  \
+            if (mine >= KL_MAX_SYNC) abort();                                    \
+        }                                                                        \
         tab[mine] = fresh;                                                       \
         uint32_t expect = 0;                                                     \
         if (!atomic_compare_exchange_strong(slot, &expect, mine)) {              \
@@ -57,53 +71,334 @@
             return tab[expect];                                                  \
         }                                                                        \
         return fresh;                                                            \
+    }                                                                            \
+    static void tab##_recycle(void *g) {                                         \
+        _Atomic uint32_t *slot = (_Atomic uint32_t *)(g);                        \
+        uint32_t idx = atomic_exchange(slot, 0);                                 \
+        if (!idx || idx >= count) return;                                        \
+        uint32_t nf = atomic_fetch_add(&tab##_nfree, 1);                         \
+        if (nf < KL_MAX_SYNC) tab##_free[nf] = idx;                              \
     }
 
-SYNC_TABLE(pthread_mutex_t, g_mtx, g_mtx_n, ({
-    pthread_mutexattr_t a; pthread_mutexattr_init(&a);
-    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(fresh, &a); pthread_mutexattr_destroy(&a);
-}))
 SYNC_TABLE(pthread_cond_t,   g_cnd, g_cnd_n, pthread_cond_init(fresh, NULL))
 SYNC_TABLE(pthread_rwlock_t, g_rwl, g_rwl_n, pthread_rwlock_init(fresh, NULL))
 
-static pthread_mutex_t  *mtx(void *g) { return g_mtx_get(g); }
+// ---------- mutexes: address-keyed map ----------
+// The slot-in-guest-storage design (shared SYNC_TABLE above) aliases two
+// logical mutexes onto one host object whenever guest storage carries a
+// stale slot index — memory freed without pthread_mutex_destroy and reused,
+// or a live 40-byte bionic mutex memcpy'd into a moved struct. Both were
+// observed in one run: the libunity static at libunity+0x1237EE4 and an
+// arena object shared slot 23, and the render thread held it via one
+// address while the main thread waited via the other — a manufactured
+// deadlock (2026-08-06 capture hang). So mutexes are keyed by guest
+// *address* instead: a copied or recycled address is the same mutex, a
+// different address is a different mutex, and guest storage is never read.
+#define MTX_MAP_SIZE 32768          // power of two; abort past it, KL_MAX_SYNC-style
+typedef struct {
+    _Atomic(uintptr_t)   key;       // guest address; 0 = empty
+    pthread_mutex_t     *m;
+    _Atomic(void *)      owner;     // owner tracking, dumped by kl_pthread_report
+    _Atomic(void *)      locksite;
+} mtx_entry;
+static mtx_entry g_mtx_map[MTX_MAP_SIZE];
+
+static unsigned mtx_hash(uintptr_t a) {
+    return (unsigned)(((a >> 4) * 0x9E3779B97F4A7C15ULL) >> 49);
+}
+
+// Find-or-create the host mutex for guest address g. Linear probe.
+static mtx_entry *mtx_entry_for(void *g) {
+    uintptr_t want = (uintptr_t)g;
+    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
+        uintptr_t k = atomic_load(&g_mtx_map[i].key);
+        if (k == want) return &g_mtx_map[i];
+        if (k) continue;
+        // empty: claim it
+        uintptr_t expect = 0;
+        if (!atomic_compare_exchange_strong(&g_mtx_map[i].key, &expect, want))
+            { i--; continue; }          // lost the race; re-read this slot
+        pthread_mutex_t *fresh = malloc(sizeof *fresh);
+        pthread_mutexattr_t a; pthread_mutexattr_init(&a);
+        pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(fresh, &a); pthread_mutexattr_destroy(&a);
+        g_mtx_map[i].m = fresh;
+        return &g_mtx_map[i];
+    }
+}
+
+static pthread_mutex_t *mtx(void *g) { return mtx_entry_for(g)->m; }
+
+static mtx_entry *mtx_find(void *g) {
+    uintptr_t want = (uintptr_t)g;
+    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
+        uintptr_t k = atomic_load(&g_mtx_map[i].key);
+        if (k == want) return &g_mtx_map[i];
+        if (!k) return NULL;
+    }
+}
+
 static pthread_cond_t   *cnd(void *g) { return g_cnd_get(g); }
 static pthread_rwlock_t *rwl(void *g) { return g_rwl_get(g); }
 
-// _destroy just releases the guest's claim; the object itself is left in the table
-// because another thread may still hold a pointer to it.
-static void sync_release(void *g) { atomic_store((_Atomic uint32_t *)g, 0); }
+// KL_TRACE_MUTEX=1: lifecycle of translated mutexes — init, destroy, and
+// lazy creation — so aliasing (two guest addresses, one host object) can be
+// attributed: copied storage keeps the same slot; freed-without-destroy
+// storage keeps a stale one.
+static int t_mtx(void) { static int t = -1; if (t < 0) t = getenv("KL_TRACE_MUTEX") != NULL; return t; }
+static void mtx_log(const char *what, void *g, uint32_t idx) {
+    if (!t_mtx()) return;
+    static _Atomic int n;
+    if (atomic_fetch_add(&n, 1) < 200)
+        fprintf(stderr, "  [klb] mutex %s: guest %p slot %u (tid %p, ra %p)\n",
+                what, g, idx, (void *)pthread_self(),
+                __builtin_return_address(0));
+}
 
 // ---------- mutex ----------
-int klb_pthread_mutex_init(void *m, const void *a) {
-    (void)a; sync_release(m); mtx(m); return 0;
+static struct { _Atomic(void *) tid, guest, ra; } g_mtx_waiters[64];
+
+static void mtx_wait_enter(void *guest, void *ra) {
+    void *self = (void *)pthread_self();
+    for (int i = 0; i < 64; i++) {
+        void *expect = NULL;
+        if (atomic_compare_exchange_strong(&g_mtx_waiters[i].tid, &expect, self)) {
+            atomic_store(&g_mtx_waiters[i].guest, guest);
+            atomic_store(&g_mtx_waiters[i].ra, ra);
+            return;
+        }
+    }
 }
-int klb_pthread_mutex_lock(void *m)    { return pthread_mutex_lock(mtx(m)); }
-int klb_pthread_mutex_unlock(void *m)  { return pthread_mutex_unlock(mtx(m)); }
-int klb_pthread_mutex_trylock(void *m) { return pthread_mutex_trylock(mtx(m)); }
-int klb_pthread_mutex_destroy(void *p) { sync_release(p); return 0; }
+static void mtx_wait_leave(void) {
+    void *self = (void *)pthread_self();
+    for (int i = 0; i < 64; i++) {
+        void *expect = self;
+        if (atomic_compare_exchange_strong(&g_mtx_waiters[i].tid, &expect, NULL))
+            return;
+    }
+}
+
+int klb_pthread_mutex_init(void *m, const void *a) {
+    (void)a;
+    // POSIX: init of an existing mutex is UB. Fresh host object either way;
+    // a stale entry's host leaks (it might be held, and freeing is worse).
+    mtx_entry *e = mtx_entry_for(m);
+    pthread_mutex_t *fresh = malloc(sizeof *fresh);
+    pthread_mutexattr_t at; pthread_mutexattr_init(&at);
+    pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(fresh, &at); pthread_mutexattr_destroy(&at);
+    e->m = fresh;
+    atomic_store(&e->owner, NULL);
+    atomic_store(&e->locksite, NULL);
+    mtx_log("init", m, (uint32_t)(e - g_mtx_map));
+    return 0;
+}
+int klb_pthread_mutex_lock(void *m) {
+    mtx_entry *e = mtx_entry_for(m);
+    mtx_wait_enter(m, __builtin_return_address(0));
+    int r = pthread_mutex_lock(e->m);
+    mtx_wait_leave();
+    if (r == 0) {
+        atomic_store(&e->locksite, __builtin_return_address(0));
+        atomic_store(&e->owner, (void *)pthread_self());
+    }
+    return r;
+}
+int klb_pthread_mutex_unlock(void *m)  {
+    mtx_entry *e = mtx_entry_for(m);
+    atomic_store(&e->owner, NULL);
+    atomic_store(&e->locksite, NULL);
+    return pthread_mutex_unlock(e->m);
+}
+int klb_pthread_mutex_trylock(void *m) {
+    mtx_entry *e = mtx_entry_for(m);
+    int r = pthread_mutex_trylock(e->m);
+    if (r == 0) {
+        atomic_store(&e->locksite, __builtin_return_address(0));
+        atomic_store(&e->owner, (void *)pthread_self());
+    }
+    return r;
+}
+int klb_pthread_mutex_destroy(void *p) {
+    mtx_log("destroy", p, 0);
+    mtx_entry *e = mtx_find(p);
+    if (e) atomic_store(&e->key, 0);    // host leaks; it may be held
+    return 0;
+}
+
+static int thread_is_alive(void *self);        // threads section, below
+static const char *thread_name_of(void *self); // threads section, below
+
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <dlfcn.h>
+
+// Current backtrace of a mutex holder, captured from the fault handler so a
+// deadlock report shows where the *owner* is parked, not just who waits.
+static void dump_thread_stack(FILE *out, void *pt) {
+    mach_port_t act = pthread_mach_thread_np((pthread_t)pt);
+    if (!act) { fprintf(out, "    (no mach thread)\n"); return; }
+    arm_thread_state64_t ts;
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(act, ARM_THREAD_STATE64, (thread_state_t)&ts,
+                         &cnt) != KERN_SUCCESS) {
+        fprintf(out, "    (thread_get_state failed)\n");
+        return;
+    }
+    void *pc = (void *)ts.__pc;
+    uint64_t fp = ts.__fp;
+    for (int d = 0; d < 12 && pc; d++) {
+        size_t off = 0;
+        const char *img = kl_addr_image(pc, &off);
+        if (img) fprintf(out, "    #%-2d %s+0x%zx\n", d, img, off);
+        else {
+            Dl_info di;
+            if (dladdr(pc, &di) && di.dli_sname)
+                fprintf(out, "    #%-2d %s+0x%tx\n", d, di.dli_sname,
+                        (const char *)pc - (const char *)di.dli_saddr);
+            else fprintf(out, "    #%-2d %p\n", d, pc);
+        }
+        if (!fp || (fp & 7)) break;
+        uint64_t pair[2];
+        mach_vm_size_t got = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), fp, sizeof pair,
+                                   (mach_vm_address_t)pair, &got) != KERN_SUCCESS ||
+            got != sizeof pair || !pair[1] || pair[0] <= fp)
+            break;
+        pc = (void *)pair[1];
+        fp = pair[0];
+    }
+}
+
+void kl_pthread_report(FILE *out) {
+    fprintf(out, "-- mutex owners (kl_pthread address map) --\n");
+    unsigned shown = 0;
+    for (uint32_t i = 0; i < MTX_MAP_SIZE; i++) {
+        void *owner = atomic_load(&g_mtx_map[i].owner);
+        if (!owner) continue;
+        const char *nm = thread_name_of(owner);
+        fprintf(out, "  guest %p: held by tid %p%s%s%s (locked from %p)\n",
+                (void *)atomic_load(&g_mtx_map[i].key), owner,
+                nm ? " [" : "", nm ? nm : "", nm ? "]" : "",
+                thread_is_alive(owner) ? "" : "  ** EXITED **",
+                atomic_load(&g_mtx_map[i].locksite));
+        dump_thread_stack(out, owner);
+        shown++;
+    }
+    if (!shown) fprintf(out, "  (no tracked holders)\n");
+    for (int i = 0; i < 64; i++) {
+        void *tid = atomic_load(&g_mtx_waiters[i].tid);
+        if (!tid) continue;
+        const char *nm = thread_name_of(tid);
+        fprintf(out, "  waiter tid %p%s%s%s wants guest %p (from %p)\n", tid,
+                nm ? " [" : "", nm ? nm : "", nm ? "]" : "",
+                atomic_load(&g_mtx_waiters[i].guest),
+                atomic_load(&g_mtx_waiters[i].ra));
+    }
+}
 // bionic pthread_mutexattr_t is a plain int holding the type.
 int klb_pthread_mutexattr_init(int *a)            { *a = 0; return 0; }
 int klb_pthread_mutexattr_destroy(int *a)         { (void)a; return 0; }
 int klb_pthread_mutexattr_settype(int *a, int t)  { *a = t; return 0; }
 
 // ---------- condition variable ----------
-int klb_pthread_cond_init(void *c, const void *a)  { (void)a; sync_release(c); cnd(c); return 0; }
-int klb_pthread_cond_destroy(void *p) { sync_release(p); return 0; }
+int klb_pthread_cond_init(void *c, const void *a)  { (void)a; g_cnd_recycle(c); cnd(c); return 0; }
+int klb_pthread_cond_destroy(void *p) { g_cnd_recycle(p); return 0; }
 int klb_pthread_cond_signal(void *c)    { return pthread_cond_signal(cnd(c)); }
 int klb_pthread_cond_broadcast(void *c) { return pthread_cond_broadcast(cnd(c)); }
-int klb_pthread_cond_wait(void *c, void *m) { return pthread_cond_wait(cnd(c), mtx(m)); }
+int klb_pthread_cond_wait(void *c, void *m) {
+    // A cond wait releases the mutex while sleeping; reflect that in the
+    // owner table or every sleeper reads as a holder.
+    mtx_entry *e = mtx_entry_for(m);
+    atomic_store(&e->owner, NULL);
+    int r = pthread_cond_wait(cnd(c), e->m);
+    atomic_store(&e->locksite, __builtin_return_address(0));
+    atomic_store(&e->owner, (void *)pthread_self());
+    return r;
+}
 int klb_pthread_cond_timedwait(void *c, void *m, const struct timespec *ts) {
-    return pthread_cond_timedwait(cnd(c), mtx(m), ts);
+    // bionic's default cond clock is CLOCK_MONOTONIC; Darwin conds speak only
+    // CLOCK_REALTIME. A guest abstime is monotonic-based (e.g. libil2cpp's
+    // ConditionVariableImpl builds it from clock_gettime(CLOCK_MONOTONIC)),
+    // so rebase it onto realtime before forwarding. Monotonic abstimes are
+    // small (< ~4.5 years of uptime seconds); realtime ones are ~1.7e9.
+    struct timespec rts;
+    static int no_rebase = -1;
+    if (no_rebase < 0) no_rebase = getenv("KL_NO_REBASE") != NULL;
+    if (!no_rebase && ts && ts->tv_sec < 100000000) {
+        struct timespec rt, mo;
+        clock_gettime(CLOCK_REALTIME, &rt);
+        clock_gettime(CLOCK_MONOTONIC, &mo);
+        int64_t dsec = (int64_t)rt.tv_sec - mo.tv_sec;
+        long    dnsec = rt.tv_nsec - mo.tv_nsec;
+        rts.tv_sec = ts->tv_sec + dsec;
+        rts.tv_nsec = ts->tv_nsec + dnsec;
+        while (rts.tv_nsec >= 1000000000L) { rts.tv_nsec -= 1000000000L; rts.tv_sec++; }
+        while (rts.tv_nsec < 0)            { rts.tv_nsec += 1000000000L; rts.tv_sec--; }
+        ts = &rts;
+    }
+    // KL_CONDWAIT_CAP_MS=<ms>: clamp the abstime to now+ms. Diagnostic for the
+    // class-init deadlock: libil2cpp's Class::Init waiters sleep on a condvar
+    // nobody signals after the cctor completes, and the abstime they compute
+    // reads as ~71 minutes out (w23 = 4294967 ms ≈ UINT_MAX µs / 1000), so
+    // they never wake to re-check the class state. Capping the wait proves
+    // whether the stuck boot is exactly those waiters never re-checking.
+    static int cap_ms = -1;
+    static int trace = -1;
+    if (cap_ms < 0) {
+        const char *e = getenv("KL_CONDWAIT_CAP_MS");
+        cap_ms = e ? atoi(e) : 0;
+    }
+    if (trace < 0) trace = getenv("KL_TRACE_CONDWAIT") ? 1 : 0;
+    if (trace && ts) {
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        static _Atomic int tlogged;
+        if (atomic_fetch_add(&tlogged, 1) < 60)
+            fprintf(stderr, "  [klb] cond_timedwait tid=%p ra=%p: ts %lld.%09ld "
+                    "(delta %.3fs)\n", (void *)pthread_self(),
+                    __builtin_return_address(0),
+                    (long long)ts->tv_sec, ts->tv_nsec,
+                    (double)(ts->tv_sec - now.tv_sec) +
+                    (double)(ts->tv_nsec - now.tv_nsec) / 1e9);
+    }
+    struct timespec cts;
+    if (cap_ms && ts) {
+        struct timespec now, lim;
+        clock_gettime(CLOCK_REALTIME, &now);
+        lim = now;
+        lim.tv_sec += cap_ms / 1000;
+        lim.tv_nsec += (cap_ms % 1000) * 1000000L;
+        if (lim.tv_nsec >= 1000000000L) { lim.tv_sec++; lim.tv_nsec -= 1000000000L; }
+        if (ts->tv_sec > lim.tv_sec ||
+            (ts->tv_sec == lim.tv_sec && ts->tv_nsec > lim.tv_nsec)) {
+            static _Atomic int logged;
+            if (atomic_fetch_add(&logged, 1) < 10)
+                fprintf(stderr, "  [klb] cond_timedwait clamped: guest ts was "
+                        "%lld.%09ld (%.3fs out), now+%dms\n",
+                        (long long)ts->tv_sec, ts->tv_nsec,
+                        (double)(ts->tv_sec - now.tv_sec) +
+                        (double)(ts->tv_nsec - now.tv_nsec) / 1e9, cap_ms);
+            cts = lim;
+            ts = &cts;
+        }
+    }
+    // A cond wait releases the mutex while sleeping; reflect that in the
+    // owner table or every sleeper reads as a holder.
+    mtx_entry *e = mtx_entry_for(m);
+    atomic_store(&e->owner, NULL);
+    int r = pthread_cond_timedwait(cnd(c), e->m, ts);
+    atomic_store(&e->locksite, __builtin_return_address(0));
+    atomic_store(&e->owner, (void *)pthread_self());
+    return r;
 }
 int klb_pthread_condattr_init(long *a)                 { *a = 0; return 0; }
 int klb_pthread_condattr_destroy(long *a)              { (void)a; return 0; }
 int klb_pthread_condattr_setclock(long *a, int clk)    { (void)a; (void)clk; return 0; }
 
 // ---------- rwlock ----------
-int klb_pthread_rwlock_init(void *l, const void *a) { (void)a; sync_release(l); rwl(l); return 0; }
-int klb_pthread_rwlock_destroy(void *p) { sync_release(p); return 0; }
+int klb_pthread_rwlock_init(void *l, const void *a) { (void)a; g_rwl_recycle(l); rwl(l); return 0; }
+int klb_pthread_rwlock_destroy(void *p) { g_rwl_recycle(p); return 0; }
 int klb_pthread_rwlock_rdlock(void *l) { return pthread_rwlock_rdlock(rwl(l)); }
 int klb_pthread_rwlock_wrlock(void *l) { return pthread_rwlock_wrlock(rwl(l)); }
 int klb_pthread_rwlock_unlock(void *l) { return pthread_rwlock_unlock(rwl(l)); }
@@ -169,11 +464,48 @@ int klb_pthread_once(int *ctl, void (*fn)(void)) {
 
 // ---------- threads ----------
 // Every guest thread needs the bionic stack-guard canary in Darwin TSD slot 5 (S0.1).
+//
+// Liveness registry for the mutex-owner dump: a holder whose tid is dead is
+// the signature of a thread that exited holding a mutex (which reads exactly
+// like a deadlock). Registered in the tramp, unregistered on return/exit.
+#define KL_MAX_THREADS_LIVE 256
+static _Atomic(void *) g_live_threads[KL_MAX_THREADS_LIVE];
+static char            g_live_names[KL_MAX_THREADS_LIVE][24];
+static void thread_register(void *self) {
+    for (int i = 0; i < KL_MAX_THREADS_LIVE; i++) {
+        void *expect = NULL;
+        if (atomic_compare_exchange_strong(&g_live_threads[i], &expect, self)) {
+            pthread_getname_np(pthread_self(), g_live_names[i],
+                               sizeof g_live_names[i]);
+            return;
+        }
+    }
+}
+static void thread_unregister(void *self) {
+    for (int i = 0; i < KL_MAX_THREADS_LIVE; i++) {
+        void *expect = self;
+        if (atomic_compare_exchange_strong(&g_live_threads[i], &expect, NULL))
+            return;
+    }
+}
+static const char *thread_name_of(void *self) {
+    for (int i = 0; i < KL_MAX_THREADS_LIVE; i++)
+        if (atomic_load(&g_live_threads[i]) == self) return g_live_names[i];
+    return NULL;
+}
+static int thread_is_alive(void *self) {
+    for (int i = 0; i < KL_MAX_THREADS_LIVE; i++)
+        if (atomic_load(&g_live_threads[i]) == self) return 1;
+    return 0;
+}
 typedef struct { void *(*fn)(void *); void *arg; } tramp;
 static void *thread_tramp(void *p) {
     tramp t = *(tramp *)p; free(p);
     kl_thread_init();
-    return t.fn(t.arg);
+    thread_register(pthread_self());
+    void *r = t.fn(t.arg);
+    thread_unregister(pthread_self());
+    return r;
 }
 int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
                        void *(*fn)(void *), void *arg) {
@@ -193,7 +525,7 @@ int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
 }
 int   klb_pthread_join(pthread_t t, void **r)  { return pthread_join(t, r); }
 int   klb_pthread_detach(pthread_t t)          { return pthread_detach(t); }
-void  klb_pthread_exit(void *r)                { pthread_exit(r); }
+void  klb_pthread_exit(void *r)                { thread_unregister(pthread_self()); pthread_exit(r); }
 pthread_t klb_pthread_self(void)               { return pthread_self(); }
 int   klb_pthread_equal(pthread_t a, pthread_t b) { return pthread_equal(a, b); }
 int   klb_pthread_kill(pthread_t t, int sig)   {

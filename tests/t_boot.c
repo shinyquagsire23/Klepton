@@ -27,6 +27,8 @@
 #include "../runtime/kl_ovrp.h"
 #include "../runtime/kl_ovrplat.h"
 #include "../runtime/kl_view.h"
+#include "../runtime/kl_sample.h"
+#include "../runtime/kl_il2cpp.h"
 
 static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
 
@@ -81,8 +83,12 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
         if (!ret) break;
         size_t roff = 0;
         const char *rimg = kl_addr_image(ret, &roff);
+        const char *mm = kl_il2cpp_method_at(ret);
         Dl_info rdi;
-        if (rimg)
+        if (mm)
+            n = snprintf(buf, sizeof buf, "    #%-2d %s  [%s+0x%zx]\n", depth, mm,
+                         rimg ? rimg : "?", roff);
+        else if (rimg)
             n = snprintf(buf, sizeof buf, "    #%-2d %s+0x%zx\n", depth, rimg, roff);
         else if (dladdr(ret, &rdi) && rdi.dli_sname)
             n = snprintf(buf, sizeof buf, "    #%-2d %s+0x%tx\n", depth, rdi.dli_sname,
@@ -107,7 +113,10 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // the surface reports otherwise, and under KL_PERMISSIVE a crash is the
     // *expected* end of a scouting run — the guest carries on with answers we
     // invented and eventually walks into one.
-    if (sig == SIGABRT || sig == SIGALRM || sig == SIGSEGV || sig == SIGBUS) {
+    if (sig == SIGABRT || sig == SIGALRM || sig == SIGSEGV || sig == SIGBUS ||
+        sig == SIGTRAP) {
+        kl_sample_stop_report(stderr);
+        kl_pthread_report(stderr);
         kl_egl_report(stderr);
         kl_opensl_report(stderr);
         kl_ovrp_report(stderr);
@@ -143,6 +152,7 @@ static void install_fault_reporter(void) {
     sigaction(SIGBUS,  &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGALRM, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);   // guest __builtin_trap / brk assertions
 }
 
 // The entitlement refusal in kl_ovrplat.c is a policy guard, and Beat Saber does
@@ -215,7 +225,10 @@ static int recon_run(int view_pump) {
     jni_onload_fn onload = (jni_onload_fn)kl_sym(main_img, "JNI_OnLoad");
     if (!onload) return fail("libmain.so exports no JNI_OnLoad");
 
-    int version = onload(kl_jni_vm(), NULL);
+    int version;
+    kl_jni_local_frame_push();      // the JVM would pop each native's local
+    version = onload(kl_jni_vm(), NULL);   // frame on return; the host plays
+    kl_jni_local_frame_pop();       // that half (see kl_jni.h)
     printf("  JNI_OnLoad returned 0x%08x\n", version);
     if (version != KL_JNI_VERSION_1_6)
         return fail("JNI_OnLoad did not return JNI_VERSION_1_6");
@@ -234,8 +247,10 @@ static int recon_run(int view_pump) {
     printf("\n=== recon: driving NativeLoader.load(\"libunity.so\") ===\n");
     fflush(NULL);
     // load() takes the *directory* — it appends "/libunity.so" itself.
+    kl_jni_local_frame_push();
     int8_t ok = ((nativeloader_load_fn)load)(kl_jni_env(), NULL,
                                              kl_jni_new_string(LIBDIR));
+    kl_jni_local_frame_pop();
     printf("  NativeLoader.load returned %d\n", ok);
 
     // UnityPlayer's constructor calls initJni(Context) first (UnityPlayer.smali
@@ -253,7 +268,9 @@ static int recon_run(int view_pump) {
         // The shared singleton, not a fresh instance: Unity also reads this
         // back through the static UnityPlayer.currentActivity and compares.
         void *context = kl_jni_activity();
+        kl_jni_local_frame_push();
         ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, context);
+        kl_jni_local_frame_pop();
         printf("  initJni returned\n");
     }
 
@@ -275,12 +292,14 @@ static int recon_run(int view_pump) {
             // widens the window when the question is what it is waiting on.
             const char *aenv = getenv("KL_ALARM");
             alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : 20);
+            kl_jni_local_frame_push();
             if (seq[i].kind == 2)
                 ((void (*)(void *, void *, int, void *))fn)(kl_jni_env(), thiz2, 0, surface);
             else if (seq[i].kind == 1)
                 printf("  -> %d\n", ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2));
             else
                 ((void (*)(void *, void *))fn)(kl_jni_env(), thiz2);
+            kl_jni_local_frame_pop();
             alarm(0);
             printf("  %s returned\n", seq[i].name);
             // Android's UI thread runs its looper between callbacks; here
@@ -339,6 +358,28 @@ static int recon_run(int view_pump) {
             const char *aenv2 = getenv("KL_ALARM");
             unsigned budget = aenv2 ? (unsigned)strtoul(aenv2, NULL, 10) : 60;
             if (!view_pump) alarm(budget);
+            // KL_SAMPLE_MS: while the pump runs, sample every guest thread's
+            // pc/backtrace and resolve it (kl_sample.c) — built to name the
+            // loop the loading-pace arc kept measuring. The metadata sits next
+            // to the libs in the unpacked APK tree.
+            const char *senv = getenv("KL_SAMPLE_MS");
+            int sampling = 0;
+            if (senv) {
+                char meta[1024];
+                const char *menv = getenv("KL_IL2CPP_METADATA");
+                if (menv) {
+                    snprintf(meta, sizeof meta, "%s", menv);
+                } else {
+                    // <apk>/lib/arm64-v8a -> <apk>/assets/bin/Data/Managed/...
+                    snprintf(meta, sizeof meta, "%s", LIBDIR);
+                    char *tail = strstr(meta, "/lib/");
+                    if (tail) *tail = 0;
+                    snprintf(meta + strlen(meta), sizeof meta - strlen(meta),
+                             "/assets/bin/Data/Managed/Metadata/global-metadata.dat");
+                }
+                sampling = kl_sample_start(
+                    (unsigned)strtoul(senv, NULL, 10), meta);
+            }
             const long frame_ns = 1000000000L / 72;
             unsigned i;
             for (i = 0; fn && (view_pump ? !g_view_quit : i < frames); i++) {
@@ -349,7 +390,12 @@ static int recon_run(int view_pump) {
                 // nativeRender then draws what it decided. Ticking after
                 // rendering would hand every frame the previous one's time.
                 kl_jni_tick_choreographer();
+                // One local frame per pumped frame, as the JVM gives each
+                // nativeRender on Android — the guest's per-frame locals are
+                // meant to die here (see kl_jni.h).
+                kl_jni_local_frame_push();
                 ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2);
+                kl_jni_local_frame_pop();
                 kl_jni_drain_ui_tasks();
                 if (view_pump) {
                     struct timespec t1;
@@ -363,6 +409,7 @@ static int recon_run(int view_pump) {
                 }
             }
             alarm(0);
+            if (sampling) kl_sample_stop_report(stdout);
             printf("  pumped %u frames\n", i);
             const char *sd = getenv("KL_DUMP_SHADERS");
             if (sd) kl_egl_dump_shaders(sd);

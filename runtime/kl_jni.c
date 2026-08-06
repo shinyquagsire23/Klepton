@@ -64,9 +64,13 @@ KL_JVM_SLOTS(KLJ_STUB_VM)
 // instead of a guess, and a jobject arriving from somewhere unexpected is
 // caught by the magic rather than dereferenced blindly.
 #define KLJ_OBJ_MAGIC 0x4B4C4A4FU   /* 'KLJO' */
-#define KLJ_MAX_OBJECTS 8192*16
+#define KLJ_MAX_OBJECTS (8192*16)   // parenthesised: a bare 8192*16 turns
+                                    // "x % KLJ_MAX_OBJECTS" into (x%8192)*16
 typedef struct klj_object {
     uint32_t    magic;
+    uint32_t    pinned; // global-ref count, or 1 forever for interned class
+                        // objects and host singletons: DeleteLocalRef and
+                        // PopLocalFrame must not recycle it while > 0
     const char *cls;    // interned class name
     void       *data;   // java/lang/String -> char*; java/lang/Class -> klj_class*
 } klj_object;
@@ -104,12 +108,108 @@ static unsigned  g_nclasses;
 static klj_object g_objects[KLJ_MAX_OBJECTS];
 static unsigned   g_nobjects;
 
-// Objects are never freed. They are startup-lifetime and there is no GC to
-// coordinate with; a free list here would buy nothing and cost use-after-free.
+// Local references are recycled, lazily. The loading-pace runs showed the
+// pool is not startup-lifetime after all: the guest leaks ~3 objects per
+// rendered frame and exhausted 131072 slots at a deterministic swap 43582.
+// Two reclamation paths, matching JNI semantics:
+//
+//   - DeleteLocalRef retires the slot;
+//   - PushLocalFrame/PopLocalFrame bracket a batch: every object allocated
+//     while a frame is open on this thread is retired at pop, except the
+//     result, which is handed to the parent frame. Frames are per-thread;
+//     native code on arbitrary guest threads can open them independently.
+//
+// Retired slots are NOT reused immediately. The guest (IL2CPP built against
+// Android, where a local ref is just a pointer and outliving its frame is
+// invisible) keeps using some objects past their pop — observed: the int[]
+// from InputDevice.getDeviceIds() retired at a pop and dereferenced a moment
+// later. Retired slots therefore sit in a FIFO quarantine; only when it
+// exceeds KLJ_QUARANTINE entries is the oldest slot actually recycled, and a
+// jstring's strdup'd bytes are freed at that point, not at retire. 8192
+// entries at the observed ~3 retires/frame is a ~2700-frame grace period.
+//
+// pinned is a global-ref COUNT (NewGlobalRef can hand out several handles to
+// one object); interned class objects and host singletons (the Activity)
+// start at 1 and effectively never reach 0. Class objects are additionally
+// exempt from recycling outright: klj_class interning keeps as_object
+// forever, so freeing one hands its slot to another class's object while
+// FindClass keeps returning the stale pointer (observed: JNIBridge's class
+// object retired at a PopLocalFrame after the guest's NewGlobalRef/
+// DeleteGlobalRef pair, the slot reused for StringBuilder, and the next
+// FindClass("bitter/jnibridge/JNIBridge") answered StringBuilder's class).
+#define KLJ_QUARANTINE 8192
+static unsigned g_retired[KLJ_MAX_OBJECTS];
+static unsigned g_retired_head, g_retired_tail;   // ring; head = oldest
+static unsigned g_retired_n;
+static uint64_t g_stat_alloc, g_stat_delete, g_stat_pop_freed;
+
+typedef struct klj_frame {
+    struct klj_frame *parent;
+    klj_object      **objs;
+    unsigned          n, cap;
+} klj_frame;
+static __thread klj_frame *t_frame;
+
+static void klj_frame_record(klj_object *o) {
+    klj_frame *f = t_frame;
+    if (!f) return;
+    if (f->n == f->cap) {
+        f->cap = f->cap ? f->cap * 2 : 16;
+        f->objs = realloc(f->objs, f->cap * sizeof *f->objs);
+    }
+    f->objs[f->n++] = o;
+}
+
+// Remove o from every frame open on this thread. Needed because a recycled
+// slot is handed out again while an outer frame still lists the old owner —
+// without this, that frame's pop retires the NEW occupant. Local refs are
+// thread-local in JNI, so the current thread's chain is the only place the
+// object can be listed.
+static void klj_frame_forget(klj_object *o) {
+    for (klj_frame *f = t_frame; f; f = f->parent)
+        for (unsigned i = 0; i < f->n; i++)
+            if (f->objs[i] == o) f->objs[i] = NULL;
+}
+
+// Caller holds g_lock. Pinned objects, class objects, and non-objects are
+// left alone.
+static void klj_retire_object_locked(klj_object *o) {
+    if (!o || o->magic != KLJ_OBJ_MAGIC || o->pinned) return;
+    if (strcmp(o->cls, KLJ_CLASS_CLASS) == 0) return;
+    klj_frame_forget(o);
+    o->magic = 0;
+    g_retired[g_retired_tail] = (unsigned)(o - g_objects);
+    g_retired_tail = (g_retired_tail + 1) % KLJ_MAX_OBJECTS;
+    g_retired_n++;
+}
+
 static klj_object *klj_alloc_object_locked(const char *cls, void *data) {
-    if (g_nobjects == KLJ_MAX_OBJECTS) { KLJ_LOG("object pool exhausted"); kl_fatal_prepare(); abort(); }
-    klj_object *o = &g_objects[g_nobjects++];
-    *o = (klj_object){KLJ_OBJ_MAGIC, cls, data};
+    klj_object *o = NULL;
+    if (g_retired_n > KLJ_QUARANTINE) {
+        // Recycle only a verifiably dead slot: skip anything still showing a
+        // live magic. The skip is defence in depth — the quarantine should
+        // make live entries impossible — but a wrong answer here is a guest
+        // corruption, and a dropped entry is only a leaked slot.
+        while (g_retired_n > KLJ_QUARANTINE) {
+            o = &g_objects[g_retired[g_retired_head]];
+            g_retired_head = (g_retired_head + 1) % KLJ_MAX_OBJECTS;
+            g_retired_n--;
+            if (o->magic != KLJ_OBJ_MAGIC) break;      // dead: reusable
+            fprintf(stderr, "  [jni] recycle skipped live slot %u (%s)\n",
+                    (unsigned)(o - g_objects), o->cls);
+            o = NULL;
+        }
+    }
+    if (!o) {
+        if (g_nobjects == KLJ_MAX_OBJECTS) { KLJ_LOG("object pool exhausted"); kl_fatal_prepare(); abort(); }
+        o = &g_objects[g_nobjects++];
+    } else if (strcmp(o->cls, KLJ_CLASS_STRING) == 0) {
+        // The old payload dies here, after the quarantine, not at retire.
+        free(o->data);
+    }
+    *o = (klj_object){KLJ_OBJ_MAGIC, 0, cls, data};
+    g_stat_alloc++;
+    klj_frame_record(o);
     return o;
 }
 
@@ -148,7 +248,9 @@ static klj_class *klj_intern_class_locked(const char *name) {
     klj_class *c = &g_classes[g_nclasses++];
     snprintf(c->name, sizeof c->name, "%s", name);
     // A jclass is a jobject in JNI, so it gets the same representation as one.
+    // Pinned: the interned class must outlive any local scope it passes through.
     c->as_object = klj_alloc_object_locked(KLJ_CLASS_CLASS, c);
+    c->as_object->pinned = 1;
     KLJ_LOG("FindClass  %s", c->name);
     return c;
 }
@@ -171,10 +273,12 @@ void *kl_jni_new_object(const char *class_name) {
 }
 
 
-// Same as kl_jni_new_object, but carries a payload. Used for the two object
+// Same as kl_jni_new_object, but carries a payload. Used for the object
 // kinds the host has to *construct* rather than merely hand back: JNIBridge
-// proxies and the java.lang.reflect.Method objects that describe what to call
-// on them.
+// proxies, android/os/Message, and the java.lang.reflect.Method/Field objects
+// that describe what to call. NOT pinned here — which lifetimes outlive a
+// local frame is a per-call-site decision (proxies and queued messages are
+// pinned there; a per-invoke Method is meant to die at the pop).
 static void *klj_new_object_data(const char *class_name, void *data) {
     pthread_once(&g_init_once, klj_init);
     pthread_mutex_lock(&g_lock);
@@ -222,6 +326,37 @@ void *kl_jni_native(const char *cls, const char *name, const char *sig) {
 void kl_jni_report(FILE *out) {
     fprintf(out, "\n--- JNI surface actually exercised ---\n");
     fprintf(out, "  classes found: %u\n", g_nclasses);
+    fprintf(out, "  objects: %llu allocated, %llu retired by DeleteLocalRef, "
+                "%llu by PopLocalFrame (%u slots in use, %u quarantined)\n",
+                (unsigned long long)g_stat_alloc,
+                (unsigned long long)g_stat_delete,
+                (unsigned long long)g_stat_pop_freed,
+                g_nobjects - g_retired_n, g_retired_n);
+    // What leaks: live objects by class, most common first. Built for the
+    // per-frame leak hunt (swap-43582 pool exhaustion).
+    {
+        unsigned *cnt = calloc(g_nclasses + 2, sizeof *cnt);
+        const char **names = malloc((g_nclasses + 2) * sizeof *names);
+        for (unsigned c = 0; c < g_nclasses; c++) names[c] = g_classes[c].name;
+        names[g_nclasses] = KLJ_CLASS_STRING;
+        names[g_nclasses + 1] = KLJ_CLASS_CLASS;
+        for (unsigned i = 0; i < g_nobjects; i++) {
+            klj_object *o = &g_objects[i];
+            if (o->magic != KLJ_OBJ_MAGIC) continue;
+            for (unsigned c = 0; c < g_nclasses + 2; c++)
+                if (o->cls == names[c]) { cnt[c]++; break; }
+        }
+        for (unsigned shown = 0; shown < 12; shown++) {
+            unsigned best = 0, bn = 0;
+            for (unsigned c = 0; c < g_nclasses + 2; c++)
+                if (cnt[c] > bn) { bn = cnt[c]; best = c; }
+            if (!bn) break;
+            fprintf(out, "    live %-50s x%u\n", names[best], bn);
+            cnt[best] = 0;
+        }
+        free(names);
+        free(cnt);
+    }
     for (unsigned i = 0; i < g_nclasses; i++) fprintf(out, "    %s\n", g_classes[i].name);
     fprintf(out, "  natives registered: %u\n", g_nnatives);
     for (unsigned i = 0; i < g_nnatives; i++)
@@ -280,10 +415,59 @@ static __attribute__((noreturn)) void klj_FatalError(void *env, const char *msg)
     kl_fatal_prepare(); abort();
 }
 
-static kl_jint klj_PushLocalFrame(void *env, kl_jint cap) { (void)env; (void)cap; return 0; }
-static void *klj_PopLocalFrame(void *env, void *result)   { (void)env; return result; }
+static kl_jint klj_PushLocalFrame(void *env, kl_jint cap) {
+    (void)env; (void)cap;
+    klj_frame *f = calloc(1, sizeof *f);
+    if (!f) return -1;
+    f->parent = t_frame;
+    t_frame = f;
+    return 0;
+}
+static void *klj_PopLocalFrame(void *env, void *result) {
+    (void)env;
+    klj_frame *f = t_frame;
+    if (!f) return result;                  // pop without push: nothing to free
+    t_frame = f->parent;
+    pthread_mutex_lock(&g_lock);
+    for (unsigned i = 0; i < f->n; i++) {
+        if (!f->objs[i] || f->objs[i] == result) continue;
+        if (klj_as_object(f->objs[i])) g_stat_pop_freed++;
+        klj_retire_object_locked(f->objs[i]);
+    }
+    // The result survives the frame; JNI promotes it to the parent frame.
+    if (klj_as_object(result) && t_frame) klj_frame_record(result);
+    pthread_mutex_unlock(&g_lock);
+    free(f->objs);
+    free(f);
+    return result;
+}
 static kl_jint klj_EnsureLocalCapacity(void *env, kl_jint c) { (void)env; (void)c; return 0; }
+
+// The host side of the frame pair (see kl_jni.h): playing the JVM's pop on
+// native return.
+void kl_jni_local_frame_push(void) { klj_PushLocalFrame(NULL, 0); }
+void kl_jni_local_frame_pop(void)  { klj_PopLocalFrame(NULL, NULL); }
+
 static void *klj_ref_identity(void *env, void *obj)       { (void)env; return obj; }
+static void  klj_DeleteLocalRef(void *env, void *obj) {
+    (void)env;
+    if (!obj) return;                       // DeleteLocalRef(NULL) is legal
+    pthread_mutex_lock(&g_lock);
+    if (klj_as_object(obj)) g_stat_delete++;
+    klj_retire_object_locked(obj);
+    pthread_mutex_unlock(&g_lock);
+}
+static void *klj_NewGlobalRef(void *env, void *obj) {
+    (void)env;
+    klj_object *o = klj_as_object(obj);
+    if (o) o->pinned++;
+    return obj;
+}
+static void  klj_DeleteGlobalRef(void *env, void *obj) {
+    (void)env;
+    klj_object *o = klj_as_object(obj);
+    if (o && o->pinned) o->pinned--;
+}
 static void  klj_ref_release(void *env, void *obj)        { (void)env; (void)obj; }
 static kl_jint klj_IsSameObject(void *env, void *a, void *b) { (void)env; return a == b; }
 
@@ -1320,7 +1504,10 @@ static const char *g_assets_dir = "beatsaber/assets";
 void kl_jni_set_assets_dir(const char *dir) { g_assets_dir = klj_abspath(dir); }
 
 static klj_val klj_singleton(const char *cls, void **slot) {
-    if (!*slot) *slot = kl_jni_new_object(cls);
+    if (!*slot) {
+        *slot = kl_jni_new_object(cls);
+        ((klj_object *)*slot)->pinned = 1;   // host-held: survives frame pops
+    }
     return (klj_val){.l = *slot};
 }
 
@@ -1448,6 +1635,7 @@ static klj_val klj_JNIBridge_newInterfaceProxy(void *env, void *clazz, const klj
 
     void *obj = kl_jni_new_object("bitter/jnibridge/JNIBridge$Proxy");
     klj_as_object(obj)->data = p;
+    klj_as_object(obj)->pinned = 1;   // guest-held long-term via native_ptr
     return (klj_val){.l = obj};
 }
 
@@ -1787,6 +1975,7 @@ static klj_val klj_Handler_obtainMessage(void *env, void *self, const klj_val *a
     m->what   = n > 0 ? (int32_t)a[0].j : 0;
     m->target = self;                       // sendToTarget() needs to find it back
     void *obj = klj_new_object_data("android/os/Message", m);
+    klj_as_object(obj)->pinned = 1;   // queued until delivered; outlives its frame
 
     // Message's members are public *fields*, not getters, so the handler reads
     // msg.what with GetIntField. Publishing them through the same per-object write
@@ -2206,11 +2395,16 @@ static void *klj_proxy_invoke(void *proxy, const char *iface,
         return NULL;
     }
     klj_proxy *p = o->data;
-    // A static native is (JNIEnv*, jclass, args...).
+    // A static native is (JNIEnv*, jclass, args...). The frame pair is the
+    // JVM's pop on native return — the method object, the args array, and
+    // whatever the guest allocates inside the callback all die at the pop.
     void *(*invoke)(void *, void *, int64_t, void *, void *, void *) = fn;
-    return invoke(kl_jni_env(), klj_class_object("bitter/jnibridge/JNIBridge"),
-                  p->native_ptr, klj_class_object(iface),
-                  klj_new_method(iface, name, sig), args);
+    klj_PushLocalFrame(NULL, 0);
+    void *r = invoke(kl_jni_env(), klj_class_object("bitter/jnibridge/JNIBridge"),
+                     p->native_ptr, klj_class_object(iface),
+                     klj_new_method(iface, name, sig), args);
+    klj_PopLocalFrame(NULL, NULL);
+    return r;
 }
 
 // Run everything the guest posted to the main looper. On Android this is what
@@ -2289,10 +2483,15 @@ void kl_jni_tick_choreographer(void) {
 
     klj_object *o = klj_as_object(cb);
     if (o && strcmp(o->cls, KLJ_CLASS_PROXY) == 0) {
+        // The frame covers the args array and the boxed nanos too — they are
+        // per-call locals, and 20000 frames of leaking them is what the pool
+        // exhaustion looked like.
+        klj_PushLocalFrame(NULL, 0);
         void *args = klj_new_array('L', "java/lang/Object", 1);
         ((void **)klj_arr(args)->data)[0] = klj_box_long(nanos);
         klj_proxy_invoke(cb, "android/view/Choreographer$FrameCallback", "doFrame",
                          "(J)V", args);
+        klj_PopLocalFrame(NULL, NULL);
         return;
     }
     KLJ_LOG("frame callback is %s, not a proxy — doFrame NOT delivered. The engine "
@@ -2459,6 +2658,38 @@ static klj_val klj_Context_checkPermission(void *env, void *self, const klj_val 
             n > 0 ? klj_str(a[0].l) : "");
     return (klj_val){.j = 0};      // PackageManager.PERMISSION_GRANTED
 }
+
+// ---- javax.net.ssl ----
+// The game's HTTPS stack (unitytls) resolves TrustManagerFactory during boot.
+// On Android these calls hand back the *system* trust store, which does not
+// exist here — and nothing in this runtime can throw, so a failed validation
+// could not be reported the Java way anyway. The honest surface is: the
+// documented algorithm name, a real factory object, and zero trust managers.
+// unitytls reads "no trust managers" as UNITYTLS_X509VERIFY_FLAG_NOT_TRUSTED
+// and the game takes its own Curl-error path (observed under KL_PERMISSIVE:
+// "Curl error 51" and boot continues). Returning a trust-all manager instead
+// would silently weaken the guest's TLS validation — refused by the same rule
+// as the DRM guard: don't invent answers the guest trusts.
+static klj_val klj_TMF_getDefaultAlgorithm(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // Android's documented default since API 24 (we present SDK 29).
+    return (klj_val){.l = kl_jni_new_string("PKIX")};
+}
+static klj_val klj_TMF_getInstance(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("TrustManagerFactory.getInstance(\"%s\")",
+            n > 0 ? klj_str(a[0].l) : "");
+    return (klj_val){.l = klj_new_object_data("javax/net/ssl/TrustManagerFactory", NULL)};
+}
+static klj_val klj_TMF_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};             // init(NULL): "system default store" — absent here
+}
+static klj_val klj_TMF_getTrustManagers(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = klj_new_array('L', "javax/net/ssl/TrustManager", 0)};
+}
+
 
 // Window.getAttributes returns the live LayoutParams — the same object every
 // time, because on Android the caller mutates it and hands it back through
@@ -2680,7 +2911,10 @@ static klj_val klj_Uri_decode(void *env, void *self, const klj_val *a, int n) {
 // object either way.
 void *kl_jni_activity(void) {
     static void *activity;
-    if (!activity) activity = kl_jni_new_object("com/unity3d/player/UnityPlayerActivity");
+    if (!activity) {
+        activity = kl_jni_new_object("com/unity3d/player/UnityPlayerActivity");
+        ((klj_object *)activity)->pinned = 1;   // singleton; survives any frame pop
+    }
     return activity;
 }
 
@@ -3691,6 +3925,11 @@ static const klj_binding g_bindings[] = {
     {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
     {"android/content/Context", "checkCallingOrSelfPermission", "(Ljava/lang/String;)I", klj_Context_checkPermission},
 
+    {"javax/net/ssl/TrustManagerFactory", "getDefaultAlgorithm", "()Ljava/lang/String;", klj_TMF_getDefaultAlgorithm},
+    {"javax/net/ssl/TrustManagerFactory", "getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;", klj_TMF_getInstance},
+    {"javax/net/ssl/TrustManagerFactory", "init", "(Ljava/security/KeyStore;)V", klj_TMF_init},
+    {"javax/net/ssl/TrustManagerFactory", "getTrustManagers", "()[Ljavax/net/ssl/TrustManager;", klj_TMF_getTrustManagers},
+
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},
     {"java/lang/ClassLoader", "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", klj_ClassLoader_findLibrary},
@@ -3995,11 +4234,11 @@ static void klj_build_tables(void) {
     ENV(PushLocalFrame,       klj_PushLocalFrame);
     ENV(PopLocalFrame,        klj_PopLocalFrame);
     ENV(EnsureLocalCapacity,  klj_EnsureLocalCapacity);
-    ENV(NewGlobalRef,         klj_ref_identity);
+    ENV(NewGlobalRef,         klj_NewGlobalRef);
     ENV(NewLocalRef,          klj_ref_identity);
     ENV(NewWeakGlobalRef,     klj_ref_identity);
-    ENV(DeleteGlobalRef,      klj_ref_release);
-    ENV(DeleteLocalRef,       klj_ref_release);
+    ENV(DeleteGlobalRef,      klj_DeleteGlobalRef);
+    ENV(DeleteLocalRef,       klj_DeleteLocalRef);
     ENV(DeleteWeakGlobalRef,  klj_ref_release);
     ENV(IsSameObject,         klj_IsSameObject);
     ENV(IsInstanceOf,         klj_IsInstanceOf);

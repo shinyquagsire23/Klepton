@@ -172,6 +172,79 @@ Built for the loading-pace investigation; all default off.
   file offset (`pc - image base`, e.g. the connect-NULL site at
   libunity+0x966964).
 
+## Clock + condvar (bionic→Darwin translation, always on) and their diagnostics
+
+These are fixes, not knobs: bionic clock ids differ from Darwin's, and bionic
+condition variables default to CLOCK_MONOTONIC while Darwin conds speak only
+CLOCK_REALTIME. Forwarding either verbatim poisons guest time:
+
+- `klb_clock_gettime`/`klb_clock_getres` (`runtime/kl_libc.c`) translate clock
+  ids (1/6→6, 4→4, 7/9→8, 2/3→12, 0/5/8→0). Before this, the guest's
+  `clock_gettime(CLOCK_MONOTONIC=1)` failed EINVAL and libunity's time
+  functions (libunity+0x883c58, +0x883c8c — no return-value check) computed
+  with the unwritten buffer: stack-garbage "now", hours to days off.
+- `klb_pthread_cond_timedwait` (`runtime/kl_pthread.c`) rebases
+  monotonic-based abstimes (ts->tv_sec < 1e8) onto realtime before forwarding.
+  Before this, libil2cpp's ConditionVariableImpl built abstimes from a
+  monotonic tick source and Darwin compared them against realtime — class-init
+  waiters slept until now+hours and never re-checked the class state (the
+  loading-pace deadlock: Dns waiters parked on fully-initialised classes).
+
+- `KL_TRACE_TIME=1` — log the first 40 `clock_gettime`/`gettimeofday` calls
+  with caller address and result. How the unchecked-failure sites were found.
+- `KL_TRACE_CONDWAIT=1` — log the first 60 guest `pthread_cond_timedwait`
+  calls: tid, return address, ts and delta-from-now. A delta of hours is the
+  signature of the poisoned abstime; sane runs read 1 ms – 1 s.
+- `KL_CONDWAIT_CAP_MS=<ms>` — clamp every guest condvar abstime to now+ms.
+  Diagnostic only (proves a stuck waiter just needs to re-check its
+  predicate); the rebase above is the fix.
+
+## Mutex map (`runtime/kl_pthread.c`) — deadlock instruments
+
+Mutexes are keyed by guest *address* (a stale slot index in reused or
+memcpy'd storage used to alias two logical mutexes onto one host object —
+the capture-path deadlock). Owner tracking is always on; these print from
+t_boot's fault handler on every fatal path:
+
+- mutex owners: guest address, holder tid (+thread name, ** EXITED ** if the
+  holder died holding it), lock return address, and the holder's current
+  backtrace — a hang names the parked owner, not just the waiters.
+- mutex waiters: who is blocked on which guest mutex and from where.
+
+- `KL_TRACE_MUTEX=1` — log the first 200 mutex init/destroy events (guest
+  address, slot/map index, tid, return address). How the slot-23 double-init
+  was caught.
+
+## Guest-thread sampler (`runtime/kl_sample.c`, `runtime/kl_il2cpp.c`)
+
+Built to name the loop the loading-pace arc kept measuring: samples every
+guest thread's pc and x29-chained backtrace with thread_get_state, resolves
+pcs to module+offset (host frames to host symbols — a thread parked in
+`__psynch_cvwait` reads as itself), and resolves libil2cpp generated-code pcs
+to managed method names via global-metadata.dat plus the Il2CppCodeGenModule
+table recovered from the loaded image (metadata v24.0 only, verified against
+Beat Saber 1.28). Read by t_boot; sampling wraps the frame pump, and the
+report prints at pump end (or on the watchdog's SIGALRM, via the fault
+handler).
+
+- `KL_SAMPLE_MS=<ms>` — sampling interval; presence enables the sampler.
+  Small values cost resolution, not correctness: a sample is whatever each
+  thread was doing when caught, so more samples just tightens the
+  distribution.
+- `KL_SAMPLE_REPORT_S=<s>` — print the aggregate report every <s> seconds
+  from the sampler thread itself (default 30; 0 disables). Periodic printing
+  exists because the runs that matter die by guest abort — kl_fatal_prepare
+  resets the signal handlers, so the pump-end and fault-handler reports never
+  run on exactly those runs.
+- `KL_SAMPLE_STACKS=0` — disable the parked-thread chain dumps. When a thread
+  has been sampled 50+ times with exactly one distinct managed frame (i.e.
+  parked in one method), the sampler prints its full resolved chain, at most
+  3 times per thread. This is what named the Dns::GetHostByName pile-up's
+  callers.
+- `KL_IL2CPP_METADATA=<path>` — host path to global-metadata.dat. Default is
+  derived from the libdir argument (`<apk>/lib/arm64-v8a` →
+  `<apk>/assets/bin/Data/Managed/Metadata/global-metadata.dat`).
+
 ## Viewer (`runtime/kl_view.c`, `tests/t_boot.c`)
 
 - `KL_POKE_CAP=<n>` — at frame-pump start, overwrite libunity's texture-unit

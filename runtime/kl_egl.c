@@ -345,6 +345,35 @@ static void klgl_GetInternalformativ(uint32_t target, uint32_t internalformat,
     params[0] = 0;
 }
 
+// GLES 3.1 program-interface enumeration (glGetProgramInterfaceiv family).
+// Unity 2019.4 walks these when it reflects a linked program (reached deep in
+// Beat Saber's loading, ~swap 1290). The null driver links no real programs,
+// so the honest answer is "no active resources": writing 0 to GL_ACTIVE_RESOURCES
+// makes the guest's enumeration loop terminate. A KL_PERMISSIVE zero does not
+// serve here: the permissive stub *returns* 0 without writing params, and Unity
+// then loops on the unwritten resource count — observed as 1.9e9 calls of
+// glGetProgramResourceName spinning a render thread at 100% CPU.
+static void klgl_GetProgramInterfaceiv(uint32_t program, uint32_t programInterface,
+                                       uint32_t pname, int32_t *params) {
+    (void)program; (void)programInterface; (void)pname;
+    if (params) params[0] = 0;
+}
+static void klgl_GetProgramResourceiv(uint32_t program, uint32_t programInterface,
+                                      uint32_t index, int32_t propsCount,
+                                      const uint32_t *props, int32_t bufSize,
+                                      int32_t *length, int32_t *params) {
+    (void)program; (void)programInterface; (void)index; (void)props;
+    if (length) *length = 0;
+    for (int32_t i = 0; i < propsCount && params && i < bufSize; i++) params[i] = 0;
+}
+static void klgl_GetProgramResourceName(uint32_t program, uint32_t programInterface,
+                                        uint32_t index, int32_t bufSize,
+                                        int32_t *length, char *name) {
+    (void)program; (void)programInterface; (void)index;
+    if (length) *length = 0;
+    if (name && bufSize > 0) name[0] = 0;
+}
+
 int kl_gl_cap_floatv(uint32_t pname, float *data) {
     if (!data) return 1;
     switch (pname) {
@@ -452,6 +481,79 @@ static uint32_t klgl_CreateShader(uint32_t type) {
     return g_gl_name++;
 }
 static uint32_t klgl_CreateProgram(void) { return g_gl_name++; }
+
+// Buffer objects with real backing store. The first attempt handed each
+// glMapBufferRange a fresh malloc of exactly `length`; the guest overran it
+// within a second (xzone malloc caught the freelist corruption on the next
+// map — the crash site was klgl_MapBufferRange, the corruptor was the write
+// through the previous mapping). So buffers now own storage sized by
+// glBufferData, glBindBuffer tracks the current binding per target, and a map
+// returns a pointer into the bound buffer's storage. Contents then survive
+// unmap/map cycles too, which the streaming paths actually rely on.
+#define KL_GL_MAX_BUFFERS 4096
+#define KL_GL_MAX_BINDINGS 16
+static struct { uint32_t name; uint8_t *data; size_t size; } g_gl_bufs[KL_GL_MAX_BUFFERS];
+static unsigned g_gl_nbufs;
+static struct { uint32_t target, name; } g_gl_binds[KL_GL_MAX_BINDINGS];
+static unsigned g_gl_nbinds;
+
+static uint32_t klgl_bound(uint32_t target) {
+    for (unsigned i = 0; i < g_gl_nbinds; i++)
+        if (g_gl_binds[i].target == target) return g_gl_binds[i].name;
+    return 0;
+}
+static void klgl_BindBuffer(uint32_t target, uint32_t name) {
+    for (unsigned i = 0; i < g_gl_nbinds; i++)
+        if (g_gl_binds[i].target == target) { g_gl_binds[i].name = name; return; }
+    if (g_gl_nbinds < KL_GL_MAX_BINDINGS) {
+        g_gl_binds[g_gl_nbinds].target = target;
+        g_gl_binds[g_gl_nbinds].name = name;
+        g_gl_nbinds++;
+    }
+}
+static typeof(g_gl_bufs[0]) *klgl_buf(uint32_t name) {
+    for (unsigned i = 0; i < g_gl_nbufs; i++)
+        if (g_gl_bufs[i].name == name) return &g_gl_bufs[i];
+    if (!name || g_gl_nbufs == KL_GL_MAX_BUFFERS) return NULL;
+    g_gl_bufs[g_gl_nbufs].name = name;
+    g_gl_nbufs++;
+    return &g_gl_bufs[g_gl_nbufs - 1];
+}
+static void klgl_BufferData(uint32_t target, intptr_t size, const void *data,
+                            uint32_t usage) {
+    (void)usage;
+    typeof(g_gl_bufs[0]) *b = klgl_buf(klgl_bound(target));
+    if (!b || size <= 0) return;
+    uint8_t *p = realloc(b->data, (size_t)size);
+    if (!p) return;
+    b->data = p;
+    b->size = (size_t)size;
+    if (data) memcpy(b->data, data, (size_t)size);
+}
+static void klgl_BufferSubData(uint32_t target, intptr_t offset, intptr_t size,
+                               const void *data) {
+    typeof(g_gl_bufs[0]) *b = klgl_buf(klgl_bound(target));
+    if (!b || !b->data || !data || offset < 0 || size < 0 ||
+        (size_t)(offset + size) > b->size) return;
+    memcpy(b->data + offset, data, (size_t)size);
+}
+static void *klgl_MapBufferRange(uint32_t target, intptr_t offset,
+                                 intptr_t length, uint32_t access) {
+    (void)access;
+    typeof(g_gl_bufs[0]) *b = klgl_buf(klgl_bound(target));
+    if (!b || offset < 0 || length <= 0) return NULL;
+    if ((size_t)(offset + length) > b->size) {      // mapped before any data
+        uint8_t *p = realloc(b->data, (size_t)(offset + length));
+        if (!p) return NULL;
+        b->data = p;
+        b->size = (size_t)(offset + length);
+    }
+    return b->data + offset;
+}
+static uint8_t klgl_UnmapBuffer(uint32_t target) {
+    (void)target;
+    return 1;   // GL_TRUE: the storage is ours, nothing here can corrupt it
+}
 
 #define KL_GL_MAX_SHADERS 512
 static struct { uint32_t name; char *src; } g_shaders[KL_GL_MAX_SHADERS];
@@ -673,6 +775,9 @@ static const struct { const char *name; void *fn; } g_gl_impl[] = {
     {"glGetBooleanv",   (void *)klgl_GetBooleanv},
     {"glGetInteger64v", (void *)klgl_GetInteger64v},
     {"glGetInternalformativ", (void *)klgl_GetInternalformativ},
+    {"glGetProgramInterfaceiv", (void *)klgl_GetProgramInterfaceiv},
+    {"glGetProgramResourceiv", (void *)klgl_GetProgramResourceiv},
+    {"glGetProgramResourceName", (void *)klgl_GetProgramResourceName},
     {"glGetTexParameteriv", (void *)klgl_GetTexParameteriv},
     {"glTexSubImage2D",  (void *)klgl_TexSubImage2D},
     {"glFenceSync",      (void *)klgl_FenceSync},
@@ -716,6 +821,11 @@ static const struct { const char *name; void *fn; } g_gl_impl[] = {
     {"glGetUniformLocation", (void *)klgl_GetLocation},
     {"glGetAttribLocation",  (void *)klgl_GetLocation},
     {"glGetUniformBlockIndex", (void *)klgl_GetLocation},
+    {"glMapBufferRange", (void *)klgl_MapBufferRange},
+    {"glUnmapBuffer",    (void *)klgl_UnmapBuffer},
+    {"glBindBuffer",     (void *)klgl_BindBuffer},
+    {"glBufferData",     (void *)klgl_BufferData},
+    {"glBufferSubData",  (void *)klgl_BufferSubData},
 
 };
 

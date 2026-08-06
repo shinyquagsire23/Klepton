@@ -87,4 +87,9 @@ int kl_errno_from_linux(int e);
 // KL_TRACE_FS reporting for guest file operations (see kl_libc.c).
 void kl_fs_trace_open(const char *path, int flags, int fd);
 
+// Mutex owner table dump (kl_pthread.c): who holds each translated guest
+// mutex and from where it was locked. Called from t_boot's fault handler so
+// a hang names the contested mutex's owner, not just its waiters.
+void kl_pthread_report(FILE *out);
+
 #endif
