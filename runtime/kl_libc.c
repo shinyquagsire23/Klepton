@@ -701,14 +701,24 @@ int klb_clock_gettime(int clk, struct timespec *ts) {
     return r;
 }
 
-int klb_gettimeofday(struct timeval *tv, void *tz) {
-    int r = gettimeofday(tv, tz);
-    if (t_time()) {
+// bionic struct timeval is { int64 sec; int64 usec }; Darwin's tv_usec is a
+// 32-bit suseconds_t. Forwarding the guest's buffer straight to gettimeofday
+// leaves the top half of its tv_usec as stack garbage — observed at il2cpp's
+// gettimeofday-based condvar wait (libil2cpp+0x1273398), whose computed
+// abstime read ~10 h out with tv_nsec > 1e9 because the stale half-word
+// happened to hold a monotonic-ms value. Write both fields with bionic's
+// 64-bit layout.
+struct klb_timeval { int64_t tv_sec; int64_t tv_usec; };
+int klb_gettimeofday(struct klb_timeval *tv, void *tz) {
+    struct timeval h;
+    int r = gettimeofday(&h, tz);
+    if (tv) { tv->tv_sec = h.tv_sec; tv->tv_usec = h.tv_usec; }
+    if (t_time() && tv) {
         static _Atomic int n;
         if (atomic_fetch_add(&n, 1) < 40)
-            fprintf(stderr, "  [klb] gettimeofday ra=%p -> %d: %lld.%06ld\n",
+            fprintf(stderr, "  [klb] gettimeofday ra=%p -> %d: %lld.%06lld\n",
                     __builtin_return_address(0), r,
-                    (long long)tv->tv_sec, (long)tv->tv_usec);
+                    (long long)tv->tv_sec, (long long)tv->tv_usec);
     }
     return r;
 }
