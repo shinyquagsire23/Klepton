@@ -2933,26 +2933,62 @@ static klj_val klj_OculusDeviceConfig_init(void *env, void *self, const klj_val 
     return (klj_val){.j = 0};
 }
 
-// getCurrentState returns a state enum whose values are NOT recoverable here: the
-// class lives in an AAR that is not in the APK, and unlike ovrpSystemHeadset it
-// leaves no trace in global-metadata.dat to read the numbering off. So 0 is a
-// genuine guess, and it is logged as one rather than quietly returned.
-//
-// It is a survivable guess in a way most would not be: the guest carries a
-// "Failed to initialize OculusDeviceConfig." message, so it has a path for this
-// service being unavailable, and landing on that path is a correct outcome for a
-// device where the service really is absent. If the trace later shows it looping
-// or taking a worse branch, this is the first thing to revisit.
+// getCurrentState returns a state enum whose numbering is not recoverable from
+// the APK (the class lives in an absent AAR) — but the guest's
+// OculusDeviceConfigExperimentModel::<Initialize>d__6::MoveNext disassembly
+// (2026-08-07) pins the contract: 2 = success (Initialize completes), 3 =
+// failure (GetError() -> System.Exception), anything else = poll
+// Task.Delay(11) until a 5 s Stopwatch deadline throws TimeoutException and
+// il2cpp aborts. In practice BOTH non-success outcomes abort the boot: 0 polls
+// to the watchdog, and the state-3 exception propagates out of
+// OculusDeviceConfigExperimentModel::.ctor uncaught (constructed on a
+// class-init path — il2cpp aborts on a throwing cctor). That leaves 2: the
+// service "succeeded" and the experiment flags it gates read as defaults
+// (absent param -> false/0), which is the baseline the game ships for a
+// device with no config.
 static klj_val klj_OculusDeviceConfig_getCurrentState(void *env, void *self,
                                                       const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static int warned;
     if (!warned) {
         warned = 1;
-        KLJ_LOG("OculusDeviceConfig.getCurrentState() -> 0 — UNVERIFIED: the enum is "
-                "not in the APK, so this value is a guess, not a measurement");
+        KLJ_LOG("OculusDeviceConfig.getCurrentState() -> 2 (success; 0 polls to "
+                "the 5 s watchdog and 3's exception is uncatchable where .ctor "
+                "runs — enum semantics from the MoveNext disasm)");
     }
+    return (klj_val){.j = 2};
+}
+
+// The state==2 path queries experiment params one by one. The managed flow
+// (GetBooleanAsync disasm, 2026-08-07) is: DidPrefetchParamName(name) -> if
+// FALSE the game throws KeyNotFoundException itself and the boot aborts; if
+// true it calls GetBoolean(name) and takes our word for the value. There is
+// no config backend, so every param is "present" with the value false —
+// experiment off, the shipping baseline for a device with no config.
+static klj_val klj_OculusDeviceConfig_didPrefetchParamName(void *env, void *self,
+                                                           const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("OculusDeviceConfig.didPrefetchParamName(\"%s\") -> true (false is "
+            "fatal: the game KeyNotFound-aborts on unknown params)",
+            n > 0 ? klj_str(a[0].l) : "?");
+    return (klj_val){.j = 1};
+}
+static klj_val klj_OculusDeviceConfig_getBoolean(void *env, void *self,
+                                                 const klj_val *a, int n) {
+    (void)env; (void)self;
+    // (Activity, String) — the activity is unused; the name is a[1].
+    KLJ_LOG("OculusDeviceConfig.getBoolean(\"%s\") -> false (no config backend)",
+            n > 1 ? klj_str(a[1].l) : "?");
     return (klj_val){.j = 0};
+}
+// The state==3 path reads one error string out of the service before raising
+// its managed "Failed to initialize OculusDeviceConfig." exception. There is
+// no service, so the honest string is the reason there is none.
+static klj_val klj_OculusDeviceConfig_getError(void *env, void *self,
+                                               const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("OculusDeviceConfig.getError() -> \"no device-config service\"");
+    return (klj_val){.l = kl_jni_new_string("no device-config service on this device")};
 }
 
 // Telephony call-state notifications. There is no telephony here, so registering
@@ -4004,6 +4040,9 @@ static const klj_binding g_bindings[] = {
     // the guest actually asks for.
     {"com/oculus/oculusdeviceconfig/OculusDeviceConfig", "init", "(Lcom.unity3d.player.UnityPlayerActivity;)V", klj_OculusDeviceConfig_init},
     {"com/oculus/oculusdeviceconfig/OculusDeviceConfig", "getCurrentState", "()I", klj_OculusDeviceConfig_getCurrentState},
+    {"com/oculus/oculusdeviceconfig/OculusDeviceConfig", "getError", "()Ljava/lang/String;", klj_OculusDeviceConfig_getError},
+    {"com/oculus/oculusdeviceconfig/OculusDeviceConfig", "didPrefetchParamName", "(Ljava/lang/String;)Z", klj_OculusDeviceConfig_didPrefetchParamName},
+    {"com/oculus/oculusdeviceconfig/OculusDeviceConfig", "getBoolean", "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z", klj_OculusDeviceConfig_getBoolean},
     {"android/os/Vibrator", "hasVibrator", "()Z", klj_Vibrator_hasVibrator},
     {"android/content/pm/PackageManager", "getInstallerPackageName", "(Ljava/lang/String;)Ljava/lang/String;", klj_PackageManager_getInstallerPackageName},
     {"android/net/Uri", "decode", "(Ljava/lang/String;)Ljava/lang/String;", klj_Uri_decode},

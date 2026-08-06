@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../runtime/klepton.h"
+#include "../runtime/kl_il2cpp.h"
 
 int main(int argc, char **argv) {
     const char *lib  = argc > 1 ? argv[1] : "beatsaber/lib/arm64-v8a/libil2cpp.so";
@@ -51,5 +52,26 @@ int main(int argc, char **argv) {
     }
 
     printf("\n=== M2 EXIT CRITERION MET: IL2CPP runtime initialised ===\n");
+
+    // KL_RESOLVE=0xoff,0xoff,... — init the method-name resolver and print
+    // the managed method containing each libil2cpp image offset. Built to
+    // read static disassembly call targets (bl 0x...) without a live boot.
+    const char *rz = getenv("KL_RESOLVE");
+    if (rz) {
+        char meta[1024];
+        snprintf(meta, sizeof meta, "%s/Metadata/global-metadata.dat", data);
+        if (kl_il2cpp_resolver_init(img, meta)) {
+            printf("  resolver up: %u methods\n", kl_il2cpp_method_count());
+            char *copy = strdup(rz), *tok = strtok(copy, ", ");
+            while (tok) {
+                uint64_t off = strtoull(tok, NULL, 0);
+                const char *m = kl_il2cpp_method_at((uint8_t *)kl_base(img) + off);
+                printf("  libil2cpp+%#llx: %s\n", (unsigned long long)off,
+                       m ? m : "(not a known method)");
+                tok = strtok(NULL, ", ");
+            }
+            free(copy);
+        } else printf("  !! resolver init failed\n");
+    }
     return 0;
 }
