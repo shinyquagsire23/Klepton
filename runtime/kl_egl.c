@@ -224,9 +224,14 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
     {0x88FF /* MAX_ARRAY_TEXTURE_LAYERS    */, 2048},
     {0x84E8 /* MAX_RENDERBUFFER_SIZE       */, 16384},
     {0x8869 /* MAX_VERTEX_ATTRIBS          */, 32},
-    {0x8872 /* MAX_TEXTURE_IMAGE_UNITS     */, 16},
-    {0x8B4D /* MAX_COMBINED_TEXTURE_IMAGE_UNITS */, 32},
-    {0x8B4C /* MAX_VERTEX_TEXTURE_IMAGE_UNITS   */, 16},
+    {0x8872 /* MAX_TEXTURE_IMAGE_UNITS     */, 32},   // matches the vendored
+    {0x8B4D /* MAX_COMBINED_TEXTURE_IMAGE_UNITS */, 64},   // ANGLE rebuild with
+    {0x8B4C /* MAX_VERTEX_TEXTURE_IMAGE_UNITS   */, 32},   // kMaxShaderSamplers=32:
+                                                           // Unity binds samplers up
+                                                           // to unit 35 on its post
+                                                           // passes and its own cap
+                                                           // check comes from these
+                                                           // answers, not ANGLE's
     {0x8DFB /* MAX_VERTEX_UNIFORM_VECTORS  */, 256},
     {0x8DFD /* MAX_FRAGMENT_UNIFORM_VECTORS*/, 224},
     {0x8DFC /* MAX_VARYING_VECTORS         */, 15},
@@ -265,7 +270,16 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
 int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     if (!params) return 1;
     for (size_t i = 0; i < sizeof g_gl_int / sizeof g_gl_int[0]; i++)
-        if (g_gl_int[i].pname == pname) { params[0] = g_gl_int[i].value; return 1; }
+        if (g_gl_int[i].pname == pname) {
+            params[0] = g_gl_int[i].value;
+            // The texture-unit caps, asked and answered: Unity's own
+            // "Invalid texture unit" check reads a cap it computed at device
+            // init — confirm what it was told.
+            if (pname == 0x8872 || pname == 0x8B4D || pname == 0x8B4C)
+                fprintf(stderr, "  [gl] glGetIntegerv(0x%x) -> %d\n",
+                        pname, params[0]);
+            return 1;
+        }
     if (pname == 0x0D3A) {                       // MAX_VIEWPORT_DIMS: two values
         params[0] = 16384; params[1] = 16384; return 1;
     }

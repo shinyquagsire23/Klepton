@@ -64,7 +64,7 @@ KL_JVM_SLOTS(KLJ_STUB_VM)
 // instead of a guess, and a jobject arriving from somewhere unexpected is
 // caught by the magic rather than dereferenced blindly.
 #define KLJ_OBJ_MAGIC 0x4B4C4A4FU   /* 'KLJO' */
-#define KLJ_MAX_OBJECTS 8192
+#define KLJ_MAX_OBJECTS 8192*16
 typedef struct klj_object {
     uint32_t    magic;
     const char *cls;    // interned class name

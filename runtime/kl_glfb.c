@@ -55,6 +55,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <math.h>          // powf — the debug tone map in the capture path
 #include <zlib.h>
 #include "kl_glfb.h"
 #include "kl_egl.h"        // kl_gl_cap_* — the capability tables
@@ -88,6 +89,7 @@
 #define GL_SRGB8_ALPHA8  0x8C43
 #define GL_RGBA8         0x8058
 #define GL_UNSIGNED_BYTE 0x1401
+#define GL_FLOAT         0x1406
 #define GL_RENDERER      0x1F01
 #define GL_VERSION       0x1F02
 
@@ -703,6 +705,32 @@ static void klfb_LinkProgram(uint32_t program) {
     if (!g_real_LinkProgram) return;
     pthread_mutex_lock(&g_compile_lock);
     g_real_LinkProgram(program);
+    // KL_GLFB_DUMP_PROGRAM=N: print the sources that were linked into program
+    // N. The timeline names programs by number ("the frame's last draw is
+    // program 7"); this turns the number into the shader text.
+    static int dump_prog = -2;
+    if (dump_prog == -2) {
+        const char *d = getenv("KL_GLFB_DUMP_PROGRAM");
+        dump_prog = d ? atoi(d) : -1;
+    }
+    if (dump_prog >= 0 && (int)program == dump_prog) {
+        static void (*r_GetAttachedShaders)(uint32_t, int32_t, int32_t *,
+                                            uint32_t *);
+        if (!r_GetAttachedShaders)
+            r_GetAttachedShaders = asym("glGetAttachedShaders");
+        if (r_GetAttachedShaders) {
+            uint32_t sh[8]; int32_t n = 0;
+            r_GetAttachedShaders(program, 8, &n, sh);
+            fprintf(stderr, "  [glfb] program %u: %d attached shaders\n",
+                    program, (int)n);
+            for (int32_t i = 0; i < n; i++) {
+                const char *src = klfb_shader_src(sh[i]);
+                fprintf(stderr, "  [glfb] ---- program %u shader %u ----\n%s\n"
+                                "  [glfb] ---- end ----\n", program, sh[i],
+                        src ? src : "(source not captured)\n");
+            }
+        }
+    }
     pthread_mutex_unlock(&g_compile_lock);
 }
 
@@ -753,6 +781,10 @@ static uint32_t klfb_maybe_unsrgb(uint32_t fmt) {
     return (on && fmt == GL_SRGB8_ALPHA8) ? GL_RGBA8 : fmt;
 }
 
+// Defined in the ABI-thunks block below; the glTexStorage2D thunk feeds it.
+static void klfb_note_tex_storage(uint32_t name, uint32_t fmt, int32_t w,
+                                  int32_t h);
+
 // KL_GLFB_TRACE_TEX=1 logs every texture call rather than only first sightings, so
 // the tail of a crashing run names the exact call it died on. The abort happens on
 // a Metal compiler thread, so the last line is the trigger's neighbourhood rather
@@ -787,6 +819,11 @@ static void (*g_real_BindFramebuffer)(uint32_t, uint32_t);
 static void (*g_real_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t, uint32_t,
                                            int32_t);
 
+// Highest FBO name handed out so far — the census scans 1..g_fbomax. Binding a
+// name glGenFramebuffers never returned is INVALID_OPERATION in ES 3.0, so the
+// scan needs a real upper bound, not a guess.
+static uint32_t g_fbomax;
+
 static int klfb_trace_fbo(void) {
     static int on = -1;
     if (on < 0) on = getenv("KL_GLFB_TRACE_FBO") != NULL;
@@ -796,6 +833,9 @@ static uint64_t klfb_tid(void) { uint64_t t = 0; pthread_threadid_np(NULL, &t); 
 
 static void klfb_GenFramebuffers(int32_t n, uint32_t *ids) {
     if (g_real_GenFramebuffers) g_real_GenFramebuffers(n, ids);
+    if (ids)
+        for (int32_t i = 0; i < n; i++)
+            if (ids[i] > g_fbomax) g_fbomax = ids[i];
     if (klfb_trace_fbo() && ids)
         fprintf(stderr, "  [glfb] t%llu glGenFramebuffers(%d) -> %u\n",
                 (unsigned long long)klfb_tid(), n, ids[0]);
@@ -831,6 +871,13 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     static int noswz = -1;
     if (noswz < 0) noswz = getenv("KL_GLFB_NOSWIZZLE") != NULL;
     if (noswz && pname >= GL_TEXTURE_SWIZZLE_R && pname <= GL_TEXTURE_SWIZZLE_A) return;
+    // TEXTURE_SRGB_DECODE_EXT writes: no EXT_texture_sRGB_decode on this ANGLE,
+    // so the write can only raise INVALID_ENUM — and does, about once per
+    // frame, leaving a sticky error that Unity then reports attributed to
+    // innocent calls (and that error-bracketing probes read as everyone's
+    // fault). Dropping it is semantics-preserving here: the decode behaviour
+    // it would select does not exist on this driver either way.
+    if (pname == 0x8A48 /* TEXTURE_SRGB_DECODE_EXT */) return;
     if (g_real_TexParameteri) g_real_TexParameteri(target, pname, param);
     if (getenv("KL_GLFB_ERRPROBE") && a_glGetError) {
         uint32_t e = a_glGetError();
@@ -886,6 +933,15 @@ static void klfb_TexStorage2D(uint32_t target, int32_t levels, uint32_t fmt,
                 levels, fmt, w, h, bound);
     }
     fmt = klfb_maybe_unsrgb(fmt);
+    // Record the allocation per texture name: ES 3.0 has no
+    // glGetTexLevelParameteriv (the ANGLE ext entry point rejects on this
+    // context — the census's fmt=0x0 readings), so the readback path learns
+    // what a texture IS from this table instead of by query.
+    if (a_glGetIntegerv) {
+        int32_t bound = -1;
+        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &bound);
+        if (bound > 0) klfb_note_tex_storage((uint32_t)bound, fmt, w, h);
+    }
     if (g_real_TexStorage2D) g_real_TexStorage2D(target, levels, fmt, w, h);
 }
 static void klfb_TexStorage3D(uint32_t target, int32_t levels, uint32_t fmt,
@@ -904,10 +960,167 @@ void kl_glfb_report_formats(void) {
 }
 
 // ---------------------------------------------------------- ABI thunks
+//
+// Per-texture storage record, written by the glTexStorage2D thunk above and
+// read by the capture: ES 3.0 has no glGetTexLevelParameteriv (the ANGLE
+// extension entry point rejects on this context), so what a texture *is* —
+// format and size — has to come from watching the allocation. Cold path, and
+// appends are serialised with the compile lock because the eye-texture setup
+// arrives on a different thread than some of the guest's own storage calls.
+#define KLFB_MAX_TEX 512
+static struct { uint32_t name, fmt; int32_t w, h; } g_tex[KLFB_MAX_TEX];
+static unsigned g_ntex;
+
+static void klfb_note_tex_storage(uint32_t name, uint32_t fmt, int32_t w,
+                                  int32_t h) {
+    pthread_mutex_lock(&g_compile_lock);
+    for (unsigned i = 0; i < g_ntex; i++)
+        if (g_tex[i].name == name) {          // reallocation replaces
+            g_tex[i].fmt = fmt; g_tex[i].w = w; g_tex[i].h = h;
+            pthread_mutex_unlock(&g_compile_lock);
+            return;
+        }
+    if (g_ntex < KLFB_MAX_TEX) {
+        g_tex[g_ntex].name = name; g_tex[g_ntex].fmt = fmt;
+        g_tex[g_ntex].w = w; g_tex[g_ntex].h = h;
+        g_ntex++;
+    }
+    pthread_mutex_unlock(&g_compile_lock);
+}
+
+static int klfb_tex_info(uint32_t name, uint32_t *fmt, int32_t *w, int32_t *h) {
+    int found = 0;
+    pthread_mutex_lock(&g_compile_lock);
+    for (unsigned i = 0; i < g_ntex; i++)
+        if (g_tex[i].name == name) {
+            if (fmt) *fmt = g_tex[i].fmt;
+            if (w) *w = g_tex[i].w;
+            if (h) *h = g_tex[i].h;
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&g_compile_lock);
+    return found;
+}
+
+// The eye textures, by name, as kl_ovrp's SetupEyeTexture2 allocates them
+// (latest registration wins — Unity re-creates them on resize). The capture
+// finds "the framebuffer with the picture" by looking for the FBO whose
+// color attachment is one of these.
+static uint32_t g_eye_tex[2];
+
+void kl_glfb_note_eye_texture(int eye, uint32_t tex) {
+    if (eye < 0 || eye > 1 || !tex) return;
+    g_eye_tex[eye] = tex;
+}
+
 static void (*g_real_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t, int32_t,
                                       int32_t, int32_t, int32_t, uint32_t, uint32_t);
 
 static void klfb_errprobe(const char *what, const char *detail);
+// Defined with the capture below; the blit probe uses it. dump/dw/dh are an
+// optional pixel out: when dump is non-NULL the probe tone-maps the readback
+// into it (g_w*g_h*4 bytes, bottom-up rows) and reports the clipped size.
+static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
+                                    char *note, size_t note_n,
+                                    uint8_t *dump, int32_t *dw, int32_t *dh);
+
+// glInvalidateFramebuffer matters here because ANGLE's Metal backend actually
+// discards (memoryless attachments): an invalidate of the scene color
+// renderbuffer placed BEFORE the eye-resolve blit reads as "the blit copied
+// black" downstream. The thunk exists to put the call on the probe timeline.
+static void (*g_real_InvalidateFramebuffer)(uint32_t, int32_t, const uint32_t *);
+
+static void klfb_InvalidateFramebuffer(int64_t target, int32_t n,
+                                       const uint32_t *attachments) {
+    if (getenv("KL_GLFB_BLIT_PROBE") && a_glGetIntegerv) {
+        int32_t dfb = -1;
+        a_glGetIntegerv(0x8CA6, &dfb);
+        // Name the color attachment being discarded — an invalidate of "fb N's
+        // COLOR_ATTACHMENT0" discards the *storage* behind it, which another
+        // FBO can share. The eye blit reading black right after a lit scene
+        // draw is only consistent with that.
+        static void (*getfap_)(uint32_t, uint32_t, uint32_t, int32_t *);
+        if (!getfap_) getfap_ = asym("glGetFramebufferAttachmentParameteriv");
+        int32_t otype = 0, oname = 0;
+        if (getfap_) {
+            getfap_((uint32_t)target, 0x8CE0, 0x8CD0, &otype);
+            getfap_((uint32_t)target, 0x8CE0, 0x8CD1, &oname);
+        }
+        fprintf(stderr, "  [glfb] glInvalidateFramebuffer(target=0x%llx, n=%d,"
+                        " att0=0x%x) on draw_fb=%d color0=%s%d atts=",
+                (long long)target, n, attachments ? attachments[0] : 0, dfb,
+                otype == 0x8D41 ? "rb" : otype == 0x1702 ? "tex" : "?",
+                oname);
+        for (int32_t i = 0; i < n; i++)
+            fprintf(stderr, "%s0x%x", i ? "," : "", attachments ? attachments[i] : 0);
+        fprintf(stderr, "\n");
+    }
+    // KL_GLFB_NO_INVALIDATE=1: don't forward. ANGLE's Metal backend gives the
+    // MSAA scene renderbuffers memoryless behavior — the depth+stencil-only
+    // invalidate Unity issues after each eye's draws is the only call between
+    // "draw probe reads the scene lit" and "the eye-resolve blit reads black",
+    // so the discard's blast radius is the open question. Dropping the call
+    // answers it: lit blits after this mean the invalidate was the eraser.
+    static int no_inv = -1;
+    if (no_inv < 0) no_inv = getenv("KL_GLFB_NO_INVALIDATE") != NULL;
+    if (g_real_InvalidateFramebuffer && !no_inv)
+        g_real_InvalidateFramebuffer((uint32_t)target, n, attachments);
+}
+
+// The eye-blit-reads-black timeline work found the scene renderbuffer lit at
+// draw time and black at blit time with no invalidate in between, so the
+// eraser is a clear or a storage reallocation. These thunks put glClear and
+// renderbuffer (re)storage on the same timeline. Logging is behind
+// KL_GLFB_BLIT_PROBE; the forwarding is unconditional.
+static void (*g_real_Clear)(uint32_t);
+static void (*g_real_ClearColor)(float, float, float, float);
+static void (*g_real_RenderbufferStorageMultisample)(uint32_t, int32_t, uint32_t,
+                                                     int32_t, int32_t);
+static void (*g_real_RenderbufferStorage)(uint32_t, uint32_t, int32_t, int32_t);
+
+static int klfb_timeline(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("KL_GLFB_BLIT_PROBE") != NULL;
+    return on;
+}
+
+static void klfb_Clear(uint32_t mask) {
+    if (klfb_timeline() && a_glGetIntegerv) {
+        int32_t dfb = -1;
+        a_glGetIntegerv(0x8CA6, &dfb);
+        fprintf(stderr, "  [glfb] glClear(mask=0x%x) on draw_fb=%d\n", mask, dfb);
+    }
+    if (g_real_Clear) g_real_Clear(mask);
+}
+static void klfb_ClearColor(float r, float g, float b, float a) {
+    if (klfb_timeline())
+        fprintf(stderr, "  [glfb] glClearColor(%.2f, %.2f, %.2f, %.2f)\n",
+                r, g, b, a);
+    if (g_real_ClearColor) g_real_ClearColor(r, g, b, a);
+}
+static void klfb_RenderbufferStorageMultisample(uint32_t target, int32_t samples,
+                                                uint32_t fmt, int32_t w, int32_t h) {
+    if (klfb_timeline() && a_glGetIntegerv) {
+        int32_t rb = -1;
+        a_glGetIntegerv(0x8CA7 /* RENDERBUFFER_BINDING */, &rb);
+        fprintf(stderr, "  [glfb] glRenderbufferStorageMultisample rb=%d "
+                        "fmt=0x%x %dx%d samples=%d (storage wiped)\n", rb, fmt,
+                w, h, samples);
+    }
+    if (g_real_RenderbufferStorageMultisample)
+        g_real_RenderbufferStorageMultisample(target, samples, fmt, w, h);
+}
+static void klfb_RenderbufferStorage(uint32_t target, uint32_t fmt,
+                                     int32_t w, int32_t h) {
+    if (klfb_timeline() && a_glGetIntegerv) {
+        int32_t rb = -1;
+        a_glGetIntegerv(0x8CA7, &rb);
+        fprintf(stderr, "  [glfb] glRenderbufferStorage rb=%d fmt=0x%x %dx%d "
+                        "(storage wiped)\n", rb, fmt, w, h);
+    }
+    if (g_real_RenderbufferStorage) g_real_RenderbufferStorage(target, fmt, w, h);
+}
 
 static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1,
                                  int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1,
@@ -959,9 +1172,57 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
             bindfb_(0x8CA9, dfb);
         }
     }
+    // KL_GLFB_BLIT_PROBE=1: probe the blit's source BEFORE the blit and its
+    // destination AFTER — the swap-time capture found every FBO black, which
+    // has two very different readings: the pixels were gone by then
+    // (glInvalidateFramebuffer discards), or the draws themselves produce
+    // black. Probing both sides of the blit puts the loss on the timeline.
+    static int blit_probe = -1;
+    if (blit_probe < 0) blit_probe = getenv("KL_GLFB_BLIT_PROBE") != NULL;
+    static float *pfb;
+    static uint8_t *pbb;
+    static void (*bp_bind)(uint32_t, uint32_t);
+    int32_t dfb = -1, rfb = -1;
+    if (blit_probe && a_glGetIntegerv) {
+        if (!pfb) {
+            pfb = malloc((size_t)g_w * g_h * 16);
+            pbb = malloc((size_t)g_w * g_h * 4);
+            bp_bind = asym("glBindFramebuffer");
+        }
+        a_glGetIntegerv(0x8CA6, &dfb);
+        a_glGetIntegerv(0x8CAA, &rfb);
+        if (pfb && pbb && bp_bind) {
+            char ns[160] = "";
+            unsigned long ls = klfb_probe_fbo((uint32_t)rfb, pfb, pbb, ns, sizeof ns,
+                                              NULL, NULL, NULL);
+            fprintf(stderr, "  [glfb] BLIT_PROBE before: read_fb=%d %lu lit (%s)\n",
+                    rfb, ls, ns);
+            bp_bind(0x8CA8, (uint32_t)rfb);
+            bp_bind(0x8CA9, (uint32_t)dfb);
+        }
+        // The guest's own blit, error-bracketed honestly: drain first, so an
+        // error after is provably this blit's. The question it answers is
+        // whether the eye resolve itself fails on this driver.
+        if (a_glGetError) while (a_glGetError()) {}
+    }
     if (g_real_BlitFramebuffer)
         g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
                                (uint32_t)mask, (uint32_t)filter);
+    if (blit_probe && a_glGetError) {
+        uint32_t be = a_glGetError();
+        if (be)
+            fprintf(stderr, "  [glfb] BLIT_PROBE: guest blit fb%d -> fb%d "
+                            "raised 0x%x\n", rfb, dfb, be);
+    }
+    if (blit_probe && pfb && pbb && bp_bind) {
+        char nd[160] = "";
+        unsigned long ld = klfb_probe_fbo((uint32_t)dfb, pfb, pbb, nd, sizeof nd,
+                                          NULL, NULL, NULL);
+        fprintf(stderr, "  [glfb] BLIT_PROBE after: draw_fb=%d %lu lit (%s)\n",
+                dfb, ld, nd);
+        bp_bind(0x8CA8, (uint32_t)rfb);          // restore the guest's bindings
+        bp_bind(0x8CA9, (uint32_t)dfb);
+    }
     klfb_errprobe("glBlitFramebuffer(after)", NULL);
 }
 
@@ -1009,6 +1270,28 @@ static unsigned g_ndraw_fbs;
 static void klfb_note_draw(void) {
     int32_t fb = -1;
     if (a_glGetIntegerv) a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
+    // The same timeline the blit probe reads: order the draws against the
+    // clears/invalidates/blits, because "black at blit time" is meaningless
+    // without knowing whether a draw came after the last clear. Program,
+    // viewport and tex0 name the pass — the frame's last draw paints the
+    // whole scene target black, and identifying it is the whole game now.
+    if (klfb_timeline()) {
+        int32_t prog = -1, vp[4] = {0,0,0,0}, tex0 = -1;
+        if (a_glGetIntegerv) {
+            a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &prog);
+            a_glGetIntegerv(0x0BA2 /* VIEWPORT */, vp);
+            a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &tex0);
+        }
+        uint32_t tfmt = 0; int32_t tw = 0, th = 0;
+        const char *tinfo = "";
+        char tbuf[48];
+        if (tex0 > 0 && klfb_tex_info((uint32_t)tex0, &tfmt, &tw, &th)) {
+            snprintf(tbuf, sizeof tbuf, " fmt=0x%x %dx%d", tfmt, tw, th);
+            tinfo = tbuf;
+        }
+        fprintf(stderr, "  [glfb] draw on fb=%d program=%d vp=%dx%d tex0=%d%s\n",
+                fb, prog, vp[2], vp[3], tex0, tinfo);
+    }
     uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
     for (unsigned i = 0; i < g_ndraw_fbs; i++)
         if (g_draw_fbs[i].fb == fb && g_draw_fbs[i].tid == tid) {
@@ -1068,31 +1351,53 @@ static void klfb_errprobe(const char *what, const char *detail);
 #define klfb_errprobe0(w) klfb_errprobe((w), NULL)
 
 // KL_GLFB_DRAW_PROBE=1: after each of the first few draws, read back the
-// middle 64x64 and say whether the draw emitted anything. Distinguishes
-// "draws run but output black" from "content drawn but lost before the
-// capture" — the readback happens inside the same command stream, so there
-// is no timing or thread question left.
+// current DRAW framebuffer and say whether the draw emitted anything.
+// Distinguishes "draws run but output black" from "content drawn but lost
+// before the capture" — the readback happens inside the same command stream,
+// so there is no timing or thread question left. The read goes through
+// klfb_probe_fbo: the scene target is an RGBA16F 4xMSAA renderbuffer, which a
+// direct RGBA/UNSIGNED_BYTE readback cannot see (that was the first version
+// of this probe, and its err 0x500 lines).
 static void klfb_draw_probe(int verts) {
-    static int on = -1, said;
-    if (on < 0) on = getenv("KL_GLFB_DRAW_PROBE") != NULL;
-    if (!on || said >= 12 || !a_glReadPixels) return;
-    if (verts < 32) return;   // skip the post-processing passes, keep scene draws
-    int32_t fb = -1;
-    if (a_glGetIntegerv) a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
+    static int on = -1, said, quota;
+    if (on < 0) {
+        on = getenv("KL_GLFB_DRAW_PROBE") != NULL;
+        // KL_GLFB_DRAW_PROBE_N overrides the 12-line default; scene frames
+        // burn the quota on early frames otherwise. 0 means unlimited.
+        const char *q = getenv("KL_GLFB_DRAW_PROBE_N");
+        quota = q ? atoi(q) : 12;
+    }
+    if (!on || (quota && said >= quota) || !a_glReadPixels) return;
+    // KL_GLFB_DRAW_PROBE_MIN lowers the 32-vert floor — the frame's last few
+    // draws are small, and one of them is a suspect in the scene's erasure.
+    static int minv = -1;
+    if (minv < 0) {
+        const char *m = getenv("KL_GLFB_DRAW_PROBE_MIN");
+        minv = m ? atoi(m) : 32;
+    }
+    if (verts < minv) return;
+    int32_t fb = -1, rfb = -1;
+    if (a_glGetIntegerv) {
+        a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
+        a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &rfb);
+    }
     if (a_glFinish) a_glFinish();
     said++;
-    uint8_t px[64 * 64 * 4];
-    memset(px, 0, sizeof px);
-    a_glReadPixels(g_w / 2 - 32, g_h / 2 - 32, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    unsigned long lit = 0, sum = 0;
-    for (int i = 0; i < 64 * 64; i++) {
-        unsigned lum = px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2];
-        sum += lum;
-        if (lum > 12) lit++;
+    static float *pfb;
+    static uint8_t *pbb;
+    static void (*dp_bind)(uint32_t, uint32_t);
+    if (!pfb) {
+        pfb = malloc((size_t)g_w * g_h * 16);
+        pbb = malloc((size_t)g_w * g_h * 4);
+        dp_bind = asym("glBindFramebuffer");
     }
-    uint32_t err = a_glGetError ? a_glGetError() : 0;
-    fprintf(stderr, "  [glfb] DRAW_PROBE fb=%d: %lu/4096 lit, mean luma %lu, err 0x%x\n",
-            fb, lit, sum / (4096 * 3), err);
+    char note[160] = "";
+    unsigned long lit = 0;
+    if (pfb && pbb)
+        lit = klfb_probe_fbo((uint32_t)fb, pfb, pbb, note, sizeof note,
+                             NULL, NULL, NULL);
+    if (dp_bind) dp_bind(0x8CA8, (uint32_t)(rfb >= 0 ? rfb : 0));
+    fprintf(stderr, "  [glfb] DRAW_PROBE fb=%d: %lu lit (%s)\n", fb, lit, note);
 }
 
 static void klfb_DrawElements(uint32_t mode, int32_t count, uint32_t type,
@@ -1272,9 +1577,15 @@ static void klfb_res_log_unhandled(const char *what, uint32_t iface, uint32_t pr
                     "(answered empty/invalid)\n", what, iface, prop);
 }
 
+static void klfb_err_say(const char *what, uint32_t a0);   // with the thunk table
+
 static void klfb_GetProgramInterfaceiv(uint32_t program, uint32_t iface,
                                        uint32_t pname, int32_t *params) {
     klfb_res_resolve();
+    // Unity's "Invalid texture unit!" lands immediately after this call in the
+    // trace: its own GL-error check misattributes whatever we raise here. A
+    // drain/report bracket names the query that actually sets the error.
+    if (a_glGetError) while (a_glGetError()) {}
     if (!params) return;
     *params = 0;
     uint32_t src = 0;
@@ -1314,6 +1625,7 @@ static void klfb_GetProgramInterfaceiv(uint32_t program, uint32_t iface,
         return;
     }
     if (r_GetProgramiv) r_GetProgramiv(program, src, params);
+    klfb_err_say("GetProgramInterfaceiv/GetProgramiv", src);
 }
 
 // One scalar prop of one GL_UNIFORM resource, via the ES 3.0 uniform queries.
@@ -1440,6 +1752,7 @@ static void klfb_GetProgramResourceiv(uint32_t program, uint32_t iface,
         if (ok) { params[i] = v; written = i + 1; }
     }
     if (length) *length = written;
+    klfb_err_say("GetProgramResourceiv", iface);
 }
 
 static void klfb_GetProgramResourceName(uint32_t program, uint32_t iface,
@@ -1562,7 +1875,109 @@ static void (*g_real_GetInteger64v)(uint32_t, int64_t *);
 static void (*g_real_GetIntegeri_v)(uint32_t, uint32_t, int32_t *);
 static void (*g_real_GetInternalformativ)(uint32_t, uint32_t, uint32_t, int32_t, int32_t *);
 
+// Unity spams "OpenGL Error: Invalid texture unit!" ~6x/frame from the very
+// first frames. glActiveTexture is the only unit-selecting call; bracket it
+// and print the first failures with the unit requested — we describe 32
+// combined units, so a failing unit <= 31 is the driver disagreeing with the
+// description, and a unit > 31 is the guest over-reading it.
+static void (*g_real_ActiveTexture)(uint32_t);
+static void klfb_ActiveTexture(uint32_t unit) {
+    // Drain first: the guest leaves errors unread, and the first version of
+    // this bracket misreported a leftover as glActiveTexture's own. Errors
+    // after this point are provably this call's.
+    if (a_glGetError) while (a_glGetError()) {}
+    if (g_real_ActiveTexture) g_real_ActiveTexture(unit);
+    // Which units does the guest actually select? Unity's "Invalid texture
+    // unit" check rejects above its own cap — if that preempts the bind, no
+    // high unit ever reaches GL, and measuring the request stream proves it.
+    {
+        static int logu = -1, saidu;
+        static uint8_t seen[64];
+        if (logu < 0) logu = getenv("KL_GLFB_LOG_UNITS") != NULL;
+        int u = (int)(unit - 0x84C0);
+        if (logu && u >= 0 && u < 64 && !seen[u]) {
+            seen[u] = 1; saidu++;
+            fprintf(stderr, "  [glfb] glActiveTexture: first use of unit %d\n", u);
+        }
+    }
+    static int said;
+    if (said < 20 && a_glGetError) {
+        uint32_t e = a_glGetError();
+        if (e) {
+            said++;
+            fprintf(stderr, "  [glfb] glActiveTexture(0x%x) (unit %d) -> GL error 0x%x\n",
+                    unit, (int)(unit - 0x84C0), e);
+        }
+    }
+}
+
+// The 0x502 the errprobe meets before program-7 draws is generated by a call
+// the probe family doesn't wrap. Bracket the per-draw state setters the same
+// drain-and-report way; the one that prints is the generator.
+static void klfb_err_say(const char *what, uint32_t a0) {
+    static int said;
+    if (said < 30 && a_glGetError) {
+        uint32_t e = a_glGetError();
+        if (e) {
+            said++;
+            int32_t prog = -1, fb = -1;
+            if (a_glGetIntegerv) {
+                a_glGetIntegerv(0x8B8D, &prog);
+                a_glGetIntegerv(0x8CA6, &fb);
+            }
+            fprintf(stderr, "  [glfb] ERRSRC %s(0x%x) -> GL error 0x%x "
+                            "(program=%d fb=%d)\n", what, a0, e, prog, fb);
+        }
+    }
+}
+static void (*g_real_UseProgram)(uint32_t);
+static void klfb_UseProgram(uint32_t p) {
+    if (a_glGetError) while (a_glGetError()) {}
+    if (g_real_UseProgram) g_real_UseProgram(p);
+    klfb_err_say("glUseProgram", p);
+}
+static void (*g_real_BindTexture)(uint32_t, uint32_t);
+static void klfb_BindTexture(uint32_t t, uint32_t n) {
+    if (a_glGetError) while (a_glGetError()) {}
+    if (g_real_BindTexture) g_real_BindTexture(t, n);
+    klfb_err_say("glBindTexture", n);
+}
+static void (*g_real_BindSampler)(uint32_t, uint32_t);
+static void klfb_BindSampler(uint32_t u, uint32_t s) {
+    if (a_glGetError) while (a_glGetError()) {}
+    if (g_real_BindSampler) g_real_BindSampler(u, s);
+    klfb_err_say("glBindSampler", s);
+}
+static void (*g_real_Uniform1i)(int32_t, int32_t);
+static void klfb_Uniform1i(int32_t loc, int32_t v) {
+    if (a_glGetError) while (a_glGetError()) {}
+    if (g_real_Uniform1i) g_real_Uniform1i(loc, v);
+    static int said;
+    if (said < 30 && a_glGetError) {
+        uint32_t e = a_glGetError();
+        if (e) {
+            said++;
+            int32_t prog = -1;
+            if (a_glGetIntegerv) a_glGetIntegerv(0x8B8D, &prog);
+            fprintf(stderr, "  [glfb] ERRSRC glUniform1i(loc=%d, %d) -> 0x%x "
+                            "(program=%d)\n", loc, v, e, prog);
+        }
+    }
+}
+static void (*g_real_GenerateMipmap)(uint32_t);
+static void klfb_GenerateMipmap(uint32_t t) {
+    if (a_glGetError) while (a_glGetError()) {}
+    if (g_real_GenerateMipmap) g_real_GenerateMipmap(t);
+    klfb_err_say("glGenerateMipmap", t);
+}
+
 static const struct { const char *name; void *thunk; void **real; } g_thunks[] = {
+    {"glActiveTexture", (void *)klfb_ActiveTexture, (void **)&g_real_ActiveTexture},
+    {"glUseProgram",  (void *)klfb_UseProgram,  (void **)&g_real_UseProgram},
+    {"glBindTexture", (void *)klfb_BindTexture, (void **)&g_real_BindTexture},
+    {"glBindSampler", (void *)klfb_BindSampler, (void **)&g_real_BindSampler},
+    {"glUniform1i",   (void *)klfb_Uniform1i,   (void **)&g_real_Uniform1i},
+    {"glGenerateMipmap", (void *)klfb_GenerateMipmap, (void **)&g_real_GenerateMipmap},
     {"glFlush",  (void *)klfb_Flush,  (void **)&g_real_Flush},
     {"glDrawElements", (void *)klfb_DrawElements, (void **)&g_real_DrawElements},
     {"glDrawArrays",   (void *)klfb_DrawArrays,   (void **)&g_real_DrawArrays},
@@ -1571,6 +1986,11 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glDrawArraysInstanced", (void *)klfb_DrawArraysInstanced, (void **)&g_real_DrawArraysInstanced},
     {"glFinish", (void *)klfb_Finish, (void **)&g_real_Finish},
     {"glBlitFramebuffer",         (void *)klfb_BlitFramebuffer,         (void **)&g_real_BlitFramebuffer},
+    {"glInvalidateFramebuffer",   (void *)klfb_InvalidateFramebuffer,   (void **)&g_real_InvalidateFramebuffer},
+    {"glClear",                   (void *)klfb_Clear,                   (void **)&g_real_Clear},
+    {"glClearColor",              (void *)klfb_ClearColor,              (void **)&g_real_ClearColor},
+    {"glRenderbufferStorageMultisample", (void *)klfb_RenderbufferStorageMultisample, (void **)&g_real_RenderbufferStorageMultisample},
+    {"glRenderbufferStorage",     (void *)klfb_RenderbufferStorage,     (void **)&g_real_RenderbufferStorage},
     {"glTexSubImage3D",           (void *)klfb_TexSubImage3D,           (void **)&g_real_TexSubImage3D},
     {"glCompressedTexSubImage3D", (void *)klfb_CompressedTexSubImage3D, (void **)&g_real_CompressedTexSubImage3D},
     // the shared-context compile lock — see the block above s10's numbers
@@ -1934,21 +2354,345 @@ unsigned kl_glfb_present(const char *dir) {
     return g_presented;
 }
 
+// ---- which FBO is the picture in?
+//
+// fb0 is black by construction (the VR frame goes to eye textures, not the
+// backbuffer), and the first census was blind twice over: it scanned only
+// fbo1..8, and it read everything as GL_RGBA/UNSIGNED_BYTE — which an RGBA16F
+// attachment rejects (INVALID_ENUM, the 0x500 in the draw-probe log) and an
+// MSAA attachment rejects outright (INVALID_OPERATION). klfb_probe_fbo reads
+// one FBO the way its own color attachment allows: the read format/type come
+// from GL_IMPLEMENTATION_COLOR_READ_FORMAT/TYPE, the attachment is identified
+// against the allocation table the glTexStorage2D thunk keeps (ES 3.0 has no
+// glGetTexLevelParameteriv — the ANGLE extension entry point rejects on this
+// context), and MSAA attachments are reported rather than misread.
+// Returns the lit count and writes a one-line description into note.
+//
+// It disturbs GL state (binds the FBO, maybe a renderbuffer), so it belongs
+// to the debug paths (PNG census, probe runs), not the sink handoff. The
+// caller restores the READ_FRAMEBUFFER binding; the renderbuffer binding is
+// saved and restored here.
+#define KLFB_IMPLEMENTATION_COLOR_READ_FORMAT 0x8B9B
+#define KLFB_IMPLEMENTATION_COLOR_READ_TYPE   0x8B9A
+#define KLFB_HALF_FLOAT 0x140B
+
+// IEEE half -> float, for RGBA16F readbacks. Bit-exact exponent rebase; no
+// denormal/inf finesse needed for a lit-pixel census and a debug picture.
+static float klfb_half_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t out;
+    if (exp == 0)        out = sign | (mant << 13);              // ~denormal
+    else if (exp == 31)  out = sign | 0x7F800000 | (mant << 13); // inf/nan
+    else                 out = sign | ((exp + 112) << 23) | (mant << 13);
+    float f;
+    memcpy(&f, &out, 4);
+    return f;
+}
+
+static uint8_t klfb_dbg_tone(float c);   // defined with the capture below
+
+static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
+                                    char *note, size_t note_n,
+                                    uint8_t *dump, int32_t *dw, int32_t *dh) {
+    static void (*r_BindFramebuffer)(uint32_t, uint32_t);
+    static uint32_t (*r_CheckFramebufferStatus)(uint32_t);
+    static void (*r_GetFramebufferAttachmentParameteriv)(uint32_t, uint32_t,
+                                                         uint32_t, int32_t *);
+    static void (*r_BindRenderbuffer)(uint32_t, uint32_t);
+    static void (*r_GetRenderbufferParameteriv)(uint32_t, uint32_t, int32_t *);
+    static void (*r_BindTexture2)(uint32_t, uint32_t);
+    if (!r_BindFramebuffer) {
+        r_BindFramebuffer = asym("glBindFramebuffer");
+        r_CheckFramebufferStatus = asym("glCheckFramebufferStatus");
+        r_GetFramebufferAttachmentParameteriv =
+            asym("glGetFramebufferAttachmentParameteriv");
+        r_BindRenderbuffer = asym("glBindRenderbuffer");
+        r_GetRenderbufferParameteriv = asym("glGetRenderbufferParameteriv");
+        r_BindTexture2 = asym("glBindTexture");
+    }
+    if (!r_BindFramebuffer || !r_CheckFramebufferStatus ||
+        !r_GetFramebufferAttachmentParameteriv || !a_glGetIntegerv ||
+        !a_glReadPixels) {
+        snprintf(note, note_n, "no GL entry points");
+        return 0;
+    }
+    r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, fb);
+    if (r_CheckFramebufferStatus(0x8CA8) != 0x8CD5) {
+        snprintf(note, note_n, "incomplete");
+        return 0;
+    }
+    int32_t otype = 0, oname = 0;
+    r_GetFramebufferAttachmentParameteriv(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */,
+                                          0x8CD0 /* OBJECT_TYPE */, &otype);
+    r_GetFramebufferAttachmentParameteriv(0x8CA8, 0x8CE0, 0x8CD1 /* OBJECT_NAME */,
+                                          &oname);
+    int32_t fmt = 0, aw = 0, ah = 0, samples = 0;
+    uint32_t resolved_via = 0, resolve_err = 0;
+    // Which staging format makes this attachment readable, if it isn't
+    // already: MSAA renderbuffers resolve to a SAME-FORMAT texture (a
+    // float->unorm blit is the forbidden one), and R11F_G11F_B10F textures —
+    // the bloom pyramid — blit to RGBA16F, because this driver's own read
+    // format for R11F (0x1907/0x8c3b) is one glReadPixels rejects outright.
+    // Both are float->float blits, the legal path.
+    uint32_t stage_want = 0;
+    if (otype == 0x1702 /* TEXTURE */) {
+        uint32_t ufmt = 0;
+        klfb_tex_info((uint32_t)oname, &ufmt, &aw, &ah);
+        fmt = (int32_t)ufmt;
+        if (ufmt == 0x8C3A /* R11F_G11F_B10F */) stage_want = 0x881A;
+    } else if (otype == 0x8D41 /* RENDERBUFFER */ && r_BindRenderbuffer &&
+               r_GetRenderbufferParameteriv) {
+        int32_t save_rb = 0;
+        a_glGetIntegerv(0x8CA7 /* RENDERBUFFER_BINDING */, &save_rb);
+        r_BindRenderbuffer(0x8D41, (uint32_t)oname);
+        r_GetRenderbufferParameteriv(0x8D41, 0x8D44 /* INTERNAL_FORMAT */, &fmt);
+        r_GetRenderbufferParameteriv(0x8D41, 0x8D42 /* WIDTH */, &aw);
+        r_GetRenderbufferParameteriv(0x8D41, 0x8D43 /* HEIGHT */, &ah);
+        r_GetRenderbufferParameteriv(0x8D41, 0x8CAB /* SAMPLES */, &samples);
+        r_BindRenderbuffer(0x8D41, (uint32_t)save_rb);
+        if (samples > 0) stage_want = (uint32_t)fmt;
+    }
+    if (stage_want) {
+        {
+            // MSAA can't be read directly, so resolve through a staging FBO of
+            // our own with a SAME-FORMAT texture — a float->unorm blit is the
+            // forbidden one, an MSAA resolve to the same format is the legal
+            // path. This is how the scene renderbuffer (where the geometry
+            // draws actually land) becomes readable. Debug path only: it
+            // creates two real GL objects on the guest's shared context.
+            static void (*r_GenTextures)(int32_t, uint32_t *);
+            static void (*r_GenFramebuffers2)(int32_t, uint32_t *);
+            static void (*r_TexStorage2D)(uint32_t, int32_t, uint32_t, int32_t,
+                                          int32_t);
+            static void (*r_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t,
+                                                  uint32_t, int32_t);
+            static void (*r_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t,
+                                             int32_t, int32_t, int32_t, int32_t,
+                                             uint32_t, uint32_t);
+            if (!r_GenTextures) {
+                r_GenTextures = asym("glGenTextures");
+                r_GenFramebuffers2 = asym("glGenFramebuffers");
+                r_TexStorage2D = asym("glTexStorage2D");
+                r_FramebufferTexture2D = asym("glFramebufferTexture2D");
+                r_BlitFramebuffer = asym("glBlitFramebuffer");
+            }
+            static uint32_t stage_tex, stage_fb;
+            static int32_t stage_w, stage_h;
+            static uint32_t stage_fmt;
+            if (!r_GenTextures || !r_BlitFramebuffer) {
+                snprintf(note, note_n, "rb=%d MSAA x%d (no staging entry points)",
+                         oname, samples);
+                return 0;
+            }
+            if (!stage_tex) {
+                r_GenTextures(1, &stage_tex);
+                r_GenFramebuffers2(1, &stage_fb);
+            }
+            if (stage_want != stage_fmt || aw != stage_w || ah != stage_h) {
+                int32_t save_tex = 0, save_draw = 0;
+                a_glGetIntegerv(0x8069, &save_tex);
+                a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &save_draw);
+                r_BindTexture2(0x0DE1, stage_tex);
+                r_TexStorage2D(0x0DE1, 1, stage_want, aw, ah);
+                r_BindTexture2(0x0DE1, (uint32_t)save_tex);
+                r_BindFramebuffer(0x8CA9 /* DRAW_FRAMEBUFFER */, stage_fb);
+                r_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, stage_tex, 0);
+                r_BindFramebuffer(0x8CA9, (uint32_t)save_draw);
+                stage_fmt = stage_want; stage_w = aw; stage_h = ah;
+            }
+            int32_t save_draw = 0;
+            a_glGetIntegerv(0x8CA6, &save_draw);
+            r_BindFramebuffer(0x8CA9, stage_fb);
+            // Sentinel first: a pixel the resolve blit did not write keeps the
+            // sentinel colour, so a silently-failing resolve reads as sentinel
+            // rather than as whatever the staging texture held before. The
+            // first version of this probe had no sentinel and produced
+            // back-to-back contradictory readings of the same renderbuffer —
+            // check the instrument before trusting it.
+            static void (*r_ClearColor)(float, float, float, float);
+            static void (*r_Clear)(uint32_t);
+            if (!r_ClearColor) {
+                r_ClearColor = asym("glClearColor");
+                r_Clear = asym("glClear");
+            }
+            if (r_ClearColor && r_Clear) {
+                r_ClearColor(0.6f, 0.1f, 0.9f, 1.0f);   // loud magenta
+                r_Clear(0x4000);
+            }
+            // fb is still bound as READ from the top of the probe. Flush the
+            // command stream first: the draw probe reads the same renderbuffer
+            // lit where the blit probe reads it black a few calls later, and
+            // the draw probe glFinish()es first — the outstanding difference.
+            if (a_glFinish) a_glFinish();
+            r_BlitFramebuffer(0, 0, aw, ah, 0, 0, aw, ah,
+                              0x4000 /* COLOR_BUFFER_BIT */, 0x2600 /* NEAREST */);
+            if (a_glGetError) resolve_err = a_glGetError();
+            r_BindFramebuffer(0x8CA9, (uint32_t)save_draw);
+            r_BindFramebuffer(0x8CA8, stage_fb);
+            resolved_via = stage_fb;
+            // fall through to the ordinary read, now against the staging FBO
+        }
+    }
+    int32_t rfmt = 0, rtype = 0;
+    a_glGetIntegerv(KLFB_IMPLEMENTATION_COLOR_READ_FORMAT, &rfmt);
+    a_glGetIntegerv(KLFB_IMPLEMENTATION_COLOR_READ_TYPE, &rtype);
+    snprintf(note, note_n, "%s=%d fmt=0x%x %dx%d read=0x%x/0x%x",
+             otype == 0x1702 ? "tex" : otype == 0x8D41 ? "rb" : "type?",
+             oname, fmt, aw, ah, rfmt, rtype);
+    if (resolved_via) {
+        size_t l = strlen(note);
+        snprintf(note + l, note_n - l, " %s resolved-via-fb%u%s%x",
+                 samples > 0 ? "MSAA" : "blit", resolved_via,
+                 resolve_err ? " resolvebliterr=0x" : "", resolve_err);
+    }
+    // The buffers are g_w*g_h; a larger attachment (the resized eye textures
+    // are 2304x2198 against a 1832x1920 default) reads clipped rather than
+    // overflowing.
+    if (aw > g_w) aw = g_w;
+    if (ah > g_h) ah = g_h;
+    if (aw <= 0 || ah <= 0) return 0;
+    if (dw) *dw = aw;
+    if (dh) *dh = ah;
+
+    if (a_glGetError) while (a_glGetError()) {}        // drain guest leftovers
+    unsigned long lit = 0, sentinel = 0;
+    float fsum = 0;
+    if (rtype == 0x1406 /* FLOAT */) {
+        a_glReadPixels(0, 0, aw, ah, GL_RGBA, GL_FLOAT, fbuf);
+        for (int32_t i = 0; i < aw * ah; i++) {
+            float r = fbuf[i * 4], g = fbuf[i * 4 + 1], b = fbuf[i * 4 + 2];
+            if (resolved_via && r > 0.55f && r < 0.65f && g > 0.05f &&
+                g < 0.15f && b > 0.85f && b < 0.95f) { sentinel++; continue; }
+            if (dump) {
+                dump[i * 4 + 0] = klfb_dbg_tone(r);
+                dump[i * 4 + 1] = klfb_dbg_tone(g);
+                dump[i * 4 + 2] = klfb_dbg_tone(b);
+                dump[i * 4 + 3] = 255;
+            }
+            float lum = r + g + b;
+            fsum += lum;
+            if (lum > 0.05f) lit++;
+        }
+    } else if (rtype == KLFB_HALF_FLOAT) {
+        // 8 bytes a pixel — fits in fbuf, which is sized for 16.
+        uint16_t *hbuf = (uint16_t *)fbuf;
+        a_glReadPixels(0, 0, aw, ah, GL_RGBA, KLFB_HALF_FLOAT, hbuf);
+        for (int32_t i = 0; i < aw * ah; i++) {
+            float r = klfb_half_to_float(hbuf[i * 4]);
+            float g = klfb_half_to_float(hbuf[i * 4 + 1]);
+            float b = klfb_half_to_float(hbuf[i * 4 + 2]);
+            if (resolved_via && r > 0.55f && r < 0.65f && g > 0.05f &&
+                g < 0.15f && b > 0.85f && b < 0.95f) { sentinel++; continue; }
+            if (dump) {
+                dump[i * 4 + 0] = klfb_dbg_tone(r);
+                dump[i * 4 + 1] = klfb_dbg_tone(g);
+                dump[i * 4 + 2] = klfb_dbg_tone(b);
+                dump[i * 4 + 3] = 255;
+            }
+            float lum = r + g + b;
+            fsum += lum;
+            if (lum > 0.05f) lit++;
+        }
+    } else {
+        a_glReadPixels(0, 0, aw, ah, GL_RGBA, GL_UNSIGNED_BYTE, bbuf);
+        if (dump) memcpy(dump, bbuf, (size_t)aw * ah * 4);
+        for (int32_t i = 0; i < aw * ah; i++) {
+            unsigned lum = bbuf[i * 4] + bbuf[i * 4 + 1] + bbuf[i * 4 + 2];
+            fsum += (float)lum / 255.0f;
+            if (lum > 12) lit++;
+        }
+    }
+    uint32_t err = a_glGetError ? a_glGetError() : 0;
+    if (err) {
+        size_t l = strlen(note);
+        snprintf(note + l, note_n - l, " readerr=0x%x", err);
+        return 0;
+    }
+    {
+        size_t l = strlen(note);
+        snprintf(note + l, note_n - l, " mean %.4f",
+                 aw * ah ? fsum / ((float)aw * ah) : 0.0f);
+        if (resolved_via) {
+            l = strlen(note);
+            snprintf(note + l, note_n - l, " sentinel=%lu", sentinel);
+        }
+    }
+    return lit;
+}
+
+// Debug transform, not color management: clamp HDR into [0,1] and apply a
+// plain 1/2.2 gamma so linear-space float content is visible on a monitor.
+// The reference renderer's job is "is there a picture", not colorimetry.
+static uint8_t klfb_dbg_tone(float c) {
+    // Debug-only display curve, env-tunable: KL_GLFB_EXPOSURE scales the
+    // linear value first, KL_GLFB_GAMMA overrides the 1/2.2 encode exponent.
+    // Statics: the 64K LUT caller memoizes this, so the env is read once.
+    static float expo = -1, gam = -1;
+    if (expo < 0) {
+        const char *e = getenv("KL_GLFB_EXPOSURE");
+        expo = e ? (float)atof(e) : 1.0f;
+        e = getenv("KL_GLFB_GAMMA");
+        gam = e ? (float)atof(e) : 1.0f / 2.2f;
+        if (expo <= 0) expo = 1.0f;
+        if (gam <= 0) gam = 1.0f / 2.2f;
+    }
+    if (!(c > 0)) return 0;                    // also NaN
+    c *= expo;
+    if (c > 1) c = 1;
+    return (uint8_t)(powf(c, gam) * 255.0f + 0.5f);
+}
+
+// 8-bit RGBA PNG, bottom-up GL rows flipped to top-down. Shared by the swap
+// capture and the per-FBO dump; returns 0 on any failure (path, alloc, zlib).
+static int klfb_write_png(const char *path, const uint8_t *px,
+                          int32_t w, int32_t h) {
+    size_t   stride = (size_t)w * 4;
+    size_t   raw_n = (stride + 1) * (size_t)h;
+    uint8_t *raw = malloc(raw_n);
+    uLongf   cn  = compressBound((uLong)raw_n);
+    uint8_t *cb  = malloc(cn);
+    if (!raw || !cb) { free(raw); free(cb); return 0; }
+    for (int32_t y = 0; y < h; y++) {            // GL bottom-up -> PNG top-down
+        raw[(stride + 1) * (size_t)y] = 0;
+        memcpy(raw + (stride + 1) * (size_t)y + 1,
+               px + stride * (size_t)(h - 1 - y), stride);
+    }
+    if (compress(cb, &cn, raw, (uLong)raw_n) != Z_OK) {
+        free(raw); free(cb); return 0;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(raw); free(cb); return 0; }
+    static const uint8_t sig[8] = {0x89,'P','N','G',13,10,26,10};
+    fwrite(sig, 1, 8, f);
+    uint8_t ih[13]; be32(ih, (uint32_t)w); be32(ih + 4, (uint32_t)h);
+    ih[8] = 8; ih[9] = 6; ih[10] = ih[11] = ih[12] = 0;
+    chunk(f, "IHDR", ih, 13);
+    chunk(f, "IDAT", cb, (uint32_t)cn);
+    chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    free(raw); free(cb);
+    return 1;
+}
+
 static unsigned glfb_capture_now(const char *dir) {
     if (!g_ready || !a_glReadPixels) return 0;
     if (a_glFinish) a_glFinish();
 
-    size_t   stride = (size_t)g_w * 4;
-    uint8_t *px = malloc(stride * (size_t)g_h);
-    if (!px) return 0;
     // Which framebuffer is the guest actually on at swap time? A black frame from
     // the default framebuffer means either nothing was drawn or it was drawn
     // somewhere else, and those need different fixes.
     int32_t draw_fb = -1, read_fb = -1, vp[4] = {0,0,0,0};
     int32_t fb_status = -1;
     static uint32_t (*a_glCheckFramebufferStatus)(uint32_t);
-    if (!a_glCheckFramebufferStatus)
+    static void (*a_BindFramebuffer)(uint32_t, uint32_t);
+    static void (*a_GetFbAttachmentParam)(uint32_t, uint32_t, uint32_t, int32_t *);
+    if (!a_glCheckFramebufferStatus) {
         a_glCheckFramebufferStatus = asym("glCheckFramebufferStatus");
+        a_BindFramebuffer = asym("glBindFramebuffer");
+        a_GetFbAttachmentParam = asym("glGetFramebufferAttachmentParameteriv");
+    }
     if (a_glGetIntegerv) {
         a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &draw_fb);
         a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &read_fb);
@@ -1956,8 +2700,123 @@ static unsigned glfb_capture_now(const char *dir) {
     }
     if (a_glCheckFramebufferStatus)
         fb_status = (int32_t)a_glCheckFramebufferStatus(0x8CA9 /* GL_DRAW_FRAMEBUFFER */);
+
+    // The frame lives in the FBO whose color attachment is an eye texture:
+    // fb0 is black by construction (the VR frame goes to eye textures, not
+    // the backbuffer — the old capture read fb0 and reported 0 lit on runs
+    // full of real draws). Find that FBO by its attachment and read it its
+    // own way; fall back to the legacy read of whatever is bound when no eye
+    // texture exists yet.
+    uint32_t src_fb = 0;
+    int32_t src_w = g_w, src_h = g_h;
+    if ((g_eye_tex[0] || g_eye_tex[1]) && a_BindFramebuffer &&
+        a_GetFbAttachmentParam && a_glCheckFramebufferStatus) {
+        for (uint32_t i = 1; i <= g_fbomax && !src_fb; i++) {
+            a_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, i);
+            if (a_glCheckFramebufferStatus(0x8CA8) != 0x8CD5) continue;
+            int32_t otype = 0, oname = 0;
+            a_GetFbAttachmentParam(0x8CA8, 0x8CE0, 0x8CD0, &otype);
+            a_GetFbAttachmentParam(0x8CA8, 0x8CE0, 0x8CD1, &oname);
+            if (otype == 0x1702 /* TEXTURE */ &&
+                ((uint32_t)oname == g_eye_tex[0] ||
+                 (uint32_t)oname == g_eye_tex[1])) {
+                src_fb = i;
+                int32_t tw = 0, th = 0;
+                if (klfb_tex_info((uint32_t)oname, NULL, &tw, &th) && tw > 0 && th > 0) {
+                    src_w = tw;
+                    src_h = th;
+                }
+            }
+        }
+        if (!src_fb)   // not found: put the guest's binding back
+            a_BindFramebuffer(0x8CA8, (uint32_t)(read_fb >= 0 ? read_fb : 0));
+    }
+
+    size_t   stride = (size_t)src_w * 4;
+    uint8_t *px = malloc(stride * (size_t)src_h);
+    if (!px) return 0;
+
+    int32_t rfmt = 0, rtype = 0;
+    if (a_glGetIntegerv) {
+        a_glGetIntegerv(KLFB_IMPLEMENTATION_COLOR_READ_FORMAT, &rfmt);
+        a_glGetIntegerv(KLFB_IMPLEMENTATION_COLOR_READ_TYPE, &rtype);
+    }
     uint32_t pre_err = a_glGetError ? a_glGetError() : 0;
-    a_glReadPixels(0, 0, g_w, g_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    int comps = (rfmt == 0x1907 /* GL_RGB */) ? 3 : 4;
+    if (src_fb && (rtype == 0x1406 /* FLOAT */ || rtype == KLFB_HALF_FLOAT)) {
+        // Float target: read in the implementation's own format/type and tone
+        // map down to 8-bit (klfb_dbg_tone). A direct RGBA/UNSIGNED_BYTE read
+        // here is the INVALID_ENUM the old capture died with. The half path
+        // goes through a 64K-entry LUT: three powf per pixel per swap put the
+        // tone map at the top of the profile (5M pixels at 2304x2198), and a
+        // half float has only 16 bits of input to memoize.
+        static uint8_t tone16[65536];
+        static int tone16_ready;
+        if (rtype == KLFB_HALF_FLOAT && !tone16_ready) {
+            for (int i = 0; i < 65536; i++)
+                tone16[i] = klfb_dbg_tone(klfb_half_to_float((uint16_t)i));
+            tone16_ready = 1;
+        }
+        size_t esz = rtype == 0x1406 ? 4 : 2;
+        void *rbuf = malloc((size_t)src_w * src_h * comps * esz);
+        if (!rbuf) { free(px); return 0; }
+        a_glReadPixels(0, 0, src_w, src_h, rfmt, rtype, rbuf);
+        // Raw-value census, one line per 60 captures: is the eye texture dim
+        // because the CONTENT is dim (fade still down — max/mean low) or
+        // because the debug tone map undersells it (max near/over 1 while the
+        // window shows murk)? KL_GLFB_RAWSTATS=0 turns the line off.
+        {
+            static int rawstats = -1;
+            if (rawstats < 0) {
+                const char *e = getenv("KL_GLFB_RAWSTATS");
+                rawstats = e ? atoi(e) : 1;
+            }
+            static unsigned rs_n;
+            if (rawstats && rs_n++ % 60 == 0) {
+                float vmin = 1e30f, vmax = -1e30f; double vsum = 0;
+                int32_t npx = src_w * src_h;
+                for (int32_t i = 0; i < npx; i++) {
+                    for (int j = 0; j < comps && j < 3; j++) {
+                        float v = rtype == 0x1406
+                                ? ((const float *)rbuf)[i * comps + j]
+                                : klfb_half_to_float(((const uint16_t *)rbuf)[i * comps + j]);
+                        if (v < vmin) vmin = v;
+                        if (v > vmax) vmax = v;
+                        vsum += v;
+                    }
+                }
+                fprintf(stderr,
+                        " [glfb] rawstats fb=%u %dx%d fmt=0x%x type=0x%x: "
+                        "min=%.4f max=%.4f mean=%.5f\n",
+                        src_fb, (int)src_w, (int)src_h, rfmt, rtype,
+                        vmin, vmax, vsum / ((double)npx * (comps < 3 ? comps : 3)));
+            }
+        }
+        if (rtype == KLFB_HALF_FLOAT && comps == 4) {
+            const uint16_t *h = (const uint16_t *)rbuf;
+            for (int32_t i = 0; i < src_w * src_h; i++) {
+                px[i * 4 + 0] = tone16[h[i * 4 + 0]];
+                px[i * 4 + 1] = tone16[h[i * 4 + 1]];
+                px[i * 4 + 2] = tone16[h[i * 4 + 2]];
+                px[i * 4 + 3] = 255;
+            }
+        } else {
+            for (int32_t i = 0; i < src_w * src_h; i++) {
+                float c[4] = {0, 0, 0, 1};
+                for (int j = 0; j < comps; j++)
+                    c[j] = rtype == 0x1406
+                         ? ((float *)rbuf)[i * comps + j]
+                         : klfb_half_to_float(((uint16_t *)rbuf)[i * comps + j]);
+                px[i * 4 + 0] = klfb_dbg_tone(c[0]);
+                px[i * 4 + 1] = klfb_dbg_tone(c[1]);
+                px[i * 4 + 2] = klfb_dbg_tone(c[2]);
+                px[i * 4 + 3] = 255;
+            }
+        }
+        free(rbuf);
+    } else {
+        a_glReadPixels(0, 0, src_w, src_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    }
     // The error could be the readback's own or one the guest left behind —
     // report both rather than blame the readback. Reading the pre-existing one
     // does clear it; this is a host-only diagnostic and the guest's errors on
@@ -1966,12 +2825,14 @@ static unsigned glfb_capture_now(const char *dir) {
     char err_buf[64] = "";
     if (err) snprintf(err_buf, sizeof err_buf, " (GL error 0x%x%s)", err,
                       pre_err ? " — but pre-existing, not the readback's" : "");
+    if (src_fb && read_fb >= 0 && a_BindFramebuffer)
+        a_BindFramebuffer(0x8CA8, (uint32_t)read_fb);   // hand the binding back
 
     // Say whether anything landed. A frame that is uniformly one colour is a clear
     // with no draw, and that is a different outcome from a frame that drew — a
     // difference invisible in a thumbnail of a dark image.
     unsigned long sum = 0; unsigned lit = 0;
-    for (size_t i = 0; i < (size_t)g_w * g_h; i++) {
+    for (size_t i = 0; i < (size_t)src_w * src_h; i++) {
         unsigned lum = px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2];
         sum += lum;
         if (lum > 12) lit++;
@@ -1984,22 +2845,34 @@ static unsigned glfb_capture_now(const char *dir) {
     // be a memcpy, not a render. Everything below stays the default output:
     // PNG to KL_GLFB_OUT, unchanged when no sink is registered.
     if (g_frame_sink) {
-        g_frame_sink(px, g_w, g_h, g_frame_sink_ctx);
+        // KL_GLFB_DUMP_SINK=<dir>: write every 100th sink frame to a PNG.
+        // The sink and the PNG path share this px buffer, so a window that
+        // shows black while these files show content is an SDL-side problem,
+        // not a capture-side one.
+        static const char *sink_dir;
+        static int sink_dir_init;
+        if (!sink_dir_init) { sink_dir = getenv("KL_GLFB_DUMP_SINK"); sink_dir_init = 1; }
+        if (sink_dir && g_presented % 100 == 0) {
+            char spath[600];
+            snprintf(spath, sizeof spath, "%s/sink_%05u.png", sink_dir, g_presented);
+            klfb_write_png(spath, px, src_w, src_h);
+        }
+        g_frame_sink(px, src_w, src_h, g_frame_sink_ctx);
         free(px);
         return ++g_presented;
     }
 
     char path[512];
     snprintf(path, sizeof path, "%s/frame_%03u.png", dir, g_presented);
-    size_t   raw_n = (stride + 1) * (size_t)g_h;
+    size_t   raw_n = (stride + 1) * (size_t)src_h;
     uint8_t *raw = malloc(raw_n);
     uLongf   cn  = compressBound((uLong)raw_n);
     uint8_t *cb  = malloc(cn);
     if (!raw || !cb) { free(px); free(raw); free(cb); return 0; }
-    for (int y = 0; y < g_h; y++) {                // GL bottom-up -> PNG top-down
+    for (int y = 0; y < src_h; y++) {              // GL bottom-up -> PNG top-down
         raw[(stride + 1) * (size_t)y] = 0;
         memcpy(raw + (stride + 1) * (size_t)y + 1,
-               px + stride * (size_t)(g_h - 1 - y), stride);
+               px + stride * (size_t)(src_h - 1 - y), stride);
     }
     if (compress(cb, &cn, raw, (uLong)raw_n) != Z_OK) {
         free(px); free(raw); free(cb); return 0;
@@ -2008,7 +2881,7 @@ static unsigned glfb_capture_now(const char *dir) {
     if (!f) { free(px); free(raw); free(cb); return 0; }
     static const uint8_t sig[8] = {0x89,'P','N','G',13,10,26,10};
     fwrite(sig, 1, 8, f);
-    uint8_t ih[13]; be32(ih, (uint32_t)g_w); be32(ih + 4, (uint32_t)g_h);
+    uint8_t ih[13]; be32(ih, (uint32_t)src_w); be32(ih + 4, (uint32_t)src_h);
     ih[8] = 8; ih[9] = 6; ih[10] = ih[11] = ih[12] = 0;
     chunk(f, "IHDR", ih, 13);
     chunk(f, "IDAT", cb, (uint32_t)cn);
@@ -2017,38 +2890,49 @@ static unsigned glfb_capture_now(const char *dir) {
     klfb_report_draws();
     // fb0 has been measured black with every draw landing on FBOs instead
     // (the VR frame goes to eye textures, not the backbuffer). Census the
-    // FBOs: bind each as READ, and if complete, count lit pixels — this names
-    // the framebuffer the picture is actually in.
+    // FBOs the guest actually created — format-correctly, see klfb_probe_fbo
+    // — and the one with lit pixels names where the picture is.
     {
         static void (*a_glBindFramebuffer)(uint32_t, uint32_t);
         if (!a_glBindFramebuffer) a_glBindFramebuffer = asym("glBindFramebuffer");
+        // KL_GLFB_DUMP_FBOS=1: the census also writes one PNG per FBO
+        // (frame_NNN_fbM.png, tone-mapped like the capture). Intermediates —
+        // the post-processing chain, the MSAA scene target — are otherwise
+        // only lit-counts on a log line.
+        static int dump_fbos = -1;
+        if (dump_fbos < 0) dump_fbos = getenv("KL_GLFB_DUMP_FBOS") != NULL;
         if (a_glBindFramebuffer) {
             int32_t save_fb = read_fb >= 0 ? read_fb : 0;
-            for (uint32_t i = 1; i <= 8; i++) {
-                a_glBindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, i);
-                if (a_glCheckFramebufferStatus &&
-                    a_glCheckFramebufferStatus(0x8CA8) != 0x8CD5) continue;
-                memset(px, 0, stride * 4);
-                a_glReadPixels(0, 0, g_w, g_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
-                unsigned long fsum = 0, flit = 0;
-                for (size_t p2 = 0; p2 < (size_t)g_w * g_h; p2++) {
-                    unsigned lum = px[p2 * 4] + px[p2 * 4 + 1] + px[p2 * 4 + 2];
-                    fsum += lum;
-                    if (lum > 12) flit++;
+            float  *fbuf = malloc((size_t)g_w * g_h * 4 * sizeof(float));
+            uint8_t *bbuf = malloc((size_t)g_w * g_h * 4);
+            uint8_t *dbuf = dump_fbos ? malloc((size_t)g_w * g_h * 4) : NULL;
+            if (fbuf && bbuf) {
+                for (uint32_t i = 1; i <= g_fbomax; i++) {
+                    char note[160] = "";
+                    int32_t dw = 0, dh = 0;
+                    unsigned long flit = klfb_probe_fbo(i, fbuf, bbuf,
+                                                        note, sizeof note,
+                                                        dbuf, &dw, &dh);
+                    if (!strcmp(note, "incomplete")) continue;
+                    fprintf(stderr, "  [glfb] census fbo%u: %lu lit — %s\n",
+                            i, flit, note);
+                    if (dbuf && dw > 0 && dh > 0) {
+                        char fpath[600];
+                        snprintf(fpath, sizeof fpath, "%s/frame_%03u_fb%u.png",
+                                 dir, g_presented, i);
+                        klfb_write_png(fpath, dbuf, dw, dh);
+                    }
                 }
-                if (flit || i <= 4)
-                    fprintf(stderr, "  [glfb] census fbo%u: %lu/%u lit, mean luma %lu\n",
-                            i, flit, (unsigned)(g_w * g_h),
-                            fsum / ((unsigned long)g_w * g_h * 3));
             }
+            free(fbuf); free(bbuf); free(dbuf);
             a_glBindFramebuffer(0x8CA8, (uint32_t)save_fb);
         }
     }
     uint64_t cap_tid = 0; pthread_threadid_np(NULL, &cap_tid);
     fprintf(stderr, "  [glfb] %s: %u/%u lit, mean luma %lu%s "
-                    "[draw_fb=%d read_fb=%d fb_status=0x%x viewport %dx%d+%d+%d] (captured on t%llu)\n", path, lit,
-            (unsigned)(g_w * g_h), sum / ((unsigned long)g_w * g_h * 3),
-            err_buf, draw_fb, read_fb, fb_status, vp[2], vp[3], vp[0], vp[1],
+                    "[draw_fb=%d read_fb=%d src=fb%u fb_status=0x%x viewport %dx%d+%d+%d] (captured on t%llu)\n", path, lit,
+            (unsigned)(src_w * src_h), sum / ((unsigned long)src_w * src_h * 3),
+            err_buf, draw_fb, read_fb, src_fb, fb_status, vp[2], vp[3], vp[0], vp[1],
             (unsigned long long)cap_tid);
     free(px); free(raw); free(cb);
     return ++g_presented;

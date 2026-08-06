@@ -7,6 +7,7 @@
 //   3. local statics    — small bionic-isms defined right here
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <string.h>
 #include <strings.h>
@@ -136,7 +137,44 @@ FILE *kl_host_file(void *guest) {
 static int kl_fputc(int c, void *f)                { return fputc(c, kl_host_file(f)); }
 static int kl_fputs(const char *s, void *f)        { return fputs(s, kl_host_file(f)); }
 static size_t kl_fwrite(const void *p, size_t a, size_t b, void *f) { return fwrite(p, a, b, kl_host_file(f)); }
-static size_t kl_fread(void *p, size_t a, size_t b, void *f)        { return fread(p, a, b, kl_host_file(f)); }
+// KL_TRACE_IO=1: one line a second with the running fread byte total — the
+// async loader's throughput is the loading-screen pacing question. Bytes are
+// attributed per open file (kl_file_path) so a slow trickle names its file.
+extern const char *kl_file_path(void *f);
+static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
+    FILE *hf = kl_host_file(f);
+    size_t r = fread(p, a, b, hf);
+    static int on = -1;
+    if (on < 0) on = getenv("KL_TRACE_IO") != NULL;
+    if (on) {
+        static _Atomic unsigned long long bytes, lines;
+        static _Atomic time_t last;
+        static struct { char path[160]; unsigned long long bytes; } per[32];
+        static int nper;
+        if (r) {
+            const char *path = kl_file_path(f);
+            if (!path) path = "?";
+            int i;
+            for (i = 0; i < nper; i++) if (!strcmp(per[i].path, path)) break;
+            if (i == nper && nper < 32) {
+                snprintf(per[nper].path, sizeof per[nper].path, "%s", path);
+                nper++;
+            }
+            if (i < nper) per[i].bytes += (unsigned long long)r * a;
+        }
+        unsigned long long nb = atomic_fetch_add(&bytes, r * a) + r * a;
+        time_t now = time(NULL), prev = atomic_load(&last);
+        if (now != prev && atomic_compare_exchange_strong(&last, &prev, now)) {
+            fprintf(stderr, "  [io] fread total %.1f MB after %llu calls\n",
+                    (double)nb / 1048576.0, (unsigned long long)atomic_fetch_add(&lines,0));
+            for (int i = 0; i < nper && i < 6; i++)
+                fprintf(stderr, "        %8.1f MB  %s\n",
+                        (double)per[i].bytes / 1048576.0, per[i].path);
+        }
+        atomic_fetch_add(&lines, 1);
+    }
+    return r;
+}
 static int kl_fclose(void *f)                      { return fclose(kl_host_file(f)); }
 static int kl_fflush(void *f)                      { return fflush(f ? kl_host_file(f) : NULL); }
 static char *kl_fgets(char *s, int n, void *f)     { return fgets(s, n, kl_host_file(f)); }
@@ -149,6 +187,244 @@ static int kl_fseeko(void *f, off_t o, int w)      { return fseeko(kl_host_file(
 static long kl_ftell(void *f)                      { return ftell(kl_host_file(f)); }
 static off_t kl_ftello(void *f)                    { return ftello(kl_host_file(f)); }
 static int kl_setvbuf(void *f, char *b, int m, size_t n) { return setvbuf(kl_host_file(f), b, m, n); }
+
+// ---------- sockets: bionic -> Darwin option constants ----------
+// socket()/bind()/connect() forward verbatim — the address families, socket
+// types and protocol numbers agree. The SOL_SOCKET *level* and its option
+// numbers do not: bionic SOL_SOCKET is 1, Darwin's is 0xffff, and the option
+// numbers diverge (SO_RCVTIMEO 20 vs 0x1006 — forwarded raw it lands on no
+// valid option, setsockopt fails EINVAL, and Unity's Ping prints "Error
+// setting socket options" forever). Payload layouts (int, timeval, linger)
+// match, so a pure constant remap suffices.
+static int kl_sock_optname(int opt) {
+    switch (opt) {                          // bionic SOL_SOCKET numbers
+    case 1:  return SO_DEBUG;
+    case 2:  return SO_REUSEADDR;
+    case 3:  return SO_TYPE;
+    case 4:  return SO_ERROR;
+    case 5:  return SO_DONTROUTE;
+    case 6:  return SO_BROADCAST;
+    case 7:  return SO_SNDBUF;
+    case 8:  return SO_RCVBUF;
+    case 9:  return SO_KEEPALIVE;
+    case 10: return SO_OOBINLINE;
+    case 13: return SO_LINGER;
+    case 15: return SO_REUSEPORT;
+    case 18: return SO_RCVLOWAT;
+    case 19: return SO_SNDLOWAT;
+    case 20: case 66: return SO_RCVTIMEO;   // 66 = SO_RCVTIMEO_NEW
+    case 21: case 67: return SO_SNDTIMEO;   // 67 = SO_SNDTIMEO_NEW
+    default: return opt;                    // IPPROTO_* options: numbers agree
+    }
+}
+static int kl_setsockopt(int fd, int level, int opt, const void *val, socklen_t len) {
+    if (level == 1) level = SOL_SOCKET;     // bionic SOL_SOCKET -> Darwin's
+    int ropt = level == SOL_SOCKET ? kl_sock_optname(opt) : opt;
+    int r = setsockopt(fd, level, ropt, val, len);
+    if (r) fprintf(stderr, "  [sock] setsockopt(fd=%d level=%d opt=%d->%d) FAILED: %s\n",
+                   fd, level, opt, ropt, strerror(errno));
+    return r;
+}
+static int kl_getsockopt(int fd, int level, int opt, void *val, socklen_t *len) {
+    if (level == 1) level = SOL_SOCKET;
+    int ropt = level == SOL_SOCKET ? kl_sock_optname(opt) : opt;
+    return getsockopt(fd, level, ropt, val, len);
+}
+
+// KL_TRACE_NET=1: name resolution and connect attempts, with durations. The
+// loading bar creeps for 20k+ frames with zero asset I/O — sequential network
+// timeouts are the remaining clock that could pace it.
+static int kl_net_trace(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("KL_TRACE_NET") != NULL;
+    return on;
+}
+// KL_NET_OFFLINE=1: present a headset with no network at all — a valid real
+// config, and the honest one here: anything certificate/TEE-backed (Oculus
+// platform, leaderboards) can never work, and failing fast keeps the guest on
+// its offline path instead of paying TCP timeouts to unreachable endpoints.
+static int kl_net_offline(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("KL_NET_OFFLINE") != NULL;
+    return off;
+}
+static void kl_sa_to_guest(struct sockaddr *sa, socklen_t *len);
+static int kl_getaddrinfo(const char *node, const char *serv,
+                          const void *hints, void *res) {
+    if (kl_net_offline()) {
+        if (kl_net_trace())
+            fprintf(stderr, "  [net] getaddrinfo(\"%s\") -> EAI_NONAME (offline)\n",
+                    node ? node : "(null)");
+        return EAI_NONAME;
+    }
+    struct addrinfo *hres = NULL;
+    int r = getaddrinfo(node, serv, hints, &hres);
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] getaddrinfo(\"%s\",\"%s\") -> %d\n",
+                node ? node : "(null)", serv ? serv : "", r);
+    // bionic and Darwin share the addrinfo layout (canonname before addr —
+    // proven by the Ping callsite, which reads ai_addr at +0x20); only the
+    // sockaddr inside differs (Darwin's sa_len). Convert each in place and
+    // hand the host's own list over; kl_freeaddrinfo is plain freeaddrinfo.
+    for (struct addrinfo *a = hres; a; a = a->ai_next) {
+        if (a->ai_addr && a->ai_addrlen) {
+            socklen_t gl = (socklen_t)a->ai_addrlen;
+            kl_sa_to_guest(a->ai_addr, &gl);
+        }
+    }
+    *(void **)res = hres;
+    return r;
+}
+// sockaddr layout differs past the family: bionic has no sa_len byte, Darwin
+// leads with it — so a guest-built sockaddr_in reads as family 0 here, and
+// every forwarded connect/sendto failed EINVAL (the "Ping" storm is one).
+// Convert through a local: bionic family (u16 at 0) -> Darwin sa_len+sa_family,
+// and AF_INET6 10 -> 30 on top of that. Port/addr offsets are identical.
+static int kl_sa_to_host(struct sockaddr_storage *dst, const struct sockaddr *sa,
+                         socklen_t len) {
+    if (!sa || len > sizeof *dst) return -1;
+    memcpy(dst, sa, len);
+    unsigned fam = *(const uint16_t *)sa;
+    if (fam == 10) fam = AF_INET6;
+    memmove((uint8_t *)dst + 2, (const uint8_t *)sa + 2, (size_t)len - 2);
+    dst->ss_family = (uint8_t)fam;
+    dst->ss_len = (uint8_t)len;
+    return 0;
+}
+static void kl_sa_to_guest(struct sockaddr *sa, socklen_t *len) {
+    if (!sa || !len) return;
+    unsigned fam = sa->sa_family;
+    if (fam == AF_INET6) fam = 10;
+    memmove((uint8_t *)sa + 2, (const uint8_t *)sa + 2, (size_t)*len - 2);
+    *(uint16_t *)sa = (uint16_t)fam;
+}
+static int kl_socket(int domain, int type, int protocol) {
+    // bionic AF_INET6=10 -> Darwin 30; SOCK_* types agree.
+    if (domain == 10) domain = AF_INET6;
+    int fd = socket(domain, type, protocol);
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] socket(dom=%d type=%d proto=%d) -> fd %d%s\n",
+                domain, type, protocol, fd, fd < 0 ? strerror(errno) : "");
+    return fd;
+}
+static int kl_connect(int fd, const struct sockaddr *sa, socklen_t len) {
+    if (kl_net_offline()) {
+        if (kl_net_trace()) fprintf(stderr, "  [net] connect() -> ENETUNREACH (offline)\n");
+        errno = ENETUNREACH;
+        return -1;
+    }
+    char host[80] = "?";
+    if (!sa) {
+        static int said;
+        if (!said++) fprintf(stderr, "  [net] connect(fd=%d, NULL, %d) — caller pc=%p\n",
+                             fd, (int)len, __builtin_return_address(0));
+    }
+    struct sockaddr_storage hs;
+    if (kl_sa_to_host(&hs, sa, len) == 0) {
+        sa = (struct sockaddr *)&hs;
+        if (hs.ss_family == AF_INET) {
+            const struct sockaddr_in *in = (const struct sockaddr_in *)&hs;
+            inet_ntop(AF_INET, &in->sin_addr, host, sizeof host);
+            char *hp = host + strlen(host);
+            snprintf(hp, sizeof host - (hp - host), ":%d", ntohs(in->sin_port));
+        } else if (hs.ss_family == AF_INET6) {
+            const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)&hs;
+            host[0] = '[';
+            inet_ntop(AF_INET6, &in6->sin6_addr, host + 1, sizeof host - 20);
+            char *hp = host + strlen(host);
+            snprintf(hp, sizeof host - (hp - host), "]:%d", ntohs(in6->sin6_port));
+        }
+    }
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int r = connect(fd, sa, len);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] connect(%s) -> %d (%s) in %.2fs [fam=%d len=%d]\n", host, r,
+                r ? strerror(errno) : "ok",
+                (double)(t1.tv_sec - t0.tv_sec) + 1e-9 * (double)(t1.tv_nsec - t0.tv_nsec),
+                sa ? ((const struct sockaddr_storage *)sa)->ss_family : -1, (int)len);
+    return r;
+}
+// The other sockaddr carriers, same conversion. msg_name inside msghdr is
+// left alone until a guest proves it uses sendmsg/recvmsg with an address.
+static int kl_bind(int fd, const struct sockaddr *sa, socklen_t len) {
+    struct sockaddr_storage hs;
+    if (kl_sa_to_host(&hs, sa, len) == 0) { sa = (struct sockaddr *)&hs; }
+    return bind(fd, sa, len);
+}
+static ssize_t kl_sendto(int fd, const void *buf, size_t n, int flags,
+                         const struct sockaddr *sa, socklen_t len) {
+    struct sockaddr_storage hs;
+    if (sa && kl_sa_to_host(&hs, sa, len) == 0) { sa = (struct sockaddr *)&hs; }
+    return sendto(fd, buf, n, flags, sa, len);
+}
+static int kl_accept(int fd, struct sockaddr *sa, socklen_t *len) {
+    int r = accept(fd, sa, len);
+    if (r >= 0) kl_sa_to_guest(sa, len);
+    return r;
+}
+static ssize_t kl_recvfrom(int fd, void *buf, size_t n, int flags,
+                           struct sockaddr *sa, socklen_t *len) {
+    ssize_t r = recvfrom(fd, buf, n, flags, sa, len);
+    if (r >= 0) kl_sa_to_guest(sa, len);
+    return r;
+}
+static int kl_getpeername(int fd, struct sockaddr *sa, socklen_t *len) {
+    int r = getpeername(fd, sa, len);
+    if (r == 0) kl_sa_to_guest(sa, len);
+    return r;
+}
+static int kl_getsockname(int fd, struct sockaddr *sa, socklen_t *len) {
+    int r = getsockname(fd, sa, len);
+    if (r == 0) kl_sa_to_guest(sa, len);
+    return r;
+}
+// Same throughput meter as kl_fread, for the raw-read path. KL_TRACE_IO=1.
+static ssize_t kl_read(int fd, void *buf, size_t n) {
+    ssize_t r = read(fd, buf, n);
+    static int on = -1;
+    if (on < 0) on = getenv("KL_TRACE_IO") != NULL;
+    if (on && r > 0) {
+        static _Atomic unsigned long long bytes;
+        static _Atomic time_t last;
+        unsigned long long nb = atomic_fetch_add(&bytes, (unsigned long long)r) + (unsigned long long)r;
+        time_t now = time(NULL), prev = atomic_load(&last);
+        if (now != prev && atomic_compare_exchange_strong(&last, &prev, now))
+            fprintf(stderr, "  [io] read total %.1f MB\n", (double)nb / 1048576.0);
+    }
+    return r;
+}
+
+// The loader thread was caught polling: guest code -> usleep, 99% of its
+// samples. KL_TRACE_SLEEP=1 histograms the requested durations once a second
+// to say what the poll period actually is.
+static int kl_usleep(unsigned usec) {
+    static int on = -1;
+    if (on < 0) on = getenv("KL_TRACE_SLEEP") != NULL;
+    if (on) {
+        static _Atomic unsigned long long cnt, usec_sum, usec_max;
+        static _Atomic time_t last;
+        unsigned long long c = atomic_fetch_add(&cnt, 1) + 1;
+        unsigned long long s = atomic_fetch_add(&usec_sum, usec) + usec;
+        unsigned long long m = atomic_load(&usec_max);
+        while (usec > m && !atomic_compare_exchange_strong(&usec_max, &m, usec)) {}
+        time_t now = time(NULL), prev = atomic_load(&last);
+        if (now != prev && atomic_compare_exchange_strong(&last, &prev, now))
+            fprintf(stderr, "  [sleep] usleep x%llu, mean %llu us, max %llu us\n",
+                    c, s / (c ? c : 1), (unsigned long long)atomic_load(&usec_max));
+    }
+    // KL_USLEEP_CAP=<usec>: clamp the guest's sleep. The loader thread polls
+    // with ~5ms usleeps; if that poll IS the loading pace, capping it to
+    // 50us moves the bottleneck somewhere measurable.
+    static int cap = -1;
+    if (cap < 0) {
+        const char *e = getenv("KL_USLEEP_CAP");
+        cap = e ? atoi(e) : 0;
+    }
+    if (cap > 0 && (int)usec > cap) usec = (unsigned)cap;
+    return usleep(usec);
+}
 
 // ---------- guest va_list consumers that live here ----------
 static int kl_vfprintf(void *f, const char *fmt, void *gva) {
@@ -244,6 +520,13 @@ static const kl_entry g_shim[] = {
     E("sscanf", klv_sscanf), E("fscanf", klv_fscanf), E("syslog", klv_syslog),
     E("__android_log_print", klv_android_log_print),
     E("open", klv_open), E("fcntl", klv_fcntl), E("ioctl", klv_ioctl),
+    E("setsockopt", kl_setsockopt), E("getsockopt", kl_getsockopt),
+    E("read", kl_read), E("usleep", kl_usleep),
+    E("getaddrinfo", kl_getaddrinfo), E("connect", kl_connect),
+    E("socket", kl_socket),
+    E("bind", kl_bind), E("sendto", kl_sendto), E("accept", kl_accept),
+    E("recvfrom", kl_recvfrom), E("getpeername", kl_getpeername),
+    E("getsockname", kl_getsockname),
     E("strtold", klv_strtold), E("wcstold", klv_wcstold), E("strtold_l", klv_strtold_l),
     E("swprintf", klb_swprintf), E("execl", klb_execl), E("syscall", klb_syscall),
 

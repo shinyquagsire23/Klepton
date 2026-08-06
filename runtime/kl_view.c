@@ -94,7 +94,7 @@ int kl_view_main(const char *libdir) {
         fprintf(stderr, "view: SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_Window *win = SDL_CreateWindow("Klepton — Beat Saber, one eye",
+    SDL_Window *win = SDL_CreateWindow("Klepton",
                                        KL_VIEW_WIN_W, KL_VIEW_WIN_H, 0);
     if (!win) {
         fprintf(stderr, "view: SDL_CreateWindow failed: %s\n", SDL_GetError());

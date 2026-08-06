@@ -3,6 +3,7 @@
 // Everything whose signature *and* layout match is in kl_libc_table.h instead.
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <errno.h>
 #include <time.h>
@@ -421,11 +422,37 @@ static void kl_fs_trace(const char *op, const char *path, int failed) {
     else        fprintf(stderr, "[fs] %s(\"%s\") ok\n", op, path);
 }
 
+void kl_file_note(void *f, const char *path);
 FILE *klb_fopen(const char *path, const char *mode) {
     KL_GUEST_PATH(path);
     FILE *f = fopen(_p, mode);
     kl_fs_trace("fopen", path, f == NULL);
+    if (f) kl_file_note(f, path);
+    // /proc/cpuinfo gets re-read ~150x/s during the loading crawl — log the
+    // caller once so the polling site is an address, not a rumour.
+    if (f && strstr(path, "/proc/")) {
+        static int said;
+        if (!said++) fprintf(stderr, "  [proc] fopen(\"%s\") from guest pc=%p\n",
+                             path, __builtin_return_address(0));
+    }
     return f;
+}
+
+// guest FILE* (here: a host FILE* the guest holds) -> the path it was opened
+// with, so KL_TRACE_IO can say WHICH file a slow read stream belongs to.
+#define KL_FILE_REGISTRY 256
+static struct { void *f; const char *path; } g_file_reg[KL_FILE_REGISTRY];
+static int g_file_reg_n;
+void kl_file_note(void *f, const char *path) {
+    if (g_file_reg_n >= KL_FILE_REGISTRY) return;
+    g_file_reg[g_file_reg_n].f = f;
+    g_file_reg[g_file_reg_n].path = strdup(path);
+    g_file_reg_n++;
+}
+const char *kl_file_path(void *f) {
+    for (int i = 0; i < g_file_reg_n; i++)
+        if (g_file_reg[i].f == f) return g_file_reg[i].path;
+    return NULL;
 }
 int klb_access(const char *path, int mode) {
     KL_GUEST_PATH(path);
@@ -631,9 +658,38 @@ static void ts_normalise(struct timespec *t) {
     while (t->tv_nsec < 0)            { t->tv_nsec += 1000000000L; t->tv_sec--; }
 }
 
+static long kl_futex_impl(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts);
 static long kl_futex(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, futex_init);
+    // KL_TRACE_FUTEX=1: once a second, waits (split by timeout expiry vs
+    // wakeup) and wakes. The async loader's pace smells like a wake that
+    // never arrives, every iteration paying the full timeout.
+    static int trace = -1;
+    if (trace < 0) trace = getenv("KL_TRACE_FUTEX") != NULL;
+    if (trace) {
+        static _Atomic unsigned long long waits, timeouts, woken, wakes;
+        static _Atomic time_t last;
+        int is_wait = (op & 0xf) == 0 || (op & 0xf) == 9;   // WAIT / WAIT_BITSET base
+        unsigned long long w  = atomic_fetch_add(&waits, is_wait) + is_wait;
+        unsigned long long wk = atomic_fetch_add(&wakes, !is_wait) + !is_wait;
+        (void)wk;
+        time_t now = time(NULL), prev = atomic_load(&last);
+        if (now != prev && atomic_compare_exchange_strong(&last, &prev, now))
+            fprintf(stderr, "  [futex] waits=%llu (timeout=%llu woken=%llu) wakes=%llu\n",
+                    w, (unsigned long long)atomic_load(&timeouts),
+                    (unsigned long long)atomic_load(&woken), wk);
+        // Result accounting happens on the way out below via these two.
+        long r = kl_futex_impl(uaddr, op, val, ts);
+        if (is_wait) {
+            if (r == 0) atomic_fetch_add(&woken, 1);
+            else if (errno == ETIMEDOUT) atomic_fetch_add(&timeouts, 1);
+        }
+        return r;
+    }
+    return kl_futex_impl(uaddr, op, val, ts);
+}
+static long kl_futex_impl(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts) {
     int      base = op & ~(KL_FUTEX_PRIVATE_FLAG | KL_FUTEX_CLOCK_REALTIME);
     unsigned b    = futex_bucket(uaddr);
 

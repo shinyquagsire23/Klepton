@@ -514,6 +514,16 @@ int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
         ok &= enc_b(spc, vpc, &patch);
         if (!ok) { note_refusal(word); st->refused++; continue; }
 
+        // KL_X18_MAP=<file>: "pool_addr site_addr" per site, so a guest return
+        // address caught in a shim (always a veneer address) can be mapped back
+        // to the call site in the image.
+        {
+            static FILE *mapf;
+            static int map_init;
+            if (!map_init) { mapf = getenv("KL_X18_MAP") ? fopen(getenv("KL_X18_MAP"), "a") : NULL; map_init = 1; }
+            if (mapf) { fprintf(mapf, "%llx %llx\n", (unsigned long long)vpc, (unsigned long long)spc); fflush(mapf); }
+        }
+
         memcpy(out, body, k * 4);
         out += k;
         w[i] = patch;

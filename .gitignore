@@ -28,3 +28,5 @@ CLAUDE.md
 
 # vendored ANGLE toolchain + build (too large to commit)
 vendor/
+fbo_dump/
+metal_workload.trace/

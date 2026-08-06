@@ -306,6 +306,31 @@ static int recon_run(int view_pump) {
         unsigned frames = fenv ? (unsigned)strtoul(fenv, NULL, 10) : 0;
         if (frames || view_pump) {
             void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
+            if (getenv("KL_POKE_CAP") || !getenv("KL_POKE_CAP_OFF")) {
+                // libunity's texture-unit cap, direct from the horse's mouth:
+                // the singleton getter at vaddr 0x313710 returns *(base +
+                // 0x122e340), and GfxDeviceGLES's SetTexture rejects units >=
+                // *(singleton + 0xe8) with "Invalid texture unit!". Unity
+                // defaults it to 32 without ever querying GL, while its
+                // HLSLCC-baked sampler bindings reach unit 35 on the post
+                // passes — so the reject preempted the binds and the samplers
+                // read stale unit-0 textures. Default is poke 64, matching the
+                // vendored ANGLE rebuild (kMaxShaderSamplers=32, combined 64);
+                // KL_POKE_CAP=<n> overrides, KL_POKE_CAP_OFF=1 leaves it alone.
+                kl_image *u = kl_find_image("libunity.so");
+                if (u) {
+                    uint8_t *ub = (uint8_t *)kl_base(u);
+                    uint8_t *singleton = *(uint8_t **)(ub + 0x122e340);
+                    const char *pv = getenv("KL_POKE_CAP");
+                    int poke_n = pv ? atoi(pv) : 64;
+                    if (poke_n > 1 && singleton &&
+                        *(int32_t *)(singleton + 0xe8) < poke_n) {
+                        fprintf(stderr, "  [poke] texture-unit cap@+0xe8 %d -> %d\n",
+                                *(int32_t *)(singleton + 0xe8), poke_n);
+                        *(int32_t *)(singleton + 0xe8) = poke_n;
+                    }
+                }
+            }
             if (view_pump)
                 printf("\n=== recon: pumping frames until the viewer closes ===\n");
             else

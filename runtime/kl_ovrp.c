@@ -338,6 +338,7 @@ static uint64_t klovrp_GetNativeXrApiType(int *out) {
 // IVRDeviceCallback_CreateEyeTextureResources). fmt=2 maps to sRGB, matching
 // the eye-sized color textures Unity allocates for itself (0x8c43).
 #include "kl_egl.h"
+#include "kl_glfb.h"      // kl_glfb_note_eye_texture — the capture's eye-FBO seam
 // GL_RGBA16F: Unity renders the scene into an RGBA16F MSAA renderbuffer
 // (measured: fmt 0x881a, samples=4, via the blit probe), and ES 3.0 makes a
 // float->unorm blit INVALID_OPERATION — the eye texture must be float to
@@ -355,9 +356,20 @@ static uint64_t klovrp_SetupEyeTexture2(int eye, int stage, uintptr_t handle,
     }
     fprintf(stderr, "  [ovrp] SetupEyeTexture2(eye=%d stage=%d) -> tex=%zu %dx%d\n",
             eye, stage, (size_t)handle, w, h);
+    // The capture reads the frame back from the FBO this texture is attached
+    // to — tell kl_glfb which names are eyes (it is a no-op consumer when the
+    // null driver is doing the "rendering").
+    kl_glfb_note_eye_texture(eye, (uint32_t)handle);
     if (gl_BindTexture && gl_TexStorage2D) {
         gl_BindTexture(0x0DE1 /* GL_TEXTURE_2D */, (uint32_t)handle);
-        gl_TexStorage2D(0x0DE1, 1, KL_OVRP_TEXFMT_EYE, w, h);
+        // Allocate h-by-w, not w-by-h: the guest's own eye-resolve blit writes
+        // a (0,0)-(h,w) region (measured: rb 2198x2304, blit rect 2198x2304,
+        // args w=2304 h=2198), so the texture must be h wide and w tall or the
+        // blit clips — losing a strip of the picture and leaving an
+        // unwritten column of stale garbage at the right edge (the "narrow
+        // vertical line" in the viewer). Whether the real signature orders
+        // these h,w or Unity pre-transposes, the blit rect is ground truth.
+        gl_TexStorage2D(0x0DE1, 1, KL_OVRP_TEXFMT_EYE, h, w);
     }
     return 1;
 }

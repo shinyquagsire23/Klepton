@@ -89,7 +89,19 @@ answers GL and kl_glfb never initializes.
   enables the blit-state log line.
 - `KL_GLFB_DRAW_PROBE=1` — after each of the first 12 scene-sized draws (32+
   vertices), read back the centre 64x64 and report lit-pixel count and mean
-  luma.
+  luma. `KL_GLFB_DRAW_PROBE_N` overrides the quota (0 = unlimited),
+  `KL_GLFB_DRAW_PROBE_MIN` lowers the vert floor (the frame's last draws are
+  small, and one of them may be the one you're hunting).
+- `KL_GLFB_BLIT_PROBE=1` — read back the source before and the destination
+  after each `glBlitFramebuffer`, and put `glClear`/`glClearColor`/
+  `glInvalidateFramebuffer`/renderbuffer-storage on the same timeline as the
+  draws (one line each, FBO/program/viewport/texture named). The instrument
+  that answered "draws lit, blit reads black".
+- `KL_GLFB_NO_INVALIDATE=1` — don't forward `glInvalidateFramebuffer`.
+  ANGLE/Metal actually discards (memoryless attachments), so this tests
+  whether an invalidate is the eraser. Diagnostic only.
+- `KL_GLFB_DUMP_PROGRAM=N` — at link time, print the captured sources of the
+  shaders attached to program N (turns the timeline's `program=N` into text).
 - `KL_GLFB_TEX_LIMIT=N` — perform only the first N `glTexSubImage2D` uploads
   and drop the rest; storage allocations still happen, so only texel contents
   go missing. Bisects the upload stream in situ. Default unlimited.
@@ -109,8 +121,66 @@ answers GL and kl_glfb never initializes.
   thread), because the swap itself does not.
 - `KL_GLFB_OUT_EVERY=N` — throttle the PNG capture to every Nth swap (default
   1). Applies to the file path only; a registered frame sink gets every swap.
+- `KL_GLFB_DUMP_FBOS=1` — alongside each `KL_GLFB_OUT` capture, write one PNG
+  per live FBO (`frame_NNN_fbM.png`, same tone map). The intermediates — MSAA
+  scene target, eye textures, the R11F bloom pyramid (blitted to RGBA16F for
+  the read) — become inspectable, not just lit-counts. Reads are clipped to
+  the `KL_GLFB_SIZE` buffers, so oversized attachments dump their top-left.
+- `KL_GLFB_DUMP_SINK=<dir>` — with a frame sink registered (the viewer), write
+  every 100th sink buffer to `<dir>/sink_NNNNN.png`. A black window with
+  content in these files is an SDL-side problem; black files are capture-side.
+- `KL_GLFB_RAWSTATS=0` — silence the per-60-captures line reporting the eye
+  texture's raw (pre-tone-map) min/max/mean. On by default; it is how the
+  "very dark" picture was shown to be 1e-3 linear content, not a bad curve.
+- `KL_GLFB_EXPOSURE=<x>` — multiply the linear eye-texture value by <x> before
+  the debug tone map (default 1). Makes the loading screen watchable; it is a
+  viewing aid, not a fix — the content really is ~1e-3 while loading runs.
+- `KL_GLFB_GAMMA=<g>` — override the tone map's encode exponent (default
+  1/2.2). Lower brightens mid-tones.
+
+## Networking (`runtime/kl_shim.c`)
+
+The socket layer translates bionic→Darwin: `SOL_SOCKET` level + option numbers
+in setsockopt/getsockopt, the `sa_len` byte and `AF_INET6` (10 vs 30) in every
+sockaddr carrier, and the addrinfo list (same struct layout on both — only the
+sockaddrs inside need converting). Without all three, Unity's Ping and the
+gamelift region probes failed EINVAL in a retry storm.
+
+- `KL_TRACE_NET=1` — log `socket`/`getaddrinfo`/`connect` with arguments and
+  durations. Read by `kl_shim.c`.
+- `KL_NET_OFFLINE=1` — getaddrinfo fails `EAI_NONAME` and connect fails
+  `ENETUNREACH` immediately: a headset with no network. NOTE: Beat Saber
+  1.28 aborts in libil2cpp on hard DNS failure during init — this mode
+  currently crashes the guest; kept for titles that tolerate it.
+
+## Loader diagnostics (`runtime/kl_shim.c`, `runtime/kl_libc.c`)
+
+Built for the loading-pace investigation; all default off.
+
+- `KL_TRACE_IO=1` — once a second: cumulative guest `fread`/`read` bytes,
+  fread attributed per open file. This is how the "slow asset loading"
+  hypothesis died: bulk reads stop within seconds; the only continuing trickle
+  is libunity re-reading `/proc/cpuinfo` once per frame.
+- `KL_TRACE_SLEEP=1` — once a second: usleep count/mean/max.
+- `KL_TRACE_FUTEX=1` — once a second: futex waits split timeout-vs-woken, and
+  wakes. The loading crawl came with zero timeouts — the wake path is healthy.
+- `KL_USLEEP_CAP=<usec>` — clamp every guest usleep. Proved the ~5 ms polling
+  loop is a watcher, not the loading pacer.
+- `KL_X18_MAP=<file>` — append "veneer_addr site_addr" per patched x18 site,
+  so a guest pc captured in a shim maps back to its call site.
+- `KL_TRACE_IMAGES=1` — per-image base/span; needed to turn a guest pc into a
+  file offset (`pc - image base`, e.g. the connect-NULL site at
+  libunity+0x966964).
 
 ## Viewer (`runtime/kl_view.c`, `tests/t_boot.c`)
+
+- `KL_POKE_CAP=<n>` — at frame-pump start, overwrite libunity's texture-unit
+  cap (the value its `SetTexture` path checks before logging "Invalid texture
+  unit!"; read via the singleton at libunity+0x122e340, field +0xe8) with n.
+  **Default is 64**, matching the 32-sampler ANGLE rebuild: Unity defaults
+  the cap to 32 without ever querying GL for it, while its HLSLCC-baked
+  sampler bindings reach unit 35 on the post passes. `KL_POKE_CAP_OFF=1`
+  leaves the field alone.
 
 - `KL_VIEW=1` — interactive one-eye viewer on SDL3; WASD+mouse-look drives
   the head pose ovrp reports. Requires `KL_GLFB=1`, runs the guest in-process

@@ -50,4 +50,11 @@ unsigned long kl_glfb_last_frame_lit(void);
 // makes this the population that matters. Safe to call when nothing was allocated.
 void kl_glfb_report_formats(void);
 
+// The eye-texture seam, texture identity out. kl_ovrp's SetupEyeTexture2 calls
+// this with the GL texture name Unity handed down; the capture finds "the
+// framebuffer with the picture" by looking for the FBO whose color attachment
+// is one of these (fb0 is black by construction — the VR frame goes to eye
+// textures, not the backbuffer).
+void kl_glfb_note_eye_texture(int eye, uint32_t tex);
+
 #endif
