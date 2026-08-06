@@ -38,9 +38,12 @@ build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 vatest: build/t_variadic
 	./build/t_variadic
 
-build/t_boot: tests/t_boot.c $(RUNTIME) runtime/klepton.h runtime/kl_jni.h
+# kl_view.c is the KL_VIEW=1 interactive viewer (SDL3); only t_boot links it,
+# so only this rule carries the pkg-config flags. kl_view.c compiles to a stub
+# without SDL3 headers, but the link flags below assume pkg-config finds sdl3.
+build/t_boot: tests/t_boot.c $(RUNTIME) runtime/kl_view.c runtime/klepton.h runtime/kl_jni.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tests/t_boot.c $(RUNTIME) $(LDLIBS)
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags sdl3) -o $@ tests/t_boot.c $(RUNTIME) runtime/kl_view.c $(LDLIBS) $(shell pkg-config --libs sdl3)
 
 boot: build/t_boot
 	./build/t_boot $(LIBS)

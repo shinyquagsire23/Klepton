@@ -956,6 +956,21 @@ static int  g_capture_pending;
 static char g_capture_dir[512];
 static unsigned glfb_capture_now(const char *dir);
 
+// The frame-out seam (kl_glfb.h). Set once by the frontend before the guest
+// starts, read on the GL thread at capture time; plain stores are fine for the
+// same reason as the pose seam — registration happens long before the first
+// swap, so there is no race to arbitrate.
+static kl_glfb_frame_sink g_frame_sink;
+static void              *g_frame_sink_ctx;
+static unsigned long      g_last_frame_lit;
+
+void kl_glfb_set_frame_sink(kl_glfb_frame_sink fn, void *ctx) {
+    g_frame_sink = fn;
+    g_frame_sink_ctx = ctx;
+}
+int kl_glfb_has_frame_sink(void) { return g_frame_sink != NULL; }
+unsigned long kl_glfb_last_frame_lit(void) { return g_last_frame_lit; }
+
 static void (*g_real_Flush)(void);
 static void (*g_real_Finish)(void);
 
@@ -1317,9 +1332,11 @@ static void chunk(FILE *f, const char *t, const uint8_t *d, uint32_t n) {
 // the framebuffer queries writing nothing at all.
 //
 // KL_GLFB_OUT_EVERY=N throttles to every Nth swap (default 1) — a 300-frame
-// pump otherwise writes 300 full-size PNGs.
+// pump otherwise writes 300 full-size PNGs. The throttle applies to the PNG
+// path only: a registered frame sink is a live display, not a batch of files,
+// so it wants every swap and dir may be NULL.
 unsigned kl_glfb_present(const char *dir) {
-    if (!g_ready || !dir) return g_presented;
+    if (!g_ready || (!dir && !g_frame_sink)) return g_presented;
     static int every = -1;
     if (every < 0) {
         const char *e = getenv("KL_GLFB_OUT_EVERY");
@@ -1327,8 +1344,8 @@ unsigned kl_glfb_present(const char *dir) {
         if (every < 1) every = 1;
     }
     static unsigned swap_n;
-    if (swap_n++ % (unsigned)every) return g_presented;
-    snprintf(g_capture_dir, sizeof g_capture_dir, "%s", dir);
+    if (!g_frame_sink && swap_n++ % (unsigned)every) return g_presented;
+    if (dir) snprintf(g_capture_dir, sizeof g_capture_dir, "%s", dir);
     // If the swap arrived on a thread that owns a context — in migration mode
     // the render thread, which is exactly where the frame was drawn — capture
     // NOW, before the next frame's clears overwrite it. (Capturing later, from
@@ -1381,6 +1398,18 @@ static unsigned glfb_capture_now(const char *dir) {
         unsigned lum = px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2];
         sum += lum;
         if (lum > 12) lit++;
+    }
+    g_last_frame_lit = lit;
+
+    // The sink half of the readback/output split: with a frontend registered
+    // the buffer IS the output — hand it over and count the frame presented.
+    // The sink runs on this (GL) thread inside the guest's frame, so it must
+    // be a memcpy, not a render. Everything below stays the default output:
+    // PNG to KL_GLFB_OUT, unchanged when no sink is registered.
+    if (g_frame_sink) {
+        g_frame_sink(px, g_w, g_h, g_frame_sink_ctx);
+        free(px);
+        return ++g_presented;
     }
 
     char path[512];

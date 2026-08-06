@@ -216,6 +216,23 @@ static uint64_t klovrp_GetNodeOrientationValid(int n, uint32_t *o) {
     return node_tracked("ovrp_GetNodeOrientationValid", o);
 }
 
+// The head pose the frontend last gave us (kl_ovrp_set_head_pose — the seam
+// declared in kl_ovrp.h). Identity by default, so a headless run sees exactly
+// what it always saw. Plain stores, deliberately not atomic: the writer is the
+// viewer's UI thread and the reader is the guest's render thread, and a torn
+// read costs one frame with a one-frame-old pose, not a wrong state — the
+// frontend rewrites it every frame anyway.
+static struct { float px, py, pz, qx, qy, qz, qw; } g_head_pose = {
+    0, 0, 0, 0, 0, 0, 1,
+};
+
+void kl_ovrp_set_head_pose(float px, float py, float pz,
+                           float qx, float qy, float qz, float qw) {
+    g_head_pose.px = px; g_head_pose.py = py; g_head_pose.pz = pz;
+    g_head_pose.qx = qx; g_head_pose.qy = qy;
+    g_head_pose.qz = qz; g_head_pose.qw = qw;
+}
+
 // out-struct via the sret register x8, NOT x2: the real function returns the
 // 88-byte ovrpPoseStatef by value (its own prologue does `mov x19, x8` and an
 // 0x58-byte memcpy back), so callers place the destination in x8 and the
@@ -224,11 +241,18 @@ static uint64_t klovrp_GetNodeOrientationValid(int n, uint32_t *o) {
 // `out` arrives here as an ordinary parameter. Fields libunity consumes:
 // +0x00 quat xyzw (w at +0x0c), +0x10 position, +0x1c velocity,
 // +0x28 acceleration, +0x34 angular velocity, +0x40 angular acceleration.
-// Identity pose, zero derivatives — real tracking is the ARKit work.
+// The pose is whatever the frontend last set (identity when there is none).
+// It is applied to every node that comes through here: node 0 is the head and
+// is the only node the pose currently describes; controllers arrive with M7
+// through their own entry points, so nothing else consumes a node pose yet.
 uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     ovrp_hit("ovrp_GetNodePoseState");
     memset(out, 0, 0x58);
-    ((float *)out)[3] = 1.0f;   // quaternion w
+    float *f = out;
+    f[0] = g_head_pose.qx; f[1] = g_head_pose.qy;      // quat xyz at +0x00
+    f[2] = g_head_pose.qz; f[3] = g_head_pose.qw;      // quat w at +0x0c
+    f[4] = g_head_pose.px; f[5] = g_head_pose.py;      // position at +0x10
+    f[6] = g_head_pose.pz;
     return OVRP_SUCCESS;
 }
 

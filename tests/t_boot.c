@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include "../runtime/klepton.h"
 #include "../runtime/kl_glfb.h"
@@ -25,6 +26,7 @@
 #include "../runtime/kl_opensl.h"
 #include "../runtime/kl_ovrp.h"
 #include "../runtime/kl_ovrplat.h"
+#include "../runtime/kl_view.h"
 
 static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
 
@@ -182,7 +184,13 @@ static int check_drm_guard(void) {
 // runs either in the re-exec'd child (normal), or in-process (KL_NOFORK=1,
 // for debugging). Returns only on a test failure; success is _exit(0), as
 // before.
-static int recon_run(void) {
+//
+// view_pump is the KL_VIEW shape: the same sequence, but the frame pump runs
+// until the viewer window closes instead of KL_FRAMES times, and the function
+// RETURNS instead of _exit(0) — the guest is a spawned thread in that mode and
+// the reports belong to the main thread after the join.
+static volatile int g_view_quit;
+static int recon_run(int view_pump) {
     install_fault_reporter();
     // Strict: an unimplemented *call* is fatal. Lookups are not, so this
     // stops only where the surface genuinely ends. KL_PERMISSIVE=1 flips it
@@ -288,17 +296,29 @@ static int recon_run(void) {
         // the GL surface looked so small. KL_FRAMES pumps the render loop
         // the way UnityPlayer's own thread would, draining the posted-task
         // queue between frames as the UI thread's looper does.
+        // In view_pump mode (KL_VIEW) the pump instead runs until the viewer
+        // window closes, paced to 72 Hz — the Quest 2 display frequency we
+        // report through ovrp_GetSystemDisplayFrequency, so the Choreographer
+        // ticks at the rate the engine believes the hardware runs at. The
+        // watchdog alarm is not armed there: the window may stay open for
+        // minutes, and a human at the keyboard IS the watchdog.
         const char *fenv = getenv("KL_FRAMES");
         unsigned frames = fenv ? (unsigned)strtoul(fenv, NULL, 10) : 0;
-        if (frames) {
+        if (frames || view_pump) {
             void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
-            printf("\n=== recon: pumping %u frames ===\n", frames);
+            if (view_pump)
+                printf("\n=== recon: pumping frames until the viewer closes ===\n");
+            else
+                printf("\n=== recon: pumping %u frames ===\n", frames);
             fflush(NULL);
             const char *aenv2 = getenv("KL_ALARM");
             unsigned budget = aenv2 ? (unsigned)strtoul(aenv2, NULL, 10) : 60;
-            alarm(budget);
+            if (!view_pump) alarm(budget);
+            const long frame_ns = 1000000000L / 72;
             unsigned i;
-            for (i = 0; i < frames && fn; i++) {
+            for (i = 0; fn && (view_pump ? !g_view_quit : i < frames); i++) {
+                struct timespec t0;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
                 // The frame clock first: on Android the Choreographer's
                 // doFrame is what wakes the engine for a frame, and
                 // nativeRender then draws what it decided. Ticking after
@@ -306,6 +326,16 @@ static int recon_run(void) {
                 kl_jni_tick_choreographer();
                 ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2);
                 kl_jni_drain_ui_tasks();
+                if (view_pump) {
+                    struct timespec t1;
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                    long used = (t1.tv_sec - t0.tv_sec) * 1000000000L +
+                                (t1.tv_nsec - t0.tv_nsec);
+                    if (used < frame_ns) {
+                        struct timespec rem = { 0, frame_ns - used };
+                        nanosleep(&rem, NULL);
+                    }
+                }
             }
             alarm(0);
             printf("  pumped %u frames\n", i);
@@ -318,6 +348,8 @@ static int recon_run(void) {
         }
     }
 
+    if (view_pump)
+        return 0;   // the main thread prints the reports after the join
     kl_jni_report(stdout);
     kl_egl_report(stdout);
     kl_ovrp_report(stdout);
@@ -326,13 +358,63 @@ static int recon_run(void) {
     _exit(0);
 }
 
+// The KL_VIEW guest thread: the same recon sequence the re-exec'd child runs,
+// but in-process and pumping until the window closes. kl_thread_init() first —
+// this thread runs guest code, and guest code needs its TLS slot (trap 1).
+static void *view_guest_thread(void *arg) {
+    (void)arg;
+    kl_thread_init();
+    recon_run(1);
+    return NULL;
+}
+
+// KL_VIEW=1: the interactive frontend (kl_view.c). This deliberately skips
+// BOTH process games main() normally plays:
+//  - the DRM-guard fork test, because the guard itself lives in kl_ovrplat.c
+//    and is unaffected by who forks, and
+//  - the re-exec, because Metal's XPC shader compiler refuses forked children
+//    (the AGX abort story above) and a windowed app never forks in the first
+//    place — in-process is the whole point.
+// The guest runs on a spawned thread; the main thread runs SDL, because macOS
+// requires windowing on the main thread.
+static int view_run(void) {
+    if (!getenv("KL_GLFB")) {
+        fprintf(stderr, "KL_VIEW=1 requires KL_GLFB=1 — the viewer displays "
+                        "what the reference renderer reads back\n");
+        return 1;
+    }
+    if (!kl_view_available()) {
+        fprintf(stderr, "KL_VIEW=1 but t_boot was built without SDL3\n");
+        return 1;
+    }
+    // The frame-out seam: the renderer's per-swap readback goes to the
+    // viewer's frame store instead of PNG files.
+    kl_glfb_set_frame_sink(kl_view_frame_sink, NULL);
+    pthread_t guest;
+    if (pthread_create(&guest, NULL, view_guest_thread, NULL)) {
+        fprintf(stderr, "view: pthread_create failed\n");
+        return 1;
+    }
+    int rc = kl_view_main(LIBDIR);   // returns when the window closes
+    g_view_quit = 1;
+    pthread_join(guest, NULL);
+    kl_jni_report(stdout);
+    kl_egl_report(stdout);
+    kl_ovrp_report(stdout);
+    kl_ovrplat_report(stdout);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) LIBDIR = argv[1];
     kl_set_library_path(LIBDIR);
 
     // Re-entry of the re-exec'd recon child (see below).
     if (getenv("KL_RECON_CHILD"))
-        return recon_run();
+        return recon_run(0);
+
+    if (getenv("KL_VIEW"))
+        return view_run();
 
     printf("=== DRM policy guard ===\n");
     // Under a debugger the forked child inherits the parent's Mach exception
@@ -358,7 +440,7 @@ int main(int argc, char **argv) {
     printf("\n=== recon: spawning child ===\n");
     fflush(NULL);
     if (getenv("KL_NOFORK"))
-        return recon_run();
+        return recon_run(0);
 
     pid_t pid = fork();
     if (pid == 0) {

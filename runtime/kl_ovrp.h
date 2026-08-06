@@ -27,4 +27,12 @@ void *kl_ovrp_sym(const char *name);
 // Which ovrp_* the guest resolved and which it called — the M6 work list.
 void kl_ovrp_report(FILE *f);
 
+// The frontend seam, pose in: whoever owns the window tells us where the head
+// is, and ovrp_GetNodePoseState reports it back to the guest. Today that is the
+// SDL viewer (KL_VIEW=1, kl_view.c) driven by WASD + mouse-look; on visionOS it
+// is ARKit's WorldTrackingProvider answering the same call. Without a frontend
+// the pose stays identity, which is what every headless run has always seen.
+void kl_ovrp_set_head_pose(float px, float py, float pz,
+                           float qx, float qy, float qz, float qw);
+
 #endif
