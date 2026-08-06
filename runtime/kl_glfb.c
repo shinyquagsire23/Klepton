@@ -486,11 +486,217 @@ static pthread_mutex_t g_compile_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void (*g_real_CompileShader)(uint32_t);
 static void (*g_real_LinkProgram)(uint32_t);
+static void (*g_real_ShaderSource)(uint32_t, int32_t, const char *const *,
+                                   const int32_t *);
+static void (*g_real_GetShaderiv)(uint32_t, uint32_t, int32_t *);
+static void (*g_real_GetShaderInfoLog)(uint32_t, int32_t, int32_t *, char *);
+
+// The Bloom diagnostic, and the fix it bought. Unity fell back to the 1-pass
+// error shader on "Hidden/PostProcessing/Bloom" — i.e. a variant failed to
+// compile — and neither the null driver (which never sees these calls under
+// KL_GLFB, the guest holding ANGLE's real pointers) nor KHR_debug said why.
+// So capture every glShaderSource, keyed by shader name the way kl_egl's null
+// driver does, and when a compile fails print the info log and the source
+// that produced it, and write both to KL_DUMP_SHADERS/<dir> if one is set.
+// That turned "Invalid pass number (13)" into the actual compiler verdict
+// without a standalone replay step, and the verdict was:
+//
+//   ERROR: 0:1: '' : unsupported shader version 320
+//
+// The version gap. kl_egl describes the device as GLES 3.2 / GLSL ES 3.20
+// (a deliberate group answer — Unity cross-checks the description against
+// itself, and gates B10G11R11 renderability on the version number itself,
+// so dropping the description to the 3.0 the driver actually is kills
+// post-processing anyway). Unity therefore emits "#version 320 es" variants,
+// and the ANGLE context behind this renderer is ES *3.0* — its Metal backend
+// caps there — and an ES 3.0 context accepts only #version 100/300 es. Every
+// 320 es source failed: 7016 compiles in one run, all two distinct texts
+// (an instancing VS with a layout(binding=) uniform block, and a trivial
+// constant FS), retried forever.
+//
+// The rewrite below repairs the text at the boundary between what we
+// describe and what ANGLE implements. Three mechanical moves, all verified
+// against the vendored ANGLE with the captured Bloom-era sources via
+// build/s09_angle:
+//
+//   1. "#version 3xx es" with xx > 00 -> "#version 300 es". Nothing in the
+//      failing corpus uses a real 3.1/3.2 feature; if a later shader does,
+//      it fails loudly here with the true error, which is what the failure
+//      reporter is for.
+//   2. drop "binding = <tok>" from layout qualifiers. layout(binding=N) on
+//      uniform blocks is an ES 3.1 feature ("only valid when used with
+//      pixel local storage" on this ANGLE). Dropping it is safe because
+//      Unity associates UBOs with glUniformBlockBinding/glBindBufferBase
+//      explicitly — it must, the same HLSLCC output also targets devices
+//      whose GLSL has no binding qualifier at all. <tok> is not always a
+//      digit: Unity's own macro is `layout(binding = x, std140)`.
+//   3. drop explicit uniform locations ("layout(location = N) uniform" and
+//      the UNITY_LOCATION(N) spelling) — likewise ES 3.1-only on a uniform,
+//      and a semantic no-op for Unity, which resolves sampler locations
+//      through glGetUniformLocation either way. in/out declarations keep
+//      their location qualifiers: those are program inputs/outputs, where
+//      the qualifier is legal ES 3.0.
+//
+// Both rewrite the captured copy, so the failure reporter and the
+// KL_DUMP_SHADERS output show what ANGLE actually compiled.
+#define KLFB_MAX_SHADERS 1024
+static struct { uint32_t name; char *src; } g_fb_shaders[KLFB_MAX_SHADERS];
+static unsigned g_fb_nshaders;
+
+// If the layout qualifier starting at `p` ("layout(...)") directly precedes a
+// `uniform` declaration, remove it (and the spaces between) in place and
+// return the new scan position; otherwise return NULL. Used to strip explicit
+// uniform locations: layout(location=N) on a *uniform* is legal GLSL only
+// from ES 3.1 on ("only valid on program inputs and outputs" here), and
+// Unity resolves sampler locations with glGetUniformLocation regardless, so
+// the pin is a no-op semantically. in/out declarations keep their qualifiers
+// — those ARE program inputs/outputs and ES 3.0 wants them.
+static char *klfb_strip_uniform_layout(char *p) {
+    char *close = strchr(p, ')');
+    if (!close) return NULL;
+    char *q = close + 1;
+    while (*q == ' ' || *q == '\t') q++;
+    if (strncmp(q, "uniform", 7) != 0) return NULL;
+    memmove(p, q, strlen(q) + 1);
+    return p;
+}
+
+// Returns buf rewritten in place (it only ever shrinks), or NULL if no rule
+// applied.
+static char *klfb_rewrite_glsl(char *buf) {
+    int changed = 0;
+    if (strncmp(buf, "#version 3", 10) == 0 &&
+        buf[10] >= '0' && buf[10] <= '9' && buf[11] >= '0' && buf[11] <= '9' &&
+        (buf[10] > '0' || buf[11] > '0') && strncmp(buf + 12, " es", 3) == 0) {
+        memcpy(buf + 10, "00", 2);          // "#version 3xx es" -> 300 es
+        changed = 1;
+    }
+    // "binding = <tok>" inside a layout list, in either comma position:
+    // "layout(binding = x, std140)" or "layout(std140, binding = 0)".
+    // Token ends at the first ',' or ')'.
+    char *p = buf;
+    while ((p = strstr(p, "binding = "))) {
+        char *tok = p + strlen("binding = ");
+        char *end = strpbrk(tok, ",)");
+        if (!end) break;
+        if (*end == ',') {                       // leading entry: drop "b = t, "
+            char *q = end + 1;
+            while (*q == ' ') q++;
+            memmove(p, q, strlen(q) + 1);
+        } else {                                 // trailing: drop ", b = t"
+            char *q = p;
+            while (q > buf && q[-1] == ' ') q--;
+            if (q > buf && q[-1] == ',') q--;
+            memmove(q, end, strlen(end) + 1);
+        }
+        changed = 1;
+    }
+    // Explicit uniform locations, both spellings Unity emits: the
+    // UNITY_LOCATION(x) macro use ("UNITY_LOCATION(0) uniform mediump
+    // sampler2D _MainTex;") and the direct layout form. HLSLCC spells every
+    // in/out qualifier as a literal "layout(location = ...)", so the macro
+    // form is unambiguous; the literal form goes through the uniform check.
+    p = buf;
+    while ((p = strstr(p, "UNITY_LOCATION("))) {
+        char *q = klfb_strip_uniform_layout(p);
+        if (q) { p = q; changed = 1; } else p += 5;
+    }
+    p = buf;
+    while ((p = strstr(p, "layout(location = "))) {
+        char *q = klfb_strip_uniform_layout(p);
+        if (q) { p = q; changed = 1; } else p += 8;
+    }
+    return changed ? buf : NULL;
+}
+
+static void klfb_ShaderSource(uint32_t shader, int32_t count,
+                              const char *const *strings, const int32_t *lengths) {
+    if (strings && count > 0) {
+        // The buffer is built for the rewrite, not just the capture: the
+        // first version of this tied the two together, and once the capture
+        // table filled (1024 entries; a long run sources thousands) the
+        // rewrite silently stopped applying and the 320 es failures came
+        // straight back.
+        size_t total = 0;
+        for (int32_t i = 0; i < count; i++)
+            total += lengths && lengths[i] >= 0 ? (size_t)lengths[i]
+                                                : (strings[i] ? strlen(strings[i]) : 0);
+        char *buf = malloc(total + 1);
+        if (buf) {
+            size_t off = 0;
+            for (int32_t i = 0; i < count; i++) {
+                size_t len = lengths && lengths[i] >= 0 ? (size_t)lengths[i]
+                                                        : (strings[i] ? strlen(strings[i]) : 0);
+                if (strings[i] && len) { memcpy(buf + off, strings[i], len); off += len; }
+            }
+            buf[off] = 0;
+            char *rewritten = klfb_rewrite_glsl(buf);
+            int stored = 0;
+            if (g_fb_nshaders < KLFB_MAX_SHADERS) {
+                pthread_mutex_lock(&g_compile_lock);
+                g_fb_shaders[g_fb_nshaders].name = shader;
+                g_fb_shaders[g_fb_nshaders].src  = buf;
+                g_fb_nshaders++;
+                pthread_mutex_unlock(&g_compile_lock);
+                stored = 1;
+            }
+            if (rewritten) {
+                if (g_real_ShaderSource) {
+                    const char *s = buf;
+                    g_real_ShaderSource(shader, 1, &s, NULL);
+                }
+                if (!stored) free(buf);
+                return;
+            }
+            if (!stored) free(buf);
+        }
+    }
+    if (g_real_ShaderSource) g_real_ShaderSource(shader, count, strings, lengths);
+}
+
+static const char *klfb_shader_src(uint32_t shader) {
+    // Latest wins: a name can be re-sourced, and shared contexts share the
+    // name space, so the most recent source for a name is the text the next
+    // compile actually saw.
+    for (unsigned i = g_fb_nshaders; i-- > 0; )
+        if (g_fb_shaders[i].name == shader) return g_fb_shaders[i].src;
+    return NULL;
+}
+
+#define KLFB_GL_COMPILE_STATUS 0x8B81
 
 static void klfb_CompileShader(uint32_t shader) {
     if (!g_real_CompileShader) return;
+    // The status/info-log readers are not thunks (the guest must get ANGLE's
+    // real answers), so they resolve lazily here rather than through g_thunks,
+    // whose entries hand their thunk pointer to the guest.
+    if (!g_real_GetShaderiv) g_real_GetShaderiv = (void *)asym("glGetShaderiv");
+    if (!g_real_GetShaderInfoLog)
+        g_real_GetShaderInfoLog = (void *)asym("glGetShaderInfoLog");
     pthread_mutex_lock(&g_compile_lock);
     g_real_CompileShader(shader);
+    int32_t ok = 1;
+    if (g_real_GetShaderiv)
+        g_real_GetShaderiv(shader, KLFB_GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        log[0] = 0;
+        if (g_real_GetShaderInfoLog)
+            g_real_GetShaderInfoLog(shader, sizeof log, NULL, log);
+        fprintf(stderr, "  [glfb] glCompileShader(%u) FAILED — info log:\n%s\n",
+                shader, log);
+        const char *src = klfb_shader_src(shader);
+        if (src)
+            fprintf(stderr, "  [glfb] ---- source of failed shader %u ----\n%s\n"
+                            "  [glfb] ---- end source ----\n", shader, src);
+        const char *dir = getenv("KL_DUMP_SHADERS");
+        if (dir && src) {
+            char path[600];
+            snprintf(path, sizeof path, "%s/failed_shader_%u.glsl", dir, shader);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(src, f); fclose(f); }
+        }
+    }
     pthread_mutex_unlock(&g_compile_lock);
 }
 static void klfb_LinkProgram(uint32_t program) {
@@ -945,6 +1151,367 @@ static void klfb_report_draws(void) {
     fprintf(stderr, "\n");
 }
 
+// ---------------------- ES 3.1 program-interface queries, on an ES 3.0 driver
+//
+// We describe GLES 3.2 (kl_egl.c), so Unity 2019.4's program setup enumerates
+// uniforms and uniform blocks through the ES 3.1 program-interface family —
+// glGetProgramInterfaceiv / glGetProgramResourceiv / glGetProgramResourceName /
+// glGetProgramResourceIndex / glGetProgramResourceLocation. ANGLE's context is
+// ES 3.0 and *rejects the whole family*: RecordVersionErrorES31 sets a
+// validation error, the out-params stay unwritten, and in the debug build each
+// call also pays a gl::Trace log line. Sampled in the act: 1925 of 3698 samples
+// of a guest worker inside glGetProgramResourceiv error logging — the guest
+// spinning on a garbage resource count while the main thread futex-waits on
+// it. That was the "IL2CPP abort" end state the Bloom fallback walked into.
+//
+// Everything this family can ask about uniforms, uniform blocks and vertex
+// inputs is ES 3.0-queryable (glGetActiveUniform{s,}iv, glGetActiveUniformBlock*,
+// glGetActiveAttrib), so translate. The ES 3.1 GL_UNIFORM resource index IS the
+// ES 3.0 active-uniform index; same for GL_UNIFORM_BLOCK. Interfaces with no
+// ES 3.0 source (program outputs, SSBOs, atomics) answer empty/invalid and log
+// once per shape — if Unity ever needs one, the log says which.
+
+#define KLFB_IF_UNIFORM        0x92E1
+#define KLFB_IF_UNIFORM_BLOCK  0x92E2
+#define KLFB_IF_PROGRAM_INPUT  0x92E3
+#define KLFB_IF_PROGRAM_OUTPUT 0x92E4
+#define KLFB_IF_BUFFER_VARIABLE 0x92E5
+#define KLFB_IF_SHADER_STORAGE_BLOCK 0x92E6
+#define KLFB_IF_TRANSFORM_FEEDBACK_VARYING 0x92F4
+#define KLFB_ACTIVE_RESOURCES  0x92F5
+#define KLFB_MAX_NAME_LENGTH   0x92F6
+#define KLFB_MAX_NUM_ACTIVE_VARIABLES 0x92F7
+// resource props (gl31.h)
+#define KLFB_P_NAME_LENGTH     0x92F9
+#define KLFB_P_TYPE            0x92FA
+#define KLFB_P_ARRAY_SIZE      0x92FB
+#define KLFB_P_OFFSET          0x92FC
+#define KLFB_P_BLOCK_INDEX     0x92FD
+#define KLFB_P_ARRAY_STRIDE    0x92FE
+#define KLFB_P_MATRIX_STRIDE   0x92FF
+#define KLFB_P_IS_ROW_MAJOR    0x9300
+#define KLFB_P_ATOMIC_COUNTER_BUFFER_INDEX 0x9301
+#define KLFB_P_BUFFER_BINDING  0x9302
+#define KLFB_P_BUFFER_DATA_SIZE 0x9303
+#define KLFB_P_NUM_ACTIVE_VARIABLES 0x9304
+#define KLFB_P_ACTIVE_VARIABLES 0x9305
+#define KLFB_P_REFERENCED_BY_VERTEX   0x9306
+#define KLFB_P_REFERENCED_BY_FRAGMENT 0x930A
+#define KLFB_P_LOCATION        0x930E
+// ES 3.0 introspection (gl3.h)
+#define KLFB_ACTIVE_UNIFORMS        0x8B86
+#define KLFB_ACTIVE_UNIFORM_MAX_LENGTH 0x8B87
+#define KLFB_ACTIVE_ATTRIBUTES      0x8B89
+#define KLFB_ACTIVE_ATTRIBUTE_MAX_LENGTH 0x8B8A
+#define KLFB_ACTIVE_UNIFORM_BLOCKS  0x8A36
+#define KLFB_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH 0x8A35
+#define KLFB_U_TYPE            0x8A37
+#define KLFB_U_SIZE            0x8A38
+#define KLFB_U_NAME_LENGTH     0x8A39
+#define KLFB_U_BLOCK_INDEX     0x8A3A
+#define KLFB_U_OFFSET          0x8A3B
+#define KLFB_U_ARRAY_STRIDE    0x8A3C
+#define KLFB_U_MATRIX_STRIDE   0x8A3D
+#define KLFB_U_IS_ROW_MAJOR    0x8A3E
+#define KLFB_UB_BINDING        0x8A3F
+#define KLFB_UB_DATA_SIZE      0x8A40
+#define KLFB_UB_NAME_LENGTH    0x8A41
+#define KLFB_UB_ACTIVE_UNIFORMS 0x8A42
+#define KLFB_UB_ACTIVE_UNIFORM_INDICES 0x8A43
+#define KLFB_UB_REF_BY_VERTEX   0x8A44
+#define KLFB_UB_REF_BY_FRAGMENT 0x8A46
+#define KLFB_INVALID_INDEX     0xFFFFFFFFu
+
+static void (*r_GetProgramiv)(uint32_t, uint32_t, int32_t *);
+static void (*r_GetActiveUniform)(uint32_t, uint32_t, int32_t, int32_t *,
+                                  int32_t *, uint32_t *, char *);
+static int32_t (*r_GetUniformLocation)(uint32_t, const char *);
+static void (*r_GetUniformIndices)(uint32_t, int32_t, const char *const *,
+                                   uint32_t *);
+static void (*r_GetActiveUniformsiv)(uint32_t, int32_t, const uint32_t *,
+                                     uint32_t, int32_t *);
+static void (*r_GetActiveUniformBlockiv)(uint32_t, uint32_t, uint32_t, int32_t *);
+static void (*r_GetActiveUniformBlockName)(uint32_t, uint32_t, int32_t,
+                                           int32_t *, char *);
+static uint32_t (*r_GetUniformBlockIndex)(uint32_t, const char *);
+static void (*r_GetActiveAttrib)(uint32_t, uint32_t, int32_t, int32_t *,
+                                 int32_t *, uint32_t *, char *);
+
+static void klfb_res_resolve(void) {
+    if (r_GetProgramiv) return;
+    r_GetProgramiv   = (void *)asym("glGetProgramiv");
+    r_GetActiveUniform = (void *)asym("glGetActiveUniform");
+    r_GetUniformLocation = (void *)asym("glGetUniformLocation");
+    r_GetUniformIndices  = (void *)asym("glGetUniformIndices");
+    r_GetActiveUniformsiv = (void *)asym("glGetActiveUniformsiv");
+    r_GetActiveUniformBlockiv = (void *)asym("glGetActiveUniformBlockiv");
+    r_GetActiveUniformBlockName = (void *)asym("glGetActiveUniformBlockName");
+    r_GetUniformBlockIndex = (void *)asym("glGetUniformBlockIndex");
+    r_GetActiveAttrib = (void *)asym("glGetActiveAttrib");
+}
+
+// The g_thunks real-slot for the program-interface family: the table wires
+// *real = fn for every entry, but these thunks self-resolve through asym
+// (klfb_res_resolve), so their slot points here and is never read.
+static void *g_res_sink;
+
+// Scout data, not spam: each unhandled (interface, prop) shape logs once.
+static struct { uint32_t iface, prop; } g_res_unhandled[32];
+static unsigned g_res_nunhandled;
+
+static void klfb_res_log_unhandled(const char *what, uint32_t iface, uint32_t prop) {
+    for (unsigned i = 0; i < g_res_nunhandled; i++)
+        if (g_res_unhandled[i].iface == iface && g_res_unhandled[i].prop == prop)
+            return;
+    if (g_res_nunhandled < 32) {
+        g_res_unhandled[g_res_nunhandled].iface = iface;
+        g_res_unhandled[g_res_nunhandled].prop  = prop;
+        g_res_nunhandled++;
+    }
+    fprintf(stderr, "  [glfb] %s: unhandled interface 0x%x prop 0x%x "
+                    "(answered empty/invalid)\n", what, iface, prop);
+}
+
+static void klfb_GetProgramInterfaceiv(uint32_t program, uint32_t iface,
+                                       uint32_t pname, int32_t *params) {
+    klfb_res_resolve();
+    if (!params) return;
+    *params = 0;
+    uint32_t src = 0;
+    if (pname == KLFB_ACTIVE_RESOURCES) {
+        switch (iface) {
+        case KLFB_IF_UNIFORM:        src = KLFB_ACTIVE_UNIFORMS; break;
+        case KLFB_IF_UNIFORM_BLOCK:  src = KLFB_ACTIVE_UNIFORM_BLOCKS; break;
+        case KLFB_IF_PROGRAM_INPUT:  src = KLFB_ACTIVE_ATTRIBUTES; break;
+        default:
+            klfb_res_log_unhandled("glGetProgramInterfaceiv", iface, pname);
+            return;
+        }
+    } else if (pname == KLFB_MAX_NAME_LENGTH) {
+        switch (iface) {
+        case KLFB_IF_UNIFORM:        src = KLFB_ACTIVE_UNIFORM_MAX_LENGTH; break;
+        case KLFB_IF_UNIFORM_BLOCK:  src = KLFB_ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH; break;
+        case KLFB_IF_PROGRAM_INPUT:  src = KLFB_ACTIVE_ATTRIBUTE_MAX_LENGTH; break;
+        default:
+            klfb_res_log_unhandled("glGetProgramInterfaceiv", iface, pname);
+            return;
+        }
+    } else if (pname == KLFB_MAX_NUM_ACTIVE_VARIABLES && iface == KLFB_IF_UNIFORM_BLOCK) {
+        // No single ES 3.0 query: the max over blocks of their active-uniform
+        // counts. Cold path, so just walk them.
+        int32_t nb = 0, best = 0;
+        if (r_GetProgramiv) r_GetProgramiv(program, KLFB_ACTIVE_UNIFORM_BLOCKS, &nb);
+        for (int32_t i = 0; i < nb; i++) {
+            int32_t n = 0;
+            if (r_GetActiveUniformBlockiv)
+                r_GetActiveUniformBlockiv(program, (uint32_t)i, KLFB_UB_ACTIVE_UNIFORMS, &n);
+            if (n > best) best = n;
+        }
+        *params = best;
+        return;
+    } else {
+        klfb_res_log_unhandled("glGetProgramInterfaceiv", iface, pname);
+        return;
+    }
+    if (r_GetProgramiv) r_GetProgramiv(program, src, params);
+}
+
+// One scalar prop of one GL_UNIFORM resource, via the ES 3.0 uniform queries.
+// Returns 1 when *out was written.
+static int klfb_uniform_prop(uint32_t program, uint32_t index, uint32_t prop,
+                             int32_t *out) {
+    uint32_t es30 = 0;
+    switch (prop) {
+    case KLFB_P_NAME_LENGTH:   es30 = KLFB_U_NAME_LENGTH; break;
+    case KLFB_P_TYPE:          es30 = KLFB_U_TYPE; break;
+    case KLFB_P_ARRAY_SIZE:    es30 = KLFB_U_SIZE; break;
+    case KLFB_P_OFFSET:        es30 = KLFB_U_OFFSET; break;
+    case KLFB_P_BLOCK_INDEX:   es30 = KLFB_U_BLOCK_INDEX; break;
+    case KLFB_P_ARRAY_STRIDE:  es30 = KLFB_U_ARRAY_STRIDE; break;
+    case KLFB_P_MATRIX_STRIDE: es30 = KLFB_U_MATRIX_STRIDE; break;
+    case KLFB_P_IS_ROW_MAJOR:  es30 = KLFB_U_IS_ROW_MAJOR; break;
+    case KLFB_P_REFERENCED_BY_VERTEX:
+    case KLFB_P_REFERENCED_BY_FRAGMENT:
+        // glGetActiveUniformsiv has no per-stage referenced flag for uniforms
+        // (only for blocks). "Referenced" is the safe answer: it keeps Unity
+        // from stripping a live uniform.
+        *out = 1;
+        return 1;
+    case KLFB_P_LOCATION: {
+        // By name: ES 3.0 has no location query by index.
+        char name[256];
+        int32_t len = 0, size = 0;
+        uint32_t type = 0;
+        if (!r_GetActiveUniform || !r_GetUniformLocation) return 0;
+        r_GetActiveUniform(program, index, sizeof name, &len, &size, &type, name);
+        name[sizeof name - 1] = 0;
+        *out = r_GetUniformLocation(program, name);
+        return 1;
+    }
+    default:
+        klfb_res_log_unhandled("glGetProgramResourceiv", KLFB_IF_UNIFORM, prop);
+        *out = 0;
+        return 1;
+    }
+    if (!r_GetActiveUniformsiv) return 0;
+    r_GetActiveUniformsiv(program, 1, &index, es30, out);
+    return 1;
+}
+
+static void klfb_GetProgramResourceiv(uint32_t program, uint32_t iface,
+                                      uint32_t index, int32_t propCount,
+                                      const uint32_t *props, int32_t bufSize,
+                                      int32_t *length, int32_t *params) {
+    klfb_res_resolve();
+    int32_t want = propCount < bufSize ? propCount : bufSize;
+    if (length) *length = 0;
+    if (!props || !params || want <= 0) return;
+    int32_t written = 0;
+    for (int32_t i = 0; i < want; i++) {
+        int32_t v = 0;
+        int ok = 0;
+        if (iface == KLFB_IF_UNIFORM) {
+            ok = klfb_uniform_prop(program, index, props[i], &v);
+        } else if (iface == KLFB_IF_UNIFORM_BLOCK) {
+            uint32_t es30 = 0;
+            switch (props[i]) {
+            case KLFB_P_NAME_LENGTH:   es30 = KLFB_UB_NAME_LENGTH; break;
+            case KLFB_P_BUFFER_DATA_SIZE: es30 = KLFB_UB_DATA_SIZE; break;
+            case KLFB_P_NUM_ACTIVE_VARIABLES: es30 = KLFB_UB_ACTIVE_UNIFORMS; break;
+            case KLFB_P_BUFFER_BINDING: es30 = KLFB_UB_BINDING; break;
+            case KLFB_P_REFERENCED_BY_VERTEX:   es30 = KLFB_UB_REF_BY_VERTEX; break;
+            case KLFB_P_REFERENCED_BY_FRAGMENT: es30 = KLFB_UB_REF_BY_FRAGMENT; break;
+            case KLFB_P_ACTIVE_VARIABLES: {
+                // Multi-value prop: fills the rest of params with the member
+                // uniform indices, spec-style.
+                int32_t n = 0;
+                if (r_GetActiveUniformBlockiv)
+                    r_GetActiveUniformBlockiv(program, index,
+                                              KLFB_UB_ACTIVE_UNIFORMS, &n);
+                int32_t room = want - i;
+                if (n > room) n = room;
+                if (n > 0 && r_GetActiveUniformBlockiv)
+                    r_GetActiveUniformBlockiv(program, index,
+                                              KLFB_UB_ACTIVE_UNIFORM_INDICES,
+                                              params + i);
+                if (length) *length = i + n;
+                return;
+            }
+            default:
+                klfb_res_log_unhandled("glGetProgramResourceiv", iface, props[i]);
+                v = 0; ok = 1;
+                break;
+            }
+            if (es30) {
+                if (r_GetActiveUniformBlockiv)
+                    r_GetActiveUniformBlockiv(program, index, es30, &v);
+                ok = 1;
+            }
+        } else if (iface == KLFB_IF_PROGRAM_INPUT) {
+            // The ES 3.1 program-input resource index is the attribute index.
+            switch (props[i]) {
+            case KLFB_P_NAME_LENGTH:
+            case KLFB_P_TYPE:
+            case KLFB_P_ARRAY_SIZE:
+            case KLFB_P_LOCATION: {
+                char name[256];
+                int32_t len = 0, size = 0;
+                uint32_t type = 0;
+                if (!r_GetActiveAttrib) break;
+                r_GetActiveAttrib(program, index, sizeof name, &len, &size, &type, name);
+                if (props[i] == KLFB_P_NAME_LENGTH)   v = len + 1;
+                if (props[i] == KLFB_P_TYPE)          v = (int32_t)type;
+                if (props[i] == KLFB_P_ARRAY_SIZE)    v = size;
+                if (props[i] == KLFB_P_LOCATION)      v = (int32_t)index; // see ResourceLocation
+                ok = 1;
+                break;
+            }
+            case KLFB_P_REFERENCED_BY_VERTEX:   v = 1; ok = 1; break;
+            case KLFB_P_REFERENCED_BY_FRAGMENT: v = 0; ok = 1; break;
+            default:
+                klfb_res_log_unhandled("glGetProgramResourceiv", iface, props[i]);
+                v = 0; ok = 1;
+                break;
+            }
+        } else {
+            klfb_res_log_unhandled("glGetProgramResourceiv", iface, props[i]);
+            ok = 1;
+        }
+        if (ok) { params[i] = v; written = i + 1; }
+    }
+    if (length) *length = written;
+}
+
+static void klfb_GetProgramResourceName(uint32_t program, uint32_t iface,
+                                        uint32_t index, int32_t bufSize,
+                                        int32_t *length, char *name) {
+    klfb_res_resolve();
+    if (length) *length = 0;
+    if (!name || bufSize <= 0) return;
+    name[0] = 0;
+    if (iface == KLFB_IF_UNIFORM) {
+        int32_t len = 0, size = 0;
+        uint32_t type = 0;
+        if (r_GetActiveUniform)
+            r_GetActiveUniform(program, index, bufSize, &len, &size, &type, name);
+        if (length) *length = len;
+    } else if (iface == KLFB_IF_UNIFORM_BLOCK) {
+        int32_t len = 0;
+        if (r_GetActiveUniformBlockName)
+            r_GetActiveUniformBlockName(program, index, bufSize, &len, name);
+        if (length) *length = len;
+    } else if (iface == KLFB_IF_PROGRAM_INPUT) {
+        int32_t len = 0, size = 0;
+        uint32_t type = 0;
+        if (r_GetActiveAttrib)
+            r_GetActiveAttrib(program, index, bufSize, &len, &size, &type, name);
+        if (length) *length = len;
+    } else {
+        klfb_res_log_unhandled("glGetProgramResourceName", iface, 0);
+    }
+}
+
+static uint32_t klfb_GetProgramResourceIndex(uint32_t program, uint32_t iface,
+                                             const char *name) {
+    klfb_res_resolve();
+    if (!name) return KLFB_INVALID_INDEX;
+    if (iface == KLFB_IF_UNIFORM) {
+        uint32_t idx = KLFB_INVALID_INDEX;
+        if (r_GetUniformIndices) r_GetUniformIndices(program, 1, &name, &idx);
+        return idx;
+    }
+    if (iface == KLFB_IF_UNIFORM_BLOCK)
+        return r_GetUniformBlockIndex ? r_GetUniformBlockIndex(program, name)
+                                      : KLFB_INVALID_INDEX;
+    klfb_res_log_unhandled("glGetProgramResourceIndex", iface, 0);
+    return KLFB_INVALID_INDEX;
+}
+
+static int32_t klfb_GetProgramResourceLocation(uint32_t program, uint32_t iface,
+                                               const char *name) {
+    klfb_res_resolve();
+    if (name && iface == KLFB_IF_UNIFORM && r_GetUniformLocation)
+        return r_GetUniformLocation(program, name);
+    if (name && iface == KLFB_IF_PROGRAM_INPUT) {
+        // Attrib "location" is queried by name too.
+        static int32_t (*r_GetAttribLocation)(uint32_t, const char *);
+        if (!r_GetAttribLocation) r_GetAttribLocation = (void *)asym("glGetAttribLocation");
+        if (r_GetAttribLocation) return r_GetAttribLocation(program, name);
+    }
+    klfb_res_log_unhandled("glGetProgramResourceLocation", iface, 0);
+    return -1;
+}
+
+static int32_t klfb_GetProgramResourceLocationIndex(uint32_t program,
+                                                    uint32_t iface,
+                                                    const char *name) {
+    (void)program; (void)name;
+    // Fragment-output location indices exist for dual-source blending, which
+    // this title does not use.
+    klfb_res_log_unhandled("glGetProgramResourceLocationIndex", iface, 0);
+    return -1;
+}
+
 // The capture has to happen on the thread that owns the context, and the guest's
 // eglSwapBuffers does not arrive there — measured: the GL thread owns the context,
 // the swap comes in on a different one, and EGL refuses to migrate (EGL_BAD_ACCESS).
@@ -1007,6 +1574,7 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glTexSubImage3D",           (void *)klfb_TexSubImage3D,           (void **)&g_real_TexSubImage3D},
     {"glCompressedTexSubImage3D", (void *)klfb_CompressedTexSubImage3D, (void **)&g_real_CompressedTexSubImage3D},
     // the shared-context compile lock — see the block above s10's numbers
+    {"glShaderSource", (void *)klfb_ShaderSource, (void **)&g_real_ShaderSource},
     {"glCompileShader", (void *)klfb_CompileShader, (void **)&g_real_CompileShader},
     {"glLinkProgram",   (void *)klfb_LinkProgram,   (void **)&g_real_LinkProgram},
     // the texture storage census — which format the AGX abort follows
@@ -1025,6 +1593,15 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glGetInteger64v", (void *)klfb_GetInteger64v, (void **)&g_real_GetInteger64v},
     {"glGetIntegeri_v", (void *)klfb_GetIntegeri_v, (void **)&g_real_GetIntegeri_v},
     {"glGetInternalformativ", (void *)klfb_GetInternalformativ, (void **)&g_real_GetInternalformativ},
+    // the ES 3.1 program-interface family — translated to ES 3.0 introspection
+    // in the block above; the real pointers self-resolve via asym, so the
+    // table's real slot is a sink
+    {"glGetProgramInterfaceiv", (void *)klfb_GetProgramInterfaceiv, (void **)&g_res_sink},
+    {"glGetProgramResourceiv",  (void *)klfb_GetProgramResourceiv,  (void **)&g_res_sink},
+    {"glGetProgramResourceName",(void *)klfb_GetProgramResourceName,(void **)&g_res_sink},
+    {"glGetProgramResourceIndex",(void *)klfb_GetProgramResourceIndex, (void **)&g_res_sink},
+    {"glGetProgramResourceLocation",(void *)klfb_GetProgramResourceLocation, (void **)&g_res_sink},
+    {"glGetProgramResourceLocationIndex",(void *)klfb_GetProgramResourceLocationIndex, (void **)&g_res_sink},
 };
 
 // ---------------------------------------------------------- the gateway

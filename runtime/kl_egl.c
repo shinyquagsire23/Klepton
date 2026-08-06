@@ -165,6 +165,17 @@ static uint64_t klgl_noop(const char *name) {
 // integer limits all have to describe the same device or Unity builds a renderer
 // against one and validates it against another. What is described here is a
 // plain, conformant GLES 3.2 with no extensions.
+//
+// 3.2 is a deliberate overstatement — ANGLE's Metal backend caps at ES 3.0 —
+// and it is priced: Unity emits "#version 320 es" shaders and calls the ES 3.1
+// program-interface queries, both of which an ES 3.0 context rejects. kl_glfb.c
+// repairs both at the GL boundary (the glShaderSource rewrite and the
+// program-interface translation). The honest 3.0 description was tried and is
+// *worse*: Unity gates B10G11R11_UFloatPack32 renderability on the version
+// number itself (no extension parse — the string appears nowhere in libunity),
+// so on 3.0 the post-processing stack falls back to format 'None' and aborts,
+// and the VRDevice switches to the distortion-window path besides. The gap is
+// smaller than the gate.
 #define GL_NO_ERROR      0
 #define GL_VENDOR   0x1F00
 #define GL_RENDERER 0x1F01
