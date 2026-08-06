@@ -57,6 +57,7 @@
 #include <unistd.h>
 #include <zlib.h>
 #include "kl_glfb.h"
+#include "kl_egl.h"        // kl_gl_cap_* — the capability tables
 #include "klepton.h"       // kl_trace_stub, for the per-name GL call trace
 
 // ---- the EGL/GLES constants used here, so there is nothing to include ----
@@ -625,6 +626,11 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     if (noswz < 0) noswz = getenv("KL_GLFB_NOSWIZZLE") != NULL;
     if (noswz && pname >= GL_TEXTURE_SWIZZLE_R && pname <= GL_TEXTURE_SWIZZLE_A) return;
     if (g_real_TexParameteri) g_real_TexParameteri(target, pname, param);
+    if (getenv("KL_GLFB_ERRPROBE") && a_glGetError) {
+        uint32_t e = a_glGetError();
+        if (e) fprintf(stderr, "  [glfb] glTexParameteri(0x%04x, 0x%04x) -> err 0x%x\n",
+                       pname, param, e);
+    }
 }
 
 // KL_GLFB_TEX_LIMIT=N performs only the first N uploads and drops the rest. The
@@ -666,9 +672,13 @@ static void klfb_TexSubImage2D(uint32_t target, int32_t level, int32_t xoff,
 static void klfb_TexStorage2D(uint32_t target, int32_t levels, uint32_t fmt,
                               int32_t w, int32_t h) {
     klfb_note_format(fmt, w, h, 1, "glTexStorage2D");
-    if (klfb_trace_tex())
+    if (klfb_trace_tex()) {
+        int32_t bound = -1;
+        if (a_glGetIntegerv) a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &bound);
         fprintf(stderr, "  [glfb] #%u glTexStorage2D target=0x%04x levels=%d "
-                        "fmt=0x%04x %dx%d\n", g_texcalls++, target, levels, fmt, w, h);
+                        "fmt=0x%04x %dx%d (tex=%d)\n", g_texcalls++, target,
+                levels, fmt, w, h, bound);
+    }
     fmt = klfb_maybe_unsrgb(fmt);
     if (g_real_TexStorage2D) g_real_TexStorage2D(target, levels, fmt, w, h);
 }
@@ -697,6 +707,52 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
                                  int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1,
                                  int64_t mask, int64_t filter) {
     klfb_errprobe("glBlitFramebuffer(before)", NULL);
+    static int blit_log = -1;
+    if (blit_log < 0) blit_log = getenv("KL_GLFB_ERRPROBE") != NULL;
+    if (blit_log && a_glGetIntegerv) {
+        int32_t dfb = -1, rfb = -1, rb = -1;
+        a_glGetIntegerv(0x8CA6, &dfb);
+        a_glGetIntegerv(0x8CAA, &rfb);
+        a_glGetIntegerv(0x0C02, &rb);
+        fprintf(stderr, "  [glfb] blit (%d,%d)-(%d,%d) -> (%d,%d)-(%d,%d) "
+                "mask=0x%llx filter=0x%llx draw_fb=%d read_fb=%d readbuf=0x%x\n",
+                sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
+                (long long)mask, (long long)filter, dfb, rfb, rb);
+        static uint32_t (*gl_CheckFbStatus)(uint32_t);
+        if (!gl_CheckFbStatus) gl_CheckFbStatus = asym("glCheckFramebufferStatus");
+        uint32_t (*bindfb_)(uint32_t, uint32_t) = asym("glBindFramebuffer");
+        void (*getfap)(uint32_t, uint32_t, uint32_t, int32_t *) =
+            asym("glGetFramebufferAttachmentParameteriv");
+        if (bindfb_ && gl_CheckFbStatus && getfap) {
+            for (int i = 0; i < 2; i++) {
+                int32_t fb = i ? dfb : rfb;
+                bindfb_(0x8CA9, fb);
+                int32_t otype = -1, oname = -1;
+                getfap(0x8CA9, 0x8CE0, 0x8CD0 /* OBJECT_TYPE */, &otype);
+                getfap(0x8CA9, 0x8CE0, 0x8CD1 /* OBJECT_NAME */, &oname);
+                fprintf(stderr, "  [glfb]   fb %d status=0x%x color0 type=0x%x name=%d",
+                        fb, gl_CheckFbStatus(0x8CA9), otype, oname);
+                if (otype == 0x8D41 /* RENDERBUFFER */) {
+                    void (*bindrb)(uint32_t, uint32_t) = asym("glBindRenderbuffer");
+                    void (*getrbp)(uint32_t, uint32_t, int32_t *) =
+                        asym("glGetRenderbufferParameteriv");
+                    if (bindrb && getrbp) {
+                        int32_t fmt = -1, samples = -1, w = -1, h = -1;
+                        bindrb(0x8D41, oname);
+                        getrbp(0x8D41, 0x8D44 /* INTERNAL_FORMAT */, &fmt);
+                        getrbp(0x8D41, 0x8CAB /* SAMPLES */, &samples);
+                        getrbp(0x8D41, 0x8D42 /* WIDTH */, &w);
+                        getrbp(0x8D41, 0x8D43 /* HEIGHT */, &h);
+                        fprintf(stderr, " rb fmt=0x%x samples=%d %dx%d",
+                                fmt, samples, w, h);
+                    }
+                }
+                fprintf(stderr, "\n");
+            }
+            bindfb_(0x8CA8, rfb);   // restore: READ<-rfb, DRAW<-dfb
+            bindfb_(0x8CA9, dfb);
+        }
+    }
     if (g_real_BlitFramebuffer)
         g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
                                (uint32_t)mask, (uint32_t)filter);
@@ -911,6 +967,19 @@ static void klfb_service_capture(void) {
 static void klfb_Flush(void)  { if (g_real_Flush)  g_real_Flush();  klfb_service_capture(); }
 static void klfb_Finish(void) { if (g_real_Finish) g_real_Finish(); klfb_service_capture(); }
 
+static void klfb_GetIntegerv(uint32_t, int32_t *);
+static void klfb_GetFloatv(uint32_t, float *);
+static void klfb_GetBooleanv(uint32_t, uint8_t *);
+static void klfb_GetInteger64v(uint32_t, int64_t *);
+static void klfb_GetIntegeri_v(uint32_t, uint32_t, int32_t *);
+static void klfb_GetInternalformativ(uint32_t, uint32_t, uint32_t, int32_t, int32_t *);
+static void (*g_real_GetIntegerv)(uint32_t, int32_t *);
+static void (*g_real_GetFloatv)(uint32_t, float *);
+static void (*g_real_GetBooleanv)(uint32_t, uint8_t *);
+static void (*g_real_GetInteger64v)(uint32_t, int64_t *);
+static void (*g_real_GetIntegeri_v)(uint32_t, uint32_t, int32_t *);
+static void (*g_real_GetInternalformativ)(uint32_t, uint32_t, uint32_t, int32_t, int32_t *);
+
 static const struct { const char *name; void *thunk; void **real; } g_thunks[] = {
     {"glFlush",  (void *)klfb_Flush,  (void **)&g_real_Flush},
     {"glDrawElements", (void *)klfb_DrawElements, (void **)&g_real_DrawElements},
@@ -933,6 +1002,14 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glGenFramebuffers", (void *)klfb_GenFramebuffers, (void **)&g_real_GenFramebuffers},
     {"glBindFramebuffer", (void *)klfb_BindFramebuffer, (void **)&g_real_BindFramebuffer},
     {"glFramebufferTexture2D", (void *)klfb_FramebufferTexture2D, (void **)&g_real_FramebufferTexture2D},
+    // the hybrid query family — ours if the capability tables describe the
+    // pname, ANGLE's otherwise (see the gateway comment below)
+    {"glGetIntegerv", (void *)klfb_GetIntegerv, (void **)&g_real_GetIntegerv},
+    {"glGetFloatv",   (void *)klfb_GetFloatv,   (void **)&g_real_GetFloatv},
+    {"glGetBooleanv", (void *)klfb_GetBooleanv, (void **)&g_real_GetBooleanv},
+    {"glGetInteger64v", (void *)klfb_GetInteger64v, (void **)&g_real_GetInteger64v},
+    {"glGetIntegeri_v", (void *)klfb_GetIntegeri_v, (void **)&g_real_GetIntegeri_v},
+    {"glGetInternalformativ", (void *)klfb_GetInternalformativ, (void **)&g_real_GetInternalformativ},
 };
 
 // ---------------------------------------------------------- the gateway
@@ -941,9 +1018,76 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
 // device with no extensions, and Unity built its renderer against that answer;
 // letting ANGLE answer instead would change the description underneath a decision
 // already made. Everything operational goes to ANGLE.
+//
+// The query family is the hybrid: the tables answer the pnames they describe,
+// and anything else is dynamic *state* (READ_BUFFER, bindings, viewport) that
+// only ANGLE tracks. Answering those with the tables' 0 was not neutral: a 0
+// for GL_READ_BUFFER became GL_INVALID_ENUM one glReadBuffer later, and the
+// eye blit died GL_INVALID_FRAMEBUFFER_OPERATION every frame (M6).
+// The query family is the hybrid, but the split is not "table vs rest":
+// ANGLE's context here is ES 3.0 while we describe 3.2 to the guest, so a
+// capability pname the table does not list (the SSBO family, 0x90d6..) must
+// NOT go to ANGLE — there it is a real GL_INVALID_ENUM, and the null driver's
+// named zero is exactly what keeps Unity off those paths. Only genuine
+// dynamic *state* — Unity's save/restore set around its blits — belongs to
+// ANGLE, which alone tracks it. The proof was 0x0C02 (READ_BUFFER): our 0
+// became GL_INVALID_ENUM one glReadBuffer later, and the eye blit died
+// GL_INVALID_FRAMEBUFFER_OPERATION every frame (M6).
+static int glfb_state_pname(uint32_t p) {
+    switch (p) {
+    case 0x0C01: case 0x0C02:   // DRAW_BUFFER, READ_BUFFER
+    case 0x8CA6: case 0x8CAA:   // DRAW/READ_FRAMEBUFFER_BINDING
+    case 0x8B8D:                // CURRENT_PROGRAM
+    case 0x84E0:                // ACTIVE_TEXTURE
+    case 0x0BA2: case 0x0C10:   // VIEWPORT, SCISSOR_BOX
+        return 1;
+    }
+    return 0;
+}
+
+static void klfb_GetIntegerv(uint32_t pname, int32_t *params) {
+    if (glfb_state_pname(pname)) {
+        if (g_real_GetIntegerv) g_real_GetIntegerv(pname, params);
+        return;
+    }
+    if (kl_gl_cap_integerv(pname, params)) return;
+    // Same contract as the null driver: named, not guessed — and crucially
+    // no GL error set, which forwarding to the ES 3.0 context would do.
+    fprintf(stderr, "  [glfb] glGetIntegerv: unhandled pname 0x%x (kept ours)\n", pname);
+    if (params) params[0] = 0;
+}
+static void klfb_GetFloatv(uint32_t pname, float *data) {
+    if (kl_gl_cap_floatv(pname, data)) return;
+    if (g_real_GetFloatv) g_real_GetFloatv(pname, data);
+}
+static void klfb_GetBooleanv(uint32_t pname, uint8_t *data) {
+    if (g_real_GetBooleanv) g_real_GetBooleanv(pname, data);   // no table: all state
+}
+static void klfb_GetInteger64v(uint32_t pname, int64_t *data) {
+    if (kl_gl_cap_integer64v(pname, data)) return;
+    if (g_real_GetInteger64v) g_real_GetInteger64v(pname, data);
+}
+static void klfb_GetIntegeri_v(uint32_t target, uint32_t index, int32_t *data) {
+    // Indexed *binding* state is dynamic, like the pnames above.
+    switch (target) {
+    case 0x8A28: case 0x8A29: case 0x8A2A:          // UNIFORM_BUFFER_*
+    case 0x8C8C: case 0x8C8D: case 0x8C8F:          // TRANSFORM_FEEDBACK_BUFFER_*
+    case 0x8E51:                                    // SAMPLE_MASK_VALUE
+        if (g_real_GetIntegeri_v) { g_real_GetIntegeri_v(target, index, data); return; }
+    }
+    if (kl_gl_cap_integeri_v(target, index, data)) return;
+    fprintf(stderr, "  [glfb] glGetIntegeri_v: unhandled target 0x%x (kept ours)\n", target);
+    if (data) data[0] = 0;
+}
+static void klfb_GetInternalformativ(uint32_t target, uint32_t internalformat,
+                                     uint32_t pname, int32_t bufSize, int32_t *params) {
+    if (kl_gl_cap_internalformativ(target, internalformat, pname, bufSize, params)) return;
+    if (g_real_GetInternalformativ)
+        g_real_GetInternalformativ(target, internalformat, pname, bufSize, params);
+}
+
 static const char *const g_keep_ours[] = {
-    "glGetString", "glGetStringi", "glGetIntegerv", "glGetIntegeri_v",
-    "glGetFloatv", "glGetBooleanv", "glGetInteger64v", "glGetInternalformativ",
+    "glGetString", "glGetStringi",
 };
 
 static int keep_ours(const char *name) {

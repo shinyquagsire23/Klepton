@@ -247,19 +247,44 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
     {0x80A9 /* SAMPLES        */, 0},
 };
 
+// The capability probe behind klgl_GetIntegerv, exported for kl_glfb: 1 when
+// the pname is one of ours (and *params written), 0 when it is not — no
+// print, no zero. Under the reference renderer the miss goes to ANGLE, which
+// owns the dynamic state (READ_BUFFER & co.) this table never described.
+int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
+    if (!params) return 1;
+    for (size_t i = 0; i < sizeof g_gl_int / sizeof g_gl_int[0]; i++)
+        if (g_gl_int[i].pname == pname) { params[0] = g_gl_int[i].value; return 1; }
+    if (pname == 0x0D3A) {                       // MAX_VIEWPORT_DIMS: two values
+        params[0] = 16384; params[1] = 16384; return 1;
+    }
+    return 0;
+}
+
 static void klgl_GetIntegerv(uint32_t pname, int32_t *params) {
     if (!params) return;
-    for (size_t i = 0; i < sizeof g_gl_int / sizeof g_gl_int[0]; i++)
-        if (g_gl_int[i].pname == pname) { params[0] = g_gl_int[i].value; return; }
-    if (pname == 0x0D3A) {                       // MAX_VIEWPORT_DIMS: two values
-        params[0] = 16384; params[1] = 16384; return;
-    }
+    if (kl_gl_cap_integerv(pname, params)) return;
     // Unknown limits get the same treatment as everything else: named, not
     // guessed. A zero here is what makes Unity allocate nothing and fail later.
     fprintf(stderr, "  [gl] glGetIntegerv: unhandled pname 0x%x\n", pname);
     params[0] = 0;
 }
 
+int kl_gl_cap_integeri_v(uint32_t target, uint32_t index, int32_t *data) {
+    if (!data) return 1;
+    switch (target) {
+    case 0x91BE /* MAX_COMPUTE_WORK_GROUP_COUNT */: data[0] = 65535; return 1;
+    case 0x91BF /* MAX_COMPUTE_WORK_GROUP_SIZE  */: data[0] = index == 2 ? 64 : 1024; return 1;
+    case 0x8A28 /* UNIFORM_BUFFER_BINDING */:
+    case 0x8A29 /* UNIFORM_BUFFER_START   */:
+    case 0x8A2A /* UNIFORM_BUFFER_SIZE    */: data[0] = 0; return 1;
+    case 0x8C8C /* TRANSFORM_FEEDBACK_BUFFER_START */:
+    case 0x8C8D /* TRANSFORM_FEEDBACK_BUFFER_SIZE  */:
+    case 0x8C8F /* TRANSFORM_FEEDBACK_BUFFER_BINDING */: data[0] = 0; return 1;
+    case 0x8E51 /* SAMPLE_MASK_VALUE */: data[0] = ~0; return 1;
+    }
+    return 0;
+}
 
 // The indexed and typed state queries. Same rule as glGetIntegerv: answer what
 // we know, and *say* when we do not rather than writing a zero the caller reads
@@ -267,20 +292,21 @@ static void klgl_GetIntegerv(uint32_t pname, int32_t *params) {
 // to dispatch anything.
 static void klgl_GetIntegeri_v(uint32_t target, uint32_t index, int32_t *data) {
     if (!data) return;
-    switch (target) {
-    case 0x91BE /* MAX_COMPUTE_WORK_GROUP_COUNT */: data[0] = 65535; return;
-    case 0x91BF /* MAX_COMPUTE_WORK_GROUP_SIZE  */: data[0] = index == 2 ? 64 : 1024; return;
-    case 0x8A28 /* UNIFORM_BUFFER_BINDING */:
-    case 0x8A29 /* UNIFORM_BUFFER_START   */:
-    case 0x8A2A /* UNIFORM_BUFFER_SIZE    */: data[0] = 0; return;
-    case 0x8C8C /* TRANSFORM_FEEDBACK_BUFFER_START */:
-    case 0x8C8D /* TRANSFORM_FEEDBACK_BUFFER_SIZE  */:
-    case 0x8C8F /* TRANSFORM_FEEDBACK_BUFFER_BINDING */: data[0] = 0; return;
-    case 0x8E51 /* SAMPLE_MASK_VALUE */: data[0] = ~0; return;
-    }
+    if (kl_gl_cap_integeri_v(target, index, data)) return;
     fprintf(stderr, "  [gl] glGetIntegeri_v: unhandled target 0x%x (index %u)\n",
             target, index);
     data[0] = 0;
+}
+
+int kl_gl_cap_internalformativ(uint32_t target, uint32_t internalformat,
+                               uint32_t pname, int32_t bufSize, int32_t *params) {
+    (void)target; (void)internalformat;
+    if (!params || bufSize <= 0) return 1;
+    switch (pname) {
+    case 0x9380 /* NUM_SAMPLE_COUNTS */: params[0] = 1; return 1;
+    case 0x80A9 /* SAMPLES */:           params[0] = 4; return 1;
+    }
+    return 0;
 }
 
 // Which sample counts a format supports. Answered as 4x only, to agree with
@@ -288,25 +314,27 @@ static void klgl_GetIntegeri_v(uint32_t target, uint32_t index, int32_t *data) {
 // places that have to describe the same device.
 static void klgl_GetInternalformativ(uint32_t target, uint32_t internalformat,
                                      uint32_t pname, int32_t bufSize, int32_t *params) {
-    (void)target; (void)internalformat;
     if (!params || bufSize <= 0) return;
-    switch (pname) {
-    case 0x9380 /* NUM_SAMPLE_COUNTS */: params[0] = 1; return;
-    case 0x80A9 /* SAMPLES */:           params[0] = 4; return;
-    }
+    if (kl_gl_cap_internalformativ(target, internalformat, pname, bufSize, params)) return;
     fprintf(stderr, "  [gl] glGetInternalformativ: unhandled pname 0x%x\n", pname);
     params[0] = 0;
 }
 
+int kl_gl_cap_floatv(uint32_t pname, float *data) {
+    if (!data) return 1;
+    switch (pname) {
+    case 0x846D /* ALIASED_POINT_SIZE_RANGE */: data[0] = 1.0f; data[1] = 1024.0f; return 1;
+    case 0x846E /* ALIASED_LINE_WIDTH_RANGE */: data[0] = 1.0f; data[1] = 1.0f; return 1;
+    case 0x0B21 /* LINE_WIDTH */:               data[0] = 1.0f; return 1;
+    case 0x84FF /* MAX_TEXTURE_MAX_ANISOTROPY */:data[0] = 16.0f; return 1;
+    case 0x0B71 /* DEPTH_RANGE (2 values) */:    data[0] = 0.0f; data[1] = 1.0f; return 1;
+    }
+    return 0;
+}
+
 static void klgl_GetFloatv(uint32_t pname, float *data) {
     if (!data) return;
-    switch (pname) {
-    case 0x846D /* ALIASED_POINT_SIZE_RANGE */: data[0] = 1.0f; data[1] = 1024.0f; return;
-    case 0x846E /* ALIASED_LINE_WIDTH_RANGE */: data[0] = 1.0f; data[1] = 1.0f; return;
-    case 0x0B21 /* LINE_WIDTH */:               data[0] = 1.0f; return;
-    case 0x84FF /* MAX_TEXTURE_MAX_ANISOTROPY */:data[0] = 16.0f; return;
-    case 0x0B71 /* DEPTH_RANGE (2 values) */:    data[0] = 0.0f; data[1] = 1.0f; return;
-    }
+    if (kl_gl_cap_floatv(pname, data)) return;
     fprintf(stderr, "  [gl] glGetFloatv: unhandled pname 0x%x\n", pname);
     data[0] = 0.0f;
 }
@@ -319,13 +347,19 @@ static void klgl_GetBooleanv(uint32_t pname, uint8_t *data) {
     data[0] = 0;
 }
 
+int kl_gl_cap_integer64v(uint32_t pname, int64_t *data) {
+    if (!data) return 1;
+    switch (pname) {
+    case 0x9111 /* MAX_SERVER_WAIT_TIMEOUT */: data[0] = 0; return 1;
+    case 0x821B /* MAJOR_VERSION */: data[0] = 3; return 1;
+    case 0x821C /* MINOR_VERSION */: data[0] = 2; return 1;
+    }
+    return 0;
+}
+
 static void klgl_GetInteger64v(uint32_t pname, int64_t *data) {
     if (!data) return;
-    switch (pname) {
-    case 0x9111 /* MAX_SERVER_WAIT_TIMEOUT */: data[0] = 0; return;
-    case 0x821B /* MAJOR_VERSION */: data[0] = 3; return;
-    case 0x821C /* MINOR_VERSION */: data[0] = 2; return;
-    }
+    if (kl_gl_cap_integer64v(pname, data)) return;
     fprintf(stderr, "  [gl] glGetInteger64v: unhandled pname 0x%x\n", pname);
     data[0] = 0;
 }

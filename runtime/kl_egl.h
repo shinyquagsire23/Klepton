@@ -8,6 +8,7 @@
 #ifndef KL_EGL_H
 #define KL_EGL_H
 #include <stdio.h>
+#include <stdint.h>
 
 // Resolve an EGL import by name. NULL if we do not provide it.
 void *kl_egl_lookup(const char *name);
@@ -37,5 +38,17 @@ void     kl_egl_dump_shaders(const char *dir);
 // textured quad these uploads are its visible content.
 void kl_egl_dump_textures(const char *dir);
 unsigned kl_egl_texture_count(void);
+
+// The capability tables behind the query entry points, for kl_glfb: under the
+// reference renderer the *description* of the device stays ours, but dynamic
+// state (READ_BUFFER, bindings, viewport — anything the tables do not list)
+// belongs to ANGLE, which actually tracks it. Each returns 1 when the pname
+// is ours (answer written), 0 when it is not — no print, no zero-fill.
+int kl_gl_cap_integerv(uint32_t pname, int32_t *params);
+int kl_gl_cap_integeri_v(uint32_t target, uint32_t index, int32_t *data);
+int kl_gl_cap_internalformativ(uint32_t target, uint32_t internalformat,
+                               uint32_t pname, int32_t bufSize, int32_t *params);
+int kl_gl_cap_floatv(uint32_t pname, float *data);
+int kl_gl_cap_integer64v(uint32_t pname, int64_t *data);
 
 #endif

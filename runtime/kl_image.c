@@ -10,6 +10,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <libkern/OSCacheControl.h>
+#include <pthread.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include "klepton.h"
 #include "kl_x18.h"
 
@@ -106,44 +109,77 @@ void kl_unresolved_named(const char *name);   // kl_shim.c
 
 static struct { char *name; void *stub; void *handler; } *g_stubs;
 static unsigned g_stub_n, g_stub_cap;
-static uint8_t *g_stub_pool;
+static uint8_t *g_stub_rw, *g_stub_rx;
 static size_t   g_stub_off;
+static pthread_mutex_t g_stub_mu = PTHREAD_MUTEX_INITIALIZER;
 
-// Build a stub that tail-calls `handler` with `nm` in x0. Shared by anything
-// that has to name what the guest reached for: unresolved ELF imports, and the
-// GL entry points handed out by eglGetProcAddress (kl_egl.c), which have the
-// same problem — one anonymous abort tells you nothing about which of two
-// hundred functions the guest actually called.
-void *kl_named_stub(const char *nm, void *handler) {
-    if (!nm || !*nm || !handler) return kl_shim_lookup("__klepton_unresolved");
+// The pool exists twice: an RX mapping the guest executes from, and an RW
+// alias of the same pages that stub_emit writes through. The old single
+// mapping had to be flipped RW->RX around every write, and any thread
+// executing an earlier stub during that window took an execute-protection
+// fault (SIGBUS, pc == fault address, in an anonymous mapping — the "parked"
+// fault from CLAUDE.md, which M6's concurrent render-thread stub traffic
+// finally reproduced reliably). Dual mapping removes the window entirely:
+// the execute view's permissions never change. The mutex is for the
+// allocator itself — the dedup scan and g_stub_off were racy in exactly the
+// same traffic. visionOS note: the RX/RW pair is a remap of our own
+// anonymous allocation, not MAP_JIT; whether that passes W^X policy on
+// device is a question for the port, not for this host-side fix.
+static int stub_pool_open(void) {
+    if (g_stub_rx) return 1;
+    mach_vm_address_t rw = 0;
+    if (mach_vm_allocate(mach_task_self(), &rw, KL_STUB_POOL,
+                         VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return 0;
+    mach_vm_address_t rx = 0;
+    vm_prot_t cur, max;
+    if (mach_vm_remap(mach_task_self(), &rx, KL_STUB_POOL, 0, VM_FLAGS_ANYWHERE,
+                      mach_task_self(), rw, FALSE, &cur, &max,
+                      VM_INHERIT_NONE) != KERN_SUCCESS ||
+        mach_vm_protect(mach_task_self(), rx, KL_STUB_POOL, FALSE,
+                        VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
+        mach_vm_deallocate(mach_task_self(), rw, KL_STUB_POOL);
+        return 0;
+    }
+    g_stub_rw = (uint8_t *)rw;
+    g_stub_rx = (uint8_t *)rx;
+    if (getenv("KL_TRACE_IMAGES"))
+        fprintf(stderr, "  [klepton] stub pool rx %p..%p (rw alias %p)\n",
+                (void *)g_stub_rx, (void *)(g_stub_rx + KL_STUB_POOL),
+                (void *)g_stub_rw);
+    return 1;
+}
+
+// Emit one stub cell and return its *executable* address. Caller holds
+// g_stub_mu. `payload` NULL means the owned copy of nm (kl_named_stub's
+// argument). i0/i1/i2 are the three instructions before the nop, so both
+// stub shapes share this allocator.
+static void *stub_emit(const char *nm, void *payload, void *target,
+                       uint32_t i0, uint32_t i1, uint32_t i2) {
     for (unsigned i = 0; i < g_stub_n; i++)             // shared across images
-        if (g_stubs[i].handler == handler && strcmp(g_stubs[i].name, nm) == 0)
+        if (g_stubs[i].handler == target && strcmp(g_stubs[i].name, nm) == 0)
             return g_stubs[i].stub;
 
-    if (!g_stub_pool) {
-        g_stub_pool = mmap(NULL, KL_STUB_POOL, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (g_stub_pool == MAP_FAILED) { g_stub_pool = NULL; return kl_shim_lookup("__klepton_unresolved"); }
-    }
-    if (g_stub_off + KL_STUB_BYTES > KL_STUB_POOL) return kl_shim_lookup("__klepton_unresolved");
-    if (getenv("KL_TRACE_IMAGES"))
-        fprintf(stderr, "  [klepton] stub pool %p..%p (writing '%s' at +0x%zx)\n",
-                (void *)g_stub_pool, (void *)(g_stub_pool + KL_STUB_POOL), nm, g_stub_off);
+    if (!stub_pool_open()) return NULL;
+    if (g_stub_off + KL_STUB_BYTES > KL_STUB_POOL) return NULL;
 
     // The name lives in the image's strtab, which kl_unload would take with it.
     char *owned = strdup(nm);
-    if (!owned) return kl_shim_lookup("__klepton_unresolved");
+    if (!owned) return NULL;
 
-    uint8_t *s = g_stub_pool + g_stub_off;
-    if (mprotect(g_stub_pool, KL_STUB_POOL, PROT_READ | PROT_WRITE) != 0) { free(owned); return kl_shim_lookup("__klepton_unresolved"); }
-    uint32_t *code = (uint32_t *)s;
-    code[0] = 0x58000080u;   // ldr x0,  #16
-    code[1] = 0x580000B0u;   // ldr x16, #20
-    code[2] = 0xD61F0200u;   // br  x16
-    code[3] = 0xD503201Fu;   // nop
-    memcpy(s + 16, &owned, 8);
-    memcpy(s + 24, &handler, 8);
-    mprotect(g_stub_pool, KL_STUB_POOL, PROT_READ | PROT_EXEC);
+    if (getenv("KL_TRACE_IMAGES"))
+        fprintf(stderr, "  [klepton] stub '%s' at +0x%zx\n", nm, g_stub_off);
+
+    uint8_t *w = g_stub_rw + g_stub_off;
+    uint32_t *code = (uint32_t *)w;
+    code[0] = i0;
+    code[1] = i1;
+    code[2] = i2;
+    code[3] = 0xD503201Fu;   // nop — the two literals land 8-byte aligned
+    if (!payload) payload = owned;
+    memcpy(w + 16, &payload, 8);
+    memcpy(w + 24, &target, 8);
+
+    uint8_t *s = g_stub_rx + g_stub_off;
     sys_icache_invalidate(s, KL_STUB_BYTES);
     g_stub_off += KL_STUB_BYTES;
 
@@ -153,9 +189,25 @@ void *kl_named_stub(const char *nm, void *handler) {
     }
     g_stubs[g_stub_n].name = owned;
     g_stubs[g_stub_n].stub = s;
-    g_stubs[g_stub_n].handler = handler;
+    g_stubs[g_stub_n].handler = target;
     g_stub_n++;
     return s;
+}
+
+// Build a stub that tail-calls `handler` with `nm` in x0. Shared by anything
+// that has to name what the guest reached for: unresolved ELF imports, and the
+// GL entry points handed out by eglGetProcAddress (kl_egl.c), which have the
+// same problem — one anonymous abort tells you nothing about which of two
+// hundred functions the guest actually called.
+void *kl_named_stub(const char *nm, void *handler) {
+    if (!nm || !*nm || !handler) return kl_shim_lookup("__klepton_unresolved");
+    pthread_mutex_lock(&g_stub_mu);
+    void *s = stub_emit(nm, NULL, handler,
+                        0x58000080u,    // ldr x0,  #16   (the name)
+                        0x580000B0u,    // ldr x16, #20   (x16 is the intra-
+                        0xD61F0200u);   // br  x16         procedure-call scratch)
+    pthread_mutex_unlock(&g_stub_mu);
+    return s ? s : kl_shim_lookup("__klepton_unresolved");
 }
 
 // The other shape of stub: one that logs and then lets the original call proceed
@@ -176,44 +228,12 @@ void *kl_named_stub(const char *nm, void *handler) {
 // freely; dedup is on (trampoline, name) exactly as it is on (handler, name).
 void *kl_trace_stub(const char *nm, void *desc, void *tramp) {
     if (!nm || !*nm || !desc || !tramp) return NULL;
-    for (unsigned i = 0; i < g_stub_n; i++)
-        if (g_stubs[i].handler == tramp && strcmp(g_stubs[i].name, nm) == 0)
-            return g_stubs[i].stub;
-
-    if (!g_stub_pool) {
-        g_stub_pool = mmap(NULL, KL_STUB_POOL, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (g_stub_pool == MAP_FAILED) { g_stub_pool = NULL; return NULL; }
-    }
-    if (g_stub_off + KL_STUB_BYTES > KL_STUB_POOL) return NULL;
-
-    char *owned = strdup(nm);
-    if (!owned) return NULL;
-
-    uint8_t *s = g_stub_pool + g_stub_off;
-    if (mprotect(g_stub_pool, KL_STUB_POOL, PROT_READ | PROT_WRITE) != 0) {
-        free(owned);
-        return NULL;
-    }
-    uint32_t *code = (uint32_t *)s;
-    code[0] = 0x58000090u;   // ldr x16, #16
-    code[1] = 0x580000B1u;   // ldr x17, #20
-    code[2] = 0xD61F0220u;   // br  x17
-    code[3] = 0xD503201Fu;   // nop
-    memcpy(s + 16, &desc,  8);
-    memcpy(s + 24, &tramp, 8);
-    mprotect(g_stub_pool, KL_STUB_POOL, PROT_READ | PROT_EXEC);
-    sys_icache_invalidate(s, KL_STUB_BYTES);
-    g_stub_off += KL_STUB_BYTES;
-
-    if (g_stub_n == g_stub_cap) {
-        g_stub_cap = g_stub_cap ? g_stub_cap * 2 : 64;
-        g_stubs = realloc(g_stubs, g_stub_cap * sizeof *g_stubs);
-    }
-    g_stubs[g_stub_n].name = owned;
-    g_stubs[g_stub_n].stub = s;
-    g_stubs[g_stub_n].handler = tramp;
-    g_stub_n++;
+    pthread_mutex_lock(&g_stub_mu);
+    void *s = stub_emit(nm, desc, tramp,
+                        0x58000090u,    // ldr x16, #16   (descriptor)
+                        0x580000B1u,    // ldr x17, #20   (trampoline)
+                        0xD61F0220u);   // br  x17
+    pthread_mutex_unlock(&g_stub_mu);
     return s;
 }
 
