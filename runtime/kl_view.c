@@ -114,6 +114,7 @@ int kl_view_main(const char *libdir) {
     float px = 0, py = KL_VIEW_EYE_HEIGHT, pz = 0;
     float yaw = 0, pitch = 0;
     int mouselook = 0;
+    int mouse_l = 0, mouse_r = 0;   // right-hand trigger / grip
 
     SDL_Texture *tex = NULL;       // created on the first frame, size unknown till then
     int tex_w = 0, tex_h = 0;
@@ -142,6 +143,12 @@ int kl_view_main(const char *libdir) {
                     SDL_SetWindowRelativeMouseMode(win, true);
                     mouselook = 1;
                 }
+                if (ev.button.button == SDL_BUTTON_LEFT)  mouse_l = 1;
+                if (ev.button.button == SDL_BUTTON_RIGHT) mouse_r = 1;
+                break;
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+                if (ev.button.button == SDL_BUTTON_LEFT)  mouse_l = 0;
+                if (ev.button.button == SDL_BUTTON_RIGHT) mouse_r = 0;
                 break;
             case SDL_EVENT_MOUSE_MOTION:
                 if (mouselook) {
@@ -180,12 +187,59 @@ int kl_view_main(const char *libdir) {
         // Pose out through the seam, every frame, even when nothing moved —
         // the read side tolerates a torn read (kl_ovrp.c says why), and a
         // constant rewrite keeps the frames honest.
+        float hqx, hqy, hqz, hqw;
         {
             float sp = sinf(pitch * 0.5f), cp = cosf(pitch * 0.5f);
             float syw = sinf(yaw * 0.5f), cyw = cosf(yaw * 0.5f);
             // q = yaw ⊗ pitch: quat multiply of (0,syw,0,cyw) and (sp,0,0,cp).
-            kl_ovrp_set_head_pose(px, py, pz,
-                                  cyw * sp, cp * syw, -syw * sp, cyw * cp);
+            hqx = cyw * sp; hqy = cp * syw; hqz = -syw * sp; hqw = cyw * cp;
+            kl_ovrp_set_head_pose(px, py, pz, hqx, hqy, hqz, hqw);
+        }
+
+        // M7 controller emulation. Both hands ride head-relative offsets
+        // (rotated by the head quat) with the head's orientation — a menu
+        // pointer, not a saber sim. ovrpButton bits (guest metadata):
+        // One=0x1 Two=0x2 Three=0x4 Four=0x8; Primary(right): IndexTrigger
+        // 0x2000, HandTrigger 0x4000, Thumbstick 0x8000, stick U/D/L/R
+        // 0x10000/0x20000/0x40000/0x80000; Secondary(left): the same <<10
+        // (0x200000/0x400000/0x800000, stick dirs 0x1000000..0x8000000).
+        // Mouse L = right trigger, mouse R = right grip, Z/X = A/B, C/V =
+        // X/Y, G/H = left trigger/grip, arrows = right thumbstick.
+        {
+            const float ox[2] = { -0.22f, 0.22f };
+            for (int hand = 0; hand < 2; hand++) {
+                // Rotate the head-relative offset (ox, -0.25, -0.40) by the
+                // head quat: v' = q ⊗ v ⊗ q⁻¹ (unit q, expanded).
+                float vx = ox[hand], vy = -0.25f, vz = -0.40f;
+                float tx = 2.0f * (hqy * vz - hqz * vy);
+                float ty = 2.0f * (hqz * vx - hqx * vz);
+                float tz = 2.0f * (hqx * vy - hqy * vx);
+                float hx = px + vx + hqw * tx + (hqy * tz - hqz * ty);
+                float hy = py + vy + hqw * ty + (hqz * tx - hqx * tz);
+                float hz = pz + vz + hqw * tz + (hqx * ty - hqy * tx);
+                kl_ovrp_set_hand_pose(hand, hx, hy, hz, hqx, hqy, hqz, hqw);
+            }
+
+            uint32_t rb = 0, lb = 0;   // right/left button bits
+            float ridx = mouse_l ? 1.0f : 0.0f, rgrip = mouse_r ? 1.0f : 0.0f;
+            float lidx = keys[SDL_SCANCODE_G] ? 1.0f : 0.0f;
+            float lgrip = keys[SDL_SCANCODE_H] ? 1.0f : 0.0f;
+            float sx = 0, sy2 = 0;
+            if (ridx > 0) rb |= 0x2000;
+            if (rgrip > 0) rb |= 0x4000;
+            if (lidx > 0) lb |= 0x200000;
+            if (lgrip > 0) lb |= 0x400000;
+            if (keys[SDL_SCANCODE_Z]) rb |= 0x1;        // One (A)
+            if (keys[SDL_SCANCODE_X]) rb |= 0x2;        // Two (B)
+            if (keys[SDL_SCANCODE_C]) lb |= 0x4;        // Three (X)
+            if (keys[SDL_SCANCODE_V]) lb |= 0x8;        // Four (Y)
+            if (keys[SDL_SCANCODE_UP])    { rb |= 0x10000; sy2 =  1.0f; }
+            if (keys[SDL_SCANCODE_DOWN])  { rb |= 0x20000; sy2 = -1.0f; }
+            if (keys[SDL_SCANCODE_LEFT])  { rb |= 0x40000; sx  = -1.0f; }
+            if (keys[SDL_SCANCODE_RIGHT]) { rb |= 0x80000; sx  =  1.0f; }
+            // Touches mirror buttons: a pressed button is a touched one.
+            kl_ovrp_set_controller_input(1, rb, rb, ridx, rgrip, sx, sy2);
+            kl_ovrp_set_controller_input(0, lb, lb, lidx, lgrip, 0.0f, 0.0f);
         }
 
         // Newest frame, if the sink stored one since last time: flip GL's

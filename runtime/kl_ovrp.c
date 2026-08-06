@@ -84,6 +84,26 @@ static void ovrp_hit(const char *name) {
     if (s >= 0) g_ovrp[s].calls++;
 }
 
+// M7 discovery: log each distinct argument value an input-family entry point
+// is called with (node id, controller mask), once each, with the caller's
+// image — names whose node/mask values the guest actually uses, and whether
+// the poller is libunity or the game itself.
+static void ovrp_log_arg(const char *name, int arg, void *ra) {
+    static struct { const char *name; int arg; } seen[64];
+    static int nseen; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    for (int i = 0; i < nseen; i++)
+        if (seen[i].name == name && seen[i].arg == arg) { pthread_mutex_unlock(&mu); return; }
+    if (nseen < 64) {
+        size_t off = 0;
+        const char *img = kl_addr_image(ra, &off);
+        fprintf(stderr, "  [ovrp] %s(arg=%d/0x%x) — first seen, called from %s+0x%zx\n",
+                name, arg, arg, img ? img : "?", off);
+        seen[nseen].name = name; seen[nseen].arg = arg; nseen++;
+    }
+    pthread_mutex_unlock(&mu);
+}
+
 // Returns ovrpResult: 0 is success. Also covers the void entry points, where the
 // return value is simply ignored by the caller.
 static uint64_t klovrp_ok(const char *name) {
@@ -201,19 +221,20 @@ static uint64_t klovrp_GetNodeFrustum2(int node, void *out) {
 // The per-frame node loop's tracked/valid probes (0x9bbe78..0x9bbeb4): u32
 // out-param, which is why these cannot be shared handlers. Tracked and valid
 // is the honest answer for the head we pose ourselves.
-static uint64_t node_tracked(const char *name, uint32_t *out) {
+static uint64_t node_tracked(const char *name, int n, uint32_t *out) {
     ovrp_hit(name);
+    ovrp_log_arg(name, n, __builtin_return_address(0));
     *out = 1;
     return OVRP_TRUE;
 }
 static uint64_t klovrp_GetNodePositionTracked2(int n, uint32_t *o) {
-    return node_tracked("ovrp_GetNodePositionTracked2", o);
+    return node_tracked("ovrp_GetNodePositionTracked2", n, o);
 }
 static uint64_t klovrp_GetNodePositionValid(int n, uint32_t *o) {
-    return node_tracked("ovrp_GetNodePositionValid", o);
+    return node_tracked("ovrp_GetNodePositionValid", n, o);
 }
 static uint64_t klovrp_GetNodeOrientationValid(int n, uint32_t *o) {
-    return node_tracked("ovrp_GetNodeOrientationValid", o);
+    return node_tracked("ovrp_GetNodeOrientationValid", n, o);
 }
 
 // The head pose the frontend last gave us (kl_ovrp_set_head_pose — the seam
@@ -222,7 +243,8 @@ static uint64_t klovrp_GetNodeOrientationValid(int n, uint32_t *o) {
 // viewer's UI thread and the reader is the guest's render thread, and a torn
 // read costs one frame with a one-frame-old pose, not a wrong state — the
 // frontend rewrites it every frame anyway.
-static struct { float px, py, pz, qx, qy, qz, qw; } g_head_pose = {
+typedef struct { float px, py, pz, qx, qy, qz, qw; } klovrp_pose;
+static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1,
 };
 
@@ -233,6 +255,51 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     g_head_pose.qz = qz; g_head_pose.qw = qw;
 }
 
+// --- M7: the two hands ------------------------------------------------------
+// Node ids and enum values are not invented: they are read out of the guest's
+// own global-metadata.dat (the OVRPlugin C# it was compiled against):
+//   Node:      EyeLeft=0 EyeRight=1 EyeCenter=2 HandLeft=3 HandRight=4
+//              TrackerZero=5..TrackerThree=8 Head=9
+//   Controller: LTouch=1 RTouch=2 Touch=3 Remote=4 Gamepad=0x10
+//               LHand=0x20 RHand=0x40 Hands=0x60 Active=0x80000000
+// Default hand poses sit slightly below/in front of an origin head in
+// tracking space, so controllers render somewhere sensible before any
+// frontend starts driving them.
+static klovrp_pose g_hand_pose[2] = {
+    { -0.20f, -0.30f, -0.35f, 0, 0, 0, 1 },   // 0 = left  (node 3)
+    {  0.20f, -0.30f, -0.35f, 0, 0, 0, 1 },   // 1 = right (node 4)
+};
+
+// Buttons/touches are ovrpButton/ovrpTouch bit values straight from the
+// metadata (Button: One=1 Two=2 Start=0x100 PrimaryIndexTrigger=0x2000
+// PrimaryHandTrigger=0x4000 PrimaryThumbstick=0x8000 ..., and the Secondary*
+// block at <<20-ish for the other hand — the frontend hands us final bits).
+static struct {
+    uint32_t buttons, touches, neartouches;
+    float    index_trigger, hand_trigger, stick_x, stick_y;
+} g_input[2];
+
+void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
+                           float qx, float qy, float qz, float qw) {
+    if ((unsigned)hand > 1) return;
+    g_hand_pose[hand].px = px; g_hand_pose[hand].py = py; g_hand_pose[hand].pz = pz;
+    g_hand_pose[hand].qx = qx; g_hand_pose[hand].qy = qy;
+    g_hand_pose[hand].qz = qz; g_hand_pose[hand].qw = qw;
+}
+
+void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
+                                  float index_trigger, float hand_trigger,
+                                  float stick_x, float stick_y) {
+    if ((unsigned)hand > 1) return;
+    g_input[hand].buttons = buttons;
+    g_input[hand].touches = touches;
+    g_input[hand].neartouches = touches;   // capacitive proximity ~ touch
+    g_input[hand].index_trigger = index_trigger;
+    g_input[hand].hand_trigger = hand_trigger;
+    g_input[hand].stick_x = stick_x;
+    g_input[hand].stick_y = stick_y;
+}
+
 // out-struct via the sret register x8, NOT x2: the real function returns the
 // 88-byte ovrpPoseStatef by value (its own prologue does `mov x19, x8` and an
 // 0x58-byte memcpy back), so callers place the destination in x8 and the
@@ -241,18 +308,19 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
 // `out` arrives here as an ordinary parameter. Fields libunity consumes:
 // +0x00 quat xyzw (w at +0x0c), +0x10 position, +0x1c velocity,
 // +0x28 acceleration, +0x34 angular velocity, +0x40 angular acceleration.
-// The pose is whatever the frontend last set (identity when there is none).
-// It is applied to every node that comes through here: node 0 is the head and
-// is the only node the pose currently describes; controllers arrive with M7
-// through their own entry points, so nothing else consumes a node pose yet.
+// Node 9 (Head) and the eyes/trackers report the frontend head pose; nodes
+// 3/4 (HandLeft/HandRight) report their own poses.
 uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     ovrp_hit("ovrp_GetNodePoseState");
+    ovrp_log_arg("ovrp_GetNodePoseState", node, __builtin_return_address(0));
     memset(out, 0, 0x58);
+    const klovrp_pose *p = &g_head_pose;
+    if (node == 3 || node == 4) p = &g_hand_pose[node - 3];
     float *f = out;
-    f[0] = g_head_pose.qx; f[1] = g_head_pose.qy;      // quat xyz at +0x00
-    f[2] = g_head_pose.qz; f[3] = g_head_pose.qw;      // quat w at +0x0c
-    f[4] = g_head_pose.px; f[5] = g_head_pose.py;      // position at +0x10
-    f[6] = g_head_pose.pz;
+    f[0] = p->qx; f[1] = p->qy;      // quat xyz at +0x00
+    f[2] = p->qz; f[3] = p->qw;      // quat w at +0x0c
+    f[4] = p->px; f[5] = p->py;      // position at +0x10
+    f[6] = p->pz;
     return OVRP_SUCCESS;
 }
 
@@ -266,27 +334,80 @@ static klovrp_vec3 klovrp_GetBoundaryDimensions(void) {
     return (klovrp_vec3){0, 0, 0};
 }
 
+// Controller masks (metadata OVRPlugin.Controller): LTouch=1, RTouch=2,
+// Touch=3, Remote=4, Gamepad=0x10, LHand=0x20, RHand=0x40, Hands=0x60,
+// Active=0x80000000. Only the Touch controllers exist here, so a mask asking
+// for anything else (Remote/Gamepad/Hands) connects nothing. Active expands
+// to the controllers that are present.
+#define OVRP_CTRL_LTOUCH 0x1u
+#define OVRP_CTRL_RTOUCH 0x2u
+#define OVRP_CTRL_ACTIVE 0x80000000u
+
+// ovrpControllerState prefix, shared by all three versions (field order from
+// the guest's own metadata — OVRInput.ControllerState{,2,4}):
+//   +0x00 u32 ConnectedControllers   +0x10 f32 LIndexTrigger
+//   +0x04 u32 Buttons                +0x14 f32 RIndexTrigger
+//   +0x08 u32 Touches                +0x18 f32 LHandTrigger
+//   +0x0C u32 NearTouches            +0x1C f32 RHandTrigger
+//   +0x20 vec2 LThumbstick           +0x28 vec2 RThumbstick
+// v2 appends +0x30/+0x38 vec2 L/RTouchpad; v4 appends +0x40.. bytes
+// L/RBatteryPercentRemaining, L/RRecenterCount, then 28 reserved.
+static void fill_controller_state(int mask, void *out, int version) {
+    memset(out, 0, version == 4 ? 0x60 : version == 2 ? 0x40 : 0x30);
+    uint32_t m = (uint32_t)mask;
+    if (m & OVRP_CTRL_ACTIVE) m |= OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH;
+    uint32_t conn = m & (OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH);
+    uint8_t *b = out;
+    uint32_t *w = (uint32_t *)out;
+    float *f = (float *)out;
+    w[0] = conn;                                        // ConnectedControllers
+    if (conn & OVRP_CTRL_LTOUCH) {
+        w[1] |= g_input[0].buttons;                     // Buttons
+        w[2] |= g_input[0].touches;                     // Touches
+        w[3] |= g_input[0].neartouches;                 // NearTouches
+        f[4] = g_input[0].index_trigger;                // LIndexTrigger
+        f[6] = g_input[0].hand_trigger;                 // LHandTrigger
+        f[8] = g_input[0].stick_x; f[9] = g_input[0].stick_y;
+        if (version >= 2) { f[12] = g_input[0].stick_x; f[13] = g_input[0].stick_y; }
+        if (version >= 4) b[0x40] = 100;                // LBatteryPercentRemaining
+    }
+    if (conn & OVRP_CTRL_RTOUCH) {
+        w[1] |= g_input[1].buttons;
+        w[2] |= g_input[1].touches;
+        w[3] |= g_input[1].neartouches;
+        f[5] = g_input[1].index_trigger;                // RIndexTrigger
+        f[7] = g_input[1].hand_trigger;                 // RHandTrigger
+        f[10] = g_input[1].stick_x; f[11] = g_input[1].stick_y;
+        if (version >= 2) { f[14] = g_input[1].stick_x; f[15] = g_input[1].stick_y; }
+        if (version >= 4) b[0x41] = 100;                // RBatteryPercentRemaining
+    }
+}
+
 // 64-byte ovrpControllerState2 by value via x8 (real plugin: stp q0..q3 of
-// zeros on the failure path). All-zero state is the honest answer until M7:
-// no buttons, no touches, no triggers, not connected.
+// zeros on the failure path).
 uint64_t klovrp_GetControllerState2_impl(int mask, void *out) {
     ovrp_hit("ovrp_GetControllerState2");
-    memset(out, 0, 0x40);
+    ovrp_log_arg("ovrp_GetControllerState2", mask, __builtin_return_address(0));
+    fill_controller_state(mask, out, 2);
     return OVRP_SUCCESS;
 }
 
 // Same state, newest shape: (mask=w0, out=x1), 0x60 bytes (real plugin's
-// memcpy size), plain ovrpResult. All-zero: no input until M7.
+// memcpy size), plain ovrpResult. This is the one the game itself polls
+// (OVRP_1_16_0::ovrp_GetControllerState4 via P/Invoke).
 static uint64_t klovrp_GetControllerState4(int mask, void *out) {
     ovrp_hit("ovrp_GetControllerState4");
-    memset(out, 0, 0x60);
+    ovrp_log_arg("ovrp_GetControllerState4", mask, __builtin_return_address(0));
+    fill_controller_state(mask, out, 4);
     return OVRP_SUCCESS;
 }
 
-// Same shape, 48 bytes (real plugin: three q-stores). v1 of the above.
+// Same shape, 48 bytes (real plugin: three q-stores). v1 of the above; this
+// is the one libunity's legacy VRDevice polls once a frame with mask=Touch.
 uint64_t klovrp_GetControllerState_impl(int mask, void *out) {
     ovrp_hit("ovrp_GetControllerState");
-    memset(out, 0, 0x30);
+    ovrp_log_arg("ovrp_GetControllerState", mask, __builtin_return_address(0));
+    fill_controller_state(mask, out, 1);
     return OVRP_SUCCESS;
 }
 

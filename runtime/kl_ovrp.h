@@ -19,6 +19,7 @@
 #ifndef KL_OVRP_H
 #define KL_OVRP_H
 #include <stdio.h>
+#include <stdint.h>
 
 void *kl_ovrp_dlopen(const char *soname);   // NULL if this is not OVRPlugin
 int   kl_ovrp_is_handle(const void *h);
@@ -34,5 +35,16 @@ void kl_ovrp_report(FILE *f);
 // the pose stays identity, which is what every headless run has always seen.
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
+
+// M7 — the rest of the pose-in seam: the two Touch controllers. `hand` is
+// 0 = left (node 3), 1 = right (node 4). Poses live in the same tracking
+// space as the head. Buttons/touches are ovrpButton/ovrpTouch bit values as
+// the guest's own OVRPlugin enum defines them (the frontend composes final
+// bits); triggers are 0..1, thumbstick -1..1 on both axes.
+void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
+                           float qx, float qy, float qz, float qw);
+void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
+                                  float index_trigger, float hand_trigger,
+                                  float stick_x, float stick_y);
 
 #endif
