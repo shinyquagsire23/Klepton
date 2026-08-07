@@ -39,6 +39,21 @@ int kl_app_configure(const char *resources, const char *container);
 // report has to survive that — on device there is no shell to have caught it.
 int kl_app_boot(void);
 
+// The Android lifecycle, after kl_app_boot: nativeRecreateGfxState, nativeResume,
+// nativeRender, then `frames` more pumped frames with the Choreographer ticked
+// and the posted-task queue drained between them.
+//
+// Separate from kl_app_boot on purpose. Boot is the P4 gate and refuses a second
+// entry, so keeping them apart lets a run take the gate's numbers first and only
+// then go further — and it keeps "initJni completed" reportable even when the
+// lifecycle is what fails. This is P5.4: it is where libil2cpp (66 MB, 3,083 x18
+// veneers) first loads under AMFI, and where the synthetic /proc is first read on
+// device (trap 6d — it prints that before anything else, because a silent zero
+// there is what made Unity refuse to start on the host).
+//
+// Returns 0 if the sequence completed. Once per process.
+int kl_app_lifecycle(unsigned frames);
+
 // Absolute path of the log kl_app_boot writes, valid after kl_app_configure.
 // The Swift side displays it and offers it for export.
 const char *kl_app_log_path(void);

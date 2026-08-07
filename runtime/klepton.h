@@ -22,6 +22,12 @@ kl_image *kl_load_dylib(const char *path);
 // translation exists, else the ELF. Lets the boot chain run mixed while some
 // libraries are still untranslatable. Every guest-library load goes through it.
 kl_image *kl_load_auto(const char *path);
+
+// Could kl_load_auto load a guest library at `path`? Ask this — never
+// stat(path) — whenever answering an existence question about a guest library on
+// the guest's behalf: with translations embedded, the .so path is a name the
+// loader resolves and not a file on disk. See the implementation comment.
+int kl_can_load(const char *path);
 // Look up an exported symbol. NULL if absent.
 void      *kl_sym(kl_image *img, const char *name);
 // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.

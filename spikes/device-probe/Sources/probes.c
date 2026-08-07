@@ -410,3 +410,375 @@ char *klepton_run_probes(const char *bundle_path) {
     sb(s, "\n===== END =====");
     return S.p;
 }
+
+// ============================ P13 ============================
+// ANGLE under AMFI, and the Metal interop primitive (port rung P5).
+//
+// Two questions in one, because they need the same setup and the device is the
+// only place either can be answered:
+//
+//   1. does a `vtool`-retargeted third-party dylib pass AMFI? This is the last
+//      unverified tail of PLANNING §12.1(1). The link line and all 299 undefined
+//      symbols were checked against the xrOS SDK offline (§12.5); what no
+//      host-side check can establish is whether AMFI objects to a Mach-O whose
+//      LC_BUILD_VERSION was rewritten after signing-time-1 by a stock tool.
+//   2. does eglCreateImageKHR(EGL_METAL_TEXTURE_ANGLE) work *here*? It works on
+//      macOS — `make mtltex`, S1.1, every check green including per-eye array
+//      slices and RGBA16F at the guest's real 2198x2304. visionOS is a different
+//      Metal and a different sandbox.
+//
+// The texture comes from Swift, deliberately: that is the shipping seam
+// (§12.6 — Swift owns Metal, C owns the guest), so this rehearses the real
+// arrangement rather than a convenient one. C hands Swift ANGLE's MTLDevice,
+// Swift allocates on it and hands the texture back, and each side verifies the
+// pixels through its own API — GL says it wrote them, Metal says they landed in
+// our texture. Neither claim implies the other.
+//
+// The ANGLE loader is duplicated here rather than shared with kl_glfb.c for the
+// same reason probe_klepton_ld duplicates the relocation walk: this app builds
+// against nothing but the visionOS SDK.
+
+#define EGL_NO_CONTEXT           ((void *)0)
+#define EGL_NO_IMAGE             ((void *)0)
+#define EGL_DEFAULT_DISPLAY      ((void *)0)
+#define EGL_NONE                 0x3038
+#define EGL_WIDTH                0x3057
+#define EGL_HEIGHT               0x3056
+#define EGL_SURFACE_TYPE         0x3033
+#define EGL_PBUFFER_BIT          0x0001
+#define EGL_RENDERABLE_TYPE      0x3040
+#define EGL_OPENGL_ES3_BIT       0x0040
+#define EGL_RED_SIZE             0x3024
+#define EGL_GREEN_SIZE           0x3023
+#define EGL_BLUE_SIZE            0x3022
+#define EGL_ALPHA_SIZE           0x3021
+#define EGL_EXTENSIONS           0x3055
+#define EGL_CONTEXT_CLIENT_VERSION 0x3098
+#define EGL_PLATFORM_ANGLE_ANGLE            0x3202
+#define EGL_PLATFORM_ANGLE_TYPE_ANGLE       0x3203
+#define EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE 0x3489
+#define EGL_DEVICE_EXT                      0x322C
+#define EGL_METAL_DEVICE_ANGLE              0x34A6
+#define EGL_METAL_TEXTURE_ANGLE             0x34A7
+#define EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE 0x34DD
+#define EGL_TEXTURE_INTERNAL_FORMAT_ANGLE   0x345D
+
+#define GL_NO_ERROR              0
+#define GL_TEXTURE_2D            0x0DE1
+#define GL_FRAMEBUFFER           0x8D40
+#define GL_COLOR_ATTACHMENT0     0x8CE0
+#define GL_FRAMEBUFFER_COMPLETE  0x8CD5
+#define GL_RGBA                  0x1908
+#define GL_RGBA16F               0x881A
+#define GL_UNSIGNED_BYTE         0x1401
+#define GL_FLOAT                 0x1406
+#define GL_COLOR_BUFFER_BIT      0x00004000
+#define GL_VERTEX_SHADER         0x8B31
+#define GL_FRAGMENT_SHADER       0x8B30
+#define GL_COMPILE_STATUS        0x8B81
+#define GL_LINK_STATUS           0x8B82
+#define GL_ARRAY_BUFFER          0x8892
+#define GL_STATIC_DRAW           0x88E4
+#define GL_TRIANGLES             0x0004
+#define GL_RENDERER              0x1F01
+#define GL_VERSION               0x1F02
+
+static SB g_alog;                       // P13's own report, read back by Swift
+static void *g_a_egl, *g_a_gles;
+static void *g_a_dpy, *g_a_ctx, *g_a_cfg;
+static uint32_t g_a_fbo, g_a_prog;
+
+static void *asym(const char *n) {
+    void *p = g_a_gles ? dlsym(g_a_gles, n) : NULL;
+    if (!p && g_a_egl) p = dlsym(g_a_egl, n);
+    return p;
+}
+
+static void *(*a_eglGetPlatformDisplayEXT)(uint32_t, void *, const int32_t *);
+static unsigned (*a_eglInitialize)(void *, int32_t *, int32_t *);
+static unsigned (*a_eglChooseConfig)(void *, const int32_t *, void **, int32_t, int32_t *);
+static void *(*a_eglCreateContext)(void *, void *, void *, const int32_t *);
+static void *(*a_eglCreatePbufferSurface)(void *, void *, const int32_t *);
+static unsigned (*a_eglMakeCurrent)(void *, void *, void *, void *);
+static const char *(*a_eglQueryString)(void *, int32_t);
+static const char *(*a_eglQueryDeviceStringEXT)(void *, int32_t);
+static unsigned (*a_eglQueryDisplayAttribEXT)(void *, int32_t, intptr_t *);
+static unsigned (*a_eglQueryDeviceAttribEXT)(void *, int32_t, intptr_t *);
+static void *(*a_eglCreateImageKHR)(void *, void *, uint32_t, void *, const int32_t *);
+static unsigned (*a_eglDestroyImageKHR)(void *, void *);
+static uint32_t (*a_eglGetError)(void);
+static void (*a_glEGLImageTargetTexture2DOES)(uint32_t, void *);
+static void (*a_glGenTextures)(int32_t, uint32_t *);
+static void (*a_glBindTexture)(uint32_t, uint32_t);
+static void (*a_glGenFramebuffers)(int32_t, uint32_t *);
+static void (*a_glBindFramebuffer)(uint32_t, uint32_t);
+static void (*a_glFramebufferTexture2D)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+static uint32_t (*a_glCheckFramebufferStatus)(uint32_t);
+static void (*a_glClearColor)(float, float, float, float);
+static void (*a_glClear)(uint32_t);
+static void (*a_glReadPixels)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void *);
+static void (*a_glFinish)(void);
+static uint32_t (*a_glGetError)(void);
+static void (*a_glViewport)(int32_t, int32_t, int32_t, int32_t);
+static const uint8_t *(*a_glGetString)(uint32_t);
+static uint32_t (*a_glCreateShader)(uint32_t);
+static void (*a_glShaderSource)(uint32_t, int32_t, const char *const *, const int32_t *);
+static void (*a_glCompileShader)(uint32_t);
+static void (*a_glGetShaderiv)(uint32_t, uint32_t, int32_t *);
+static uint32_t (*a_glCreateProgram)(void);
+static void (*a_glAttachShader)(uint32_t, uint32_t);
+static void (*a_glLinkProgram)(uint32_t);
+static void (*a_glGetProgramiv)(uint32_t, uint32_t, int32_t *);
+static void (*a_glUseProgram)(uint32_t);
+static void (*a_glGenBuffers)(int32_t, uint32_t *);
+static void (*a_glBindBuffer)(uint32_t, uint32_t);
+static void (*a_glBufferData)(uint32_t, intptr_t, const void *, uint32_t);
+static void (*a_glVertexAttribPointer)(uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void *);
+static void (*a_glEnableVertexAttribArray)(uint32_t);
+static void (*a_glDrawArrays)(uint32_t, int32_t, int32_t);
+static void (*a_glUniform3f)(int32_t, float, float, float);
+static int32_t (*a_glGetUniformLocation)(uint32_t, const char *);
+
+const char *klepton_angle_log(void) { return g_alog.p ? g_alog.p : ""; }
+
+// Returns ANGLE's own MTLDevice as an opaque pointer, or NULL. The device has to
+// be ANGLE's: the extension spec requires the texture come from the display's
+// device, so MTLCreateSystemDefaultDevice() is not interchangeable and would
+// fail with EGL_BAD_PARAMETER for a reason nothing else would explain.
+void *klepton_angle_init(const char *bundle_path) {
+    SB *s = &g_alog;
+    if (!s->p) sb_init(s);
+
+    char p[1024];
+    snprintf(p, sizeof p, "%s/Frameworks/libEGL.framework/libEGL", bundle_path);
+    g_a_egl = dlopen(p, RTLD_NOW | RTLD_LOCAL);
+    if (!g_a_egl) {
+        sb(s, "    dlopen libEGL FAILED: %s", dlerror());
+        sb(s, "    >>> AMFI REJECTED THE vtool-RETARGETED DYLIB — §12.1(1) BLOCKED");
+        return NULL;
+    }
+    sb(s, "    dlopen libEGL OK       <<< AMFI ACCEPTED THE RETARGETED DYLIB");
+    // libEGL finds libGLESv2 itself on iOS-family platforms — it dlopens
+    // <exec dir>/Frameworks/libGLESv2.framework/libGLESv2 (ANGLE's
+    // system_utils_posix.cpp), which is exactly where the embed phase puts it.
+    // We open it too, for the gl* exports: libEGL exports only egl* (115
+    // symbols) and libGLESv2 only gl* (826), so both handles are needed.
+    snprintf(p, sizeof p, "%s/Frameworks/libGLESv2.framework/libGLESv2", bundle_path);
+    g_a_gles = dlopen(p, RTLD_NOW | RTLD_LOCAL);
+    if (!g_a_gles) { sb(s, "    dlopen libGLESv2 FAILED: %s", dlerror()); return NULL; }
+    sb(s, "    dlopen libGLESv2 OK    (12 MB, carries all of libANGLE)");
+
+    a_eglGetPlatformDisplayEXT = asym("eglGetPlatformDisplayEXT");
+    a_eglInitialize            = asym("eglInitialize");
+    a_eglChooseConfig          = asym("eglChooseConfig");
+    a_eglCreateContext         = asym("eglCreateContext");
+    a_eglCreatePbufferSurface  = asym("eglCreatePbufferSurface");
+    a_eglMakeCurrent           = asym("eglMakeCurrent");
+    a_eglQueryString           = asym("eglQueryString");
+    a_eglQueryDeviceStringEXT  = asym("eglQueryDeviceStringEXT");
+    a_eglQueryDisplayAttribEXT = asym("eglQueryDisplayAttribEXT");
+    a_eglQueryDeviceAttribEXT  = asym("eglQueryDeviceAttribEXT");
+    a_eglCreateImageKHR        = asym("eglCreateImageKHR");
+    a_eglDestroyImageKHR       = asym("eglDestroyImageKHR");
+    a_eglGetError              = asym("eglGetError");
+    a_glEGLImageTargetTexture2DOES = asym("glEGLImageTargetTexture2DOES");
+    a_glGenTextures            = asym("glGenTextures");
+    a_glBindTexture            = asym("glBindTexture");
+    a_glGenFramebuffers        = asym("glGenFramebuffers");
+    a_glBindFramebuffer        = asym("glBindFramebuffer");
+    a_glFramebufferTexture2D   = asym("glFramebufferTexture2D");
+    a_glCheckFramebufferStatus = asym("glCheckFramebufferStatus");
+    a_glClearColor             = asym("glClearColor");
+    a_glClear                  = asym("glClear");
+    a_glReadPixels             = asym("glReadPixels");
+    a_glFinish                 = asym("glFinish");
+    a_glGetError               = asym("glGetError");
+    a_glViewport               = asym("glViewport");
+    a_glGetString              = asym("glGetString");
+    a_glCreateShader           = asym("glCreateShader");
+    a_glShaderSource           = asym("glShaderSource");
+    a_glCompileShader          = asym("glCompileShader");
+    a_glGetShaderiv            = asym("glGetShaderiv");
+    a_glCreateProgram          = asym("glCreateProgram");
+    a_glAttachShader           = asym("glAttachShader");
+    a_glLinkProgram            = asym("glLinkProgram");
+    a_glGetProgramiv           = asym("glGetProgramiv");
+    a_glUseProgram             = asym("glUseProgram");
+    a_glGenBuffers             = asym("glGenBuffers");
+    a_glBindBuffer             = asym("glBindBuffer");
+    a_glBufferData             = asym("glBufferData");
+    a_glVertexAttribPointer    = asym("glVertexAttribPointer");
+    a_glEnableVertexAttribArray = asym("glEnableVertexAttribArray");
+    a_glDrawArrays             = asym("glDrawArrays");
+    a_glUniform3f              = asym("glUniform3f");
+    a_glGetUniformLocation     = asym("glGetUniformLocation");
+    if (!a_eglInitialize || !a_eglCreateImageKHR || !a_glEGLImageTargetTexture2DOES
+        || !a_eglQueryDeviceAttribEXT || !a_glFramebufferTexture2D) {
+        sb(s, "    missing an interop entry point (createImage=%d imageTarget=%d devAttrib=%d)",
+           a_eglCreateImageKHR != NULL, a_glEGLImageTargetTexture2DOES != NULL,
+           a_eglQueryDeviceAttribEXT != NULL);
+        return NULL;
+    }
+
+    const int32_t dpy_attrs[] = {
+        EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE, EGL_NONE };
+    g_a_dpy = a_eglGetPlatformDisplayEXT
+            ? a_eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, EGL_DEFAULT_DISPLAY, dpy_attrs)
+            : NULL;
+    int32_t major = 0, minor = 0;
+    if (!g_a_dpy || !a_eglInitialize(g_a_dpy, &major, &minor)) {
+        sb(s, "    eglInitialize FAILED on the Metal backend (EGL error 0x%x)",
+           a_eglGetError ? a_eglGetError() : 0);
+        return NULL;
+    }
+    sb(s, "    EGL %d.%d initialised on the Metal backend", major, minor);
+
+    const char *exts = a_eglQueryString(g_a_dpy, EGL_EXTENSIONS);
+    static const char *want[] = { "EGL_ANGLE_metal_texture_client_buffer",
+                                  "EGL_KHR_image_base",
+                                  "EGL_ANGLE_metal_shared_event_sync" };
+    for (size_t i = 0; i < sizeof want / sizeof *want; i++)
+        sb(s, "    %-42s %s", want[i],
+           exts && strstr(exts, want[i]) ? "present" : "MISSING");
+
+    const int32_t cfg_attrs[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE };
+    int32_t ncfg = 0;
+    if (!a_eglChooseConfig(g_a_dpy, cfg_attrs, &g_a_cfg, 1, &ncfg) || ncfg < 1) {
+        sb(s, "    eglChooseConfig FAILED"); return NULL;
+    }
+    const int32_t surf_attrs[] = { EGL_WIDTH, 64, EGL_HEIGHT, 64, EGL_NONE };
+    void *surf = a_eglCreatePbufferSurface(g_a_dpy, g_a_cfg, surf_attrs);
+    const int32_t ctx_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    g_a_ctx = a_eglCreateContext(g_a_dpy, g_a_cfg, EGL_NO_CONTEXT, ctx_attrs);
+    if (!g_a_ctx || !a_eglMakeCurrent(g_a_dpy, surf, surf, g_a_ctx)) {
+        sb(s, "    no current ES3 context (EGL error 0x%x)",
+           a_eglGetError ? a_eglGetError() : 0);
+        return NULL;
+    }
+    sb(s, "    GL_RENDERER = %s", (const char *)a_glGetString(GL_RENDERER));
+    sb(s, "    GL_VERSION  = %s", (const char *)a_glGetString(GL_VERSION));
+
+    intptr_t egl_dev = 0, mtl_dev = 0;
+    if (!a_eglQueryDisplayAttribEXT(g_a_dpy, EGL_DEVICE_EXT, &egl_dev) || !egl_dev) {
+        sb(s, "    eglQueryDisplayAttribEXT(EGL_DEVICE_EXT) FAILED"); return NULL;
+    }
+    // EGL_ANGLE_device_metal is a *device* extension, so it is advertised here
+    // and never in the display string. Looking for it in the display string
+    // reports a working capability as missing — cost one confused minute on the
+    // host, so it is spelled out.
+    const char *dexts = a_eglQueryDeviceStringEXT
+                      ? a_eglQueryDeviceStringEXT((void *)egl_dev, EGL_EXTENSIONS) : NULL;
+    sb(s, "    EGL_ANGLE_device_metal (device ext)        %s",
+       dexts && strstr(dexts, "EGL_ANGLE_device_metal") ? "present" : "MISSING");
+    if (!a_eglQueryDeviceAttribEXT((void *)egl_dev, EGL_METAL_DEVICE_ANGLE, &mtl_dev)
+        || !mtl_dev) {
+        sb(s, "    eglQueryDeviceAttribEXT(EGL_METAL_DEVICE_ANGLE) FAILED"); return NULL;
+    }
+    a_glGenFramebuffers(1, &g_a_fbo);
+    return (void *)mtl_dev;
+}
+
+// A triangle covering the whole clip square, in `rgb`. A clear can be serviced
+// by a load-action alone; a draw needs the whole pipeline pointed at our
+// texture, which is the claim worth making.
+static int angle_draw_tri(float r, float g, float b) {
+    if (!g_a_prog) {
+        const char *vs = "#version 300 es\nin vec2 p;void main(){gl_Position=vec4(p,0.,1.);}\n";
+        const char *fs = "#version 300 es\nprecision mediump float;uniform vec3 c;"
+                         "out vec4 o;void main(){o=vec4(c,1.);}\n";
+        uint32_t v = a_glCreateShader(GL_VERTEX_SHADER), f = a_glCreateShader(GL_FRAGMENT_SHADER);
+        int32_t ok = 0;
+        a_glShaderSource(v, 1, &vs, NULL); a_glCompileShader(v);
+        a_glGetShaderiv(v, GL_COMPILE_STATUS, &ok); if (!ok) return 0;
+        a_glShaderSource(f, 1, &fs, NULL); a_glCompileShader(f);
+        a_glGetShaderiv(f, GL_COMPILE_STATUS, &ok); if (!ok) return 0;
+        g_a_prog = a_glCreateProgram();
+        a_glAttachShader(g_a_prog, v); a_glAttachShader(g_a_prog, f);
+        a_glLinkProgram(g_a_prog);
+        a_glGetProgramiv(g_a_prog, GL_LINK_STATUS, &ok); if (!ok) { g_a_prog = 0; return 0; }
+        uint32_t vbo = 0;
+        const float tri[] = { -1.f, -1.f, 3.f, -1.f, -1.f, 3.f };
+        a_glGenBuffers(1, &vbo);
+        a_glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        a_glBufferData(GL_ARRAY_BUFFER, (intptr_t)sizeof tri, tri, GL_STATIC_DRAW);
+        a_glVertexAttribPointer(0, 2, GL_FLOAT, 0, 0, NULL);
+        a_glEnableVertexAttribArray(0);
+    }
+    a_glUseProgram(g_a_prog);
+    if (a_glUniform3f && a_glGetUniformLocation)
+        a_glUniform3f(a_glGetUniformLocation(g_a_prog, "c"), r, g, b);
+    while (a_glGetError() != GL_NO_ERROR) {}
+    a_glDrawArrays(GL_TRIANGLES, 0, 3);
+    return a_glGetError() == GL_NO_ERROR;
+}
+
+// Wrap `slice` of the Swift-allocated MTLTexture as a GL texture and draw into
+// it. `f16` selects the guest's real eye format (GL_RGBA16F) over RGBA8; the
+// RGBA8 case additionally reads back through GL, which a float target cannot do
+// with a fixed format/type pair.
+// Returns 0 on success, non-zero at the step that failed.
+int klepton_angle_draw(void *mtl_texture, int slice, int f16, int w, int h,
+                       float r, float g, float b) {
+    SB *s = &g_alog;
+    if (!g_a_dpy || !mtl_texture) return 1;
+    uint32_t ifmt = f16 ? GL_RGBA16F : GL_RGBA;
+    const int32_t img_attrs[] = {
+        EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE, slice,
+        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE,   (int32_t)ifmt,
+        EGL_NONE,
+    };
+    void *img = a_eglCreateImageKHR(g_a_dpy, EGL_NO_CONTEXT, EGL_METAL_TEXTURE_ANGLE,
+                                    mtl_texture, img_attrs);
+    if (img == EGL_NO_IMAGE) {
+        sb(s, "    slice %d: eglCreateImageKHR FAILED, EGL error 0x%x", slice,
+           a_eglGetError ? a_eglGetError() : 0);
+        return 2;
+    }
+    uint32_t tex = 0;
+    a_glGenTextures(1, &tex);
+    a_glBindTexture(GL_TEXTURE_2D, tex);
+    while (a_glGetError() != GL_NO_ERROR) {}
+    a_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
+    uint32_t e = a_glGetError();
+    if (e != GL_NO_ERROR) {
+        sb(s, "    slice %d: glEGLImageTargetTexture2DOES -> GL error 0x%x", slice, e);
+        a_eglDestroyImageKHR(g_a_dpy, img);
+        return 3;
+    }
+    a_glBindFramebuffer(GL_FRAMEBUFFER, g_a_fbo);
+    a_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    uint32_t st = a_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (st != GL_FRAMEBUFFER_COMPLETE) {
+        sb(s, "    slice %d: FBO INCOMPLETE (0x%x)", slice, st);
+        a_eglDestroyImageKHR(g_a_dpy, img);
+        return 4;
+    }
+    a_glViewport(0, 0, w, h);
+    a_glClearColor(0.f, 0.f, 1.f, 1.f);      // blue first, then overdrawn, so a
+    a_glClear(GL_COLOR_BUFFER_BIT);          // stale clear cannot pass as a draw
+    int drew = angle_draw_tri(r, g, b);
+    a_glFinish();
+    if (!drew) { sb(s, "    slice %d: draw FAILED", slice);
+                 a_eglDestroyImageKHR(g_a_dpy, img); return 5; }
+
+    if (!f16) {          // GL's own view of what it just wrote
+        uint8_t px[4] = { 0 };
+        a_glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        int want_r = (int)(r * 255.f + 0.5f), want_g = (int)(g * 255.f + 0.5f);
+        sb(s, "    slice %d: GL-side readback = %u,%u,%u  %s", slice, px[0], px[1], px[2],
+           (px[0] == want_r && px[1] == want_g) ? "[matches]" : "[MISMATCH]");
+    }
+    sb(s, "    slice %d: EGLImage -> GL texture -> FBO complete -> draw OK "
+          "(%dx%d %s)", slice, w, h, f16 ? "RGBA16F" : "RGBA8");
+    a_eglDestroyImageKHR(g_a_dpy, img);
+    return 0;
+}
+
+// Swift appends its Metal-side verdicts through here, so the whole P13 report
+// stays one block in the log rather than two interleaved ones.
+void klepton_angle_note(const char *line) {
+    if (!g_alog.p) sb_init(&g_alog);
+    sb(&g_alog, "%s", line);
+}

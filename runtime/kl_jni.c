@@ -1754,8 +1754,16 @@ static klj_val klj_ClassLoader_findLibrary(void *env, void *self, const klj_val 
         snprintf(path, sizeof path, "%s/%s", g_native_lib_dir, name);
     else
         snprintf(path, sizeof path, "%s/lib%s.so", g_native_lib_dir, name);
-    struct stat st;
-    int found = stat(path, &st) == 0;
+    // kl_can_load, not stat: with klepton-ld translations embedded in a bundle
+    // the ELF tree is not on disk at all, so stat'ing the .so answers "absent"
+    // for a library the loader would load without trouble. That is what killed
+    // the first device lifecycle run — findLibrary("il2cpp") returned null,
+    // Unity never attempted the dlopen, and the symptom was
+    // "Failed to load Il2CPP." with nothing near the actual cause.
+    //
+    // The answer stays the .so path: the guest hands it straight back to dlopen,
+    // where kl_load_auto resolves it, so there is one resolver and not two.
+    int found = kl_can_load(path);
     KLJ_LOG("ClassLoader.findLibrary(\"%s\") -> %s", name, found ? path : "null");
     return (klj_val){.l = found ? kl_jni_new_string(path) : NULL};
 }

@@ -92,8 +92,36 @@ EOF
   echo "  $NAME.xcframework   klepton-ld output ($(stat -f%z build/xros/$NAME/../$NAME.framework/$NAME 2>/dev/null || stat -f%z build/xros/$NAME.framework/$NAME) bytes)"
 }
 
+# ANGLE — the P13 / port-rung-P5 subject. Not built here either: these come out
+# of the vendored iOS build, retargeted to visionOS by tools/angle_retarget.sh
+# (`make angle-xros angle-xrsim`). The open question is whether AMFI objects to a
+# Mach-O whose LC_BUILD_VERSION a stock tool rewrote after the fact.
+#
+# Embedded, not linked — same reasoning as the guest frameworks: nothing
+# references their symbols, the probe dlopens them by path. libEGL then finds
+# libGLESv2 by itself at <exec dir>/Frameworks/libGLESv2.framework/libGLESv2,
+# which is exactly where the embed phase puts it.
+make_angle_frameworks() {
+  local n missing=0
+  for n in libEGL libGLESv2; do
+    for d in xros xrsim; do
+      [ -f "../../vendor/out/$d/$n.framework/$n" ] || { missing=1; \
+        echo "  !! vendor/out/$d/$n.framework/$n missing"; }
+    done
+  done
+  [ "$missing" = 0 ] || { echo "  !! run 'make angle-xros angle-xrsim' first"; return 1; }
+  for n in libEGL libGLESv2; do
+    xcodebuild -create-xcframework \
+        -framework "../../vendor/out/xros/$n.framework" \
+        -framework "../../vendor/out/xrsim/$n.framework" \
+        -output "$OUT/ANGLE_$n.xcframework" > /dev/null
+    echo "  ANGLE_$n.xcframework   $(stat -f%z ../../vendor/out/xros/$n.framework/$n) bytes (xros)"
+  done
+}
+
 echo "[mkframeworks] building probe XCFrameworks…"
 make_xcframework KleptonProbeA
 make_xcframework KleptonProbeB -Wl,-segalign,0x10000
 make_guest_framework
+make_angle_frameworks
 echo "[mkframeworks] done -> $OUT/"

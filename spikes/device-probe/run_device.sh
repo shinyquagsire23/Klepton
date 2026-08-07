@@ -75,8 +75,13 @@ xcodebuild -project KleptonProbe.xcodeproj -scheme KleptonProbe \
 set -e
 
 APP="build/dd-device/Build/Products/Debug-xros/KleptonProbe.app"
-if [ ! -d "$APP" ]; then
-  echo "!! build produced no .app at $APP — see errors above"
+# A directory is not enough: a failed build leaves the previous run's .app
+# skeleton behind, and installing that produces "not a valid bundle / Info.plist
+# missing" — which reads as a signing or packaging problem rather than as the
+# compile error twenty lines up. Gate on the Info.plist, which only a completed
+# build writes.
+if [ ! -f "$APP/Info.plist" ]; then
+  echo "!! build produced no usable .app at $APP — see the errors above"
   exit 1
 fi
 echo "    app: $APP"

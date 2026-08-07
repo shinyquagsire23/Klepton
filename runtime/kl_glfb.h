@@ -57,4 +57,61 @@ void kl_glfb_report_formats(void);
 // textures, not the backbuffer).
 void kl_glfb_note_eye_texture(int eye, uint32_t tex);
 
+// ---------------------------------------------------------------------------
+// The Metal interop seam (P5). Proven on host and device before any of this
+// existed — `make mtltex` and device probe P13; PLANNING §12.9.
+//
+// On visionOS the guest's eye textures must live in MTLTextures the compositor
+// can sample, so instead of allocating GL storage for the texture name Unity
+// hands down, we back it with an MTLTexture the host allocated:
+//
+//     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA16F, h, w)   // host / no provider
+//     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image)   // with a provider
+//
+// With no provider registered nothing below changes behaviour, which is why the
+// macOS path and `make check` are unaffected.
+
+// What the host supplies for one (eye, stage). `texture` is an id<MTLTexture>
+// which the host must keep alive for as long as the guest holds the eye texture.
+// `slice` addresses an array slice, which is how the two eyes arrive in a
+// layered drawable; 0 for a plain 2D texture.
+//
+// `w`/`h` are the texture's ACTUAL dimensions, and the provider must fill them:
+// EGL_ANGLE_metal_texture_client_buffer takes the size from the MTLTexture and
+// ignores everything we say about it, so a provider that returns a texture of
+// the wrong size gets a successful eglCreateImageKHR and a guest rendering into
+// storage smaller than it believes it has. That is exactly what happened the
+// first time this ran — Unity re-creates its eye textures at a *different* size
+// partway through startup (measured: 1832x1920, then 2198x2304), the provider
+// handed back its one cached texture, and the result was a partially-filled
+// frame with nothing anywhere reporting a problem. So kl_glfb refuses a
+// mismatch rather than trusting the caller.
+typedef struct { void *texture; int slice; int w, h; } kl_mtl_eye_texture;
+
+// Called from ovrp_SetupEyeTexture2 when Unity asks for eye storage. Return
+// non-zero having filled `out`, or 0 to let the guest get ordinary GL storage.
+// w/h are the dimensions the texture must have — note they arrive already
+// transposed relative to ovrp's arguments; see kl_ovrp.c's SetupEyeTexture2.
+typedef int (*kl_glfb_mtl_provider)(int eye, int stage, int w, int h,
+                                    kl_mtl_eye_texture *out, void *ctx);
+void kl_glfb_set_mtl_provider(kl_glfb_mtl_provider fn, void *ctx);
+int  kl_glfb_has_mtl_provider(void);
+
+// ANGLE's own MTLDevice (an id<MTLDevice>), or NULL. The host MUST allocate on
+// this device: EGL_ANGLE_metal_texture_client_buffer requires the texture come
+// from the display's device, and passing one from MTLCreateSystemDefaultDevice()
+// fails with EGL_BAD_PARAMETER for a reason nothing else would explain.
+void *kl_glfb_mtl_device(void);
+
+// Ask the registered provider for (eye, stage) and give `gl_tex` storage backed
+// by what it returns. Returns 1 if the texture is now MTLTexture-backed, 0 if
+// the caller should allocate GL storage itself. `internal_fmt` is the GL
+// internalformat the guest asked for.
+int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
+                                 int w, int h, uint32_t internal_fmt);
+
+// The MTLTexture currently backing (eye, stage), or NULL — what the compositor
+// pass samples, and what a test reads back to check the guest's frame arrived.
+void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice);
+
 #endif

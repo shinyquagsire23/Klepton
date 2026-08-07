@@ -769,6 +769,18 @@ static uint64_t klovrp_SetupEyeTexture2(int eye, int stage, uintptr_t handle,
     // to — tell kl_glfb which names are eyes (it is a no-op consumer when the
     // null driver is doing the "rendering").
     kl_glfb_note_eye_texture(eye, (uint32_t)handle);
+    // P5: when the host has MTLTextures for the compositor to sample, the eye
+    // texture's storage IS one of them — glEGLImageTargetTexture2DOES in place of
+    // glTexStorage2D, and nothing else about this function changes (PLANNING
+    // §12.9). The h,w transposition below applies identically, so it is passed on
+    // in the same order.
+    //
+    // With no provider registered — every host run, so `make check` too — this is
+    // a single NULL test and the GL path below is unchanged.
+    if (kl_glfb_has_mtl_provider() &&
+        kl_glfb_bind_eye_mtl_texture(eye, stage, (uint32_t)handle, h, w,
+                                     KL_OVRP_TEXFMT_EYE))
+        return 1;
     if (gl_BindTexture && gl_TexStorage2D) {
         gl_BindTexture(0x0DE1 /* GL_TEXTURE_2D */, (uint32_t)handle);
         // Allocate h-by-w, not w-by-h: the guest's own eye-resolve blit writes

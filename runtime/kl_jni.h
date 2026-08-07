@@ -65,6 +65,12 @@ void kl_jni_set_assets_dir(const char *dir);
 void kl_jni_set_files_dir(const char *dir);
 // The APK, which Unity opens as a zip via getPackageCodePath(). Default "beatsaber.apk".
 void kl_jni_set_apk_path(const char *path);
+// The native library directory: what ApplicationInfo.nativeLibraryDir reports and
+// what ClassLoader.findLibrary() builds paths in. Defaults to the *relative*
+// "beatsaber/lib/arm64-v8a" resolved against the working directory, which is the
+// repo root under the tests and `/` inside an app bundle — so a bundle must set
+// it explicitly or Unity reads back a path like "//beatsaber/lib/arm64-v8a".
+void kl_jni_set_native_lib_dir(const char *dir);
 
 // Everything the guest asked us for: classes found, natives registered, and
 // every method/field id it wanted. This is the M4 work list.

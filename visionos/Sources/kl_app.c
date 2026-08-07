@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "klepton.h"
@@ -74,6 +75,14 @@ int kl_app_configure(const char *resources, const char *container) {
     mkdir(g_files, 0755);
 
     kl_set_library_path(g_libdir);
+    // Explicitly, because the default is a *relative* path that gets absolutised
+    // against the working directory — which is the repo root under t_boot and `/`
+    // inside an app bundle. Left unset on device it became
+    // "//beatsaber/lib/arm64-v8a", and that is the string Unity reads back as
+    // ApplicationInfo.nativeLibraryDir and hands to ClassLoader.findLibrary. It
+    // survived only because kl_can_load matches a translation on the basename;
+    // anything that actually used the directory would have been quietly wrong.
+    kl_jni_set_native_lib_dir(g_libdir);
     kl_jni_set_assets_dir(g_assets);
     kl_jni_set_apk_path(g_apk);
     kl_jni_set_files_dir(g_files);
@@ -106,6 +115,44 @@ static int open_log(void) {
     return 0;
 }
 
+// A heartbeat on its own thread, because three different failures look identical
+// in a log that simply stops growing — and on device there is no shell, no
+// sampler and no way to attach:
+//
+//   * the process is SUSPENDED  -> the timestamps show a gap and then resume
+//   * the process was KILLED    -> the log just ends (jetsam/watchdog send SIGKILL,
+//                                  which no handler can report)
+//   * the GUEST THREAD is stuck -> the heartbeat KEEPS TICKING while the guest's
+//                                  output stops, which is the case nothing else
+//                                  distinguishes
+//
+// Wall clock rather than monotonic on purpose: a suspension is exactly the thing
+// a monotonic clock is designed to hide.
+static const char *volatile g_phase = "start";
+static void *heartbeat(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        struct tm tm;
+        localtime_r(&ts.tv_sec, &tm);
+        fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s\n",
+                tm.tm_hour, tm.tm_min, tm.tm_sec, g_phase);
+        fflush(stderr);
+        struct timespec iv = { 2, 0 };   // nanosleep: usleep is EINVAL at >= 1e6
+        nanosleep(&iv, NULL);
+    }
+    return NULL;
+}
+static void heartbeat_start(void) {
+    static pthread_t th;
+    static int started;
+    if (started) return;
+    started = 1;
+    pthread_create(&th, NULL, heartbeat, NULL);
+    pthread_detach(th);
+}
+
 typedef int    (*jni_onload_fn)(void *vm, void *reserved);
 typedef int8_t (*nativeloader_load_fn)(void *env, void *clazz, void *path);
 
@@ -136,6 +183,7 @@ int kl_app_boot(void) {
     if (!*g_libdir) return fail("kl_app_configure was not called");
     if (open_log()) return fail("could not open the log file");
 
+    heartbeat_start();
     kl_fault_install();
     // Strict: an unimplemented *call* is fatal, so the run stops exactly where
     // the surface genuinely ends. Lookups are not — the guest resolves plenty
@@ -180,6 +228,7 @@ int kl_app_boot(void) {
     fflush(NULL);
 
     // load() takes the *directory* — it appends "/libunity.so" itself.
+    g_phase = "NativeLoader.load";
     printf("\n=== NativeLoader.load(\"%s\") ===\n", g_libdir);
     fflush(NULL);
     kl_jni_local_frame_push();
@@ -197,6 +246,7 @@ int kl_app_boot(void) {
     // UnityPlayer.currentActivity and compares.
     void *initJni = kl_jni_native("com/unity3d/player/UnityPlayer", "initJni", NULL);
     if (!initJni) return fail("UnityPlayer.initJni was never registered");
+    g_phase = "initJni";
     printf("\n=== UnityPlayer.initJni(Context) ===\n");
     fflush(NULL);
     void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
@@ -207,8 +257,135 @@ int kl_app_boot(void) {
 
     printf("\n=== P4 EXIT CRITERION MET: initJni completed on visionOS, "
            "no unimplemented JNI calls ===\n");
+    g_phase = "boot report";
     kl_jni_report(stdout);
     fflush(NULL);
+    g_phase = "boot done";
     snprintf(g_status, sizeof g_status, "initJni completed");
+    return 0;
+}
+
+// The synthetic /proc that trap 6d built, read back on the platform where it has
+// never been read. PLANNING §12.7 asks for this BEFORE chasing anything else in
+// a device lifecycle run, and the reason is specific: proc_build() gets the
+// free-page count from host_statistics64(), which links on visionOS but may be
+// restricted inside the sandbox — and a silent zero there is not read by Unity
+// as "unknown", it is read as a machine with no memory. That is the exact
+// failure trap 6d records: `Cores = 0, Memory = 0mb`, and Unity refuses to
+// start, with nothing anywhere mentioning memory.
+static void report_proc(void) {
+    static const char *files[] = { "/proc/cpuinfo", "/proc/meminfo",
+                                   "/sys/devices/system/cpu/possible" };
+    printf("\n=== the synthetic /proc, on device (trap 6d) ===\n");
+    for (unsigned i = 0; i < sizeof files / sizeof *files; i++) {
+        // Through the same rewrite the guest's own open() takes, so this reads
+        // what the guest reads and not something adjacent to it.
+        char buf[1024];
+        const char *real = kl_guest_path(files[i], buf, sizeof buf);
+        FILE *f = real ? fopen(real, "r") : NULL;
+        if (!f) { printf("  %-34s NOT SERVED (%s)\n", files[i], real ? real : "no path");
+                  continue; }
+        char line[256];
+        int shown = 0;
+        while (shown < 4 && fgets(line, sizeof line, f)) {
+            size_t n = strlen(line);
+            while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+            // MemTotal/MemFree are the two that matter; for cpuinfo the first
+            // lines are enough to see it is not empty.
+            if (strstr(files[i], "meminfo") && !strstr(line, "Mem")) continue;
+            printf("  %-34s %s\n", shown ? "" : files[i], line);
+            shown++;
+        }
+        if (!shown) printf("  %-34s (served but EMPTY — see trap 6d)\n", files[i]);
+        fclose(f);
+    }
+    fflush(NULL);
+}
+
+int kl_app_lifecycle(unsigned frames) {
+    // Separate from kl_app_boot rather than folded into it, because boot is the
+    // P4 gate and refuses a second entry: keeping them apart lets the UI run the
+    // gate, read its numbers, and only then go further.
+    static pthread_mutex_t once_mu = PTHREAD_MUTEX_INITIALIZER;
+    static int entered;
+    pthread_mutex_lock(&once_mu);
+    int already = entered;
+    entered = 1;
+    pthread_mutex_unlock(&once_mu);
+    if (already) return fail("kl_app_lifecycle was already run in this process");
+
+    void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+    if (!thiz) return fail("kl_app_boot must run first");
+
+    // First, before anything can be misdiagnosed on top of it.
+    g_phase = "proc";
+    report_proc();
+
+    const char *aenv = getenv("KL_ALARM");
+    unsigned alarm_secs = aenv ? (unsigned)strtoul(aenv, NULL, 10) : 120;
+
+    // The order UnityPlayerActivity drives, exactly as t_boot's recon does:
+    // attach a surface, resume, then one frame. nativeRecreateGfxState is what
+    // reaches for EGL, and on device it is also what pulls in libil2cpp — the
+    // 66 MB image with 3,083 x18 veneers that P4 never loaded here (§12.7).
+    void *surface = kl_jni_new_object("android/view/Surface");
+    struct { const char *name; int kind; } seq[] = {
+        { "nativeRecreateGfxState", 2 }, { "nativeResume", 0 }, { "nativeRender", 1 },
+    };
+    for (unsigned i = 0; i < sizeof seq / sizeof seq[0]; i++) {
+        void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", seq[i].name, NULL);
+        if (!fn) { printf("  %s: not registered\n", seq[i].name); continue; }
+        g_phase = seq[i].name;
+        printf("\n=== UnityPlayer.%s ===\n", seq[i].name);
+        fflush(NULL);
+        // Arm the watchdog, exactly as t_boot does. kl_fault_install already
+        // handles SIGALRM and reports it as "still alive and blocked" rather than
+        // as a crash, which is the whole point: on device there is no shell to
+        // notice a hang and no way to attach a sampler, so a run that simply
+        // stops growing its log says nothing about *where* it stopped. KL_ALARM
+        // widens it when the question is what the guest is waiting on.
+        alarm(alarm_secs);
+        kl_jni_local_frame_push();
+        if (seq[i].kind == 2)
+            ((void (*)(void *, void *, int, void *))fn)(kl_jni_env(), thiz, 0, surface);
+        else if (seq[i].kind == 1)
+            printf("  -> %d\n", ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz));
+        else
+            ((void (*)(void *, void *))fn)(kl_jni_env(), thiz);
+        kl_jni_local_frame_pop();
+        alarm(0);
+        printf("  %s returned\n", seq[i].name);
+        // Android's UI thread runs its looper between callbacks; here nothing
+        // else will, so the queue would only grow.
+        alarm(alarm_secs);
+        unsigned ran = kl_jni_drain_ui_tasks();
+        alarm(0);
+        if (ran) printf("  drained %u posted task%s\n", ran, ran == 1 ? "" : "s");
+        fflush(NULL);
+    }
+
+    void *render = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
+    printf("\n=== pumping %u frames ===\n", frames);
+    fflush(NULL);
+    unsigned i = 0;
+    g_phase = "frame pump";
+    alarm(alarm_secs);
+    for (; render && i < frames; i++) {
+        // The frame clock first: on Android the Choreographer's doFrame is what
+        // wakes the engine, and nativeRender then draws what it decided.
+        // Ticking after would hand every frame the previous one's time.
+        kl_jni_tick_choreographer();
+        kl_jni_local_frame_push();
+        ((int8_t (*)(void *, void *))render)(kl_jni_env(), thiz);
+        kl_jni_local_frame_pop();
+        kl_jni_drain_ui_tasks();
+    }
+    alarm(0);
+    printf("  pumped %u frames\n", i);
+    printf("\n=== P5.4: the lifecycle ran on device ===\n");
+    kl_jni_report(stdout);
+    kl_egl_report(stdout);
+    fflush(NULL);
+    snprintf(g_status, sizeof g_status, "lifecycle ran, %u frames", i);
     return 0;
 }

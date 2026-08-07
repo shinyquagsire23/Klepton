@@ -56,9 +56,16 @@ vatest: build/t_variadic
 # kl_view.c is the KL_VIEW=1 interactive viewer (SDL3); only t_boot links it,
 # so only this rule carries the pkg-config flags. kl_view.c compiles to a stub
 # without SDL3 headers, but the link flags below assume pkg-config finds sdl3.
-build/t_boot: tests/t_boot.c $(RUNTIME) runtime/kl_view.c runtime/klepton.h runtime/kl_jni.h
+# tests/t_mtl_provider.m is the host stand-in for Compositor Services (P5.3):
+# Objective-C because it has to *create* MTLTextures. Host-only and diagnostic —
+# named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
+# plain C and takes an opaque texture pointer.
+build/t_boot: tests/t_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
+              runtime/klepton.h runtime/kl_jni.h tests/t_mtl_provider.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(shell pkg-config --cflags sdl3) -o $@ tests/t_boot.c $(RUNTIME) runtime/kl_view.c $(LDLIBS) $(shell pkg-config --libs sdl3)
+	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
+	  tests/t_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
+	  $(LDLIBS) -framework Metal -framework Foundation $(shell pkg-config --libs sdl3)
 
 boot: build/t_boot
 	./build/t_boot $(LIBS)
@@ -286,7 +293,16 @@ xros-sim: build/xrsim/libklepton.dylib
 # The two archives as one XCFramework, so the app target links the right slice
 # without a per-platform search path. Xcode resolves the slice from the
 # destination; getting that wrong otherwise fails as a confusing arch mismatch.
-build/Klepton.xcframework: build/xros/libklepton.a build/xrsim/libklepton.a
+#
+# The headers are prerequisites too, and that is not pedantry. `-headers runtime`
+# COPIES them into the xcframework, and the app compiles against the copy — so
+# with only the archives listed, a header-only change (a new prototype, say) never
+# reaches the app and the build fails with "call to undeclared function" naming a
+# function that is plainly declared in runtime/. This is the same stale-artifact
+# trap visionos/README.md records for libklepton.a; the fix there stopped at the
+# archives and left the headers behind it.
+build/Klepton.xcframework: build/xros/libklepton.a build/xrsim/libklepton.a \
+                           $(wildcard runtime/*.h)
 	@rm -rf $@
 	@xcodebuild -create-xcframework \
 	   -library build/xros/libklepton.a -headers runtime \
@@ -299,7 +315,7 @@ build/Klepton.xcframework: build/xros/libklepton.a build/xrsim/libklepton.a
 # LC_BUILD_VERSION afterwards. Confirmed prior art (ALVR ships a Rust dylib this
 # way); §12.1(1). ANGLE emits ios_framework_bundle on iOS, so the output is
 # already the .framework packaging §4.0.1 wants.
-.PHONY: angle-ios angle-xros
+.PHONY: angle-ios angle-ios-sim angle-xros
 angle-ios:
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" && \
 	  gn gen out/ios --args='is_debug=false target_os="ios" target_cpu="arm64" \
@@ -307,15 +323,26 @@ angle-ios:
 	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
 	  autoninja -C out/ios libEGL libGLESv2
 
+# The simulator slice. Same trick one platform over: an iOS *simulator* build
+# vtool'd to visionossim. Needed because the simulator is the fast development
+# loop for P5.3 — a device round trip is minutes, the simulator is seconds — and
+# an xcframework with no matching slice fails as an arch mismatch rather than as
+# a missing slice.
+angle-ios-sim:
+	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" && \
+	  gn gen out/ios-sim --args='is_debug=false target_os="ios" target_cpu="arm64" \
+	    target_environment="simulator" ios_enable_code_signing=false \
+	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
+	  autoninja -C out/ios-sim libEGL libGLESv2
+
+# The retarget itself is a script (tools/angle_retarget.sh) — it rewrites the
+# Info.plist as well as LC_BUILD_VERSION, and the header there says why.
 angle-xros: angle-ios
-	@mkdir -p vendor/out/xros
-	@for n in libEGL libGLESv2; do \
-	  rm -rf vendor/out/xros/$$n.framework; \
-	  cp -R vendor/out/ios/$$n.framework vendor/out/xros/$$n.framework; \
-	  xcrun vtool -arch arm64 -set-build-version visionos 1.0 26.0 -replace \
-	    -output vendor/out/xros/$$n.framework/$$n vendor/out/ios/$$n.framework/$$n; \
-	  printf '%-12s ' $$n; xcrun vtool -show-build vendor/out/xros/$$n.framework/$$n \
-	    | grep -E 'platform'; done
+	@./tools/angle_retarget.sh ios xros visionos XROS
+
+.PHONY: angle-xrsim
+angle-xrsim: angle-ios-sim
+	@./tools/angle_retarget.sh ios-sim xrsim visionossim XRSimulator
 
 # ---- graphics spikes (host-only, not part of `make check`) ----
 # S0.7/S0.8 probe Apple's desktop GL; S0.9 probes ANGLE. None of them link the
@@ -328,6 +355,17 @@ build/s09_angle: spikes/s09_angle.c
 	$(CC) $(CFLAGS) -o $@ $<
 build/s10_shared: spikes/s10_shared.c
 	$(CC) $(CFLAGS) -o $@ $<
+
+# S1.1 — the P5 interop primitive: ANGLE rendering into an MTLTexture we own.
+# Objective-C because the spike has to *create* the MTLTexture; the shipping
+# path never does — it receives one from Swift as an opaque pointer, which is
+# why kl_glfb stays plain C (PLANNING §12.6).
+build/s11_mtltex: spikes/s11_mtltex.m
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $< -framework Metal -framework Foundation
+
+.PHONY: mtltex
+mtltex: build/s11_mtltex
+	@./build/s11_mtltex
 
 # A *vendored debug build* of ANGLE lives in vendor/ (gitignored) — the Metal
 # backend can be stepped into, which is what the AGX-abort investigation needs

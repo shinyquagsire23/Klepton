@@ -115,7 +115,18 @@ struct BootView: View {
             }
             RunLoop.current.add(poll, forMode: .common)
 
-            let result = kl_app_boot()
+            var result = kl_app_boot()
+            // P5.4: carry on into the Android lifecycle when asked, in the same
+            // process and on the same thread. Only after boot has reported, so a
+            // lifecycle failure cannot be mistaken for a boot failure — and only
+            // when asked, because P4's gate is a boot that stops at initJni and
+            // it must stay possible to take exactly that measurement.
+            //
+            // This is where libil2cpp (66 MB, 3,083 x18 veneers) first loads
+            // under AMFI, and where the synthetic /proc is first read on device.
+            if result == 0, let f = ProcessInfo.processInfo.environment["KL_FRAMES"] {
+                result = kl_app_lifecycle(UInt32(f) ?? 1)
+            }
             poll.invalidate()
 
             let text = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""

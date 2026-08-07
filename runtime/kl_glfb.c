@@ -108,6 +108,24 @@ static const char *kl_angle_dir(void) {
     return ANGLE_DEFAULT_DIR;
 }
 
+// ANGLE arrives in two shapes and the port needs both: a bare dylib on macOS,
+// and a .framework bundle on visionOS (ANGLE emits ios_framework_bundle for
+// iOS-family targets, and an app may only load code from inside its bundle
+// anyway). Try both rather than making the caller know which.
+//
+// Note libEGL then finds libGLESv2 *itself* on iOS-family platforms — it dlopens
+// <exec dir>/Frameworks/libGLESv2.framework/libGLESv2 (ANGLE's
+// system_utils_posix.cpp) — so on the device both frameworks must be embedded,
+// and this loader's own libGLESv2 open resolves to that same image.
+static void *angle_dlopen(const char *dir, const char *name) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s.dylib", dir, name);
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (h) return h;
+    snprintf(path, sizeof path, "%s/%s.framework/%s", dir, name, name);
+    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+
 static void *g_egl_lib, *g_gles_lib;
 static void *g_dpy, *g_surf, *g_ctx, *g_cfg;
 // Kept so per-thread contexts can be created later, after init has chosen a config.
@@ -180,11 +198,8 @@ int kl_glfb_init(void) {
     }
 
     const char *dir = kl_angle_dir();
-    char egl_path[1024], gles_path[1024];
-    snprintf(egl_path,  sizeof egl_path,  "%s/libEGL.dylib", dir);
-    snprintf(gles_path, sizeof gles_path, "%s/libGLESv2.dylib", dir);
-    g_egl_lib  = dlopen(egl_path,  RTLD_NOW | RTLD_LOCAL);
-    g_gles_lib = dlopen(gles_path, RTLD_NOW | RTLD_LOCAL);
+    g_egl_lib  = angle_dlopen(dir, "libEGL");
+    g_gles_lib = angle_dlopen(dir, "libGLESv2");
     if (!g_egl_lib || !g_gles_lib) {
         fprintf(stderr, "  [glfb] cannot load ANGLE from %s\n         (%s)\n"
                         "         set KL_ANGLE_DIR to a Chromium app's Libraries "
@@ -1012,6 +1027,159 @@ static uint32_t g_eye_tex[2];
 void kl_glfb_note_eye_texture(int eye, uint32_t tex) {
     if (eye < 0 || eye > 1 || !tex) return;
     g_eye_tex[eye] = tex;
+}
+
+// ---------------------------------------------------------------------------
+// The Metal interop (P5). PLANNING §12.9 for why it is eglCreateImageKHR and
+// not a pbuffer, and for the host/device measurements that came before this.
+//
+// The extension is unconditional on ANGLE's Metal backend (DisplayMtl.mm sets
+// both mtlTextureClientBuffer and EGLImageOES), so there is no capability path
+// to take here — if the entry points resolve, it works, and if they do not the
+// caller falls back to ordinary GL storage.
+#define EGL_NO_CONTEXT_          ((void *)0)
+#define EGL_NO_IMAGE_            ((void *)0)
+#define EGL_NONE_                0x3038
+#define EGL_DEVICE_EXT_                      0x322C
+#define EGL_METAL_DEVICE_ANGLE_              0x34A6
+#define EGL_METAL_TEXTURE_ANGLE_             0x34A7
+#define EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE_ 0x34DD
+#define EGL_TEXTURE_INTERNAL_FORMAT_ANGLE_   0x345D
+
+static void *(*a_eglCreateImageKHR)(void *, void *, uint32_t, void *, const int32_t *);
+static unsigned (*a_eglDestroyImageKHR)(void *, void *);
+static unsigned (*a_eglQueryDisplayAttribEXT)(void *, int32_t, intptr_t *);
+static unsigned (*a_eglQueryDeviceAttribEXT)(void *, int32_t, intptr_t *);
+static void (*a_glEGLImageTargetTexture2DOES)(uint32_t, void *);
+static void (*a_glBindTexture_mtl)(uint32_t, uint32_t);
+
+static kl_glfb_mtl_provider g_mtl_provider;
+static void *g_mtl_provider_ctx;
+// One record per (eye, stage). Stage count is ovrp_GetEyeTextureStageCount's
+// answer, which is 1 today — raising it for GPU pipelining is what makes
+// §12.1(3)'s "key the pose to the stage" warning bite, so the array is indexed
+// by stage from the start rather than retrofitted later.
+#define KL_MTL_MAX_STAGES 4
+static struct { void *tex; int slice; void *image; } g_eye_mtl[2][KL_MTL_MAX_STAGES];
+
+void kl_glfb_set_mtl_provider(kl_glfb_mtl_provider fn, void *ctx) {
+    g_mtl_provider = fn;
+    g_mtl_provider_ctx = ctx;
+}
+int kl_glfb_has_mtl_provider(void) { return g_mtl_provider != NULL; }
+
+static int mtl_resolve(void) {
+    if (a_eglCreateImageKHR) return 1;
+    if (!g_ready) return 0;
+    a_eglCreateImageKHR        = asym("eglCreateImageKHR");
+    a_eglDestroyImageKHR       = asym("eglDestroyImageKHR");
+    a_eglQueryDisplayAttribEXT = asym("eglQueryDisplayAttribEXT");
+    a_eglQueryDeviceAttribEXT  = asym("eglQueryDeviceAttribEXT");
+    a_glEGLImageTargetTexture2DOES = asym("glEGLImageTargetTexture2DOES");
+    a_glBindTexture_mtl        = asym("glBindTexture");
+    return a_eglCreateImageKHR && a_glEGLImageTargetTexture2DOES
+        && a_eglQueryDeviceAttribEXT && a_glBindTexture_mtl;
+}
+
+void *kl_glfb_mtl_device(void) {
+    static void *dev;
+    static int tried;
+    if (tried) return dev;
+    tried = 1;
+    if (!kl_glfb_init() || !mtl_resolve()) return NULL;
+    intptr_t egl_dev = 0, mtl = 0;
+    if (!a_eglQueryDisplayAttribEXT ||
+        !a_eglQueryDisplayAttribEXT(g_dpy, EGL_DEVICE_EXT_, &egl_dev) || !egl_dev) {
+        fprintf(stderr, "  [glfb] eglQueryDisplayAttribEXT(EGL_DEVICE_EXT) failed — "
+                        "no MTLDevice to share\n");
+        return NULL;
+    }
+    if (!a_eglQueryDeviceAttribEXT((void *)egl_dev, EGL_METAL_DEVICE_ANGLE_, &mtl) || !mtl) {
+        fprintf(stderr, "  [glfb] eglQueryDeviceAttribEXT(EGL_METAL_DEVICE_ANGLE) failed — "
+                        "is this the Metal backend?\n");
+        return NULL;
+    }
+    dev = (void *)mtl;
+    return dev;
+}
+
+void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice) {
+    if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) return NULL;
+    if (out_slice) *out_slice = g_eye_mtl[eye][stage].slice;
+    return g_eye_mtl[eye][stage].tex;
+}
+
+int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
+                                 int w, int h, uint32_t internal_fmt) {
+    if (!g_mtl_provider || eye < 0 || eye > 1 || !gl_tex) return 0;
+    if (stage < 0 || stage >= KL_MTL_MAX_STAGES) {
+        fprintf(stderr, "  [glfb] eye stage %d is beyond KL_MTL_MAX_STAGES (%d)\n",
+                stage, KL_MTL_MAX_STAGES);
+        return 0;
+    }
+    if (!kl_glfb_init() || !mtl_resolve()) {
+        fprintf(stderr, "  [glfb] a Metal texture provider is registered but ANGLE's "
+                        "interop entry points are missing — falling back to GL storage\n");
+        return 0;
+    }
+    kl_mtl_eye_texture t = { NULL, 0, 0, 0 };
+    if (!g_mtl_provider(eye, stage, w, h, &t, g_mtl_provider_ctx) || !t.texture) {
+        fprintf(stderr, "  [glfb] provider declined eye=%d stage=%d %dx%d\n",
+                eye, stage, w, h);
+        return 0;
+    }
+    // The size check the extension will not do for us. eglCreateImageKHR takes
+    // the dimensions from the MTLTexture and succeeds regardless of what we ask
+    // for, so without this a wrong-sized texture produces a guest rendering into
+    // storage smaller than it believes it has — and nothing reports it. Refuse
+    // instead: ordinary GL storage of the right size is wrong in a way that
+    // shows up immediately, which is strictly better than being subtly wrong.
+    if (t.w != w || t.h != h) {
+        fprintf(stderr, "  [glfb] provider returned a %dx%d texture for a %dx%d eye "
+                        "(eye=%d stage=%d) — refusing; the guest would render into "
+                        "storage it does not have\n", t.w, t.h, w, h, eye, stage);
+        return 0;
+    }
+    const int32_t attrs[] = {
+        EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE_, t.slice,
+        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE_,   (int32_t)internal_fmt,
+        EGL_NONE_,
+    };
+    void *img = a_eglCreateImageKHR(g_dpy, EGL_NO_CONTEXT_, EGL_METAL_TEXTURE_ANGLE_,
+                                   t.texture, attrs);
+    if (img == EGL_NO_IMAGE_) {
+        // Most likely cause by far: the texture was not allocated on ANGLE's own
+        // MTLDevice, which the extension requires. Named because nothing else
+        // about the failure points at it.
+        fprintf(stderr, "  [glfb] eglCreateImageKHR(EGL_METAL_TEXTURE_ANGLE) failed for "
+                        "eye=%d stage=%d — was the texture made on "
+                        "kl_glfb_mtl_device()?\n", eye, stage);
+        return 0;
+    }
+    a_glBindTexture_mtl(0x0DE1 /* GL_TEXTURE_2D */, gl_tex);
+    while (a_glGetError && a_glGetError() != 0) {}
+    a_glEGLImageTargetTexture2DOES(0x0DE1, img);
+    uint32_t e = a_glGetError ? a_glGetError() : 0;
+    if (e) {
+        fprintf(stderr, "  [glfb] glEGLImageTargetTexture2DOES -> GL error 0x%x "
+                        "(eye=%d stage=%d)\n", e, eye, stage);
+        if (a_eglDestroyImageKHR) a_eglDestroyImageKHR(g_dpy, img);
+        return 0;
+    }
+    // The EGLImage is kept, not destroyed: it is the binding between the GL
+    // texture and the MTLTexture, and Unity keeps the texture for the process
+    // lifetime. Releasing it here is the kind of thing that works right up until
+    // the first reallocation. (If Unity re-creates eye textures on resize, the
+    // previous image for this slot is released first.)
+    if (g_eye_mtl[eye][stage].image && a_eglDestroyImageKHR)
+        a_eglDestroyImageKHR(g_dpy, g_eye_mtl[eye][stage].image);
+    g_eye_mtl[eye][stage].tex   = t.texture;
+    g_eye_mtl[eye][stage].slice = t.slice;
+    g_eye_mtl[eye][stage].image = img;
+    fprintf(stderr, "  [glfb] eye=%d stage=%d tex=%u is now backed by MTLTexture %p "
+                    "slice %d (%dx%d fmt 0x%x)\n",
+            eye, stage, gl_tex, t.texture, t.slice, w, h, internal_fmt);
+    return 1;
 }
 
 static void (*g_real_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t, int32_t,

@@ -31,6 +31,7 @@
 #include "../runtime/kl_mprobe.h"
 #include "../runtime/kl_il2cpp.h"
 #include "../runtime/kl_fault.h"
+#include "t_mtl_provider.h"
 
 static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
 
@@ -200,6 +201,11 @@ static int recon_run(int view_pump) {
     // surface, resume, then pump one frame. This is where M4 runs into M5 —
     // nativeRecreateGfxState is what reaches for EGL.
     if (getenv("KL_LIFECYCLE")) {
+        // P5.3: with KL_GLFB_MTL=1, the eye textures Unity is about to ask for
+        // become MTLTextures we allocated — the host stand-in for what
+        // Compositor Services will hand over. Registered here because
+        // ovrp_SetupEyeTexture2 arrives inside nativeRecreateGfxState, below.
+        kl_mtl_provider_install();
         void *surface = kl_jni_new_object("android/view/Surface");
         void *thiz2   = kl_jni_new_object("com/unity3d/player/UnityPlayer");
         struct { const char *name; int kind; } seq[] = {
@@ -338,6 +344,36 @@ static int recon_run(int view_pump) {
             alarm(0);
             if (sampling) kl_sample_stop_report(stdout);
             printf("  pumped %u frames\n", i);
+            // P5.3's gate. Not "did the interop bind" — that is reported when it
+            // happens — but "did the guest's rendering arrive in the MTLTexture".
+            // The lit count uses the same luma threshold as kl_glfb's capture, so
+            // it is directly comparable with the reference path's number: the two
+            // should agree, and a lit reference frame beside a black interop one
+            // means the binding took and the rendering went elsewhere.
+            if (kl_glfb_has_mtl_provider()) {
+                printf("\n=== P5 interop: the guest's frame, read back through Metal ===\n");
+                printf("  reference (glReadPixels, kl_glfb): %lu lit\n",
+                       kl_glfb_last_frame_lit());
+                for (int eye = 0; eye < 2; eye++) {
+                    int w = 0, h = 0;
+                    unsigned long lit = kl_mtl_count_lit(eye, 0, &w, &h);
+                    unsigned long n = w && h ? ((unsigned long)((w + 7) / 8)
+                                              * (unsigned long)((h + 7) / 8)) : 0;
+                    printf("  eye %d MTLTexture %dx%d: %lu/%lu lit, mean luma %u%s\n",
+                           eye, w, h, lit, n, kl_mtl_mean_luma(),
+                           lit ? "" : "  <<< BLACK");
+                    // A picture, not just a count: KL_GLFB_OUT already holds the
+                    // reference frames, so writing the interop eyes beside them
+                    // is what makes "does it render the same" answerable.
+                    const char *out = getenv("KL_GLFB_OUT");
+                    if (out) {
+                        char p[1200];
+                        snprintf(p, sizeof p, "%s/mtl_eye%d.png", out, eye);
+                        printf("  eye %d -> %s%s\n", eye, p,
+                               kl_mtl_dump_png(eye, 0, p) ? "" : "  (write FAILED)");
+                    }
+                }
+            }
             const char *sd = getenv("KL_DUMP_SHADERS");
             if (sd) kl_egl_dump_shaders(sd);
             if (getenv("KL_DUMP_TEXTURES"))

@@ -489,38 +489,65 @@ kl_image *kl_load_dylib(const char *path) {
 // A missing translation is normal and quiet. A translation that is *present and
 // fails* is not: it returns NULL and says so, because falling back to the ELF
 // there would hide exactly the regression this path exists to catch.
-kl_image *kl_load_auto(const char *path) {
+// The translation of `path`, if KL_DYLIB_DIR names one. Factored out because two
+// callers must agree about it: kl_load_auto, which loads it, and kl_can_load,
+// which answers "does this library exist" for the guest. They disagreed once and
+// it cost a device run — see kl_can_load.
+static int dylib_candidate(const char *path, char *out, size_t cap, char *name_out,
+                           size_t name_cap) {
     const char *dir = getenv("KL_DYLIB_DIR");
-    if (dir && *dir) {
-        const char *stem = strrchr(path, '/');
-        stem = stem ? stem + 1 : path;
-        char name[256];
-        snprintf(name, sizeof name, "%s", stem);
-        char *dot = strstr(name, ".so");
-        if (dot) *dot = 0;
+    if (!dir || !*dir) return 0;
+    const char *stem = strrchr(path, '/');
+    stem = stem ? stem + 1 : path;
+    char name[256];
+    snprintf(name, sizeof name, "%s", stem);
+    char *dot = strstr(name, ".so");
+    if (dot) *dot = 0;
+    if (name_out) snprintf(name_out, name_cap, "%s", name);
 
-        // Two layouts, because the host and the bundle disagree about what a
-        // translated library looks like. `make dylibs` writes bare .dylib
-        // files; an app bundle carries frameworks (§4.0.1), which is also what
-        // P3/P12 actually got past AMFI — Xcode code-signs what it embeds in
-        // Frameworks/, and a loose Mach-O elsewhere in the bundle is only
-        // sealed, not signed. Same image either way.
-        char cand[1024];
-        snprintf(cand, sizeof cand, "%s/%s.dylib", dir, name);
-        if (access(cand, R_OK) != 0)
-            snprintf(cand, sizeof cand, "%s/%s.framework/%s", dir, name, name);
-        if (access(cand, R_OK) == 0) {
-            kl_image *img = kl_load_dylib(cand);
-            if (!img) {
-                fprintf(stderr, "  [klepton] %s: translated dylib present but failed "
-                                "to load: %s\n", cand, kl_error());
-                return NULL;
-            }
-            fprintf(stderr, "  [klepton] %s: loaded as a translated dylib (M1b)\n", name);
-            return img;
+    // Two layouts, because the host and the bundle disagree about what a
+    // translated library looks like. `make dylibs` writes bare .dylib files; an
+    // app bundle carries frameworks (§4.0.1), which is also what P3/P12 actually
+    // got past AMFI — Xcode code-signs what it embeds in Frameworks/, and a loose
+    // Mach-O elsewhere in the bundle is only sealed, not signed. Same image
+    // either way.
+    snprintf(out, cap, "%s/%s.dylib", dir, name);
+    if (access(out, R_OK) == 0) return 1;
+    snprintf(out, cap, "%s/%s.framework/%s", dir, name, name);
+    return access(out, R_OK) == 0;
+}
+
+kl_image *kl_load_auto(const char *path) {
+    char cand[1024], name[256];
+    if (dylib_candidate(path, cand, sizeof cand, name, sizeof name)) {
+        kl_image *img = kl_load_dylib(cand);
+        if (!img) {
+            fprintf(stderr, "  [klepton] %s: translated dylib present but failed "
+                            "to load: %s\n", cand, kl_error());
+            return NULL;
         }
+        fprintf(stderr, "  [klepton] %s: loaded as a translated dylib (M1b)\n", name);
+        return img;
     }
     return kl_load(path);
+}
+
+// Could kl_load_auto load a guest library at `path`? Anything that answers an
+// existence question about a guest library on the guest's behalf must ask this
+// and not stat(path) — because on device the ELF tree is deliberately NOT in the
+// bundle (only the translations are, which is 80 MB saved), so the .so path is a
+// name the loader resolves rather than a file that exists.
+//
+// This is what P5.4's first device lifecycle run died on.
+// ClassLoader.findLibrary() stat'ed the .so and returned null for libil2cpp, so
+// Unity never even attempted the dlopen that would have succeeded — and put up
+// "Failed to load Il2CPP." three layers away from the stat that caused it. The
+// path stays the .so path in the answer, so there is still exactly one place
+// that resolves it: here.
+int kl_can_load(const char *path) {
+    char cand[1024];
+    if (dylib_candidate(path, cand, sizeof cand, NULL, 0)) return 1;
+    return access(path, R_OK) == 0;
 }
 
 kl_image *kl_load(const char *path) {
