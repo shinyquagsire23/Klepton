@@ -4,11 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>
 #include "klepton.h"
 #include "kl_egl.h"
 #include "kl_opensl.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_mediandk.h"
 
 #define KL_MAX_IMAGES 64
 typedef struct { char soname[128]; kl_image *img; } entry;
@@ -23,6 +25,61 @@ void kl_set_library_path(const char *dir) { snprintf(g_libdir, sizeof g_libdir, 
 static const char *basename_of(const char *p) {
     const char *s = strrchr(p, '/');
     return s ? s + 1 : p;
+}
+
+// ---------- dl_iterate_phdr: how the guest unwinds ----------
+// libil2cpp statically links LLVM's libunwind and imports exactly one symbol to
+// drive it: dl_iterate_phdr. That call is the *only* way it can find a pc's
+// PT_GNU_EH_FRAME, so a stub returning 0 (which this was) means no FDE is ever
+// found, _Unwind_RaiseException fails phase 1, and __cxa_throw calls abort().
+// The effect is that EVERY guest exception kills the process whether or not a
+// handler exists — three separate "the guest threw and died" symptoms (the
+// offline Dns SocketException, <Initialize>d__6's TimeoutException, the
+// KeyNotFound on an unknown device-config param) were all this one stub.
+//
+// The struct is bionic's (link.h), not Darwin's — the two have different shapes
+// and it is guest code reading these offsets. Only the first four fields are
+// load-bearing for the unwinder; the Android-R tail is zeroed and `size` tells
+// the callee how much is real.
+typedef struct {
+    uint64_t     dlpi_addr;          // load bias; vaddr V lives at base + V
+    const char  *dlpi_name;
+    const void  *dlpi_phdr;
+    uint16_t     dlpi_phnum;
+    unsigned long long dlpi_adds, dlpi_subs;
+    size_t       dlpi_tls_modid;
+    void        *dlpi_tls_data;
+} kl_dl_phdr_info;
+
+// Takes no lock, for the same reason kl_addr_image does not: this runs on
+// arbitrary threads during unwinding, including inside a fault path where some
+// dead thread may hold g_lock. Registration is append-only and g_nimgs is read
+// once, so a concurrent load is merely not seen yet — never a torn entry.
+// The callback is declared void*-first so this definition and kl_shim.c's extern
+// are the same type: a mismatch across two TUs compiles silently (trap 6b) and
+// the guest's real callback signature is bionic's, not ours, either way.
+int kl_dl_iterate_phdr(int (*cb)(void *, size_t, void *), void *data) {
+    if (!cb) return 0;
+    // KL_NO_DL_PHDR=1 restores the old empty answer, which is the A/B for
+    // "is this failure an unwind failure?": with it set, any guest throw
+    // aborts in _Unwind_RaiseException instead of reaching its handler.
+    static int off = -1;
+    if (off < 0) off = getenv("KL_NO_DL_PHDR") != NULL;
+    if (off) return 0;
+    int n = g_nimgs;
+    for (int i = 0; i < n; i++) {
+        unsigned phnum = 0;
+        const void *phdr = kl_phdrs(g_imgs[i].img, &phnum);
+        if (!phdr || !phnum) continue;
+        kl_dl_phdr_info info = {0};
+        info.dlpi_addr  = (uint64_t)(uintptr_t)kl_base(g_imgs[i].img);
+        info.dlpi_name  = g_imgs[i].soname;
+        info.dlpi_phdr  = phdr;
+        info.dlpi_phnum = (uint16_t)phnum;
+        int r = cb((void *)&info, sizeof info, data);
+        if (r) return r;                   // non-zero stops iteration, as on Linux
+    }
+    return 0;
 }
 
 // Register an image so guest dlsym/dladdr can see it (also used for the root libs).
@@ -41,6 +98,48 @@ kl_image *kl_find_image(const char *soname) {
     for (int i = 0; i < g_nimgs; i++)
         if (strcmp(g_imgs[i].soname, b) == 0) return g_imgs[i].img;
     return NULL;
+}
+
+// Cross-image export search, used by the loader's relocation-time import
+// binding (kl_image.c) for symbols the shim does not serve. Registration order
+// is dependencies-first, so the first hit is what Android's linker would have
+// bound (nearest dependency wins).
+void *kl_guest_sym_global(const char *name) {
+    void *v = NULL;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_nimgs && !v; i++)
+        v = kl_sym(g_imgs[i].img, name);
+    pthread_mutex_unlock(&g_lock);
+    return v;
+}
+
+// Load an .so together with its DT_NEEDED chain, dependencies first, so each
+// image's relocation-time imports can bind against the images it needs
+// (kl_guest_sym_global). Names with no file in the library path are assumed
+// shim-served (libc/libm/libdl/liblog/... or a synthetic gateway) and skipped.
+kl_image *kl_load_recursive(const char *path) {
+    kl_image *have = kl_find_image(path);
+    if (have) return have;                       // cycle guard / already loaded
+
+    char names[32][128];
+    int nn = kl_list_needed(path, names, 32);
+    for (int i = 0; i < nn; i++) {
+        char full[1024];
+        if (strchr(names[i], '/')) snprintf(full, sizeof full, "%s", names[i]);
+        else snprintf(full, sizeof full, "%s/%s", g_libdir, names[i]);
+        if (access(full, R_OK) != 0) continue;   // shim-served, not a file
+        if (!kl_load_recursive(full)) {
+            fprintf(stderr, "  [klepton] dependency %s of %s failed to load: %s\n",
+                    names[i], path, kl_error());
+            return NULL;
+        }
+    }
+
+    kl_image *img = kl_load(path);
+    if (!img) return NULL;
+    kl_register_image(path, img);
+    kl_run_init(img);
+    return img;
 }
 
 // Which guest image an address falls in, and how far into it. Guest libraries
@@ -78,6 +177,8 @@ void *klb_dlopen(const char *path, int flags) {
     // OVRPlugin: the real one only forwards to a system service that is not here.
     void *plat = kl_ovrplat_dlopen(path);
     if (plat) return plat;
+    void *md = kl_mediandk_dlopen(path);
+    if (md) return md;
     pthread_mutex_lock(&g_lock);
     kl_image *found = kl_find_image(path);           // already loaded? refcount is coarse
     pthread_mutex_unlock(&g_lock);
@@ -87,14 +188,12 @@ void *klb_dlopen(const char *path, int flags) {
     if (strchr(path, '/')) snprintf(full, sizeof full, "%s", path);
     else                   snprintf(full, sizeof full, "%s/%s", g_libdir, path);
 
-    kl_image *img = kl_load(full);
+    kl_image *img = kl_load_recursive(full);
     if (!img) {
         snprintf(g_dlerr, sizeof g_dlerr, "klepton: cannot load %s: %s", full, kl_error());
         fprintf(stderr, "  [klepton] guest dlopen(\"%s\") FAILED: %s\n", path, kl_error());
         return NULL;
     }
-    kl_register_image(path, img);
-    kl_run_init(img);
     fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> %p\n", path, (void *)img);
     return img;
 }
@@ -104,6 +203,7 @@ void *klb_dlsym(void *handle, const char *name) {
     if (kl_opensl_is_handle(handle)) return kl_opensl_sym(name);
     if (kl_ovrp_is_handle(handle)) return kl_ovrp_sym(name);
     if (kl_ovrplat_is_handle(handle)) return kl_ovrplat_sym(name);
+    if (kl_mediandk_is_handle(handle)) return kl_mediandk_sym(name);
     if (handle == NULL || handle == (void *)-1) {    // RTLD_DEFAULT / RTLD_NEXT
         void *s = kl_shim_lookup(name);
         if (s) return s;

@@ -159,12 +159,19 @@ static void stat_to_bionic(const struct stat *d, bionic_stat *b) {
 // stat/lstat are declared before the /proc layer they use, so the rewriting
 // helper is forward-declared rather than reordering the file.
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
+static void kl_fs_trace(const char *op, const char *path, const char *extra, int failed);
 
+// stat/lstat are traced like open: File.Exists() in managed code is a stat,
+// never an open, so an untraced stat makes a probe for a missing file look
+// like the guest never asked at all. That blind spot read as "the game never
+// checks for settings.cfg" once — it does, it just never opens it.
 int klb_stat(const char *p, bionic_stat *b)  { char kp[1024]; const char *q = kl_guest_path(p, kp, sizeof kp);
                                                struct stat s; int r = stat(q, &s);
+                                               kl_fs_trace("stat", p, NULL, r != 0);
                                                if (!r) stat_to_bionic(&s, b); return r; }
 int klb_lstat(const char *p, bionic_stat *b) { char kp[1024]; const char *q = kl_guest_path(p, kp, sizeof kp);
                                                struct stat s; int r = lstat(q, &s);
+                                               kl_fs_trace("lstat", p, NULL, r != 0);
                                                if (!r) stat_to_bionic(&s, b); return r; }
 int klb_fstat(int fd, bionic_stat *b)        { struct stat s; int r = fstat(fd, &s);
                                                if (!r) stat_to_bionic(&s, b); return r; }
@@ -415,18 +422,19 @@ static int kl_fs_trace_mode(void) {
     }
     return mode;
 }
-static void kl_fs_trace(const char *op, const char *path, int failed) {
+static void kl_fs_trace(const char *op, const char *path, const char *extra, int failed) {
+    if (!extra) extra = "";
     int mode = kl_fs_trace_mode();
     if (!mode || (mode == 1 && !failed)) return;
-    if (failed) fprintf(stderr, "[fs] %s(\"%s\") FAILED: %s\n", op, path, strerror(errno));
-    else        fprintf(stderr, "[fs] %s(\"%s\") ok\n", op, path);
+    if (failed) fprintf(stderr, "[fs] %s(\"%s\", \"%s\") FAILED: %s\n", op, path, extra, strerror(errno));
+    else        fprintf(stderr, "[fs] %s(\"%s\", \"%s\") ok\n", op, path, extra);
 }
 
 void kl_file_note(void *f, const char *path);
 FILE *klb_fopen(const char *path, const char *mode) {
     KL_GUEST_PATH(path);
     FILE *f = fopen(_p, mode);
-    kl_fs_trace("fopen", path, f == NULL);
+    kl_fs_trace("fopen", path, mode, f == NULL);
     if (f) kl_file_note(f, path);
     // /proc/cpuinfo gets re-read ~150x/s during the loading crawl — log the
     // caller once so the polling site is an address, not a rumour.
@@ -457,22 +465,22 @@ const char *kl_file_path(void *f) {
 int klb_access(const char *path, int mode) {
     KL_GUEST_PATH(path);
     int r = access(_p, mode);
-    kl_fs_trace("access", path, r != 0);
+    kl_fs_trace("access", path, NULL, r != 0);
     return r;
 }
 int klb_mkdir(const char *path, mode_t mode) {
     int r = mkdir(path, mode);
-    kl_fs_trace("mkdir", path, r != 0);
+    kl_fs_trace("mkdir", path, NULL, r != 0);
     return r;
 }
 int klb_unlink(const char *path) {
     int r = unlink(path);
-    kl_fs_trace("unlink", path, r != 0);
+    kl_fs_trace("unlink", path, NULL, r != 0);
     return r;
 }
 int klb_rename(const char *a, const char *b) {
     int r = rename(a, b);
-    kl_fs_trace("rename", a, r != 0);
+    kl_fs_trace("rename", a, b, r != 0);
     return r;
 }
 
@@ -932,5 +940,5 @@ int klb_madvise(void *a, size_t n, int advice) {
 // comes back here rather than duplicating the mode lookup there.
 void kl_fs_trace_open(const char *path, int flags, int fd) {
     (void)flags;
-    kl_fs_trace("open", path, fd < 0);
+    kl_fs_trace("open", path, NULL, fd < 0);
 }

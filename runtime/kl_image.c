@@ -250,6 +250,22 @@ void  *kl_base(kl_image *i) { return i->base; }
 size_t kl_span(kl_image *i) { return i->span; }
 const kl_stats *kl_get_stats(kl_image *i) { return &i->stats; }
 
+// The mapped phdr array. Every guest lib here has a first PT_LOAD covering file
+// offset 0 at vaddr 0 (verified for all five), so the ELF header — and the phdr
+// table it points at — is mapped at `base`, and the load bias equals the base.
+// Checked rather than assumed: a lib whose phdrs are not mapped reports none,
+// and the unwinder then simply does not see it.
+const void *kl_phdrs(kl_image *i, unsigned *count) {
+    if (count) *count = 0;
+    if (!i || !i->base) return NULL;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)i->base;
+    if (memcmp(eh->e_ident, "\177ELF", 4) != 0) return NULL;
+    if (eh->e_phentsize != sizeof(Elf64_Phdr)) return NULL;
+    if (eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr) > i->span) return NULL;
+    if (count) *count = eh->e_phnum;
+    return i->base + eh->e_phoff;
+}
+
 // ---------- S0.1: rewrite `mrs xN, tpidr_el0` -> `mrs xN, tpidrro_el0` ----------
 // Darwin keeps the thread pointer in TPIDRRO_EL0; TPIDR_EL0 is clobbered by the
 // kernel on preemption. The two encodings differ by exactly one bit (0x20).
@@ -269,6 +285,12 @@ static uint64_t sym_value(kl_image *img, uint32_t idx, const char **name_out) {
     if (name_out) *name_out = nm;
     if (s->st_shndx != 0) return (uint64_t)(uintptr_t)(img->base + s->st_value);
     void *ext = kl_shim_lookup(nm);
+    // Not a shim: try other already-loaded guest images. Android's linker binds
+    // an .so's imports against its DT_NEEDED chain; our chain is the image
+    // registry, filled dependencies-first by kl_load_recursive. This is what
+    // lets libmain.so's SDL_* imports bind to the guest libSDL3 instead of
+    // falling to an unresolved stub.
+    if (!ext) ext = kl_guest_sym_global(nm);
     return (uint64_t)(uintptr_t)ext;      // 0 if unresolved
 }
 
@@ -460,4 +482,52 @@ void kl_unload(kl_image *img) {
     if (!img) return;
     munmap(img->base, img->span);
     free(img);
+}
+
+// Read an image's DT_NEEDED sonames straight out of the file, without loading
+// it. kl_load_recursive uses this to pull the dependency chain in before the
+// image that imports it, so relocation-time binding (sym_value's global guest
+// search) has the exports in place. d_val entries are vaddrs; converting them
+// to file offsets goes through the PT_LOAD table, which on these libraries is
+// identity-mapped (p_vaddr == p_offset) but is not required to be.
+int kl_list_needed(const char *path, char names[][128], int max) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) { close(fd); return -1; }
+    uint8_t *file = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (file == MAP_FAILED) return -1;
+
+    int n = 0;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)file;
+    if (memcmp(eh->e_ident, "\x7f" "ELF", 4) == 0 && eh->e_machine == 183) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)(file + eh->e_phoff);
+        const Elf64_Dyn *dyn = NULL;
+        for (int i = 0; i < eh->e_phnum; i++)
+            if (ph[i].p_type == PT_DYNAMIC) { dyn = (const Elf64_Dyn *)(file + ph[i].p_offset); break; }
+        const char *strtab = NULL;
+        if (dyn)
+            for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL; dp++)
+                if (dp->d_tag == DT_STRTAB) {
+                    // vaddr -> file offset via PT_LOAD
+                    for (int i = 0; i < eh->e_phnum; i++)
+                        if (ph[i].p_type == PT_LOAD &&
+                            dp->d_val >= ph[i].p_vaddr &&
+                            dp->d_val < ph[i].p_vaddr + ph[i].p_filesz) {
+                            strtab = (const char *)(file + ph[i].p_offset +
+                                                    (dp->d_val - ph[i].p_vaddr));
+                            break;
+                        }
+                    break;
+                }
+        if (dyn && strtab)
+            for (const Elf64_Dyn *dp = dyn; dp->d_tag != DT_NULL && n < max; dp++)
+                if (dp->d_tag == DT_NEEDED) {
+                    snprintf(names[n], 128, "%s", strtab + dp->d_val);
+                    n++;
+                }
+    }
+    munmap(file, (size_t)sb.st_size);
+    return n;
 }

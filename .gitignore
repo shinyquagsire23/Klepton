@@ -1,5 +1,6 @@
 # app assets
 /beatsaber/*
+/beatsaber-*/
 /steamlink-android/*
 *.apk
 
@@ -29,4 +30,5 @@ CLAUDE.md
 # vendored ANGLE toolchain + build (too large to commit)
 vendor/
 fbo_dump/
+tex_dump/
 metal_workload.trace/

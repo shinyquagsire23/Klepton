@@ -1432,11 +1432,47 @@ static void klfb_DrawElementsInstanced(uint32_t mode, int32_t count, uint32_t ty
         g_real_DrawElementsInstanced(mode, count, type, indices, instances);
     klfb_draw_probe(count * instances);
 }
+// glDrawElementsBaseVertex is core in GLES 3.2 but NOT in ES 3.0 — and ES 3.0
+// is what ANGLE's Metal backend gives us, while kl_egl describes 3.2, so Unity
+// calls it freely. ANGLE *resolves* the entry point and then rejects every call
+// at validation with INVALID_OPERATION, so the draw silently does not happen.
+// That is what ate the UI text: Unity's canvas/TMP batching draws sub-ranges of
+// one shared mesh buffer, and a sub-range is exactly what basevertex expresses,
+// so text draws failed while ordinary geometry (plain glDrawElements) rendered.
+// Same version-gap class as the Bloom fix, one API family over.
+//
+// basevertex == 0 is definitionally plain glDrawElements, which ES 3.0 does
+// have; otherwise prefer an EXT/OES entry point if ANGLE exposes one. Anything
+// left over falls through to the core call and is named once, rather than
+// silently dropping the draw the way the unconditional forward did.
+static void (*g_real_DrawElementsBaseVertexEXT)(uint32_t, int32_t, uint32_t,
+                                                const void *, int32_t);
 static void klfb_DrawElementsBaseVertex(uint32_t mode, int32_t count, uint32_t type,
                                         const void *indices, int32_t basevertex) {
     klfb_note_draw();
-    if (g_real_DrawElementsBaseVertex)
-        g_real_DrawElementsBaseVertex(mode, count, type, indices, basevertex);
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        g_real_DrawElementsBaseVertexEXT = asym("glDrawElementsBaseVertexEXT");
+        if (!g_real_DrawElementsBaseVertexEXT)
+            g_real_DrawElementsBaseVertexEXT = asym("glDrawElementsBaseVertexOES");
+        fprintf(stderr, "  [glfb] glDrawElementsBaseVertex: core call is invalid on "
+                "ANGLE's ES 3.0; EXT/OES entry point %s\n",
+                g_real_DrawElementsBaseVertexEXT ? "available" : "ABSENT "
+                "(basevertex!=0 draws will still fail)");
+    }
+    if (basevertex == 0 && g_real_DrawElements) {
+        g_real_DrawElements(mode, count, type, indices);
+    } else if (g_real_DrawElementsBaseVertexEXT) {
+        g_real_DrawElementsBaseVertexEXT(mode, count, type, indices, basevertex);
+    } else {
+        static int said;
+        if (said++ < 5)
+            fprintf(stderr, "  [glfb] glDrawElementsBaseVertex(basevertex=%d) has no "
+                    "ES 3.0 route — draw dropped by ANGLE\n", basevertex);
+        if (g_real_DrawElementsBaseVertex)
+            g_real_DrawElementsBaseVertex(mode, count, type, indices, basevertex);
+    }
     klfb_draw_probe(count);
 }
 static void klfb_DrawArraysInstanced(uint32_t mode, int32_t first, int32_t count,
@@ -2247,13 +2283,60 @@ static unsigned g_trace_from;
 // Called from the trampoline with the argument registers already saved. Anything
 // this touches must be safe on any guest thread, so it stays to stderr and a
 // relaxed counter — no allocation, no locks worth deadlocking on.
+// KL_GLFB_ERRSCAN=1: name the call that GENERATES a GL error, anywhere in the
+// stream — not just the hand-wrapped few ERRSRC covers. The trampoline calls
+// this BEFORE the real call, so a non-zero glGetError on entry to call N was
+// produced by call N-1: record the previous name and blame it. This is what
+// attributes Unity's "OPENGL NATIVE PLUG-IN ERROR" spam, which is only ever
+// observed later, at a plugin-event boundary, long after the guilty call.
+//
+// Two things it changes by existing: it CLEARS the error flag, so the guest's
+// own glGetError sees nothing and the Unity spam stops (that disappearance is
+// itself confirmation the scan is seeing the same errors); and g_prev is a
+// plain cross-thread global, so with several guest threads in GL the blame can
+// land one call off. Diagnostic only.
+// KL_GLFB_ERRSCAN=<code> reports only that GL error, so the known sticky
+// INVALID_ENUM from TEXTURE_SRGB_DECODE_EXT (0x8a48, absent on ANGLE's ES 3.0)
+// does not spend the whole report budget thousands of calls before the
+// interesting one. =1 reports every code.
+static const char *g_err_prev;
+static uint32_t g_err_only;
+static int getenv_trace_print(void);
+static int glfb_errscan(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("KL_GLFB_ERRSCAN");
+        on = e != NULL;
+        if (e) {
+            uint32_t v = (uint32_t)strtoul(e, NULL, 0);
+            if (v > 1) g_err_only = v;
+        }
+    }
+    return on;
+}
+
 void kl_gl_trace_log(const char *name) {
     unsigned n = __atomic_fetch_add(&g_trace_calls, 1, __ATOMIC_RELAXED);
-    if (n >= g_trace_from)
+    if (glfb_errscan() && a_glGetError) {
+        static unsigned said;   // plain: __atomic_* reject _Atomic-qualified operands
+        uint32_t e = a_glGetError();
+        if (e && (!g_err_only || e == g_err_only) &&
+            __atomic_load_n(&said, __ATOMIC_RELAXED) < 40) {
+            __atomic_fetch_add(&said, 1, __ATOMIC_RELAXED);
+            fprintf(stderr, "  [glfb] ERRSCAN GL error 0x%x generated by %s "
+                    "(before #%u %s)\n",
+                    e, g_err_prev ? g_err_prev : "(nothing yet)", n, name);
+            while (a_glGetError()) {}          // drain the rest of the queue
+        }
+        g_err_prev = name;
+    }
+    if (getenv_trace_print() && n >= g_trace_from)
         fprintf(stderr, "  [gl] #%u %s\n", n, name);
 }
 
-static int glfb_tracing(void) {
+// The per-call log line is KL_GLFB_TRACE's; ERRSCAN needs the same trampoline
+// but not the firehose, so the two are separate questions.
+static int getenv_trace_print(void) {
     static int on = -1;
     if (on < 0) {
         on = getenv("KL_GLFB_TRACE") != NULL;
@@ -2261,6 +2344,10 @@ static int glfb_tracing(void) {
         if (from) g_trace_from = (unsigned)strtoul(from, NULL, 0);
     }
     return on;
+}
+
+static int glfb_tracing(void) {
+    return getenv_trace_print() || glfb_errscan();
 }
 
 static int glfb_locking(void) {

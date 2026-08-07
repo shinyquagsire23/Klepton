@@ -13,6 +13,10 @@
 // Resolve an EGL import by name. NULL if we do not provide it.
 void *kl_egl_lookup(const char *name);
 
+// The GLES level the device description reports (version string, GLSL version,
+// MAJOR/MINOR limits). Default 3.2 for Beat Saber; call before any GL traffic.
+void kl_egl_set_gles_version(int major, int minor);
+
 // Unity reaches GLES through *two* doors, not one. eglGetProcAddress is the
 // documented one; the other is dlopen("libGLESv2.so") followed by dlsym, and
 // when that dlopen failed Unity called straight through the resulting NULL —

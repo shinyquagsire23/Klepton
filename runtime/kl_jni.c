@@ -477,6 +477,7 @@ static kl_jint klj_IsSameObject(void *env, void *a, void *b) { (void)env; return
 // name match would say "no" and send the engine down its no-Activity path.
 static const struct { const char *cls, *super; } g_supers[] = {
     {"com/unity3d/player/UnityPlayerActivity", "android/app/Activity"},
+    {"org/libsdl/app/SDLActivity",             "android/app/Activity"},
     {"android/app/Activity",                   "android/view/ContextThemeWrapper"},
     {"android/view/ContextThemeWrapper",       "android/content/ContextWrapper"},
     {"android/content/ContextWrapper",         "android/content/Context"},
@@ -2904,15 +2905,20 @@ static klj_val klj_Uri_decode(void *env, void *self, const klj_val *a, int n) {
     return r;
 }
 
-// The single UnityPlayerActivity. t_boot hands this same object to initJni as the
+// The single activity. t_boot hands this same object to initJni as the
 // Context, and Unity reads it back through the static UnityPlayer.currentActivity
 // — so it has to be one instance, not two of the same class. Created lazily
 // because whichever of the two paths runs first should win, and they are the same
-// object either way.
+// object either way. The class is the title's manifest activity: Unity's by
+// default, SDLActivity for the SDL3 target (kl_jni_set_activity_class, called
+// before the first kl_jni_activity()).
+static const char *g_activity_class = "com/unity3d/player/UnityPlayerActivity";
+void kl_jni_set_activity_class(const char *cls) { if (cls) g_activity_class = cls; }
+
 void *kl_jni_activity(void) {
     static void *activity;
     if (!activity) {
-        activity = kl_jni_new_object("com/unity3d/player/UnityPlayerActivity");
+        activity = kl_jni_new_object(g_activity_class);
         ((klj_object *)activity)->pinned = 1;   // singleton; survives any frame pop
     }
     return activity;

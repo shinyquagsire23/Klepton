@@ -49,10 +49,12 @@ void *kl_jni_native(const char *cls, const char *name, const char *sig);
 // GetObjectClass answer truthfully instead of guessing.
 void *kl_jni_new_object(const char *class_name);
 
-// The one UnityPlayerActivity instance. A singleton because the guest reaches it
-// two ways — as the Context handed to initJni, and through the static field
-// UnityPlayer.currentActivity — and compares them for identity.
+// The one activity instance. A singleton because the guest reaches it two ways
+// — as the Context handed to a native, and through statics like
+// UnityPlayer.currentActivity — and compares them for identity. The class
+// defaults to UnityPlayerActivity; the SDL3 target overrides it.
 void *kl_jni_activity(void);
+void kl_jni_set_activity_class(const char *cls);
 void *kl_jni_new_string(const char *utf8);
 
 // Root for Context.getAssets()/AssetManager.open(). Defaults to "beatsaber/assets".

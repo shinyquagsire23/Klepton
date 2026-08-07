@@ -186,14 +186,28 @@ static uint64_t klgl_noop(const char *name) {
 #define GL_MAJOR_VERSION  0x821B
 #define GL_MINOR_VERSION  0x821C
 
+// The described GLES level. Default 3.2 for Beat Saber (the overstatement is
+// deliberate and priced — see below); Steam Link is a GLES2 app and is told so
+// via kl_egl_set_gles_version(2, 0) before any GL traffic.
+static int g_es_major = 3, g_es_minor = 2;
+void kl_egl_set_gles_version(int major, int minor) {
+    g_es_major = major; g_es_minor = minor;
+}
+
 static const char *klgl_GetString(uint32_t name) {
+    static char ver[64], glsl[64];
     switch (name) {
     case GL_VENDOR:     return "Klepton";
     case GL_RENDERER:   return "Klepton GLES";
     // Unity parses this to decide the GLES level it drives, so the shape matters
     // as much as the number: it expects "OpenGL ES <major>.<minor> <vendor>".
-    case GL_VERSION:    return "OpenGL ES 3.2 Klepton";
-    case GL_SHADING_LANGUAGE_VERSION: return "OpenGL ES GLSL ES 3.20";
+    case GL_VERSION:
+        snprintf(ver, sizeof ver, "OpenGL ES %d.%d Klepton", g_es_major, g_es_minor);
+        return ver;
+    case GL_SHADING_LANGUAGE_VERSION:
+        snprintf(glsl, sizeof glsl, "OpenGL ES GLSL ES %d.%d0",
+                 g_es_major, g_es_minor);
+        return glsl;
     // Empty for the same reason as the EGL extension string: naming one is a
     // promise, and a broken promise fails far from its cause. ES3 asks for these
     // through glGetStringi anyway.
@@ -269,6 +283,8 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
 // owns the dynamic state (READ_BUFFER & co.) this table never described.
 int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     if (!params) return 1;
+    if (pname == GL_MAJOR_VERSION) { params[0] = g_es_major; return 1; }
+    if (pname == GL_MINOR_VERSION) { params[0] = g_es_minor; return 1; }
     for (size_t i = 0; i < sizeof g_gl_int / sizeof g_gl_int[0]; i++)
         if (g_gl_int[i].pname == pname) {
             params[0] = g_gl_int[i].value;

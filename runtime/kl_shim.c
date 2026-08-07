@@ -28,6 +28,8 @@
 #include <sched.h>
 #include <poll.h>
 #include <termios.h>
+#include <malloc/malloc.h>
+#include <sys/random.h>
 #include <utime.h>
 #include <pwd.h>
 #include <zlib.h>
@@ -450,10 +452,40 @@ static void *kl_memset_chk(void *d, int c, size_t n, size_t dl) {
     if (n > dl) die("__memset_chk overflow"); return memset(d, c, n); }
 static char *kl_strcpy_chk(char *d, const char *s, size_t dl) {
     if (strlen(s) + 1 > dl) die("__strcpy_chk overflow"); return strcpy(d, s); }
+static size_t kl_strlen_chk(const char *s, size_t dl) {
+    size_t n = strlen(s);
+    if (n >= dl) die("__strlen_chk overflow");
+    return n;
+}
+static char *kl_strchr_chk(char *s, int ch, size_t dl) {
+    kl_strlen_chk(s, dl);                  // proves the object is dl bytes
+    return strchr(s, ch);
+}
+// bionic: __vsnprintf_chk(dest, supplied_size, flags, compiler_size, fmt, va).
+static int kl_vsnprintf_chk(char *d, size_t n, int flags, size_t dl,
+                            const char *fmt, void *gva) {
+    (void)flags;
+    if (n > dl) die("__vsnprintf_chk overflow");
+    char m[512] __attribute__((aligned(16)));
+    if (kl_va_marshal(fmt, (kl_va *)gva, m, sizeof m, KL_VA_PRINTF) == (size_t)-1) return -1;
+    return vsnprintf(d, n, fmt, (va_list)m);
+}
+static size_t kl_malloc_usable_size(const void *p) { return malloc_size(p); }
+// execv would replace the HOST process with an Android binary — the one
+// outcome worse than refusing. execl already answers ENOSYS; match it.
+static int kl_execv(const char *p, char *const argv[]) {
+    (void)p; (void)argv;
+    static int warned;
+    if (!warned++) fprintf(stderr, "  [klepton] execv() refused — ENOSYS\n");
+    errno = ENOSYS;
+    return -1;
+}
 
 // ---------- small bionic-isms ----------
 static void kl_set_abort_message(const char *m) { fprintf(stderr, "[guest abort] %s\n", m ? m : ""); }
-static int  kl_dl_iterate_phdr(void *cb, void *d) { (void)cb; (void)d; return 0; }
+// Real implementation in kl_dl.c — it owns the image registry. This is the
+// guest unwinder's FDE lookup, not a bionic nicety; see the comment there.
+extern int kl_dl_iterate_phdr(int (*cb)(void *, size_t, void *), void *d);
 static void kl_openlog(const char *a, int b, int c) { (void)a; (void)b; (void)c; }
 static void kl_closelog(void) {}
 static int  kl_cxa_atexit(void (*f)(void *), void *a, void *d) { (void)f;(void)a;(void)d; return 0; }
@@ -493,7 +525,9 @@ X(klb_pthread_self) X(klb_pthread_equal) X(klb_pthread_kill) X(klb_pthread_sigma
 X(klb_sigprocmask)
 X(klb_pthread_setname_np) X(klb_pthread_atfork)
 X(klb_sem_init) X(klb_sem_destroy) X(klb_sem_post) X(klb_sem_wait)
-X(klb_sem_timedwait) X(klb_sem_getvalue)
+X(klb_sem_timedwait) X(klb_sem_getvalue) X(klb_sem_trywait)
+X(klb_sem_open) X(klb_sem_close)
+X(klb_pthread_getschedparam) X(klb_pthread_setschedparam)
 X(klb_dlopen) X(klb_dlsym) X(klb_dlclose) X(klb_dlerror) X(klb_dladdr)
 X(klb_clock_gettime) X(klb_clock_getres) X(klb_gettimeofday)
 #undef X
@@ -539,6 +573,8 @@ static const kl_entry g_shim[] = {
     E("__memcpy_chk", kl_memcpy_chk), E("__memset_chk", kl_memset_chk),
     E("__strcpy_chk", kl_strcpy_chk), E("__stack_chk_fail", kl_stack_chk_fail),
     E("__FD_ISSET_chk", klb_FD_ISSET_chk), E("__FD_SET_chk", klb_FD_SET_chk),
+    E("__strlen_chk", kl_strlen_chk), E("__strchr_chk", kl_strchr_chk),
+    E("__vsnprintf_chk", kl_vsnprintf_chk),
 
     // divergent layouts / Android-only
     E("__errno", klb_errno), E("environ", &environ), E("gettid", klb_gettid),
@@ -606,6 +642,10 @@ static const kl_entry g_shim[] = {
     E("sem_init", klb_sem_init), E("sem_destroy", klb_sem_destroy),
     E("sem_post", klb_sem_post), E("sem_wait", klb_sem_wait),
     E("sem_timedwait", klb_sem_timedwait), E("sem_getvalue", klb_sem_getvalue),
+    E("sem_trywait", klb_sem_trywait),
+    E("sem_open", klb_sem_open), E("sem_close", klb_sem_close),
+    E("pthread_getschedparam", klb_pthread_getschedparam),
+    E("pthread_setschedparam", klb_pthread_setschedparam),
 
     // dl
     E("dlopen", klb_dlopen), E("dlsym", klb_dlsym), E("dlclose", klb_dlclose),
@@ -624,6 +664,10 @@ static const kl_entry g_shim[] = {
     E("android_set_abort_message", kl_set_abort_message),
     E("openlog", kl_openlog), E("closelog", kl_closelog),
     E("__cxa_atexit", kl_cxa_atexit), E("__cxa_finalize", kl_cxa_finalize),
+
+    // Steam Link (SDL3) additions — plain forwards plus the small wrappers above
+    E("getentropy", getentropy), E("tzset", tzset), E("strncasecmp", strncasecmp),
+    E("malloc_usable_size", kl_malloc_usable_size), E("execv", kl_execv),
 
     E("__klepton_unresolved", kl_unresolved),
 };

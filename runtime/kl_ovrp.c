@@ -316,6 +316,22 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     memset(out, 0, 0x58);
     const klovrp_pose *p = &g_head_pose;
     if (node == 3 || node == 4) p = &g_hand_pose[node - 3];
+    // KL_OVRP_HANDS_IN_VIEW=1: park both hands at a fixed spot well inside an
+    // identity head's frustum, overriding whatever the frontend last wrote.
+    // Answers one question and only one — does the guest draw controllers at
+    // all? If nothing appears here, the game considers them absent and the
+    // problem is a status answer, not a pose. Read side, so it beats the
+    // viewer's per-frame writes. Diagnostic: the hands do not move.
+    klovrp_pose parked;
+    if (node == 3 || node == 4) {
+        static int inview = -1;
+        if (inview < 0) inview = getenv("KL_OVRP_HANDS_IN_VIEW") != NULL;
+        if (inview) {
+            parked = (klovrp_pose){ node == 3 ? -0.15f : 0.15f,
+                                    -0.12f, -0.55f, 0, 0, 0, 1 };
+            p = &parked;
+        }
+    }
     float *f = out;
     f[0] = p->qx; f[1] = p->qy;      // quat xyz at +0x00
     f[2] = p->qz; f[3] = p->qw;      // quat w at +0x0c

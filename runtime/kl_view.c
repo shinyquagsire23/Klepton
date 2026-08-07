@@ -206,6 +206,18 @@ int kl_view_main(const char *libdir) {
         // Mouse L = right trigger, mouse R = right grip, Z/X = A/B, C/V =
         // X/Y, G/H = left trigger/grip, arrows = right thumbstick.
         {
+            // KL_VIEW_AIM_AT_EYE=1 collapses both hands onto the head
+            // position. Beat Saber's menu pointer (VRUIControls.
+            // VRGraphicRaycaster) casts from the controller transform, so the
+            // offset hands below put the ray 0.25 m under your gaze — you
+            // must aim high by an amount you can only learn by feel, and with
+            // no text on screen there is nothing to aim *at*. Collapsed, the
+            // ray IS the gaze ray and the viewport centre is a crosshair.
+            // Off by default: the offset is the honest emulation (a real
+            // controller is not at your eye) and it is what puts the in-game
+            // controller models where a body would hold them.
+            static int aim_eye = -1;
+            if (aim_eye < 0) aim_eye = getenv("KL_VIEW_AIM_AT_EYE") != NULL;
             const float ox[2] = { -0.22f, 0.22f };
             for (int hand = 0; hand < 2; hand++) {
                 // Rotate the head-relative offset (ox, -0.25, -0.40) by the
@@ -217,6 +229,7 @@ int kl_view_main(const char *libdir) {
                 float hx = px + vx + hqw * tx + (hqy * tz - hqz * ty);
                 float hy = py + vy + hqw * ty + (hqz * tx - hqx * tz);
                 float hz = pz + vz + hqw * tz + (hqx * ty - hqy * tx);
+                if (aim_eye) { hx = px; hy = py; hz = pz; }
                 kl_ovrp_set_hand_pose(hand, hx, hy, hz, hqx, hqy, hqz, hqw);
             }
 

@@ -149,9 +149,15 @@ gamelift region probes failed EINVAL in a retry storm.
 - `KL_TRACE_NET=1` — log `socket`/`getaddrinfo`/`connect` with arguments and
   durations. Read by `kl_shim.c`.
 - `KL_NET_OFFLINE=1` — getaddrinfo fails `EAI_NONAME` and connect fails
-  `ENETUNREACH` immediately: a headset with no network. NOTE: Beat Saber
-  1.28 aborts in libil2cpp on hard DNS failure during init — this mode
-  currently crashes the guest; kept for titles that tolerate it.
+  `ENETUNREACH` immediately: a headset with no network. The guest takes its
+  own offline path (curl reports "Could not resolve host", the GameLift
+  region probe retries 4× per region and gives up) and the run completes.
+  The abort this used to cause was *not* a DNS bug — it was the empty
+  `dl_iterate_phdr` breaking the guest's unwinder, so the `SocketException`
+  could never reach its handler. See CLAUDE.md trap 8.
+- `KL_NO_DL_PHDR=1` — restore the old empty `dl_iterate_phdr`. Any guest
+  throw then aborts in `_Unwind_RaiseException` instead of being caught;
+  this is the A/B for trap 8.
 
 ## Loader diagnostics (`runtime/kl_shim.c`, `runtime/kl_libc.c`)
 
@@ -259,6 +265,16 @@ handler).
   the head pose ovrp reports. Requires `KL_GLFB=1`, runs the guest in-process
   on a spawned thread (no guard test, no re-exec), and pumps frames until the
   window closes instead of `KL_FRAMES` times.
+  Controls: mouse-look aims, **mouse-L = right index trigger** (the menu
+  click), mouse-R = grip, `Z`/`X` = A/B, `C`/`V` = X/Y, `G`/`H` = left
+  trigger/grip, arrows = right thumbstick, WASD/`R`/`F` move.
+- `KL_VIEW_AIM_AT_EYE=1` — put both hands at the head position. Beat Saber's
+  menu pointer (`VRUIControls.VRGraphicRaycaster`) casts from the controller
+  transform, and the default head-relative hands sit 0.25 m below your gaze,
+  so the ray lands 0.25 m low at any panel distance. With this set the ray is
+  the gaze ray and the viewport centre is a crosshair. Off by default: the
+  offset is the honest emulation and is what puts the in-game controller
+  models where a body would hold them.
 
 ## Audio
 
@@ -282,6 +298,12 @@ No environment variables. `kl_opensl.c` reads none.
   diagnosis.
 - `KL_TRACE_FS=1` — log every guest file op and its result; `=fail` logs only
   the failures. Read by `kl_libc.c`. Any other non-empty value means "all".
+  Covers open/fopen/access/mkdir/rename/unlink **and stat/lstat**. The stat
+  pair was added after their absence produced a wrong conclusion: managed
+  `File.Exists()` is a stat and never an open, so Beat Saber's probe for
+  `files/settings.cfg` and `files/PlayerData.dat` (plus both `.bak`s) was
+  invisible, and the game looked like it was showing its first-run gate
+  without ever checking saved state. It checks; the files simply do not exist.
 - `KL_TRACE_IMAGES=1` — log each loaded image's base and span, the stub pool
   mapping, and each emitted stub. Read by `kl_image.c`.
 

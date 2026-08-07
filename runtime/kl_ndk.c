@@ -243,6 +243,81 @@ static int32_t kl_ANativeWindow_setBuffersGeometry(kl_native_window *w,
     return 0;
 }
 
+// The software path: SDL3's renderer is GLES2, but the lock/unlockAndPost pair
+// is what a canvas renderer would paint through, and libmain imports both.
+// The bits buffer is real memory so the guest can draw without faulting;
+// nothing displays it — display goes through EGL (M5).
+typedef struct { int32_t width, height, stride, format; void *bits; uint32_t rsvd[6]; }
+    kl_window_buffer;
+static void *g_lock_bits;
+static size_t g_lock_bytes;
+
+static int32_t kl_ANativeWindow_lock(kl_native_window *w, kl_window_buffer *buf, void *dirty) {
+    (void)dirty;
+    kl_native_window *nw = w ? w : &g_window;
+    size_t need = (size_t)nw->width * (size_t)nw->height * 4;
+    if (need > g_lock_bytes) {
+        free(g_lock_bits);
+        g_lock_bits = calloc(1, need);
+        if (!g_lock_bits) return -ENOMEM;
+        g_lock_bytes = need;
+    }
+    buf->width  = nw->width;
+    buf->height = nw->height;
+    buf->stride = nw->width;
+    buf->format = nw->format;
+    buf->bits   = g_lock_bits;
+    return 0;
+}
+static int32_t kl_ANativeWindow_unlockAndPost(kl_native_window *w) { (void)w; return 0; }
+
+// ==================================================================== AAsset
+// Steam Link reads its assets through the NDK C API where Unity reads them
+// over JNI (see kl_ndk.h). An AAsset is a plain file under the assets root —
+// the unpacked APK tree, which the JNI side (kl_jni.c) also serves from.
+typedef struct { FILE *f; int64_t len; } kl_asset;
+
+static char g_asset_root[1024] = "assets";
+void kl_ndk_set_assets_dir(const char *dir) {
+    if (dir) snprintf(g_asset_root, sizeof g_asset_root, "%s", dir);
+}
+
+static void *kl_AAssetManager_fromJava(void *env, void *jmgr) {
+    (void)env; (void)jmgr;
+    static char mgr;                 // one manager; it is a directory, not state
+    return &mgr;
+}
+
+static void *kl_AAssetManager_open(void *mgr, const char *fname, int mode) {
+    (void)mgr; (void)mode;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/%s", g_asset_root, fname);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    kl_asset *a = calloc(1, sizeof *a);
+    if (!a) { fclose(f); return NULL; }
+    fseeko(f, 0, SEEK_END);
+    a->len = ftello(f);
+    fseeko(f, 0, SEEK_SET);
+    a->f = f;
+    return a;
+}
+
+static int kl_AAsset_read(kl_asset *a, void *buf, size_t count) {
+    if (!a || !a->f) return -1;
+    return (int)fread(buf, 1, count, a->f);
+}
+static int64_t kl_AAsset_getLength64(kl_asset *a) { return a ? a->len : -1; }
+static int64_t kl_AAsset_seek64(kl_asset *a, int64_t off, int whence) {
+    if (!a || !a->f || fseeko(a->f, off, whence) != 0) return -1;
+    return ftello(a->f);
+}
+static void kl_AAsset_close(kl_asset *a) {
+    if (!a) return;
+    if (a->f) fclose(a->f);
+    free(a);
+}
+
 // =================================================================== ASensor
 // The sensor list is empty, and that is the correct answer rather than a
 // shortcut. Vision Pro exposes no Android-shaped accelerometer/gyro to the
@@ -351,6 +426,15 @@ static const struct { const char *name; void *fn; } g_ndk[] = {
     N("ANativeWindow_getHeight",          kl_ANativeWindow_getHeight),
     N("ANativeWindow_getFormat",          kl_ANativeWindow_getFormat),
     N("ANativeWindow_setBuffersGeometry", kl_ANativeWindow_setBuffersGeometry),
+    N("ANativeWindow_lock",               kl_ANativeWindow_lock),
+    N("ANativeWindow_unlockAndPost",      kl_ANativeWindow_unlockAndPost),
+
+    N("AAssetManager_fromJava", kl_AAssetManager_fromJava),
+    N("AAssetManager_open",     kl_AAssetManager_open),
+    N("AAsset_read",            kl_AAsset_read),
+    N("AAsset_getLength64",     kl_AAsset_getLength64),
+    N("AAsset_seek64",          kl_AAsset_seek64),
+    N("AAsset_close",           kl_AAsset_close),
 
     N("ASensorManager_getInstance",           kl_ASensorManager_getInstance),
     N("ASensorManager_getInstanceForPackage", kl_ASensorManager_getInstanceForPackage),

@@ -23,6 +23,7 @@
 #include <semaphore.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <time.h>
 #include <dispatch/dispatch.h>
@@ -650,6 +651,49 @@ int klb_sem_trywait(int *s) {
     if (!k) { errno = EINVAL; return -1; }
     if (dispatch_semaphore_wait(k->d, DISPATCH_TIME_NOW) != 0) { errno = EAGAIN; return -1; }
     atomic_fetch_sub(&k->count, 1);
+    return 0;
+}
+
+// sem_open/sem_close: bionic's named semaphores, modelled over the same slot
+// table as sem_init. Darwin's own sem_open is persistent across processes,
+// which is the wrong semantics here — the guest's names are process-scoped.
+// The value argument only exists when O_CREAT (Linux 0x40 — NOT Darwin's
+// 0x200) is set; the receive-side variadic read is the klb_execl pattern.
+void *klb_sem_open(const char *name, int oflag, ...) {
+    static struct { char name[128]; int slot; int used; } named[64];
+    for (int i = 0; i < 64; i++)
+        if (named[i].used && strcmp(named[i].name, name) == 0)
+            return &named[i].slot;
+    if (!(oflag & 0x40)) { errno = ENOENT; return (void *)-1; }  // SEM_FAILED
+    va_list ap;
+    va_start(ap, oflag);
+    (void)va_arg(ap, int);              // mode_t mode — permission bits, moot
+    unsigned value = va_arg(ap, unsigned);
+    va_end(ap);
+    for (int i = 0; i < 64; i++)
+        if (!named[i].used) {
+            if (klb_sem_init(&named[i].slot, 0, value) != 0) return (void *)-1;
+            snprintf(named[i].name, sizeof named[i].name, "%s", name);
+            named[i].used = 1;
+            return &named[i].slot;
+        }
+    errno = ENOSPC;
+    return (void *)-1;
+}
+
+// Deliberately not destroying the semaphore: a closed name that is re-opened
+// must come back with its count intact. The table is bounded and tiny.
+int klb_sem_close(void *s) { (void)s; return 0; }
+
+// Scheduling policy is the host's business; the honest no-op is success.
+int klb_pthread_getschedparam(void *t, int *policy, void *param) {
+    (void)t;
+    if (policy) *policy = 0;              // SCHED_OTHER
+    if (param)  *(int *)param = 0;        // sched_param.sched_priority
+    return 0;
+}
+int klb_pthread_setschedparam(void *t, int policy, const void *param) {
+    (void)t; (void)policy; (void)param;
     return 0;
 }
 

@@ -1,11 +1,10 @@
-// Android NDK surface (M3). Exactly the 27 symbols libunity.so actually imports:
-// ALooper_* (6), ANativeWindow_* (6), ASensor* (15).
-//
-// Measured, not assumed — see tests/t_load.c output. Notably *absent* from the
-// import list, and therefore not implemented here: AAssetManager_*,
-// AConfiguration_*, and the whole ANativeActivity lifecycle. This APK is a
-// com.unity3d.player.UnityPlayerActivity, so assets and configuration arrive
-// over JNI and there is no ANativeActivity_onCreate anywhere in the chain.
+// Android NDK surface (M3). The base set is what libunity.so imports:
+// ALooper_*, ANativeWindow_*, ASensor*. The Steam Link target (SDL3) adds
+// ANativeWindow_lock/unlockAndPost and the AAssetManager_*/AAsset_* subset —
+// Unity never imported those (its assets arrive over JNI), which is why they
+// were absent from the original measured surface rather than refused.
+// Still absent: AConfiguration_* and the whole ANativeActivity lifecycle —
+// neither target has an ANativeActivity_onCreate anywhere in the chain.
 #ifndef KL_NDK_H
 #define KL_NDK_H
 #include <stdint.h>
@@ -22,5 +21,8 @@ void *kl_ndk_window(void);
 // from whatever eglQuerySurface reports, and a second set of numbers that
 // disagreed with the window would be worse than either alone.
 void kl_ndk_window_size(const void *win, int32_t *w, int32_t *h);
+
+// Root directory for AAssetManager_open() — the unpacked APK's assets dir.
+void kl_ndk_set_assets_dir(const char *dir);
 
 #endif

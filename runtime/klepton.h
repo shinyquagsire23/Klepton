@@ -65,6 +65,19 @@ void *kl_trace_stub(const char *name, void *desc, void *tramp);
 void      kl_set_library_path(const char *dir);
 void      kl_register_image(const char *soname, kl_image *img);
 kl_image *kl_find_image(const char *soname);
+// Load an .so plus its DT_NEEDED chain, dependencies first (kl_dl.c).
+kl_image *kl_load_recursive(const char *path);
+// Read a file's DT_NEEDED sonames without loading it (kl_image.c).
+int       kl_list_needed(const char *path, char names[][128], int max);
+// Search every registered guest image for an export (kl_dl.c); used by the
+// loader's import binding after the shim misses.
+void     *kl_guest_sym_global(const char *name);
+// The image's program headers, as mapped. Every guest lib's first PT_LOAD maps
+// file offset 0 at vaddr 0, so the phdr array is live at base + e_phoff and the
+// load bias is simply the base. This is what dl_iterate_phdr hands the guest's
+// unwinder so it can find PT_GNU_EH_FRAME (kl_dl.c).
+const void *kl_phdrs(kl_image *img, unsigned *count);
+
 // Which guest image an address is in, and its offset within it. NULL if none.
 // Guest libraries land wherever the kernel put them, so this is what makes a
 // raw pc from a fault mean anything.
