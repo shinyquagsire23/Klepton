@@ -18,6 +18,10 @@ kl_image *kl_load(const char *path);
 // TLS and x18 rewrites happened offline. This is the path that has to work on
 // visionOS; kl_load() above is the development one. Same kl_image afterwards.
 kl_image *kl_load_dylib(const char *path);
+// Pick between the two: with KL_DYLIB_DIR set, prefer <dir>/<name>.dylib when a
+// translation exists, else the ELF. Lets the boot chain run mixed while some
+// libraries are still untranslatable. Every guest-library load goes through it.
+kl_image *kl_load_auto(const char *path);
 // Look up an exported symbol. NULL if absent.
 void      *kl_sym(kl_image *img, const char *name);
 // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.

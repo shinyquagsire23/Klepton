@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    kl_image *img = kl_load(argv[1]);
+    kl_image *img = kl_load_auto(argv[1]);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (!img) { printf("FAILED: %s\n", kl_error()); return 1; }
     double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;

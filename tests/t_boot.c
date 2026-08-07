@@ -247,7 +247,7 @@ static int recon_run(int view_pump) {
     snprintf(path, sizeof path, "%s/libmain.so", LIBDIR);
 
     printf("=== libmain.so entry ===\n");
-    kl_image *main_img = kl_load(path);
+    kl_image *main_img = kl_load_auto(path);
     if (!main_img) return fail(kl_error());
     kl_register_image("libmain.so", main_img);
     kl_run_init(main_img);

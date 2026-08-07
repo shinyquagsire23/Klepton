@@ -451,6 +451,42 @@ kl_image *kl_load_dylib(const char *path) {
     return img;
 }
 
+// Pick a loader for a guest library. With KL_DYLIB_DIR set, a klepton-ld
+// translation of this library is used when one has been built, and the ELF
+// otherwise — so the boot chain can run *mixed* while the offline x18 veneer
+// pass is still missing. Three of the five guest libraries have 0 x18 sites and
+// translate today; libunity (14,536) and libil2cpp (3,083) do not, and
+// klepton-ld refuses them rather than emitting something silently wrong.
+//
+// A missing translation is normal and quiet. A translation that is *present and
+// fails* is not: it returns NULL and says so, because falling back to the ELF
+// there would hide exactly the regression this path exists to catch.
+kl_image *kl_load_auto(const char *path) {
+    const char *dir = getenv("KL_DYLIB_DIR");
+    if (dir && *dir) {
+        const char *stem = strrchr(path, '/');
+        stem = stem ? stem + 1 : path;
+        char name[256];
+        snprintf(name, sizeof name, "%s", stem);
+        char *dot = strstr(name, ".so");
+        if (dot) *dot = 0;
+
+        char cand[1024];
+        snprintf(cand, sizeof cand, "%s/%s.dylib", dir, name);
+        if (access(cand, R_OK) == 0) {
+            kl_image *img = kl_load_dylib(cand);
+            if (!img) {
+                fprintf(stderr, "  [klepton] %s: translated dylib present but failed "
+                                "to load: %s\n", cand, kl_error());
+                return NULL;
+            }
+            fprintf(stderr, "  [klepton] %s: loaded as a translated dylib (M1b)\n", name);
+            return img;
+        }
+    }
+    return kl_load(path);
+}
+
 kl_image *kl_load(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { err("open %s: %s", path, strerror(errno)); return NULL; }

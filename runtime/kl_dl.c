@@ -135,7 +135,7 @@ kl_image *kl_load_recursive(const char *path) {
         }
     }
 
-    kl_image *img = kl_load(path);
+    kl_image *img = kl_load_auto(path);
     if (!img) return NULL;
     kl_register_image(path, img);
     kl_run_init(img);

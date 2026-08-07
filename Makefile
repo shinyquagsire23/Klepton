@@ -155,6 +155,51 @@ p2: build/klepton-ld
 	   -o build/dl_xrsim tools/dlprobe.c
 	@xcrun simctl spawn $(XRSIM) $(PWD)/build/dl_xrsim $(PWD)/build/libunityopus-xrsim.dylib
 
+# Translate every guest library klepton-ld can currently take. libunity and
+# libil2cpp are *expected* to be refused until the offline x18 veneer pass
+# exists (PLANNING §12.2) — the refusal is the point, so it is reported rather
+# than hidden, and the run below is honestly a mixed one.
+.PHONY: dylibs
+dylibs: build/klepton-ld
+	@mkdir -p build/dylibs
+	@for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
+	  if ./build/klepton-ld $(LIBS)/$$f.so -o build/dylibs/$$f.dylib \
+	       --platform $(KL_PLATFORM) --quiet 2>build/dylibs/$$f.err; then \
+	    codesign -s - -f build/dylibs/$$f.dylib 2>/dev/null; \
+	    printf '  %-22s translated\n' $$f; \
+	  else \
+	    rm -f build/dylibs/$$f.dylib; \
+	    printf '  %-22s REFUSED — %s\n' $$f "$$(sed 's/^klepton-ld: //' build/dylibs/$$f.err | head -1)"; \
+	  fi; done
+KL_PLATFORM ?= macos
+
+# t_boot over the translated libraries. KL_DYLIB_DIR makes every guest-library
+# load prefer a translation when one exists, so this exercises kl_load_dylib
+# inside the real boot chain — the image registry, the DT_NEEDED walk and the
+# guest's own dlopen of libunity — rather than in t_opus's single-image case.
+# Mixed until the x18 pass lands; `make dylibs` prints which half is which.
+.PHONY: bootdylib
+bootdylib: dylibs build/t_boot
+	@KL_DYLIB_DIR=$(PWD)/build/dylibs ./build/t_boot $(LIBS) > build/bootdylib.log 2>&1; \
+	  echo "  exit=$$?"; \
+	  grep -aE 'loaded as a translated dylib|guard verified|natives registered:|ids requested:|M3 EXIT' \
+	    build/bootdylib.log
+	@echo "  NOTE: only libmain is reachable as a dylib here. libunityopus and"
+	@echo "  lib_burst_generated are never dlopen'd this early (nor in a 30-frame"
+	@echo "  lifecycle), and libunity/libil2cpp are refused above — so this run"
+	@echo "  does NOT cover the two libraries that matter. 'make loaddylib' checks"
+	@echo "  each translated library on its own."
+
+# Load each translated library through kl_load_dylib on its own, since the boot
+# chain does not reach all of them. Import counts must match `make check`'s.
+.PHONY: loaddylib
+loaddylib: dylibs build/t_load
+	@for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
+	  test -f build/dylibs/$$f.dylib || continue; \
+	  printf '  %-22s' $$f; \
+	  KL_DYLIB_DIR=$(PWD)/build/dylibs ./build/t_load $(LIBS)/$$f.so 2>&1 \
+	    | grep -E '^  imports:' | tr -d '\n'; echo; done
+
 # ANGLE for visionOS. The vendored checkout's gn has no xros target and does not
 # need one: build for iOS — which already enables the Metal backend — and rewrite
 # LC_BUILD_VERSION afterwards. Confirmed prior art (ALVR ships a Rust dylib this
