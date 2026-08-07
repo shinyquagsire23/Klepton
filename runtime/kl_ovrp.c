@@ -368,11 +368,34 @@ static klovrp_vec3 klovrp_GetBoundaryDimensions(void) {
 //   +0x20 vec2 LThumbstick           +0x28 vec2 RThumbstick
 // v2 appends +0x30/+0x38 vec2 L/RTouchpad; v4 appends +0x40.. bytes
 // L/RBatteryPercentRemaining, L/RRecenterCount, then 28 reserved.
+// KL_OVRP_FAKE_BUTTONS=<hex>: OR this mask into both hands' Buttons and
+// Touches, toggling on/off on a duty cycle so GetDown/GetUp transitions
+// actually occur — a held-from-boot bit never reads as a press. Set it to
+// 0xffffffff and aim at a control: if the UI reacts to *anything*, the button
+// path is alive and only the bit mapping is wrong; if nothing reacts with
+// every bit set, the buttons are not the problem and the pointer is.
+// Diagnostic only, and deliberately crude: it presses everything at once.
+static uint32_t klovrp_fake_buttons(void) {
+    static int init;
+    static uint32_t mask;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("KL_OVRP_FAKE_BUTTONS");
+        if (e) mask = (uint32_t)strtoul(e, NULL, 0);
+    }
+    if (!mask) return 0;
+    static unsigned calls;
+    // ~7 controller polls a frame, so 256 on / 256 off is roughly a 0.4 s
+    // press at 90 Hz — slow enough for a UI to see both edges.
+    return ((calls++ >> 8) & 1) ? mask : 0;
+}
+
 static void fill_controller_state(int mask, void *out, int version) {
     memset(out, 0, version == 4 ? 0x60 : version == 2 ? 0x40 : 0x30);
     uint32_t m = (uint32_t)mask;
     if (m & OVRP_CTRL_ACTIVE) m |= OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH;
     uint32_t conn = m & (OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH);
+    uint32_t fake = conn ? klovrp_fake_buttons() : 0;
     uint8_t *b = out;
     uint32_t *w = (uint32_t *)out;
     float *f = (float *)out;
@@ -397,6 +420,8 @@ static void fill_controller_state(int mask, void *out, int version) {
         if (version >= 2) { f[14] = g_input[1].stick_x; f[15] = g_input[1].stick_y; }
         if (version >= 4) b[0x41] = 100;                // RBatteryPercentRemaining
     }
+    w[1] |= fake;                                       // Buttons
+    w[2] |= fake;                                       // Touches
 }
 
 // 64-byte ovrpControllerState2 by value via x8 (real plugin: stp q0..q3 of

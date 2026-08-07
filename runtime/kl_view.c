@@ -233,23 +233,32 @@ int kl_view_main(const char *libdir) {
                 kl_ovrp_set_hand_pose(hand, hx, hy, hz, hqx, hqy, hqz, hqw);
             }
 
-            uint32_t rb = 0, lb = 0;   // right/left button bits
+            // ControllerState4.Buttons carries OVRPlugin's RAW bits
+            // (OVRInput.RawButton / ovrpButton), NOT the virtual OVRInput.Button
+            // enum — the guest's metadata defines both (Button/Touch/Axis1D and
+            // RawButton/RawTouch/RawAxis1D), and OVRInput maps raw->virtual
+            // itself through its buttonMap. This block used to emit virtual
+            // values, where 0x2000 is PrimaryIndexTrigger; in raw space 0x2000
+            // is RThumbstickDown, so every "trigger press" was a stick flick and
+            // no press ever reached a UI. Raw values below; KL_OVRP_FAKE_BUTTONS
+            // is the check that the bits, not the pointer, were the problem.
+            uint32_t rb = 0, lb = 0;   // right/left RAW button bits
             float ridx = mouse_l ? 1.0f : 0.0f, rgrip = mouse_r ? 1.0f : 0.0f;
             float lidx = keys[SDL_SCANCODE_G] ? 1.0f : 0.0f;
             float lgrip = keys[SDL_SCANCODE_H] ? 1.0f : 0.0f;
             float sx = 0, sy2 = 0;
-            if (ridx > 0) rb |= 0x2000;
-            if (rgrip > 0) rb |= 0x4000;
-            if (lidx > 0) lb |= 0x200000;
-            if (lgrip > 0) lb |= 0x400000;
-            if (keys[SDL_SCANCODE_Z]) rb |= 0x1;        // One (A)
-            if (keys[SDL_SCANCODE_X]) rb |= 0x2;        // Two (B)
-            if (keys[SDL_SCANCODE_C]) lb |= 0x4;        // Three (X)
-            if (keys[SDL_SCANCODE_V]) lb |= 0x8;        // Four (Y)
-            if (keys[SDL_SCANCODE_UP])    { rb |= 0x10000; sy2 =  1.0f; }
-            if (keys[SDL_SCANCODE_DOWN])  { rb |= 0x20000; sy2 = -1.0f; }
-            if (keys[SDL_SCANCODE_LEFT])  { rb |= 0x40000; sx  = -1.0f; }
-            if (keys[SDL_SCANCODE_RIGHT]) { rb |= 0x80000; sx  =  1.0f; }
+            if (ridx > 0) rb |= 0x04000000;             // RIndexTrigger
+            if (rgrip > 0) rb |= 0x08000000;            // RHandTrigger
+            if (lidx > 0) lb |= 0x10000000;             // LIndexTrigger
+            if (lgrip > 0) lb |= 0x20000000;            // LHandTrigger
+            if (keys[SDL_SCANCODE_Z]) rb |= 0x00000001; // A
+            if (keys[SDL_SCANCODE_X]) rb |= 0x00000002; // B
+            if (keys[SDL_SCANCODE_C]) lb |= 0x00000100; // X
+            if (keys[SDL_SCANCODE_V]) lb |= 0x00000200; // Y
+            if (keys[SDL_SCANCODE_UP])    { rb |= 0x00001000; sy2 =  1.0f; }  // RThumbstickUp
+            if (keys[SDL_SCANCODE_DOWN])  { rb |= 0x00002000; sy2 = -1.0f; }  // RThumbstickDown
+            if (keys[SDL_SCANCODE_LEFT])  { rb |= 0x00004000; sx  = -1.0f; }  // RThumbstickLeft
+            if (keys[SDL_SCANCODE_RIGHT]) { rb |= 0x00008000; sx  =  1.0f; }  // RThumbstickRight
             // Touches mirror buttons: a pressed button is a touched one.
             kl_ovrp_set_controller_input(1, rb, rb, ridx, rgrip, sx, sy2);
             kl_ovrp_set_controller_input(0, lb, lb, lidx, lgrip, 0.0f, 0.0f);
