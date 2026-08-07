@@ -12,7 +12,11 @@
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+// vm_*, not mach_vm_*: <mach/mach_vm.h> is `#error unsupported` on both the
+// xrOS and xrsimulator SDKs, while <mach/vm_map.h> exists on all three and the
+// two families are identical for an in-process mach_task_self() call. One code
+// path rather than an #ifdef, so `make check` on the host tests what ships.
+#include <mach/vm_map.h>
 #include <dlfcn.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
@@ -133,17 +137,17 @@ static pthread_mutex_t g_stub_mu = PTHREAD_MUTEX_INITIALIZER;
 // device is a question for the port, not for this host-side fix.
 static int stub_pool_open(void) {
     if (g_stub_rx) return 1;
-    mach_vm_address_t rw = 0;
-    if (mach_vm_allocate(mach_task_self(), &rw, KL_STUB_POOL,
-                         VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return 0;
-    mach_vm_address_t rx = 0;
+    vm_address_t rw = 0;
+    if (vm_allocate(mach_task_self(), &rw, KL_STUB_POOL,
+                    VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return 0;
+    vm_address_t rx = 0;
     vm_prot_t cur, max;
-    if (mach_vm_remap(mach_task_self(), &rx, KL_STUB_POOL, 0, VM_FLAGS_ANYWHERE,
-                      mach_task_self(), rw, FALSE, &cur, &max,
-                      VM_INHERIT_NONE) != KERN_SUCCESS ||
-        mach_vm_protect(mach_task_self(), rx, KL_STUB_POOL, FALSE,
-                        VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
-        mach_vm_deallocate(mach_task_self(), rw, KL_STUB_POOL);
+    if (vm_remap(mach_task_self(), &rx, KL_STUB_POOL, 0, VM_FLAGS_ANYWHERE,
+                 mach_task_self(), rw, FALSE, &cur, &max,
+                 VM_INHERIT_NONE) != KERN_SUCCESS ||
+        vm_protect(mach_task_self(), rx, KL_STUB_POOL, FALSE,
+                   VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
+        vm_deallocate(mach_task_self(), rw, KL_STUB_POOL);
         return 0;
     }
     g_stub_rw = (uint8_t *)rw;
@@ -495,8 +499,16 @@ kl_image *kl_load_auto(const char *path) {
         char *dot = strstr(name, ".so");
         if (dot) *dot = 0;
 
+        // Two layouts, because the host and the bundle disagree about what a
+        // translated library looks like. `make dylibs` writes bare .dylib
+        // files; an app bundle carries frameworks (§4.0.1), which is also what
+        // P3/P12 actually got past AMFI — Xcode code-signs what it embeds in
+        // Frameworks/, and a loose Mach-O elsewhere in the bundle is only
+        // sealed, not signed. Same image either way.
         char cand[1024];
         snprintf(cand, sizeof cand, "%s/%s.dylib", dir, name);
+        if (access(cand, R_OK) != 0)
+            snprintf(cand, sizeof cand, "%s/%s.framework/%s", dir, name, name);
         if (access(cand, R_OK) == 0) {
             kl_image *img = kl_load_dylib(cand);
             if (!img) {

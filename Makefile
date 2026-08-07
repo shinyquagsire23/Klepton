@@ -1,14 +1,28 @@
 CC      := clang
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64
 LDLIBS  := -lz
-RUNTIME := runtime/kl_image.c runtime/kl_shim.c runtime/kl_va.c \
+# The host/ship split is a source-list boundary, not a runtime getenv (§12.2).
+#
+# RUNTIME_SHIP is everything that goes into the visionOS app bundle. It is the
+# list `make xros` builds against the xrOS SDK, so anything added here has to
+# compile for the device — which is the point of keeping it separate rather
+# than discovering the divergence at port time.
+#
+# RUNTIME_DIAG is host-only instrumentation: the sampling profiler and the
+# managed-side probe. Nothing in RUNTIME_SHIP includes their headers (only
+# tests/t_boot.c does), so the boundary holds by construction rather than by
+# discipline. runtime/kl_view.c (SDL viewer) is host-only too and is named by
+# the t_boot rule alone.
+RUNTIME_SHIP := runtime/kl_image.c runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_va_handlers.c runtime/kl_va_thunks.S \
            runtime/kl_libc.c runtime/kl_pthread.c runtime/kl_dl.c \
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S \
            runtime/kl_ovrplat.c runtime/kl_mediandk.c runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
-           runtime/kl_il2cpp.c runtime/kl_sample.c runtime/kl_mprobe.c
+           runtime/kl_il2cpp.c runtime/kl_fault.c
+RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c
+RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
 .PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
 all: build/t_opus
@@ -206,6 +220,79 @@ loaddylib: dylibs build/t_load
 	  printf '  %-22s' $$f; \
 	  KL_DYLIB_DIR=$(PWD)/build/dylibs ./build/t_load $(LIBS)/$$f.so 2>&1 \
 	    | grep -E '^  imports:' | tr -d '\n'; echo; done
+
+# ---- P4 — the runtime builds for visionOS (PLANNING §12.4) ----
+#
+# Two gates, and the second is the one that carries the information. Compiling
+# proves the headers are there; *linking* proves every symbol the runtime
+# references is present in the SDK, which is where an API that is declared but
+# absent — or present on macOS and nowhere else — actually shows up.
+# -all_load forces every object in and -undefined error refuses to defer, so a
+# missing symbol inside a function nothing calls yet still fails the build.
+#
+# Both platforms are built, because they diverge: xrsimulator is a macOS-kernel
+# host with an iOS-shaped SDK, so a header present only there would pass the
+# simulator and fail the device.
+XROS_SDK  := $(shell xcrun --sdk xros --show-sdk-path)
+XRSIM_SDK := $(shell xcrun --sdk xrsimulator --show-sdk-path)
+XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64
+
+.PHONY: xros xros-device xros-sim
+xros: xros-device xros-sim build/Klepton.xcframework
+	@echo "  P4 gate: the shipping runtime compiles and links for both visionOS platforms."
+
+# The archives are real targets with real prerequisites, not side effects of a
+# .PHONY rule. That distinction cost a debugging pass: with only a phony rule
+# producing it, an edited kl_image.c left a stale libklepton.a in place, the
+# xcframework was built from it, and the app in the simulator silently ran the
+# *previous* loader — which reads as a bug in the app rather than in the build.
+build/xros/libklepton.a: $(RUNTIME_SHIP)
+	@mkdir -p build/xros
+	@rm -f $@
+	@for s in $(RUNTIME_SHIP); do \
+	  o=build/xros/$$(basename $$s | sed 's/\.[cS]$$/.o/'); \
+	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) \
+	    -c $$s -o $$o || exit 1; done
+	@ar rcs $@ build/xros/*.o
+
+build/xrsim/libklepton.a: $(RUNTIME_SHIP)
+	@mkdir -p build/xrsim
+	@rm -f $@
+	@for s in $(RUNTIME_SHIP); do \
+	  o=build/xrsim/$$(basename $$s | sed 's/\.[cS]$$/.o/'); \
+	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) \
+	    -c $$s -o $$o || exit 1; done
+	@ar rcs $@ build/xrsim/*.o
+
+# The gate: link each archive into a dylib with -all_load, so a symbol that is
+# declared in a header but absent from the platform fails the build even inside
+# a function nothing calls yet.
+build/xros/libklepton.dylib: build/xros/libklepton.a
+	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz -install_name @rpath/libklepton.dylib
+
+build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
+	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz -install_name @rpath/libklepton.dylib
+
+xros-device: build/xros/libklepton.dylib
+	@printf '  xros       '; xcrun vtool -show-build $< | grep -E 'platform' | tr -d '\n'
+	@printf '  %s\n' "$$(ls -l $< | awk '{print $$5" bytes"}')"
+
+xros-sim: build/xrsim/libklepton.dylib
+	@printf '  xrsim      '; xcrun vtool -show-build $< | grep -E 'platform' | tr -d '\n'
+	@printf '  %s\n' "$$(ls -l $< | awk '{print $$5" bytes"}')"
+
+# The two archives as one XCFramework, so the app target links the right slice
+# without a per-platform search path. Xcode resolves the slice from the
+# destination; getting that wrong otherwise fails as a confusing arch mismatch.
+build/Klepton.xcframework: build/xros/libklepton.a build/xrsim/libklepton.a
+	@rm -rf $@
+	@xcodebuild -create-xcframework \
+	   -library build/xros/libklepton.a -headers runtime \
+	   -library build/xrsim/libklepton.a -headers runtime \
+	   -output $@ > /dev/null
+	@echo "  build/Klepton.xcframework"
 
 # ANGLE for visionOS. The vendored checkout's gn has no xros target and does not
 # need one: build for iOS — which already enables the Metal backend — and rewrite

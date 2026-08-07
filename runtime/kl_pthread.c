@@ -231,7 +231,7 @@ static int thread_is_alive(void *self);        // threads section, below
 static const char *thread_name_of(void *self); // threads section, below
 
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#include <mach/vm_map.h>
 #include <dlfcn.h>
 
 // Current backtrace of a mutex holder, captured from the fault handler so a
@@ -261,9 +261,9 @@ static void dump_thread_stack(FILE *out, void *pt) {
         }
         if (!fp || (fp & 7)) break;
         uint64_t pair[2];
-        mach_vm_size_t got = 0;
-        if (mach_vm_read_overwrite(mach_task_self(), fp, sizeof pair,
-                                   (mach_vm_address_t)pair, &got) != KERN_SUCCESS ||
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), fp, sizeof pair,
+                              (vm_address_t)pair, &got) != KERN_SUCCESS ||
             got != sizeof pair || !pair[1] || pair[0] <= fp)
             break;
         pc = (void *)pair[1];

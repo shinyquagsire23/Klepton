@@ -1,0 +1,49 @@
+// The bundle-shaped entry into the Klepton runtime.
+//
+// This is t_boot's sequence with the harness removed. What goes away is
+// everything that assumed a command line and a Unix process tree: the forked
+// DRM-guard self-test, the re-exec'd recon child (PLANNING §12.2 — an app
+// bundle never forks, and the Metal-refuses-forked-children reason for it is
+// moot once it does not), argv path handling, and the SDL viewer.
+//
+// What stays is the part that is actually under test: load libmain, run its
+// JNI_OnLoad against the synthetic JavaVM, drive NativeLoader.load to pull in
+// libunity, and call UnityPlayer.initJni. That is the P4 gate.
+//
+// Deliberately C, not Swift. Everything here is guest-facing — opaque jobjects,
+// function pointers cast to JNI signatures, a JNIEnv we synthesise — and none
+// of it is expressible in Swift without fighting the type system for nothing.
+// PLANNING §12.6 puts the language boundary at the platform layer: Swift owns
+// the App, the ImmersiveSpace, Metal and ARKit; C owns the guest.
+#ifndef KL_APP_H
+#define KL_APP_H
+
+// Point the runtime at the four paths it needs. `resources` is the app
+// bundle's resource dir (guest libraries, translated dylibs); `container` is
+// the app's Documents dir, where the 2.3 GB of APK assets are staged and where
+// the guest's writable roots live.
+//
+// Both must be absolute — trap 6c: Unity mounts the APK into its VFS under
+// whatever getPackageCodePath() returned and then resolves entries by
+// concatenation, so a relative mount point silently stops matching and the
+// failure surfaces three layers away as "not enough storage space".
+//
+// Returns 0 on success, or non-zero if a required path is missing, in which
+// case kl_app_status() explains which one. Checking here is the point: a
+// missing asset tree otherwise presents as a shim bug deep inside Unity.
+int kl_app_configure(const char *resources, const char *container);
+
+// Run the boot sequence. Returns 0 if initJni completed with no unimplemented
+// JNI call. Everything printed goes to the log file below as well as stdout,
+// because an unimplemented JNI slot aborts the process by design and the
+// report has to survive that — on device there is no shell to have caught it.
+int kl_app_boot(void);
+
+// Absolute path of the log kl_app_boot writes, valid after kl_app_configure.
+// The Swift side displays it and offers it for export.
+const char *kl_app_log_path(void);
+
+// Human-readable status of the last call, for the UI. Never NULL.
+const char *kl_app_status(void);
+
+#endif

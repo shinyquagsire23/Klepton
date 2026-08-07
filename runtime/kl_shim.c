@@ -29,7 +29,16 @@
 #include <poll.h>
 #include <termios.h>
 #include <malloc/malloc.h>
+// <sys/random.h> does not exist in the xrOS or xrsimulator SDKs, but the
+// symbol does — _getentropy is exported from libSystem on both. Only the
+// declaration is missing, so supply it rather than substituting a different
+// generator: the guest imports getentropy by name and the shim forwards it
+// directly, so the implementation must stay the platform's own.
+#if __has_include(<sys/random.h>)
 #include <sys/random.h>
+#else
+int getentropy(void *buffer, size_t size);
+#endif
 #include <utime.h>
 #include <pwd.h>
 #include <zlib.h>

@@ -295,9 +295,17 @@ static uint64_t proc_free_bytes(void) {
 }
 
 static void proc_build(void) {
+    // TMPDIR, not /tmp: on visionOS the process is sandboxed into a container
+    // and /tmp is not writable, while TMPDIR always names the container's own
+    // tmp. Both platforms hand it back with a trailing slash, but appending
+    // one only when it is missing costs nothing and a wrong separator here
+    // would put the synthetic /proc tree somewhere the guest never finds it.
     char tmpl[512];
     const char *tmp = getenv("TMPDIR");
-    snprintf(tmpl, sizeof tmpl, "%sklepton-proc.XXXXXX", tmp && *tmp ? tmp : "/tmp/");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    size_t n = strlen(tmp);
+    snprintf(tmpl, sizeof tmpl, "%s%sklepton-proc.XXXXXX", tmp,
+             tmp[n - 1] == '/' ? "" : "/");
     if (!mkdtemp(tmpl)) return;
     snprintf(g_procroot, sizeof g_procroot, "%s", tmpl);
 

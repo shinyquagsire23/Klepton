@@ -30,6 +30,7 @@
 #include "../runtime/kl_sample.h"
 #include "../runtime/kl_mprobe.h"
 #include "../runtime/kl_il2cpp.h"
+#include "../runtime/kl_fault.h"
 
 static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
 
@@ -38,122 +39,13 @@ typedef int8_t (*nativeloader_load_fn)(void *env, void *clazz, void *path);
 
 static int fail(const char *msg) { fprintf(stderr, "FAIL: %s\n", msg); return 1; }
 
-// A fault in guest code is the one stop the parent can only name by number, and
-// by then the child is gone. Reporting it from inside says the three things that
-// identify it: where it touched, where it was executing, and — the question a
-// signal number cannot answer — whether it was even the main thread. A crash on
-// an engine worker lands at whatever point the main thread's log had reached,
-// which reads as a different bug on every run.
-//
-// This has to survive being called in a broken process, so it uses write(2)
-// rather than stdio and does not attempt a symbolised backtrace.
-static void report_fault(int sig, siginfo_t *si, void *uctx) {
-    // Our own handler, so this is a Darwin ucontext_t and reading it is safe —
-    // the mismatch in trap 5 is about the *guest's* handlers seeing one.
-    ucontext_t *uc = uctx;
-    void *pc = uc ? (void *)uc->uc_mcontext->__ss.__pc : NULL;
-    uint64_t tid = 0;
-    pthread_threadid_np(NULL, &tid);
-
-    size_t      off = 0;
-    const char *img = kl_addr_image(pc, &off);
-    // Not a guest image, so it is ours or the system's — dladdr names it, which
-    // turns "<host>+0x0" into something actionable. Only safe-ish because we are
-    // already dying; it is not async-signal-safe.
-    Dl_info di;
-    if (!img && pc && dladdr(pc, &di) && di.dli_sname) {
-        img = di.dli_sname;
-        off = (size_t)((const char *)pc - (const char *)di.dli_saddr);
-    }
-
-    char buf[256];
-    int  n = snprintf(buf, sizeof buf,
-                      "\n[t_boot] fault: signal %d at %p, pc %s+0x%zx (%p), thread %llu%s\n",
-                      sig, si ? si->si_addr : NULL, img ? img : "<host>", off, pc,
-                      (unsigned long long)tid,
-                      pthread_main_np() ? " (main)" : " (a guest worker thread)");
-    if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
-
-    // Walk the frame chain. The faulting pc is usually in libsystem — memmove
-    // with a null pointer says nothing about who passed it — so what matters is
-    // the first guest frame above it. AAPCS64 keeps x29 as the frame pointer and
-    // stores {fp, lr} at [fp], which both the guest and our own code honour.
-    void **fp = uc ? (void **)uc->uc_mcontext->__ss.__fp : NULL;
-    for (int depth = 0; fp && depth < 12; depth++) {
-        void *ret = fp[1];
-        if (!ret) break;
-        size_t roff = 0;
-        const char *rimg = kl_addr_image(ret, &roff);
-        const char *mm = kl_il2cpp_method_at(ret);
-        Dl_info rdi;
-        if (mm)
-            n = snprintf(buf, sizeof buf, "    #%-2d %s  [%s+0x%zx]\n", depth, mm,
-                         rimg ? rimg : "?", roff);
-        else if (rimg)
-            n = snprintf(buf, sizeof buf, "    #%-2d %s+0x%zx\n", depth, rimg, roff);
-        else if (dladdr(ret, &rdi) && rdi.dli_sname)
-            n = snprintf(buf, sizeof buf, "    #%-2d %s+0x%tx\n", depth, rdi.dli_sname,
-                         (const char *)ret - (const char *)rdi.dli_saddr);
-        else
-            n = snprintf(buf, sizeof buf, "    #%-2d %p\n", depth, ret);
-        if (n > 0) { ssize_t w2 = write(2, buf, (size_t)n); (void)w2; }
-        void **next = (void **)fp[0];
-        if (next <= fp) break;                  // stacks grow down; anything else is junk
-        fp = next;
-    }
-
-    // SIGABRT here is usually the *guest* dying, not us — Unity's audio thread
-    // aborts outright when FMOD cannot open an output device. Those paths never
-    // touch kl_fatal_prepare(), so this is the only place the graphics surface
-    // report can still be emitted. Not async-signal-safe, but nothing after this
-    // point is going to run anyway.
-    // SIGALRM means the guest is still alive and blocked, which is a different
-    // question from a crash — the surface reports say how far it got and what it
-    // was waiting on, so emit them here too.
-    // Print on every fatal signal, not just the orderly ones. A SIGSEGV loses
-    // the surface reports otherwise, and under KL_PERMISSIVE a crash is the
-    // *expected* end of a scouting run — the guest carries on with answers we
-    // invented and eventually walks into one.
-    if (sig == SIGABRT || sig == SIGALRM || sig == SIGSEGV || sig == SIGBUS ||
-        sig == SIGTRAP) {
-        kl_sample_stop_report(stderr);
-        kl_pthread_report(stderr);
-        kl_egl_report(stderr);
-        kl_opensl_report(stderr);
-        kl_ovrp_report(stderr);
-        kl_ovrplat_report(stderr);
-    }
-
-    // KL_FAULT_WAIT=1: park here instead of dying so a debugger can attach and
-    // inspect every thread at the moment of the fault. This exists because the
-    // AGX abort is masked when the guest runs *under* lldb from the start (the
-    // debugger's signal traffic serializes the run enough to avoid the race),
-    // so the only way to get a symbolicated look at it is post-mortem attach.
-    if (getenv("KL_FAULT_WAIT")) {
-        n = snprintf(buf, sizeof buf,
-                     "[t_boot] KL_FAULT_WAIT: pid %d parked on signal %d — "
-                     "attach with `lldb -p %d`, then `bt all`\n", getpid(), sig,
-                     getpid());
-        if (n > 0) { ssize_t w3 = write(2, buf, (size_t)n); (void)w3; }
-        for (;;) pause();
-    }
-
-    // Die of the original signal, so the parent still reports it as one.
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
-
+// The fatal-signal reporter moved to runtime/kl_fault.c when the visionOS app
+// needed the same thing inside a bundle (PLANNING §12.7) — it is a diagnostic
+// that ships, not a harness detail. The sampling profiler stays host-only, so
+// t_boot registers it rather than kl_fault.c referencing RUNTIME_DIAG.
 static void install_fault_reporter(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = report_fault;
-    sa.sa_flags     = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS,  &sa, NULL);
-    sigaction(SIGABRT, &sa, NULL);
-    sigaction(SIGALRM, &sa, NULL);
-    sigaction(SIGTRAP, &sa, NULL);   // guest __builtin_trap / brk assertions
+    kl_fault_add_reporter(kl_sample_stop_report);
+    kl_fault_install();
 }
 
 // The entitlement refusal in kl_ovrplat.c is a policy guard, and Beat Saber does

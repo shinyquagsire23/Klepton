@@ -18,7 +18,7 @@
 //
 // Nothing here suspends the sampled threads: a sample is whatever the thread
 // was doing when thread_get_state caught it, which over enough samples is the
-// distribution we want. Stack reads go through mach_vm_read_overwrite so a
+// distribution we want. Stack reads go through vm_read_overwrite so a
 // torn frame pointer costs one sample, not the process.
 #include <stdint.h>
 #include <stdio.h>
@@ -29,7 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#include <mach/vm_map.h>
 #include "klepton.h"
 #include "kl_il2cpp.h"
 #include "kl_sample.h"
@@ -163,10 +163,10 @@ static void sample_once(void) {
         while (fp && nf < KL_SAMPLE_DEPTH) {
             if (fp & 7) break;
             uint64_t pair[2];
-            mach_vm_size_t got = 0;
-            if (mach_vm_read_overwrite(mach_task_self(), fp, sizeof pair,
-                                       (mach_vm_address_t)pair,
-                                       &got) != KERN_SUCCESS || got != sizeof pair)
+            vm_size_t got = 0;
+            if (vm_read_overwrite(mach_task_self(), fp, sizeof pair,
+                                  (vm_address_t)pair,
+                                  &got) != KERN_SUCCESS || got != sizeof pair)
                 break;
             if (!pair[1] || pair[0] <= fp) break;
             frames[nf] = (void *)pair[1];
@@ -262,11 +262,11 @@ static void sample_once(void) {
                 for (unsigned f = 1; f < nf; f++) {
                     if (frames[f] != base + 0x129c2c0) continue;
                     uint64_t saved[2];
-                    mach_vm_size_t got = 0;
-                    if (mach_vm_read_overwrite(mach_task_self(),
-                                               fps[f - 1] - 0x10, sizeof saved,
-                                               (mach_vm_address_t)saved,
-                                               &got) != KERN_SUCCESS ||
+                    vm_size_t got = 0;
+                    if (vm_read_overwrite(mach_task_self(),
+                                          fps[f - 1] - 0x10, sizeof saved,
+                                          (vm_address_t)saved,
+                                          &got) != KERN_SUCCESS ||
                         got != sizeof saved)
                         break;
                     uint64_t klass = saved[0] - 0xe0;    // live x20 - 0xe0
@@ -282,10 +282,10 @@ static void sample_once(void) {
                     // (far-future or infinite); a moving ts means the 1ms
                     // poll loop is alive and something else is wrong.
                     struct { int64_t sec, nsec; } wts = {0, 0};
-                    mach_vm_read_overwrite(mach_task_self(),
-                                           fps[f - 1] - 0x60, sizeof wts,
-                                           (mach_vm_address_t)&wts,
-                                           &(mach_vm_size_t){0});
+                    vm_read_overwrite(mach_task_self(),
+                                      fps[f - 1] - 0x60, sizeof wts,
+                                      (vm_address_t)&wts,
+                                      &(vm_size_t){0});
                     static struct {
                         mach_port_t act; uint64_t klass;
                         int64_t sec, nsec;
@@ -348,32 +348,32 @@ static void sample_once(void) {
                         uint32_t state, inprog;
                         uint64_t owner;
                         const char *name, *ns;
-                        if (mach_vm_read_overwrite(mach_task_self(),
-                                                   klass + 0xdc, 4,
-                                                   (mach_vm_address_t)&inprog,
-                                                   &(mach_vm_size_t){0}) != KERN_SUCCESS)
+                        if (vm_read_overwrite(mach_task_self(),
+                                              klass + 0xdc, 4,
+                                              (vm_address_t)&inprog,
+                                              &(vm_size_t){0}) != KERN_SUCCESS)
                             break;
-                        mach_vm_read_overwrite(mach_task_self(), klass + 0xe0, 4,
-                                               (mach_vm_address_t)&state,
-                                               &(mach_vm_size_t){0});
-                        mach_vm_read_overwrite(mach_task_self(), klass + 0xe8, 8,
-                                               (mach_vm_address_t)&owner,
-                                               &(mach_vm_size_t){0});
-                        mach_vm_read_overwrite(mach_task_self(), klass + 0x10, 8,
-                                               (mach_vm_address_t)&name,
-                                               &(mach_vm_size_t){0});
-                        mach_vm_read_overwrite(mach_task_self(), klass + 0x18, 8,
-                                               (mach_vm_address_t)&ns,
-                                               &(mach_vm_size_t){0});
+                        vm_read_overwrite(mach_task_self(), klass + 0xe0, 4,
+                                          (vm_address_t)&state,
+                                          &(vm_size_t){0});
+                        vm_read_overwrite(mach_task_self(), klass + 0xe8, 8,
+                                          (vm_address_t)&owner,
+                                          &(vm_size_t){0});
+                        vm_read_overwrite(mach_task_self(), klass + 0x10, 8,
+                                          (vm_address_t)&name,
+                                          &(vm_size_t){0});
+                        vm_read_overwrite(mach_task_self(), klass + 0x18, 8,
+                                          (vm_address_t)&ns,
+                                          &(vm_size_t){0});
                         char nbuf[96], nsbuf[96];
-                        mach_vm_size_t g1 = 0, g2 = 0;
+                        vm_size_t g1 = 0, g2 = 0;
                         memset(nbuf, 0, sizeof nbuf); memset(nsbuf, 0, sizeof nsbuf);
-                        mach_vm_read_overwrite(mach_task_self(),
-                                               (mach_vm_address_t)name, sizeof nbuf - 1,
-                                               (mach_vm_address_t)nbuf, &g1);
-                        mach_vm_read_overwrite(mach_task_self(),
-                                               (mach_vm_address_t)ns, sizeof nsbuf - 1,
-                                               (mach_vm_address_t)nsbuf, &g2);
+                        vm_read_overwrite(mach_task_self(),
+                                          (vm_address_t)name, sizeof nbuf - 1,
+                                          (vm_address_t)nbuf, &g1);
+                        vm_read_overwrite(mach_task_self(),
+                                          (vm_address_t)ns, sizeof nsbuf - 1,
+                                          (vm_address_t)nsbuf, &g2);
                         if (!g1 || nbuf[0] < 0x20 || nbuf[0] > 0x7e)
                             break;              // torn read, not a klass
                         if (nseen < 64) seen[nseen++] = klass;
