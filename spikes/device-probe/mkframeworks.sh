@@ -50,7 +50,50 @@ make_xcframework() {     # <name> <extra ld flags...>
   echo "  $NAME.xcframework   __TEXT vmsize=$SZ"
 }
 
+# KleptonGuest — the P3 subject. NOT built by clang: this framework's binary is
+# emitted by klepton-ld from a real guest .so, so it is the *hand-emitted* Mach-O
+# that S0.2 never tested. S0.2 proved a signed dylib loads; the open question is
+# whether one dyld's own linker never touched survives AMFI on device.
+make_guest_framework() {
+  local NAME="KleptonGuest"
+  local LD="../../build/klepton-ld"
+  local SO="../../beatsaber/lib/arm64-v8a/libunityopus.so"
+  [ -x "$LD" ] || { echo "  !! $LD missing — run 'make build/klepton-ld' first"; return 1; }
+  [ -f "$SO" ] || { echo "  !! $SO missing"; return 1; }
+
+  local PLAT KLPLAT DIR FW
+  for PLAT in xros xrsimulator; do
+    case "$PLAT" in
+      xros)        KLPLAT=visionos    ;;
+      xrsimulator) KLPLAT=visionossim ;;
+    esac
+    DIR="build/$PLAT"; FW="$DIR/$NAME.framework"
+    mkdir -p "$FW"
+    "$LD" "$SO" -o "$FW/$NAME" --platform "$KLPLAT" \
+         --install-name "@rpath/$NAME.framework/$NAME" --quiet
+    cat > "$FW/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>$NAME</string>
+  <key>CFBundleIdentifier</key><string>dev.klepton.probe.$NAME</string>
+  <key>CFBundleName</key><string>$NAME</string>
+  <key>CFBundlePackageType</key><string>FMWK</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>MinimumOSVersion</key><string>1.0</string>
+</dict></plist>
+EOF
+  done
+  xcodebuild -create-xcframework \
+      -framework "build/xros/$NAME.framework" \
+      -framework "build/xrsimulator/$NAME.framework" \
+      -output "$OUT/$NAME.xcframework"
+  echo "  $NAME.xcframework   klepton-ld output ($(stat -f%z build/xros/$NAME/../$NAME.framework/$NAME 2>/dev/null || stat -f%z build/xros/$NAME.framework/$NAME) bytes)"
+}
+
 echo "[mkframeworks] building probe XCFrameworks…"
 make_xcframework KleptonProbeA
 make_xcframework KleptonProbeB -Wl,-segalign,0x10000
+make_guest_framework
 echo "[mkframeworks] done -> $OUT/"

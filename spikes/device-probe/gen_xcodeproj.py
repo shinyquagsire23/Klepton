@@ -35,10 +35,10 @@ CL_PROJ   = oid("CLPRJ"); CL_TGT   = oid("CLTGT")
 C_PROJ_D  = oid("CPRJD"); C_PROJ_R = oid("CPRJR")
 C_TGT_D   = oid("CTGTD"); C_TGT_R  = oid("CTGTR")
 F_SWIFT   = oid("FSWFT"); F_C      = oid("FC");    F_H     = oid("FH");   F_BRIDGE = oid("FBRDG")
-F_FWA     = oid("FFWA");  F_FWB    = oid("FFWB")
+F_FWA     = oid("FFWA");  F_FWB    = oid("FFWB"); F_FWG = oid("FFWG")
 B_SWIFT   = oid("BSWFT"); B_C      = oid("BC")
 B_LNKA    = oid("BLNKA"); B_LNKB   = oid("BLNKB")
-B_EMBA    = oid("BEMBA"); B_EMBB   = oid("BEMBB")
+B_EMBA    = oid("BEMBA"); B_EMBB   = oid("BEMBB"); B_EMBG = oid("BEMBG")
 
 COMMON = f"""
 				CLANG_ENABLE_MODULES = YES;
@@ -78,6 +78,7 @@ PBX = f"""// !$*UTF8*$!
 		{B_LNKB} /* B in Frameworks */ = {{isa = PBXBuildFile; fileRef = {F_FWB}; }};
 		{B_EMBA} /* A in Embed */ = {{isa = PBXBuildFile; fileRef = {F_FWA}; settings = {{ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }}; }};
 		{B_EMBB} /* B in Embed */ = {{isa = PBXBuildFile; fileRef = {F_FWB}; settings = {{ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }}; }};
+		{B_EMBG} /* Guest in Embed */ = {{isa = PBXBuildFile; fileRef = {F_FWG}; settings = {{ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }}; }};
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -88,6 +89,7 @@ PBX = f"""// !$*UTF8*$!
 		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "{NAME}-Bridging-Header.h"; sourceTree = "<group>"; }};
 		{F_FWA} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = KleptonProbeA.xcframework; path = Frameworks/KleptonProbeA.xcframework; sourceTree = "<group>"; }};
 		{F_FWB} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = KleptonProbeB.xcframework; path = Frameworks/KleptonProbeB.xcframework; sourceTree = "<group>"; }};
+		{F_FWG} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = KleptonGuest.xcframework; path = Frameworks/KleptonGuest.xcframework; sourceTree = "<group>"; }};
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -111,6 +113,7 @@ PBX = f"""// !$*UTF8*$!
 			files = (
 				{B_EMBA},
 				{B_EMBB},
+				{B_EMBG},
 			);
 			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -143,6 +146,7 @@ PBX = f"""// !$*UTF8*$!
 			children = (
 				{F_FWA},
 				{F_FWB},
+				{F_FWG},
 			);
 			name = Frameworks;
 			sourceTree = "<group>";

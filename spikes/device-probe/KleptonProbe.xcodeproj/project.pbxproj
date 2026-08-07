@@ -6,12 +6,13 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		KLEPT0N0023BSWFT00000000 /* app.swift in Sources */ = {isa = PBXBuildFile; fileRef = KLEPT0N0017FSWFT00000000; };
-		KLEPT0N0024BC00000000000 /* probes.c in Sources */ = {isa = PBXBuildFile; fileRef = KLEPT0N0018FC00000000000; };
-		KLEPT0N0025BLNKA00000000 /* A in Frameworks */ = {isa = PBXBuildFile; fileRef = KLEPT0N0021FFWA000000000; };
-		KLEPT0N0026BLNKB00000000 /* B in Frameworks */ = {isa = PBXBuildFile; fileRef = KLEPT0N0022FFWB000000000; };
-		KLEPT0N0027BEMBA00000000 /* A in Embed */ = {isa = PBXBuildFile; fileRef = KLEPT0N0021FFWA000000000; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
-		KLEPT0N0028BEMBB00000000 /* B in Embed */ = {isa = PBXBuildFile; fileRef = KLEPT0N0022FFWB000000000; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		KLEPT0N0024BSWFT00000000 /* app.swift in Sources */ = {isa = PBXBuildFile; fileRef = KLEPT0N0017FSWFT00000000; };
+		KLEPT0N0025BC00000000000 /* probes.c in Sources */ = {isa = PBXBuildFile; fileRef = KLEPT0N0018FC00000000000; };
+		KLEPT0N0026BLNKA00000000 /* A in Frameworks */ = {isa = PBXBuildFile; fileRef = KLEPT0N0021FFWA000000000; };
+		KLEPT0N0027BLNKB00000000 /* B in Frameworks */ = {isa = PBXBuildFile; fileRef = KLEPT0N0022FFWB000000000; };
+		KLEPT0N0028BEMBA00000000 /* A in Embed */ = {isa = PBXBuildFile; fileRef = KLEPT0N0021FFWA000000000; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		KLEPT0N0029BEMBB00000000 /* B in Embed */ = {isa = PBXBuildFile; fileRef = KLEPT0N0022FFWB000000000; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		KLEPT0N0030BEMBG00000000 /* Guest in Embed */ = {isa = PBXBuildFile; fileRef = KLEPT0N0023FFWG000000000; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -22,6 +23,7 @@
 		KLEPT0N0020FBRDG00000000 = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "KleptonProbe-Bridging-Header.h"; sourceTree = "<group>"; };
 		KLEPT0N0021FFWA000000000 = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = KleptonProbeA.xcframework; path = Frameworks/KleptonProbeA.xcframework; sourceTree = "<group>"; };
 		KLEPT0N0022FFWB000000000 = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = KleptonProbeB.xcframework; path = Frameworks/KleptonProbeB.xcframework; sourceTree = "<group>"; };
+		KLEPT0N0023FFWG000000000 = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = KleptonGuest.xcframework; path = Frameworks/KleptonGuest.xcframework; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -29,8 +31,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				KLEPT0N0025BLNKA00000000,
-				KLEPT0N0026BLNKB00000000,
+				KLEPT0N0026BLNKA00000000,
+				KLEPT0N0027BLNKB00000000,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -43,8 +45,9 @@
 			dstPath = "";
 			dstSubfolderSpec = 10;
 			files = (
-				KLEPT0N0027BEMBA00000000,
-				KLEPT0N0028BEMBB00000000,
+				KLEPT0N0028BEMBA00000000,
+				KLEPT0N0029BEMBB00000000,
+				KLEPT0N0030BEMBG00000000,
 			);
 			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -77,6 +80,7 @@
 			children = (
 				KLEPT0N0021FFWA000000000,
 				KLEPT0N0022FFWB000000000,
+				KLEPT0N0023FFWG000000000,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -140,8 +144,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				KLEPT0N0023BSWFT00000000,
-				KLEPT0N0024BC00000000000,
+				KLEPT0N0024BSWFT00000000,
+				KLEPT0N0025BC00000000000,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
