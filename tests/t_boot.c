@@ -352,8 +352,15 @@ static int recon_run(int view_pump) {
             // means the binding took and the rendering went elsewhere.
             if (kl_glfb_has_mtl_provider()) {
                 printf("\n=== P5 interop: the guest's frame, read back through Metal ===\n");
-                printf("  reference (glReadPixels, kl_glfb): %lu lit\n",
-                       kl_glfb_last_frame_lit());
+                // Under the viewer's hardware compositor there IS no reference:
+                // registering a GPU fence replaces the readback, so kl_glfb has
+                // counted nothing and a bare 0 here would read as a black frame.
+                if (kl_glfb_has_gpu_fence())
+                    printf("  reference: none — the GPU compositor is driving, "
+                           "so nothing was read back\n");
+                else
+                    printf("  reference (glReadPixels, kl_glfb): %lu lit\n",
+                           kl_glfb_last_frame_lit());
                 for (int eye = 0; eye < 2; eye++) {
                     int w = 0, h = 0;
                     unsigned long lit = kl_mtl_count_lit(eye, 0, &w, &h);
@@ -422,15 +429,32 @@ static int view_run(void) {
         fprintf(stderr, "KL_VIEW=1 but t_boot was built without SDL3\n");
         return 1;
     }
-    // The frame-out seam: the renderer's per-swap readback goes to the
-    // viewer's frame store instead of PNG files.
-    kl_glfb_set_frame_sink(kl_view_frame_sink, NULL);
+    // The frame-out seam, and which of its two implementations to use. Decided
+    // HERE, on the main thread, before the guest thread exists: kl_glfb_mtl_
+    // device() brings ANGLE up to answer, and kl_glfb_init() is not something
+    // two threads may race into.
+    //
+    // Hardware is the default — the guest's eye textures become MTLTextures we
+    // allocated and the viewer composites one straight into the window's
+    // CAMetalLayer, so no frame is ever read back or copied. KL_VIEW_CPU=1
+    // keeps the old glReadPixels path, which is the A/B when the compositor
+    // shows the wrong picture.
+    int hw = 0;
+    if (getenv("KL_VIEW_CPU")) {
+        fprintf(stderr, "view: KL_VIEW_CPU=1 — readback path\n");
+    } else if (!kl_glfb_mtl_device()) {
+        fprintf(stderr, "view: no MTLDevice from ANGLE — readback path\n");
+    } else {
+        kl_mtl_provider_install();          // installs unconditionally under KL_VIEW
+        hw = kl_glfb_has_mtl_provider();
+    }
+    if (!hw) kl_glfb_set_frame_sink(kl_view_frame_sink, NULL);
     pthread_t guest;
     if (pthread_create(&guest, NULL, view_guest_thread, NULL)) {
         fprintf(stderr, "view: pthread_create failed\n");
         return 1;
     }
-    int rc = kl_view_main(LIBDIR);   // returns when the window closes
+    int rc = kl_view_main(LIBDIR, hw);   // returns when the window closes
     g_view_quit = 1;
     pthread_join(guest, NULL);
     kl_jni_report(stdout);

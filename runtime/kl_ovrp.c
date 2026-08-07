@@ -201,9 +201,28 @@ static const char *klovrp_GetSystemProductName(void) {
 // Stored into Unity's VR timing config (0x9bce28). No division by it in the
 // Oculus path, but 0.0 would poison Unity-side pacing math; 72 is the Quest 2
 // default and agrees with the device we describe.
+// The display frequency we report. Quest 2's 72 Hz by default — the device we
+// claim to be everywhere else — until a frontend measures the real one and
+// pushes it through kl_ovrp_set_display_frequency. Unity reads this once,
+// early, and stores it into its VR timing config, so the push has to happen
+// before the guest boots; on visionOS that is what the compositor's priming
+// pass is for.
+static float g_display_hz = KL_OVRP_REFRESH;
+
+void kl_ovrp_set_display_frequency(float hz) {
+    // A display frequency is a divisor in Unity's pacing math and a period
+    // everywhere else. Anything outside the range a headset can actually run at
+    // is a measurement that went wrong, and passing it on turns one bad number
+    // into a frame loop that never settles.
+    if (!(hz >= 30.0f) || !(hz <= 240.0f)) return;
+    g_display_hz = hz;
+}
+
+float kl_ovrp_display_frequency(void) { return g_display_hz; }
+
 static float klovrp_GetSystemDisplayFrequency(void) {
     ovrp_hit("ovrp_GetSystemDisplayFrequency");
-    return KL_OVRP_REFRESH;
+    return g_display_hz;
 }
 
 // Packed return: width in the low 32 bits, height in the high (0x9bce58).
@@ -224,13 +243,51 @@ static uint64_t klovrp_GetDesiredEyeTextureFormat(void) {
     return 2;
 }
 
+// The frustum we tell the guest to render with, per eye: left, right, top,
+// bottom tangents, all positive (cp_view_get_tangents order — see kl_ovrp.h).
+// 1.0 everywhere is the coherent symmetric 90-degree frustum every host run has
+// used; a frontend that knows the display's real field of view overwrites it
+// through kl_ovrp_set_eye_frustum.
+static float g_eye_tan[2][4] = {{1, 1, 1, 1}, {1, 1, 1, 1}};
+
+void kl_ovrp_set_eye_frustum(int eye, float left, float right, float top, float bottom) {
+    if ((unsigned)eye > 1) return;
+    // A zero or negative tangent is not a narrow frustum, it is a degenerate
+    // one — libunity divides by their max for the aspect. Refuse rather than
+    // pass it on; the default stays, which is at worst the wrong field of view
+    // instead of a division by zero four layers down.
+    if (!(left > 0) || !(right > 0) || !(top > 0) || !(bottom > 0)) return;
+    g_eye_tan[eye][0] = left;  g_eye_tan[eye][1] = right;
+    g_eye_tan[eye][2] = top;   g_eye_tan[eye][3] = bottom;
+}
+
 // Fills four f32 fov tangents at out+0x08..+0x14 (0x9bcbd4). libunity divides
-// by their max for the aspect, so 0 is not survivable; 1.0 everywhere is a
-// coherent 90-degree frustum until real fov values arrive with the pose work.
+// by their max for the aspect, so 0 is not survivable.
+//
+// The order here is ovrpFovf — UpTan, DownTan, LeftTan, RightTan — which is not
+// the order the seam speaks, and this is the one place that transposition
+// belongs: everything above the ABI uses Compositor Services' (left, right,
+// top, bottom) so the compositor never has to remember two conventions. With
+// the default symmetric frustum the two are indistinguishable, which is exactly
+// why getting it wrong here would stay invisible until the day a real
+// asymmetric field of view is pushed in.
+//
+// So the order is read, not assumed — out of the guest's own metadata, the same
+// way the node ids and controller masks were. global-metadata.dat's string
+// table has `zNear, zFar` adjacent (ovrpFrustum2f) and `UpTan, DownTan,
+// LeftTan, RightTan` adjacent (ovrpFovf), in declaration order, which pins both
+// the struct layout and this transposition.
 static uint64_t klovrp_GetNodeFrustum2(int node, void *out) {
     ovrp_hit("ovrp_GetNodeFrustum2");
+    // Nodes 0/1 are EyeLeft/EyeRight; anything else asking about a frustum
+    // (EyeCenter, Head) gets the left eye's, which is what a symmetric or
+    // near-symmetric display makes true enough to be honest.
+    const float *t = g_eye_tan[node == 1 ? 1 : 0];
     float *f = (float *)out;
-    f[2] = f[3] = f[4] = f[5] = 1.0f;
+    f[2] = t[2];    // UpTan    <- top
+    f[3] = t[3];    // DownTan  <- bottom
+    f[4] = t[0];    // LeftTan  <- left
+    f[5] = t[1];    // RightTan <- right
     return OVRP_SUCCESS;
 }
 
@@ -339,6 +396,102 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     g_head_pose.qx = qx; g_head_pose.qy = qy;
     g_head_pose.qz = qz; g_head_pose.qw = qw;
     g_head_set = 1;
+}
+
+void kl_ovrp_get_head_pose(float *px, float *py, float *pz,
+                           float *qx, float *qy, float *qz, float *qw) {
+    klovrp_pose h = klovrp_head();
+    if (px) *px = h.px; if (py) *py = h.py; if (pz) *pz = h.pz;
+    if (qx) *qx = h.qx; if (qy) *qy = h.qy;
+    if (qz) *qz = h.qz; if (qw) *qw = h.qw;
+}
+
+// --- Timewarp bookkeeping ---------------------------------------------------
+// See kl_ovrp.h for what this is for and why it is keyed to the stage. The
+// consumer is kl_reproject.c / the two compositors.
+//
+// Locked, unlike the pose above. The pose is written and read every frame by
+// two threads and a torn read costs one frame of staleness; a *record* is
+// different — half of one frame's rotation with half of another's is a pose
+// that never existed, and reprojecting against it would produce a visible jump
+// rather than a shrug. The lock is taken twice per frame per side and is
+// uncontended in practice.
+#define KLOVRP_MAX_STAGES 4
+static struct {
+    kl_ovrp_render_pose r[KLOVRP_MAX_STAGES];
+    uint64_t            serial;         // frames begun
+    int                 last_complete;  // stage of the last completed frame, -1 = none
+    pthread_mutex_t     mu;
+} g_frames = { .last_complete = -1, .mu = PTHREAD_MUTEX_INITIALIZER };
+
+// How many swapchain stages we tell the guest it has. Raising this is a
+// deliberate act with a consequence: the stage a frame draws into is derived
+// below from our own frame counter, which is only *known* to agree with
+// libunity's own choice while there is exactly one stage to choose. Measure
+// which stage the guest actually renders into before raising it.
+#define KLOVRP_STAGES 1
+
+// libunity's frame dispatcher (0x9bb808) calls BeginFrame, EndEye2 twice, then
+// EndFrame. This is where the pose the frame will be rendered with is fixed:
+// the frontend wrote it before driving this frame, and every
+// ovrp_GetNodePoseState the guest is about to make will answer the same thing.
+//
+// The argument is the guest's own frame index, and it is deliberately ignored:
+// our own counter is what the ring is indexed by, so a guest that numbers
+// frames differently — or restarts them — cannot desynchronise the ring from
+// the records in it.
+static uint64_t klovrp_BeginFrame(int guest_frame_index) {
+    ovrp_hit("ovrp_BeginFrame");
+    (void)guest_frame_index;
+    klovrp_pose h = klovrp_head();
+    pthread_mutex_lock(&g_frames.mu);
+    uint64_t s = ++g_frames.serial;
+    int stage = (int)((s - 1) % KLOVRP_STAGES);
+    kl_ovrp_render_pose *r = &g_frames.r[stage];
+    r->px = h.px; r->py = h.py; r->pz = h.pz;
+    r->qx = h.qx; r->qy = h.qy; r->qz = h.qz; r->qw = h.qw;
+    // The frustum is recorded per frame rather than read live by the
+    // compositor, because a frontend may push a new one at any time: a picture
+    // rendered with the old field of view must keep being placed with the old
+    // field of view, or it is resized by a change that happened after it.
+    memcpy(r->tangents, g_eye_tan, sizeof r->tangents);
+    r->serial = s;
+    r->stage = stage;
+    r->complete = 0;
+    pthread_mutex_unlock(&g_frames.mu);
+    return OVRP_SUCCESS;
+}
+
+// The guest has finished submitting this frame's eyes. Only now is the stage
+// safe for a compositor to sample; before it, the record describes a picture
+// that is still being drawn.
+static uint64_t klovrp_EndFrame(int guest_frame_index) {
+    ovrp_hit("ovrp_EndFrame");
+    (void)guest_frame_index;
+    pthread_mutex_lock(&g_frames.mu);
+    if (g_frames.serial) {
+        int stage = (int)((g_frames.serial - 1) % KLOVRP_STAGES);
+        g_frames.r[stage].complete = 1;
+        g_frames.last_complete = stage;
+    }
+    pthread_mutex_unlock(&g_frames.mu);
+    return OVRP_SUCCESS;
+}
+
+int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out) {
+    if ((unsigned)stage >= KLOVRP_MAX_STAGES || !out) return 0;
+    pthread_mutex_lock(&g_frames.mu);
+    int have = g_frames.r[stage].serial != 0;
+    if (have) *out = g_frames.r[stage];
+    pthread_mutex_unlock(&g_frames.mu);
+    return have;
+}
+
+int kl_ovrp_last_complete_stage(void) {
+    pthread_mutex_lock(&g_frames.mu);
+    int s = g_frames.last_complete;
+    pthread_mutex_unlock(&g_frames.mu);
+    return s;
 }
 
 // --- M7: the two hands ------------------------------------------------------
@@ -721,7 +874,11 @@ static uint64_t klovrp_GetAppAsymmetricFov(char *out) {
 // the GetSystemDisplayFrequency answer above.
 static uint64_t klovrp_GetSystemDisplayAvailableFrequencies(float *buf, int *count) {
     ovrp_hit("ovrp_GetSystemDisplayAvailableFrequencies");
-    if (buf) buf[0] = KL_OVRP_REFRESH;
+    // One rate, and it is the one we report as current. Offering a menu of
+    // frequencies we cannot actually switch between would invite the guest to
+    // ask for one — ovrp_SetSystemDisplayFrequency is not implemented, and a
+    // list is a promise.
+    if (buf) buf[0] = g_display_hz;
     *count = 1;
     return 1;
 }
@@ -859,6 +1016,12 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_SetTrackingOriginType", (void *)klovrp_SetTrackingOriginType},
     {"ovrp_GetTrackingOriginType", (void *)klovrp_GetTrackingOriginType},
     {"ovrp_GetNodeFrustum2", (void *)klovrp_GetNodeFrustum2},
+    // Real implementations only so that the frame boundary can be *observed* —
+    // both still answer ovrpSuccess and neither has an out-param. This is the
+    // timewarp bookkeeping (kl_ovrp.h): the pose the guest is about to render
+    // with, latched against the stage that frame draws into.
+    {"ovrp_BeginFrame", (void *)klovrp_BeginFrame},
+    {"ovrp_EndFrame", (void *)klovrp_EndFrame},
     {"ovrp_GetNodePositionTracked2", (void *)klovrp_GetNodePositionTracked2},
     {"ovrp_GetNodePositionValid", (void *)klovrp_GetNodePositionValid},
     {"ovrp_GetNodeOrientationValid", (void *)klovrp_GetNodeOrientationValid},
@@ -905,8 +1068,10 @@ static const char *const g_ovrp_result_ok[] = {
     // The frame lifecycle (0x9bb808 dispatcher: BeginFrame, EndEye2 x2,
     // EndFrame) and the one-shot Update2 at the end of init (0x9bb52c) and
     // reconfigure (0x9bce3c). All have their return ignored by the guest and
-    // take no out-params.
-    "ovrp_Update2", "ovrp_BeginFrame", "ovrp_EndEye2", "ovrp_EndFrame",
+    // take no out-params. BeginFrame and EndFrame have moved to real
+    // implementations above — they answer the same ovrpSuccess, but they are
+    // where the timewarp bookkeeping is latched.
+    "ovrp_Update2", "ovrp_EndEye2",
     "ovrp_RecenterTrackingOrigin",
     // Thread-scheduling hints from PlayerSettings, set once at init; void
     // configuration like the setters above.

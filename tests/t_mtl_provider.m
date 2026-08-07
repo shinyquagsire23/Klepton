@@ -84,7 +84,12 @@ static int provide(int eye, int stage, int w, int h, kl_mtl_eye_texture *out, vo
 }
 
 void kl_mtl_provider_install(void) {
-    if (!getenv("KL_GLFB_MTL")) return;
+    // KL_VIEW implies it: the viewer's hardware compositor samples exactly
+    // these textures, so without a provider there is nothing to composite and
+    // the viewer would silently fall back to the readback path it exists to
+    // avoid. KL_VIEW_CPU=1 is how you ask for that fallback on purpose.
+    if (!getenv("KL_GLFB_MTL") &&
+        !(getenv("KL_VIEW") && !getenv("KL_VIEW_CPU"))) return;
     if (!kl_glfb_enabled()) {
         fprintf(stderr, "  [mtl] KL_GLFB_MTL needs KL_GLFB=1 — ignoring\n");
         return;

@@ -13,8 +13,13 @@
 //       than letting the guest own a pump loop. That is why CADisplayLink was
 //       never added as an interim pacer: it would be a third mechanism to
 //       then remove.
-//    3. The composite pass — sampling those eye textures into the drawable,
-//       flipped.
+//    3. The composite pass — which is also the reprojection pass. See
+//       runtime/kl_reproject.h: the guest's picture is placed as a quad at a
+//       fixed far distance, sized by the frustum it was *rendered* with, in the
+//       space the pose it was rendered with defines, and then looked at from
+//       where the head is now through the projection this drawable wants. That
+//       corrects two things at once — the stale pose (timewarp) and the fact
+//       that the guest's Quest-shaped frustum is not the Vision Pro's.
 //
 //  **Why not zero-copy.** Handing the guest a cp_drawable's own texture would
 //  avoid a copy, but drawables are per-frame while eye textures are created
@@ -24,10 +29,19 @@
 //  timewarp wins — the resampling pass reprojection needs *is* this composite
 //  pass, so the copy is not actually extra work.
 //
+//  **Two reprojections happen, and they are not the same one.** This pass moves
+//  the guest's picture from the pose it was rendered with to the pose we
+//  predict for presentation. Compositor Services then does its own correction
+//  from that predicted pose to what the hardware actually reports at scanout —
+//  which is what `drawable.deviceAnchor` is for, and why the anchor set below
+//  is the *display* one and not the render one. Setting the render pose there
+//  instead would apply our delta twice. ALVR's visionOS client splits it the
+//  same way (`ALVRClient/Renderer.swift`, PLANNING §12.8).
+//
 //  **The flip is not cosmetic.** GL renders bottom-up; Metal and the display
 //  are top-down. The first host dump of these textures came out upside down
-//  (§12.9). It is done here, in the shader, because this is the only pass that
-//  reads the eye textures.
+//  (§12.9). It is done in the shared shader, because the composite is the only
+//  pass that reads the eye textures.
 //
 import SwiftUI
 import CompositorServices
@@ -77,6 +91,17 @@ final class KleptonCompositor {
     private var pipeline: MTLRenderPipelineState!
     private var sampler: MTLSamplerState!
 
+    // GPU ordering, not CPU. The guest's frame is in ANGLE's Metal command
+    // queue and this pass is in ours, and Metal orders nothing across queues:
+    // without an explicit wait the composite samples a texture ANGLE may still
+    // be rendering into. That reads as intermittent tearing and is exactly the
+    // kind of bug that gets blamed on the guest. kl_glfb signals this event at
+    // each eglSwapBuffers (EGL_ANGLE_metal_shared_event_sync); the value is
+    // also how this loop tells a fresh guest frame from a reused one.
+    private var guestFrameEvent: MTLSharedEvent!
+    private var lastGuestFrame: UInt64 = 0
+    private var staleInARow = 0
+
     // Keyed by (eye, stage). Indexed by stage from the start rather than kept
     // as a "last texture" global, because ovrp_GetEyeTextureStageCount is ours
     // to answer and Unity cycles stages: a pose or an image keyed to anything
@@ -95,6 +120,17 @@ final class KleptonCompositor {
     private let handTracking = HandTrackingProvider()
     private let controllers = KleptonControllers()
     private var arRunning = false
+
+    // How much work reprojection is doing, sampled for the log.
+    private var reprojectFrames = 0
+    private var worstDelta: Float = 0
+
+    // KL_OVRP_QUEST_FOV=1 keeps the synthetic symmetric 90° frustum and the
+    // Quest 2's 72 Hz instead of the display's own, which is the A/B if the
+    // real numbers turn out to send Unity somewhere unexpected. The priming
+    // pass still runs and still logs what it measured.
+    private let keepQuestDisplay =
+        ProcessInfo.processInfo.environment["KL_OVRP_QUEST_FOV"] != nil
 
     init(_ layerRenderer: LayerRenderer) {
         self.layerRenderer = layerRenderer
@@ -159,6 +195,10 @@ final class KleptonCompositor {
         // renders with should be the pose the display will show it at, which is
         // the whole point of having a deadline to render against.
         if let anchor = worldTracking.queryDeviceAnchor(atTimestamp: presentationTime) {
+            // This is the pose the guest will render with, and kl_ovrp latches
+            // it into the stage record when the guest reaches ovrp_BeginFrame —
+            // which is what the composite pass reads back to know where the
+            // picture it is about to show was drawn from.
             let (p, q) = Self.decompose(anchor.originFromAnchorTransform)
             kl_ovrp_set_head_pose(p.x, p.y, p.z, q.imag.x, q.imag.y, q.imag.z, q.real)
         }
@@ -208,6 +248,16 @@ final class KleptonCompositor {
         queue = device.makeCommandQueue()
         buildPipeline()
 
+        // Register the shared event before the guest can swap, so no frame is
+        // ever composited without the wait.
+        if let ev = device.makeSharedEvent() {
+            guestFrameEvent = ev
+            kl_glfb_set_gpu_fence(Unmanaged.passUnretained(ev).toOpaque())
+        } else {
+            NSLog("[cp] no MTLSharedEvent — the composite cannot be ordered "
+                  + "against ANGLE's queue")
+        }
+
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         kl_glfb_set_mtl_provider({ (eye, stage, w, h, out, ctx) -> Int32 in
             guard let ctx, let out else { return 0 }
@@ -219,40 +269,19 @@ final class KleptonCompositor {
     }
 
     private func buildPipeline() {
-        // Compiled from source rather than a .metal file so the shader lives
-        // beside the pass it serves and the project generator stays a source
-        // list. It is twenty lines and compiles once.
-        let src = """
-        #include <metal_stdlib>
-        using namespace metal;
-
-        struct VOut { float4 pos [[position]]; float2 uv; };
-
-        // A full-screen triangle, not a quad: three vertices, no buffer, no
-        // seam down the middle where two triangles meet.
-        vertex VOut kl_blit_v(uint vid [[vertex_id]]) {
-            float2 p = float2((vid << 1) & 2, vid & 2);
-            VOut o;
-            o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);
-            // v is flipped here: the guest rendered this through GL, which puts
-            // the origin at the BOTTOM left, and everything downstream of us is
-            // top-left. Doing it in the sampler's coordinates costs nothing.
-            o.uv  = float2(p.x, 1.0 - p.y);
-            return o;
-        }
-
-        fragment float4 kl_blit_f(VOut in [[stage_in]],
-                                  texture2d_array<float> tex [[texture(0)]],
-                                  sampler samp [[sampler(0)]],
-                                  constant uint &slice [[buffer(0)]]) {
-            return tex.sample(samp, in.uv, slice);
-        }
-        """
+        // The shader is kl_reproject.c's, shared verbatim with the macOS
+        // viewer's compositor (runtime/kl_view_mtl.m) — one copy of the flip,
+        // the quad and the array-slice sampler, because having them diverge
+        // means debugging the picture twice, and the viewer is where this math
+        // can actually be run before a device is available. Compiled from
+        // source rather than shipped as a .metal so it stays beside the
+        // matrices that feed it (kl_reproject_build).
+        let src = String(cString: kl_reproject_msl())
         do {
             let lib = try device.makeLibrary(source: src, options: nil)
             let desc = MTLRenderPipelineDescriptor()
-            desc.vertexFunction   = lib.makeFunction(name: "kl_blit_v")
-            desc.fragmentFunction = lib.makeFunction(name: "kl_blit_f")
+            desc.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
+            desc.fragmentFunction = lib.makeFunction(name: "kl_reproject_f")
             desc.colorAttachments[0].pixelFormat = .rgba16Float
             desc.depthAttachmentPixelFormat = .depth32Float
             pipeline = try device.makeRenderPipelineState(descriptor: desc)
@@ -343,6 +372,11 @@ final class KleptonCompositor {
         installProvider()
         startARKit()
 
+        // Before the guest, not after: the frustum and the display rate can
+        // only be read from a drawable, and the guest reads both exactly once
+        // during the lifecycle below. See primeDisplay().
+        primeDisplay()
+
         // Bring the guest up to its first frame before asking it for one per
         // drawable. _begin is once per process and does the /proc report,
         // nativeRecreateGfxState, nativeResume and the first nativeRender.
@@ -391,16 +425,70 @@ final class KleptonCompositor {
         // One guest frame per drawable: ticks the Choreographer, calls
         // nativeRender, drains the posted-task queue. The guest renders into
         // the eye textures the provider handed it.
+        //
+        // Synchronous, deliberately for now: a guest that misses the deadline
+        // delays this loop rather than letting it present the previous picture
+        // reprojected. Everything needed to do the latter is in place below —
+        // the stage record, the anchor ring, the fence value that says whether
+        // the frame is new — and decoupling the guest onto its own thread is
+        // the change that makes timewarp pay for itself rather than merely be
+        // correct. It is not this change, because it also moves the frame clock
+        // and P5.4's measurement with it.
         _ = kl_app_frame()
 
         guard let drawable = frame.queryDrawable() else { return 0 }
-
         guard let pipeline, let sampler, let cmd = queue.makeCommandBuffer() else { return 0 }
+
+        // Which stage holds a *finished* picture. -1 means the guest has not
+        // completed a frame yet (ovrp_EndFrame never seen) — there is nothing
+        // to show, but the drawable still has to be presented or Compositor
+        // Services stalls waiting for it.
+        let stage = max(0, Int(kl_ovrp_last_complete_stage()))
+        var rendered = kl_ovrp_render_pose()
+        var haveRendered = withUnsafeMutablePointer(to: &rendered) {
+            kl_ovrp_stage_render_pose(Int32(stage), $0) != 0
+        }
+        // `complete` is redundant today and will not be: with one stage, the
+        // guest's *next* ovrp_BeginFrame overwrites the record this one is
+        // reading, so the moment the guest stops being driven synchronously
+        // from this thread a record can describe a frame still being drawn.
+        // Reprojecting against a pose whose picture does not exist yet is a
+        // silent wrong answer, so it is checked now rather than after the
+        // change that makes it possible.
+        if haveRendered && rendered.complete == 0 { haveRendered = false }
+
+        // Order this pass after the guest's rendering. The value only advances
+        // when the guest swaps, so an unchanged one also means "no new picture"
+        // — which is not an error, it is the case reprojection is for.
+        let frameValue = kl_glfb_gpu_fence_value()
+        if let ev = guestFrameEvent, frameValue != 0 {
+            cmd.encodeWaitForEvent(ev, value: frameValue)
+        }
+        if frameValue != 0 && frameValue == lastGuestFrame {
+            staleInARow += 1
+        } else {
+            staleInARow = 0
+            lastGuestFrame = frameValue
+        }
+
+        // The pose the picture will be *shown* at, as freshly predicted as we
+        // can make it: re-queried here rather than reused from updatePoses,
+        // because the guest's render has happened in between and the prediction
+        // is that much better for it. This is what the pass reprojects to, and
+        // therefore also what the drawable is told it was rendered with.
+        let presentation = LayerRenderer.Clock.Instant.epoch
+            .duration(to: drawable.frameTiming.presentationTime).timeInterval
+        let displayAnchor = worldTracking.queryDeviceAnchor(atTimestamp: presentation)
+        drawable.deviceAnchor = displayAnchor
+        let originFromDevice = displayAnchor?.originFromAnchorTransform ?? matrix_identity_float4x4
+
+        noteReprojection(rendered: haveRendered ? rendered : nil,
+                         originFromDevice: originFromDevice, stage: stage)
 
         var encoded = 0
         for (i, view) in drawable.views.enumerated() {
             let eye = i                              // view 0 = left, 1 = right
-            eyesLock.lock(); let alloc = eyes[Self.key(eye, 0)]; eyesLock.unlock()
+            eyesLock.lock(); let alloc = eyes[Self.key(eye, stage)]; eyesLock.unlock()
             guard let alloc else { continue }
 
             let pass = MTLRenderPassDescriptor()
@@ -418,12 +506,24 @@ final class KleptonCompositor {
             }
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { continue }
             enc.label = "klepton composite eye \(eye)"
+            // The viewport matters here in a way it did not for a full-screen
+            // triangle: the quad is projected, so it lands where the projection
+            // says, and the view's own bounds within a shared texture are part
+            // of that.
+            enc.setViewport(map.viewport)
             enc.setRenderPipelineState(pipeline)
             enc.setFragmentTexture(alloc.texture, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
-            var slice = UInt32(alloc.slice)
-            enc.setFragmentBytes(&slice, length: MemoryLayout<UInt32>.size, index: 0)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+
+            var u = withUnsafePointer(to: rendered) { r in
+                kl_reproject_build(haveRendered ? r : nil, Int32(eye),
+                                   originFromDevice, view.transform,
+                                   drawable.computeProjection(viewIndex: i),
+                                   UInt32(alloc.slice))
+            }
+            enc.setVertexBytes(&u, length: MemoryLayout<kl_reproject_uniforms>.size, index: 0)
+            enc.setFragmentBytes(&u, length: MemoryLayout<kl_reproject_uniforms>.size, index: 0)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             enc.endEncoding()
             encoded += 1
         }
@@ -431,5 +531,125 @@ final class KleptonCompositor {
         drawable.encodePresent(commandBuffer: cmd)
         cmd.commit()
         return encoded > 0 ? 1 : 0
+    }
+
+    /// Harvest what only a drawable can tell us, *before* the guest exists to
+    /// ask — the per-eye frustum and the display's real frame rate.
+    ///
+    /// **This exists because of an ordering problem, and the solution is
+    /// ALVR's.** Both numbers can only be read from a `cp_drawable`, and a
+    /// drawable only arrives once the frame loop is running — but the guest
+    /// reads both *once*, early, and stores them: Unity latches the frustum
+    /// when its VRDevice initializes and the display frequency straight into
+    /// its VR timing config. Answering correctly one frame later is answering a
+    /// question nobody will ask again.
+    ///
+    /// `ALVRClient/DummyMetalRenderer.swift` solves it by rendering throwaway
+    /// frames purely to harvest `views[].transform` and the tangents, setting
+    /// `haveRenderInfo`, and only then starting the real renderer — ALVR has to
+    /// do it in a whole separate ImmersiveSpace opened first
+    /// (`Entry/EntryControls.swift` opens it, waits for the flag, closes it),
+    /// because its renderer needs the info before its own layer exists. We own
+    /// this loop and the guest has not been driven yet, so the same mechanism
+    /// fits inline: prime here, then `kl_app_lifecycle_begin()`. One fewer
+    /// space, same trick.
+    ///
+    /// Tangents come from the projection matrix rather than `cp_view_tangents`,
+    /// which visionOS 2.0 deprecated — and the matrix is the more honest source
+    /// anyway, since it is what the composite pass projects with.
+    private func primeDisplay() {
+        var stamps: [TimeInterval] = []
+        var tangents: [SIMD4<Float>] = []
+        // Eight frames: enough for a median frame interval that a slow first
+        // frame cannot drag, and under 100 ms of startup.
+        for _ in 0..<8 {
+            guard layerRenderer.state == .running,
+                  let frame = layerRenderer.queryNextFrame() else { break }
+            frame.startUpdate()
+            frame.endUpdate()
+            let timing = frame.predictTiming()
+            if let timing { LayerRenderer.Clock().wait(until: timing.optimalInputTime) }
+            frame.startSubmission()
+            if let drawable = frame.queryDrawable() {
+                stamps.append(LayerRenderer.Clock.Instant.epoch
+                    .duration(to: drawable.frameTiming.presentationTime).timeInterval)
+                if tangents.isEmpty {
+                    tangents = (0..<drawable.views.count).map {
+                        kl_reproject_tangents(drawable.computeProjection(viewIndex: $0))
+                    }
+                }
+                clearAndPresent(drawable)
+            }
+            frame.endSubmission()
+        }
+
+        for (i, t) in tangents.enumerated() where i < 2 {
+            NSLog(String(format: "[cp] eye %d display tangents l=%.4f r=%.4f t=%.4f b=%.4f "
+                                 + "(%.1f x %.1f degrees)", i, t.x, t.y, t.z, t.w,
+                         (atan(t.x) + atan(t.y)) * 180 / .pi,
+                         (atan(t.z) + atan(t.w)) * 180 / .pi))
+            if !keepQuestDisplay { kl_ovrp_set_eye_frustum(Int32(i), t.x, t.y, t.z, t.w) }
+        }
+
+        // The frame interval, as the median of the gaps between successive
+        // presentation times. Median rather than mean because the first frames
+        // of a freshly-started layer are not representative and one of them is
+        // enough to move an average by several Hz.
+        let gaps = zip(stamps.dropFirst(), stamps).map(-).filter { $0 > 0 }.sorted()
+        if let mid = gaps.isEmpty ? nil : gaps[gaps.count / 2], mid > 0 {
+            let hz = Float(1.0 / mid)
+            NSLog(String(format: "[cp] display %.2f Hz measured over %d frames%@",
+                         hz, gaps.count,
+                         keepQuestDisplay ? " (not pushed: KL_OVRP_QUEST_FOV)" : ""))
+            if !keepQuestDisplay { kl_ovrp_set_display_frequency(hz) }
+        } else {
+            NSLog("[cp] could not measure the display rate — the guest keeps "
+                  + "\(kl_ovrp_display_frequency()) Hz")
+        }
+        NSLog(String(format: "[cp] guest will be told %.2f Hz",
+                     kl_ovrp_display_frequency()))
+    }
+
+    /// A drawable with nothing in it. The priming frames are shown to the user,
+    /// so they have to be *something*; an unwritten drawable is whatever was in
+    /// that texture last.
+    private func clearAndPresent(_ drawable: LayerRenderer.Drawable) {
+        guard let cmd = queue.makeCommandBuffer() else { return }
+        for view in drawable.views {
+            let map = view.textureMap
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture     = drawable.colorTextures[map.textureIndex]
+            pass.colorAttachments[0].slice       = map.sliceIndex
+            pass.colorAttachments[0].loadAction  = .clear
+            pass.colorAttachments[0].storeAction = .store
+            pass.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 1)
+            cmd.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+        }
+        drawable.encodePresent(commandBuffer: cmd)
+        cmd.commit()
+    }
+
+    /// The measurement that says whether any of this is doing anything.
+    ///
+    /// `delta` is how far the head turned between the pose the picture was
+    /// rendered with and the pose it is being displayed at — zero means the
+    /// guest is keeping up and the pass is a blit, and a growing value with
+    /// `stale` frames behind it means pictures are being reused, which is
+    /// reprojection earning its place rather than a fault.
+    private func noteReprojection(rendered: kl_ovrp_render_pose?,
+                                  originFromDevice: simd_float4x4, stage: Int) {
+        reprojectFrames += 1
+        var delta: Float = 0
+        if var r = rendered {
+            delta = withUnsafePointer(to: &r) {
+                kl_reproject_delta_degrees($0, originFromDevice)
+            }
+        }
+        worstDelta = max(worstDelta, delta)
+        guard reprojectFrames % 90 == 0 else { return }
+        NSLog(String(format: "[cp] timewarp: stage %d serial %llu, delta %.2f deg "
+                             + "(worst %.2f), %d stale in a row",
+                     stage, rendered?.serial ?? 0, delta, worstDelta, staleInARow))
+        worstDelta = 0
     }
 }

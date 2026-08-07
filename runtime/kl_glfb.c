@@ -2058,9 +2058,90 @@ unsigned long kl_glfb_last_frame_lit(void) { return g_last_frame_lit; }
 static void (*g_real_Flush)(void);
 static void (*g_real_Finish)(void);
 
+// ---- the GPU frame seam (kl_glfb.h) -----------------------------------------
+//
+// EGL_SYNC_METAL_SHARED_EVENT_ANGLE, not eglCreateSyncKHR's EGLint attribute
+// list: the shared event arrives as a 64-bit pointer and an EGLint cannot hold
+// one. eglCreateSync (EGL 1.5) takes EGLAttrib, which can. Getting this wrong
+// truncates the pointer and ANGLE creates its OWN event instead — a sync that
+// works perfectly and orders nothing we can wait on.
+#define EGL_SYNC_METAL_SHARED_EVENT_ANGLE_              0x34D8
+#define EGL_SYNC_METAL_SHARED_EVENT_OBJECT_ANGLE_       0x34D9
+#define EGL_SYNC_METAL_SHARED_EVENT_SIGNAL_VALUE_LO_    0x34DA
+#define EGL_SYNC_METAL_SHARED_EVENT_SIGNAL_VALUE_HI_    0x34DB
+
+static void *(*a_eglCreateSync)(void *, uint32_t, const intptr_t *);
+static unsigned (*a_eglDestroySync)(void *, void *);
+// Resolved from ANGLE directly rather than reusing g_real_Flush: that one is
+// only filled in once the GUEST has resolved glFlush through the trampoline
+// table, and a fence that is created but never committed is worse than no
+// fence at all — the compositor would wait on a value the GPU never reaches.
+static void (*a_glFlush_fence)(void);
+static void     *g_gpu_fence;        // an id<MTLSharedEvent>, owned by the caller
+static void     *g_gpu_fence_sync;   // last frame's EGLSync, destroyed one frame late
+static uint64_t  g_gpu_fence_value;
+
+void kl_glfb_set_gpu_fence(void *mtl_shared_event) {
+    g_gpu_fence = mtl_shared_event;
+}
+int kl_glfb_has_gpu_fence(void) { return g_gpu_fence != NULL; }
+uint64_t kl_glfb_gpu_fence_value(void) {
+    return __atomic_load_n(&g_gpu_fence_value, __ATOMIC_ACQUIRE);
+}
+
+// Runs on the context-owning thread, in place of glfb_capture_now, once per
+// swap. Encodes "the guest's frame is done" into ANGLE's command stream and
+// publishes the value that will carry it.
+static unsigned klfb_gpu_frame_now(void) {
+    if (!g_ready || !g_gpu_fence) return g_presented;
+    if (!a_eglCreateSync) {
+        a_eglCreateSync  = asym("eglCreateSync");
+        a_eglDestroySync = asym("eglDestroySync");
+        a_glFlush_fence  = asym("glFlush");
+        // eglCreateSync, not eglCreateSyncKHR — the KHR form's attribute list is
+        // EGLint, and a 64-bit MTLSharedEvent pointer does not fit in one.
+        if (!a_eglCreateSync || !a_glFlush_fence) {
+            fprintf(stderr, "  [glfb] this ANGLE has no %s — the GPU compositor "
+                            "cannot order against the guest's frame\n",
+                    a_eglCreateSync ? "glFlush" : "eglCreateSync");
+            g_gpu_fence = NULL;
+            return g_presented;
+        }
+    }
+    uint64_t v = g_gpu_fence_value + 1;
+    const intptr_t attrs[] = {
+        EGL_SYNC_METAL_SHARED_EVENT_OBJECT_ANGLE_,    (intptr_t)g_gpu_fence,
+        EGL_SYNC_METAL_SHARED_EVENT_SIGNAL_VALUE_LO_, (intptr_t)(uint32_t)v,
+        EGL_SYNC_METAL_SHARED_EVENT_SIGNAL_VALUE_HI_, (intptr_t)(uint32_t)(v >> 32),
+        EGL_NONE_,
+    };
+    void *sync = a_eglCreateSync(g_dpy, EGL_SYNC_METAL_SHARED_EVENT_ANGLE_, attrs);
+    if (!sync) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] eglCreateSync(METAL_SHARED_EVENT) failed — "
+                            "the compositor will show whatever is in the eye "
+                            "texture, unordered\n");
+        return g_presented;
+    }
+    // Commit, so the signal actually reaches the GPU: eglCreateSync only
+    // *queues* the event onto ANGLE's current command buffer. No wait here —
+    // a glFinish would be the stall this whole path exists to remove.
+    a_glFlush_fence();
+    __atomic_store_n(&g_gpu_fence_value, v, __ATOMIC_RELEASE);
+    // One frame late, so the object outlives the encode it belongs to. Nothing
+    // documents that destroying it immediately is safe, and the failure mode
+    // would be a signal that never arrives — i.e. a compositor that hangs.
+    if (g_gpu_fence_sync && a_eglDestroySync)
+        a_eglDestroySync(g_dpy, g_gpu_fence_sync);
+    g_gpu_fence_sync = sync;
+    return ++g_presented;
+}
+
 static void klfb_service_capture(void) {
     if (!g_capture_pending) return;
     g_capture_pending = 0;
+    if (g_gpu_fence) { klfb_gpu_frame_now(); return; }
     glfb_capture_now(g_capture_dir);
 }
 static void klfb_Flush(void)  { if (g_real_Flush)  g_real_Flush();  klfb_service_capture(); }
@@ -2588,7 +2669,18 @@ static void chunk(FILE *f, const char *t, const uint8_t *d, uint32_t n) {
 // path only: a registered frame sink is a live display, not a batch of files,
 // so it wants every swap and dir may be NULL.
 unsigned kl_glfb_present(const char *dir) {
-    if (!g_ready || (!dir && !g_frame_sink)) return g_presented;
+    if (!g_ready || (!dir && !g_frame_sink && !g_gpu_fence)) return g_presented;
+    // A registered GPU fence replaces the readback entirely — the compositor
+    // samples the eye texture itself and only needs to know when the guest's
+    // frame is done. Same thread rule as the capture below: the sync has to be
+    // created where the context is current, so a swap off the GL thread defers.
+    if (g_gpu_fence) {
+        pthread_once(&g_tls_once, klfb_tls_init);
+        klfb_thread_gl *tg = pthread_getspecific(g_tls_key);
+        if (tg && tg->ctx) return klfb_gpu_frame_now();
+        g_capture_pending = 1;
+        return g_presented;
+    }
     static int every = -1;
     if (every < 0) {
         const char *e = getenv("KL_GLFB_OUT_EVERY");

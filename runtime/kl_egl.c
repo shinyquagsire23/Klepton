@@ -1111,11 +1111,13 @@ static unsigned klegl_SwapBuffers(EGLDisplay dpy, EGLSurface s) {
     (void)dpy; (void)s;
     g_frames++;
     // A swap is where a frame is finished, so it is where the reference renderer
-    // captures. No-op unless KL_GLFB_OUT names a directory — or a frame sink is
-    // registered (KL_VIEW=1), which is the same trigger with a live frontend
-    // instead of PNG files.
+    // captures. No-op unless KL_GLFB_OUT names a directory — or a frontend is
+    // attached: a frame sink (the readback path) or a GPU fence (KL_VIEW=1's
+    // hardware compositor, which wants the *timing* of the swap and none of
+    // its pixels).
     const char *out = getenv("KL_GLFB_OUT");
-    if (kl_glfb_enabled() && (out || kl_glfb_has_frame_sink()))
+    if (kl_glfb_enabled() &&
+        (out || kl_glfb_has_frame_sink() || kl_glfb_has_gpu_fence()))
         kl_glfb_present(out);
     return EGL_TRUE;
 }

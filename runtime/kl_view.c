@@ -8,10 +8,18 @@
 //                calls kl_ovrp_set_head_pose(); the guest reads it back out of
 //                ovrp_GetNodePoseState. On visionOS this same seam is where
 //                ARKit's WorldTrackingProvider attaches.
-//   frame out  — kl_glfb hands each swap's readback to kl_view_frame_sink
-//                (registered by t_boot), which stores it under a mutex; this
-//                loop uploads the newest frame to a streaming texture. On
-//                visionOS the same seam is where Compositor Services attaches.
+//   frame out  — two implementations of one seam, chosen by t_boot:
+//                * hardware (the default). The guest's eye textures ARE
+//                  MTLTextures we allocated, and kl_view_mtl.m composites one
+//                  into the window's CAMetalLayer. Nothing is read back and
+//                  nothing is copied. This is the same pass, and the same
+//                  shader, as KleptonCompositor.swift on visionOS.
+//                * readback (KL_VIEW_CPU=1). kl_glfb glReadPixels the eye and
+//                  hands the buffer to kl_view_frame_sink, which stores it
+//                  under a mutex; this loop row-flips it and uploads it to a
+//                  streaming texture. Kept because it works with no Metal
+//                  interop at all, which makes it the A/B when the hardware
+//                  path shows the wrong picture.
 //
 // Everything in this file is host-only scaffolding, like kl_glfb itself: it
 // exists so a human can look at the frame and walk the pose around while the
@@ -25,11 +33,13 @@
 
 #include "kl_view.h"
 #include "kl_glfb.h"     // kl_glfb_last_frame_lit — the HUD's liveness signal
+#include "kl_view_mtl.h" // the hardware composite path
 #include "kl_ovrp.h"     // kl_ovrp_set_head_pose — the pose-in seam
 
 #if __has_include(<SDL3/SDL.h>)
 #define KL_VIEW_HAVE_SDL 1
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_metal.h>
 #endif
 
 // ---- axis and control conventions -------------------------------------------
@@ -88,25 +98,117 @@ int kl_view_available(void) {
 
 #ifdef KL_VIEW_HAVE_SDL
 
-int kl_view_main(const char *libdir) {
+// ---- the readback path's display (KL_VIEW_CPU=1) ----------------------------
+// Everything in here is what the hardware path does not do: a row flip of the
+// whole eye, an upload of the whole eye, and upstream of both a glReadPixels
+// that stalled the guest's GL thread to produce the buffer. Kept as the A/B —
+// it needs no Metal interop, so a picture that is right here and wrong through
+// the compositor localises the bug to the compositor.
+typedef struct {
+    SDL_Texture *tex;              // created on the first frame, size unknown till then
+    int          tex_w, tex_h;
+    uint8_t     *flip;             // top-down staging for SDL_UpdateTexture
+    size_t       flip_cap;
+} view_cpu_disp;
+
+static void view_show_cpu_frame(view_cpu_disp *d, SDL_Renderer *ren, SDL_Window *win) {
+    // Newest frame, if the sink stored one since last time: flip GL's
+    // bottom-up rows into top-down and upload. SDL_PIXELFORMAT_RGBA32 is
+    // the byte-order alias whose memory layout is R,G,B,A — exactly what
+    // the glReadPixels(GL_RGBA) in kl_glfb produced.
+    pthread_mutex_lock(&g_frame_mu);
+    int have = g_frame_new, w = g_frame_w, h = g_frame_h;
+    if (have) {
+        size_t n = (size_t)w * (size_t)h * 4;
+        if (n > d->flip_cap) {
+            uint8_t *nb = realloc(d->flip, n);
+            if (nb) { d->flip = nb; d->flip_cap = n; }
+        }
+        if (d->flip) {
+            size_t stride = (size_t)w * 4;
+            for (int y = 0; y < h; y++)
+                memcpy(d->flip + stride * (size_t)y,
+                       g_frame_buf + stride * (size_t)(h - 1 - y), stride);
+        } else {
+            have = 0;
+        }
+        g_frame_new = 0;
+    }
+    pthread_mutex_unlock(&g_frame_mu);
+
+    if (have) {
+        if (!d->tex || w != d->tex_w || h != d->tex_h) {
+            if (d->tex) SDL_DestroyTexture(d->tex);
+            d->tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32,
+                                       SDL_TEXTUREACCESS_STREAMING, w, h);
+            d->tex_w = w;
+            d->tex_h = h;
+        }
+        if (d->tex) SDL_UpdateTexture(d->tex, NULL, d->flip, w * 4);
+    }
+
+    if (d->tex) {
+        // Letterbox: the eye is 1832x1920-ish, the window is not.
+        int ww, wh;
+        SDL_GetWindowSize(win, &ww, &wh);
+        float scale = fminf((float)ww / d->tex_w, (float)wh / d->tex_h);
+        SDL_FRect dst = {
+            (ww - d->tex_w * scale) * 0.5f, (wh - d->tex_h * scale) * 0.5f,
+            d->tex_w * scale, d->tex_h * scale,
+        };
+        SDL_RenderClear(ren);
+        SDL_RenderTexture(ren, d->tex, NULL, &dst);
+        SDL_RenderPresent(ren);
+    }
+}
+
+static void view_cpu_disp_free(view_cpu_disp *d) {
+    free(d->flip);
+    if (d->tex) SDL_DestroyTexture(d->tex);
+    d->flip = NULL;
+    d->tex = NULL;
+}
+
+int kl_view_main(const char *libdir, int hw) {
     (void)libdir;   // the title names the frontend, not the target
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "view: SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_Window *win = SDL_CreateWindow("Klepton",
-                                       KL_VIEW_WIN_W, KL_VIEW_WIN_H, 0);
+    SDL_Window *win = SDL_CreateWindow("Klepton", KL_VIEW_WIN_W, KL_VIEW_WIN_H,
+                                       hw ? SDL_WINDOW_METAL : 0);
     if (!win) {
         fprintf(stderr, "view: SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
         return 1;
     }
-    SDL_Renderer *ren = SDL_CreateRenderer(win, NULL);
-    if (!ren) {
-        fprintf(stderr, "view: SDL_CreateRenderer failed: %s\n", SDL_GetError());
-        SDL_DestroyWindow(win);
-        SDL_Quit();
-        return 1;
+
+    // The two frame paths are mutually exclusive at the window level: the
+    // hardware one owns the window's CAMetalLayer directly, so there is no
+    // SDL_Renderer to create — an SDL_Renderer would want the same layer.
+    SDL_Renderer *ren = NULL;
+    SDL_MetalView mview = NULL;
+    void *mlayer = NULL;
+    if (hw) {
+        mview = SDL_Metal_CreateView(win);
+        mlayer = mview ? SDL_Metal_GetLayer(mview) : NULL;
+        if (!mlayer) {
+            fprintf(stderr, "view: SDL_Metal_CreateView failed (%s) — falling "
+                            "back to the readback path\n", SDL_GetError());
+            if (mview) SDL_Metal_DestroyView(mview);
+            mview = NULL;
+            kl_glfb_set_frame_sink(kl_view_frame_sink, NULL);
+            hw = 0;
+        }
+    }
+    if (!hw) {
+        ren = SDL_CreateRenderer(win, NULL);
+        if (!ren) {
+            fprintf(stderr, "view: SDL_CreateRenderer failed: %s\n", SDL_GetError());
+            SDL_DestroyWindow(win);
+            SDL_Quit();
+            return 1;
+        }
     }
 
     // Head state. Position starts at standing eye height; yaw/pitch start at
@@ -116,14 +218,12 @@ int kl_view_main(const char *libdir) {
     int mouselook = 0;
     int mouse_l = 0, mouse_r = 0;   // right-hand trigger / grip
 
-    SDL_Texture *tex = NULL;       // created on the first frame, size unknown till then
-    int tex_w = 0, tex_h = 0;
-    uint8_t *flip = NULL;          // top-down staging for SDL_UpdateTexture
-    size_t flip_cap = 0;
+    view_cpu_disp disp = {0};      // the readback path's staging; unused when hw
+    int hw_up = 0, hw_warned = 0;  // the compositor starts lazily — see the loop
 
     int done = 0;
     uint64_t t_prev = SDL_GetTicks();
-    uint64_t hud_last = t_prev;
+    uint64_t t_start = t_prev, hud_last = t_prev;
     while (!done) {
         uint64_t t_now = SDL_GetTicks();
         float dt = (float)(t_now - t_prev) / 1000.0f;
@@ -264,66 +364,63 @@ int kl_view_main(const char *libdir) {
             kl_ovrp_set_controller_input(0, lb, lb, lidx, lgrip, 0.0f, 0.0f);
         }
 
-        // Newest frame, if the sink stored one since last time: flip GL's
-        // bottom-up rows into top-down and upload. SDL_PIXELFORMAT_RGBA32 is
-        // the byte-order alias whose memory layout is R,G,B,A — exactly what
-        // the glReadPixels(GL_RGBA) in kl_glfb produced.
-        pthread_mutex_lock(&g_frame_mu);
-        int have = g_frame_new, w = g_frame_w, h = g_frame_h;
-        if (have) {
-            size_t n = (size_t)w * (size_t)h * 4;
-            if (n > flip_cap) {
-                uint8_t *nb = realloc(flip, n);
-                if (nb) { flip = nb; flip_cap = n; }
+        // ---- frame out.
+        //
+        // Hardware: one Metal pass, no pixels on this side at all.
+        // kl_viewmtl_start is retried until it takes, because there is nothing
+        // to composite until the guest has taken its eye textures — that
+        // happens inside nativeRecreateGfxState, seconds into the run.
+        if (hw) {
+            if (!hw_up) {
+                hw_up = kl_viewmtl_start(mlayer);
+                if (!hw_up && !hw_warned && t_now - t_start > 15000) {
+                    hw_warned = 1;
+                    fprintf(stderr, "view: 15 s in and the guest has not asked "
+                                    "for eye textures — nothing to composite "
+                                    "yet. KL_VIEW_CPU=1 forces the readback "
+                                    "path.\n");
+                }
             }
-            if (flip) {
-                size_t stride = (size_t)w * 4;
-                for (int y = 0; y < h; y++)
-                    memcpy(flip + stride * (size_t)y,
-                           g_frame_buf + stride * (size_t)(h - 1 - y), stride);
-            } else {
-                have = 0;
+            if (hw_up) {
+                // Pixels, not points: a Retina window's drawable is 2x its
+                // logical size, and a drawableSize in points renders the eye
+                // into a quarter of the window and then upscales it.
+                int pw = 0, ph = 0;
+                SDL_GetWindowSizeInPixels(win, &pw, &ph);
+                kl_viewmtl_present(pw, ph);
             }
-            g_frame_new = 0;
-        }
-        pthread_mutex_unlock(&g_frame_mu);
-
-        if (have) {
-            if (!tex || w != tex_w || h != tex_h) {
-                if (tex) SDL_DestroyTexture(tex);
-                tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32,
-                                        SDL_TEXTUREACCESS_STREAMING, w, h);
-                tex_w = w;
-                tex_h = h;
-            }
-            if (tex) SDL_UpdateTexture(tex, NULL, flip, w * 4);
-        }
-
-        if (tex) {
-            // Letterbox: the eye is 1832x1920-ish, the window is not.
-            int ww, wh;
-            SDL_GetWindowSize(win, &ww, &wh);
-            float scale = fminf((float)ww / tex_w, (float)wh / tex_h);
-            SDL_FRect dst = {
-                (ww - tex_w * scale) * 0.5f, (wh - tex_h * scale) * 0.5f,
-                tex_w * scale, tex_h * scale,
-            };
-            SDL_RenderClear(ren);
-            SDL_RenderTexture(ren, tex, NULL, &dst);
-            SDL_RenderPresent(ren);
+        } else {
+            view_show_cpu_frame(&disp, ren, win);
         }
 
         // The HUD is one stderr line a second, not text rendering: a blank
         // frame with a moving pose and a nonzero lit count is still a live
         // pipeline, and that distinction is the whole point of the line.
+        //
+        // `frame` is the GUEST's frame count in both paths — swaps — because
+        // that is the number worth watching and the number the two paths can
+        // be compared on. The hardware path adds `shown`, which is display-
+        // paced and will lag it: the guest is free to run faster than 60 Hz
+        // now that nothing stalls it, and the compositor simply skips the
+        // frames the display cannot show. On the readback path the two are the
+        // same number by construction, since every swap IS a readback.
+        //
+        // `lit` on the hardware path is estimated from the 64x64 downsample
+        // the compositor renders alongside the drawable — nothing is read back
+        // for kl_glfb to count exactly.
         if (t_now - hud_last >= 1000) {
             hud_last = t_now;
+            char frames[64];
+            if (hw) snprintf(frames, sizeof frames, "frame %llu, shown %u",
+                             (unsigned long long)kl_glfb_gpu_fence_value(),
+                             kl_viewmtl_frames());
+            else    snprintf(frames, sizeof frames, "frame %u", g_frame_seq);
             fprintf(stderr,
-                    "view: frame %u, pose (%.2f, %.2f, %.2f) yaw=%.1f pitch=%.1f, lit=%lu\n",
-                    g_frame_seq, px, py, pz,
+                    "view: %s, pose (%.2f, %.2f, %.2f) yaw=%.1f pitch=%.1f, lit=%lu\n",
+                    frames, px, py, pz,
                     (double)(yaw * 180.0f / (float)M_PI),
                     (double)(pitch * 180.0f / (float)M_PI),
-                    kl_glfb_last_frame_lit());
+                    hw ? kl_viewmtl_lit() : kl_glfb_last_frame_lit());
         }
 
         // ~60 Hz: pace on the remainder rather than a blind SDL_Delay(16),
@@ -332,19 +429,21 @@ int kl_view_main(const char *libdir) {
         if (elapsed < 16) SDL_Delay((uint32_t)(16 - elapsed));
     }
 
-    free(flip);
-    if (tex) SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(ren);
+    unsigned shown = hw ? kl_viewmtl_frames() : g_frame_seq;
+    kl_viewmtl_stop();          // unregisters the fence before the event goes
+    view_cpu_disp_free(&disp);
+    if (mview) SDL_Metal_DestroyView(mview);
+    if (ren) SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
-    fprintf(stderr, "view: window closed, %u frames displayed\n", g_frame_seq);
+    fprintf(stderr, "view: window closed, %u frames displayed\n", shown);
     return 0;
 }
 
 #else  // !KL_VIEW_HAVE_SDL
 
-int kl_view_main(const char *libdir) {
-    (void)libdir;
+int kl_view_main(const char *libdir, int hw) {
+    (void)libdir; (void)hw;
     fprintf(stderr, "view: KL_VIEW=1 but this binary was built without SDL3 "
                     "(pkg-config sdl3 not present at build time)\n");
     return 1;

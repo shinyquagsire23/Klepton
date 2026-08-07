@@ -18,7 +18,7 @@ RUNTIME_SHIP := runtime/kl_image.c runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_libc.c runtime/kl_pthread.c runtime/kl_dl.c \
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_ovrp.c \
-           runtime/kl_ovrp_sret.S \
+           runtime/kl_ovrp_sret.S runtime/kl_reproject.c \
            runtime/kl_ovrplat.c runtime/kl_mediandk.c runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_il2cpp.c runtime/kl_fault.c
 RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c
@@ -61,11 +61,14 @@ vatest: build/t_variadic
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
 build/t_boot: tests/t_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
-              runtime/klepton.h runtime/kl_jni.h tests/t_mtl_provider.h
+              runtime/kl_view_mtl.m runtime/klepton.h runtime/kl_jni.h \
+              runtime/kl_view.h runtime/kl_view_mtl.h tests/t_mtl_provider.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
 	  tests/t_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
-	  $(LDLIBS) -framework Metal -framework Foundation $(shell pkg-config --libs sdl3)
+	  runtime/kl_view_mtl.m \
+	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
+	  $(shell pkg-config --libs sdl3)
 
 boot: build/t_boot
 	./build/t_boot $(LIBS)
@@ -366,6 +369,19 @@ build/s11_mtltex: spikes/s11_mtltex.m
 .PHONY: mtltex
 mtltex: build/s11_mtltex
 	@./build/s11_mtltex
+
+# Timewarp — the composite/reprojection pass, checked without a headset: the
+# matrices, and that the shared shader actually compiles. Separate from `make
+# check` on purpose; it needs Metal's compiler service and the gate should not
+# take a dependency on that. See tests/t_reproject.m.
+build/t_reproject: tests/t_reproject.m runtime/kl_reproject.c runtime/kl_reproject.h \
+                   runtime/kl_ovrp.h
+	$(CC) $(CFLAGS) -fobjc-arc -Iruntime -o $@ $< runtime/kl_reproject.c \
+	  -framework Metal -framework Foundation
+
+.PHONY: reproject
+reproject: build/t_reproject
+	@./build/t_reproject
 
 # A *vendored debug build* of ANGLE lives in vendor/ (gitignored) — the Metal
 # backend can be stepped into, which is what the AGX-abort investigation needs

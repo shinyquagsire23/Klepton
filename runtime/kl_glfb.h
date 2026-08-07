@@ -45,6 +45,30 @@ int  kl_glfb_has_frame_sink(void);
 // from a dead pipeline.
 unsigned long kl_glfb_last_frame_lit(void);
 
+// ---------------------------------------------------------------------------
+// The frame-out seam, GPU edition — what a hardware compositor needs instead of
+// the sink above. The sink hands over *pixels*, which costs a glReadPixels of
+// the whole eye (a full pipeline stall plus ~40 MB at 2198x2304 RGBA16F) and a
+// tone map and two memcpys before anything is displayed. A compositor that
+// samples the eye's MTLTexture directly needs none of that; what it needs is
+// *ordering*, because the guest's rendering is in ANGLE's Metal command queue
+// and the composite is in ours, and Metal does not order across queues.
+//
+// So: register an id<MTLSharedEvent>, and each swap encodes a signal of it into
+// ANGLE's command stream after the guest's frame (EGL_ANGLE_metal_shared_event
+// _sync) and flushes. The compositor reads the value below and does
+// encodeWaitForEvent: before its pass. Nothing is read back, nothing is copied.
+//
+// Registering a fence takes priority over the CPU sink: they are two answers to
+// the same question and the swap does one or the other, never both.
+void kl_glfb_set_gpu_fence(void *mtl_shared_event);
+int  kl_glfb_has_gpu_fence(void);
+
+// The value the most recent swap's signal will reach, or 0 before the first.
+// Read from the compositor thread; monotonically increasing, so an unchanged
+// value means "no new guest frame since you last looked".
+uint64_t kl_glfb_gpu_fence_value(void);
+
 // Print the internalformats the guest allocated immutable texture storage with.
 // KL_GLFB_SKIP bisected the AGX abort to glTexStorage* + glTexSubImage*, which
 // makes this the population that matters. Safe to call when nothing was allocated.
