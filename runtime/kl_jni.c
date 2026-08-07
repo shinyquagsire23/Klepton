@@ -2576,15 +2576,102 @@ static klj_val klj_PowerManager_sustainedPerf(void *env, void *self, const klj_v
     return (klj_val){.j = 0};
 }
 
+// The two Touch controllers, as Android input device ids. See
+// klj_InputDevice_getDeviceIds for why the enumeration is load-bearing.
+#define KLJ_INPUT_DEV_LTOUCH 8
+#define KLJ_INPUT_DEV_RTOUCH 9
+
 static klj_val klj_InputDevice_getDeviceIds(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    // Empty: no controllers are attached, which is the truth until M7 binds
-    // GameController. An invented id would have Unity poll a device that cannot
-    // answer.
-    static void *empty;
-    if (!empty) empty = klj_new_array('I', NULL, 0);
-    KLJ_LOG("InputDevice.getDeviceIds() -> [] (no input devices until M7)");
-    return (klj_val){.l = empty};
+    // The two Touch controllers. This is not cosmetic: Unity's Android player
+    // builds its *joystick list* from this enumeration, and Input.GetAxis with
+    // "Get Motion from all Joysticks" reads nothing when the list is empty. An
+    // empty answer here is why Beat Saber's TriggerLeftHand/TriggerRightHand
+    // axes (InputManager joystick axes 8 and 9) stayed at zero even though
+    // libunity was faithfully filling the axis values from our
+    // ovrp_GetControllerState — the values had no device to land on, so the
+    // menu pointer never activated and no click ever occurred.
+    //
+    // On a Quest the Touch controllers really are Android input devices, so
+    // reporting them is the truthful answer, not an invented one. Ids are
+    // arbitrary but must be stable: Unity keys its joystick slots on them.
+    static void *ids;
+    if (!ids) {
+        ids = klj_new_array('I', NULL, 2);
+        int32_t *v = klj_arr(ids)->data;
+        v[0] = KLJ_INPUT_DEV_LTOUCH;
+        v[1] = KLJ_INPUT_DEV_RTOUCH;
+    }
+    KLJ_LOG("InputDevice.getDeviceIds() -> [%d, %d] (the two Touch controllers)",
+            KLJ_INPUT_DEV_LTOUCH, KLJ_INPUT_DEV_RTOUCH);
+    return (klj_val){.l = ids};
+}
+
+// An InputDevice instance. One per controller, allocated once and reused: the
+// object identity is what Unity keys its joystick slot on, and a fresh object
+// per getDevice() would look like a hot-plug every frame.
+//
+// The values describe a Quest Touch controller, which is what the guest is
+// told it is holding everywhere else (Build.MODEL, ovrp_GetSystemProductName).
+// SOURCE_GAMEPAD|SOURCE_JOYSTICK is what makes Unity treat it as a joystick at
+// all — a device with neither source is enumerated and then ignored.
+#define KLJ_SOURCE_GAMEPAD   0x00000401
+#define KLJ_SOURCE_JOYSTICK  0x01000010
+
+typedef struct {
+    int         id;
+    const char *name;
+    const char *descriptor;
+} klj_inputdev;
+
+static klj_inputdev g_input_devs[] = {
+    { KLJ_INPUT_DEV_LTOUCH, "Oculus Touch Controller - Left",  "klepton-touch-l" },
+    { KLJ_INPUT_DEV_RTOUCH, "Oculus Touch Controller - Right", "klepton-touch-r" },
+};
+
+static klj_inputdev *klj_inputdev_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o ? o->data : NULL;
+}
+
+static klj_val klj_InputDevice_getDevice(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int id = (n > 0) ? (int)(int32_t)a[0].j : -1;
+    static void *cache[sizeof g_input_devs / sizeof g_input_devs[0]];
+    for (unsigned i = 0; i < sizeof g_input_devs / sizeof g_input_devs[0]; i++) {
+        if (g_input_devs[i].id != id) continue;
+        if (!cache[i]) {
+            cache[i] = klj_new_object_data("android/view/InputDevice", &g_input_devs[i]);
+            klj_as_object(cache[i])->pinned = 1;   // survives frame pops
+        }
+        KLJ_LOG("InputDevice.getDevice(%d) -> %s", id, g_input_devs[i].name);
+        return (klj_val){.l = cache[i]};
+    }
+    KLJ_LOG("InputDevice.getDevice(%d) -> null (unknown id)", id);
+    return (klj_val){.l = NULL};
+}
+
+static klj_val klj_InputDevice_getName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_inputdev *d = klj_inputdev_of(self);
+    return (klj_val){.l = kl_jni_new_string(d ? d->name : "")};
+}
+
+static klj_val klj_InputDevice_getId(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_inputdev *d = klj_inputdev_of(self);
+    return (klj_val){.j = (uint64_t)(d ? d->id : -1)};
+}
+
+static klj_val klj_InputDevice_getSources(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = KLJ_SOURCE_GAMEPAD | KLJ_SOURCE_JOYSTICK};
+}
+
+static klj_val klj_InputDevice_getDescriptor(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_inputdev *d = klj_inputdev_of(self);
+    return (klj_val){.l = kl_jni_new_string(d ? d->descriptor : "")};
 }
 
 static klj_val klj_InputManager_registerListener(void *env, void *self, const klj_val *a, int n) {
@@ -3957,6 +4044,11 @@ static const klj_binding g_bindings[] = {
     {"android/view/Window", "setFlags", "(II)V", klj_Window_setFlags},
     {"android/os/PowerManager", "isSustainedPerformanceModeSupported", "()Z", klj_PowerManager_sustainedPerf},
     {"android/view/InputDevice", "getDeviceIds", "()[I", klj_InputDevice_getDeviceIds},
+    {"android/view/InputDevice", "getDevice", "(I)Landroid/view/InputDevice;", klj_InputDevice_getDevice},
+    {"android/view/InputDevice", "getName", "()Ljava/lang/String;", klj_InputDevice_getName},
+    {"android/view/InputDevice", "getId", "()I", klj_InputDevice_getId},
+    {"android/view/InputDevice", "getSources", "()I", klj_InputDevice_getSources},
+    {"android/view/InputDevice", "getDescriptor", "()Ljava/lang/String;", klj_InputDevice_getDescriptor},
     {"android/hardware/input/InputManager", "registerInputDeviceListener",
      "(Landroid/hardware/input/InputManager$InputDeviceListener;Landroid/os/Handler;)V",
      klj_InputManager_registerListener},

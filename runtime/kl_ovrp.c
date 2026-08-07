@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <pthread.h>
 #include "klepton.h"
 #include "kl_ovrp.h"
@@ -19,6 +20,12 @@ static unsigned g_novrp;
 // render); without this, two concurrent inserts can split a slot and leave a
 // NULL name for a later strcmp — observed as SIGSEGV inside ovrp_hit.
 static pthread_mutex_t g_ovrp_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// name -> the pointer we handed the guest, so a guest function table can be
+// read back by name (see klovrp_dump_vrdevice).
+static struct { const char *name; void *ptr; } g_sym[KL_OVRP_MAX];
+static unsigned g_nsym;
+static void *kl_ovrp_sym_inner(const char *name);
 
 static int ovrp_slot(const char *name) {
     pthread_mutex_lock(&g_ovrp_mu);
@@ -88,18 +95,27 @@ static void ovrp_hit(const char *name) {
 // is called with (node id, controller mask), once each, with the caller's
 // image — names whose node/mask values the guest actually uses, and whether
 // the poller is libunity or the game itself.
+// The caller is part of the key, not just the argument: libunity's node loop
+// polls every node every frame, so keying on (name, arg) alone suppresses the
+// *game's* first call for a node libunity already asked about — which is
+// exactly the call worth seeing (it tells apart "OVRInput reads hand poses"
+// from "only the engine does"). Keyed on (name, arg) this read as "libil2cpp
+// never asks for node 3", which was an artefact of the instrument.
 static void ovrp_log_arg(const char *name, int arg, void *ra) {
-    static struct { const char *name; int arg; } seen[64];
+    static struct { const char *name; int arg; void *ra; } seen[128];
     static int nseen; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&mu);
     for (int i = 0; i < nseen; i++)
-        if (seen[i].name == name && seen[i].arg == arg) { pthread_mutex_unlock(&mu); return; }
-    if (nseen < 64) {
+        if (seen[i].name == name && seen[i].arg == arg && seen[i].ra == ra) {
+            pthread_mutex_unlock(&mu); return;
+        }
+    if (nseen < 128) {
         size_t off = 0;
         const char *img = kl_addr_image(ra, &off);
         fprintf(stderr, "  [ovrp] %s(arg=%d/0x%x) — first seen, called from %s+0x%zx\n",
                 name, arg, arg, img ? img : "?", off);
-        seen[nseen].name = name; seen[nseen].arg = arg; nseen++;
+        seen[nseen].name = name; seen[nseen].arg = arg;
+        seen[nseen].ra = ra; nseen++;
     }
     pthread_mutex_unlock(&mu);
 }
@@ -218,6 +234,26 @@ static uint64_t klovrp_GetNodeFrustum2(int node, void *out) {
     return OVRP_SUCCESS;
 }
 
+// ovrpTrackingOrigin: EyeLevel=0, FloorLevel=1, Stage=2. This decides what
+// space every pose we report is *in*, so it cannot stay a discarded argument
+// on the generic yes-stub: under FloorLevel/Stage the guest expects the head
+// to sit at standing eye height above y=0, and an identity (y=0) head puts the
+// camera on the floor — the menu then renders above the view and the hands are
+// below the floor, out of frustum. Recorded here and read by the pose defaults.
+static int g_tracking_origin;          // 0 = eye level, until the guest says otherwise
+int kl_ovrp_tracking_origin(void) { return g_tracking_origin; }
+static uint64_t klovrp_SetTrackingOriginType(int origin) {
+    ovrp_hit("ovrp_SetTrackingOriginType");
+    ovrp_log_arg("ovrp_SetTrackingOriginType", origin, __builtin_return_address(0));
+    g_tracking_origin = origin;
+    return OVRP_TRUE;
+}
+static uint64_t klovrp_GetTrackingOriginType(int *out) {
+    ovrp_hit("ovrp_GetTrackingOriginType");
+    if (out) *out = g_tracking_origin;
+    return OVRP_TRUE;
+}
+
 // The per-frame node loop's tracked/valid probes (0x9bbe78..0x9bbeb4): u32
 // out-param, which is why these cannot be shared handlers. Tracked and valid
 // is the honest answer for the head we pose ourselves.
@@ -247,12 +283,52 @@ typedef struct { float px, py, pz, qx, qy, qz, qw; } klovrp_pose;
 static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1,
 };
+static int g_head_set;              // has a frontend ever written a head pose?
+
+// Standing eye height, and why the default head cannot be the origin.
+// The guest sets ovrp_SetTrackingOriginType(FloorLevel) — measured, see that
+// function — so y=0 is the *floor*, not the eye. An identity head under
+// FloorLevel is a camera lying on the ground: Beat Saber's menu is authored at
+// eye height, so it renders above the view, and anything parked near y=0 (the
+// hands) is a metre and a half below the frustum. Under EyeLevel the eye *is*
+// the origin, so the offset is zero and nothing moves.
+static float klovrp_eye_height(void) {
+    static int init;
+    static float h = 1.6f;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("KL_OVRP_EYE_HEIGHT");
+        if (e) h = strtof(e, NULL);
+    }
+    return g_tracking_origin == 0 ? 0.0f : h;
+}
+
+// The head pose as reported: the frontend's, or a synthesized one standing at
+// eye height when no frontend has spoken.
+static klovrp_pose klovrp_head(void) {
+    klovrp_pose h = g_head_pose;
+    if (!g_head_set) h.py = klovrp_eye_height();
+    return h;
+}
+
+// v' = q ⊗ v ⊗ q⁻¹ for a unit quaternion, expanded — used to carry a
+// head-relative offset into tracking space.
+static void klovrp_qrot(const klovrp_pose *q, float vx, float vy, float vz,
+                        float *ox, float *oy, float *oz) {
+    float tx = 2.0f * (q->qy * vz - q->qz * vy);
+    float ty = 2.0f * (q->qz * vx - q->qx * vz);
+    float tz = 2.0f * (q->qx * vy - q->qy * vx);
+    *ox = vx + q->qw * tx + (q->qy * tz - q->qz * ty);
+    *oy = vy + q->qw * ty + (q->qz * tx - q->qx * tz);
+    *oz = vz + q->qw * tz + (q->qx * ty - q->qy * tx);
+}
 
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     g_head_pose.px = px; g_head_pose.py = py; g_head_pose.pz = pz;
     g_head_pose.qx = qx; g_head_pose.qy = qy;
     g_head_pose.qz = qz; g_head_pose.qw = qw;
+    g_head_set = 1;
 }
 
 // --- M7: the two hands ------------------------------------------------------
@@ -262,13 +338,13 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
 //              TrackerZero=5..TrackerThree=8 Head=9
 //   Controller: LTouch=1 RTouch=2 Touch=3 Remote=4 Gamepad=0x10
 //               LHand=0x20 RHand=0x40 Hands=0x60 Active=0x80000000
-// Default hand poses sit slightly below/in front of an origin head in
-// tracking space, so controllers render somewhere sensible before any
-// frontend starts driving them.
-static klovrp_pose g_hand_pose[2] = {
-    { -0.20f, -0.30f, -0.35f, 0, 0, 0, 1 },   // 0 = left  (node 3)
-    {  0.20f, -0.30f, -0.35f, 0, 0, 0, 1 },   // 1 = right (node 4)
-};
+// Default hand poses ride a head-relative offset (resolved in
+// klovrp_GetNodePoseState), so controllers render somewhere sensible before any
+// frontend starts driving them — and stay in the frustum wherever the head is.
+// These were absolute tracking-space coordinates until the FloorLevel origin
+// was measured, which put them below the floor and out of view.
+static klovrp_pose g_hand_pose[2];
+static int g_hand_set[2];
 
 // Buttons/touches are ovrpButton/ovrpTouch bit values straight from the
 // metadata (Button: One=1 Two=2 Start=0x100 PrimaryIndexTrigger=0x2000
@@ -285,6 +361,7 @@ void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
     g_hand_pose[hand].px = px; g_hand_pose[hand].py = py; g_hand_pose[hand].pz = pz;
     g_hand_pose[hand].qx = qx; g_hand_pose[hand].qy = qy;
     g_hand_pose[hand].qz = qz; g_hand_pose[hand].qw = qw;
+    g_hand_set[hand] = 1;
 }
 
 void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
@@ -298,6 +375,87 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
     g_input[hand].hand_trigger = hand_trigger;
     g_input[hand].stick_x = stick_x;
     g_input[hand].stick_y = stick_y;
+}
+
+// KL_OVRP_HANDS_SWEEP=1: collapse both hands onto the head and sweep their
+// pitch from -70 to +70 degrees in 5-degree steps, holding each step long
+// enough for the KL_OVRP_FAKE_TRIGGER duty cycle to complete two presses.
+//
+// It exists because the ray a controller casts is NOT the pose we report:
+// Beat Saber's IVRPlatformHelper.AdjustControllerTransform rotates the
+// controller transform by a device-specific offset (a Touch controller does
+// not point along its tracked forward axis), and that offset is game data we
+// cannot read. A sweep does not need to know it — if any pitch produces a UI
+// hit, the offset is the only unknown left; if none does over 140 degrees, the
+// ray is not the problem and the controller never reaches the raycaster.
+// Pair it with KL_OVRP_FAKE_TRIGGER=1 and watch for the menu advancing.
+// KL_OVRP_DUMP_VRDEVICE=1: dump libunity's own Oculus VRDevice object once.
+// The pointer lives at a fixed vaddr in this build (libunity+0x127a6c0 — the
+// `ldr x8, [x?, #1728]` every VRDevice method starts with), and its first three
+// words are the unique device ids libunity stamps into both the joystick
+// descriptors (0x9bd3fc/0x9bd60c) and the XR node states (0x9bbf60..0x9bbf98):
+// [+0] left controller, [+4] right controller, [+8] HMD. Zero ids mean Unity
+// never allocated the controller devices, which is the difference between "the
+// game ignores our controllers" and "there are no controllers to ignore".
+// Read-only, and only when asked for — this is a build-specific address.
+static void klovrp_dump_vrdevice(void) {
+    static int done;
+    if (done) return;
+    if (!getenv("KL_OVRP_DUMP_VRDEVICE")) { done = 1; return; }
+    kl_image *img = kl_find_image("libunity.so");
+    if (!img) { fprintf(stderr, "  [ovrp] VRDevice: no libunity image\n"); done = 1; return; }
+    unsigned char *base = kl_base(img);
+    if (!base || kl_span(img) < 0x127a6c8) {
+        fprintf(stderr, "  [ovrp] VRDevice: base=%p span=0x%zx\n", (void *)base, kl_span(img));
+        done = 1; return;
+    }
+    void *obj = *(void **)(base + 0x127a000 + 1728);
+    if (!obj) return;                    // not built yet — try again next frame
+    done = 1;
+    const uint32_t *w = obj;
+    fprintf(stderr, "  [ovrp] VRDevice %p: idLeft=%u idRight=%u idHmd=%u\n",
+            obj, w[0], w[1], w[2]);
+    // Name every function-pointer slot by matching it against what we handed
+    // back from kl_ovrp_sym. This is the VRDevice's whole contract with the
+    // plugin in one place: which entry point sits behind each `ldr x8, [x?,
+    // #N] / blr x8` in the disassembly, so a status predicate we answer wrong
+    // can be found by name instead of by chasing offsets.
+    void *const *slot = (void *const *)obj;
+    for (size_t off = 0; off + 8 <= 768; off += 8) {
+        void *fn = slot[off / 8];
+        if (!fn) continue;
+        for (unsigned i = 0; i < g_nsym; i++)
+            if (g_sym[i].ptr == fn) {
+                fprintf(stderr, "  [ovrp]   +%-4zu %s\n", off, g_sym[i].name);
+                break;
+            }
+    }
+}
+
+static void klovrp_hand_sweep(const klovrp_pose *head, klovrp_pose *hand) {
+    static int on = -1;
+    if (on < 0) on = getenv("KL_OVRP_HANDS_SWEEP") != NULL;
+    if (!on) return;
+    static unsigned polls;
+    // ~2 hand-pose polls a frame from libunity's node loop, so 512 polls is
+    // ~256 frames a step — two full presses of the trigger's 64-frame period.
+    // 29 steps is ~7400 frames, so a long run sweeps more than once and at
+    // least one full sweep happens after the menu is up.
+    unsigned step = (polls++ / 512u) % 29u;
+    float deg = -70.0f + 5.0f * (float)step;
+    static unsigned last_step = ~0u;
+    if (step != last_step) {
+        last_step = step;
+        fprintf(stderr, "  [ovrp] hand sweep: pitch %+.0f deg\n", (double)deg);
+    }
+    float half = deg * 0.5f * 3.14159265f / 180.0f;
+    float sx = sinf(half), cw = cosf(half);
+    // q = q_head ⊗ q_pitch, with q_pitch a rotation about the head's local X.
+    hand->qx = head->qw * sx + head->qx * cw;
+    hand->qy = head->qy * cw + head->qz * sx;
+    hand->qz = head->qz * cw - head->qy * sx;
+    hand->qw = head->qw * cw - head->qx * sx;
+    hand->px = head->px; hand->py = head->py; hand->pz = head->pz;
 }
 
 // out-struct via the sret register x8, NOT x2: the real function returns the
@@ -314,23 +472,40 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     ovrp_hit("ovrp_GetNodePoseState");
     ovrp_log_arg("ovrp_GetNodePoseState", node, __builtin_return_address(0));
     memset(out, 0, 0x58);
-    const klovrp_pose *p = &g_head_pose;
-    if (node == 3 || node == 4) p = &g_hand_pose[node - 3];
-    // KL_OVRP_HANDS_IN_VIEW=1: park both hands at a fixed spot well inside an
-    // identity head's frustum, overriding whatever the frontend last wrote.
-    // Answers one question and only one — does the guest draw controllers at
-    // all? If nothing appears here, the game considers them absent and the
-    // problem is a status answer, not a pose. Read side, so it beats the
-    // viewer's per-frame writes. Diagnostic: the hands do not move.
-    klovrp_pose parked;
+    klovrp_pose head = klovrp_head();
+    const klovrp_pose *p = &head;
+    klovrp_pose hand;
     if (node == 3 || node == 4) {
+        int h = node - 3;
+        // KL_OVRP_HANDS_IN_VIEW=1: park both hands at a fixed spot well inside
+        // the *current head's* frustum, overriding whatever the frontend last
+        // wrote. Answers one question and only one — does the guest draw
+        // controllers at all? Read side, so it beats the viewer's per-frame
+        // writes. Diagnostic: the hands do not move with your real hands.
+        //
+        // This offset is head-relative on purpose. It used to be absolute
+        // tracking-space coordinates chosen for an identity head, and the guest
+        // asks for a FloorLevel origin — so the "in view" park was 12 cm below
+        // the floor and 1.7 m under the head, i.e. reliably out of frustum.
+        // The knob meant to prove the controllers render was hiding them.
         static int inview = -1;
         if (inview < 0) inview = getenv("KL_OVRP_HANDS_IN_VIEW") != NULL;
-        if (inview) {
-            parked = (klovrp_pose){ node == 3 ? -0.15f : 0.15f,
-                                    -0.12f, -0.55f, 0, 0, 0, 1 };
-            p = &parked;
+        if (inview || !g_hand_set[h]) {
+            float dx = inview ? (h ? 0.15f : -0.15f) : (h ? 0.20f : -0.20f);
+            float dy = inview ? -0.12f : -0.30f;
+            float dz = inview ? -0.55f : -0.35f;
+            float ox, oy, oz;
+            klovrp_qrot(&head, dx, dy, dz, &ox, &oy, &oz);
+            hand = head;
+            hand.px = head.px + ox;
+            hand.py = head.py + oy;
+            hand.pz = head.pz + oz;
+        } else {
+            hand = g_hand_pose[h];
         }
+        klovrp_dump_vrdevice();
+        klovrp_hand_sweep(&head, &hand);
+        p = &hand;
     }
     float *f = out;
     f[0] = p->qx; f[1] = p->qy;      // quat xyz at +0x00
@@ -370,11 +545,29 @@ static klovrp_vec3 klovrp_GetBoundaryDimensions(void) {
 // L/RBatteryPercentRemaining, L/RRecenterCount, then 28 reserved.
 // KL_OVRP_FAKE_BUTTONS=<hex>: OR this mask into both hands' Buttons and
 // Touches, toggling on/off on a duty cycle so GetDown/GetUp transitions
-// actually occur — a held-from-boot bit never reads as a press. Set it to
-// 0xffffffff and aim at a control: if the UI reacts to *anything*, the button
-// path is alive and only the bit mapping is wrong; if nothing reacts with
-// every bit set, the buttons are not the problem and the pointer is.
-// Diagnostic only, and deliberately crude: it presses everything at once.
+// actually occur — a held-from-boot bit never reads as a press.
+//
+// Which bits reach the game, measured from libunity's joystick fill
+// (0x9bd338 left / 0x9bd548 right) against this title's InputManager axes:
+//   Buttons 0x1 (A)   -> joystick button 0  = MenuButtonRightHand
+//   Buttons 0x2 (B)   -> joystick button 1
+//   Buttons 0x100 (X) -> joystick button 2  = MenuButtonLeftHand
+//   Buttons 0x200 (Y) -> joystick button 3
+//   Buttons 0x400 (LThumbstick) -> button 8 = MenuButtonLeftHandOculusTouch
+//   Buttons 0x4   (RThumbstick) -> button 9 = MenuButtonRightHandOculusTouch
+//   Buttons 0x100000 (Start)    -> button 7
+// Every other bit — including the raw trigger bits 0x04000000/0x08000000/
+// 0x10000000/0x20000000 — is read by nobody: libunity carries the triggers as
+// *float axes*, never as buttons. So this knob cannot produce a UI click, and
+// a "nothing reacts with 0xffffffff" result says nothing about the trigger.
+// That is what KL_OVRP_FAKE_TRIGGER below is for.
+static unsigned klovrp_fake_phase(void) {
+    // ~7 controller polls a frame, so 256 on / 256 off is roughly a 0.4 s
+    // press at 90 Hz — slow enough for a UI to see both edges.
+    static unsigned calls;
+    return (calls++ >> 8) & 1;
+}
+
 static uint32_t klovrp_fake_buttons(void) {
     static int init;
     static uint32_t mask;
@@ -384,10 +577,25 @@ static uint32_t klovrp_fake_buttons(void) {
         if (e) mask = (uint32_t)strtoul(e, NULL, 0);
     }
     if (!mask) return 0;
-    static unsigned calls;
-    // ~7 controller polls a frame, so 256 on / 256 off is roughly a 0.4 s
-    // press at 90 Hz — slow enough for a UI to see both edges.
-    return ((calls++ >> 8) & 1) ? mask : 0;
+    return klovrp_fake_phase() ? mask : 0;
+}
+
+// KL_OVRP_FAKE_TRIGGER=<0..1>: drive both index triggers to this value on the
+// same duty cycle. This is the click, not a button: Beat Saber's
+// VRControllersInputManager reads Input.GetAxis("TriggerLeftHand"/"...Right"),
+// which the InputManager asset binds to joystick axes 8 and 9 — libunity fills
+// those from LIndexTrigger/RIndexTrigger, the floats. It is the only way to
+// exercise a menu click without the interactive viewer.
+static float klovrp_fake_trigger(void) {
+    static int init;
+    static float v;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("KL_OVRP_FAKE_TRIGGER");
+        if (e) v = *e ? strtof(e, NULL) : 1.0f;
+    }
+    if (v <= 0.0f) return 0.0f;
+    return klovrp_fake_phase() ? v : 0.0f;
 }
 
 static void fill_controller_state(int mask, void *out, int version) {
@@ -396,6 +604,7 @@ static void fill_controller_state(int mask, void *out, int version) {
     if (m & OVRP_CTRL_ACTIVE) m |= OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH;
     uint32_t conn = m & (OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH);
     uint32_t fake = conn ? klovrp_fake_buttons() : 0;
+    float fake_trig = conn ? klovrp_fake_trigger() : 0.0f;
     uint8_t *b = out;
     uint32_t *w = (uint32_t *)out;
     float *f = (float *)out;
@@ -422,6 +631,10 @@ static void fill_controller_state(int mask, void *out, int version) {
     }
     w[1] |= fake;                                       // Buttons
     w[2] |= fake;                                       // Touches
+    if (fake_trig > 0.0f) {
+        if (conn & OVRP_CTRL_LTOUCH) f[4] = fake_trig;  // LIndexTrigger
+        if (conn & OVRP_CTRL_RTOUCH) f[5] = fake_trig;  // RIndexTrigger
+    }
 }
 
 // 64-byte ovrpControllerState2 by value via x8 (real plugin: stp q0..q3 of
@@ -597,6 +810,8 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetEyeTextureSize", (void *)klovrp_GetEyeTextureSize},
     {"ovrp_GetEyeTextureStageCount", (void *)klovrp_GetEyeTextureStageCount},
     {"ovrp_GetDesiredEyeTextureFormat", (void *)klovrp_GetDesiredEyeTextureFormat},
+    {"ovrp_SetTrackingOriginType", (void *)klovrp_SetTrackingOriginType},
+    {"ovrp_GetTrackingOriginType", (void *)klovrp_GetTrackingOriginType},
     {"ovrp_GetNodeFrustum2", (void *)klovrp_GetNodeFrustum2},
     {"ovrp_GetNodePositionTracked2", (void *)klovrp_GetNodePositionTracked2},
     {"ovrp_GetNodePositionValid", (void *)klovrp_GetNodePositionValid},
@@ -693,8 +908,6 @@ static const char *const g_ovrp_bool_yes[] = {
     // Setup calls whose return the guest ignores (0x9bba0c, 0x9bcd5c); 1 for
     // consistency with the other "it worked" answers.
     "ovrp_SetupDistortionWindow3", "ovrp_SetupDisplayObjects",
-    // bool return (real plugin: success = !(result < 0)); recorded state.
-    "ovrp_SetTrackingOriginType",
     // Haptics commands we accept and drop — no haptics backend yet (M8).
     "ovrp_SetControllerHaptics", "ovrp_SetControllerVibration",
 };
@@ -736,6 +949,22 @@ static void *klovrp_shared(const char *name) {
 void *kl_ovrp_sym(const char *name) {
     if (!name) return NULL;
     ovrp_slot(name);          // before the impl check, so "resolved" counts everything
+    void *fn = kl_ovrp_sym_inner(name);
+    if (fn && g_nsym < KL_OVRP_MAX) {
+        pthread_mutex_lock(&g_ovrp_mu);
+        unsigned i = 0;
+        for (; i < g_nsym; i++) if (g_sym[i].ptr == fn) break;
+        if (i == g_nsym && g_nsym < KL_OVRP_MAX) {
+            g_sym[g_nsym].name = strdup(name);
+            g_sym[g_nsym].ptr = fn;
+            g_nsym++;
+        }
+        pthread_mutex_unlock(&g_ovrp_mu);
+    }
+    return fn;
+}
+
+static void *kl_ovrp_sym_inner(const char *name) {
     for (size_t i = 0; i < sizeof g_ovrp_impl / sizeof g_ovrp_impl[0]; i++)
         if (strcmp(g_ovrp_impl[i].name, name) == 0) return g_ovrp_impl[i].fn;
     void *shared = klovrp_shared(name);

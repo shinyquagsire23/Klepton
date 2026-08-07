@@ -28,11 +28,19 @@ void *kl_ovrp_sym(const char *name);
 // Which ovrp_* the guest resolved and which it called — the M6 work list.
 void kl_ovrp_report(FILE *f);
 
+// Which space those poses are in: 0 = eye level, 1 = floor level, 2 = stage,
+// as the guest last set with ovrp_SetTrackingOriginType. Beat Saber asks for
+// floor level, so y=0 is the floor and a head belongs at standing eye height —
+// a frontend that reports an eye-level head into a floor-level world puts the
+// camera on the ground and its hands underneath it.
+int kl_ovrp_tracking_origin(void);
+
 // The frontend seam, pose in: whoever owns the window tells us where the head
 // is, and ovrp_GetNodePoseState reports it back to the guest. Today that is the
 // SDL viewer (KL_VIEW=1, kl_view.c) driven by WASD + mouse-look; on visionOS it
 // is ARKit's WorldTrackingProvider answering the same call. Without a frontend
-// the pose stays identity, which is what every headless run has always seen.
+// the head stands at eye height above the floor origin (KL_OVRP_EYE_HEIGHT,
+// default 1.6 m) and the hands ride a head-relative offset in front of it.
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
 

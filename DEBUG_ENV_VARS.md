@@ -251,6 +251,71 @@ handler).
   derived from the libdir argument (`<apk>/lib/arm64-v8a` →
   `<apk>/assets/bin/Data/Managed/Metadata/global-metadata.dat`).
 
+## XR runtime / controllers (`runtime/kl_ovrp.c`)
+
+Poses live in the space the guest asked for with `ovrp_SetTrackingOriginType`.
+Beat Saber asks for **FloorLevel**, so y=0 is the floor and a head belongs at
+standing eye height — `kl_ovrp_tracking_origin()` reports which space is in
+force, and a frontend that reports an eye-level head into a floor-level world
+puts the camera on the ground with its hands underneath it.
+
+- `KL_OVRP_EYE_HEIGHT=<metres>` — standing eye height for the *default* head
+  pose, i.e. what a headless run reports when no frontend has called
+  `kl_ovrp_set_head_pose`. **Default 1.6**, and forced to 0 when the guest
+  selected the EyeLevel origin (there the eye already is the origin). This is
+  not cosmetic: with the head at y=0 under FloorLevel the menu renders above
+  the view and the default hands sit ~1.7 m below the frustum.
+- `KL_OVRP_HANDS_IN_VIEW=1` — park both hands at a fixed spot inside the
+  *current head's* frustum (head-relative, 15 cm out, 12 cm down, 55 cm
+  forward), overriding whatever the frontend last wrote. Read side, so it
+  beats the viewer's per-frame writes. Answers one question only — does the
+  guest draw controllers at all. Diagnostic: the hands do not move with your
+  real hands. The offset was absolute tracking-space coordinates until the
+  FloorLevel origin was measured, which parked them below the floor and out
+  of frustum — the knob meant to prove the controllers render was hiding them.
+- `KL_OVRP_FAKE_BUTTONS=<hex>` — OR this mask into both hands' `Buttons` and
+  `Touches` on a duty cycle (~256 polls on, 256 off), so `GetDown`/`GetUp`
+  edges actually occur; a bit held from boot never reads as a press. Which
+  bits reach the game, measured from libunity's joystick fill (`0x9bd338`
+  left, `0x9bd548` right) against this title's InputManager:
+
+  | ovrpButton | joystick button | this title's axis |
+  |---|---|---|
+  | `0x1` A | 0 | `MenuButtonRightHand` |
+  | `0x2` B | 1 | — |
+  | `0x100` X | 2 | `MenuButtonLeftHand` |
+  | `0x200` Y | 3 | — |
+  | `0x4` RThumbstick click | 9 | `MenuButtonRightHandOculusTouch` |
+  | `0x400` LThumbstick click | 8 | `MenuButtonLeftHandOculusTouch` |
+  | `0x100000` Start | 7 | — |
+
+  Every other bit is read by nobody — **including the raw trigger bits**
+  (`0x04000000`/`0x08000000`/`0x10000000`/`0x20000000`), because libunity
+  carries the triggers as float *axes*, never as buttons. So this knob cannot
+  produce a UI click, and "nothing reacts with `0xffffffff`" says nothing
+  about the trigger. Use `KL_OVRP_FAKE_TRIGGER` for that.
+- `KL_OVRP_FAKE_TRIGGER=<0..1>` — drive both index triggers to this value on
+  the same duty cycle (bare/empty means 1.0). This is the click: Beat Saber's
+  `VRControllersInputManager` reads `Input.GetAxis("TriggerLeftHand"/"…Right")`,
+  which the InputManager asset binds to joystick axes 8 and 9, and libunity
+  fills those from `LIndexTrigger`/`RIndexTrigger`. The only way to exercise a
+  menu click without the interactive viewer.
+- `KL_OVRP_HANDS_SWEEP=1` — collapse both hands onto the head and sweep their
+  pitch −70°..+70° in 5° steps, ~256 frames a step (two full
+  `KL_OVRP_FAKE_TRIGGER` presses each), logging each step. The ray a controller
+  casts is *not* the pose we report: `IVRPlatformHelper.AdjustControllerTransform`
+  rotates the controller transform by a device-specific offset that is game
+  data we cannot read. A sweep does not need to know it — if any pitch produces
+  a UI hit the offset is the only unknown left; if none does over 140°, the ray
+  is not the problem. Pair with `KL_OVRP_FAKE_TRIGGER=1`.
+- `KL_OVRP_DUMP_VRDEVICE=1` — dump libunity's own Oculus VRDevice object once:
+  the three unique device ids it stamps into both the joystick descriptors and
+  the XR node states, then every function-pointer slot **named** by matching it
+  against what `kl_ovrp_sym` handed back. This is the whole VRDevice↔plugin
+  contract in one place, so a status predicate answered wrong can be found by
+  name instead of by chasing `ldr x8, [x?, #N]` offsets. Reads a build-specific
+  vaddr (`libunity+0x127a6c0`), which is why it is opt-in.
+
 ## Viewer (`runtime/kl_view.c`, `tests/t_boot.c`)
 
 - `KL_POKE_CAP=<n>` — at frame-pump start, overwrite libunity's texture-unit
