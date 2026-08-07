@@ -120,6 +120,64 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/t_boot
 	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/t_boot $(LIBS) > build/boot.log 2>/dev/null && \
 	  grep -E 'guard verified|DLC enumeration|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|M3 EXIT|M4 \(partial\)' build/boot.log
 
+# ---- M1b / the visionOS port (PLANNING §12) ----
+#
+# klepton-ld translates a guest ELF .so into a Mach-O dylib so dyld — not our
+# mmap loader — maps the guest text. It links runtime/kl_x18.c because the S0.5
+# decoder is the authority on what an x18 site is; a bit-field guess reports
+# 2158 sites in libunityopus.so where the decoder correctly reports 0.
+build/klepton-ld: tools/klepton_ld.c runtime/kl_x18.c runtime/kl_x18.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/klepton_ld.c runtime/kl_x18.c
+
+# P1 — the same t_opus roundtrip that M1a passes, through the translated dylib.
+# t_opus picks its loader from the file's magic, so this is one test over two
+# loaders rather than two tests. arm64 macOS requires at least an ad-hoc
+# signature before dyld will map anything.
+.PHONY: p1
+p1: build/klepton-ld build/t_opus
+	@./build/klepton-ld $(LIBS)/libunityopus.so -o build/libunityopus.dylib
+	@codesign -s - -f build/libunityopus.dylib 2>/dev/null
+	@./build/t_opus $(PWD)/build/libunityopus.dylib | tail -4
+
+# P2 — the same dylib under the visionOS Simulator's dyld, which is where a
+# malformed hand-emitted Mach-O gets caught (§4, rung 2). Needs a booted
+# visionOS simulator; XRSIM overrides which one.
+XRSIM ?= $(shell xcrun simctl list devices booted 2>/dev/null | grep -o '[0-9A-F-]\{36\}' | head -1)
+.PHONY: p2
+p2: build/klepton-ld
+	@test -n "$(XRSIM)" || { echo "no booted simulator — 'xcrun simctl boot <udid>' first"; exit 1; }
+	@./build/klepton-ld $(LIBS)/libunityopus.so -o build/libunityopus-xrsim.dylib \
+	   --platform visionossim --quiet
+	@codesign -s - -f build/libunityopus-xrsim.dylib 2>/dev/null
+	@clang -target arm64-apple-xros1.0-simulator \
+	   -isysroot $$(xcrun --sdk xrsimulator --show-sdk-path) -arch arm64 \
+	   -o build/dl_xrsim tools/dlprobe.c
+	@xcrun simctl spawn $(XRSIM) $(PWD)/build/dl_xrsim $(PWD)/build/libunityopus-xrsim.dylib
+
+# ANGLE for visionOS. The vendored checkout's gn has no xros target and does not
+# need one: build for iOS — which already enables the Metal backend — and rewrite
+# LC_BUILD_VERSION afterwards. Confirmed prior art (ALVR ships a Rust dylib this
+# way); §12.1(1). ANGLE emits ios_framework_bundle on iOS, so the output is
+# already the .framework packaging §4.0.1 wants.
+.PHONY: angle-ios angle-xros
+angle-ios:
+	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" && \
+	  gn gen out/ios --args='is_debug=false target_os="ios" target_cpu="arm64" \
+	    target_environment="device" ios_enable_code_signing=false \
+	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
+	  autoninja -C out/ios libEGL libGLESv2
+
+angle-xros: angle-ios
+	@mkdir -p vendor/out/xros
+	@for n in libEGL libGLESv2; do \
+	  rm -rf vendor/out/xros/$$n.framework; \
+	  cp -R vendor/out/ios/$$n.framework vendor/out/xros/$$n.framework; \
+	  xcrun vtool -arch arm64 -set-build-version visionos 1.0 26.0 -replace \
+	    -output vendor/out/xros/$$n.framework/$$n vendor/out/ios/$$n.framework/$$n; \
+	  printf '%-12s ' $$n; xcrun vtool -show-build vendor/out/xros/$$n.framework/$$n \
+	    | grep -E 'platform'; done
+
 # ---- graphics spikes (host-only, not part of `make check`) ----
 # S0.7/S0.8 probe Apple's desktop GL; S0.9 probes ANGLE. None of them link the
 # runtime — they answer questions about the host, not about the shim.

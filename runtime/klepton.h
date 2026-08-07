@@ -13,6 +13,11 @@ typedef struct kl_image kl_image;
 
 // Load and fully relocate an ELF .so. Returns NULL on error; kl_error() explains.
 kl_image *kl_load(const char *path);
+// M1b: load a klepton-ld-translated Mach-O dylib instead. dyld maps the guest
+// text — nothing is RWX and no guest byte is written at runtime, because the
+// TLS and x18 rewrites happened offline. This is the path that has to work on
+// visionOS; kl_load() above is the development one. Same kl_image afterwards.
+kl_image *kl_load_dylib(const char *path);
 // Look up an exported symbol. NULL if absent.
 void      *kl_sym(kl_image *img, const char *name);
 // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.

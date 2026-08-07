@@ -1,4 +1,9 @@
 // M1 exit criterion: libunityopus.so translated, loaded, and decoding correctly.
+//
+// The same roundtrip is also the P1 gate for M1b (PLANNING §12.4): hand it a
+// klepton-ld-produced Mach-O dylib instead of the ELF and it must pass
+// identically. Which loader runs is decided by the file's magic, not a flag, so
+// the two paths are held to one test rather than two.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,14 +11,31 @@
 
 #define NEED(v, name) do { if (!(v)) { printf("  !! missing export: %s\n", name); return 1; } } while (0)
 
+// 0 = ELF (mmap loader), 1 = Mach-O (translated dylib), -1 = unreadable.
+static int is_macho(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    unsigned char m[4] = {0};
+    size_t n = fread(m, 1, 4, f);
+    fclose(f);
+    if (n != 4) return -1;
+    if (!memcmp(m, "\x7f" "ELF", 4)) return 0;
+    return (m[0] == 0xcf && m[1] == 0xfa && m[2] == 0xed && m[3] == 0xfe) ? 1 : -1;
+}
+
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1]
         : "beatsaber/lib/arm64-v8a/libunityopus.so";
 
     kl_thread_init();                       // canary for the main thread (S0.1)
 
+    int macho = is_macho(path);
+    if (macho < 0) { printf("load failed: %s is neither ELF64 nor Mach-O\n", path); return 1; }
+
     printf("=== klepton M1: loading %s ===\n", path);
-    kl_image *img = kl_load(path);
+    printf("  loader: %s\n", macho ? "kl_load_dylib (M1b — dyld maps the guest text)"
+                                   : "kl_load (M1a — mmap + runtime rewrite)");
+    kl_image *img = macho ? kl_load_dylib(path) : kl_load(path);
     if (!img) { printf("load failed: %s\n", kl_error()); return 1; }
 
     const kl_stats *st = kl_get_stats(img);

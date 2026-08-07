@@ -13,6 +13,10 @@
 #include <pthread.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <dlfcn.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include "klepton.h"
 #include "kl_x18.h"
 
@@ -67,6 +71,8 @@ struct kl_image {
     char       path[512];
     const char **missing;      // unique unresolved import names
     unsigned    missing_n, missing_cap;
+    void       *dl_handle;     // set when the image arrived as a translated
+                               // Mach-O dylib (M1b); then dyld owns the mapping
 };
 
 static void record_missing(kl_image *img, const char *nm) {
@@ -331,6 +337,120 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
     return 0;
 }
 
+// Walk PT_DYNAMIC and bind the image: symtab/strtab, DT_INIT_ARRAY, and every
+// relocation. Shared by both loaders — the mmap path below and kl_load_dylib()
+// — because this half is identical either way. It is the whole reason M1b can
+// emit a dylib with *zero dyld fixups*: nothing here needs dyld's help, and no
+// relocation target is in __TEXT (M1a's measurement), so the guest image can be
+// mapped read-execute by dyld and still relocate correctly.
+//
+// `lo` is the lowest PT_LOAD vaddr, so `img->base + p_vaddr - lo` addresses the
+// mapped copy in both cases (it is 0 for every guest library here).
+static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t lo) {
+    const Elf64_Rela *rela = NULL, *jmprel = NULL;
+    size_t relasz = 0, pltsz = 0;
+    for (int i = 0; i < phnum; i++) {
+        if (ph[i].p_type != PT_DYNAMIC) continue;
+        const Elf64_Dyn *dp = (const Elf64_Dyn *)(img->base + ph[i].p_vaddr - lo);
+        for (; dp->d_tag != DT_NULL; dp++) {
+            switch (dp->d_tag) {
+            case DT_SYMTAB: img->symtab = (Elf64_Sym *)(img->base + dp->d_val); break;
+            case DT_STRTAB: img->strtab = (const char *)(img->base + dp->d_val); break;
+            case DT_RELA:   rela   = (const Elf64_Rela *)(img->base + dp->d_val); break;
+            case DT_RELASZ: relasz = dp->d_val; break;
+            case DT_JMPREL: jmprel = (const Elf64_Rela *)(img->base + dp->d_val); break;
+            case DT_PLTRELSZ: pltsz = dp->d_val; break;
+            case DT_INIT_ARRAY:   img->init_array = (void (**)(void))(img->base + dp->d_val); break;
+            case DT_INIT_ARRAYSZ: img->init_count = dp->d_val / sizeof(void *); break;
+            }
+        }
+    }
+    if (!img->symtab || !img->strtab) { err("missing DT_SYMTAB/DT_STRTAB"); return -1; }
+
+    if ((rela   && apply_relocs(img, rela,   relasz / sizeof(Elf64_Rela)) != 0) ||
+        (jmprel && apply_relocs(img, jmprel, pltsz  / sizeof(Elf64_Rela)) != 0))
+        return -1;
+    return 0;
+}
+
+// ---------- M1b: load a klepton-ld-translated Mach-O dylib ----------
+// The shipping loader. dyld maps and (on device) AMFI validates the guest text,
+// so nothing here is ever RWX and no guest byte is written by us — the S0.1 TLS
+// rewrite and the S0.5 x18 veneers were applied offline by klepton-ld.
+//
+// The guest ELF image is embedded verbatim in the dylib at a constant shift, and
+// found through the __TEXT,__klelf section rather than an exported symbol: that
+// is what lets klepton-ld skip the exports trie entirely. getsectiondata()
+// applies the image's slide for us.
+//
+// The mach_header is located by matching the dylib against dyld's loaded-image
+// list. dlsym would be the obvious route and is precisely what we cannot use —
+// the translated dylib deliberately exports nothing.
+kl_image *kl_load_dylib(const char *path) {
+    char real[PATH_MAX];
+    if (!realpath(path, real)) snprintf(real, sizeof real, "%s", path);
+
+    void *h = dlopen(real, RTLD_NOW | RTLD_LOCAL);
+    if (!h) { err("dlopen %s: %s", real, dlerror()); return NULL; }
+
+    const struct mach_header_64 *mh = NULL;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *nm = _dyld_get_image_name(i);
+        char nr[PATH_MAX];
+        if (!nm) continue;
+        if (!realpath(nm, nr)) snprintf(nr, sizeof nr, "%s", nm);
+        if (strcmp(nr, real) == 0) {
+            mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            break;
+        }
+    }
+    if (!mh) { err("%s loaded but not found in dyld's image list", real);
+               dlclose(h); return NULL; }
+
+    unsigned long secsz = 0;
+    uint8_t *elf = getsectiondata(mh, "__TEXT", "__klelf", &secsz);
+    if (!elf) { err("%s has no __TEXT,__klelf section — not a klepton-ld image", real);
+                dlclose(h); return NULL; }
+
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)elf;
+    if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 || eh->e_machine != 183) {
+        err("%s: __klelf does not hold an AArch64 ELF64 image", real);
+        dlclose(h); return NULL;
+    }
+
+    kl_image *img = calloc(1, sizeof *img);
+    img->base      = elf;
+    img->dl_handle = h;
+    snprintf(img->path, sizeof img->path, "%s", real);
+
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(elf + eh->e_phoff);
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (int i = 0; i < eh->e_phnum; i++)
+        if (ph[i].p_type == PT_LOAD) {
+            if (ph[i].p_vaddr < lo) lo = ph[i].p_vaddr;
+            if (ph[i].p_vaddr + ph[i].p_memsz > hi) hi = ph[i].p_vaddr + ph[i].p_memsz;
+        }
+    if (lo == UINT64_MAX) { err("%s: embedded image has no PT_LOAD", real);
+                            free(img); dlclose(h); return NULL; }
+    img->span = (size_t)(hi - lo);
+
+    if (bind_dynamic(img, ph, eh->e_phnum, lo) != 0) { free(img); dlclose(h); return NULL; }
+
+    // The rewrites the mmap loader does here happened offline. Report what
+    // klepton-ld already applied, so the two paths' stats stay comparable.
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
+        const uint32_t *w = (const uint32_t *)(img->base + ph[i].p_vaddr - lo);
+        for (size_t k = 0; k + 4 <= ph[i].p_filesz; k += 4, w++)
+            if ((*w & 0xffffffe0u) == 0xd53bd060u) img->stats.tls_rewrites++;
+    }
+
+    if (getenv("KL_TRACE_IMAGES"))
+        fprintf(stderr, "  [klepton] dylib %s: mach header %p, guest image %p span %#zx\n",
+                real, (const void *)mh, (void *)img->base, img->span);
+    return img;
+}
+
 kl_image *kl_load(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { err("open %s: %s", path, strerror(errno)); return NULL; }
@@ -371,31 +491,9 @@ kl_image *kl_load(const char *path) {
         // remainder of memsz is .bss — already zero from MAP_ANON
     }
 
-    // ---- PT_DYNAMIC ----
-    const Elf64_Rela *rela = NULL, *jmprel = NULL;
-    size_t relasz = 0, pltsz = 0;
-    for (int i = 0; i < eh->e_phnum; i++) {
-        if (ph[i].p_type != PT_DYNAMIC) continue;
-        const Elf64_Dyn *dp = (const Elf64_Dyn *)(img->base + ph[i].p_vaddr - lo);
-        for (; dp->d_tag != DT_NULL; dp++) {
-            switch (dp->d_tag) {
-            case DT_SYMTAB: img->symtab = (Elf64_Sym *)(img->base + dp->d_val); break;
-            case DT_STRTAB: img->strtab = (const char *)(img->base + dp->d_val); break;
-            case DT_RELA:   rela   = (const Elf64_Rela *)(img->base + dp->d_val); break;
-            case DT_RELASZ: relasz = dp->d_val; break;
-            case DT_JMPREL: jmprel = (const Elf64_Rela *)(img->base + dp->d_val); break;
-            case DT_PLTRELSZ: pltsz = dp->d_val; break;
-            case DT_INIT_ARRAY:   img->init_array = (void (**)(void))(img->base + dp->d_val); break;
-            case DT_INIT_ARRAYSZ: img->init_count = dp->d_val / sizeof(void *); break;
-            }
-        }
-    }
-    if (!img->symtab || !img->strtab) { err("missing DT_SYMTAB/DT_STRTAB");
-                                        munmap(file, sb.st_size); return NULL; }
-
-    // ---- relocate (every target is in the RW segment; __TEXT is never written) ----
-    if ((rela   && apply_relocs(img, rela,   relasz / sizeof(Elf64_Rela)) != 0) ||
-        (jmprel && apply_relocs(img, jmprel, pltsz  / sizeof(Elf64_Rela)) != 0)) {
+    // ---- PT_DYNAMIC, then relocate ----
+    // Every relocation target is in the RW segment; __TEXT is never written.
+    if (bind_dynamic(img, ph, eh->e_phnum, lo) != 0) {
         munmap(file, sb.st_size); return NULL;
     }
 
@@ -480,7 +578,8 @@ void *kl_sym(kl_image *img, const char *name) {
 
 void kl_unload(kl_image *img) {
     if (!img) return;
-    munmap(img->base, img->span);
+    if (img->dl_handle) dlclose(img->dl_handle);   // M1b: dyld owns the mapping
+    else                munmap(img->base, img->span);
     free(img);
 }
 
