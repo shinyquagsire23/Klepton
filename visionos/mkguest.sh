@@ -21,7 +21,11 @@ LIBS="libmain lib_burst_generated libunityopus libunity libil2cpp"
 
 [ -x "$LD" ] || { echo "!! $LD missing — run 'make build/klepton-ld' first"; exit 1; }
 
-rm -rf build/guest "$OUT"; mkdir -p build/guest "$OUT"
+# Only the guest xcframeworks are cleared, not the whole of Frameworks/ — it is
+# shared with mkangle.sh, and wiping it here made the two scripts order-dependent
+# in a way nothing would have reported except a missing ANGLE at runtime.
+rm -rf build/guest; mkdir -p build/guest "$OUT"
+for NAME in $LIBS; do rm -rf "$OUT/$NAME.xcframework"; done
 
 for NAME in $LIBS; do
   [ -f "$SRC/$NAME.so" ] || { echo "!! $SRC/$NAME.so missing"; exit 1; }

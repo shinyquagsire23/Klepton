@@ -1,20 +1,40 @@
 import SwiftUI
 import Foundation
+import CompositorServices
 
 // The visionOS host app (PLANNING §12.6 — Swift for the platform layer).
 //
-// At P4 this is deliberately a plain WindowGroup and not an ImmersiveSpace.
-// The gate is "the guest boots inside an app bundle under AMFI, and a veneer
-// executes" — no rendering, no compositor, no ARKit. Adding an ImmersiveSpace
-// now would put Compositor Services into the picture before there is anything
-// to present, and a failure in either half would read as a failure of the
-// other. The immersive path arrives at P5b, once ANGLE has somewhere to draw.
+// P4 was deliberately a plain WindowGroup and nothing else: the gate is "the
+// guest boots inside an app bundle under AMFI, and a veneer executes", and an
+// ImmersiveSpace would have put Compositor Services into the picture before
+// there was anything to present, so a failure in either half would have read
+// as a failure of the other.
+//
+// P5b adds the immersive path *beside* it rather than in place of it, behind
+// KL_IMMERSIVE. The window still boots and still reports, so P4's measurement
+// stays takeable on the same binary — which matters because that measurement
+// is how a device regression gets localised.
+
+enum Immersive {
+    static let id = "KleptonImmersive"
+    static var wanted: Bool { ProcessInfo.processInfo.environment["KL_IMMERSIVE"] != nil }
+}
 
 @main
 struct KleptonApp: App {
     var body: some Scene {
         WindowGroup { BootView() }
             .defaultSize(width: 1100, height: 900)
+
+        ImmersiveSpace(id: Immersive.id) {
+            CompositorLayer(configuration: KleptonStageConfiguration()) { layerRenderer in
+                KleptonCompositor(layerRenderer).startRenderLoop()
+            }
+        }
+        // .full, not .mixed: the guest is a VR title that renders its own
+        // world, so passthrough behind it would only show through wherever
+        // Beat Saber's own sky is, which is nowhere.
+        .immersionStyle(selection: .constant(.full), in: .full)
     }
 }
 
@@ -39,6 +59,8 @@ struct BootView: View {
     @State private var running = false
     @State private var finished = false
     @State private var succeeded = false
+    @State private var openedSpace = false
+    @Environment(\.openImmersiveSpace) private var openImmersiveSpace
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -124,7 +146,13 @@ struct BootView: View {
             //
             // This is where libil2cpp (66 MB, 3,083 x18 veneers) first loads
             // under AMFI, and where the synthetic /proc is first read on device.
-            if result == 0, let f = ProcessInfo.processInfo.environment["KL_FRAMES"] {
+            //
+            // Skipped under KL_IMMERSIVE: there the compositor is the frame
+            // clock and drives kl_app_lifecycle_begin/_frame itself, and both
+            // entries are once-per-process, so running the pump here as well
+            // would take the lifecycle's only turn.
+            if result == 0, !Immersive.wanted,
+               let f = ProcessInfo.processInfo.environment["KL_FRAMES"] {
                 result = kl_app_lifecycle(UInt32(f) ?? 1)
             }
             poll.invalidate()
@@ -135,6 +163,16 @@ struct BootView: View {
                 status = String(cString: kl_app_status())
                 succeeded = (result == 0)
                 running = false; finished = true
+                // The space opens only after boot has succeeded, and from here
+                // rather than from .task, because the compositor's very first
+                // act is kl_app_lifecycle_begin() — which needs the UnityPlayer
+                // that kl_app_boot creates. Opening it in parallel with boot
+                // would be a race whose losing side reports "kl_app_boot must
+                // run first" and reads like a missing binding.
+                if result == 0, Immersive.wanted, !openedSpace {
+                    openedSpace = true
+                    Task { _ = await openImmersiveSpace(id: Immersive.id) }
+                }
             }
         }
     }

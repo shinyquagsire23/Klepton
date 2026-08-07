@@ -16,6 +16,12 @@ What the app links, and why it comes from three places:
                         references their symbols; the runtime dlopens them by
                         path. Linking them would make dyld resolve an exports
                         trie that klepton-ld deliberately does not emit.
+  ANGLE_*.xcframework   ANGLE retargeted to visionOS, built by mkangle.sh.
+                        Embedded the same way and for the same reason: kl_glfb
+                        dlopens libEGL/libGLESv2 by path, and linking a renderer
+                        the app never names would only make dyld load it on
+                        every run, including the ones that stay on the null
+                        driver.
   Sources/              the Swift app layer and kl_app.c (PLANNING §12.6).
 """
 import os, subprocess, sys, re
@@ -24,6 +30,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 NAME = "Klepton"
 BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", "dev.klepton.app")
 GUEST = ["libmain", "lib_burst_generated", "libunityopus", "libunity", "libil2cpp"]
+ANGLE = ["ANGLE_libEGL", "ANGLE_libGLESv2"]
+# Both sets are embedded-not-linked, so the pbxproj treatment is identical and
+# the generator stays data-driven — the two lists differ only in what a missing
+# one means, which is why main() reports them separately.
+EMBED = GUEST + ANGLE
 
 
 def detect_team():
@@ -56,12 +67,27 @@ BP_SRC  = oid("BPSRC"); BP_FRM = oid("BPFRM"); BP_EMB  = oid("BPEMB")
 CL_PROJ = oid("CLPRJ"); CL_TGT = oid("CLTGT")
 C_PRJ_D = oid("CPRJD"); C_PRJ_R = oid("CPRJR")
 C_TGT_D = oid("CTGTD"); C_TGT_R = oid("CTGTR")
-F_SWIFT = oid("FSWFT"); F_C = oid("FC"); F_H = oid("FH"); F_BRIDGE = oid("FBRDG")
-B_SWIFT = oid("BSWFT"); B_C = oid("BC")
+F_C = oid("FC"); F_H = oid("FH"); F_BRIDGE = oid("FBRDG")
+B_C = oid("BC")
+
+# The Swift half of §12.6's split: the App/UI, and the Compositor Services
+# renderer P5b adds. A list rather than an id pair each, for the same reason
+# the guest libraries are one.
+SWIFT = [f"{NAME}App.swift", f"{NAME}Compositor.swift", f"{NAME}Controllers.swift"]
+swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
+
+swift_buildfiles = "\n".join(
+    f'\t\t{s["bld"]} /* {s["name"]} in Sources */ = {{isa = PBXBuildFile; fileRef = {s["ref"]}; }};'
+    for s in swift)
+swift_filerefs = "\n".join(
+    f'\t\t{s["ref"]} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; '
+    f'path = {s["name"]}; sourceTree = "<group>"; }};' for s in swift)
+swift_children = "\n".join(f'\t\t\t\t{s["ref"]},' for s in swift)
+swift_sources  = "\n".join(f'\t\t\t\t{s["bld"]},' for s in swift)
 F_RT    = oid("FRT");   B_RT_LNK = oid("BRTLK")
 
-# One file ref + one embed build-file per guest library.
-guest = [{"name": g, "ref": oid(f"FG{i}"), "emb": oid(f"BG{i}")} for i, g in enumerate(GUEST)]
+# One file ref + one embed build-file per embedded framework.
+guest = [{"name": g, "ref": oid(f"FG{i}"), "emb": oid(f"BG{i}")} for i, g in enumerate(EMBED)]
 
 buildfiles = "\n".join(
     f'\t\t{g["emb"]} /* {g["name"]} in Embed */ = {{isa = PBXBuildFile; fileRef = {g["ref"]}; '
@@ -88,6 +114,7 @@ COMMON = f"""
 					"$(SRCROOT)/../runtime",
 				);
 				INFOPLIST_KEY_CFBundleDisplayName = Klepton;
+				INFOPLIST_KEY_NSHandsTrackingUsageDescription = "Klepton maps your hands onto the guest's two Touch controllers.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -113,7 +140,7 @@ PBX = f"""// !$*UTF8*$!
 	objects = {{
 
 /* Begin PBXBuildFile section */
-		{B_SWIFT} /* {NAME}App.swift in Sources */ = {{isa = PBXBuildFile; fileRef = {F_SWIFT}; }};
+{swift_buildfiles}
 		{B_C} /* kl_app.c in Sources */ = {{isa = PBXBuildFile; fileRef = {F_C}; }};
 		{B_RT_LNK} /* Klepton.xcframework in Frameworks */ = {{isa = PBXBuildFile; fileRef = {F_RT}; }};
 {buildfiles}
@@ -121,7 +148,7 @@ PBX = f"""// !$*UTF8*$!
 
 /* Begin PBXFileReference section */
 		{PRODUCT} /* {NAME}.app */ = {{isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = {NAME}.app; sourceTree = BUILT_PRODUCTS_DIR; }};
-		{F_SWIFT} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = {NAME}App.swift; sourceTree = "<group>"; }};
+{swift_filerefs}
 		{F_C} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = kl_app.c; sourceTree = "<group>"; }};
 		{F_H} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = kl_app.h; sourceTree = "<group>"; }};
 		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "{NAME}-Bridging-Header.h"; sourceTree = "<group>"; }};
@@ -167,7 +194,7 @@ PBX = f"""// !$*UTF8*$!
 		{G_SRC} /* Sources */ = {{
 			isa = PBXGroup;
 			children = (
-				{F_SWIFT},
+{swift_children}
 				{F_C},
 				{F_H},
 				{F_BRIDGE},
@@ -243,7 +270,7 @@ PBX = f"""// !$*UTF8*$!
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				{B_SWIFT},
+{swift_sources}
 				{B_C},
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -318,10 +345,11 @@ PBX = f"""// !$*UTF8*$!
 
 
 def main():
-    for g in GUEST:
+    for g, how in [(g, "visionos/mkguest.sh") for g in GUEST] + \
+                  [(a, "visionos/mkangle.sh") for a in ANGLE]:
         p = os.path.join(HERE, "Frameworks", f"{g}.xcframework")
         if not os.path.isdir(p):
-            print(f"!! missing {p} — run visionos/mkguest.sh first", file=sys.stderr)
+            print(f"!! missing {p} — run {how} first", file=sys.stderr)
             return 1
     if not os.path.isdir(os.path.join(HERE, "..", "build", "Klepton.xcframework")):
         print("!! missing build/Klepton.xcframework — run `make xros` first", file=sys.stderr)
@@ -335,6 +363,7 @@ def main():
     print(f"  DEVELOPMENT_TEAM = {TEAM or '(NOT DETECTED - set KLEPTON_TEAM)'}")
     print(f"  PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID}")
     print(f"  embedded guest frameworks: {', '.join(GUEST)}")
+    print(f"  embedded ANGLE:            {', '.join(ANGLE)}")
     return 0
 
 

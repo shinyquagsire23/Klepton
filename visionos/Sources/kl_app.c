@@ -97,6 +97,14 @@ int kl_app_configure(const char *resources, const char *container) {
     // not a fallback (kl_load_auto).
     if (have_translations()) setenv("KL_DYLIB_DIR", g_dylibs, 1);
 
+    // ANGLE rides in the same Frameworks/ directory, so the app can answer
+    // "where is ANGLE" itself rather than have the launcher guess at a path
+    // that only exists on the device. Not forced: an explicit KL_ANGLE_DIR
+    // still wins, which is how a run points at a different build. This only
+    // says where ANGLE *is* — KL_GLFB is still what decides whether it is used,
+    // so an app without KL_GLFB set stays on the null driver exactly as before.
+    setenv("KL_ANGLE_DIR", g_dylibs, 0);
+
     snprintf(g_status, sizeof g_status, "configured");
     return 0;
 }
@@ -302,7 +310,13 @@ static void report_proc(void) {
     fflush(NULL);
 }
 
-int kl_app_lifecycle(unsigned frames) {
+// The guest handle and the resolved nativeRender, kept between _begin and each
+// _frame. Set by kl_app_lifecycle_begin and read by kl_app_frame; a NULL
+// g_render is how kl_app_frame knows _begin has not run.
+static void *g_thiz, *g_render;
+static unsigned g_alarm_secs = 120, g_frames_pumped;
+
+int kl_app_lifecycle_begin(void) {
     // Separate from kl_app_boot rather than folded into it, because boot is the
     // P4 gate and refuses a second entry: keeping them apart lets the UI run the
     // gate, read its numbers, and only then go further.
@@ -316,6 +330,7 @@ int kl_app_lifecycle(unsigned frames) {
 
     void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
     if (!thiz) return fail("kl_app_boot must run first");
+    g_thiz = thiz;
 
     // First, before anything can be misdiagnosed on top of it.
     g_phase = "proc";
@@ -323,6 +338,7 @@ int kl_app_lifecycle(unsigned frames) {
 
     const char *aenv = getenv("KL_ALARM");
     unsigned alarm_secs = aenv ? (unsigned)strtoul(aenv, NULL, 10) : 120;
+    g_alarm_secs = alarm_secs;
 
     // The order UnityPlayerActivity drives, exactly as t_boot's recon does:
     // attach a surface, resume, then one frame. nativeRecreateGfxState is what
@@ -364,28 +380,50 @@ int kl_app_lifecycle(unsigned frames) {
         fflush(NULL);
     }
 
-    void *render = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
-    printf("\n=== pumping %u frames ===\n", frames);
-    fflush(NULL);
-    unsigned i = 0;
+    g_render = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
     g_phase = "frame pump";
-    alarm(alarm_secs);
-    for (; render && i < frames; i++) {
-        // The frame clock first: on Android the Choreographer's doFrame is what
-        // wakes the engine, and nativeRender then draws what it decided.
-        // Ticking after would hand every frame the previous one's time.
-        kl_jni_tick_choreographer();
-        kl_jni_local_frame_push();
-        ((int8_t (*)(void *, void *))render)(kl_jni_env(), thiz);
-        kl_jni_local_frame_pop();
-        kl_jni_drain_ui_tasks();
-    }
+    return 0;
+}
+
+// One guest frame. Split out of the pump loop so that Compositor Services can
+// be the clock (P5b): on device the frame deadline belongs to
+// cp_frame_predict_timing, and a pump that owns its own loop cannot be paced by
+// something else. kl_app_lifecycle keeps calling this in a plain loop, so the
+// P5.4 measurement is the same code it always was.
+//
+// Returns what nativeRender returned, or -1 if kl_app_lifecycle_begin has not
+// run (or nativeRender was never registered).
+int kl_app_frame(void) {
+    if (!g_render || !g_thiz) return -1;
+    alarm(g_alarm_secs);
+    // The frame clock first: on Android the Choreographer's doFrame is what
+    // wakes the engine, and nativeRender then draws what it decided. Ticking
+    // after would hand every frame the previous one's time.
+    kl_jni_tick_choreographer();
+    kl_jni_local_frame_push();
+    int r = ((int8_t (*)(void *, void *))g_render)(kl_jni_env(), g_thiz);
+    kl_jni_local_frame_pop();
+    kl_jni_drain_ui_tasks();
     alarm(0);
-    printf("  pumped %u frames\n", i);
+    g_frames_pumped++;
+    return r;
+}
+
+void kl_app_lifecycle_report(void) {
+    printf("  pumped %u frames\n", g_frames_pumped);
     printf("\n=== P5.4: the lifecycle ran on device ===\n");
     kl_jni_report(stdout);
     kl_egl_report(stdout);
     fflush(NULL);
-    snprintf(g_status, sizeof g_status, "lifecycle ran, %u frames", i);
+    snprintf(g_status, sizeof g_status, "lifecycle ran, %u frames", g_frames_pumped);
+}
+
+int kl_app_lifecycle(unsigned frames) {
+    int rc = kl_app_lifecycle_begin();
+    if (rc) return rc;
+    printf("\n=== pumping %u frames ===\n", frames);
+    fflush(NULL);
+    while (g_frames_pumped < frames && kl_app_frame() >= 0) { }
+    kl_app_lifecycle_report();
     return 0;
 }

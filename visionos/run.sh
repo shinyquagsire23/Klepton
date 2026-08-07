@@ -14,9 +14,18 @@ cd "$(dirname "$0")"
 BUNDLE_ID="${KLEPTON_BUNDLE_ID:-dev.klepton.app}"
 MODE="${1:-sim}"
 
+# Knobs forwarded from this shell into the app, on both the device and simulator
+# paths. A list rather than a line each, because the two paths spell the same
+# thing differently (devicectl JSON vs SIMCTL_CHILD_*) and they were already
+# drifting apart. KL_ANGLE_DIR is deliberately NOT here: only the app knows
+# where its own bundle is, so kl_app_configure sets it (and an explicit one
+# still wins, since it is set with overwrite=0).
+FORWARD="KL_FRAMES KL_PERMISSIVE KL_ALARM KL_GLFB KL_GLFB_MTL KL_GLFB_OUT"
+
 echo "[1/5] runtime + guest translations…"
 (cd .. && make -s xros)
 ./mkguest.sh | tail -1
+./mkangle.sh | tail -1
 
 echo "[2/5] project…"
 python3 gen_xcodeproj.py | head -1
@@ -74,8 +83,10 @@ print(phys[0]["identifier"])
   # AMFI. Unset, the run stops at initJni, which is P4's measurement and has to
   # stay takeable.
   ENVJSON='{"KL_AUTOBOOT":"1"'
-  [ -z "${KL_FRAMES:-}" ] || ENVJSON="$ENVJSON,\"KL_FRAMES\":\"$KL_FRAMES\""
-  [ -z "${KL_PERMISSIVE:-}" ] || ENVJSON="$ENVJSON,\"KL_PERMISSIVE\":\"$KL_PERMISSIVE\""
+  for K in $FORWARD; do
+    eval "V=\${$K:-}"
+    [ -z "$V" ] || ENVJSON="$ENVJSON,\"$K\":\"$V\""
+  done
   ENVJSON="$ENVJSON}"
   if [ -z "${KL_FRAMES:-}" ]; then
     # P4's shape: --console blocks until the app terminates, which for a UI app
@@ -143,11 +154,12 @@ echo "[5/5] launching…"
 # `env`, not a bare prefix: bash only treats NAME=value as an assignment when it
 # is literally there before expansion, so ${KL_FRAMES:+SIMCTL_CHILD_KL_FRAMES=…}
 # is parsed as a *command* name and dies with "command not found".
-env SIMCTL_CHILD_KL_AUTOBOOT=1 \
-  ${KL_FRAMES:+SIMCTL_CHILD_KL_FRAMES="$KL_FRAMES"} \
-  ${KL_ALARM:+SIMCTL_CHILD_KL_ALARM="$KL_ALARM"} \
-  ${KL_PERMISSIVE:+SIMCTL_CHILD_KL_PERMISSIVE="$KL_PERMISSIVE"} \
-  xcrun simctl launch --terminate-running-process "$UDID" "$BUNDLE_ID"
+SIMENV=(SIMCTL_CHILD_KL_AUTOBOOT=1)
+for K in $FORWARD; do
+  eval "V=\${$K:-}"
+  [ -z "$V" ] || SIMENV+=("SIMCTL_CHILD_$K=$V")
+done
+env "${SIMENV[@]}" xcrun simctl launch --terminate-running-process "$UDID" "$BUNDLE_ID"
 LOG="$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data)/Documents/klepton-boot.log"
 echo "    log: $LOG"
 n=0; until [ -f "$LOG" ] || [ $n -ge 20 ]; do sleep 1; n=$((n+1)); done

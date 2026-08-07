@@ -54,6 +54,23 @@ int kl_app_boot(void);
 // Returns 0 if the sequence completed. Once per process.
 int kl_app_lifecycle(unsigned frames);
 
+// The same lifecycle, taken apart so something else can be the frame clock.
+// P5b needs this: on device the deadline belongs to Compositor Services
+// (cp_frame_predict_timing), so the compositor calls kl_app_frame() once per
+// drawable rather than the guest owning a pump loop of its own. This is also
+// why CADisplayLink was not added as an interim pacer — it would be a third
+// mechanism to then remove.
+//
+// _begin runs everything up to the first frame (the synthetic /proc report,
+// nativeRecreateGfxState, nativeResume, nativeRender) and is once per process,
+// exactly as kl_app_lifecycle is. _frame runs one frame and returns what
+// nativeRender returned, or -1 if _begin has not run. _report prints the P5.4
+// numbers. kl_app_lifecycle is implemented on top of these three, so its
+// measurement is unchanged.
+int  kl_app_lifecycle_begin(void);
+int  kl_app_frame(void);
+void kl_app_lifecycle_report(void);
+
 // Absolute path of the log kl_app_boot writes, valid after kl_app_configure.
 // The Swift side displays it and offers it for export.
 const char *kl_app_log_path(void);
