@@ -73,20 +73,87 @@ uint32_t klx_substitute(uint32_t insn, const klx_info *info, unsigned reg);
 // ---------- veneering ----------
 #include <stdio.h>
 
+// The per-thread shadow slot, as a Darwin TSD index.
+//
+// It is baked into every veneer as the immediate of `ldr b, [a, #SLOT*8]`, so it
+// MUST be a build-time constant: klepton-ld emits veneers offline, where no
+// pthread key exists yet, and a runtime-chosen slot cannot be patched in later
+// without writing to a dyld-mapped __TEXT — the exact thing M1b exists to stop.
+//
+// The constant is nevertheless a REAL pthread key, claimed at runtime, not a
+// squatted reserved slot. kl_x18_init() calls pthread_key_create in a loop until
+// it is handed exactly this key, keeps it, and releases the ones it collected on
+// the way. Darwin allocates external keys upward from 258 and never returns one
+// that is currently held, so the walk terminates here and the key is genuinely
+// ours; if something else already holds it, we fail loudly instead of sharing.
+//
+// SQUATTING A RESERVED SLOT WAS TRIED FIRST AND IS WRONG. Slot 200 looked ideal:
+// Darwin's assigned blocks are the pthread/libc internals at 0-9 and per-
+// framework blocks running to roughly 130, the dynamic range starts at 258, and
+// surveying the live TSD array with ANGLE, Metal and QuartzCore loaded showed
+// only 0,1,2,3,4,7,20,25,40,43,55,114 occupied. It still corrupted the process:
+// a 30-frame lifecycle run died in `malloc: pointer being freed was not
+// allocated: 0x3` — 0x3 being a guest x18 value that some libSystem consumer of
+// that slot then read back as its own pointer.
+//
+// The survey was the bug. It proved the slot was empty at three *instants*, not
+// that it was unowned; a slot used transiently reads as zero whenever you are
+// not looking. There is no sampling schedule that establishes ownership, which
+// is why this is now a claimed key rather than a measured-free one.
+#define KLX_TSD_SLOT 300
+
+// Longest veneer, in instructions. Public because klepton-ld sizes its pool from
+// the site count before it emits anything.
+#define KLX_VEN_MAX_INSN 8
+
 typedef struct {
     unsigned sites;     // instructions found naming x18
     unsigned patched;   // veneers installed
     unsigned refused;   // sites left alone — still broken, and reported by name
 } kl_x18_stats;
 
-// Allocate the per-thread shadow slot and check the assumptions the emitted code
-// depends on. Returns 0 on success; non-zero means veneering must not be used.
+// Check the assumptions the emitted code depends on: thread-pointer alignment
+// and that KLX_TSD_SLOT is actually free. Returns 0 on success; non-zero means
+// veneering must not be used. The runtime loader calls it before patching, and
+// kl_load_dylib() calls it too — a translated image arrives with the slot
+// already baked into its text, so a collision there is fatal rather than
+// recoverable, and has to be found at load time instead of as a wrong answer.
 int  kl_x18_init(void);
+
+// Emit veneers for every x18 site in an executable range. Pure with respect to
+// memory: it writes only into `code` and `pool`, and takes the addresses those
+// buffers will have *when executed* separately, so the same emitter serves the
+// runtime loader (where they are equal to the pointers) and klepton-ld (where
+// the image is a file buffer being laid out for a future mapping).
+//
+// Splitting this out is what lets the offline pass and the load-time pass share
+// one implementation — which matters because `make x18` and `make guest` only
+// validate the one they can reach.
+int  kl_x18_emit(void *code, size_t size, uint64_t code_va,
+                 void *pool, size_t poolcap, uint64_t pool_va,
+                 kl_x18_stats *st, size_t *pool_used);
 
 // Patch every x18 site in an executable range, which must still be writable.
 // `code` is where it is mapped now. Idempotent per range only in the sense that
 // it should be called once, before the segment is made read-execute.
 int  kl_x18_patch(void *code, size_t size, kl_x18_stats *st);
+
+// Count x18 sites without emitting anything — klepton-ld sizes its pool with it.
+unsigned kl_x18_count(const void *code, size_t size);
+
+// What an offline translation did, recorded in the emitted image's
+// __TEXT,__klstat section. A translated library has no sites left to count at
+// load time — the veneers are already in its text — so without this the loader
+// would report "x18 sites: 0", which reads as "this library never needed any"
+// rather than "this was handled at translation time". Silent zeros are worse
+// than errors (CLAUDE.md trap 6d).
+#define KLX_STAT_MAGIC 0x38315838u   /* "8X18" */
+typedef struct {
+    uint32_t magic;
+    uint32_t sites, patched, refused;
+    uint32_t tls_rewrites;
+    uint32_t slot;          // KLX_TSD_SLOT the veneers were built against
+} klx_stat_section;
 
 // Encodings that were refused, with counts — the work list for extending the
 // decoder. Prints nothing when there are none.

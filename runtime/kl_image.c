@@ -436,13 +436,37 @@ kl_image *kl_load_dylib(const char *path) {
 
     if (bind_dynamic(img, ph, eh->e_phnum, lo) != 0) { free(img); dlclose(h); return NULL; }
 
-    // The rewrites the mmap loader does here happened offline. Report what
-    // klepton-ld already applied, so the two paths' stats stay comparable.
-    for (int i = 0; i < eh->e_phnum; i++) {
-        if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
-        const uint32_t *w = (const uint32_t *)(img->base + ph[i].p_vaddr - lo);
-        for (size_t k = 0; k + 4 <= ph[i].p_filesz; k += 4, w++)
-            if ((*w & 0xffffffe0u) == 0xd53bd060u) img->stats.tls_rewrites++;
+    // The TLS rewrite and the x18 veneers were applied offline, so there is
+    // nothing left in this image to count — which is precisely why klepton-ld
+    // records what it did. Reporting a computed 0 here would read as "this
+    // library never needed any", not "this was handled at translation time".
+    unsigned long statsz = 0;
+    const klx_stat_section *rec =
+        (const klx_stat_section *)getsectiondata(mh, "__TEXT", "__klstat", &statsz);
+    if (rec && statsz >= sizeof *rec && rec->magic == KLX_STAT_MAGIC) {
+        img->stats.tls_rewrites = rec->tls_rewrites;
+        img->stats.x18_sites    = rec->sites;
+        img->stats.x18_patched  = rec->patched;
+        img->stats.x18_refused  = rec->refused;
+
+        // The veneers carry a TSD slot chosen at translation time. If this
+        // process cannot have that slot, every one of them reads and writes
+        // somebody else's per-thread state — wrong in both directions and
+        // silent. It is baked into the text, so there is no recovering: fail
+        // here, at load, rather than as a wrong answer later.
+        if (rec->patched) {
+            if (rec->slot != KLX_TSD_SLOT) {
+                err("%s was translated against TSD slot %u but this runtime uses "
+                    "%d — rebuild it with a matching klepton-ld",
+                    real, rec->slot, KLX_TSD_SLOT);
+                free(img); dlclose(h); return NULL;
+            }
+            if (kl_x18_init() != 0) {
+                err("%s needs x18 veneering but TSD slot %d is unavailable in this "
+                    "process", real, KLX_TSD_SLOT);
+                free(img); dlclose(h); return NULL;
+            }
+        }
     }
 
     if (getenv("KL_TRACE_IMAGES"))

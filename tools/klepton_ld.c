@@ -83,7 +83,7 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define SHF_EXECINSTR 0x4
 
 #define PAGE 0x4000ull                 // 16 KB — Apple's page on arm64
-#define IMAGE_SHIFT 0x4000ull          // S: room for the Mach-O header below the image
+#define HDR_RESERVE 0x4000ull          // room for the Mach-O header and load commands
 
 static uint64_t align_up(uint64_t v, uint64_t a)   { return (v + a - 1) & ~(a - 1); }
 static uint64_t align_down(uint64_t v, uint64_t a) { return v & ~(a - 1); }
@@ -110,24 +110,14 @@ static unsigned rewrite_tls(uint8_t *p, size_t n) {
     return hits;
 }
 
-// Count x18 sites with the real S0.5 decoder, not a bit-field guess. Which
-// fields of an encoding are general-purpose registers — as opposed to
+// x18 sites are found with the real S0.5 decoder, never a bit-field guess.
+// Which fields of an encoding are general-purpose registers — as opposed to
 // immediates, condition codes or vector registers — is exactly what klx_decode
 // exists to decide, and guessing gets it wrong in the unsafe direction: a naive
 // "does any 5-bit field equal 18" scan reports 2158 sites in libunityopus.so,
-// where the decoder correctly reports 0. This is a count only; emitting the
-// veneers offline is the P4 work (PLANNING §12.2), and until then an image with
-// real sites is refused rather than translated wrongly.
-static unsigned count_x18(const uint8_t *p, size_t n) {
-    unsigned hits = 0;
-    const uint32_t *w = (const uint32_t *)p;
-    for (size_t i = 0; i + 4 <= n; i += 4, w++) {
-        klx_info info;
-        klx_decode(*w, &info);
-        if (info.nfields) hits++;
-    }
-    return hits;
-}
+// where the decoder correctly reports 0. kl_x18_count/kl_x18_emit are the same
+// code the runtime loader uses, which matters because `make x18` and
+// `make guest` can only validate one implementation.
 
 struct platform { const char *name; uint32_t id; uint32_t minos, sdk; };
 static const struct platform PLATFORMS[] = {
@@ -217,31 +207,72 @@ int main(int argc, char **argv) {
     if (!img) die("out of memory");
     memcpy(img, f, (size_t)sb.st_size);
 
-    unsigned tls_rewrites = 0, x18_suspect = 0;
+    unsigned tls_rewrites = 0, x18_sites = 0;
     const Elf64_Shdr *sh = (eh->e_shoff && eh->e_shnum)
                          ? (const Elf64_Shdr *)(f + eh->e_shoff) : NULL;
     if (!sh) die("%s has no section headers — cannot separate code from rodata "
                  "(see CLAUDE.md trap 0); refusing to rewrite", in);
+
+    // Pass 1: the TLS rewrite, and a site count so the veneer pool can be sized
+    // before the layout is chosen. TLS first, then count — the same order the
+    // runtime loader uses, and it matters: `mrs x18, tpidr_el0` is itself an x18
+    // site, and rewriting it changes the word the decoder then sees.
     for (int i = 0; i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
         tls_rewrites += rewrite_tls(img + sh[i].sh_offset, (size_t)sh[i].sh_size);
-        x18_suspect  += count_x18(img + sh[i].sh_offset, (size_t)sh[i].sh_size);
+        x18_sites    += kl_x18_count(img + sh[i].sh_offset, (size_t)sh[i].sh_size);
     }
-    if (x18_suspect)
-        die("%s has %u instructions naming x18; the offline veneer pass is not "
-            "wired up yet (PLANNING §12.2). Refusing rather than emitting an "
-            "image that would be silently wrong.", in, x18_suspect);
 
     // ---- lay out the Mach-O ----
-    // Segment k covers [seg_vm[k], seg_vm[k+1]) — contiguous, no holes.
+    // The veneer pool lives *before* the guest image, inside __TEXT, which is
+    // why the image shift is computed rather than fixed: S grows to make room.
+    // Putting it there rather than in a segment of its own keeps the file to two
+    // loadable segments and keeps every `b` well inside its +/-128 MB reach —
+    // the furthest any site can be from the pool is the image's own span, and
+    // the largest guest library here is libil2cpp at 57 MB.
+    uint64_t pool_va   = HDR_RESERVE;                       // right after the header
+    uint64_t pool_cap  = (uint64_t)x18_sites * KLX_VEN_MAX_INSN * 4;
+    uint64_t image_shift = align_up(pool_va + pool_cap, PAGE);
+
+    uint8_t *pool = NULL;
+    if (pool_cap) { pool = calloc(1, (size_t)pool_cap); if (!pool) die("out of memory"); }
+
+    // Pass 2: emit. Each section's veneers take the next slice of the pool, and
+    // the addresses handed in are the ones the code will have once mapped — the
+    // buffers here are a file image, not a mapping.
+    kl_x18_stats x18st = {0};
+    uint64_t pool_off = 0;
+    for (int i = 0; i < eh->e_shnum && pool_cap; i++) {
+        if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
+        kl_x18_stats st;
+        size_t used = 0;
+        if (kl_x18_emit(img + sh[i].sh_offset, (size_t)sh[i].sh_size,
+                        image_shift + sh[i].sh_addr,
+                        pool + pool_off, (size_t)(pool_cap - pool_off),
+                        pool_va + pool_off, &st, &used) != 0)
+            die("x18 veneer emission failed for section %d", i);
+        x18st.sites   += st.sites;
+        x18st.patched += st.patched;
+        x18st.refused += st.refused;
+        pool_off      += used;
+    }
+    if (x18st.refused) {
+        // Same posture as the runtime loader: a refused site keeps its raw x18
+        // and stays exposed to trap 0, so it is reported rather than hidden. The
+        // two known ones are libunity's `br x18` jump tables (PLANNING S0.5).
+        fprintf(stderr, "klepton-ld: %s: %u of %u x18 sites refused — still "
+                        "exposed to trap 0:\n", in, x18st.refused, x18st.sites);
+        kl_x18_report(stderr);
+    }
+
     uint64_t seg_vm[10], seg_vmend[10], seg_foff[10], seg_fsize[10];
     for (int g = 0; g < ngrp; g++) {
-        uint64_t want = IMAGE_SHIFT + grp[g].vlo;
+        uint64_t want = image_shift + grp[g].vlo;
         seg_vm[g] = (g == 0) ? 0 : align_down(want, PAGE);
         if (g && seg_vm[g] < seg_vmend[g - 1])
             die("segment %d would overlap the previous one (image shift %#llx is "
-                "too small for this library's layout)", g, (unsigned long long)IMAGE_SHIFT);
-        seg_vmend[g] = align_up(IMAGE_SHIFT + grp[g].vhi_mem, PAGE);
+                "too small for this library's layout)", g, (unsigned long long)image_shift);
+        seg_vmend[g] = align_up(image_shift + grp[g].vhi_mem, PAGE);
     }
     // Make them gapless: each segment runs up to the next one's start.
     for (int g = 0; g + 1 < ngrp; g++) seg_vmend[g] = seg_vm[g + 1];
@@ -251,7 +282,7 @@ int main(int argc, char **argv) {
         seg_foff[g]  = align_up(seg_foff[g], PAGE);
         // File content stops at the end of initialised data; the rest is .bss,
         // which dyld supplies as zero pages beyond filesize.
-        seg_fsize[g] = (IMAGE_SHIFT + grp[g].vhi_file) - seg_vm[g];
+        seg_fsize[g] = (image_shift + grp[g].vhi_file) - seg_vm[g];
         if (g == 0) seg_fsize[g] = seg_vmend[0];   // __TEXT: file covers the whole segment
     }
     uint64_t linkedit_vm   = seg_vmend[ngrp - 1];
@@ -266,7 +297,12 @@ int main(int argc, char **argv) {
     else snprintf(iname, sizeof iname, "@rpath/%s.framework/%s", base, base);
 
     const char *libsystem = "/usr/lib/libSystem.B.dylib";
-    uint32_t sz_text = sizeof(struct segment_command_64) + sizeof(struct section_64);
+    // __TEXT carries the guest image (__klelf), the veneer pool (__klx18, absent
+    // when the library has no x18 sites), and a small record of what this
+    // translation did (__klstat) parked at the top of the header reserve.
+    uint32_t nsect_text = 2 + (pool_off ? 1 : 0);
+    uint64_t stat_va = HDR_RESERVE - 64;
+    uint32_t sz_text = sizeof(struct segment_command_64) + nsect_text * sizeof(struct section_64);
     uint32_t sz_data = sizeof(struct segment_command_64) + sizeof(struct section_64);
     uint32_t sz_link = sizeof(struct segment_command_64);
     uint32_t sz_id   = (uint32_t)align_up(sizeof(struct dylib_command) + strlen(iname) + 1, 8);
@@ -282,9 +318,9 @@ int main(int argc, char **argv) {
     if (ngrp < 2) { ncmds--; sz_data = 0; }
     uint32_t sizeofcmds = sz_text + sz_data + sz_link + sz_id + sz_ld + sz_bv +
                           sz_st + sz_dst + sz_uuid;
-    if (sizeof(struct mach_header_64) + sizeofcmds > IMAGE_SHIFT)
+    if (sizeof(struct mach_header_64) + sizeofcmds > HDR_RESERVE)
         die("load commands (%u bytes) do not fit below the image shift %#llx",
-            sizeofcmds, (unsigned long long)IMAGE_SHIFT);
+            sizeofcmds, (unsigned long long)HDR_RESERVE);
 
     // __LINKEDIT holds a minimal (empty) symbol table. There is nothing for
     // dyld to bind — MH_NOUNDEFS — and nothing to export, because the runtime
@@ -315,11 +351,32 @@ int main(int argc, char **argv) {
         s->vmaddr = seg_vm[0]; s->vmsize = seg_vmend[0] - seg_vm[0];
         s->fileoff = seg_foff[0]; s->filesize = seg_fsize[0];
         s->maxprot = s->initprot = VM_PROT_READ | VM_PROT_EXECUTE;
-        s->nsects = 1; s->flags = 0;
+        s->nsects = nsect_text; s->flags = 0;
         struct section_64 *sec = (struct section_64 *)(s + 1);
+
+        strncpy(sec->sectname, "__klstat", 16);
+        strncpy(sec->segname,  "__TEXT",   16);
+        sec->addr   = stat_va;
+        sec->size   = sizeof(klx_stat_section);
+        sec->offset = (uint32_t)(seg_foff[0] + (stat_va - seg_vm[0]));
+        sec->align  = 3;
+        sec->flags  = S_REGULAR;
+        sec++;
+
+        if (pool_off) {
+            strncpy(sec->sectname, "__klx18", 16);
+            strncpy(sec->segname,  "__TEXT",  16);
+            sec->addr   = pool_va;
+            sec->size   = pool_off;
+            sec->offset = (uint32_t)(seg_foff[0] + (pool_va - seg_vm[0]));
+            sec->align  = 2;
+            sec->flags  = S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
+            sec++;
+        }
+
         strncpy(sec->sectname, "__klelf", 16);
         strncpy(sec->segname,  "__TEXT",  16);
-        sec->addr = IMAGE_SHIFT + grp[0].vlo;
+        sec->addr = image_shift + grp[0].vlo;
         sec->size = grp[0].vhi_file - grp[0].vlo;
         sec->offset = (uint32_t)(seg_foff[0] + (sec->addr - seg_vm[0]));
         sec->align = 14;                       // 16 KB
@@ -338,7 +395,7 @@ int main(int argc, char **argv) {
         struct section_64 *sec = (struct section_64 *)(s + 1);
         strncpy(sec->sectname, "__kldata", 16);
         strncpy(sec->segname,  "__DATA",   16);
-        sec->addr = IMAGE_SHIFT + grp[1].vlo;
+        sec->addr = image_shift + grp[1].vlo;
         sec->size = grp[1].vhi_file - grp[1].vlo;
         sec->offset = (uint32_t)(seg_foff[1] + (sec->addr - seg_vm[1]));
         sec->align = 4;
@@ -414,10 +471,20 @@ int main(int argc, char **argv) {
         lc += sz_uuid;
     }
 
+    // ---- the veneer pool and the translation record ----
+    // Both live in __TEXT below the image, so seg_foff[0] + vmaddr is the file
+    // offset (segment 0 starts at vmaddr 0 and fileoff 0).
+    if (pool_off) memcpy(o + seg_foff[0] + pool_va, pool, (size_t)pool_off);
+    {
+        klx_stat_section rec = { KLX_STAT_MAGIC, x18st.sites, x18st.patched,
+                                 x18st.refused, tls_rewrites, KLX_TSD_SLOT };
+        memcpy(o + seg_foff[0] + stat_va, &rec, sizeof rec);
+    }
+
     // ---- copy the image, LOAD by LOAD, at its shifted address ----
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
-        uint64_t vm = IMAGE_SHIFT + ph[i].p_vaddr;
+        uint64_t vm = image_shift + ph[i].p_vaddr;
         int g = 0;
         for (int k = 0; k < ngrp; k++)
             if (vm >= seg_vm[k] && vm < seg_vmend[k]) { g = k; break; }
@@ -440,7 +507,7 @@ int main(int argc, char **argv) {
         printf("  platform      %s (LC_BUILD_VERSION platform=%u)\n", plat->name, plat->id);
         printf("  install name  %s\n", iname);
         printf("  image shift   %#llx   (ELF vaddr V lives at macho vmaddr S+V)\n",
-               (unsigned long long)IMAGE_SHIFT);
+               (unsigned long long)image_shift);
         for (int g = 0; g < ngrp; g++)
             printf("  %-10s vm %#09llx..%#09llx  file %#09llx+%#llx  (ELF %#llx..%#llx)\n",
                    g == 0 ? "__TEXT" : "__DATA",
@@ -450,8 +517,11 @@ int main(int argc, char **argv) {
         if (ngrp >= 2)
             printf("  text->data delta preserved: ELF %#llx, macho %#llx (same)\n",
                    (unsigned long long)(grp[1].vlo - grp[0].vlo),
-                   (unsigned long long)((IMAGE_SHIFT + grp[1].vlo) - (IMAGE_SHIFT + grp[0].vlo)));
-        printf("  TLS rewrites  %u   x18 sites %u\n", tls_rewrites, x18_suspect);
+                   (unsigned long long)((image_shift + grp[1].vlo) - (image_shift + grp[0].vlo)));
+        printf("  TLS rewrites  %u\n", tls_rewrites);
+        printf("  x18 sites     %u   veneered %u   refused %u   (pool %#llx bytes at %#llx)\n",
+               x18st.sites, x18st.patched, x18st.refused,
+               (unsigned long long)pool_off, (unsigned long long)pool_va);
         printf("  total         %llu bytes\n", (unsigned long long)total);
     }
     return 0;

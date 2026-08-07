@@ -322,9 +322,11 @@ uint32_t klx_substitute(uint32_t w, const klx_info *info, unsigned reg) {
 // dropped for scratch registers rather than x18 itself, and a, b are ordinary
 // registers that survive preemption normally — which is the whole reason this
 // is sound where the architectural x18 is not.
-#define VEN_MAX_INSN 8
+#define VEN_MAX_INSN KLX_VEN_MAX_INSN
 #define REFUSE_KINDS 24
 
+// The slot is a compile-time constant now (see kl_x18.h for why, and for the
+// measurement behind the number). g_slot only records that it has been checked.
 static int g_slot = -1;
 static struct { uint32_t word; unsigned n; } g_refused[REFUSE_KINDS];
 static unsigned g_nrefused_kinds, g_refused_total;
@@ -340,19 +342,56 @@ int kl_x18_init(void) {
     // access, and a misaligned base there is a silently wrong read rather than
     // a fault. Cheap to check once, so check rather than assume.
     if (tp & 7) return -1;
+    if (KLX_TSD_SLOT >= 4096) return -1;          // ldr's scaled imm12 caps the slot
 
-    pthread_key_t k;
-    if (pthread_key_create(&k, NULL) != 0) return -1;
-    if ((unsigned)k >= 4096) return -1;          // ldr's scaled imm12 caps the slot
-    // The veneer reads the slot inline as [tsd + k*8]. That is the same storage
-    // pthread_setspecific uses only for the direct range, so prove it on this
-    // key before emitting seventeen thousand copies of the assumption.
-    pthread_setspecific(k, (void *)(uintptr_t)0x5A5A5A5AU);
-    if (((void **)(uintptr_t)tp)[k] != (void *)(uintptr_t)0x5A5A5A5AU) return -1;
-    pthread_setspecific(k, NULL);
+    // Claim KLX_TSD_SLOT as a real pthread key rather than squatting it (see
+    // kl_x18.h for what squatting cost). Darwin hands out external keys upward
+    // and never reissues one that is currently held, so creating keys until it
+    // yields ours walks up to it; the ones collected on the way are released
+    // afterwards, so the process keeps its key budget.
+    #define KLX_KEY_WALK 512
+    static pthread_key_t spare[KLX_KEY_WALK];
+    unsigned nspare = 0;
+    int got = 0;
+    for (unsigned i = 0; i < KLX_KEY_WALK; i++) {
+        pthread_key_t k;
+        if (pthread_key_create(&k, NULL) != 0) break;
+        if ((unsigned)k == KLX_TSD_SLOT) { got = 1; break; }
+        if ((unsigned)k > KLX_TSD_SLOT) { spare[nspare++] = k; break; }
+        spare[nspare++] = k;
+    }
+    for (unsigned i = 0; i < nspare; i++) pthread_key_delete(spare[i]);
+    if (!got) {
+        fprintf(stderr, "  [klepton] x18: could not claim TSD key %d — something "
+                        "else in this process holds it. Veneers are baked against "
+                        "that key; see runtime/kl_x18.h.\n", KLX_TSD_SLOT);
+        return -1;
+    }
 
-    g_slot = (int)k;
+    // The veneer reads the key inline as [tsd + k*8] rather than through
+    // pthread_getspecific, so prove that the direct access agrees with the API
+    // on this key before emitting seventeen thousand copies of the assumption.
+    pthread_setspecific(KLX_TSD_SLOT, (void *)(uintptr_t)0x5A5A5A5AU);
+    if (((void **)(uintptr_t)tp)[KLX_TSD_SLOT] != (void *)(uintptr_t)0x5A5A5A5AU) {
+        fprintf(stderr, "  [klepton] x18: TSD key %d is not at tsd[%d] on this OS\n",
+                KLX_TSD_SLOT, KLX_TSD_SLOT);
+        return -1;
+    }
+    pthread_setspecific(KLX_TSD_SLOT, NULL);
+
+    g_slot = KLX_TSD_SLOT;
     return 0;
+}
+
+unsigned kl_x18_count(const void *code, size_t size) {
+    const uint32_t *w = (const uint32_t *)code;
+    unsigned n = 0;
+    for (size_t i = 0; i + 4 <= size; i += 4, w++) {
+        klx_info in;
+        klx_decode(*w, &in);
+        if (in.nfields) n++;
+    }
+    return n;
 }
 
 // ---------- instruction encoders ----------
@@ -435,40 +474,32 @@ static int veneer_enabled(void) {
     return cached;
 }
 
-int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
+// The emitter proper. `code_va`/`pool_va` are the addresses the two buffers will
+// have when the code executes, which is what every `b` and `adrp` is computed
+// against; the buffers themselves may live anywhere (a file image being laid out
+// offline, or the mapping itself at load time).
+int kl_x18_emit(void *code, size_t size, uint64_t code_va,
+                void *pool, size_t poolcap, uint64_t pool_va,
+                kl_x18_stats *st, size_t *pool_used) {
     memset(st, 0, sizeof *st);
 
     uint32_t *w = (uint32_t *)code;
     size_t    n = size / 4;
 
-    unsigned want = 0;
-    for (size_t i = 0; i < n; i++) {
-        klx_info in;
-        klx_decode(w[i], &in);
-        if (in.nfields) want++;
-    }
+    unsigned want = kl_x18_count(code, size);
     st->sites = want;
+    if (pool_used) *pool_used = 0;
     if (!want || !veneer_enabled()) return 0;
-    if (g_slot < 0 && kl_x18_init() != 0) return -1;
 
-    // The pool goes immediately after the code so that `b` reaches it from
-    // anywhere in the range. mmap treats the address as a hint, so the result
-    // is range-checked per site rather than assumed.
-    size_t   cap  = ((size_t)want * VEN_MAX_INSN * 4 + 0xFFFF) & ~(size_t)0xFFFF;
-    uint8_t *hint = (uint8_t *)(((uintptr_t)code + size + 0xFFFF) & ~(uintptr_t)0xFFFF);
-    uint8_t *base = mmap(hint, cap, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (base == MAP_FAILED) return -1;
-
-    uint32_t *out = (uint32_t *)base, *pool_end = (uint32_t *)(base + cap);
+    uint32_t *out = (uint32_t *)pool, *pool_end = (uint32_t *)((uint8_t *)pool + poolcap);
 
     for (size_t i = 0; i < n; i++) {
         klx_info in;
         klx_decode(w[i], &in);
         if (!in.nfields) continue;
 
-        uint64_t spc = (uint64_t)(uintptr_t)&w[i];
-        uint64_t vpc = (uint64_t)(uintptr_t)out;
+        uint64_t spc = code_va + (uint64_t)i * 4;
+        uint64_t vpc = pool_va + (uint64_t)((uint8_t *)out - (uint8_t *)pool);
         uint32_t word = w[i];
 
         if (in.hazard || in.pcrel == KLX_PC_ADR || in.pcrel == KLX_PC_LITERAL ||
@@ -486,7 +517,7 @@ int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
 
         if (in.pcrel == KLX_PC_CBZ || in.pcrel == KLX_PC_TBZ) {
             uint64_t target = br_target(word, spc, in.pcrel);
-            body[k++] = enc_ldr(b, a, (unsigned)g_slot * 8);
+            body[k++] = enc_ldr(b, a, (unsigned)KLX_TSD_SLOT * 8);
             // Inverted (bit 24 flips cbz<->cbnz and tbz<->tbnz) so the taken
             // path is a short forward skip and the real target is reached by an
             // unrestricted `b` — cbz only spans 1 MB, which the pool may exceed.
@@ -498,14 +529,14 @@ int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
             ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
         } else {
             uint32_t sub = klx_substitute(word, &in, b);
-            if (in.roles & KLX_R) body[k++] = enc_ldr(b, a, (unsigned)g_slot * 8);
+            if (in.roles & KLX_R) body[k++] = enc_ldr(b, a, (unsigned)KLX_TSD_SLOT * 8);
             if (in.pcrel == KLX_PC_ADRP) {
                 int fits;
                 sub = reenc_adrp(sub, spc, vpc + k * 4, &fits);
                 ok &= fits;
             }
             body[k++] = sub;
-            if (in.roles & KLX_W) body[k++] = enc_str(b, a, (unsigned)g_slot * 8);
+            if (in.roles & KLX_W) body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
             body[k++] = enc_ldp(a, b, -16);
             ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
         }
@@ -530,9 +561,36 @@ int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
         st->patched++;
     }
 
+    if (pool_used) *pool_used = (size_t)((uint8_t *)out - (uint8_t *)pool);
+    return 0;
+}
+
+// The load-time path: allocate a pool next to the code and emit into it. Here
+// the executing addresses *are* the buffer addresses, which is the degenerate
+// case of kl_x18_emit.
+int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
+    memset(st, 0, sizeof *st);
+
+    unsigned want = kl_x18_count(code, size);
+    st->sites = want;
+    if (!want || !veneer_enabled()) return 0;
+    if (g_slot < 0 && kl_x18_init() != 0) return -1;
+
+    // The pool goes immediately after the code so that `b` reaches it from
+    // anywhere in the range. mmap treats the address as a hint, so the result
+    // is range-checked per site rather than assumed.
+    size_t   cap  = ((size_t)want * VEN_MAX_INSN * 4 + 0xFFFF) & ~(size_t)0xFFFF;
+    uint8_t *hint = (uint8_t *)(((uintptr_t)code + size + 0xFFFF) & ~(uintptr_t)0xFFFF);
+    uint8_t *base = mmap(hint, cap, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base == MAP_FAILED) return -1;
+
+    int rc = kl_x18_emit(code, size, (uint64_t)(uintptr_t)code,
+                         base, cap, (uint64_t)(uintptr_t)base, st, NULL);
+
     mprotect(base, cap, PROT_READ | PROT_EXEC);
     sys_icache_invalidate(base, cap);
-    return 0;
+    return rc;
 }
 
 void kl_x18_report(FILE *f) {

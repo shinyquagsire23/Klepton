@@ -155,10 +155,9 @@ p2: build/klepton-ld
 	   -o build/dl_xrsim tools/dlprobe.c
 	@xcrun simctl spawn $(XRSIM) $(PWD)/build/dl_xrsim $(PWD)/build/libunityopus-xrsim.dylib
 
-# Translate every guest library klepton-ld can currently take. libunity and
-# libil2cpp are *expected* to be refused until the offline x18 veneer pass
-# exists (PLANNING §12.2) — the refusal is the point, so it is reported rather
-# than hidden, and the run below is honestly a mixed one.
+# Translate every guest library. All five go through now that the x18 veneer
+# pass runs offline; a library klepton-ld cannot take is reported rather than
+# skipped silently, so a regression here reads as one.
 .PHONY: dylibs
 dylibs: build/klepton-ld
 	@mkdir -p build/dylibs
@@ -184,11 +183,19 @@ bootdylib: dylibs build/t_boot
 	  echo "  exit=$$?"; \
 	  grep -aE 'loaded as a translated dylib|guard verified|natives registered:|ids requested:|M3 EXIT' \
 	    build/bootdylib.log
-	@echo "  NOTE: only libmain is reachable as a dylib here. libunityopus and"
-	@echo "  lib_burst_generated are never dlopen'd this early (nor in a 30-frame"
-	@echo "  lifecycle), and libunity/libil2cpp are refused above — so this run"
-	@echo "  does NOT cover the two libraries that matter. 'make loaddylib' checks"
-	@echo "  each translated library on its own."
+	@echo "  NOTE: this reaches libmain and libunity. libil2cpp arrives only in the"
+	@echo "  lifecycle ('make bootdylib-life'), and libunityopus/lib_burst_generated"
+	@echo "  are not dlopen'd by either — 'make loaddylib' covers those on their own."
+
+# The lifecycle over translated dylibs: this is the run that pulls libil2cpp in
+# and executes all 17,617 veneers out of a dyld-mapped, read-only __TEXT. Must
+# match the ELF baseline — exit 0 and 26 swaps under the null driver.
+.PHONY: bootdylib-life
+bootdylib-life: dylibs build/t_boot
+	@KL_DYLIB_DIR=$(PWD)/build/dylibs KL_FRAMES=30 KL_ALARM=60 KL_LIFECYCLE=1 \
+	  script -q /dev/null timeout 300 ./build/t_boot $(LIBS) > build/bootdylib-life.log 2>&1; \
+	  echo "  exit=$$?"; \
+	  grep -aE 'loaded as a translated dylib|eglSwapBuffers:' build/bootdylib-life.log
 
 # Load each translated library through kl_load_dylib on its own, since the boot
 # chain does not reach all of them. Import counts must match `make check`'s.
