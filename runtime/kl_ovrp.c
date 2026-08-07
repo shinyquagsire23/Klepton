@@ -257,11 +257,21 @@ static uint64_t klovrp_GetTrackingOriginType(int *out) {
 // The per-frame node loop's tracked/valid probes (0x9bbe78..0x9bbeb4): u32
 // out-param, which is why these cannot be shared handlers. Tracked and valid
 // is the honest answer for the head we pose ourselves.
+//
+// These return ovrpResult, NOT ovrpBool — the answer is the out-param and
+// SUCCESS IS 0. Returning OVRP_TRUE (1) here read as a failure code, and the
+// two callers disagree about how much that matters: libunity's node loop only
+// reads the out-param, so its nodes tracked fine and this stayed invisible,
+// while managed OVRPlugin checks `result == Result.Success` first and answers
+// false without ever looking at the out-param. That is what made
+// OVRInput.GetControllerPositionValid false with the controllers connected and
+// tracked — and with it Beat Saber's controller poses, its laser and every UI
+// hit, since VRController takes a pose only from a valid node.
 static uint64_t node_tracked(const char *name, int n, uint32_t *out) {
     ovrp_hit(name);
     ovrp_log_arg(name, n, __builtin_return_address(0));
     *out = 1;
-    return OVRP_TRUE;
+    return OVRP_SUCCESS;
 }
 static uint64_t klovrp_GetNodePositionTracked2(int n, uint32_t *o) {
     return node_tracked("ovrp_GetNodePositionTracked2", n, o);
@@ -673,6 +683,30 @@ uint64_t klovrp_GetControllerHapticsDesc_impl(int mask, void *out) {
     return OVRP_SUCCESS;
 }
 
+// ovrpResult with a bool OUT-PARAM (OVRP_1_18_0), NOT the bare ovrpBool its
+// name-mates ovrp_GetAppHasVrFocus/ovrp_GetUserPresent use. It sat in the
+// bool-yes list returning 1, and managed OVRPlugin reads that as
+//
+//     Result result = ovrp_GetAppHasInputFocus(out inputFocus);
+//     if (Result.Success == result) return inputFocus == Bool.True;
+//     return false;                       // <- 1 is not Success (0)
+//
+// so `OVRPlugin.hasInputFocus` was false while we believed we were answering
+// yes. Beat Saber hides its menu controllers while input focus is away — it
+// has inputFocusWasCaptured/Released events for exactly this — which switched
+// off the MenuControllers object and with it both saber hilts, both lasers and
+// every UI raycast. hasVrFocus stayed true throughout, which is what made the
+// pair look healthy.
+//
+// Safe to give an out-param because ONLY libil2cpp references this name;
+// libunity does not (checked against both binaries). ovrp_GetAppHasVrFocus is
+// referenced by both and really is a bare bool, so it stays where it is.
+static uint64_t klovrp_GetAppHasInputFocus(char *out) {
+    ovrp_hit("ovrp_GetAppHasInputFocus");
+    if (out) *out = 1;
+    return OVRP_SUCCESS;
+}
+
 // ovrpResult with a bool OUT-PARAM (real plugin: ldrb/str w8 to [x0],
 // -1001 on NULL). We accepted ovrp_SetAppAsymmetricFov at init, so the
 // read-back says enabled — one device story, like the headset above.
@@ -823,6 +857,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetControllerState", (void *)klovrp_GetControllerState_entry},
     {"ovrp_GetControllerState4", (void *)klovrp_GetControllerState4},
     {"ovrp_GetAppAsymmetricFov", (void *)klovrp_GetAppAsymmetricFov},
+    {"ovrp_GetAppHasInputFocus", (void *)klovrp_GetAppHasInputFocus},
     {"ovrp_GetNativeXrApiType", (void *)klovrp_GetNativeXrApiType},
     {"ovrp_GetSystemDisplayAvailableFrequencies", (void *)klovrp_GetSystemDisplayAvailableFrequencies},
     {"ovrp_SetupEyeTexture2", (void *)klovrp_SetupEyeTexture2},
@@ -901,8 +936,18 @@ static const char *const g_ovrp_bool_yes[] = {
     // Per-frame predicates (0x9bbe58 gate; focus gates whether Unity renders
     // at all). The head is present and the app is focused: true.
     "ovrp_GetNodePresent", "ovrp_GetAppHasVrFocus", "ovrp_GetUserPresent",
+    // The OVRP_0_1_2 shape of the tracked predicates: these return ovrpBool
+    // DIRECTLY, where the ...Tracked2/...Valid forms above take a u32
+    // out-param and return ovrpResult — same question, two ABIs, and only the
+    // out-param pair was answered. Managed OVRPlugin reaches for these from
+    // OVRInput.GetControllerPositionTracked, so a controller-tracking query
+    // from the game's own C# (not libunity's node loop) landed on the
+    // unimplemented trampoline and aborted the run.
+    "ovrp_GetNodePositionTracked", "ovrp_GetNodeOrientationTracked",
     // We answered ovrp_Initialize5 with success and stand behind it.
-    "ovrp_GetInitialized", "ovrp_GetAppHasInputFocus",
+    // NOT ovrp_GetAppHasInputFocus — that one is ovrpResult + out-param, see
+    // klovrp_GetAppHasInputFocus below.
+    "ovrp_GetInitialized",
     // Agrees with ovrp_Media_Initialize's success above.
     "ovrp_Media_GetInitialized",
     // Setup calls whose return the guest ignores (0x9bba0c, 0x9bcd5c); 1 for

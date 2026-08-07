@@ -8,7 +8,7 @@ RUNTIME := runtime/kl_image.c runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S \
            runtime/kl_ovrplat.c runtime/kl_mediandk.c runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
-           runtime/kl_il2cpp.c runtime/kl_sample.c
+           runtime/kl_il2cpp.c runtime/kl_sample.c runtime/kl_mprobe.c
 
 .PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
 all: build/t_opus
@@ -118,7 +118,7 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/t_boot
 	 else echo "=== guest differential: SKIPPED (set ANDROID_NDK_HOME) ==="; fi
 	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so beatsaber/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log
 	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/t_boot $(LIBS) > build/boot.log 2>/dev/null && \
-	  grep -E 'guard verified|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|M3 EXIT|M4 \(partial\)' build/boot.log
+	  grep -E 'guard verified|DLC enumeration|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|M3 EXIT|M4 \(partial\)' build/boot.log
 
 # ---- graphics spikes (host-only, not part of `make check`) ----
 # S0.7/S0.8 probe Apple's desktop GL; S0.9 probes ANGLE. None of them link the

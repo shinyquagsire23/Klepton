@@ -251,6 +251,58 @@ handler).
   derived from the libdir argument (`<apk>/lib/arm64-v8a` →
   `<apk>/assets/bin/Data/Managed/Metadata/global-metadata.dat`).
 
+## Managed-side probe (`runtime/kl_mprobe.c`)
+
+Calls Unity's **own C#** from the host, through the IL2CPP embedding API that
+libil2cpp exports (domain → assembly → image → class → `MethodInfo` →
+`il2cpp_runtime_invoke`). Every other instrument measures the native side of the
+boundary; this one measures the far side, which is where a wrongly-encoded
+status answer actually shows up. It is what found the `ovrpResult`-vs-`ovrpBool`
+trap (CLAUDE.md trap 10) and named `MenuControllers` as the disabled object
+behind "no controllers render". Diagnostic only, off unless asked for.
+
+- `KL_PROBE_INPUT=1` — turn it on. Each tick prints:
+  - **axes** — `Input.GetAxis` for the eight axes this title binds
+    (`TriggerLeftHand`/`Right`, the two sticks, the menu buttons).
+  - **OVRInput** — `GetConnectedControllers`, and per hand
+    `GetControllerPositionValid` / `PositionTracked` /
+    `GetLocalControllerPosition` / `Rotation`. This is the game's own pose
+    seam: `VRController::Update` → `IVRPlatformHelper::GetNodePose` → OVRInput
+    → `InputTracking` node states → libunity → our ovrp answers.
+  - **focus** — `OVRPlugin.hasInputFocus` / `hasVrFocus` / `userPresent`. The
+    first two disagreeing is the tell for the trap: `hasVrFocus` is a bare
+    `ovrpBool`, `hasInputFocus` is `ovrpResult` + out-param.
+  - **xr** — `XRSettings.loadedDeviceName`, `XRDevice.model`, `enabled`,
+    `isPresent`. Expected: `device="Oculus" model="Oculus Quest 2" 1 1`. This
+    is how the game picks between its four `IVRPlatformHelper` implementations
+    — a wrong answer here selects `DevicelessVRHelper`, whose `GetNodePose`
+    reports no pose *by design*.
+  - **scene** — active/total counts per type (see `KL_PROBE_TYPES`).
+  - **VRController** — each controller's `active`, node, position, and its
+    **parent chain** with `activeSelf`/`activeInHierarchy` at every level. An
+    object can be invisible because a *parent* is off, and only the ancestor
+    actually switched off is worth explaining.
+- `KL_PROBE_FROM=<frame>` — first frame to probe. **Default 1200, and not
+  cosmetic:** the first call into a managed class runs its `cctor`, and touching
+  `OVRInput`/`OVRPlugin` before the guest has loaded the plugin drags the
+  runtime down paths it would not take on its own. One such run aborted on an
+  ovrp entry point the game only reaches from there. A probe that perturbs the
+  run it measures is worse than no probe.
+- `KL_PROBE_EVERY=<frames>` — interval, default 120.
+- `KL_PROBE_TYPES=<a,b,...>` — types to census, as `Namespace.Type` (bare name
+  for the global namespace); default is the menu pointer chain
+  (`VRUIControls.VRPointer,…VRInputModule,…VRLaserPointer,…VRGraphicRaycaster`).
+  Prints `active/total`: `FindObjectsOfType` sees only components on **active**
+  objects, `Resources.FindObjectsOfTypeAll` includes inactive ones, and the gap
+  between the two is the measurement — `VRLaserPointer=0/1` means the laser
+  exists and is switched off.
+
+**One caveat, recorded so it is not trusted.** The probe also prints
+`eventsystem: overUI=...`, which stays `no` even when the pointer works:
+`EventSystem.IsPointerOverGameObject()`'s zero-argument overload asks about
+pointer id −1 (the mouse), while this title's `VRInputModule` uses its own id.
+It is a blind detector, not evidence that the ray misses.
+
 ## XR runtime / controllers (`runtime/kl_ovrp.c`)
 
 Poses live in the space the guest asked for with `ovrp_SetTrackingOriginType`.

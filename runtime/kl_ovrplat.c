@@ -46,12 +46,51 @@ static int permissive(void) {
 //   IAP       — purchases and their ownership records.
 //   AssetFile — download and unlock of purchasable DLC; the delivery half of the
 //               same question. ovr_AssetFile_* is how paid content arrives.
+//               Note the g_plat_absent carve-out above: the pure *enumeration*
+//               call is answered with "nothing here", which grants no access.
 //   Purchase  — belt and braces for the SDK's other spelling of IAP.
 static const char *const g_drm_markers[] = {
     "Entitle", "Entitlement", "IAP", "Purchase", "AssetFile", "AssetDetails",
 };
 
+// The carve-out: ownership-ADJACENT calls we answer, because the honest answer
+// grants nothing.
+//
+// The line PLANNING 8 draws is against fabricating a POSITIVE entitlement —
+// telling the app the user owns something they do not. Reporting that no DLC is
+// present is the opposite of that. It unlocks nothing, it is strictly more
+// restrictive than the truth, and it is the same "the platform is absent" story
+// ovr_IsPlatformInitialized and ovr_PopMessage already tell. No content is
+// reachable through a run that answers this which was not reachable through a
+// run that aborted on it.
+//
+// Exact names, not substrings, and checked BEFORE the markers below — so the
+// marker list keeps its fail-closed default and anything new still lands on the
+// refusal. Each entry has to earn its place on the "enumerates, never grants"
+// test:
+//
+//   ovr_AssetFile_GetList — enumerates the DLC asset files present on this
+//     device. There are none, and saying so is a fact about this host rather
+//     than a licence decision. It carries no entitlement flag: the ownership
+//     question is asked by the Entitlement/IAP families, which stay refused,
+//     as does everything that could DELIVER content (ovr_AssetFile_Download*).
+//
+// Answered through klplat_init_fails, i.e. request id 0: the platform request
+// APIs are asynchronous and ovr_PopMessage never produces a message, so a
+// plausible id would leave the caller polling forever for a completion that
+// cannot come. 0 puts it on the error path it already has.
+static const char *const g_plat_absent[] = {
+    "ovr_AssetFile_GetList",
+};
+
+static int plat_is_absent_ok(const char *name) {
+    for (size_t i = 0; i < sizeof g_plat_absent / sizeof g_plat_absent[0]; i++)
+        if (strcmp(name, g_plat_absent[i]) == 0) return 1;
+    return 0;
+}
+
 static int plat_is_drm(const char *name) {
+    if (plat_is_absent_ok(name)) return 0;
     for (size_t i = 0; i < sizeof g_drm_markers / sizeof g_drm_markers[0]; i++)
         if (strstr(name, g_drm_markers[i])) return 1;
     return 0;
@@ -196,9 +235,89 @@ static const char *const g_plat_request[] = {
     "ovr_User_GetLoggedInUser",
 };
 
+// Whole families where EVERY entry point is request-returning, so the same
+// answer is right for all of them and an exact list would only stop the run
+// once per name for nothing.
+//
+//   ovr_Achievements_* — progress and definitions for achievements. All nine
+//     calls (AddCount, AddFields, Unlock, GetAllDefinitions, GetAllProgress,
+//     GetDefinitionsByName, GetProgressByName and the two ArrayPage walkers)
+//     return an ovrRequest. This is not an ownership question: achievements
+//     record what the player has done, not what they have bought, and 0 says
+//     the request could not be made rather than reporting any progress. The
+//     entitlement families are unaffected — plat_is_drm runs first.
+//   ovr_GroupPresence_* — "who are you playing with", the multiplayer presence
+//     the invite/roster panels read. Ownership does not enter into it, and the
+//     trailing underscore keeps this clear of ovr_GroupPresenceOptions_* below,
+//     which is a different shape entirely.
+static const char *const g_plat_request_prefix[] = {
+    "ovr_Achievements_", "ovr_GroupPresence_",
+};
+
+// ---------------------------------------------------------------------------
+// Options objects: ovr_<Thing>Options_Create / _Set<Field> / _Destroy.
+//
+// Not requests and not queries — a local builder the caller fills in and then
+// hands to a request call. Create returns an opaque handle, so 0 is the one
+// answer that is NOT safe here: the guest would carry a NULL through to the
+// setters, and on a real platform that is a null deref inside the library.
+//
+// We hand back a non-NULL cookie instead. Nothing reads it: the setters are
+// no-ops because the request the options would feed cannot be made anyway
+// (ovr_GroupPresence_Set and friends answer 0 above), so there is no state
+// worth keeping and one shared cookie serves every live options object. That
+// is invented behaviour in the narrow sense, but it invents no ANSWER — the
+// guest learns nothing from it that it did not itself put in.
+//
+// Entitlement spellings never reach here: plat_is_drm runs first, so
+// ovr_IAPOptions_* and the rest still refuse.
+// Outbound-only calls: the guest hands us something and asks nothing back.
+// Accepted and dropped, which is not a stub standing in for an answer — there
+// is no answer involved. Same treatment as the haptics commands in kl_ovrp.c.
+//
+//   ovr_Log_NewEvent(name, ovrKeyValuePair *, count) — analytics. Telemetry
+//     with no service behind it goes nowhere, and a headset that is not
+//     attached to an Oculus account has nowhere to send it anyway.
+static const char *const g_plat_drop[] = {
+    "ovr_Log_NewEvent",
+};
+
+static int plat_is_drop(const char *name) {
+    for (size_t i = 0; i < sizeof g_plat_drop / sizeof g_plat_drop[0]; i++)
+        if (strcmp(g_plat_drop[i], name) == 0) return 1;
+    return 0;
+}
+
+static const char g_options_cookie[] = "klepton-ovr-options";
+
+static uint64_t klplat_options_create(const char *name) {
+    plat_hit(name);
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [plat] %s -> opaque cookie (options objects are local "
+                        "state; the request they feed cannot be made)\n", name);
+    }
+    return (uint64_t)(uintptr_t)g_options_cookie;
+}
+
+static int plat_is_options_create(const char *name) {
+    return strstr(name, "Options_Create") != NULL;
+}
+
+// The setters and the destructor. Both are genuinely nothing to do, not stubs
+// standing in for something: there is no options state to keep.
+static int plat_is_options_sink(const char *name) {
+    return strstr(name, "Options_Destroy") != NULL ||
+           strstr(name, "Options_Set") != NULL;
+}
+
 static int plat_is_request(const char *name) {
     for (size_t i = 0; i < sizeof g_plat_request / sizeof g_plat_request[0]; i++)
         if (strcmp(g_plat_request[i], name) == 0) return 1;
+    for (size_t i = 0; i < sizeof g_plat_request_prefix / sizeof g_plat_request_prefix[0]; i++)
+        if (strncmp(name, g_plat_request_prefix[i],
+                    strlen(g_plat_request_prefix[i])) == 0) return 1;
     return 0;
 }
 
@@ -238,7 +357,13 @@ void *kl_ovrplat_sym(const char *name) {
         if (strcmp(g_plat_impl[i].name, name) == 0) return g_plat_impl[i].fn;
     if (plat_is_unity_hook(name))
         return kl_named_stub(name, (void *)klplat_void);
-    if (plat_is_init(name) || plat_is_request(name))
+    if (plat_is_drop(name))
+        return kl_named_stub(name, (void *)klplat_void);
+    if (plat_is_options_create(name))
+        return kl_named_stub(name, (void *)klplat_options_create);
+    if (plat_is_options_sink(name))
+        return kl_named_stub(name, (void *)klplat_void);
+    if (plat_is_absent_ok(name) || plat_is_init(name) || plat_is_request(name))
         return kl_named_stub(name, (void *)klplat_init_fails);
     return kl_named_stub(name, (void *)klplat_called);
 }

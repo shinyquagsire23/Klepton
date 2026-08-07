@@ -28,6 +28,7 @@
 #include "../runtime/kl_ovrplat.h"
 #include "../runtime/kl_view.h"
 #include "../runtime/kl_sample.h"
+#include "../runtime/kl_mprobe.h"
 #include "../runtime/kl_il2cpp.h"
 
 static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
@@ -167,25 +168,54 @@ static void install_fault_reporter(void) {
 // what was looked up, and the surface report separates entitlement lookups out
 // specifically so a real one is visible — probing from the parent would leave our
 // own test sitting in that list, indistinguishable from the guest asking.
-static int check_drm_guard(void) {
+// Does calling `name` abort? Runs it in a child, because passing means dying.
+// Returns 1 = aborted, 0 = returned a value, -1 = the name resolved to nothing.
+static int drm_call_aborts(const char *name) {
     fflush(NULL);
     pid_t p = fork();
     if (p == 0) {
         // The refusal prints a paragraph and a surface report; not wanted here.
         freopen("/dev/null", "w", stderr);
-        void *drm = kl_ovrplat_sym("ovr_Entitlement_GetIsViewerEntitled");
-        if (!drm) _exit(2);             // resolved to nothing at all
-        ((uint64_t (*)(void))drm)();
-        _exit(3);                       // returned a value == the guard failed
+        void *fn = kl_ovrplat_sym(name);
+        if (!fn) _exit(2);              // resolved to nothing at all
+        ((uint64_t (*)(void))fn)();
+        _exit(3);                       // returned a value
     }
     int st = 0;
     waitpid(p, &st, 0);
-    if (WIFEXITED(st) && WEXITSTATUS(st) == 2)
-        return fail("entitlement guard: the name resolved to nothing");
-    if (!(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT))
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 2) return -1;
+    return WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT;
+}
+
+static int check_drm_guard(void) {
+    // 1. The licence check itself must die rather than answer.
+    int r = drm_call_aborts("ovr_Entitlement_GetIsViewerEntitled");
+    if (r < 0) return fail("entitlement guard: the name resolved to nothing");
+    if (!r)
         return fail("entitlement guard did NOT abort — an ownership query would be "
                     "answered, which is exactly what must not happen");
-    printf("  entitlement/ownership queries refuse and abort (guard verified)\n");
+
+    // 2. So must anything that would DELIVER paid content. This is also what
+    //    proves the ovr_AssetFile_GetList carve-out below is an exact name and
+    //    not a widening of the "AssetFile" marker to the whole family.
+    r = drm_call_aborts("ovr_AssetFile_DownloadById");
+    if (r < 0) return fail("DRM guard: ovr_AssetFile_DownloadById resolved to nothing");
+    if (!r)
+        return fail("DRM guard did NOT abort on ovr_AssetFile_DownloadById — a "
+                    "content-delivery call must never be answered");
+
+    // 3. The carve-out, in the other direction: enumerating installed DLC is
+    //    answered with "none", because that grants nothing (kl_ovrplat.c,
+    //    g_plat_absent). If this ever starts aborting the game stops at the
+    //    language select again.
+    r = drm_call_aborts("ovr_AssetFile_GetList");
+    if (r < 0) return fail("ovr_AssetFile_GetList resolved to nothing");
+    if (r)
+        return fail("ovr_AssetFile_GetList aborted — enumerating DLC we do not have "
+                    "is a fact about this host, not a licence decision");
+
+    printf("  entitlement/ownership queries refuse and abort (guard verified);\n"
+           "  DLC enumeration answers \"none\" without granting anything\n");
     return 0;
 }
 
@@ -397,6 +427,11 @@ static int recon_run(int view_pump) {
                 ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2);
                 kl_jni_local_frame_pop();
                 kl_jni_drain_ui_tasks();
+                // KL_PROBE_INPUT: ask Unity's own managed API what it sees —
+                // joystick count, the bound axes, the XR node poses. Between
+                // frames on the thread that just ran one, which is where
+                // managed calls are safe.
+                kl_mprobe_tick(i);
                 if (view_pump) {
                     struct timespec t1;
                     clock_gettime(CLOCK_MONOTONIC, &t1);
