@@ -109,7 +109,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // AGX abort is masked when the guest runs *under* lldb from the start (the
     // debugger's signal traffic serializes the run enough to avoid the race),
     // so the only way to get a symbolicated look at it is post-mortem attach.
-    if (getenv("KL_FAULT_WAIT")) {
+    if (kl_env_on("KL_FAULT_WAIT", 0)) {
         n = snprintf(buf, sizeof buf,
                      "[klepton] KL_FAULT_WAIT: pid %d parked on signal %d — "
                      "attach with `lldb -p %d`, then `bt all`\n", getpid(), sig,

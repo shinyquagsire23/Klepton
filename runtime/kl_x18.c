@@ -29,6 +29,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include "kl_x18.h"
+#include "kl_env.h"
 
 static void addfld(klx_info *o, uint32_t w, uint8_t shift, uint8_t role) {
     unsigned r = (w >> shift) & 31;
@@ -489,8 +490,7 @@ static void note_refusal(uint32_t word) {
 static int veneer_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
-        const char *v = getenv("KL_X18");
-        cached = !(v && (v[0] == '0' || v[0] == 'n' || v[0] == 'N'));
+        cached = kl_env_on("KL_X18", 1);   // ON unless explicitly KL_X18=0
     }
     return cached;
 }
@@ -572,7 +572,7 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
         {
             static FILE *mapf;
             static int map_init;
-            if (!map_init) { mapf = getenv("KL_X18_MAP") ? fopen(getenv("KL_X18_MAP"), "a") : NULL; map_init = 1; }
+            if (!map_init) { mapf = kl_env_str("KL_X18_MAP", NULL) ? fopen(kl_env_str("KL_X18_MAP", NULL), "a") : NULL; map_init = 1; }
             if (mapf) { fprintf(mapf, "%llx %llx\n", (unsigned long long)vpc, (unsigned long long)spc); fflush(mapf); }
         }
 

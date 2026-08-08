@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kl_reproject.h"
+#include "kl_env.h"
 
 // KL_REPROJECT_MODE — the bisection this pass never had.
 //
@@ -32,10 +33,10 @@ enum { KLR_NORMAL = 0, KLR_OFF = 1, KLR_INVERSE = 2 };
 static int klr_mode(void) {
     static int m = -1;
     if (m < 0) {
-        const char *e = getenv("KL_REPROJECT_MODE");
+        const char *e = kl_env_str("KL_REPROJECT_MODE", "normal");
         m = KLR_NORMAL;
-        if (e && !strcmp(e, "off"))          m = KLR_OFF;
-        else if (e && !strcmp(e, "inverse")) m = KLR_INVERSE;
+        if (!strcmp(e, "off"))          m = KLR_OFF;
+        else if (!strcmp(e, "inverse")) m = KLR_INVERSE;
         if (m != KLR_NORMAL)
             fprintf(stderr, "  [reproject] MODE %s — DIAGNOSTIC, the picture is "
                             "wrong by construction\n", e);
@@ -57,7 +58,7 @@ static int klr_mode(void) {
 // kl_ovrp's eye nodes rather than to this file.
 static int klr_nocant(void) {
     static int on = -1;
-    if (on < 0) on = getenv("KL_REPROJECT_NOCANT") != NULL;
+    if (on < 0) on = kl_env_on("KL_REPROJECT_NOCANT", 0);
     return on;
 }
 
@@ -258,8 +259,7 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     // is a number in the log rather than an argument.
     static float s_depth = 0.0f;
     if (s_depth == 0.0f) {
-        const char *e = getenv("KL_REPROJECT_DEPTH");
-        float v = e ? (float)atof(e) : 0.0f;
+        float v = kl_env_float("KL_REPROJECT_DEPTH", 0.0);
         s_depth = (v > 0.0f) ? v : KL_REPROJECT_DEPTH;
     }
     u.depth = s_depth;

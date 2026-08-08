@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include "kl_env.h"
 
 typedef struct kl_image kl_image;
 
@@ -73,13 +74,6 @@ void  kl_fatal_prepare(void);
 // Map a guest FILE* (an offset into our fake bionic __sF block) to a host stream.
 FILE *kl_host_file(void *guest);
 
-// Read a KL_* knob as a boolean, honouring its VALUE rather than merely its
-// presence: unset gives `dflt`, and "0"/"no"/"off"/"false"/"" are off. Most of
-// this runtime's knobs are historically presence-tested, which is fine for a
-// diagnostic that is either on or absent — but it makes `KL_FOO=0` turn KL_FOO
-// *on*, which is a trap the moment a knob acquires a default. Use this for any
-// knob that defaults on, and for any the shipping app sets on the user's behalf.
-int kl_env_on(const char *name, int dflt);
 // Build a code stub that tail-calls `handler` with `name` in x0, so whatever the
 // guest reached for names itself instead of arriving as one anonymous abort.
 // Used for unresolved ELF imports and for eglGetProcAddress's GL entry points.

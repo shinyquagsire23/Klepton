@@ -25,6 +25,7 @@
 #include "kl_ovrp.h"
 #include "kl_reproject.h"
 #include "kl_view_mtl.h"
+#include "kl_env.h"
 
 // The liveness downsample. 64x64 is 16 KB read back in a completion handler —
 // off the critical path and small enough not to matter, but enough resolution
@@ -144,7 +145,7 @@ int kl_viewmtl_start(void *metal_layer) {
     g_pipe = klvm_pipeline(kl_reproject_blit_msl(), "kl_blit_v", "kl_blit_f", "blit");
     if (!g_pipe) return 0;
 
-    g_timewarp = getenv("KL_VIEW_TIMEWARP") != NULL;
+    g_timewarp = kl_env_on("KL_VIEW_TIMEWARP", 0);
     if (g_timewarp) {
         g_pipe_rp = klvm_pipeline(kl_reproject_msl(), "kl_reproject_v",
                                   "kl_reproject_f", "reprojection");

@@ -60,12 +60,6 @@ typedef struct {
 // the guest's real callback signature is bionic's, not ours, either way.
 int kl_dl_iterate_phdr(int (*cb)(void *, size_t, void *), void *data) {
     if (!cb) return 0;
-    // KL_NO_DL_PHDR=1 restores the old empty answer, which is the A/B for
-    // "is this failure an unwind failure?": with it set, any guest throw
-    // aborts in _Unwind_RaiseException instead of reaching its handler.
-    static int off = -1;
-    if (off < 0) off = getenv("KL_NO_DL_PHDR") != NULL;
-    if (off) return 0;
     int n = g_nimgs;
     for (int i = 0; i < n; i++) {
         unsigned phnum = 0;

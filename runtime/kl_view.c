@@ -36,6 +36,7 @@
 #include "kl_view_mtl.h" // the hardware composite path
 #include "kl_ovrp.h"     // kl_ovrp_set_head_pose — the pose-in seam
 #include "kl_present.h"  // mono vs stereo — which shape of picture the guest makes
+#include "kl_env.h"
 
 #if __has_include(<SDL3/SDL.h>)
 #define KL_VIEW_HAVE_SDL 1
@@ -357,7 +358,7 @@ int kl_view_main(const char *libdir, int hw) {
             // controller is not at your eye) and it is what puts the in-game
             // controller models where a body would hold them.
             static int aim_eye = -1;
-            if (aim_eye < 0) aim_eye = getenv("KL_VIEW_AIM_AT_EYE") != NULL;
+            if (aim_eye < 0) aim_eye = kl_env_on("KL_VIEW_AIM_AT_EYE", 0);
             const float ox[2] = { -0.22f, 0.22f };
             for (int hand = 0; hand < 2; hand++) {
                 // Rotate the head-relative offset (ox, -0.25, -0.40) by the

@@ -456,12 +456,42 @@ void kl_jni_local_frame_push(void) { klj_PushLocalFrame(NULL, 0); }
 void kl_jni_local_frame_pop(void)  { klj_PopLocalFrame(NULL, NULL); }
 
 static void *klj_ref_identity(void *env, void *obj)       { (void)env; return obj; }
+// A reference is the identity function here, so DeleteLocalRef cannot mean
+// "drop this handle" — it can only mean "retire this object", and those are
+// different whenever the object is reachable from somewhere else. Real JNI
+// hands out a NEW local ref for every GetObjectArrayElement / GetObjectField,
+// and a careful guest deletes each one; doing that to a shared object kills it
+// out from under its container.
+//
+// SDL3 is such a guest. nativeRunMain sizes argv in one pass and copies it in a
+// second, and pass one DeleteLocalRefs each element it measured — so pass two
+// read retired strings and every argument arrived EMPTY. argc was right, the
+// strings were right, and the app simply saw no options: Steam Link's
+// EStreamTransport stayed 0 and it reported "couldn't find a streaming game for
+// your account" without opening a socket. Same shape as trap 15 — a rule that
+// held for Beat Saber because Beat Saber never deleted a container-derived ref.
+//
+// The frame record is the only evidence we have of which refs a frame actually
+// created, so that is the test: retire only what this thread's open frames
+// recorded. An element read back out of an array was allocated elsewhere, is
+// listed in no open frame, and survives. With no frame open at all there is no
+// bookkeeping to consult, so the old unconditional retire stands — that is the
+// behaviour every Beat Saber measurement was taken against, and making it a
+// no-op there would leak the pool instead.
+static int klj_frame_holds(const klj_object *o) {
+    for (klj_frame *f = t_frame; f; f = f->parent)
+        for (unsigned i = 0; i < f->n; i++)
+            if (f->objs[i] == o) return 1;
+    return 0;
+}
+
 static void  klj_DeleteLocalRef(void *env, void *obj) {
     (void)env;
     if (!obj) return;                       // DeleteLocalRef(NULL) is legal
     pthread_mutex_lock(&g_lock);
-    if (klj_as_object(obj)) g_stat_delete++;
-    klj_retire_object_locked(obj);
+    klj_object *o = klj_as_object(obj);
+    if (o) g_stat_delete++;
+    if (!t_frame || !o || klj_frame_holds(o)) klj_retire_object_locked(obj);
     pthread_mutex_unlock(&g_lock);
 }
 static void *klj_NewGlobalRef(void *env, void *obj) {
@@ -1092,6 +1122,21 @@ static void *klj_GetObjectArrayElement(void *env, void *a, kl_jint i) {
     if (!arr || arr->kind != 'L' || i < 0 || i >= arr->len) return NULL;
     return ((void **)arr->data)[i];
 }
+// A java/lang/String[], built host-side. SDL3's nativeRunMain takes its argv
+// this way — the real SteamLink activity passes the intent's "sArgs" extra
+// straight through as the third parameter — so a host driving onCreate needs to
+// be able to make one. Built through the same klj_new_array the guest's
+// NewObjectArray uses, so there is one array representation, not two.
+void *kl_jni_new_string_array(const char *const *items, int n) {
+    pthread_once(&g_init_once, klj_init);
+    void      *obj = klj_new_array('L', KLJ_CLASS_STRING, n);
+    klj_array *arr = klj_arr(obj);
+    if (!arr) return obj;
+    for (int i = 0; i < n; i++)
+        ((void **)arr->data)[i] = kl_jni_new_string(items[i]);
+    return obj;
+}
+
 static void klj_SetObjectArrayElement(void *env, void *a, kl_jint i, void *v) {
     (void)env;
     klj_array *arr = klj_arr(a);

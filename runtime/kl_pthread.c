@@ -146,7 +146,7 @@ static pthread_rwlock_t *rwl(void *g) { return g_rwl_get(g); }
 // lazy creation — so aliasing (two guest addresses, one host object) can be
 // attributed: copied storage keeps the same slot; freed-without-destroy
 // storage keeps a stale one.
-static int t_mtx(void) { static int t = -1; if (t < 0) t = getenv("KL_TRACE_MUTEX") != NULL; return t; }
+static int t_mtx(void) { static int t = -1; if (t < 0) t = kl_env_on("KL_TRACE_MUTEX", 0); return t; }
 static void mtx_log(const char *what, void *g, uint32_t idx) {
     if (!t_mtx()) return;
     static _Atomic int n;
@@ -325,7 +325,7 @@ int klb_pthread_cond_timedwait(void *c, void *m, const struct timespec *ts) {
     // small (< ~4.5 years of uptime seconds); realtime ones are ~1.7e9.
     struct timespec rts;
     static int no_rebase = -1;
-    if (no_rebase < 0) no_rebase = getenv("KL_NO_REBASE") != NULL;
+    if (no_rebase < 0) no_rebase = kl_env_on("KL_NO_REBASE", 0);
     if (!no_rebase && ts && ts->tv_sec < 100000000) {
         struct timespec rt, mo;
         clock_gettime(CLOCK_REALTIME, &rt);
@@ -347,10 +347,9 @@ int klb_pthread_cond_timedwait(void *c, void *m, const struct timespec *ts) {
     static int cap_ms = -1;
     static int trace = -1;
     if (cap_ms < 0) {
-        const char *e = getenv("KL_CONDWAIT_CAP_MS");
-        cap_ms = e ? atoi(e) : 0;
+        cap_ms = kl_env_int("KL_CONDWAIT_CAP_MS", 0);
     }
-    if (trace < 0) trace = getenv("KL_TRACE_CONDWAIT") ? 1 : 0;
+    if (trace < 0) trace = kl_env_on("KL_TRACE_CONDWAIT", 0) ? 1 : 0;
     if (trace && ts) {
         struct timespec now;
         clock_gettime(CLOCK_REALTIME, &now);
@@ -536,7 +535,7 @@ pthread_t klb_pthread_self(void)               { return pthread_self(); }
 int   klb_pthread_equal(pthread_t a, pthread_t b) { return pthread_equal(a, b); }
 int   klb_pthread_kill(pthread_t t, int sig)   {
     int r = pthread_kill(t, sig);
-    if (getenv("KL_TRACE_SIG"))
+    if (kl_env_on("KL_TRACE_SIG", 0))
         fprintf(stderr, "  [sig] pthread_kill(%p, %d) -> %d%s\n", (void *)t, sig, r,
                 r ? " FAILED" : "");
     return r;
@@ -632,7 +631,7 @@ int klb_sem_destroy(int *s)  { *s = 0; return 0; }
 int klb_sem_post(int *s) {
     kl_sem *k = sem_of(s);
     if (!k) { errno = EINVAL; return -1; }
-    if (getenv("KL_TRACE_SIG")) {
+    if (kl_env_on("KL_TRACE_SIG", 0)) {
         static _Atomic int n;
         if (atomic_fetch_add(&n, 1) < 12)
             fprintf(stderr, "  [sig] sem_post slot %d (count now %d)\n",

@@ -121,7 +121,7 @@ static int gl_slot(const char *name) {
 
 static int g_permissive = -1;
 static int permissive(void) {
-    if (g_permissive < 0) g_permissive = getenv("KL_PERMISSIVE") != NULL;
+    if (g_permissive < 0) g_permissive = kl_env_on("KL_PERMISSIVE", 0);
     return g_permissive;
 }
 
@@ -1126,7 +1126,7 @@ static unsigned klegl_SwapBuffers(EGLDisplay dpy, EGLSurface s) {
     // attached: a frame sink (the readback path) or a GPU fence (KL_VIEW=1's
     // hardware compositor, which wants the *timing* of the swap and none of
     // its pixels).
-    const char *out = getenv("KL_GLFB_OUT");
+    const char *out = kl_env_str("KL_GLFB_OUT", NULL);
     if (kl_glfb_enabled() &&
         (out || kl_glfb_has_frame_sink() || kl_glfb_has_gpu_fence()))
         kl_glfb_present(out);

@@ -46,12 +46,6 @@ out:
     return rc;
 }
 
-static int g_permissive = -1;
-static int permissive(void) {
-    if (g_permissive < 0) g_permissive = getenv("KL_PERMISSIVE") != NULL;
-    return g_permissive;
-}
-
 // Reached through a per-name trampoline, so x0 is the entry point's own name.
 // The stub tail-calls here, so this return value is the ovrp_ call's return
 // value. ovrpSuccess is 0, which makes a permissive zero mean "it worked" —
@@ -59,7 +53,7 @@ static int permissive(void) {
 static uint64_t klovrp_called(const char *name) {
     int s = ovrp_slot(name);
     if (s >= 0) g_ovrp[s].calls++;
-    if (permissive()) {
+    if (kl_permissive()) {
         if (s >= 0 && g_ovrp[s].calls == 1)
             fprintf(stderr, "  [ovrp] call (permissive, returning 0): %s\n", name);
         return 0;
@@ -310,8 +304,7 @@ void kl_ovrp_set_eye_rotation(int eye, float qx, float qy, float qz, float qw) {
 static int klovrp_eye_cant(void) {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("KL_OVRP_EYE_CANT");
-        on = !(e && e[0] == '0');
+        on = kl_env_on("KL_OVRP_EYE_CANT", 0);
     }
     return on;
 }
@@ -323,8 +316,7 @@ static int klovrp_eye_cant(void) {
 static void klovrp_eye_offset(int eye, float *ox, float *oy, float *oz) {
     static float forced = -1.0f;
     if (forced < 0.0f) {
-        const char *e = getenv("KL_OVRP_IPD");
-        float v = e ? (float)atof(e) : 0.0f;
+        float v = kl_env_float("KL_OVRP_IPD", 0.0f);
         forced = (v > 0.0f && v < 0.2f) ? v : 0.0f;
     }
     if (forced > 0.0f) {
@@ -487,8 +479,7 @@ static float klovrp_eye_height(void) {
     static float h = 1.6f;
     if (!init) {
         init = 1;
-        const char *e = getenv("KL_OVRP_EYE_HEIGHT");
-        if (e) h = strtof(e, NULL);
+        h = kl_env_float("KL_OVRP_EYE_HEIGHT", 1.6f);
     }
     return g_tracking_origin == 0 ? 0.0f : h;
 }
@@ -534,8 +525,7 @@ static int         g_frame_latched;
 static int klovrp_latch_enabled(void) {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("KL_OVRP_LATCH");
-        on = !(e && e[0] == '0');
+        on = kl_env_on("KL_OVRP_LATCH", 0);
     }
     return on;
 }
@@ -856,8 +846,7 @@ static struct {
 int kl_ovrp_stage_count(void) {
     static int n;
     if (!n) {
-        const char *e = getenv("KL_OVRP_STAGES");
-        n = e ? atoi(e) : KLOVRP_STAGES_DEFAULT;
+        n = kl_env_int("KL_OVRP_STAGES", KLOVRP_STAGES_DEFAULT);
         if (n < 1) n = 1;
         if (n > KLOVRP_MAX_STAGES) n = KLOVRP_MAX_STAGES;
     }
@@ -1152,7 +1141,7 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
 static void klovrp_dump_vrdevice(void) {
     static int done;
     if (done) return;
-    if (!getenv("KL_OVRP_DUMP_VRDEVICE")) { done = 1; return; }
+    if (!kl_env_on("KL_OVRP_DUMP_VRDEVICE", 0)) { done = 1; return; }
     kl_image *img = kl_find_image("libunity.so");
     if (!img) { fprintf(stderr, "  [ovrp] VRDevice: no libunity image\n"); done = 1; return; }
     unsigned char *base = kl_base(img);
@@ -1185,7 +1174,7 @@ static void klovrp_dump_vrdevice(void) {
 
 static void klovrp_hand_sweep(const klovrp_pose *head, klovrp_pose *hand) {
     static int on = -1;
-    if (on < 0) on = getenv("KL_OVRP_HANDS_SWEEP") != NULL;
+    if (on < 0) on = kl_env_on("KL_OVRP_HANDS_SWEEP", 0);
     if (!on) return;
     static unsigned polls;
     // ~2 hand-pose polls a frame from libunity's node loop, so 512 polls is
@@ -1260,7 +1249,7 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
         // the floor and 1.7 m under the head, i.e. reliably out of frustum.
         // The knob meant to prove the controllers render was hiding them.
         static int inview = -1;
-        if (inview < 0) inview = getenv("KL_OVRP_HANDS_IN_VIEW") != NULL;
+        if (inview < 0) inview = kl_env_on("KL_OVRP_HANDS_IN_VIEW", 0);
         if (inview || !__atomic_load_n(&g_hand_set[h], __ATOMIC_ACQUIRE)) {
             float dx = inview ? (h ? 0.15f : -0.15f) : (h ? 0.20f : -0.20f);
             float dy = inview ? -0.12f : -0.30f;
@@ -1344,8 +1333,7 @@ static uint32_t klovrp_fake_buttons(void) {
     static uint32_t mask;
     if (!init) {
         init = 1;
-        const char *e = getenv("KL_OVRP_FAKE_BUTTONS");
-        if (e) mask = (uint32_t)strtoul(e, NULL, 0);
+        mask = kl_env_uint("KL_OVRP_FAKE_BUTTONS", 0);
     }
     if (!mask) return 0;
     return klovrp_fake_phase() ? mask : 0;
@@ -1362,8 +1350,7 @@ static float klovrp_fake_trigger(void) {
     static float v;
     if (!init) {
         init = 1;
-        const char *e = getenv("KL_OVRP_FAKE_TRIGGER");
-        if (e) v = *e ? strtof(e, NULL) : 1.0f;
+        v = kl_env_on("KL_OVRP_FAKE_TRIGGER", 0) ? 1.0f : 0.0f;
     }
     if (v <= 0.0f) return 0.0f;
     return klovrp_fake_phase() ? v : 0.0f;

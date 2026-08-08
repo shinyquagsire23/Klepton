@@ -59,6 +59,7 @@ int getentropy(void *buffer, size_t size);
 #include <arpa/inet.h>
 #include <net/if.h>
 #include "klepton.h"
+#include "kl_env.h"
 #include "kl_va.h"
 #include "kl_ndk.h"
 #include "kl_egl.h"
@@ -131,15 +132,6 @@ __attribute__((noreturn)) static void kl_stack_chk_fail(void) {
     die(msg);
 }
 
-// ---------- knobs ----------
-// See klepton.h for why this reads the value and not just the presence.
-int kl_env_on(const char *name, int dflt) {
-    const char *v = getenv(name);
-    if (!v) return dflt;
-    return !(!*v || !strcmp(v, "0") || !strcasecmp(v, "no")
-             || !strcasecmp(v, "off") || !strcasecmp(v, "false"));
-}
-
 // ---------- bionic FILE ----------
 // The guest computes stderr as &__sF[2] using bionic's sizeof(FILE), which we do not
 // know, so anything landing inside the block routes to stderr.
@@ -181,7 +173,7 @@ static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
     FILE *hf = kl_host_file(f);
     size_t r = fread(p, a, b, hf);
     static int on = -1;
-    if (on < 0) on = getenv("KL_TRACE_IO") != NULL;
+    if (on < 0) on = kl_env_on("KL_TRACE_IO", 0);
     if (on) {
         static _Atomic unsigned long long bytes, lines;
         static _Atomic time_t last;
@@ -250,20 +242,77 @@ static int kl_sock_optname(int opt) {
     case 19: return SO_SNDLOWAT;
     case 20: case 66: return SO_RCVTIMEO;   // 66 = SO_RCVTIMEO_NEW
     case 21: case 67: return SO_SNDTIMEO;   // 67 = SO_SNDTIMEO_NEW
-    default: return opt;                    // IPPROTO_* options: numbers agree
+    default: return opt;
     }
 }
+
+// ...and the IPPROTO_IP / IPPROTO_IPV6 levels diverge too, which an earlier
+// comment here denied. They are not a harmless subset: the numbers OVERLAP, so
+// a forwarded option lands on a DIFFERENT real option rather than on none.
+// Linux IP_TOS is 1 and Darwin's 1 is IP_OPTIONS; Linux IP_TTL is 2 and
+// Darwin's 2 is IP_HDRINCL. Setting a TTL of 4 would ask Darwin to enable raw
+// IP headers — a call that SUCCEEDS and means something else entirely, which is
+// strictly worse than the EINVAL that made trap 4 visible.
+//
+// Found through Steam Link: IPV6_V6ONLY is 26 on Linux and 27 on Darwin, so its
+// dual-stack UDP socket failed "Protocol not available" on every start. The
+// multicast entries are the ones that matter for LAN host discovery.
+//
+// Only well-established pairs are translated. Anything unrecognised is passed
+// through and named once — guessing is what this whole comment is about.
+static int kl_ip_optname(int opt) {
+    switch (opt) {                          // bionic IPPROTO_IP numbers
+    case 1:  return IP_TOS;
+    case 2:  return IP_TTL;
+    case 3:  return IP_HDRINCL;
+    case 4:  return IP_OPTIONS;
+    case 6:  return IP_RECVOPTS;
+    case 7:  return IP_RETOPTS;
+    case 32: return IP_MULTICAST_IF;
+    case 33: return IP_MULTICAST_TTL;
+    case 34: return IP_MULTICAST_LOOP;
+    case 35: return IP_ADD_MEMBERSHIP;
+    case 36: return IP_DROP_MEMBERSHIP;
+    case 8:  return IP_PKTINFO;
+    default: return opt;
+    }
+}
+static int kl_ipv6_optname(int opt) {
+    switch (opt) {                          // bionic IPPROTO_IPV6 numbers
+    case 16: return IPV6_UNICAST_HOPS;
+    case 17: return IPV6_MULTICAST_IF;
+    case 18: return IPV6_MULTICAST_HOPS;
+    case 19: return IPV6_MULTICAST_LOOP;
+    case 20: return IPV6_JOIN_GROUP;        // Linux IPV6_ADD_MEMBERSHIP
+    case 21: return IPV6_LEAVE_GROUP;       // Linux IPV6_DROP_MEMBERSHIP
+    case 26: return IPV6_V6ONLY;
+    // Darwin only declares these two under __APPLE_USE_RFC_3542, which this
+    // file does not set (it changes other IPv6 semantics wholesale). The wire
+    // numbers are stable ABI, so spell them rather than pass the Linux ones
+    // through onto whatever Darwin option happens to share the number.
+    case 49: return 61;                     // IPV6_RECVPKTINFO
+    case 50: return 46;                     // IPV6_PKTINFO
+    case 67: return IPV6_TCLASS;
+    default: return opt;
+    }
+}
+// One place, so set and get cannot drift into disagreeing about an option.
+static int kl_sock_level_opt(int *level, int opt) {
+    if (*level == 1) { *level = SOL_SOCKET; return kl_sock_optname(opt); }
+    if (*level == SOL_SOCKET)  return kl_sock_optname(opt);
+    if (*level == IPPROTO_IP)  return kl_ip_optname(opt);
+    if (*level == IPPROTO_IPV6) return kl_ipv6_optname(opt);
+    return opt;                             // IPPROTO_TCP: NODELAY agrees at 1
+}
 static int kl_setsockopt(int fd, int level, int opt, const void *val, socklen_t len) {
-    if (level == 1) level = SOL_SOCKET;     // bionic SOL_SOCKET -> Darwin's
-    int ropt = level == SOL_SOCKET ? kl_sock_optname(opt) : opt;
+    int ropt = kl_sock_level_opt(&level, opt);
     int r = setsockopt(fd, level, ropt, val, len);
     if (r) fprintf(stderr, "  [sock] setsockopt(fd=%d level=%d opt=%d->%d) FAILED: %s\n",
                    fd, level, opt, ropt, strerror(errno));
     return r;
 }
 static int kl_getsockopt(int fd, int level, int opt, void *val, socklen_t *len) {
-    if (level == 1) level = SOL_SOCKET;
-    int ropt = level == SOL_SOCKET ? kl_sock_optname(opt) : opt;
+    int ropt = kl_sock_level_opt(&level, opt);
     return getsockopt(fd, level, ropt, val, len);
 }
 
@@ -272,7 +321,7 @@ static int kl_getsockopt(int fd, int level, int opt, void *val, socklen_t *len) 
 // timeouts are the remaining clock that could pace it.
 static int kl_net_trace(void) {
     static int on = -1;
-    if (on < 0) on = getenv("KL_TRACE_NET") != NULL;
+    if (on < 0) on = kl_env_on("KL_TRACE_NET", 0);
     return on;
 }
 // KL_NET_OFFLINE=1: present a headset with no network at all — a valid real
@@ -281,7 +330,7 @@ static int kl_net_trace(void) {
 // its offline path instead of paying TCP timeouts to unreachable endpoints.
 static int kl_net_offline(void) {
     static int off = -1;
-    if (off < 0) off = getenv("KL_NET_OFFLINE") != NULL;
+    if (off < 0) off = kl_env_on("KL_NET_OFFLINE", 0);
     return off;
 }
 static void kl_sa_to_guest(struct sockaddr *sa, socklen_t *len);
@@ -420,7 +469,7 @@ static int kl_getsockname(int fd, struct sockaddr *sa, socklen_t *len) {
 static ssize_t kl_read(int fd, void *buf, size_t n) {
     ssize_t r = read(fd, buf, n);
     static int on = -1;
-    if (on < 0) on = getenv("KL_TRACE_IO") != NULL;
+    if (on < 0) on = kl_env_on("KL_TRACE_IO", 0);
     if (on && r > 0) {
         static _Atomic unsigned long long bytes;
         static _Atomic time_t last;
@@ -437,7 +486,7 @@ static ssize_t kl_read(int fd, void *buf, size_t n) {
 // to say what the poll period actually is.
 static int kl_usleep(unsigned usec) {
     static int on = -1;
-    if (on < 0) on = getenv("KL_TRACE_SLEEP") != NULL;
+    if (on < 0) on = kl_env_on("KL_TRACE_SLEEP", 0);
     if (on) {
         static _Atomic unsigned long long cnt, usec_sum, usec_max;
         static _Atomic time_t last;
@@ -454,10 +503,7 @@ static int kl_usleep(unsigned usec) {
     // with ~5ms usleeps; if that poll IS the loading pace, capping it to
     // 50us moves the bottleneck somewhere measurable.
     static int cap = -1;
-    if (cap < 0) {
-        const char *e = getenv("KL_USLEEP_CAP");
-        cap = e ? atoi(e) : 0;
-    }
+    if (cap < 0) cap = kl_env_int("KL_USLEEP_CAP", 0);
     if (cap > 0 && (int)usec > cap) usec = (unsigned)cap;
     return usleep(usec);
 }

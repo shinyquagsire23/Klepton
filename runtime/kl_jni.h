@@ -63,6 +63,9 @@ void *kl_jni_class(const char *name);
 void *kl_jni_activity(void);
 void kl_jni_set_activity_class(const char *cls);
 void *kl_jni_new_string(const char *utf8);
+// A java/lang/String[] — what SDL3's nativeRunMain takes as argv, and what the
+// real SteamLink activity fills from the launching intent's "sArgs" extra.
+void *kl_jni_new_string_array(const char *const *items, int n);
 
 // Root for Context.getAssets()/AssetManager.open(). Defaults to "beatsaber/assets".
 // With no AAssetManager_* import, this JNI path is how assets reach Unity.

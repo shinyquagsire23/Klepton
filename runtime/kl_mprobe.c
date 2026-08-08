@@ -144,20 +144,17 @@ static const char *const AXES[] = {
 
 void kl_mprobe_tick(unsigned frame) {
     static int on = -1;
-    if (on < 0) on = getenv("KL_PROBE_INPUT") != NULL;
-    if (!on) return;
+    if (on < 0) on = kl_env_on("KL_PROBE_INPUT", 0);
     static unsigned every, from;
     if (!every) {
-        const char *e = getenv("KL_PROBE_EVERY");
-        every = e ? (unsigned)strtoul(e, NULL, 10) : 120;
+        every = kl_env_uint("KL_PROBE_EVERY", 120);
         if (!every) every = 120;
         // Probing is not free of side effects: the first call into a managed
         // class runs its cctor, and doing that to OVRInput/OVRPlugin before the
         // guest has loaded the plugin drags the runtime down paths it would not
         // take on its own (one such run aborted on an ovrp entry point the game
         // reaches only from there). Wait for the game to be up.
-        const char *f = getenv("KL_PROBE_FROM");
-        from = f ? (unsigned)strtoul(f, NULL, 10) : 1200;
+        from = kl_env_uint("KL_PROBE_FROM", 1200u);
     }
     if (frame < from || frame % every) return;
     if (!mprobe_init()) { on = 0; return; }
@@ -261,10 +258,8 @@ void kl_mprobe_tick(unsigned frame) {
         Il2CppClass *k = find_class("", "VRController");
         if (k) vrc_type = il.type_get_object(il.class_get_type(k));
 
-        const char *spec = getenv("KL_PROBE_TYPES");
-        if (!spec)
-            spec = "VRUIControls.VRPointer,VRUIControls.VRInputModule,"
-                   "VRUIControls.VRLaserPointer,VRUIControls.VRGraphicRaycaster";
+        const char *spec = kl_env_str("KL_PROBE_TYPES", "VRUIControls.VRPointer,VRUIControls.VRInputModule,"
+                                                        "VRUIControls.VRLaserPointer,VRUIControls.VRGraphicRaycaster");
         char buf[512];
         snprintf(buf, sizeof buf, "%s", spec);
         for (char *tok = strtok(buf, ","); tok && n_types < 12;

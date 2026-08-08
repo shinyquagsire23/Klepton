@@ -179,7 +179,7 @@ static void *stub_emit(const char *nm, void *payload, void *target, int trace) {
     void *s = (trace ? kl_stub_trace_cells : kl_stub_named_cells)
               + (size_t)idx * KL_STUB_CELL_BYTES;
 
-    if (getenv("KL_TRACE_IMAGES"))
+    if (kl_env_on("KL_TRACE_IMAGES", 0))
         fprintf(stderr, "  [klepton] stub '%s' -> %s cell %u (%p)\n",
                 nm, trace ? "trace" : "named", idx, s);
 
@@ -460,7 +460,7 @@ kl_image *kl_load_dylib(const char *path) {
         }
     }
 
-    if (getenv("KL_TRACE_IMAGES"))
+    if (kl_env_on("KL_TRACE_IMAGES", 0))
         fprintf(stderr, "  [klepton] dylib %s: mach header %p, guest image %p span %#zx\n",
                 real, (const void *)mh, (void *)img->base, img->span);
     return img;
@@ -482,7 +482,7 @@ kl_image *kl_load_dylib(const char *path) {
 // it cost a device run — see kl_can_load.
 static int dylib_candidate(const char *path, char *out, size_t cap, char *name_out,
                            size_t name_cap) {
-    const char *dir = getenv("KL_DYLIB_DIR");
+    const char *dir = kl_env_str("KL_DYLIB_DIR", NULL);
     if (!dir || !*dir) return 0;
     const char *stem = strrchr(path, '/');
     stem = stem ? stem + 1 : path;
@@ -672,7 +672,7 @@ kl_image *kl_load(const char *path) {
                     (unsigned long)s, (unsigned long)(e - s), prot, strerror(errno));
     }
 
-    if (getenv("KL_TRACE_IMAGES"))
+    if (kl_env_on("KL_TRACE_IMAGES", 0))
         fprintf(stderr, "  [klepton] image %s base %p span %#zx\n",
                 path, (void *)img->base, img->span);
     munmap(file, (size_t)sb.st_size);

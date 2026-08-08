@@ -102,7 +102,7 @@
     "Google Chrome Framework.framework/Libraries"
 
 static const char *kl_angle_dir(void) {
-    const char *dir = getenv("KL_ANGLE_DIR");
+    const char *dir = kl_env_str("KL_ANGLE_DIR", NULL);
     if (dir) return dir;
     if (access(ANGLE_VENDORED_DIR "/libEGL.dylib", R_OK) == 0)
         return ANGLE_VENDORED_DIR;
@@ -151,7 +151,7 @@ void kl_glfb_set_size(int w, int h) {
     // 1832x1920, and each thread gets its own with depth and stencil — so surface
     // size is the one resource axis none of them varied. Shrinking it here tests
     // that without touching anything else.
-    const char *env = getenv("KL_GLFB_SIZE");
+    const char *env = kl_env_str("KL_GLFB_SIZE", NULL);
     if (env) {
         int ew = 0, eh = 0;
         if (sscanf(env, "%dx%d", &ew, &eh) == 2 && ew > 0 && eh > 0) { w = ew; h = eh; }
@@ -194,7 +194,7 @@ int kl_glfb_init(void) {
     // Applied here rather than only in kl_glfb_set_size, which this path never
     // calls — the eye size stays at its 1832x1920 default unless OVRPlugin says
     // otherwise, so a setter-only override silently does nothing.
-    const char *size_env = getenv("KL_GLFB_SIZE");
+    const char *size_env = kl_env_str("KL_GLFB_SIZE", NULL);
     if (size_env) {
         int ew = 0, eh = 0;
         if (sscanf(size_env, "%dx%d", &ew, &eh) == 2 && ew > 0 && eh > 0) {
@@ -228,7 +228,7 @@ int kl_glfb_init(void) {
 
     // Metal by name. The default display selects ANGLE's OpenGL backend, and with
     // it every limitation this move exists to escape (S0.9).
-    const char *want = getenv("KL_ANGLE_BACKEND");
+    const char *want = kl_env_str("KL_ANGLE_BACKEND", "angle");
     int use_gl = want && strcmp(want, "gl") == 0;
     const int32_t dpy_attrs[] = {
         EGL_PLATFORM_ANGLE_TYPE_ANGLE,
@@ -278,7 +278,7 @@ int kl_glfb_init(void) {
     // message. The vendored debug ANGLE speaks KHR_debug fluently, so a guest
     // call failing silently (the "0 lit" frame was one) comes with its reason
     // here instead of needing an error-code probe per call site.
-    if (getenv("KL_GLFB_DEBUG_CB")) {
+    if (kl_env_on("KL_GLFB_DEBUG_CB", 0)) {
         void (*glDebugMessageCallback)(const void *, const void *) =
             asym("glDebugMessageCallback");
         void (*glEnable)(uint32_t) = asym("glEnable");
@@ -352,7 +352,7 @@ void kl_glfb_make_current(void) {
     if (!t) {
         t = calloc(1, sizeof *t);
         if (!t) return;
-        if (!getenv("KL_GLFB_SHARED")) {
+        if (!kl_env_on("KL_GLFB_SHARED", 0)) {
             // Migration mode: take the root context if it is free or already
             // ours; if another thread is holding it, this thread gets nothing —
             // same as EGL, which would answer EGL_BAD_ACCESS.
@@ -380,13 +380,13 @@ void kl_glfb_make_current(void) {
             // picture is meaningless — but it answers one question cleanly: whether
             // the AGX abort needs object sharing at all, or merely a second thread
             // issuing GL. Rendering correctness is not the point of this knob.
-            void *share = getenv("KL_GLFB_NOSHARE_OBJ") ? EGL_NO_CONTEXT : g_ctx;
+            void *share = kl_env_on("KL_GLFB_NOSHARE_OBJ", 0) ? EGL_NO_CONTEXT : g_ctx;
             t->ctx  = a_eglCreateContext(g_dpy, g_cfg, share, ctx_attrs);
         }
         pthread_setspecific(g_tls_key, t);
         fprintf(stderr, "  [glfb] thread %llu gets its own %s context\n",
                 (unsigned long long)tid, t->ctx == g_ctx ? "root" : "shared");
-    } else if (!getenv("KL_GLFB_SHARED") && !t->ctx &&
+    } else if (!kl_env_on("KL_GLFB_SHARED", 0) && !t->ctx &&
                (!g_root_owner || g_root_owner == tid)) {
         // Released earlier (by us or never taken) and now free again: retake.
         t->ctx = g_ctx; t->surf = g_surf;
@@ -400,7 +400,7 @@ void kl_glfb_make_current(void) {
     // slot, its x18 veneers, its stack) and the elaborate GL sequence is a red
     // herring; if they pass, the environment is fine and it really is the sequence.
     // It clears the guest's framebuffer, so it is a probe and not a mode.
-    if (getenv("KL_GLFB_PROBE") && !t->probed) {
+    if (kl_env_on("KL_GLFB_PROBE", 0) && !t->probed) {
         t->probed = 1;
         if (a_eglMakeCurrent(g_dpy, t->surf, t->surf, t->ctx)) {
             uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
@@ -426,7 +426,7 @@ void kl_glfb_make_current(void) {
             fprintf(stderr, "  [glfb] eglMakeCurrent failed even with a per-thread "
                             "context (egl error 0x%x)\n", eglGetError ? eglGetError() : 0);
         }
-    } else if (getenv("KL_GLFB_DEBUG_CB") && !t->debug_cb) {
+    } else if (kl_env_on("KL_GLFB_DEBUG_CB", 0) && !t->debug_cb) {
         // The debug callback is per-context state, so the root-context
         // registration in kl_glfb_init does not cover this thread's context.
         t->debug_cb = 1;
@@ -711,7 +711,7 @@ static void klfb_CompileShader(uint32_t shader) {
         if (src)
             fprintf(stderr, "  [glfb] ---- source of failed shader %u ----\n%s\n"
                             "  [glfb] ---- end source ----\n", shader, src);
-        const char *dir = getenv("KL_DUMP_SHADERS");
+        const char *dir = kl_env_str("KL_DUMP_SHADERS", NULL);
         if (dir && src) {
             char path[600];
             snprintf(path, sizeof path, "%s/failed_shader_%u.glsl", dir, shader);
@@ -730,7 +730,7 @@ static void klfb_LinkProgram(uint32_t program) {
     // program 7"); this turns the number into the shader text.
     static int dump_prog = -2;
     if (dump_prog == -2) {
-        const char *d = getenv("KL_GLFB_DUMP_PROGRAM");
+        const char *d = kl_env_str("KL_GLFB_DUMP_PROGRAM", NULL);
         dump_prog = d ? atoi(d) : -1;
     }
     if (dump_prog >= 0 && (int)program == dump_prog) {
@@ -797,7 +797,7 @@ static void klfb_note_format(uint32_t fmt, int32_t w, int32_t h, int32_t d,
 
 static uint32_t klfb_maybe_unsrgb(uint32_t fmt) {
     static int on = -1;
-    if (on < 0) on = getenv("KL_GLFB_NOSRGB") != NULL;
+    if (on < 0) on = kl_env_on("KL_GLFB_NOSRGB", 0);
     return (on && fmt == GL_SRGB8_ALPHA8) ? GL_RGBA8 : fmt;
 }
 
@@ -811,7 +811,7 @@ static void klfb_note_tex_storage(uint32_t name, uint32_t fmt, int32_t w,
 // than provably the trigger itself — but it bounds the search to one call.
 static int klfb_trace_tex(void) {
     static int on = -1;
-    if (on < 0) on = getenv("KL_GLFB_TRACE_TEX") != NULL;
+    if (on < 0) on = kl_env_on("KL_GLFB_TRACE_TEX", 0);
     return on;
 }
 static unsigned g_texcalls;
@@ -846,7 +846,7 @@ static uint32_t g_fbomax;
 
 static int klfb_trace_fbo(void) {
     static int on = -1;
-    if (on < 0) on = getenv("KL_GLFB_TRACE_FBO") != NULL;
+    if (on < 0) on = kl_env_on("KL_GLFB_TRACE_FBO", 0);
     return on;
 }
 static uint64_t klfb_tid(void) { uint64_t t = 0; pthread_threadid_np(NULL, &t); return t; }
@@ -916,7 +916,7 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
         fprintf(stderr, "  [glfb] #%u glTexParameteri target=0x%04x pname=0x%04x "
                         "param=0x%04x\n", g_texcalls++, target, pname, param);
     static int noswz = -1;
-    if (noswz < 0) noswz = getenv("KL_GLFB_NOSWIZZLE") != NULL;
+    if (noswz < 0) noswz = kl_env_on("KL_GLFB_NOSWIZZLE", 0);
     if (noswz && pname >= GL_TEXTURE_SWIZZLE_R && pname <= GL_TEXTURE_SWIZZLE_A) return;
     // TEXTURE_SRGB_DECODE_EXT writes: no EXT_texture_sRGB_decode on this ANGLE,
     // so the write can only raise INVALID_ENUM — and does, about once per
@@ -926,7 +926,7 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     // it would select does not exist on this driver either way.
     if (pname == 0x8A48 /* TEXTURE_SRGB_DECODE_EXT */) return;
     if (g_real_TexParameteri) g_real_TexParameteri(target, pname, param);
-    if (getenv("KL_GLFB_ERRPROBE") && a_glGetError) {
+    if (kl_env_on("KL_GLFB_ERRPROBE", 0) && a_glGetError) {
         uint32_t e = a_glGetError();
         if (e) fprintf(stderr, "  [glfb] glTexParameteri(0x%04x, 0x%04x) -> err 0x%x\n",
                        pname, param, e);
@@ -943,8 +943,7 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
 static int klfb_upload_budget(void) {
     static int n = -2;
     if (n == -2) {
-        const char *e = getenv("KL_GLFB_TEX_LIMIT");
-        n = e ? atoi(e) : -1;          // -1 means unlimited
+        n = kl_env_int("KL_GLFB_TEX_LIMIT", -1);
     }
     return n;
 }
@@ -1375,7 +1374,7 @@ static void (*g_real_InvalidateFramebuffer)(uint32_t, int32_t, const uint32_t *)
 
 static void klfb_InvalidateFramebuffer(int64_t target, int32_t n,
                                        const uint32_t *attachments) {
-    if (getenv("KL_GLFB_BLIT_PROBE") && a_glGetIntegerv) {
+    if (kl_env_on("KL_GLFB_BLIT_PROBE", 0) && a_glGetIntegerv) {
         int32_t dfb = -1;
         a_glGetIntegerv(0x8CA6, &dfb);
         // Name the color attachment being discarded — an invalidate of "fb N's
@@ -1405,7 +1404,7 @@ static void klfb_InvalidateFramebuffer(int64_t target, int32_t n,
     // so the discard's blast radius is the open question. Dropping the call
     // answers it: lit blits after this mean the invalidate was the eraser.
     static int no_inv = -1;
-    if (no_inv < 0) no_inv = getenv("KL_GLFB_NO_INVALIDATE") != NULL;
+    if (no_inv < 0) no_inv = kl_env_on("KL_GLFB_NO_INVALIDATE", 0);
     if (g_real_InvalidateFramebuffer && !no_inv)
         g_real_InvalidateFramebuffer((uint32_t)target, n, attachments);
 }
@@ -1423,7 +1422,7 @@ static void (*g_real_RenderbufferStorage)(uint32_t, uint32_t, int32_t, int32_t);
 
 static int klfb_timeline(void) {
     static int on = -1;
-    if (on < 0) on = getenv("KL_GLFB_BLIT_PROBE") != NULL;
+    if (on < 0) on = kl_env_on("KL_GLFB_BLIT_PROBE", 0);
     return on;
 }
 
@@ -1469,7 +1468,7 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
                                  int64_t mask, int64_t filter) {
     klfb_errprobe("glBlitFramebuffer(before)", NULL);
     static int blit_log = -1;
-    if (blit_log < 0) blit_log = getenv("KL_GLFB_ERRPROBE") != NULL;
+    if (blit_log < 0) blit_log = kl_env_on("KL_GLFB_ERRPROBE", 0);
     if (blit_log && a_glGetIntegerv) {
         int32_t dfb = -1, rfb = -1, rb = -1;
         a_glGetIntegerv(0x8CA6, &dfb);
@@ -1520,7 +1519,7 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
     // (glInvalidateFramebuffer discards), or the draws themselves produce
     // black. Probing both sides of the blit puts the loss on the timeline.
     static int blit_probe = -1;
-    if (blit_probe < 0) blit_probe = getenv("KL_GLFB_BLIT_PROBE") != NULL;
+    if (blit_probe < 0) blit_probe = kl_env_on("KL_GLFB_BLIT_PROBE", 0);
     static float *pfb;
     static uint8_t *pbb;
     static void (*bp_bind)(uint32_t, uint32_t);
@@ -1773,7 +1772,7 @@ static void klfb_service_capture(void);
 // was not reading them anyway.
 static void klfb_errprobe(const char *what, const char *detail) {
     static int on = -1, said;
-    if (on < 0) on = getenv("KL_GLFB_ERRPROBE") != NULL;
+    if (on < 0) on = kl_env_on("KL_GLFB_ERRPROBE", 0);
     if (!on || !a_glGetError) return;
     // Consumes the pending error. Called before and after the real call:
     // "pre=0xN" on the BEFORE line is an earlier unwrapped call's leftover, on
@@ -1812,19 +1811,17 @@ static void klfb_errprobe(const char *what, const char *detail);
 static void klfb_draw_probe(int verts) {
     static int on = -1, said, quota;
     if (on < 0) {
-        on = getenv("KL_GLFB_DRAW_PROBE") != NULL;
+        on = kl_env_on("KL_GLFB_DRAW_PROBE", 0);
         // KL_GLFB_DRAW_PROBE_N overrides the 12-line default; scene frames
         // burn the quota on early frames otherwise. 0 means unlimited.
-        const char *q = getenv("KL_GLFB_DRAW_PROBE_N");
-        quota = q ? atoi(q) : 12;
+        quota = kl_env_int("KL_GLFB_DRAW_PROBE_N", 12);
     }
     if (!on || (quota && said >= quota) || !a_glReadPixels) return;
     // KL_GLFB_DRAW_PROBE_MIN lowers the 32-vert floor — the frame's last few
     // draws are small, and one of them is a suspect in the scene's erasure.
     static int minv = -1;
     if (minv < 0) {
-        const char *m = getenv("KL_GLFB_DRAW_PROBE_MIN");
-        minv = m ? atoi(m) : 32;
+        minv = kl_env_int("KL_GLFB_DRAW_PROBE_MIN", 12);
     }
     if (verts < minv) return;
     int32_t fb = -1, rfb = -1;
@@ -2461,7 +2458,7 @@ static void klfb_ActiveTexture(uint32_t unit) {
     {
         static int logu = -1, saidu;
         static uint8_t seen[64];
-        if (logu < 0) logu = getenv("KL_GLFB_LOG_UNITS") != NULL;
+        if (logu < 0) logu = kl_env_on("KL_GLFB_LOG_UNITS", 0);
         int u = (int)(unit - 0x84C0);
         if (logu && u >= 0 && u < 64 && !seen[u]) {
             seen[u] = 1; saidu++;
@@ -2690,7 +2687,7 @@ static int keep_ours(const char *name) {
 // to get that visibility and needs hand-written asm to preserve the arguments
 // across the log call; this needed none.
 static int glfb_skipped(const char *name) {
-    const char *list = getenv("KL_GLFB_SKIP");
+    const char *list = kl_env_str("KL_GLFB_SKIP", NULL);
     if (!list || !*list) return 0;
     size_t n = strlen(name);
     for (const char *p = list; *p; ) {
@@ -2763,7 +2760,7 @@ static void *klfb_selftest_thread(void *arg) {
 }
 
 static void klfb_selftest(void) {
-    if (!getenv("KL_GLFB_SELFTEST")) return;
+    if (!kl_env_on("KL_GLFB_SELFTEST", 0)) return;
     pthread_t th;
     if (pthread_create(&th, NULL, klfb_selftest_thread, NULL) == 0)
         pthread_join(th, NULL);
@@ -2838,7 +2835,7 @@ static int getenv_trace_print(void);
 static int glfb_errscan(void) {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("KL_GLFB_ERRSCAN");
+        const char *e = kl_env_str("KL_GLFB_ERRSCAN", NULL);
         on = e != NULL;
         if (e) {
             uint32_t v = (uint32_t)strtoul(e, NULL, 0);
@@ -2872,9 +2869,8 @@ void kl_gl_trace_log(const char *name) {
 static int getenv_trace_print(void) {
     static int on = -1;
     if (on < 0) {
-        on = getenv("KL_GLFB_TRACE") != NULL;
-        const char *from = getenv("KL_GLFB_TRACE_FROM");
-        if (from) g_trace_from = (unsigned)strtoul(from, NULL, 0);
+        on = kl_env_on("KL_GLFB_TRACE", 0);
+        g_trace_from = kl_env_uint("KL_GLFB_TRACE_FROM", g_trace_from);
     }
     return on;
 }
@@ -2885,7 +2881,7 @@ static int glfb_tracing(void) {
 
 static int glfb_locking(void) {
     static int on = -1;
-    if (on < 0) on = getenv("KL_GLFB_LOCK") != NULL;
+    if (on < 0) on = kl_env_on("KL_GLFB_LOCK", 0);
     return on;
 }
 
@@ -2967,8 +2963,7 @@ unsigned kl_glfb_present(const char *dir) {
     }
     static int every = -1;
     if (every < 0) {
-        const char *e = getenv("KL_GLFB_OUT_EVERY");
-        every = e ? atoi(e) : 1;
+        every = kl_env_int("KL_GLFB_OUT_EVERY", 1);
         if (every < 1) every = 1;
     }
     static unsigned swap_n;
@@ -3262,10 +3257,8 @@ static uint8_t klfb_dbg_tone(float c) {
     // Statics: the 64K LUT caller memoizes this, so the env is read once.
     static float expo = -1, gam = -1;
     if (expo < 0) {
-        const char *e = getenv("KL_GLFB_EXPOSURE");
-        expo = e ? (float)atof(e) : 1.0f;
-        e = getenv("KL_GLFB_GAMMA");
-        gam = e ? (float)atof(e) : 1.0f / 2.2f;
+        expo = kl_env_float("KL_GLFB_EXPOSURE", 1.0f);
+        gam = kl_env_float("KL_GLFB_GAMMA", 1.0f / 2.2f);
         if (expo <= 0) expo = 1.0f;
         if (gam <= 0) gam = 1.0f / 2.2f;
     }
@@ -3399,8 +3392,7 @@ static unsigned glfb_capture_now(const char *dir) {
         {
             static int rawstats = -1;
             if (rawstats < 0) {
-                const char *e = getenv("KL_GLFB_RAWSTATS");
-                rawstats = e ? atoi(e) : 1;
+                rawstats = kl_env_int("KL_GLFB_RAWSTATS", 1);
             }
             static unsigned rs_n;
             if (rawstats && rs_n++ % 60 == 0) {
@@ -3482,7 +3474,7 @@ static unsigned glfb_capture_now(const char *dir) {
         // not a capture-side one.
         static const char *sink_dir;
         static int sink_dir_init;
-        if (!sink_dir_init) { sink_dir = getenv("KL_GLFB_DUMP_SINK"); sink_dir_init = 1; }
+        if (!sink_dir_init) { sink_dir = kl_env_str("KL_GLFB_DUMP_SINK", NULL); sink_dir_init = 1; }
         if (sink_dir && g_presented % 100 == 0) {
             char spath[600];
             snprintf(spath, sizeof spath, "%s/sink_%05u.png", sink_dir, g_presented);
@@ -3531,7 +3523,7 @@ static unsigned glfb_capture_now(const char *dir) {
         // the post-processing chain, the MSAA scene target — are otherwise
         // only lit-counts on a log line.
         static int dump_fbos = -1;
-        if (dump_fbos < 0) dump_fbos = getenv("KL_GLFB_DUMP_FBOS") != NULL;
+        if (dump_fbos < 0) dump_fbos = kl_env_on("KL_GLFB_DUMP_FBOS", 0);
         if (a_glBindFramebuffer) {
             int32_t save_fb = read_fb >= 0 ? read_fb : 0;
             float  *fbuf = malloc((size_t)g_w * g_h * 4 * sizeof(float));

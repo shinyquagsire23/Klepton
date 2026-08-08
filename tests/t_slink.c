@@ -173,12 +173,35 @@ static void *sdl_thread_body(void *arg) {
     // more Android-like, but the registry key is what must match.)
     char libpath[1024];
     snprintf(libpath, sizeof libpath, "%s/%s", LIBDIR, lib);
-    printf("  [sdl] nativeRunMain(\"%s\", \"%s\", NULL)\n", libpath, fn);
+
+    // argv. SDL3's nativeRunMain takes a String[] and prepends argv[0] itself,
+    // so this array is argv[1..]. The real activity fills it from the launching
+    // intent's "sArgs" extra (§11.9) and libmain PARSES IT — --server, --appid,
+    // --steamid, --transport and ~40 more. Passing NULL is not "no options
+    // chosen", it is the streaming client being asked to stream nothing, which
+    // is why it reaches OnStreamError before opening a single socket.
+    char  argbuf[2048];
+    const char *argv[64];
+    int   argc = 0;
+    const char *a = getenv("KL_SLINK_ARGS");
+    if (a && *a) {
+        snprintf(argbuf, sizeof argbuf, "%s", a);
+        for (char *tok = strtok(argbuf, " \t");
+             tok && argc < (int)(sizeof argv / sizeof argv[0]);
+             tok = strtok(NULL, " \t"))
+            argv[argc++] = tok;
+    }
+    void *jargs = argc ? kl_jni_new_string_array(argv, argc) : NULL;
+
+    printf("  [sdl] nativeRunMain(\"%s\", \"%s\", %s", libpath, fn,
+           argc ? "[" : "NULL");
+    for (int i = 0; i < argc; i++) printf("%s\"%s\"", i ? ", " : "", argv[i]);
+    printf("%s)\n", argc ? "])" : ")");
     fflush(NULL);
 
     kl_jni_local_frame_push();
     int rc = ((int (*)(void *, void *, void *, void *, void *))slot[1])(
-        env, cls, kl_jni_new_string(libpath), kl_jni_new_string(fn), NULL);
+        env, cls, kl_jni_new_string(libpath), kl_jni_new_string(fn), jargs);
     kl_jni_local_frame_pop();
 
     printf("  [sdl] nativeRunMain returned %d\n", rc);

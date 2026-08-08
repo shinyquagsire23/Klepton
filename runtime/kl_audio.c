@@ -92,7 +92,7 @@ static void put32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
 static void put16(FILE *f, uint16_t v) { fwrite(&v, 2, 1, f); }
 
 static void dump_open(void) {
-    const char *path = getenv("KL_AUDIO_DUMP");
+    const char *path = kl_env_str("KL_AUDIO_DUMP", NULL);
     if (!path || !*path) return;
     g_dump = fopen(path, "wb");
     if (!g_dump) { fprintf(stderr, "  [au] cannot write %s\n", path); return; }
@@ -313,8 +313,7 @@ int kl_audio_open(unsigned rate, unsigned channels, unsigned bits) {
     // wrap it; the *fill target* is what sets latency, and it is much smaller.
     // Keeping those two separate is what lets the target grow to fit an
     // unexpectedly large guest buffer without reallocating anything.
-    const char *lat = getenv("KL_AUDIO_LATENCY_MS");
-    unsigned lat_ms = lat ? (unsigned)atoi(lat) : 80;
+    unsigned lat_ms = kl_env_int("KL_AUDIO_LATENCY_MS", 80);
     if (lat_ms < 10) lat_ms = 10;
     if (lat_ms > 500) lat_ms = 500;
 

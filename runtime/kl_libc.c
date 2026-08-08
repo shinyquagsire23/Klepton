@@ -301,8 +301,7 @@ static void proc_build(void) {
     // one only when it is missing costs nothing and a wrong separator here
     // would put the synthetic /proc tree somewhere the guest never finds it.
     char tmpl[512];
-    const char *tmp = getenv("TMPDIR");
-    if (!tmp || !*tmp) tmp = "/tmp";
+    const char *tmp = kl_env_str("TMPDIR", "/tmp");
     size_t n = strlen(tmp);
     snprintf(tmpl, sizeof tmpl, "%s%sklepton-proc.XXXXXX", tmp,
              tmp[n - 1] == '/' ? "" : "/");
@@ -425,7 +424,7 @@ const char *kl_guest_path(const char *path, char *buf, size_t cap) {
 static int kl_fs_trace_mode(void) {
     static int mode = -1;   // 0 off, 1 failures only, 2 everything
     if (mode < 0) {
-        const char *e = getenv("KL_TRACE_FS");
+        const char *e = kl_env_str("KL_TRACE_FS", NULL);
         mode = !e ? 0 : (strcmp(e, "fail") == 0 ? 1 : 2);
     }
     return mode;
@@ -576,11 +575,11 @@ static int klb_fatal_signal(int sig) {
 
 int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
     struct sigaction d, o;
-    if (getenv("KL_TRACE_SIG"))
+    if (kl_env_on("KL_TRACE_SIG", 0))
         fprintf(stderr, "  [sig] sigaction(%d, handler=%p)\n", sig,
                 in ? in->handler : NULL);
     static int allow_guest = -1;
-    if (allow_guest < 0) allow_guest = getenv("KL_GUEST_SIGNALS") != NULL;
+    if (allow_guest < 0) allow_guest = kl_env_on("KL_GUEST_SIGNALS", 0);
     if (in && in->handler && in->handler != (void *)SIG_DFL &&
         in->handler != (void *)SIG_IGN && klb_fatal_signal(sig) && !allow_guest) {
         fprintf(stderr, "[sig] refusing the guest's handler for signal %d "
@@ -678,7 +677,7 @@ static void ts_normalise(struct timespec *t) {
 // Diagnostic for the class-init deadlock: the abstime the guest feeds
 // pthread_cond_timedwait lands ~9.5 hours out, so either its clock source is
 // wrong going in (this trace) or its arithmetic corrupts it after (disasm).
-static int t_time(void) { static int t = -1; if (t < 0) t = getenv("KL_TRACE_TIME") != NULL; return t; }
+static int t_time(void) { static int t = -1; if (t < 0) t = kl_env_on("KL_TRACE_TIME", 0); return t; }
 
 // bionic clock ids differ from Darwin's; forwarding them verbatim makes
 // clock_gettime(CLOCK_MONOTONIC=1) fail EINVAL, and libunity reads the
@@ -748,7 +747,7 @@ static long kl_futex(int32_t *uaddr, int op, uint32_t val, const struct timespec
     // wakeup) and wakes. The async loader's pace smells like a wake that
     // never arrives, every iteration paying the full timeout.
     static int trace = -1;
-    if (trace < 0) trace = getenv("KL_TRACE_FUTEX") != NULL;
+    if (trace < 0) trace = kl_env_on("KL_TRACE_FUTEX", 0);
     if (trace) {
         static _Atomic unsigned long long waits, timeouts, woken, wakes;
         static _Atomic time_t last;

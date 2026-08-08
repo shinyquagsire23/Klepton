@@ -87,8 +87,7 @@ static mach_port_t     g_main_act;    // the thread that started the pump
 // Parked-thread chain dumps (see sample_once). KL_SAMPLE_STACKS=0 opts out.
 #define KL_SAMPLE_STACKS_MAX 3
 static int t_stack_trace_enabled(void) {
-    const char *e = getenv("KL_SAMPLE_STACKS");
-    return !(e && e[0] == '0');
+    return kl_env_on("KL_SAMPLE_STACKS", 0);
 }
 
 // Label one pc: managed method name, guest module+offset, host symbol, or
@@ -446,8 +445,7 @@ static void sample_once(void) {
 void kl_sample_report(FILE *out);   // below; the sampler self-reports periodically
 
 static void *sampler_main(void *arg) {    (void)arg;
-    const char *renv = getenv("KL_SAMPLE_REPORT_S");
-    unsigned report_s = renv ? (unsigned)strtoul(renv, NULL, 10) : 30;
+    unsigned report_s = kl_env_uint("KL_SAMPLE_REPORT_S", 30u);
     struct timespec last;
     clock_gettime(CLOCK_MONOTONIC, &last);
     while (!g_stop) {

@@ -27,12 +27,6 @@ static void plat_hit(const char *name) {
     if (s >= 0) g_plat[s].calls++;
 }
 
-static int g_permissive = -1;
-static int permissive(void) {
-    if (g_permissive < 0) g_permissive = getenv("KL_PERMISSIVE") != NULL;
-    return g_permissive;
-}
-
 // ---------------------------------------------------------------------------
 // The DRM classifier
 //
@@ -122,7 +116,7 @@ static uint64_t klplat_drm(const char *name) {
 // Everything else: named, so the guest says which of the 1335 it wants.
 static uint64_t klplat_called(const char *name) {
     plat_hit(name);
-    if (permissive()) {
+    if (kl_permissive()) {
         int s = plat_slot(name);
         if (s >= 0 && g_plat[s].calls == 1)
             fprintf(stderr, "  [plat] call (permissive, returning 0): %s\n", name);
