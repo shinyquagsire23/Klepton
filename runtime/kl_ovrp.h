@@ -122,6 +122,26 @@ int kl_ovrp_last_complete_stage(void);
 // mid-run stays consistent with the pictures rendered under it.
 void kl_ovrp_set_eye_frustum(int eye, float left, float right, float top, float bottom);
 
+// The head->eye offset seam — i.e. the IPD, and the only place the guest can
+// learn it from.
+//
+// libunity's per-frame node loop (libunity+0x9bbff0) asks
+// ovrp_GetNodePoseState for node 0 (EyeLeft) and node 1 (EyeRight) as well as
+// node 9 (Head), and *that pair is where its stereo separation comes from*:
+// there is no ovrp_GetUserIPD in the surface this title imports, so an eye
+// pose that equals the head pose is a headset with an IPD of zero. Both eyes
+// then render from the same point, every disparity is zero, and the world
+// reads as flat and infinitely far away — which presents as "things look too
+// big and too far", not as "the stereo is off".
+//
+// `x, y, z` are metres in the HEAD's own frame (right, up, back), which is
+// exactly `cp_view_get_transform`'s translation on visionOS. Defaults to zero
+// on both eyes, which is the behaviour every host run so far has had — the
+// SDL viewer is monocular, so nothing on the host can tell the difference.
+// KL_OVRP_IPD=<metres> overrides both eyes with a symmetric ±IPD/2 and is the
+// A/B for "is the separation the compositor pushed the right one".
+void kl_ovrp_set_eye_offset(int eye, float x, float y, float z);
+
 // The display frequency the guest is told the headset runs at
 // (ovrp_GetSystemDisplayFrequency, and the single entry in
 // ovrp_GetSystemDisplayAvailableFrequencies). Defaults to the Quest 2's 72 Hz,

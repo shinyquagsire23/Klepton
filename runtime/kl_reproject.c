@@ -62,7 +62,7 @@ static const char kl_msl_reproject[] =
 "                               sampler samp [[sampler(0)]],\n"
 "                               constant KLReproj &u [[buffer(0)]])\n"
 "{\n"
-"    return tex.sample(samp, in.uv, u.slice);\n"
+"    return float4(tex.sample(samp, in.uv, u.slice).rgb, 1.0);\n"
 "}\n"
 "\n"
 // The probe ladder (KL_CP_PROBE). Same library, same vertex function, so each

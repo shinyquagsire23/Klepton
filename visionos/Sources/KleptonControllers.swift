@@ -10,8 +10,15 @@
 //    * **PSVR2 Sense controllers**, when paired. Poses come from ARKit's
 //      `AccessoryTrackingProvider`, buttons from GameController. This is the
 //      real answer — it is the only source that has buttons at all.
-//    * **Hands**, always. `HandTrackingProvider`'s wrist anchor stands in for
-//      the grip pose. Poses only: a hand has no trigger, so nothing clicks.
+//    * **Hands**, always. `HandTrackingProvider`'s skeleton supplies the grip
+//      pose (the middle-finger metacarpal, so a hilt is gripped rather than
+//      swinging off the wrist), and the index trigger comes from the system's
+//      own pinch recogniser through `LayerRenderer.onSpatialEvent` — not from
+//      our arithmetic on two fingertip joints, which was tried twice and was
+//      unstable both times. The fingertip distance survives as the trigger's
+//      analog value and as the fallback if no spatial event ever arrives.
+//      No other button exists on a hand, but a trigger is the one a menu
+//      clicks with.
 //
 //  So this file is a merge, not a switch: Sense wins per hand where it is
 //  present, hands fill in the rest, and a Sense controller that is paired for
@@ -27,6 +34,7 @@
 import Foundation
 import ARKit
 import GameController
+import SwiftUI
 import simd
 
 /// One hand's worth of state, in the guest's own units.
@@ -74,6 +82,132 @@ enum OVRPRawButton {
     static let rHandTrigger: UInt32   = 0x0800_0000   // (v)
     static let lIndexTrigger: UInt32  = 0x1000_0000   // (v)
     static let lHandTrigger: UInt32   = 0x2000_0000   // (v)
+}
+
+/// The wrist frame ARKit reports, expressed in the grip frame the guest wants.
+///
+/// **These are not the same basis, and nothing above this line converts them.**
+/// `HandAnchor.originFromAnchorTransform` is the wrist joint, whose axes are
+/// anatomical and mirrored between hands; the guest wants an Oculus Touch grip
+/// pose — right-handed, +Y up out of the top of the hilt, **-Z along the
+/// direction the hilt points**. Handing the wrist frame over unconverted is
+/// what put the laser out of the side of the wrist rather than out of the fist.
+///
+/// The mapping is ALVR's, from `WorldTracker.swift`'s
+/// `rightHandOrientationCorrection` — the same anchor, the same provider, the
+/// same OS — and it is observed correct on device for the RIGHT hand:
+///
+///   grip X = wrist +Y, grip Y = wrist +Z, grip Z = wrist +X
+///
+/// **The LEFT hand is `R · Rx(180)`**, and four playtests force that — no free
+/// parameters are left:
+///
+/// | left constant | the hilt |
+/// |---|---|
+/// | A = `R · Ry(180)` (ALVR's mirrored pair) | base at the pinky |
+/// | B = `R` (the right hand's own) | "about how I would want it, **if it were just rotated 180**" |
+/// | C = `R · Rz(180)` | base at the pinky again — indistinguishable from A |
+///
+/// A and C look the same, and that is the measurement that closes it. They
+/// differ by exactly `Rx(180)` (`Rx·Ry = Rz` for half-turns about orthogonal
+/// axes), so a feature invariant between them is invariant under `Rx(180)` —
+/// which means **the visible hilt axis is the grip's X**, not its Z. (It is not
+/// our Z because the game does not point a saber down the raw grip axis:
+/// `IVRPlatformHelper.AdjustControllerTransform` rotates a Touch controller by
+/// a large device-specific offset before rendering anything.)
+///
+/// B reverses the hilt relative to A and C — it flips X — and B is the one whose
+/// direction was right. So the fix must keep B's X and turn the hilt over about
+/// it: `Rx(180)`, the only half-turn that preserves X.
+///
+/// Which is also why the two earlier attempts failed the same way. Both reasoned
+/// about *which axis of Apple's wrist frame means what*, and that has no ground
+/// truth to check against — the relationship between the hands' frames is a
+/// convention that is not written down, and cannot be derived (a joint transform
+/// is a rotation, determinant +1; a mirror is not, so something must differ
+/// between the hands and which axis differs was a free choice). The playtests do
+/// have ground truth. Reading them eliminated Y, then eliminated Z, and X is what
+/// remains.
+///
+/// A/Bs, since this is still inference from four samples:
+///   * `KL_HAND_ANATOMICAL=1` derives the left frame from joint **positions**
+///     instead (`anatomicalFrame`) — no convention needed at all, but it has
+///     never been confirmed on device.
+///   * `KL_HAND_MIRROR=1` restores row A.
+///   * `KL_HAND_ROT_L="180,0,0"` / `"0,180,0"` / `"0,0,180"` sweeps the axes
+///     from here with no rebuild.
+private let klGripFromWrist: [simd_quatf] = {
+    let r = simd_quatf(ix: 0.5, iy: 0.5, iz: 0.5, r: 0.5)
+    if ProcessInfo.processInfo.environment["KL_HAND_MIRROR"] == "1" {
+        NSLog("[cp] KL_HAND_MIRROR: ALVR's mirrored pair")
+        return [simd_quatf(ix: 0.5, iy: -0.5, iz: -0.5, r: 0.5), r]
+    }
+    // r * Rx(180), multiplied out, so the constant in the source and the
+    // constant in a log line are the same object.
+    return [simd_quatf(ix: -0.5, iy: -0.5, iz: 0.5, r: 0.5), r]
+}()
+
+/// `KL_HAND_ROT="x,y,z"` (degrees) and `KL_HAND_POS="x,y,z"` (metres): a further
+/// rotation and offset in the *grip's own* frame, applied to every hand pose
+/// after the correction above. `KL_HAND_ROT_L` / `KL_HAND_ROT_R` (and the `POS`
+/// pair) override it for one hand.
+///
+/// Per-hand, because the errors that are left are not guaranteed to be
+/// symmetric — the shared correction above is a claim about a convention, and
+/// if it turns out to be half right the fix is 180 degrees on one hand only,
+/// which a shared knob cannot express.
+///
+/// This exists because the remaining error is a comfort angle, not a basis
+/// error, and a comfort angle can only be found by wearing the thing: Beat
+/// Saber's own `IVRPlatformHelper.AdjustControllerTransform` tilts a Touch
+/// controller by a device-specific offset we cannot read, so even a perfect
+/// grip pose does not put the saber where a Quest player's muscle memory
+/// expects. One device run per candidate angle, with no rebuild between them.
+private struct KLHandTune {
+    var rot = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    /// 4 cm out along the hilt axis by default (`-Z`, the direction the blade
+    /// leaves the fist). The metacarpal midpoint is where the hand *holds* the
+    /// hilt, which is not where a Touch controller's tracked origin sits — the
+    /// controller extends past the fist — so a hilt pinned to the palm reads as
+    /// sliding back down its own pointing ray. Directionally right, not gripped
+    /// right. `KL_HAND_POS` replaces this outright.
+    var pos = SIMD3<Float>(0, 0, -0.04)
+
+    /// Indexed by hand: 0 = left, 1 = right.
+    static let shared: [KLHandTune] = [make(0), make(1)]
+
+    private static func make(_ hand: Int) -> KLHandTune {
+        var t = KLHandTune()
+        let env = ProcessInfo.processInfo.environment
+        let suffix = hand == 0 ? "_L" : "_R"
+        // The per-hand key wins where it is set; the shared one is the default.
+        func triple(_ key: String) -> (SIMD3<Float>, String)? {
+            for k in [key + suffix, key] {
+                guard let s = env[k] else { continue }
+                let f = s.split(separator: ",")
+                    .compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+                guard f.count == 3 else {
+                    NSLog("[cp] \(k)=\(s) is not three comma-separated numbers — ignored")
+                    continue
+                }
+                return (SIMD3<Float>(f[0], f[1], f[2]), k)
+            }
+            return nil
+        }
+        if let (d, k) = triple("KL_HAND_ROT") {
+            let r = d * .pi / 180
+            // X then Y then Z, in the grip's own frame.
+            t.rot = simd_quatf(angle: r.x, axis: [1, 0, 0])
+                  * simd_quatf(angle: r.y, axis: [0, 1, 0])
+                  * simd_quatf(angle: r.z, axis: [0, 0, 1])
+            NSLog("[cp] \(k): hand \(hand) extra grip rotation \(d) degrees")
+        }
+        if let (p, k) = triple("KL_HAND_POS") {
+            t.pos = p
+            NSLog("[cp] \(k): hand \(hand) extra grip offset \(p) m")
+        }
+        return t
+    }
 }
 
 final class KleptonControllers {
@@ -165,7 +299,18 @@ final class KleptonControllers {
             case .right: hand = 1
             default:     hand = 1
             }
-            let m = anchor.originFromAnchorTransform
+            // The anchor's OWN transform is the accessory's base — the middle
+            // of the plastic — and pointing a laser out of that is the same
+            // class of bug as pointing it out of the wrist. `.grip` is the
+            // location the platform defines for "where a hand holds this", in
+            // the convention the guest already wants, so no correction follows
+            // it (ALVR applies none either; only a 5-degree PSVR2 comfort tilt,
+            // which is what KL_HAND_ROT is for). A controller that does not
+            // publish a grip — a stylus — falls back to its base.
+            let m = anchor.accessory.locations.contains(.grip)
+                ? anchor.coordinateSpace(for: .grip, correction: .rendered)
+                        .ancestorFromSpaceTransformFloat().matrix
+                : anchor.originFromAnchorTransform
             // Through a non-async helper: taking a lock directly inside an
             // async function is an error in Swift 6 mode, and the fix is not to
             // suppress it — the critical section genuinely must not span a
@@ -179,8 +324,167 @@ final class KleptonControllers {
         lock.lock()
         defer { lock.unlock() }
         accessoryPose[hand] = removed ? nil
-            : (SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z), simd_quatf(m))
+            : KleptonControllers.tuned(SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z),
+                                       simd_quatf(m), hand: hand)
     }
+
+    /// Apply the KL_HAND_ROT / KL_HAND_POS tuning, in the grip's own frame.
+    /// The one place both pose sources pass through, so a tuned angle means the
+    /// same thing whether it came from a Sense controller or a hand.
+    private static func tuned(_ p: SIMD3<Float>, _ q: simd_quatf,
+                              hand: Int) -> (SIMD3<Float>, simd_quatf) {
+        let t = KLHandTune.shared[hand]
+        let q2 = q * t.rot
+        return (p + q2.act(t.pos), q2)
+    }
+
+    /// The hand's **anatomical** frame, built out of joint positions rather than
+    /// out of anyone's frame convention — OpenXR's grip basis, by its own
+    /// definition:
+    ///
+    ///   * `-Z` is "the ray through the tube formed by the non-thumb fingers,
+    ///     in the direction of little finger to thumb" — so `+Z` runs index
+    ///     knuckle to little knuckle.
+    ///   * `+X` is the palm normal: *into* the palm for the right hand, *away
+    ///     from* it for the left.
+    ///   * `+Y` completes it.
+    ///
+    /// **Why this is worth computing rather than converting.** Two attempts at
+    /// converting the wrist frame both got the two hands' relationship wrong,
+    /// in opposite directions, because that relationship is a convention nobody
+    /// documents and it cannot be derived from anatomy: a joint transform is a
+    /// rotation (determinant +1) and a mirror is not, so *something* must differ
+    /// between the hands and which axis differs is a free choice Apple made.
+    /// Positions have no such freedom. Built from three joint positions, the
+    /// frame comes out consistent between hands by construction.
+    ///
+    /// The chirality that looks like it should need a special case cancels:
+    /// `n = (I-W) x (L-W)` points *out of* the palm on the right hand and *into*
+    /// it on the left, and OpenXR wants `+X` into the palm on the right and out
+    /// of it on the left — so `+X = -n` on both. That cancellation is the whole
+    /// reason OpenXR defines `+X` with an explicit per-hand flip: it makes a
+    /// symmetric controller held the same way produce the same grip rotation in
+    /// either hand, which is exactly the property that has been missing here.
+    private static func anatomicalFrame(_ anchor: HandAnchor) -> simd_quatf? {
+        guard let sk = anchor.handSkeleton else { return nil }
+        let w = sk.joint(.wrist), i = sk.joint(.indexFingerKnuckle),
+            l = sk.joint(.littleFingerKnuckle)
+        guard w.isTracked, i.isTracked, l.isTracked else { return nil }
+        // Anchor-local is enough: the frame is then rotated into the world by
+        // the anchor, exactly as the joints are.
+        func p(_ j: HandSkeleton.Joint) -> SIMD3<Float> {
+            let c = j.anchorFromJointTransform.columns.3
+            return SIMD3<Float>(c.x, c.y, c.z)
+        }
+        let W = p(w), I = p(i), L = p(l)
+        let n = simd_cross(I - W, L - W)
+        // A flat or degenerate triangle means the joints are stacked and the
+        // normal is noise. Refuse rather than emit a frame that spins.
+        guard simd_length(n) > 1e-6, simd_length(L - I) > 1e-4 else { return nil }
+        let z = simd_normalize(L - I)
+        let x = simd_normalize(-n)
+        let y = simd_cross(z, x)            // unit already: x and z are orthogonal
+        let local = simd_float3x3(columns: (x, y, z))
+        return simd_quatf(anchor.originFromAnchorTransform) * simd_quatf(local)
+    }
+
+    /// The grip frame expressed in the anatomical frame — the one constant that
+    /// relates the two, and the same for both hands by the argument above.
+    ///
+    /// **Learned from the right hand, applied to the left.** The right hand's
+    /// wrist-based conversion is the one that has been observed correct on
+    /// device, so it stays untouched and is the reference: whenever the right
+    /// hand is tracked, `K = A_right⁻¹ · W_right · R` is measured and latched,
+    /// and the left hand is then `A_left · K` — which is the left hand's
+    /// anatomically equivalent grip, whatever Apple's wrist convention happens
+    /// to be. Zero risk to the hand that already works, and no third guess at
+    /// the hand that does not.
+    ///
+    /// Until the right hand has been seen once, the left falls back to the
+    /// wrist conversion, i.e. today's behaviour. `KL_HAND_MIRROR=1` disables
+    /// the whole mechanism and restores ALVR's mirrored pair.
+    private var gripFromAnatomical: simd_quatf?
+
+    /// The grip pose for a tracked hand: where a held hilt would be, and which
+    /// way it would point.
+    ///
+    /// Position is the middle of the **middle-finger metacarpal** — the bone
+    /// running through the palm — taken as the midpoint of its two ends. That
+    /// is the bone a fist closes around, so a hilt placed there is a hilt being
+    /// gripped rather than swinging about the wrist as the anchor origin does.
+    ///
+    /// **The offset is cached in the wrist's own frame, and that is not an
+    /// optimisation.** Finger joints drop in and out of `isTracked` as the hand
+    /// turns, and the old code fell back to the raw anchor origin whenever they
+    /// did — a ~7 cm snap between two different definitions of "here", several
+    /// times a second while rotating the hand. That is the hilts jumping
+    /// around. Holding the last known wrist-local offset instead means losing
+    /// the skeleton costs precision, not position.
+    private func gripPose(_ anchor: HandAnchor, hand: Int) -> (SIMD3<Float>, simd_quatf) {
+        let origin = anchor.originFromAnchorTransform
+        let wristRot = simd_quatf(origin)
+
+        // --- orientation.
+        var q = wristRot * klGripFromWrist[hand]
+        if Self.anatomical, let a = Self.anatomicalFrame(anchor) {
+            if hand == 1 {
+                // The reference hand. Measure the constant — and LOW-PASS it.
+                // K is a constant of the two frames' relationship, so every
+                // frame is another sample of the same number; taking the latest
+                // one raw would pipe the right hand's joint noise straight into
+                // the left hand's pose, which is a jitter with no visible
+                // cause. Converges in about two seconds and is then steady.
+                let sample = a.inverse * q
+                if let k = gripFromAnatomical {
+                    gripFromAnatomical = simd_slerp(k, sample, 0.02)
+                } else {
+                    gripFromAnatomical = sample
+                    NSLog(String(format: "[cp] grip-from-anatomical latched from the right hand: "
+                                 + "(%.4f, %.4f, %.4f, %.4f) — the left hand now follows it",
+                                 sample.imag.x, sample.imag.y, sample.imag.z, sample.real))
+                }
+            } else if let k = gripFromAnatomical {
+                q = a * k
+            }
+        }
+
+        // --- position, in the wrist's frame so a dropout cannot move it.
+        //
+        // **Heavily smoothed, and frozen while the trigger is down.** In the
+        // wrist's frame this offset is a bone: it is the same number every
+        // frame for a given pair of hands, so anything that moves it is either
+        // tracker noise or the hand changing shape — and the hand changing
+        // shape is exactly what a pinch is. Letting it through means the
+        // pointer's origin walks at the instant of the click, which is a ray
+        // that leaves the button as you press it. That is indistinguishable
+        // from an unreliable trigger and is not a trigger bug at all.
+        if !pinchHeld[hand], let sk = anchor.handSkeleton {
+            let base = sk.joint(.middleFingerMetacarpal)
+            let tip  = sk.joint(.middleFingerKnuckle)
+            if base.isTracked && tip.isTracked {
+                let a = base.anchorFromJointTransform.columns.3
+                let b = tip.anchorFromJointTransform.columns.3
+                let m = SIMD3<Float>((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5)
+                // First sample lands, the rest converge — no visible settle,
+                // and steady afterwards.
+                gripOffset[hand] = gripOffset[hand].map { $0 + (m - $0) * 0.05 } ?? m
+            }
+        }
+        let local = gripOffset[hand] ?? .zero
+        let world = origin * SIMD4<Float>(local.x, local.y, local.z, 1)
+        return Self.tuned(SIMD3<Float>(world.x, world.y, world.z), q, hand: hand)
+    }
+
+    /// Last known grip point in the wrist's own frame, per hand.
+    private var gripOffset: [SIMD3<Float>?] = [nil, nil]
+
+    /// KL_HAND_ANATOMICAL=1 — derive the left hand's frame from joint positions
+    /// rather than from the constant above. Off by default: it is the more
+    /// principled construction and it has never been confirmed on device, and a
+    /// default nobody has looked at is not better than a constant three
+    /// playtests point at.
+    private static let anatomical =
+        ProcessInfo.processInfo.environment["KL_HAND_ANATOMICAL"] == "1"
 
     // MARK: - Polling
 
@@ -285,11 +589,196 @@ final class KleptonControllers {
 
     // MARK: - The seam
 
+    /// The index trigger, from a pinch.
+    ///
+    /// A hand has no buttons, which used to mean a hand-tracked run could reach
+    /// the menu and then not click anything in it. The thumb-to-index distance
+    /// is the one continuous quantity a hand does supply, and it maps onto a
+    /// trigger the way a trigger already behaves.
+    ///
+    /// **It is a TWO-point calibration, and the closed end is the one that
+    /// matters.** The first version was `1 - d / 5cm`, which reads as "touching
+    /// is fully pressed" and is wrong about what touching means: `thumbTip` and
+    /// `indexFingerTip` are skeletal joints inside fingers that have thickness,
+    /// so a hard pinch bottoms out around 1.5 cm apart, not 0. That version
+    /// therefore topped out near 0.7 — enough that the guest saw the axis move
+    /// (the laser changed with it) and never enough for a full press. It read
+    /// as a missing button bit and was a missing 30% of range.
+    ///
+    /// So: `KL_PINCH_CLOSED` metres (default 1.5 cm) or nearer is 1.0,
+    /// `KL_PINCH_OPEN` (default 5 cm) or further is 0.0, linear between. Both
+    /// are per-user — fingers differ — which is why they are knobs and why
+    /// `KL_PINCH_TRACE=1` reports the distance actually measured.
+    ///
+    /// The *bit* gets hysteresis; the axis does not. `RawButton.RIndexTrigger`
+    /// is what a UI click is edged off, and a bare threshold on a noisy
+    /// millimetre of fingertip jitter emits a burst of press/release pairs at
+    /// exactly the moment the user meant one click.
+    private func pinchTrigger(_ anchor: HandAnchor, hand: Int) -> Float {
+        guard let sk = anchor.handSkeleton else { pinchNoSkeleton[hand] += 1; return 0 }
+        let thumb = sk.joint(.thumbTip), index = sk.joint(.indexFingerTip)
+        guard thumb.isTracked && index.isTracked else {
+            pinchNoSkeleton[hand] += 1; return 0
+        }
+        let o = anchor.originFromAnchorTransform
+        let a = (o * thumb.anchorFromJointTransform).columns.3
+        let b = (o * index.anchorFromJointTransform).columns.3
+        let d = simd_length(SIMD3<Float>(a.x - b.x, a.y - b.y, a.z - b.z))
+        let t = max(0, min(1, (Self.pinchOpen - d) / (Self.pinchOpen - Self.pinchClosed)))
+        tracePinch(hand: hand, distance: d, value: t)
+        return t
+    }
+
+    /// The distance that reads as a fully released trigger. KL_PINCH_OPEN.
+    private static let pinchOpen: Float = envMetres("KL_PINCH_OPEN", 0.05)
+    /// ...and the one that reads as fully pressed. KL_PINCH_CLOSED. Kept below
+    /// `pinchOpen` whatever the environment says, because the two are divided.
+    ///
+    /// **3 cm, raised from the original 1.5.** A device playtest got through
+    /// the menus only after raising this by hand, which is a measurement: these
+    /// joints bottom out much further apart than the first guess assumed. It is
+    /// a *floor*, not a threshold — anything closer also reads 1.0 — so erring
+    /// wide costs a little sensitivity and erring narrow costs the click.
+    private static let pinchClosed: Float = min(envMetres("KL_PINCH_CLOSED", 0.03),
+                                                pinchOpen - 0.005)
+
+    /// KL_PINCH_SRC — which source is allowed to press the button. Default
+    /// `both`; `system` or `distance` isolates one when the question is which
+    /// of the two is misbehaving.
+    private enum PinchSource { case both, system, distance }
+    private static let pinchSrc: PinchSource = {
+        switch ProcessInfo.processInfo.environment["KL_PINCH_SRC"] {
+        case "system":   NSLog("[cp] KL_PINCH_SRC=system — system pinch events only"); return .system
+        case "distance": NSLog("[cp] KL_PINCH_SRC=distance — fingertip distance only"); return .distance
+        default: return .both
+        }
+    }()
+
+    /// Which source pressed, counted per report interval — so "the system is
+    /// dropping presses" and "the distance never gets there" stop being one
+    /// sentence of playtest feedback.
+    private var pinchFromSystem = [0, 0]
+    private var pinchFromDistance = [0, 0]
+    /// Spatial events seen, and those the system could not attribute to a hand.
+    private var spatialEvents = 0
+    private var spatialNoChirality = 0
+
+    private static func envMetres(_ key: String, _ fallback: Float) -> Float {
+        let v = ProcessInfo.processInfo.environment[key].flatMap { Float($0) } ?? 0
+        return (v > 0 && v < 0.5) ? v : fallback
+    }
+
+    /// The closest pinch seen per hand, the axis value it produced, and whether
+    /// the bit was ever set — every two seconds.
+    ///
+    /// **On by default** (`KL_PINCH_TRACE=0` silences it), because two device
+    /// playtests have now reported "the trigger does not click" and neither
+    /// could say *which* of the four things in the chain was missing: the
+    /// skeleton, the joints, the range, or the threshold. One line every two
+    /// seconds distinguishes all four, and this is a bring-up seam where that
+    /// is worth more than the log space. `pinches` counts frames where the bit
+    /// was actually asserted, so "nothing reached the guest" and "the guest
+    /// ignored it" stop looking the same.
+    private var pinchMin: [Float] = [9, 9]
+    private var pinchPeak: [Float] = [0, 0]
+    private var pinchFires: [Int] = [0, 0]
+    private var pinchNoSkeleton: [Int] = [0, 0]
+    private var pinchNextLog: TimeInterval = 0
+    private func tracePinch(hand: Int, distance: Float, value: Float) {
+        pinchMin[hand] = min(pinchMin[hand], distance)
+        pinchPeak[hand] = max(pinchPeak[hand], value)
+    }
+    private func reportPinch() {
+        guard Self.pinchTrace else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= pinchNextLog else { return }
+        pinchNextLog = now + 2
+        // A "closest" of 9 means the distance was never computed at all — no
+        // skeleton, or the two fingertip joints were not tracked. That is a
+        // different bug from a pinch that is measured and too wide, and it is
+        // the one the value alone cannot show.
+        func fmt(_ h: Int) -> String {
+            pinchMin[h] > 8
+                ? String(format: "no skeleton (%d frames)", pinchNoSkeleton[h])
+                : String(format: "%.3f m -> %.2f, %d down (sys %d, dist %d)",
+                         pinchMin[h], pinchPeak[h], pinchFires[h],
+                         pinchFromSystem[h], pinchFromDistance[h])
+        }
+        NSLog("[cp] pinch: L \(fmt(0)) | R \(fmt(1)) "
+              + String(format: "(open %.3f closed %.3f, %d spatial events, %d unattributed)",
+                       Self.pinchOpen, Self.pinchClosed, spatialEvents, spatialNoChirality))
+        pinchMin = [9, 9]; pinchPeak = [0, 0]
+        pinchFires = [0, 0]; pinchNoSkeleton = [0, 0]
+        pinchFromSystem = [0, 0]; pinchFromDistance = [0, 0]
+        spatialEvents = 0; spatialNoChirality = 0
+    }
+    private static let pinchTrace =
+        ProcessInfo.processInfo.environment["KL_PINCH_TRACE"] != "0"
+
+    /// Debounced press state for the *fallback* pinch trigger, per hand.
+    private var pinchHeld = [false, false]
+
+    // MARK: - The system pinch
+
+    /// Whether the system says each hand is currently pinching, and whether it
+    /// has ever said anything at all.
+    ///
+    /// The second flag matters: until an event arrives we cannot tell "not
+    /// pinching" from "this callback is never going to fire", and those need
+    /// different behaviour. Before the first event the fingertip-distance
+    /// fallback still drives the button; after it, the system is the only thing
+    /// that presses, because two sources of truth for one bit is how a click
+    /// ends up half-registered.
+    private var systemPinch = [false, false]
+    private var systemPinchSeen = false
+
+    /// `LayerRenderer.onSpatialEvent`. Called on the system's own queue, hence
+    /// the lock.
+    ///
+    /// Only `.indirectPinch` is taken. `.directPinch` is a finger touching a
+    /// real surface and `.pointer`/`.touch` are other devices entirely; the
+    /// guest's index trigger means "the user is selecting", which is what an
+    /// indirect pinch is.
+    func handleSpatialEvents(_ events: SpatialEventCollection) {
+        for e in events {
+            guard e.kind == .indirectPinch else { continue }
+            // No chirality means the system could not attribute the pinch to a
+            // hand. Attributing it to the right is the same choice the accessory
+            // path already makes, and for the same reason: one-handed use is
+            // overwhelmingly the right hand.
+            let hand: Int
+            var unattributed = false
+            switch e.chirality {
+            case .left:  hand = 0
+            case .right: hand = 1
+            default:
+                hand = 1
+                unattributed = true
+                if !loggedNoChirality {
+                    loggedNoChirality = true
+                    NSLog("[cp] spatial pinch with no chirality — attributed to the right hand")
+                }
+            }
+            let active = e.phase == .active
+            lock.lock()
+            spatialEvents += 1
+            if unattributed { spatialNoChirality += 1 }
+            if !systemPinchSeen {
+                systemPinchSeen = true
+                NSLog("[cp] system pinch events are live — the fingertip-distance "
+                      + "fallback no longer presses anything")
+            }
+            systemPinch[hand] = active
+            lock.unlock()
+        }
+    }
+    private var loggedNoChirality = false
+
     /// Merge every source and push the result across to kl_ovrp.
     ///
-    /// `handAnchors` is the hand-tracking fallback: used for a hand's *pose*
-    /// only, and only where a Sense controller has not already supplied one.
-    func update(leftHand: simd_float4x4?, rightHand: simd_float4x4?) {
+    /// The hand anchors are the fallback: used for a hand's *pose* and its
+    /// pinch trigger, and only where a Sense controller has not supplied one.
+    func update(leftHand: HandAnchor?, rightHand: HandAnchor?) {
         pollButtons()
 
         for hand in 0...1 {
@@ -300,12 +789,52 @@ final class KleptonControllers {
 
             if let accPose {
                 st.position = accPose.0; st.orientation = accPose.1
-            } else if let m = (hand == 0 ? leftHand : rightHand) {
-                st.position = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z)
-                st.orientation = simd_quatf(m)
-                // A hand has no buttons; pollButtons() has already cleared them
-                // for any hand no controller wrote this frame, so there is
-                // nothing to undo here.
+            } else if let anchor = (hand == 0 ? leftHand : rightHand) {
+                let (p, q) = gripPose(anchor, hand: hand)
+                st.position = p; st.orientation = q
+                // pollButtons() has already cleared this hand's bits (no Sense
+                // controller wrote it), so everything the pinch sets is set
+                // here and nothing has to be undone.
+                let t = pinchTrigger(anchor, hand: hand)
+                lock.lock()
+                let sysSeen = systemPinchSeen, sysDown = systemPinch[hand]
+                lock.unlock()
+
+                // **Both sources, OR'd**, and that is deliberate rather than
+                // indecisive. Each has now been observed unreliable on its own:
+                // thresholding the fingertip distance chattered, and the
+                // system's own recogniser drops presses in here too — plausibly
+                // because `.mixed` immersion leaves the system competing for
+                // the same gesture (try KL_FULL=1), or because a pinch it
+                // cannot attribute to a hand is not one we can use. Their
+                // failures are not correlated: the system misses presses the
+                // distance sees, and the distance chatters where the system's
+                // hysteresis is clean. A union is more reliable than either,
+                // and for a *button* a union is also the right shape — the cost
+                // of a spurious release is a dropped click, the cost of a
+                // spurious press is nothing the user will notice.
+                //
+                // KL_PINCH_SRC=system|distance isolates one when the question
+                // is which of them is misbehaving.
+                let byDistance = Self.pinchSrc != .system
+                    && (pinchHeld[hand] ? (t > 0.30) : (t > 0.55))
+                let bySystem = Self.pinchSrc != .distance && sysSeen && sysDown
+                let pressed = byDistance || bySystem
+                if bySystem { pinchFromSystem[hand] += 1 }
+                if byDistance { pinchFromDistance[hand] += 1 }
+
+                // The analog value stays the measured distance — the guest's
+                // laser reacts to it and a trigger that snaps 0->1 loses that —
+                // but a press pins it to 1.0 so the axis can never disagree
+                // with the bit.
+                st.indexTrigger = pressed ? 1 : t
+                pinchHeld[hand] = pressed
+                if pressed {
+                    pinchFires[hand] += 1
+                    let bit = hand == 0 ? OVRPRawButton.lIndexTrigger
+                                        : OVRPRawButton.rIndexTrigger
+                    st.buttons |= bit; st.touches |= bit
+                }
             } else {
                 // Nothing tracked this hand. Leave kl_ovrp's own synthesised
                 // head-relative hand alone rather than pushing a stale pose —
@@ -323,5 +852,6 @@ final class KleptonControllers {
 
             lock.lock(); state[hand] = st; lock.unlock()
         }
+        reportPinch()
     }
 }

@@ -220,6 +220,19 @@ final class KleptonCompositor {
 
     init(_ layerRenderer: LayerRenderer) {
         self.layerRenderer = layerRenderer
+
+        // The system's own pinch, rather than our arithmetic on two fingertip
+        // joints. `onSpatialEvent` is how a fully-immersive Metal app is told
+        // that the user selected something — the same recogniser the rest of
+        // visionOS uses, with the platform's own hysteresis, its own idea of
+        // what counts as a pinch, and gaze already folded in. Two rounds of
+        // hand-rolled distance thresholding were unstable at exactly the
+        // moment they mattered, and there is no version of that arithmetic
+        // that beats the recogniser the OS ships.
+        let controllers = self.controllers
+        layerRenderer.onSpatialEvent = { events in
+            controllers.handleSpatialEvents(events)
+        }
     }
 
     // MARK: - Poses
@@ -306,11 +319,15 @@ final class KleptonCompositor {
             Task { await runARKit() }
         }
 
-        var left: simd_float4x4?, right: simd_float4x4?
+        // The anchors themselves, not their transforms: the grip pose is built
+        // from the hand skeleton (the metacarpal a fist closes around) and so
+        // is the pinch trigger, and neither is recoverable from the anchor
+        // origin alone.
+        var left: HandAnchor?, right: HandAnchor?
         if HandTrackingProvider.isSupported {
             let hands = handTracking.latestAnchors
-            if let a = hands.leftHand,  a.isTracked { left  = a.originFromAnchorTransform }
-            if let a = hands.rightHand, a.isTracked { right = a.originFromAnchorTransform }
+            if let a = hands.leftHand,  a.isTracked { left  = a }
+            if let a = hands.rightHand, a.isTracked { right = a }
         }
         controllers.update(leftHand: left, rightHand: right)
     }
@@ -831,6 +848,9 @@ final class KleptonCompositor {
             }
         }
 
+        // The guest's stereo separation, refreshed from the display itself.
+        pushEyeOffsets(drawable)
+
         var encoded = 0
         for (i, view) in drawable.views.enumerated() {
             let eye = i                              // view 0 = left, 1 = right
@@ -959,6 +979,39 @@ final class KleptonCompositor {
     /// Tangents come from the projection matrix rather than `cp_view_tangents`,
     /// which visionOS 2.0 deprecated — and the matrix is the more honest source
     /// anyway, since it is what the composite pass projects with.
+    /// Tell the guest where this display's eyes actually are.
+    ///
+    /// `view.transform` is `device_from_view`, so its translation is the
+    /// head->eye offset in the head's own frame — which is precisely what
+    /// `kl_ovrp_set_eye_offset` wants, and precisely what the guest had no way
+    /// of knowing before. Until this existed, nodes 0 and 1 both answered the
+    /// head pose: an IPD of zero, both eyes rendering from the same point, and
+    /// a world with no disparity anywhere in it (kl_ovrp.h says what that looks
+    /// like).
+    ///
+    /// Pushed from `primeDisplay` so it is right before the guest's first
+    /// frame, and again each frame because it costs two stores and the user can
+    /// change the fit of the headset mid-run.
+    ///
+    /// Not gated on `keepQuestDisplay`: that knob keeps the synthetic *frustum*
+    /// and frame rate, and an eye separation is neither. Use KL_OVRP_IPD to
+    /// override this one.
+    private func pushEyeOffsets(_ drawable: LayerRenderer.Drawable) {
+        for (i, view) in drawable.views.enumerated() where i < 2 {
+            let t = view.transform.columns.3
+            kl_ovrp_set_eye_offset(Int32(i), t.x, t.y, t.z)
+            if !loggedEyeOffsets && i == drawable.views.count - 1 {
+                loggedEyeOffsets = true
+                let l = drawable.views[0].transform.columns.3
+                NSLog(String(format: "[cp] eye offsets: L (%.4f, %.4f, %.4f) "
+                             + "R (%.4f, %.4f, %.4f) — IPD %.1f mm",
+                             l.x, l.y, l.z, t.x, t.y, t.z,
+                             abs(t.x - l.x) * 1000))
+            }
+        }
+    }
+    private var loggedEyeOffsets = false
+
     private func primeDisplay() {
         var stamps: [TimeInterval] = []
         var tangents: [SIMD4<Float>] = []
@@ -983,6 +1036,7 @@ final class KleptonCompositor {
                 tangents = (0..<drawable.views.count).map {
                     kl_reproject_tangents(drawable.computeProjection(viewIndex: $0))
                 }
+                pushEyeOffsets(drawable)
             }
             clearAndPresent(drawable)
             // Only after a drawable was actually presented — trap 14. The old

@@ -261,6 +261,33 @@ void kl_ovrp_set_eye_frustum(int eye, float left, float right, float top, float 
     g_eye_tan[eye][2] = top;   g_eye_tan[eye][3] = bottom;
 }
 
+// The head->eye offsets, head-local metres, and the guest's whole source of
+// stereo separation — see kl_ovrp.h. Zero is the historical host behaviour and
+// stays the default; the visionOS compositor pushes the display's own numbers.
+static float g_eye_off[2][3];
+
+void kl_ovrp_set_eye_offset(int eye, float x, float y, float z) {
+    if ((unsigned)eye > 1) return;
+    g_eye_off[eye][0] = x; g_eye_off[eye][1] = y; g_eye_off[eye][2] = z;
+}
+
+// KL_OVRP_IPD=<metres>: force a symmetric separation, ignoring whatever the
+// frontend pushed. The A/B for "is the compositor's number the wrong one" —
+// and, with no frontend at all, the only way to get stereo out of a host run.
+static void klovrp_eye_offset(int eye, float *ox, float *oy, float *oz) {
+    static float forced = -1.0f;
+    if (forced < 0.0f) {
+        const char *e = getenv("KL_OVRP_IPD");
+        float v = e ? (float)atof(e) : 0.0f;
+        forced = (v > 0.0f && v < 0.2f) ? v : 0.0f;
+    }
+    if (forced > 0.0f) {
+        *ox = (eye == 1 ? 0.5f : -0.5f) * forced; *oy = 0.0f; *oz = 0.0f;
+        return;
+    }
+    *ox = g_eye_off[eye][0]; *oy = g_eye_off[eye][1]; *oz = g_eye_off[eye][2];
+}
+
 // Fills four f32 fov tangents at out+0x08..+0x14 (0x9bcbd4). libunity divides
 // by their max for the aspect, so 0 is not survivable.
 //
@@ -681,8 +708,19 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     memset(out, 0, 0x58);
     klovrp_pose head = klovrp_head();
     const klovrp_pose *p = &head;
-    klovrp_pose hand;
-    if (node == 3 || node == 4) {
+    klovrp_pose hand, eye;
+    if (node == 0 || node == 1) {
+        // EyeLeft/EyeRight. The head pose displaced by this eye's own offset,
+        // rotated into the world by the head's orientation — this pair IS the
+        // guest's IPD (kl_ovrp.h). Node 2 (EyeCenter) and node 9 (Head) keep
+        // the head pose itself, which is what they mean.
+        float dx, dy, dz, ox, oy, oz;
+        klovrp_eye_offset(node, &dx, &dy, &dz);
+        klovrp_qrot(&head, dx, dy, dz, &ox, &oy, &oz);
+        eye = head;
+        eye.px = head.px + ox; eye.py = head.py + oy; eye.pz = head.pz + oz;
+        p = &eye;
+    } else if (node == 3 || node == 4) {
         int h = node - 3;
         // KL_OVRP_HANDS_IN_VIEW=1: park both hands at a fixed spot well inside
         // the *current head's* frustum, overriding whatever the frontend last
