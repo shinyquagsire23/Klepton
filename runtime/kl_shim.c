@@ -113,7 +113,22 @@ __attribute__((noreturn)) void kl_unresolved_named(const char *name) {
     snprintf(msg, sizeof msg, "called unresolved import '%s'", name ? name : "?");
     die(msg);
 }
-__attribute__((noreturn)) static void kl_stack_chk_fail(void) { die("stack smashing detected"); }
+// The guest's -fstack-protector epilogue calls this when the canary it read at
+// entry no longer matches. Naming the caller is most of the diagnosis and costs
+// nothing: bionic keeps the canary in TLS slot 5, which we squat (trap 1), so
+// "stack smashing detected" here has two quite different causes — a genuine
+// overflow of a guest buffer (often one WE filled), or slot 5 changing under a
+// frame that was holding a copy. Which function it was usually separates them,
+// and a bare one-line abort separates nothing.
+__attribute__((noreturn)) static void kl_stack_chk_fail(void) {
+    char msg[256];
+    void *ra = __builtin_return_address(0);
+    size_t off = 0;
+    const char *img = kl_addr_image(ra, &off);
+    if (img) snprintf(msg, sizeof msg, "stack smashing detected in %s+0x%zx", img, off);
+    else     snprintf(msg, sizeof msg, "stack smashing detected, called from %p", ra);
+    die(msg);
+}
 
 // ---------- knobs ----------
 // See klepton.h for why this reads the value and not just the presence.
@@ -548,6 +563,19 @@ X(klb_sem_open) X(klb_sem_close)
 X(klb_pthread_getschedparam) X(klb_pthread_setschedparam)
 X(klb_dlopen) X(klb_dlsym) X(klb_dlclose) X(klb_dlerror) X(klb_dladdr)
 X(klb_clock_gettime) X(klb_clock_getres) X(klb_gettimeofday)
+// kl_libc_slink.c — the surface Steam Link reaches for and Beat Saber does not.
+X(klb_getauxval)
+X(klb_fegetenv) X(klb_fesetenv) X(klb_feholdexcept) X(klb_feupdateenv)
+X(klb_statvfs) X(klb_fstatvfs) X(klb_sendfile)
+X(klb_epoll_create) X(klb_epoll_create1) X(klb_epoll_ctl) X(klb_epoll_wait)
+X(klb_openat) X(klb___open_2)
+X(klb___memmove_chk) X(klb___strncpy_chk) X(klb___strncpy_chk2) X(klb___strcat_chk)
+X(klb___read_chk) X(klb___vsprintf_chk)
+X(klb_sincosf) X(klb_sincos) X(klb_putchar) X(klb_getchar) X(klb_fdatasync)
+X(klb___cmsg_nxthdr) X(klb___cxa_thread_atexit_impl)
+X(klb_fileno) X(klb_fgetc) X(klb_ungetc) X(klb_getwc) X(klb_fgetwc)
+X(klb_ungetwc) X(klb_fputwc) X(klb_putwc) X(klb_fwide)
+X(klb_pthread_rwlock_tryrdlock) X(klb_pthread_rwlock_trywrlock)
 #undef X
 extern char **environ;
 
@@ -611,6 +639,44 @@ static const kl_entry g_shim[] = {
     E("__system_property_find", klb_sysprop_find),
     E("__system_property_get", klb_sysprop_get),
     E("__system_property_read", klb_sysprop_read),
+
+    // The clocks are hand-written (kl_libc.c) and must stay that way: the
+    // Choreographer, System.nanoTime and the engine's frame delta all have to
+    // agree on CLOCK_MONOTONIC, and a frame delta measured across two different
+    // clocks is the offset between them. These three lived as hand-edits inside
+    // the GENERATED table until 2026-08-08, where the next `gen_libc_table.py`
+    // run would have silently turned them back into direct forwards.
+    E("clock_gettime", klb_clock_gettime), E("clock_getres", klb_clock_getres),
+    E("gettimeofday", klb_gettimeofday),
+
+    // ---- kl_libc_slink.c: the surface Steam Link adds (PLANNING §11.4) ----
+    // Every one of these is hand-written for a reason recorded at its
+    // definition — a divergent layout, a colliding signature, or no Darwin
+    // equivalent at all. None of them may become a direct forward.
+    E("getauxval", klb_getauxval),
+    E("fegetenv", klb_fegetenv), E("fesetenv", klb_fesetenv),
+    E("feholdexcept", klb_feholdexcept), E("feupdateenv", klb_feupdateenv),
+    E("statvfs", klb_statvfs), E("fstatvfs", klb_fstatvfs),
+    E("sendfile", klb_sendfile),
+    E("epoll_create", klb_epoll_create), E("epoll_create1", klb_epoll_create1),
+    E("epoll_ctl", klb_epoll_ctl), E("epoll_wait", klb_epoll_wait),
+    E("openat", klb_openat), E("__open_2", klb___open_2),
+    E("__memmove_chk", klb___memmove_chk), E("__strncpy_chk", klb___strncpy_chk),
+    E("__strncpy_chk2", klb___strncpy_chk2), E("__strcat_chk", klb___strcat_chk),
+    E("__read_chk", klb___read_chk), E("__vsprintf_chk", klb___vsprintf_chk),
+    E("sincosf", klb_sincosf), E("sincos", klb_sincos),
+    E("putchar", klb_putchar), E("getchar", klb_getchar),
+    E("fdatasync", klb_fdatasync),
+    E("__cmsg_nxthdr", klb___cmsg_nxthdr),
+    E("__cxa_thread_atexit_impl", klb___cxa_thread_atexit_impl),
+    E("fileno", klb_fileno), E("fgetc", klb_fgetc), E("ungetc", klb_ungetc),
+    E("getwc", klb_getwc), E("fgetwc", klb_fgetwc), E("ungetwc", klb_ungetwc),
+    E("fputwc", klb_fputwc), E("putwc", klb_putwc), E("fwide", klb_fwide),
+    E("pthread_rwlock_tryrdlock", klb_pthread_rwlock_tryrdlock),
+    E("pthread_rwlock_trywrlock", klb_pthread_rwlock_trywrlock),
+    // bionic's LP64 stat aliases must land on the translating shim, never on
+    // Darwin's stat — same struct divergence as `stat` itself (trap 7).
+    E("stat64", klb_stat), E("lstat64", klb_lstat), E("fstat64", klb_fstat),
 
     // setjmp/longjmp forward directly: bionic's jmp_buf (256B) is LARGER than
     // Darwin's (192B), so the guest's buffer is safe, and registering the host
@@ -699,5 +765,30 @@ void *kl_shim_lookup(const char *name) {
     if (ndk) return ndk;
     // Tier 5: EGL (M5). Same reasoning again, and it is the door to GLES —
     // eglGetProcAddress hands out the rest of the graphics surface.
-    return kl_egl_lookup(name);
+    void *egl = kl_egl_lookup(name);
+    if (egl) return egl;
+
+    // Tier 6: GLES and OpenSL ES as *ELF imports*.
+    //
+    // Beat Saber reaches both through dlopen + dlsym — FMOD resolves
+    // slCreateEngine at runtime, and Unity takes GL entry points from
+    // eglGetProcAddress — so for that title nothing in the import list names
+    // them and these gateways are only ever entered through kl_dl.c.
+    //
+    // Steam Link is the other shape: libSDL3.so DT_NEEDEDs libGLESv2.so and
+    // libOpenSLES.so and imports 57 gl* and 6 SL_* symbols directly, so they
+    // have to bind at RELOCATION time or 63 draws' worth of entry points become
+    // unresolved stubs. Same implementations, different door.
+    //
+    // Both routes are gated on the name, because kl_egl_sym never returns NULL
+    // — it manufactures a named stub for anything it does not know. Letting it
+    // answer every miss would swallow the unresolved-import report that is this
+    // project's entire work-list mechanism, and AMediaCodec_* would silently
+    // become "resolved". A lookup is a measurement; it must still be able to
+    // say no.
+    if (name[0] == 'g' && name[1] == 'l' && name[2] >= 'A' && name[2] <= 'Z')
+        return kl_egl_sym(name);
+    if (!strncmp(name, "SL_IID_", 7) || !strcmp(name, "slCreateEngine"))
+        return kl_opensl_sym(name);
+    return NULL;
 }

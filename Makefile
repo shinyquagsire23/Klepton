@@ -15,7 +15,7 @@ LDLIBS  := -lz -framework AudioToolbox
 # the t_boot rule alone.
 RUNTIME_SHIP := runtime/kl_image.c runtime/kl_stub_cells.S runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_va_handlers.c runtime/kl_va_thunks.S \
-           runtime/kl_libc.c runtime/kl_pthread.c runtime/kl_dl.c \
+           runtime/kl_libc.c runtime/kl_libc_slink.c runtime/kl_pthread.c runtime/kl_dl.c \
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c \
@@ -45,6 +45,16 @@ LIBS := beatsaber/lib/arm64-v8a
 load: build/t_load
 	@for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
 	  ./build/t_load $(LIBS)/$$f.so || true; echo; done
+
+# SL-1 — the second target's boot harness (PLANNING §11). Links the same
+# runtime as t_boot, minus the host-only diagnostics: this target has no
+# managed side to probe and no viewer yet.
+build/t_slink: tests/t_slink.c $(RUNTIME) runtime/klepton.h runtime/kl_jni.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_slink.c $(RUNTIME) $(LDLIBS)
+
+slink: build/t_slink
+	./build/t_slink
 
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 	@mkdir -p build
@@ -110,6 +120,15 @@ build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h
 x18: build/t_x18
 	python3 tools/check_x18.py build/t_x18 $(LIBS)/libunity.so $(LIBS)/libil2cpp.so \
 	  $(LIBS)/libunityopus.so $(LIBS)/libmain.so $(LIBS)/lib_burst_generated.so
+
+# The same decoder check against the second target. Kept separate from `x18`
+# because it proves a different thing: Steam Link is a different toolchain
+# (Valve's clang, BoringSSL, SDL3) and it is what found the data-in-.text class
+# — 1059 of libmain.so's 1080 apparent x18 sites are BoringSSL constants.
+SLLIBS := steamlink-android/lib/arm64-v8a
+x18-slink: build/t_x18
+	python3 tools/check_x18.py build/t_x18 $(SLLIBS)/libmain.so $(SLLIBS)/libSDL3.so \
+	  $(SLLIBS)/libSDL3_ttf.so $(SLLIBS)/libSDL3_image.so $(SLLIBS)/libc++_shared.so
 
 # kl_jni_slots.h is checked in; regenerate only when bumping the NDK.
 jnislots:

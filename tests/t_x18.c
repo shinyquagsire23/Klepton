@@ -74,27 +74,47 @@ static void scan(const char *path) {
     }
     const Elf64_Shdr *sh = (const Elf64_Shdr *)(f + eh->e_shoff);
 
+    // ...and code inside those sections, not the whole section: a `.text` can
+    // hold constant tables (Steam Link's libmain.so has 148 KB of them). The
+    // loader and klepton-ld skip the same ranges, so this stays the honest
+    // measurement of what actually gets patched.
+    static klx_range skip[256];
+    unsigned nskip = kl_x18_data_ranges(f, (size_t)sb.st_size, skip,
+                                        sizeof skip / sizeof *skip);
+    if (nskip) {
+        uint64_t bytes = 0;
+        for (unsigned i = 0; i < nskip; i++) bytes += skip[i].end - skip[i].start;
+        fprintf(stderr, "[t_x18] %s: %u data range(s) inside executable sections, "
+                        "%llu bytes — not scanned\n",
+                path, nskip, (unsigned long long)bytes);
+    }
+
     for (int i = 0; i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
-        const uint32_t *w = (const uint32_t *)(f + sh[i].sh_offset);
-        size_t n = (size_t)sh[i].sh_size / 4;
-        for (size_t k = 0; k < n; k++) {
-            uint64_t va = sh[i].sh_addr + (uint64_t)k * 4;
-            klx_info info;
-            klx_decode(w[k], &info);
-            g_words++;
-            if (info.ok && info.nfields == 0) continue;    // nothing to do here
-            if (!info.ok) g_refused++;
-            else {
-                g_sites++;
-                if (info.roles == KLX_R) g_rd++;
-                else if (info.roles == KLX_W) g_wr++;
-                else g_rw++;
+        uint64_t cursor = sh[i].sh_addr, cva;
+        size_t csz;
+        while (kl_x18_next_code(sh[i].sh_addr, (size_t)sh[i].sh_size,
+                                skip, nskip, &cursor, &cva, &csz)) {
+            const uint32_t *w = (const uint32_t *)(f + sh[i].sh_offset + (cva - sh[i].sh_addr));
+            size_t n = csz / 4;
+            for (size_t k = 0; k < n; k++) {
+                uint64_t va = cva + (uint64_t)k * 4;
+                klx_info info;
+                klx_decode(w[k], &info);
+                g_words++;
+                if (info.ok && info.nfields == 0) continue;    // nothing to do here
+                if (!info.ok) g_refused++;
+                else {
+                    g_sites++;
+                    if (info.roles == KLX_R) g_rd++;
+                    else if (info.roles == KLX_W) g_wr++;
+                    else g_rw++;
+                }
+                printf("%llx %08x %08x %d %u %u\n",
+                       (unsigned long long)va, w[k],
+                       info.ok ? klx_substitute(w[k], &info, TEST_REG) : w[k],
+                       info.ok, info.nfields, info.roles);
             }
-            printf("%llx %08x %08x %d %u %u\n",
-                   (unsigned long long)va, w[k],
-                   info.ok ? klx_substitute(w[k], &info, TEST_REG) : w[k],
-                   info.ok, info.nfields, info.roles);
         }
     }
     munmap(f, (size_t)sb.st_size);

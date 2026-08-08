@@ -47,6 +47,7 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define PF_R 4
 #define DT_NULL 0
 #define DT_NEEDED 1
+#define DT_HASH   4
 #define DT_STRTAB 5
 #define DT_SYMTAB 6
 #define DT_RELA 7
@@ -68,6 +69,7 @@ struct kl_image {
     uint8_t   *base;        // mapping base; ELF vaddr V lives at base + V
     size_t     span;
     Elf64_Sym *symtab;
+    size_t     nsyms;       // from DT_HASH's nchain; 0 if the image had none
     const char *strtab;
     void     (**init_array)(void);
     size_t     init_count;
@@ -339,6 +341,11 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
             switch (dp->d_tag) {
             case DT_SYMTAB: img->symtab = (Elf64_Sym *)(img->base + dp->d_val); break;
             case DT_STRTAB: img->strtab = (const char *)(img->base + dp->d_val); break;
+            // The authoritative .dynsym entry count. DT_HASH's second word is
+            // nchain, and the chain array is parallel to the symbol table, so
+            // nchain IS the number of symbols — this is how a real dynamic
+            // linker knows, and it needs no section headers.
+            case DT_HASH:   img->nsyms = ((const uint32_t *)(img->base + dp->d_val))[1]; break;
             case DT_RELA:   rela   = (const Elf64_Rela *)(img->base + dp->d_val); break;
             case DT_RELASZ: relasz = dp->d_val; break;
             case DT_JMPREL: jmprel = (const Elf64_Rela *)(img->base + dp->d_val); break;
@@ -599,20 +606,41 @@ kl_image *kl_load(const char *path) {
         if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
         rewrite_tls(img->base + ph[i].p_vaddr - lo, (size_t)ph[i].p_filesz, &img->stats);
     }
+    // ...and code inside those sections, not whole sections. An executable
+    // section can itself contain data: Steam Link's libmain.so carries
+    // BoringSSL's 148 KB `ecp_nistz256_precomputed` table inside .text, and
+    // 1059 of its 1080 apparent x18 sites are words of that table. Patching
+    // them would replace elliptic-curve constants with branches — a wrong
+    // answer that surfaces as a failing TLS handshake, nowhere near here.
+    static klx_range skip[256];
+    unsigned nskip = sh ? kl_x18_data_ranges(file, (size_t)sb.st_size, skip,
+                                             sizeof skip / sizeof *skip) : 0;
+    if (nskip) {
+        uint64_t bytes = 0;
+        for (unsigned i = 0; i < nskip; i++) bytes += skip[i].end - skip[i].start;
+        fprintf(stderr, "  [klepton] %s: %u data range(s) inside executable sections, "
+                        "%llu bytes — left alone\n",
+                path, nskip, (unsigned long long)bytes);
+    }
     for (int i = 0; sh && i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
-        uint8_t *p = img->base + sh[i].sh_addr - lo;
-        rewrite_tls(p, (size_t)sh[i].sh_size, &img->stats);
-        if (!veneer) continue;
-        kl_x18_stats xs;
-        if (kl_x18_patch(p, (size_t)sh[i].sh_size, &xs) != 0) {
-            fprintf(stderr, "  [klepton] %s: x18 veneering failed to start\n", path);
-            veneer = 0;
-            continue;
+        uint64_t cursor = sh[i].sh_addr, cva;
+        size_t csz;
+        while (kl_x18_next_code(sh[i].sh_addr, (size_t)sh[i].sh_size,
+                                skip, nskip, &cursor, &cva, &csz)) {
+            uint8_t *p = img->base + cva - lo;
+            rewrite_tls(p, csz, &img->stats);
+            if (!veneer) continue;
+            kl_x18_stats xs;
+            if (kl_x18_patch(p, csz, &xs) != 0) {
+                fprintf(stderr, "  [klepton] %s: x18 veneering failed to start\n", path);
+                veneer = 0;
+                continue;
+            }
+            img->stats.x18_sites   += xs.sites;
+            img->stats.x18_patched += xs.patched;
+            img->stats.x18_refused += xs.refused;
         }
-        img->stats.x18_sites   += xs.sites;
-        img->stats.x18_patched += xs.patched;
-        img->stats.x18_refused += xs.refused;
     }
     sys_icache_invalidate(img->base, img->span);
 
@@ -643,8 +671,19 @@ void kl_run_init(kl_image *img) {
 
 void *kl_sym(kl_image *img, const char *name) {
     // Linear scan of .dynsym. Fine for M1; klepton-ld will emit a hash table.
-    // Symbol count is bounded by the gap between symtab and strtab.
-    size_t n = ((const char *)img->strtab - (const char *)img->symtab) / sizeof(Elf64_Sym);
+    //
+    // The count comes from DT_HASH's nchain. It used to be inferred from the
+    // gap between symtab and strtab, which silently assumes .dynstr directly
+    // follows .dynsym — true of every Beat Saber library and false of every
+    // Steam Link one, where the linker puts .gnu.hash and .hash between them.
+    // libc++_shared.so has 2506 symbols and a gap of 4198 entries, so the scan
+    // ran off the end of .dynsym into the hash tables, read their words as
+    // st_name offsets and dereferenced strtab + garbage. It faulted inside
+    // strcmp during a cross-image import bind — a wild read that a slightly
+    // different layout would have turned into a wrong answer instead.
+    size_t n = img->nsyms;
+    if (!n)     // no DT_HASH: fall back to the old inference rather than bind nothing
+        n = ((const char *)img->strtab - (const char *)img->symtab) / sizeof(Elf64_Sym);
     for (size_t i = 0; i < n; i++) {
         const Elf64_Sym *s = &img->symtab[i];
         if (s->st_shndx == 0 || !s->st_name) continue;

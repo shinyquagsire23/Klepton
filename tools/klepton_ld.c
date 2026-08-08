@@ -213,14 +213,29 @@ int main(int argc, char **argv) {
     if (!sh) die("%s has no section headers — cannot separate code from rodata "
                  "(see CLAUDE.md trap 0); refusing to rewrite", in);
 
+    // ...and code inside those sections, not whole sections: a `.text` can hold
+    // constant tables (Steam Link's libmain.so has 148 KB of BoringSSL's P-256
+    // tables in there, which account for 1059 of its 1080 apparent x18 sites).
+    // Same ranges the runtime loader skips — kl_x18.c owns the answer so the
+    // offline and load-time passes cannot drift apart.
+    static klx_range skip[256];
+    unsigned nskip = kl_x18_data_ranges(f, (size_t)sb.st_size, skip,
+                                        sizeof skip / sizeof *skip);
+
     // Pass 1: the TLS rewrite, and a site count so the veneer pool can be sized
     // before the layout is chosen. TLS first, then count — the same order the
     // runtime loader uses, and it matters: `mrs x18, tpidr_el0` is itself an x18
     // site, and rewriting it changes the word the decoder then sees.
     for (int i = 0; i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
-        tls_rewrites += rewrite_tls(img + sh[i].sh_offset, (size_t)sh[i].sh_size);
-        x18_sites    += kl_x18_count(img + sh[i].sh_offset, (size_t)sh[i].sh_size);
+        uint64_t cursor = sh[i].sh_addr, cva;
+        size_t csz;
+        while (kl_x18_next_code(sh[i].sh_addr, (size_t)sh[i].sh_size,
+                                skip, nskip, &cursor, &cva, &csz)) {
+            uint8_t *p = img + sh[i].sh_offset + (cva - sh[i].sh_addr);
+            tls_rewrites += rewrite_tls(p, csz);
+            x18_sites    += kl_x18_count(p, csz);
+        }
     }
 
     // ---- lay out the Mach-O ----
@@ -244,17 +259,22 @@ int main(int argc, char **argv) {
     uint64_t pool_off = 0;
     for (int i = 0; i < eh->e_shnum && pool_cap; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
-        kl_x18_stats st;
-        size_t used = 0;
-        if (kl_x18_emit(img + sh[i].sh_offset, (size_t)sh[i].sh_size,
-                        image_shift + sh[i].sh_addr,
-                        pool + pool_off, (size_t)(pool_cap - pool_off),
-                        pool_va + pool_off, &st, &used) != 0)
-            die("x18 veneer emission failed for section %d", i);
-        x18st.sites   += st.sites;
-        x18st.patched += st.patched;
-        x18st.refused += st.refused;
-        pool_off      += used;
+        uint64_t cursor = sh[i].sh_addr, cva;
+        size_t csz;
+        while (kl_x18_next_code(sh[i].sh_addr, (size_t)sh[i].sh_size,
+                                skip, nskip, &cursor, &cva, &csz)) {
+            kl_x18_stats st;
+            size_t used = 0;
+            if (kl_x18_emit(img + sh[i].sh_offset + (cva - sh[i].sh_addr), csz,
+                            image_shift + cva,
+                            pool + pool_off, (size_t)(pool_cap - pool_off),
+                            pool_va + pool_off, &st, &used) != 0)
+                die("x18 veneer emission failed for section %d", i);
+            x18st.sites   += st.sites;
+            x18st.patched += st.patched;
+            x18st.refused += st.refused;
+            pool_off      += used;
+        }
     }
     if (x18st.refused) {
         // Same posture as the runtime loader: a refused site keeps its raw x18

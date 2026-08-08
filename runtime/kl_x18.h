@@ -159,4 +159,40 @@ typedef struct {
 // decoder. Prints nothing when there are none.
 void kl_x18_report(FILE *f);
 
+// ---------------------------------------------------- data inside code
+//
+// "Executable sections, not the executable segment" (trap 0) is one level too
+// shallow: a `.text` SECTION can itself contain data. Steam Link's libmain.so
+// carries BoringSSL's `ecp_nistz256_precomputed` — 148 KB of elliptic-curve
+// constants — as an STT_OBJECT at 0xb23000, inside .text, and 1059 of that
+// library's 1080 apparent x18 sites are words of that table. Veneering them
+// replaces the constants with branches, so the P-256 tables are silently wrong
+// and every TLS handshake fails somewhere far away from here.
+//
+// Beat Saber has none of this (measured: 0 bytes of STT_OBJECT inside any
+// executable section, across all five libraries), which is why it never showed
+// up. Note the corollary: the objdump cross-check cannot see this class either
+// unless the disassembler can — it renders such a symbol as bytes only because
+// the symbol table says it is data, so a stripped library hides the hazard from
+// BOTH tools. Symbol coverage is the ceiling on what can be detected here.
+typedef struct { uint64_t start, end; } klx_range;
+
+// Ranges of an ELF's address space that are data despite living in an
+// executable section: STT_OBJECT symbols from .symtab/.dynsym, plus `$d`
+// mapping symbols where the toolchain emitted them. Returned sorted, merged and
+// outward-aligned to 4 bytes, so the code chunks between them stay instruction
+// aligned. `elf` is the whole mapped file. Returns the count written, which is
+// capped at `max`; a truncated list is reported by kl_x18_data_ranges itself.
+unsigned kl_x18_data_ranges(const void *elf, size_t size,
+                            klx_range *out, unsigned max);
+
+// Iterate the sub-ranges of [sec_va, sec_va+sec_size) that `skip` does NOT
+// cover — i.e. the parts of an executable section that are really code. Set
+// *cursor to sec_va before the first call; returns 1 and fills *out_va/*out_size
+// per chunk, 0 when the section is exhausted. With nskip == 0 this yields the
+// whole section once, which is what every previously-working library gets.
+int kl_x18_next_code(uint64_t sec_va, size_t sec_size,
+                     const klx_range *skip, unsigned nskip,
+                     uint64_t *cursor, uint64_t *out_va, size_t *out_size);
+
 #endif

@@ -49,6 +49,13 @@ void *kl_jni_native(const char *cls, const char *name, const char *sig);
 // GetObjectClass answer truthfully instead of guessing.
 void *kl_jni_new_object(const char *class_name);
 
+// The interned jclass for a name — the host side of FindClass. A native method
+// is called with its declaring class as the second argument, and a guest may
+// keep it: SDL3's nativeSetupJNI stashes it in a global ref and makes every
+// static call through it. Passing NULL there is not a missing log line, it is a
+// class handle the guest can never resolve.
+void *kl_jni_class(const char *name);
+
 // The one activity instance. A singleton because the guest reaches it two ways
 // — as the Context handed to a native, and through statics like
 // UnityPlayer.currentActivity — and compares them for identity. The class

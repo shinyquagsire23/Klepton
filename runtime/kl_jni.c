@@ -386,6 +386,13 @@ static void *klj_FindClass(void *env, const char *name) {
     return c;
 }
 
+// The host's own FindClass. A native method receives its declaring class as the
+// second argument, and SDL3's nativeSetupJNI keeps that jclass in a global ref
+// and routes every later static call through it — so a harness that passes NULL
+// there does not merely lose a log line, it hands the guest a class handle that
+// can never resolve. See kl_jni.h.
+void *kl_jni_class(const char *name) { return klj_FindClass(NULL, name); }
+
 static void *klj_GetObjectClass(void *env, void *obj) {
     (void)env;
     klj_object *o = klj_as_object(obj);

@@ -403,6 +403,11 @@ int klb_pthread_rwlock_destroy(void *p) { g_rwl_recycle(p); return 0; }
 int klb_pthread_rwlock_rdlock(void *l) { return pthread_rwlock_rdlock(rwl(l)); }
 int klb_pthread_rwlock_wrlock(void *l) { return pthread_rwlock_wrlock(rwl(l)); }
 int klb_pthread_rwlock_unlock(void *l) { return pthread_rwlock_unlock(rwl(l)); }
+// SDL3 reaches for the try- forms; Beat Saber never did. Same side-table
+// indirection as the blocking pair — a bionic rwlock is 56 bytes of 4-byte
+// aligned int32 (trap 3), so what lives in it is an index, not a handle.
+int klb_pthread_rwlock_tryrdlock(void *l) { return pthread_rwlock_tryrdlock(rwl(l)); }
+int klb_pthread_rwlock_trywrlock(void *l) { return pthread_rwlock_trywrlock(rwl(l)); }
 
 // ---------- attributes ----------
 // bionic pthread_attr_t: { uint32 flags; void* stack_base; size_t stack_size;

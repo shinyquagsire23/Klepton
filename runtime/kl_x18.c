@@ -62,21 +62,36 @@ static int dp_imm(uint32_t w, klx_info *o) {
         addfld(o, w, KLX_RN, KLX_R);
         return 1;
     case 0x24:                                 // logical (immediate)
+        // N is the top bit of the bitmask-immediate encoding and only exists in
+        // the 64-bit form: sf == 0 with N == 1 is unallocated. Words like
+        // 52412072 in the middle of Steam Link's .text hit exactly this, and
+        // they are not instructions at all — they are constant-pool bytes with
+        // no symbol to exclude them. Refusing keeps the veneer off data.
+        if (!((w >> 31) & 1) && ((w >> 22) & 1)) return 0;
         addfld(o, w, KLX_RD, KLX_W);
         addfld(o, w, KLX_RN, KLX_R);
         return 1;
     case 0x25:                                 // move wide: imm16 covers [20:5]
+        if (opc == 1) return 0;                            // unallocated
+        if (!((w >> 31) & 1) && ((w >> 22) & 1)) return 0;  // 32-bit form: hw >= 2
         // movk merges into the existing value; movz/movn overwrite it.
         addfld(o, w, KLX_RD, opc == 3 ? (KLX_R | KLX_W) : KLX_W);
         return 1;
     case 0x26:                                 // bitfield
         if (opc == 3) return 0;                // unallocated
+        if (((w >> 31) & 1) != ((w >> 22) & 1)) return 0;   // N must track sf
         // bfm (and so bfi/bfxil) leaves the untouched bits of Rd in place, which
         // makes Rd a read as well. sbfm/ubfm overwrite the whole register.
         addfld(o, w, KLX_RD, opc == 1 ? (KLX_R | KLX_W) : KLX_W);
         addfld(o, w, KLX_RN, KLX_R);
         return 1;
     case 0x27:                                 // extract (extr, and so ror #imm)
+        if (opc != 0 || ((w >> 21) & 1)) return 0;          // op21/o0 unallocated
+        if (((w >> 31) & 1) != ((w >> 22) & 1)) return 0;   // N must track sf
+        // ...and in the 32-bit form imms only has five meaningful bits, so a set
+        // bit 5 is unallocated too. Same story as the logical case above: the
+        // words that reach here are data, not a `ror` we are mis-reading.
+        if (!((w >> 31) & 1) && ((w >> 15) & 1)) return 0;
         addfld(o, w, KLX_RD, KLX_W);
         addfld(o, w, KLX_RN, KLX_R);
         addfld(o, w, KLX_RM, KLX_R);
@@ -211,6 +226,12 @@ static int dp_reg(uint32_t w, klx_info *o) {
         return 1;
     }
     if (c == 0x1b) {                           // 3-source: madd/msub/smaddl/umulh/...
+        // op54 is unallocated for anything but 00, and the 32-bit form has only
+        // madd/msub (op31 == 000). 5b9cca4f — data in Steam Link's .text with no
+        // symbol over it — decodes here with op54 = 10 and would otherwise be
+        // patched as if it were a real multiply.
+        if ((w >> 29) & 3) return 0;
+        if (!((w >> 31) & 1) && ((w >> 21) & 7)) return 0;
         addfld(o, w, KLX_RD, KLX_W);
         addfld(o, w, KLX_RN, KLX_R);
         addfld(o, w, KLX_RM, KLX_R);
@@ -591,6 +612,105 @@ int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
     mprotect(base, cap, PROT_READ | PROT_EXEC);
     sys_icache_invalidate(base, cap);
     return rc;
+}
+
+// ---------------------------------------------------- data inside code
+//
+// See kl_x18.h for what this is for and what it cannot see. The ELF64 subset
+// here is local on purpose: this file is deliberately not linked against the
+// runtime (tests/t_x18.c links kl_x18.c alone, so a decoder bug cannot hide
+// behind a working loader), so it cannot borrow kl_image.c's declarations.
+typedef struct { uint8_t e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version;
+    uint64_t e_entry, e_phoff, e_shoff; uint32_t e_flags;
+    uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx; } klx_ehdr;
+typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offset,
+    sh_size; uint32_t sh_link, sh_info; uint64_t sh_addralign, sh_entsize; } klx_shdr;
+typedef struct { uint32_t st_name; uint8_t st_info, st_other; uint16_t st_shndx;
+    uint64_t st_value, st_size; } klx_sym;
+#define KLX_SHT_SYMTAB   2
+#define KLX_SHT_DYNSYM   11
+#define KLX_SHT_PROGBITS 1
+#define KLX_SHF_EXECINSTR 0x4
+#define KLX_STT_OBJECT   1
+
+static int range_cmp(const void *a, const void *b) {
+    const klx_range *x = a, *y = b;
+    return x->start < y->start ? -1 : x->start > y->start ? 1 : 0;
+}
+
+unsigned kl_x18_data_ranges(const void *elf, size_t size, klx_range *out, unsigned max) {
+    if (!elf || size < sizeof(klx_ehdr) || !out || !max) return 0;
+    const uint8_t *f = elf;
+    const klx_ehdr *eh = (const klx_ehdr *)f;
+    if (memcmp(eh->e_ident, "\177ELF", 4) != 0) return 0;
+    if (!eh->e_shoff || !eh->e_shnum) return 0;
+    if (eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(klx_shdr) > size) return 0;
+    const klx_shdr *sh = (const klx_shdr *)(f + eh->e_shoff);
+
+    unsigned n = 0, dropped = 0;
+    for (int i = 0; i < eh->e_shnum; i++) {
+        if (sh[i].sh_type != KLX_SHT_SYMTAB && sh[i].sh_type != KLX_SHT_DYNSYM) continue;
+        if (!sh[i].sh_entsize || sh[i].sh_offset + sh[i].sh_size > size) continue;
+        uint64_t count = sh[i].sh_size / sh[i].sh_entsize;
+        for (uint64_t k = 0; k < count; k++) {
+            const klx_sym *sym = (const klx_sym *)(f + sh[i].sh_offset + k * sh[i].sh_entsize);
+            // A zero-size object tells us nothing about where it ends, and
+            // SHN_UNDEF has no address at all.
+            if ((sym->st_info & 0xf) != KLX_STT_OBJECT || !sym->st_size || !sym->st_shndx)
+                continue;
+            if (sym->st_shndx >= eh->e_shnum) continue;
+            const klx_shdr *owner = &sh[sym->st_shndx];
+            if (owner->sh_type != KLX_SHT_PROGBITS ||
+                !(owner->sh_flags & KLX_SHF_EXECINSTR)) continue;   // ordinary data, already skipped
+            if (n >= max) { dropped++; continue; }
+            out[n].start = sym->st_value & ~(uint64_t)3;
+            out[n].end   = (sym->st_value + sym->st_size + 3) & ~(uint64_t)3;
+            n++;
+        }
+    }
+    if (dropped)
+        fprintf(stderr, "  [klepton] x18: %u data-in-code ranges beyond the %u-entry "
+                        "limit were DROPPED — those words will be treated as code\n",
+                dropped, max);
+    if (!n) return 0;
+
+    qsort(out, n, sizeof *out, range_cmp);
+    unsigned m = 0;                                    // merge overlaps/adjacency
+    for (unsigned i = 1; i < n; i++) {
+        if (out[i].start <= out[m].end) {
+            if (out[i].end > out[m].end) out[m].end = out[i].end;
+        } else {
+            out[++m] = out[i];
+        }
+    }
+    return m + 1;
+}
+
+int kl_x18_next_code(uint64_t sec_va, size_t sec_size,
+                     const klx_range *skip, unsigned nskip,
+                     uint64_t *cursor, uint64_t *out_va, size_t *out_size) {
+    uint64_t end = sec_va + sec_size;
+    uint64_t p = *cursor;
+    if (p < sec_va) p = sec_va;
+    while (p < end) {
+        const klx_range *hit = NULL;                   // first range still ahead of p
+        for (unsigned i = 0; i < nskip; i++) {         // sorted and merged, so the
+            if (skip[i].end <= p) continue;            // first overlap is the nearest
+            if (skip[i].start >= end) break;
+            hit = &skip[i];
+            break;
+        }
+        if (!hit) { *out_va = p; *out_size = (size_t)(end - p); *cursor = end; return 1; }
+        if (hit->start > p) {
+            *out_va = p;
+            *out_size = (size_t)(hit->start - p);
+            *cursor = hit->end < end ? hit->end : end;
+            return 1;
+        }
+        p = hit->end;                                  // p is inside the range: step over it
+    }
+    *cursor = end;
+    return 0;
 }
 
 void kl_x18_report(FILE *f) {
