@@ -18,6 +18,14 @@ TARGETS = [
     (os.path.join(ROOT, 'steamlink-android/lib/arm64-v8a'),
      ['libmain', 'libSDL3', 'libSDL3_ttf', 'libSDL3_image',
       'libh264bitstream', 'libhevcbitstream', 'libc++_shared']),
+    # The VR build of the same app (steamlink-vr.apk, PLANNING §11.8). Its 2D
+    # half is the same seven libraries; libvrlink_scene is the OpenXR
+    # NativeActivity and is listed because it imports a different libc surface
+    # (AAudio, more of the NDK) that has to reach the same shim.
+    (os.path.join(ROOT, 'steamlink-vr/lib/arm64-v8a'),
+     ['libmain', 'libSDL3', 'libSDL3_ttf', 'libSDL3_image',
+      'libh264bitstream', 'libhevcbitstream', 'libc++_shared',
+      'libvrlink_scene']),
 ]
 
 def undefined_symbols(path):
@@ -77,15 +85,29 @@ __memmove_chk __strncpy_chk __strncpy_chk2 __strcat_chk __read_chk __vsprintf_ch
 sincosf sincos putchar getchar fdatasync __cmsg_nxthdr __cxa_thread_atexit_impl
 fileno fgetc ungetc getwc fgetwc ungetwc fputwc putwc fwide
 stat64 lstat64 fstat64
+stdout stderr stdin __register_atfork __gnu_strerror_r __write_chk _ctype_
 """.split())
+
+# Subsystem gateways with their own files, like gl*/SL_* below: AAudio is the
+# VR build's audio API (kl_audio.c's sink already exists; the API in front of it
+# does not), and xr* is the OpenXR runtime we must REPLACE rather than forward —
+# libopenxr_loader.so talks to an Android runtime broker that does not exist
+# here, exactly as libOVRPlugin.so did (PLANNING §3.1).
+PREFIX_SUBSYSTEM = ('AAudio', 'xr')
 
 PREFIX_SKIP = ('pthread_', 'sem_', '__android_log', 'egl')
 # Same reason gl* is excluded: these are subsystem gateways with their own
 # files, not libc. SL_/sl (OpenSL ES) -> kl_opensl.c, AMedia*/AMEDIA* ->
 # kl_mediandk.c, SDL_/IMG_/TTF_ are the guest's own cross-library imports and
 # bind against the guest libSDL3.
-RE_SKIP = re.compile(r'^(AAsset|ALooper|ANative|ASensor|AConfig|AInput|AMedia|AMEDIA'
-                     r'|SL_|sl[A-Z]|SDL_|IMG_|TTF_|Mix_|gl[A-Z])')
+# The NDK families belong in kl_ndk.c, not here. This list grew when the VR
+# build arrived: it reaches AHardwareBuffer/AImageReader (the decoder's
+# zero-copy path), AKeyEvent/AMotionEvent (NativeActivity input) and ATrace,
+# none of which exist on Darwin — and a generated forward for a symbol that
+# does not exist is caught by the linker, which is the only reason this was not
+# a silent wrong answer. Keep it generous: an over-skip costs one hand-written
+# line, an under-skip costs a link error at best and trap 6b at worst.
+RE_SKIP = re.compile(r'^(A[A-Z]|AMEDIA|SL_|sl[A-Z]|SDL_|IMG_|TTF_|Mix_|gl[A-Z])')
 
 def main():
     allu, exported = set(), set()
@@ -103,6 +125,7 @@ def main():
 
     fwd = sorted(s for s in allu
                  if not s.startswith(PREFIX_SKIP)
+                 and not s.startswith(PREFIX_SUBSYSTEM)
                  and not RE_SKIP.match(s)
                  and s not in SPECIAL
                  and s not in listed)

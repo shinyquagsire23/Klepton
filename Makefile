@@ -56,6 +56,13 @@ build/t_slink: tests/t_slink.c $(RUNTIME) runtime/klepton.h runtime/kl_jni.h
 slink: build/t_slink
 	./build/t_slink
 
+# The VR build of the same app (steamlink-vr.apk, PLANNING §11.8). Same seven
+# libraries for the 2D half, so SL-1 is the same gate; libvrlink_scene is the
+# OpenXR NativeActivity and is NOT loaded by this target yet.
+SLVRLIBS := steamlink-vr/lib/arm64-v8a
+slink-vr: build/t_slink
+	./build/t_slink $(SLVRLIBS)
+
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(LDLIBS)
@@ -129,6 +136,8 @@ SLLIBS := steamlink-android/lib/arm64-v8a
 x18-slink: build/t_x18
 	python3 tools/check_x18.py build/t_x18 $(SLLIBS)/libmain.so $(SLLIBS)/libSDL3.so \
 	  $(SLLIBS)/libSDL3_ttf.so $(SLLIBS)/libSDL3_image.so $(SLLIBS)/libc++_shared.so
+	python3 tools/check_x18.py build/t_x18 $(SLVRLIBS)/libmain.so $(SLVRLIBS)/libSDL3.so \
+	  $(SLVRLIBS)/libvrlink_scene.so $(SLVRLIBS)/libopenxr_loader.so
 
 # kl_jni_slots.h is checked in; regenerate only when bumping the NDK.
 jnislots:

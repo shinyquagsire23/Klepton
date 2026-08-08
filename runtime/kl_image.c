@@ -39,6 +39,7 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
     sh_size; uint32_t sh_link, sh_info; uint64_t sh_addralign, sh_entsize; } Elf64_Shdr;
 
 #define SHT_PROGBITS  1
+#define SHT_DYNSYM    11
 #define SHF_EXECINSTR 0x4
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
@@ -593,6 +594,20 @@ kl_image *kl_load(const char *path) {
     // branches rather than flipping one bit, so it would corrupt it loudly.
     const Elf64_Shdr *sh = (eh->e_shoff && eh->e_shnum)
                          ? (const Elf64_Shdr *)(file + eh->e_shoff) : NULL;
+
+    // The authoritative .dynsym entry count, and the reason it is taken from the
+    // SECTION rather than from DT_HASH: DT_HASH is optional. Steam Link's VR APK
+    // builds libSDL3/libmain with `.gnu.hash` only — no `.hash` section, so no
+    // DT_HASH — and `.gnu.hash` then sits between `.dynsym` and `.dynstr`, which
+    // is exactly the adjacency the old inference assumed. Section headers are
+    // required here anyway (x18 cannot separate code from rodata without them),
+    // so this is free. DT_HASH's nchain, set in bind_dynamic, is the fallback.
+    for (int i = 0; sh && i < eh->e_shnum; i++) {
+        if (sh[i].sh_type != SHT_DYNSYM || !sh[i].sh_entsize) continue;
+        img->nsyms = (size_t)(sh[i].sh_size / sh[i].sh_entsize);
+        break;
+    }
+
     int veneer = sh != NULL;      // KL_X18 is honoured inside kl_x18_patch, which
                                   // still counts sites when the rewrite is off
     if (!sh)
@@ -682,12 +697,23 @@ void *kl_sym(kl_image *img, const char *name) {
     // strcmp during a cross-image import bind — a wild read that a slightly
     // different layout would have turned into a wrong answer instead.
     size_t n = img->nsyms;
-    if (!n)     // no DT_HASH: fall back to the old inference rather than bind nothing
+    if (!n)     // neither sections nor DT_HASH: infer, rather than bind nothing
         n = ((const char *)img->strtab - (const char *)img->symtab) / sizeof(Elf64_Sym);
+
+    // Belt and braces, and this is the part that makes the class of bug above
+    // impossible rather than merely fixed: an over-long count must degrade to
+    // "no match", never to a wild read. Everything an ELF symbol table can name
+    // lives inside the mapping, so a st_name or st_value outside it is a symbol
+    // this table does not really have — which is precisely what a miscounted
+    // scan reads once it walks off the end into the hash tables.
+    const char *lo_p = (const char *)img->base, *hi_p = lo_p + img->span;
     for (size_t i = 0; i < n; i++) {
         const Elf64_Sym *s = &img->symtab[i];
+        if ((const char *)(s + 1) > hi_p) break;             // past the mapping
         if (s->st_shndx == 0 || !s->st_name) continue;
-        if (strcmp(img->strtab + s->st_name, name) == 0)
+        const char *nm = img->strtab + s->st_name;
+        if (nm < lo_p || nm >= hi_p) continue;               // not a real name
+        if (strcmp(nm, name) == 0)
             return img->base + s->st_value;
     }
     return NULL;

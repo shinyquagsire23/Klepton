@@ -54,6 +54,7 @@ int getentropy(void *buffer, size_t size);
 #include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/statvfs.h>
+#include <sys/sem.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -576,8 +577,11 @@ X(klb___cmsg_nxthdr) X(klb___cxa_thread_atexit_impl)
 X(klb_fileno) X(klb_fgetc) X(klb_ungetc) X(klb_getwc) X(klb_fgetwc)
 X(klb_ungetwc) X(klb_fputwc) X(klb_putwc) X(klb_fwide)
 X(klb_pthread_rwlock_tryrdlock) X(klb_pthread_rwlock_trywrlock)
+X(klb___register_atfork) X(klb___gnu_strerror_r) X(klb___write_chk)
 #undef X
 extern char **environ;
+// A VARIABLE, not a function, so it cannot ride the X() macro above.
+extern const unsigned char *klb_ctype_ptr;   // kl_libc_slink.c
 
 // ---------- table ----------
 typedef struct { const char *name; void *fn; } kl_entry;
@@ -674,6 +678,17 @@ static const kl_entry g_shim[] = {
     E("fputwc", klb_fputwc), E("putwc", klb_putwc), E("fwide", klb_fwide),
     E("pthread_rwlock_tryrdlock", klb_pthread_rwlock_tryrdlock),
     E("pthread_rwlock_trywrlock", klb_pthread_rwlock_trywrlock),
+    // The standard streams are `FILE *` VARIABLES in bionic, so the table entry
+    // is the address OF the pointer — one level of indirection that, got wrong,
+    // hands the guest a FILE whose first field is a function pointer. Same trap
+    // kl_opensl.c records for the SL_IID_* interface ids.
+    E("stdout", &stdout), E("stderr", &stderr), E("stdin", &stdin),
+    E("__register_atfork", klb___register_atfork),
+    E("__gnu_strerror_r", klb___gnu_strerror_r),
+    E("__write_chk", klb___write_chk),
+    // bionic indexes this table directly from its <ctype.h> macros, so what
+    // the guest binds is the array, offset by one (index -1 is legal).
+    E("_ctype_", &klb_ctype_ptr),
     // bionic's LP64 stat aliases must land on the translating shim, never on
     // Darwin's stat — same struct divergence as `stat` itself (trap 7).
     E("stat64", klb_stat), E("lstat64", klb_lstat), E("fstat64", klb_fstat),

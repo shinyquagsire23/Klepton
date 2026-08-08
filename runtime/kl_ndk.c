@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -317,6 +318,47 @@ static void kl_AAsset_close(kl_asset *a) {
     if (a->f) fclose(a->f);
     free(a);
 }
+// The 32-bit spelling. Both exist in the NDK and the newer SDL3 in the VR build
+// imports this one; truncating is what Android does too, and no asset here is
+// anywhere near 2 GB.
+static int kl_AAsset_getLength(kl_asset *a) { return a ? (int)a->len : -1; }
+
+// Directory enumeration. Android returns FILE names only — no subdirectories,
+// no "." or ".." — and returns NULL to end iteration, which is also how the
+// caller learns the directory was empty. The name belongs to the AAssetDir and
+// is invalidated by the next call, so it is stored in the handle rather than
+// strdup'd: a caller that keeps it is relying on Android's lifetime, and
+// matching that exactly is what keeps a bug ours rather than theirs.
+typedef struct { DIR *d; char name[256]; } kl_assetdir;
+
+static void *kl_AAssetManager_openDir(void *mgr, const char *dirname) {
+    (void)mgr;
+    char path[1200];
+    snprintf(path, sizeof path, "%s/%s", g_asset_root, dirname && *dirname ? dirname : ".");
+    DIR *d = opendir(path);
+    if (!d) return NULL;
+    kl_assetdir *ad = calloc(1, sizeof *ad);
+    if (!ad) { closedir(d); return NULL; }
+    ad->d = d;
+    return ad;
+}
+
+static const char *kl_AAssetDir_getNextFileName(kl_assetdir *ad) {
+    if (!ad || !ad->d) return NULL;
+    for (struct dirent *e; (e = readdir(ad->d)) != NULL; ) {
+        if (e->d_name[0] == '.') continue;           // skip . .. and dotfiles
+        if (e->d_type == DT_DIR) continue;           // files only, as Android does
+        snprintf(ad->name, sizeof ad->name, "%s", e->d_name);
+        return ad->name;
+    }
+    return NULL;
+}
+
+static void kl_AAssetDir_close(kl_assetdir *ad) {
+    if (!ad) return;
+    if (ad->d) closedir(ad->d);
+    free(ad);
+}
 
 // =================================================================== ASensor
 // The sensor list is empty, and that is the correct answer rather than a
@@ -435,6 +477,10 @@ static const struct { const char *name; void *fn; } g_ndk[] = {
     N("AAsset_getLength64",     kl_AAsset_getLength64),
     N("AAsset_seek64",          kl_AAsset_seek64),
     N("AAsset_close",           kl_AAsset_close),
+    N("AAsset_getLength",       kl_AAsset_getLength),
+    N("AAssetManager_openDir",  kl_AAssetManager_openDir),
+    N("AAssetDir_getNextFileName", kl_AAssetDir_getNextFileName),
+    N("AAssetDir_close",        kl_AAssetDir_close),
 
     N("ASensorManager_getInstance",           kl_ASensorManager_getInstance),
     N("ASensorManager_getInstanceForPackage", kl_ASensorManager_getInstanceForPackage),

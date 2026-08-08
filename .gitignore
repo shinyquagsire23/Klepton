@@ -2,6 +2,7 @@
 /beatsaber/*
 /beatsaber-*/
 /steamlink-android/*
+/steamlink-vr/*
 *.apk
 
 # claude

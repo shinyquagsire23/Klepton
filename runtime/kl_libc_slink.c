@@ -16,6 +16,7 @@
 //   * a Linux facility with no Darwin equivalent (`epoll`, `getauxval`).
 //
 // Direct forwards for this target live in the generated table as usual.
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -503,6 +504,83 @@ void *klb___cmsg_nxthdr(void *mhdr, void *cmsg) {
 int __cxa_thread_atexit(void (*fn)(void *), void *obj, void *dso);
 int klb___cxa_thread_atexit_impl(void (*fn)(void *), void *obj, void *dso) {
     return __cxa_thread_atexit(fn, obj, dso);
+}
+
+// bionic exports the three standard streams as `FILE *` VARIABLES, so what the
+// shim must supply is the address of a pointer, not the stream. Darwin's own
+// `stdout`/`stderr` are variables too, and kl_host_file passes any pointer
+// outside the __sF stand-in array straight through, so the guest's writes land
+// where they should. (Beat Saber only ever reached __sF, hence these arriving
+// with the second target.)
+
+// ------------------------------------------------------------------ _ctype_
+//
+// bionic exports `_ctype_` as a 1+256 byte table and its <ctype.h> macros index
+// it directly as `_ctype_[c + 1]` — so the guest reads this array itself rather
+// than calling isupper(). Darwin has no `_ctype_` at all (it uses
+// _DefaultRuneLocale with a different shape and different bit values), which is
+// why a direct forward does not merely differ, it does not link.
+//
+// Built from the host's own classifiers at startup rather than transcribed:
+// a hand-copied table is a second copy of a fact, and this way the answers
+// cannot disagree with the isupper() the same guest may also call. The bit
+// values are bionic's, and those DO have to be written down.
+// Prefixed, because Darwin's own <ctype.h> defines _CTYPE_U and friends with
+// DIFFERENT values (0x00008000L, not 0x01). Reusing those names compiled with a
+// warning and would have built the table out of the host's bit assignments
+// while the guest read it with bionic's — a silent wrong answer of exactly the
+// kind trap 4 describes, caught only because the redefinition was noisy.
+#define KLB_CT_U 0x01   /* upper */
+#define KLB_CT_L 0x02   /* lower */
+#define KLB_CT_D 0x04   /* digit */
+#define KLB_CT_S 0x08   /* space */
+#define KLB_CT_P 0x10   /* punct */
+#define KLB_CT_C 0x20   /* control */
+#define KLB_CT_X 0x40   /* hex digit */
+#define KLB_CT_B 0x80   /* blank */
+
+static unsigned char g_ctype[257];
+const unsigned char *klb_ctype_ptr = g_ctype + 1;   // the table entry is &this
+
+__attribute__((constructor)) static void kl_build_ctype(void) {
+    for (int c = -1; c < 256; c++) {
+        unsigned char f = 0;
+        if (c >= 0 && c < 128) {                    // ASCII only, as bionic's is
+            if (isupper(c))  f |= KLB_CT_U;
+            if (islower(c))  f |= KLB_CT_L;
+            if (isdigit(c))  f |= KLB_CT_D;
+            if (isspace(c))  f |= KLB_CT_S;
+            if (ispunct(c))  f |= KLB_CT_P;
+            if (iscntrl(c))  f |= KLB_CT_C;
+            if (isxdigit(c)) f |= KLB_CT_X;
+            if (isblank(c))  f |= KLB_CT_B;
+        }
+        g_ctype[c + 1] = f;
+    }
+}
+
+// FORTIFY's write, the counterpart to __read_chk above.
+ssize_t klb___write_chk(int fd, const void *buf, size_t n, size_t cap) {
+    if (n > cap) chk_fail("__write_chk", n, cap);
+    return write(fd, buf, n);
+}
+
+// bionic's atfork registration, which libc++ and the pthread shims funnel
+// through. The 4th argument is the caller's DSO handle, used only so bionic can
+// unregister handlers when a library is unloaded — we never unload a guest
+// image, so dropping it is exact rather than approximate.
+int klb___register_atfork(void (*prep)(void), void (*parent)(void),
+                          void (*child)(void), void *dso) {
+    (void)dso;
+    return pthread_atfork(prep, parent, child);
+}
+
+// The GNU flavour of strerror_r returns char* and may ignore the buffer; the
+// POSIX one Darwin has returns int. Getting these two confused is trap 6b in
+// miniature — the caller would read an errno as a pointer.
+char *klb___gnu_strerror_r(int err, char *buf, size_t cap) {
+    if (strerror_r(err, buf, cap) != 0) snprintf(buf, cap, "Unknown error %d", err);
+    return buf;
 }
 
 // ---------------------------------------------------------------- stdio
