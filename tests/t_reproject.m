@@ -196,9 +196,18 @@ static void check_pixels(void) {
     td.width = 2; td.height = 2; td.arrayLength = 2;
     td.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> src = [dev newTextureWithDescriptor:td];
-    // Row 0 first — in Metal's memory order that is the row at v = 0.
-    uint8_t s0[16] = { 255,0,0,255,   0,255,0,255,       // row 0: red,   green
-                       0,0,255,255,   255,255,255,255 }; // row 1: blue,  white
+    // Row 0 first, in Metal's memory order — the row sampled at v = 0.
+    //
+    // The eye texture this pass really consumes is written by GL through an
+    // EGLImage, and GL's framebuffer origin is bottom-left: memory row 0 holds
+    // the BOTTOM of the picture, not the top. That is the entire reason the
+    // pass flips at all, so the source here is authored the same way — row 0 is
+    // the picture's bottom — and the flipped expectation below is what "right
+    // way up" then means. Modelling a replaceRegion-authored (top-down) source
+    // instead would test the shader against a texture the shipping path never
+    // sees, and would assert precisely the opposite flip.
+    uint8_t s0[16] = { 0,0,255,255,   255,255,255,255,   // row 0 = picture BOTTOM
+                       255,0,0,255,   0,255,0,255 };     // row 1 = picture TOP
     uint8_t s1[16] = { 0,255,255,255, 0,255,255,255,
                        0,255,255,255, 0,255,255,255 };   // all cyan
     [src replaceRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0 slice:0
@@ -249,18 +258,23 @@ static void check_pixels(void) {
 
     // The render target's row 0 is its top. The quad covers the whole viewport
     // (proved above), so output row 0 must be whatever the shader samples at
-    // the top of the picture — and that is the source's row 0.
-    ok(memcmp(out, s0, 16) == 0,
+    // the top of the picture — and in a GL-authored source that is the LAST
+    // row, not the first. So the expectation is the source with its rows
+    // reversed: that is what an un-inverted picture looks like coming out.
+    uint8_t want[16];
+    memcpy(want,     s0 + 8, 8);     // source row 1 (picture top)    -> output top
+    memcpy(want + 8, s0,     8);     // source row 0 (picture bottom) -> output bottom
+    ok(memcmp(out, want, 16) == 0,
        "the pass reproduces the source, right way up, from the right slice");
-    if (memcmp(out, s0, 16) != 0)
+    if (memcmp(out, want, 16) != 0)
         printf("    got  %3u,%3u,%3u | %3u,%3u,%3u\n"
                "         %3u,%3u,%3u | %3u,%3u,%3u\n"
                "    want %3u,%3u,%3u | %3u,%3u,%3u\n"
                "         %3u,%3u,%3u | %3u,%3u,%3u\n",
                out[0],out[1],out[2],  out[4],out[5],out[6],
                out[8],out[9],out[10], out[12],out[13],out[14],
-               s0[0],s0[1],s0[2],     s0[4],s0[5],s0[6],
-               s0[8],s0[9],s0[10],    s0[12],s0[13],s0[14]);
+               want[0],want[1],want[2],    want[4],want[5],want[6],
+               want[8],want[9],want[10],   want[12],want[13],want[14]);
 
     // The same picture through the other slice must NOT be the same picture.
     u.slice = 1;

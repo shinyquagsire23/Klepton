@@ -55,7 +55,19 @@ import ARKit
 struct KleptonStageConfiguration: CompositorLayerConfiguration {
     func makeConfiguration(capabilities: LayerRenderer.Capabilities,
                            configuration: inout LayerRenderer.Configuration) {
-        configuration.colorFormat = .rgba16Float
+        // KL_CP_FORMAT=8 selects bgra8Unorm_srgb, which is what ALVR uses on
+        // this same headset. rgba16Float is what the guest renders and what the
+        // tone map wants, and the drawable does come back reporting it — but a
+        // format the layer ACCEPTS is not necessarily one it DISPLAYS, and that
+        // distinction is untested here. Logged against the capability list so
+        // the answer is in the log rather than in an argument.
+        // (supportedColorFormats(options:) is visionOS 26+, so it is not asked
+        // here — the drawable reports the format it actually got instead.)
+        let want: MTLPixelFormat =
+            ProcessInfo.processInfo.environment["KL_CP_FORMAT"] == "8"
+            ? .bgra8Unorm_srgb : .rgba16Float
+        NSLog("[cp] asking for colour format \(want.rawValue)")
+        configuration.colorFormat = want
         configuration.depthFormat = .depth32Float
         // Foveation is left off deliberately for now. It changes the drawable's
         // rasterization-rate map, and a composite pass that ignores that map
@@ -87,9 +99,56 @@ private struct EyeAllocation {
 final class KleptonCompositor {
     private let layerRenderer: LayerRenderer
     private var device: MTLDevice!
-    private var queue: MTLCommandQueue!
+    // Optional, not implicitly unwrapped, and that is the whole fix for one
+    // crash: when ANGLE has no MTLDevice this used to stay nil while the loop
+    // carried on, and primeDisplay trapped on it before the guest thread was
+    // even started — so the immersive path could not run at all without
+    // KL_GLFB, which is exactly the configuration you want when the question
+    // is about the lifecycle rather than the picture.
+    private var queue: MTLCommandQueue?
     private var pipeline: MTLRenderPipelineState!
+    private var depthState: MTLDepthStencilState?
     private var sampler: MTLSamplerState!
+
+    // KL_CP_PROBE — the bisection ladder for a black immersive space. The pass
+    // has many links and a black frame indicts all of them equally; each rung
+    // removes one and keeps the rest, so whichever rung first shows something
+    // names the link below it.
+    //
+    //   1  clear only, solid blue, no draw   does ANY drawable reach the display?
+    //   2  the quad, flat magenta            does the reprojected quad land in
+    //                                        the viewport at all? (geometry,
+    //                                        poses, projection, 500 m depth)
+    //   3  the quad, sampled, alpha := 1     is the picture arriving alpha-0?
+    //   4  full-viewport blit, alpha := 1    is the eye texture lit? bypasses
+    //                                        the quad, the poses and the
+    //                                        projection — the viewer's own
+    //                                        proven path, on device
+    //
+    // Read them in order: the FIRST rung that shows something is the answer,
+    // and every rung above it is then known-good.
+    private let probe = Int(ProcessInfo.processInfo.environment["KL_CP_PROBE"] ?? "") ?? 0
+    private var probePipeline: MTLRenderPipelineState?
+    /// Red, green, blue — one second each, off the wall clock. Deliberately
+    /// full-intensity primaries: whatever tone mapping or colour management sits
+    /// between the drawable and the display, these stay obviously themselves.
+    private static func cyclingClear() -> MTLClearColor {
+        switch Int(Date().timeIntervalSince1970) % 3 {
+        case 0:  return MTLClearColorMake(1, 0, 0, 1)
+        case 1:  return MTLClearColorMake(0, 1, 0, 1)
+        default: return MTLClearColorMake(0, 0, 1, 1)
+        }
+    }
+
+    private static func probeName(_ p: Int) -> String {
+        switch p {
+        case 1: return "clear only, solid blue, no draw"
+        case 2: return "quad with flat magenta — geometry only"
+        case 3: return "quad, sampled, alpha forced to 1"
+        case 4: return "full-viewport blit of the eye texture, alpha forced to 1"
+        default: return "unknown"
+        }
+    }
 
     // GPU ordering, not CPU. The guest's frame is in ANGLE's Metal command
     // queue and this pass is in ours, and Metal orders nothing across queues:
@@ -129,8 +188,35 @@ final class KleptonCompositor {
     // Quest 2's 72 Hz instead of the display's own, which is the A/B if the
     // real numbers turn out to send Unity somewhere unexpected. The priming
     // pass still runs and still logs what it measured.
-    private let keepQuestDisplay =
-        ProcessInfo.processInfo.environment["KL_OVRP_QUEST_FOV"] != nil
+    private let keepQuestDisplay = klEnvOn("KL_OVRP_QUEST_FOV", default: false)
+
+    // KL_SYNC_GUEST=1 restores P5b's shape: kl_app_frame() called inline on
+    // this thread, inside the submission window. That is the clock P5.4's
+    // device numbers were measured against, so it stays reachable — and it is
+    // the A/B for anything that looks like a pacing problem after §12.12.
+    private let syncGuest = klEnvOn("KL_SYNC_GUEST", default: false)
+
+    // How many drawables went out before the guest had a picture to put in
+    // them. Counted rather than logged per frame, because on device it is
+    // legitimately hundreds and each one is uninteresting.
+    private var blackFrames = 0
+    private var loggedDepthRange = false
+    private let noFence = klEnvOn("KL_CP_NOFENCE", default: false)
+    private var cmdCommitted = 0
+    private let cmdLock = NSLock()
+    private var cmdCompleted = 0
+    private var cmdError: Error?
+    private var loggedFirstPicture = false
+    private var loggedGuestEnd = false
+
+    // Why a frame produced nothing. Compositor Services expects this loop to
+    // keep presenting, and every one of these three is a path that leaves
+    // WITHOUT presenting — so if the system tears the app down for not holding
+    // up its end, the reason is one of these counters and nothing else in the
+    // log would say so. Reported by the liveness line in renderLoop().
+    private var bailNoFrame = 0
+    private var bailNoDrawable = 0
+    private var bailNoPipeline = 0
 
     init(_ layerRenderer: LayerRenderer) {
         self.layerRenderer = layerRenderer
@@ -240,13 +326,32 @@ final class KleptonCompositor {
         // creates an EGLImage that fails at bind time, and on a single-GPU Mac
         // the two happen to be the same object, so testing on the host would
         // not catch getting this wrong (§12.9).
-        guard let d = kl_glfb_mtl_device() else {
-            NSLog("[cp] ANGLE has no MTLDevice yet — provider not installed")
-            return
+        let angle = kl_glfb_mtl_device()
+        if let d = angle {
+            device = Unmanaged<MTLDevice>.fromOpaque(d).takeUnretainedValue() as MTLDevice
+        } else {
+            // No ANGLE: the null GL driver, i.e. a run asking about the
+            // lifecycle rather than the picture. There will be no eye textures
+            // to composite — but this loop still has to hold up its end of the
+            // bargain, which is to prime the display, present cleared drawables
+            // and keep publishing poses to the guest. Its own device is enough
+            // for all three, and *not* taking one here is what used to kill the
+            // whole compositor in primeDisplay.
+            guard let d = MTLCreateSystemDefaultDevice() else {
+                NSLog("[cp] no MTLDevice at all — the compositor cannot run")
+                return
+            }
+            device = d
         }
-        device = Unmanaged<MTLDevice>.fromOpaque(d).takeUnretainedValue() as MTLDevice
         queue = device.makeCommandQueue()
         buildPipeline()
+
+        guard angle != nil else {
+            NSLog("[cp] ANGLE has no MTLDevice — no eye textures this run "
+                  + "(KL_GLFB unset?); drawables will be cleared and presented, "
+                  + "and the guest still gets its frames")
+            return
+        }
 
         // Register the shared event before the guest can swap, so no frame is
         // ever composited without the wait.
@@ -285,6 +390,43 @@ final class KleptonCompositor {
             desc.colorAttachments[0].pixelFormat = .rgba16Float
             desc.depthAttachmentPixelFormat = .depth32Float
             pipeline = try device.makeRenderPipelineState(descriptor: desc)
+
+            // Depth WRITES, which this pass never did. visionOS reprojects the
+            // submitted frame using its depth buffer, so a pass that writes no
+            // depth submits perfect colour with the geometry "nothing is here at
+            // any finite distance" — and the compositor honours that literally.
+            // Measured on device: a fullscreen quad at reverse-Z 0 with writes
+            // off is invisible; the same quad at 0.05 (2 m) with writes on
+            // appears. .greater matches the reverse-Z clear of 0.
+            let dsd = MTLDepthStencilDescriptor()
+            dsd.depthCompareFunction = .greater
+            dsd.isDepthWriteEnabled = true
+            depthState = device.makeDepthStencilState(descriptor: dsd)
+
+            // KL_CP_PROBE: swap ONE thing about the pass and see if the black
+            // moves. Each rung isolates a different link in the chain, so a
+            // single device run localises a dark picture instead of a session
+            // of one-hypothesis-per-build. See kl_reproject.c for the shaders.
+            if probe > 0 {
+                let d = MTLRenderPipelineDescriptor()
+                d.colorAttachments[0].pixelFormat = .rgba16Float
+                d.depthAttachmentPixelFormat = .depth32Float
+                switch probe {
+                case 2:  d.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
+                         d.fragmentFunction = lib.makeFunction(name: "kl_probe_solid_f")
+                case 3:  d.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
+                         d.fragmentFunction = lib.makeFunction(name: "kl_probe_opaque_f")
+                case 4:  d.vertexFunction   = lib.makeFunction(name: "kl_probe_full_v")
+                         d.fragmentFunction = lib.makeFunction(name: "kl_probe_full_f")
+                default: d.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
+                         d.fragmentFunction = lib.makeFunction(name: "kl_reproject_f")
+                }
+                if probe >= 2 && probe <= 4 {
+                    probePipeline = try? device.makeRenderPipelineState(descriptor: d)
+                }
+                NSLog("[cp] PROBE \(probe): \(Self.probeName(probe)) — "
+                      + "this is a DIAGNOSTIC frame, not the real pass")
+            }
         } catch {
             NSLog("[cp] composite pipeline failed: \(error)")
             return
@@ -367,8 +509,73 @@ final class KleptonCompositor {
         t.start()
     }
 
+    /// KL_CP_PROBE=9 — the floor. Apple's template minus the cube: wait for the
+    /// layer, then nothing but query / update / drawable / submit / clear /
+    /// present, forever. No ARKit, no priming pass, no eye-texture provider, no
+    /// guest, no shared-event wait, no pipeline, no poses, no anchor.
+    ///
+    /// Every rung above this one has come back clean while the display stayed
+    /// black, which means the thing being bisected is not a feature of the pass.
+    /// This establishes whether THIS APP can put any colour on THIS display at
+    /// all. Blue here and black at rung 1 localises the fault to what rung 1
+    /// still has that this does not; black here says the fault is structural —
+    /// the scene, the configuration, or the layer — and nothing in renderFrame()
+    /// was ever going to fix it.
+    private func minimalLoop() {
+        NSLog("[cp] PROBE 9: MINIMAL LOOP — clear to blue, present, nothing else")
+        var n = 0
+        var next = Date()
+        while true {
+            if layerRenderer.state == .invalidated { break }
+            if layerRenderer.state == .paused { layerRenderer.waitUntilRunning(); continue }
+            guard let frame = layerRenderer.queryNextFrame() else { continue }
+            frame.startUpdate()
+            frame.endUpdate()
+            if let t = frame.predictTiming() {
+                LayerRenderer.Clock().wait(until: t.optimalInputTime)
+            }
+            guard let drawable = frame.queryDrawable() else { continue }
+            frame.startSubmission()
+            // deviceAnchor is deliberately LEFT ALONE. Stripping it would be
+            // stripping something already measured as working (anchor=set), and
+            // the system uses it to place and reproject the frame — so a black
+            // result would no longer distinguish "structural fault" from "the
+            // probe broke it". A floor test may remove only what is suspect.
+            if let cmd = queue?.makeCommandBuffer() {
+                for view in drawable.views {
+                    let map = view.textureMap
+                    let pass = MTLRenderPassDescriptor()
+                    pass.colorAttachments[0].texture     = drawable.colorTextures[map.textureIndex]
+                    pass.colorAttachments[0].slice       = map.sliceIndex
+                    pass.colorAttachments[0].loadAction  = .clear
+                    pass.colorAttachments[0].storeAction = .store
+                    pass.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 1, 1)
+                    cmd.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+                }
+                drawable.encodePresent(commandBuffer: cmd)
+                cmd.commit()
+            }
+            frame.endSubmission()
+            n += 1
+            if Date() >= next {
+                next = Date().addingTimeInterval(2)
+                NSLog("[cp] minimal: \(n) frames presented, state=\(String(describing: layerRenderer.state))")
+            }
+        }
+        NSLog("[cp] minimal loop ended after \(n) frames")
+    }
+
     private func renderLoop() {
         layerRenderer.waitUntilRunning()
+        if probe == 9 {
+            // The system default device, exactly as Apple's template uses —
+            // not ANGLE's. Nothing here samples a guest texture, so there is no
+            // reason to involve the device that owns them, and every reason not
+            // to: it is one of the things being ruled out.
+            queue = MTLCreateSystemDefaultDevice()?.makeCommandQueue()
+            minimalLoop()
+            return
+        }
         installProvider()
         startARKit()
 
@@ -377,32 +584,75 @@ final class KleptonCompositor {
         // during the lifecycle below. See primeDisplay().
         primeDisplay()
 
-        // Bring the guest up to its first frame before asking it for one per
-        // drawable. _begin is once per process and does the /proc report,
-        // nativeRecreateGfxState, nativeResume and the first nativeRender.
-        if kl_app_lifecycle_begin() != 0 {
-            NSLog("[cp] lifecycle_begin failed: \(String(cString: kl_app_status()))")
+        // Bring the guest up, on its own thread — PLANNING §12.12. _begin is
+        // once per process and does the /proc report, nativeRecreateGfxState,
+        // nativeResume and the first nativeRender, and it happens over there
+        // rather than here: this loop must be free to present black while the
+        // guest is still starting, which can take tens of seconds on device.
+        //
+        // Under KL_SYNC_GUEST the old inline shape is kept instead, because
+        // P5.4's device measurement was taken against it and the device has
+        // never been run with either. It is the A/B for anything that looks
+        // like a pacing regression.
+        if syncGuest {
+            NSLog("[cp] KL_SYNC_GUEST — driving the guest inline on this thread")
+            if kl_app_lifecycle_begin() != 0 {
+                NSLog("[cp] lifecycle_begin failed: \(String(cString: kl_app_status()))")
+                return
+            }
+        } else if kl_app_guest_start() != 0 {
+            NSLog("[cp] guest thread failed to start: \(String(cString: kl_app_status()))")
             return
         }
 
+        // This loop's own liveness, logged on a wall clock rather than a frame
+        // count. The device kills an immersive app that stops presenting, and
+        // that kill arrives as a bare SIGKILL with no crash report at all — so
+        // "was this loop still running, and was it producing anything" is a
+        // question the log has to be able to answer after the fact. A frame
+        // counter cannot answer it: a loop that has stopped iterating stops
+        // incrementing, and the absence of a line is exactly what a healthy
+        // quiet loop looks like too.
         var presented = 0
+        var iterations = 0
+        var nextReport = Date()
         loop: while true {
             switch layerRenderer.state {
             case .invalidated:
                 break loop
             case .paused:
+                NSLog("[cp] layer paused at iteration \(iterations) — waiting")
                 layerRenderer.waitUntilRunning()
+                NSLog("[cp] layer running again")
                 continue loop
             default:
                 autoreleasepool { presented += renderFrame() }
             }
+            iterations += 1
+            if Date() >= nextReport {
+                nextReport = Date().addingTimeInterval(2)
+                cmdLock.lock(); let done = cmdCompleted; cmdLock.unlock()
+                NSLog("[cp] alive: \(iterations) iters, \(presented) with a picture, "
+                      + "\(blackFrames) black, guest=\(kl_app_guest_state()), "
+                      + "bail(frame/drawable/pipeline)="
+                      + "\(bailNoFrame)/\(bailNoDrawable)/\(bailNoPipeline), "
+                      // committed vs completed: if these diverge and stay
+                      // diverged, the GPU is waiting on the guest's fence and
+                      // nothing is being drawn at all.
+                      + "cmdbuf \(done)/\(cmdCommitted) done"
+                      + (noFence ? " (NOFENCE)" : ""))
+            }
         }
-        NSLog("[cp] render loop ended after \(presented) presented frames")
-        kl_app_lifecycle_report()
+        NSLog("[cp] render loop ended after \(presented) presented frames, "
+              + "\(iterations) iterations, state=\(String(describing: layerRenderer.state))")
+        // Ends the guest's loop and joins it, so its report — which is the
+        // P5.4 report, and belongs to the guest's end of the run rather than
+        // to this one — has been written before this returns.
+        if syncGuest { kl_app_lifecycle_report() } else { kl_app_guest_stop() }
     }
 
     private func renderFrame() -> Int {
-        guard let frame = layerRenderer.queryNextFrame() else { return 0 }
+        guard let frame = layerRenderer.queryNextFrame() else { bailNoFrame += 1; return 0 }
         frame.startUpdate()
         frame.endUpdate()
 
@@ -413,8 +663,30 @@ final class KleptonCompositor {
         if let timing {
             LayerRenderer.Clock().wait(until: timing.optimalInputTime)
         }
-        frame.startSubmission()
-        defer { frame.endSubmission() }
+        // NOT `defer { frame.endSubmission() }`. Compositor Services treats
+        // ending a submission that never presented a drawable as a client bug
+        // and aborts the process:
+        //
+        //   __BUG_IN_CLIENT__  <- cp_frame_end_submission
+        //                      <- $defer #1 in renderFrame()
+        //
+        // — SIGABRT on the compositor thread, 2026-08-07 on device, after
+        // thousands of healthy frames. A defer is exactly wrong here: the whole
+        // point of the early returns below is that this frame will NOT be
+        // presented, and those are the frames that must not be ended. ALVR's
+        // Renderer.swift and Apple's own template both simply abandon the frame
+        // — no endSubmission on that path — and this now does the same.
+        // ...and it is started AFTER the drawable is in hand, below — which is
+        // the order Apple's template and ALVR both use:
+        //
+        //   queryNextFrame -> startUpdate/endUpdate -> predictTiming
+        //     -> wait(optimalInputTime) -> queryDrawable -> startSubmission
+        //     -> encode -> encodePresent -> commit -> endSubmission
+        //
+        // This used to call startSubmission here, before queryDrawable. That
+        // also makes the two bail paths below abandon a submission they had
+        // already started, which is the same shape as trap 14 from the other
+        // side.
 
         // Poses first, then the frame that uses them.
         if let timing {
@@ -422,28 +694,50 @@ final class KleptonCompositor {
                             .timeInterval)
         }
 
-        // One guest frame per drawable: ticks the Choreographer, calls
-        // nativeRender, drains the posted-task queue. The guest renders into
-        // the eye textures the provider handed it.
-        //
-        // Synchronous, deliberately for now: a guest that misses the deadline
-        // delays this loop rather than letting it present the previous picture
-        // reprojected. Everything needed to do the latter is in place below —
-        // the stage record, the anchor ring, the fence value that says whether
-        // the frame is new — and decoupling the guest onto its own thread is
-        // the change that makes timewarp pay for itself rather than merely be
-        // correct. It is not this change, because it also moves the frame clock
-        // and P5.4's measurement with it.
-        _ = kl_app_frame()
+        // Offer the guest this frame's pose and carry straight on — PLANNING
+        // §12.12. The guest wakes on its own thread, ticks the Choreographer,
+        // calls nativeRender and renders into the eye textures the provider
+        // handed it, and this loop does not wait for any of it. A guest that
+        // keeps up finishes before the next publish and behaves exactly as the
+        // synchronous version did; a guest that does not simply leaves the
+        // stage record where it was, and the composite below reprojects the
+        // picture already there against the newer pose. That case is the whole
+        // reason the pass exists, and it was unreachable while the thing being
+        // reprojected was the thing blocking this loop.
+        if syncGuest {
+            _ = kl_app_frame()
+        } else {
+            kl_app_guest_publish()
+            // A guest that has *ended* looks exactly like a guest that is
+            // merely slow — both leave the stage record where it was and both
+            // make `stale` climb. Say which, once, or the log below cannot be
+            // read: the same numbers mean "reprojection is earning its keep"
+            // in one case and "there is nothing left to reproject" in the other.
+            if !loggedGuestEnd && kl_app_guest_state() < 0 {
+                loggedGuestEnd = true
+                NSLog("[cp] the guest thread has ended (\(String(cString: kl_app_status())))"
+                      + " — everything from here is its last picture, reprojected")
+            }
+        }
 
-        guard let drawable = frame.queryDrawable() else { return 0 }
-        guard let pipeline, let sampler, let cmd = queue.makeCommandBuffer() else { return 0 }
+        guard let drawable = frame.queryDrawable() else { bailNoDrawable += 1; return 0 }
+        frame.startSubmission()
+        guard let pipeline, let sampler, let cmd = queue?.makeCommandBuffer() else {
+            bailNoPipeline += 1
+            return 0
+        }
 
         // Which stage holds a *finished* picture. -1 means the guest has not
         // completed a frame yet (ovrp_EndFrame never seen) — there is nothing
         // to show, but the drawable still has to be presented or Compositor
         // Services stalls waiting for it.
-        let stage = max(0, Int(kl_ovrp_last_complete_stage()))
+        //
+        // Sampling stage 0 anyway would be worse than showing black: with the
+        // guest decoupled it may well be *mid-draw* into exactly that texture,
+        // so the frames before the first EndFrame would be a torn picture
+        // rather than an empty one, and reprojected against no pose at all.
+        let completeStage = Int(kl_ovrp_last_complete_stage())
+        let stage = max(0, completeStage)
         var rendered = kl_ovrp_render_pose()
         var haveRendered = withUnsafeMutablePointer(to: &rendered) {
             kl_ovrp_stage_render_pose(Int32(stage), $0) != 0
@@ -461,7 +755,13 @@ final class KleptonCompositor {
         // when the guest swaps, so an unchanged one also means "no new picture"
         // — which is not an error, it is the case reprojection is for.
         let frameValue = kl_glfb_gpu_fence_value()
-        if let ev = guestFrameEvent, frameValue != 0 {
+        // KL_CP_NOFENCE=1 skips the wait. A composite command buffer that waits
+        // on an event value the guest's queue never signals is COMMITTED and
+        // never EXECUTES: the drawable is presented, every counter here looks
+        // healthy, and the display shows nothing. That failure is invisible
+        // from this side, so it needs its own A/B — and cmdCompleted below is
+        // the measurement that says whether it is happening.
+        if let ev = guestFrameEvent, frameValue != 0, !noFence {
             cmd.encodeWaitForEvent(ev, value: frameValue)
         }
         if frameValue != 0 && frameValue == lastGuestFrame {
@@ -485,11 +785,57 @@ final class KleptonCompositor {
         noteReprojection(rendered: haveRendered ? rendered : nil,
                          originFromDevice: originFromDevice, stage: stage)
 
+        // The drawable's depth range, once. This is not curiosity: the quad is
+        // placed at KL_REPROJECT_DEPTH metres (500 by default, so the eye offset
+        // is negligible), and if that is beyond the far plane the compositor
+        // chose, every corner is clipped and the display is black with a pass
+        // that ran perfectly. ALVR places its own panel at 1 m. Logged rather
+        // than assumed because it is the compositor's number, not ours.
+        if !loggedDepthRange {
+            loggedDepthRange = true
+            let r = drawable.depthRange
+            NSLog("[cp] drawable depthRange = \(r) (x=far, y=near in reverse-Z); "
+                  + "quad at \(ProcessInfo.processInfo.environment["KL_REPROJECT_DEPTH"] ?? "500") m")
+            // The drawable's actual shape, once. A clear fills the whole
+            // attachment whatever the viewport says, so a blue clear that is
+            // not visible means the texture being cleared is not the texture
+            // being displayed — and these are the numbers that say which.
+            NSLog("[cp] drawable: \(drawable.colorTextures.count) color texture(s), "
+                  + "\(drawable.views.count) view(s), anchor="
+                  + (drawable.deviceAnchor == nil ? "nil" : "set"))
+            // Whose device owns what. installProvider() takes ANGLE's MTLDevice
+            // so the eye textures can be shared with the guest, and its own
+            // comment notes that on the host ANGLE's device and the system
+            // default "happen to be the same object, so testing on the host
+            // would not catch getting this wrong". Compositor Services allocates
+            // the drawable on ITS device. If those are two different objects,
+            // every render pass here attaches textures the command queue does
+            // not own — which is not a picture that comes out wrong, it is a
+            // picture that never happens.
+            if let dt = drawable.colorTextures.first?.device {
+                let ours = queue?.device
+                NSLog("[cp] devices: queue=\(ours?.name ?? "nil")/"
+                      + "\(ours.map { String($0.registryID) } ?? "-") "
+                      + "drawable=\(dt.name)/\(dt.registryID) "
+                      + (ours === dt ? "SAME OBJECT" : "*** DIFFERENT OBJECTS ***"))
+            }
+            for (i, t) in drawable.colorTextures.enumerated() {
+                NSLog("[cp]   color[\(i)] \(t.width)x\(t.height) "
+                      + "array=\(t.arrayLength) type=\(t.textureType.rawValue) "
+                      + "fmt=\(t.pixelFormat.rawValue)")
+            }
+            for (i, v) in drawable.views.enumerated() {
+                let m = v.textureMap
+                NSLog("[cp]   view[\(i)] -> texture \(m.textureIndex) slice "
+                      + "\(m.sliceIndex) viewport \(m.viewport)")
+            }
+        }
+
         var encoded = 0
         for (i, view) in drawable.views.enumerated() {
             let eye = i                              // view 0 = left, 1 = right
-            eyesLock.lock(); let alloc = eyes[Self.key(eye, stage)]; eyesLock.unlock()
-            guard let alloc else { continue }
+            eyesLock.lock(); let a = eyes[Self.key(eye, stage)]; eyesLock.unlock()
+            let alloc = completeStage < 0 ? nil : a
 
             let pass = MTLRenderPassDescriptor()
             let map = view.textureMap
@@ -497,21 +843,49 @@ final class KleptonCompositor {
             pass.colorAttachments[0].slice       = map.sliceIndex
             pass.colorAttachments[0].loadAction  = .clear
             pass.colorAttachments[0].storeAction = .store
-            pass.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 1)
+            // Rung 1 clears to blue instead of black and draws nothing at all:
+            // if the display stays black through THAT, nothing this file draws
+            // was ever going to be seen and the fault is below the pass.
+            // Rung 1's colour CYCLES — red, green, blue, one second each — and
+            // that is the point. A static colour cannot distinguish "our clear
+            // is reaching the display" from "the display is showing black for
+            // its own reasons", because both look like a constant field. A
+            // colour that changes on a known period can: if it cycles, our
+            // content is being composited and the question moves to what we
+            // draw; if it is a steady anything, it is not ours at all.
+            pass.colorAttachments[0].clearColor  = probe == 1
+                ? Self.cyclingClear() : MTLClearColorMake(0, 0, 0, 1)
             if let depth = drawable.depthTextures.first {
                 pass.depthAttachment.texture     = depth
                 pass.depthAttachment.slice       = map.sliceIndex
                 pass.depthAttachment.loadAction  = .clear
-                pass.depthAttachment.storeAction = .dontCare
+                // .store, NOT .dontCare. visionOS reprojects the submitted frame
+                // using its depth buffer, so throwing the depth away hands the
+                // compositor a colour image with no geometry — and a reverse-Z
+                // clear of 0 reads as "everything is infinitely far away".
+                // .dontCare here meant the quad's colour was correct and its
+                // depth said nothing was there.
+                pass.depthAttachment.storeAction = .store
+                pass.depthAttachment.clearDepth  = 0.0
             }
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { continue }
             enc.label = "klepton composite eye \(eye)"
+            if probe == 1 { enc.endEncoding(); encoded += 1; continue }
+            // No eye texture yet — the guest is still in _begin, or it has not
+            // reached ovrp_SetupEyeTexture2 for this stage. The encoder is
+            // still made and still ended, because the clear above is the point:
+            // a drawable that is presented without being written shows whatever
+            // was in that texture last, and with the guest now taking its own
+            // time to start there are a great many such frames.
+            guard let alloc else { enc.endEncoding(); continue }
+
             // The viewport matters here in a way it did not for a full-screen
             // triangle: the quad is projected, so it lands where the projection
             // says, and the view's own bounds within a shared texture are part
             // of that.
             enc.setViewport(map.viewport)
-            enc.setRenderPipelineState(pipeline)
+            enc.setRenderPipelineState(probePipeline ?? pipeline)
+            if let depthState { enc.setDepthStencilState(depthState) }
             enc.setFragmentTexture(alloc.texture, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
 
@@ -528,8 +902,36 @@ final class KleptonCompositor {
             encoded += 1
         }
 
+        // The one thing worth saying out loud about the decoupling: how long
+        // the guest took to put anything in a drawable. Under the old inline
+        // shape this could not be measured, because the loop did not run until
+        // the guest had already produced its first frame.
+        if encoded == 0 {
+            blackFrames += 1
+        } else if !loggedFirstPicture {
+            loggedFirstPicture = true
+            NSLog("[cp] first guest picture composited, after \(blackFrames) black frames")
+        }
+
+        // Did this command buffer actually RUN? "Presented" only means committed,
+        // and a buffer stalled on a shared-event wait never executes — so a
+        // black display and a perfect frame count are the same picture from
+        // here. Counted, with the first error printed, because "committed but
+        // never completed" is otherwise indistinguishable from "completed and
+        // drew black".
+        cmd.addCompletedHandler { [weak self] b in
+            guard let self else { return }
+            self.cmdLock.lock()
+            self.cmdCompleted += 1
+            let first = self.cmdError == nil && b.error != nil
+            if first { self.cmdError = b.error }
+            self.cmdLock.unlock()
+            if first { NSLog("[cp] composite command buffer error: \(b.error!)") }
+        }
         drawable.encodePresent(commandBuffer: cmd)
         cmd.commit()
+        cmdCommitted += 1
+        frame.endSubmission()      // only here — see startSubmission above
         return encoded > 0 ? 1 : 0
     }
 
@@ -569,17 +971,23 @@ final class KleptonCompositor {
             frame.endUpdate()
             let timing = frame.predictTiming()
             if let timing { LayerRenderer.Clock().wait(until: timing.optimalInputTime) }
+            // Drawable first, THEN startSubmission — the documented order, and
+            // the same correction as renderFrame(). These are the layer's first
+            // eight frames, so getting the sequence wrong here is not a local
+            // matter: it is the state the whole session starts from.
+            guard let drawable = frame.queryDrawable() else { continue }
             frame.startSubmission()
-            if let drawable = frame.queryDrawable() {
-                stamps.append(LayerRenderer.Clock.Instant.epoch
-                    .duration(to: drawable.frameTiming.presentationTime).timeInterval)
-                if tangents.isEmpty {
-                    tangents = (0..<drawable.views.count).map {
-                        kl_reproject_tangents(drawable.computeProjection(viewIndex: $0))
-                    }
+            stamps.append(LayerRenderer.Clock.Instant.epoch
+                .duration(to: drawable.frameTiming.presentationTime).timeInterval)
+            if tangents.isEmpty {
+                tangents = (0..<drawable.views.count).map {
+                    kl_reproject_tangents(drawable.computeProjection(viewIndex: $0))
                 }
-                clearAndPresent(drawable)
             }
+            clearAndPresent(drawable)
+            // Only after a drawable was actually presented — trap 14. The old
+            // shape ended the submission even on the no-drawable path, which is
+            // the abort waiting to happen rather than the one already seen.
             frame.endSubmission()
         }
 
@@ -614,7 +1022,7 @@ final class KleptonCompositor {
     /// so they have to be *something*; an unwritten drawable is whatever was in
     /// that texture last.
     private func clearAndPresent(_ drawable: LayerRenderer.Drawable) {
-        guard let cmd = queue.makeCommandBuffer() else { return }
+        guard let cmd = queue?.makeCommandBuffer() else { return }
         for view in drawable.views {
             let map = view.textureMap
             let pass = MTLRenderPassDescriptor()

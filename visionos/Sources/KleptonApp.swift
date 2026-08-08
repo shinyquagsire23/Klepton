@@ -15,9 +15,36 @@ import CompositorServices
 // stays takeable on the same binary — which matters because that measurement
 // is how a device regression gets localised.
 
+/// A KL_* knob read by value, not by presence — the Swift twin of
+/// `kl_env_on()`. Both defaults below are ON, so `KL_FOO=0` has to be a real
+/// way to say no rather than a second way to say yes.
+func klEnvOn(_ name: String, default dflt: Bool) -> Bool {
+    guard let v = ProcessInfo.processInfo.environment[name] else { return dflt }
+    return !["", "0", "no", "off", "false"].contains(v.lowercased())
+}
+
 enum Immersive {
     static let id = "KleptonImmersive"
-    static var wanted: Bool { ProcessInfo.processInfo.environment["KL_IMMERSIVE"] != nil }
+    // Default ON. Klepton runs a VR title, so the immersive space is the app —
+    // launching from the Home View and getting a window with a Boot button is
+    // not a sensible product, it is a test harness. P4's window-and-report
+    // shape is still exactly one knob away (KL_IMMERSIVE=0) and has to stay so,
+    // because it is the measurement that localises a device regression.
+    static var wanted: Bool { klEnvOn("KL_IMMERSIVE", default: true) }
+
+    // .mixed by default now that the picture works. The guest renders an opaque
+    // world so passthrough shows through nowhere it matters, and being able to
+    // see the room is worth a great deal while the thing being judged is how the
+    // scene SITS — scale, distance and IPD are all much easier to call against
+    // real surroundings than against a black void. KL_FULL=1 restores .full,
+    // which is what shipping a VR title eventually wants.
+    static var mixed: Bool { !klEnvOn("KL_FULL", default: false) }
+
+    // How many times the CompositorLayer closure has been entered. SwiftUI may
+    // re-evaluate a scene, and a second layer would mean the render loop the log
+    // describes is not the one on screen.
+    nonisolated(unsafe) private static var closures = 0
+    static func bump() -> Int { closures += 1; return closures }
 }
 
 @main
@@ -26,15 +53,42 @@ struct KleptonApp: App {
         WindowGroup { BootView() }
             .defaultSize(width: 1100, height: 900)
 
+        // The floor test — KL_TEMPLATE=1. Its own space and its own renderer,
+        // sharing nothing with the one below, so a picture here says the
+        // platform and the app are fine and a black here says they are not.
+        // See KleptonTemplate.swift.
+        // KL_TPL_MIXED=1 puts the floor test in .mixed instead of .full, and it
+        // is the more informative of the two right now. In .full, "our content
+        // is not compositing" and "our content is black" look identical — both
+        // are a black field, which is exactly the ambiguity that has cost this
+        // hunt several runs. In .mixed the room shows through, so an opaque blue
+        // clear is unmistakable: blue means the layer composites, passthrough
+        // means it does not, and there is no third reading.
+        // The template's own scene shape: a CompositorContent struct, not a bare
+        // CompositorLayer in this closure. See KleptonTemplate.swift.
+        ImmersiveSpace(id: Template.id) {
+            TemplateImmersiveContent()
+        }
+        .immersionStyle(selection: .constant(Template.mixed ? .mixed : .full),
+                        in: .mixed, .full)
+
         ImmersiveSpace(id: Immersive.id) {
             CompositorLayer(configuration: KleptonStageConfiguration()) { layerRenderer in
+                // How many times this closure runs, and for which renderer. If
+                // it runs twice, the loop we watch in the log is not necessarily
+                // the layer being displayed — which would explain a correct pass
+                // that nobody sees.
+                NSLog("[cp] CompositorLayer closure #\(Immersive.bump()) "
+                      + "renderer=\(ObjectIdentifier(layerRenderer))")
                 KleptonCompositor(layerRenderer).startRenderLoop()
             }
         }
-        // .full, not .mixed: the guest is a VR title that renders its own
-        // world, so passthrough behind it would only show through wherever
-        // Beat Saber's own sky is, which is nowhere.
-        .immersionStyle(selection: .constant(.full), in: .full)
+        // .mixed by default — see Immersive.mixed. The guest renders an opaque
+        // world, so passthrough only shows where Beat Saber's own sky is, which
+        // is nowhere; what it buys is being able to see the room while judging
+        // how the scene sits. KL_FULL=1 goes back.
+        .immersionStyle(selection: .constant(Immersive.mixed ? .mixed : .full),
+                        in: .mixed, .full)
     }
 }
 
@@ -95,10 +149,36 @@ struct BootView: View {
             }
         }
         .padding(24)
-        // KL_AUTOBOOT=1 starts the run without a tap, so the simulator and
-        // device paths can be driven from a script (`visionos/run.sh`). The
-        // button stays the interactive way in.
-        .task { if ProcessInfo.processInfo.environment["KL_AUTOBOOT"] != nil { boot() } }
+        // Boots on its own. Tapping an app and then tapping Boot is a harness,
+        // not a product — and the scripted paths (`visionos/run.sh`) wanted
+        // this anyway, which is what KL_AUTOBOOT was for. `KL_AUTOBOOT=0`
+        // restores the button-only shape for hand-driven debugging, where the
+        // point is to attach or start a capture before the guest runs.
+        .task {
+            // The floor test runs INSTEAD of booting. No guest is loaded at
+            // all, so a black result here cannot be blamed on anything the
+            // guest, ANGLE or the runtime did — which is the whole reason it
+            // exists. See KleptonTemplate.swift.
+            if Template.wanted {
+                status = "template immersive space"
+                log = "KL_TEMPLATE=1 — the floor test. No guest is booted.\n"
+                // Configure but do NOT boot. This only resolves the two roots
+                // and redirects stderr into Documents/klepton-boot.log, which is
+                // where every [tpl] line has to land to be readable afterwards —
+                // NSLog alone would only reach the system log. No guest library
+                // is touched, so the floor stays a floor.
+                _ = kl_app_configure(Paths.resources, Paths.container)
+                // ...and open the log, which kl_app_boot would normally do.
+                // Without this the container keeps the previous run's file and
+                // the floor test looks like it produced nothing.
+                _ = kl_app_open_log()
+                NSLog("[tpl] KL_TEMPLATE=1 — floor test, no guest will be booted")
+                let r = await openImmersiveSpace(id: Template.id)
+                NSLog("[tpl] openImmersiveSpace -> \(r)")
+                return
+            }
+            if klEnvOn("KL_AUTOBOOT", default: true) { boot() }
+        }
     }
 
     private func boot() {
@@ -171,7 +251,15 @@ struct BootView: View {
                 // run first" and reads like a missing binding.
                 if result == 0, Immersive.wanted, !openedSpace {
                     openedSpace = true
-                    Task { _ = await openImmersiveSpace(id: Immersive.id) }
+                    // The result is logged rather than discarded: `.error` and
+                    // `.userCancelled` both leave the app alive with no
+                    // compositor, which is indistinguishable in the log from a
+                    // compositor that came up and died — and those want
+                    // completely different next moves.
+                    Task {
+                        let r = await openImmersiveSpace(id: Immersive.id)
+                        NSLog("[cp] openImmersiveSpace -> \(r)")
+                    }
                 }
             }
         }

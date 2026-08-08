@@ -115,6 +115,15 @@ __attribute__((noreturn)) void kl_unresolved_named(const char *name) {
 }
 __attribute__((noreturn)) static void kl_stack_chk_fail(void) { die("stack smashing detected"); }
 
+// ---------- knobs ----------
+// See klepton.h for why this reads the value and not just the presence.
+int kl_env_on(const char *name, int dflt) {
+    const char *v = getenv(name);
+    if (!v) return dflt;
+    return !(!*v || !strcmp(v, "0") || !strcasecmp(v, "no")
+             || !strcasecmp(v, "off") || !strcasecmp(v, "false"));
+}
+
 // ---------- bionic FILE ----------
 // The guest computes stderr as &__sF[2] using bionic's sizeof(FILE), which we do not
 // know, so anything landing inside the block routes to stderr.

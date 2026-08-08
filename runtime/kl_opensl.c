@@ -536,11 +536,17 @@ static uint64_t klsl_called(const char *name) {
 
 static const char g_sl_handle[] = "klepton-opensles";
 
-void *kl_opensl_dlopen(const char *soname) {
-    if (!soname) return NULL;
+int kl_opensl_claims(const char *soname) {
+    if (!soname) return 0;
     const char *b = strrchr(soname, '/');
     b = b ? b + 1 : soname;
-    if (strcmp(b, "libOpenSLES.so") != 0) return NULL;
+    return strcmp(b, "libOpenSLES.so") == 0;
+}
+
+void *kl_opensl_dlopen(const char *soname) {
+    if (!kl_opensl_claims(soname)) return NULL;
+    const char *b = strrchr(soname, '/');
+    b = b ? b + 1 : soname;
     fprintf(stderr, "  [sl] guest dlopen(\"%s\") -> synthetic OpenSL ES handle\n", b);
     return (void *)g_sl_handle;
 }

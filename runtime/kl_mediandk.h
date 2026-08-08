@@ -8,6 +8,7 @@
 #define KL_MEDIANDK_H
 
 void *kl_mediandk_dlopen(const char *soname);   // NULL if not one of ours
+int   kl_mediandk_claims(const char *soname);   // the same test, without opening
 int   kl_mediandk_is_handle(const void *h);
 void *kl_mediandk_sym(const char *name);        // never NULL
 

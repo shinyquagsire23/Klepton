@@ -69,7 +69,14 @@ typedef struct {
     simd_float4x4 model_view;   // render-pose space -> display eye space
     simd_float4   tangents;     // what the guest RENDERED with: left, right, top, bottom
     uint32_t      slice;        // array slice of the eye texture this eye owns
-    uint32_t      pad[3];
+    // Metres the quad is placed at. Effectively "far away" on purpose: only
+    // ROTATION is corrected (both head poses have their translation dropped),
+    // but device_from_view keeps its eye offset, so a near quad would add
+    // stereo disparity the guest already baked in. It must still land inside
+    // the drawable's depth range — a quad beyond the far plane is clipped and
+    // the display is simply black. KL_REPROJECT_DEPTH overrides it.
+    float         depth;
+    uint32_t      pad[2];
 } kl_reproject_uniforms;
 
 // The reprojection pass. Draw as a 4-vertex triangle strip, no vertex buffer.

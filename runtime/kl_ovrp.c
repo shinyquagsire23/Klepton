@@ -342,15 +342,61 @@ static uint64_t klovrp_GetNodeOrientationValid(int n, uint32_t *o) {
 
 // The head pose the frontend last gave us (kl_ovrp_set_head_pose — the seam
 // declared in kl_ovrp.h). Identity by default, so a headless run sees exactly
-// what it always saw. Plain stores, deliberately not atomic: the writer is the
-// viewer's UI thread and the reader is the guest's render thread, and a torn
-// read costs one frame with a one-frame-old pose, not a wrong state — the
-// frontend rewrites it every frame anyway.
+// what it always saw.
 typedef struct { float px, py, pz, qx, qy, qz, qw; } klovrp_pose;
 static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1,
 };
 static int g_head_set;              // has a frontend ever written a head pose?
+
+// --- The frontend/guest pose handoff, and why it is a seqlock now -----------
+//
+// These used to be plain unsynchronised stores, on the argument that a torn
+// read costs one frame of staleness and the frontend rewrites it next frame
+// anyway. That argument was wrong in a way that did not matter yet, and
+// PLANNING §12.12 is what makes it matter:
+//
+//  - A torn read is not a *stale* pose, it is an *incoherent* one — half of one
+//    frame's rotation with half of another's, a pose that never existed.
+//  - Until the guest was decoupled from the compositor thread, that could
+//    barely happen: on device the writer and the reader were the same thread,
+//    so the reader could only see a fully-written value because it *was* the
+//    writer. That is no longer true of either frontend.
+//  - And the consequence grew. Reprojection *subtracts* the pose a frame was
+//    rendered with from the pose it is displayed at (kl_reproject.c), so an
+//    incoherent latch is a wrong delta, and a wrong delta is a visible jump
+//    rather than a shrug.
+//
+// A seqlock rather than a mutex, because the readers are on the guest's hot
+// path — every ovrp_GetNodePoseState — while the writer is one thread at
+// display rate. The retry count is **bounded**: past it the read is taken
+// unsynchronised, which is exactly what this code did before, so a descheduled
+// writer degrades to the old behaviour instead of spinning inside a frame.
+static uint32_t g_pose_seq;         // even = stable, odd = a write in flight
+
+static klovrp_pose klovrp_pose_read(const klovrp_pose *src) {
+    for (int try = 0; try < 8; try++) {
+        uint32_t s = __atomic_load_n(&g_pose_seq, __ATOMIC_ACQUIRE);
+        if (s & 1u) continue;
+        klovrp_pose v = *src;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&g_pose_seq, __ATOMIC_RELAXED) == s) return v;
+    }
+    return *src;
+}
+
+// One sequence counter for the whole handoff, which is sound because there is
+// exactly one writer: the frontend samples every pose for a frame from a single
+// thread (the compositor's render loop, the viewer's UI thread) and pushes them
+// through here. A second writer thread would need a real lock, so if one ever
+// appears, this is the comment it invalidates.
+static void klovrp_pose_write(klovrp_pose *dst, const klovrp_pose *v) {
+    uint32_t s = __atomic_load_n(&g_pose_seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pose_seq, s + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *dst = *v;
+    __atomic_store_n(&g_pose_seq, s + 2, __ATOMIC_RELEASE);
+}
 
 // Standing eye height, and why the default head cannot be the origin.
 // The guest sets ovrp_SetTrackingOriginType(FloorLevel) — measured, see that
@@ -373,8 +419,8 @@ static float klovrp_eye_height(void) {
 // The head pose as reported: the frontend's, or a synthesized one standing at
 // eye height when no frontend has spoken.
 static klovrp_pose klovrp_head(void) {
-    klovrp_pose h = g_head_pose;
-    if (!g_head_set) h.py = klovrp_eye_height();
+    klovrp_pose h = klovrp_pose_read(&g_head_pose);
+    if (!__atomic_load_n(&g_head_set, __ATOMIC_ACQUIRE)) h.py = klovrp_eye_height();
     return h;
 }
 
@@ -392,10 +438,9 @@ static void klovrp_qrot(const klovrp_pose *q, float vx, float vy, float vz,
 
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
-    g_head_pose.px = px; g_head_pose.py = py; g_head_pose.pz = pz;
-    g_head_pose.qx = qx; g_head_pose.qy = qy;
-    g_head_pose.qz = qz; g_head_pose.qw = qw;
-    g_head_set = 1;
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw };
+    klovrp_pose_write(&g_head_pose, &v);
+    __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
 }
 
 void kl_ovrp_get_head_pose(float *px, float *py, float *pz,
@@ -521,10 +566,9 @@ static struct {
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     if ((unsigned)hand > 1) return;
-    g_hand_pose[hand].px = px; g_hand_pose[hand].py = py; g_hand_pose[hand].pz = pz;
-    g_hand_pose[hand].qx = qx; g_hand_pose[hand].qy = qy;
-    g_hand_pose[hand].qz = qz; g_hand_pose[hand].qw = qw;
-    g_hand_set[hand] = 1;
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw };
+    klovrp_pose_write(&g_hand_pose[hand], &v);
+    __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
 }
 
 void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
@@ -653,7 +697,7 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
         // The knob meant to prove the controllers render was hiding them.
         static int inview = -1;
         if (inview < 0) inview = getenv("KL_OVRP_HANDS_IN_VIEW") != NULL;
-        if (inview || !g_hand_set[h]) {
+        if (inview || !__atomic_load_n(&g_hand_set[h], __ATOMIC_ACQUIRE)) {
             float dx = inview ? (h ? 0.15f : -0.15f) : (h ? 0.20f : -0.20f);
             float dy = inview ? -0.12f : -0.30f;
             float dz = inview ? -0.55f : -0.35f;
@@ -664,7 +708,7 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
             hand.py = head.py + oy;
             hand.pz = head.pz + oz;
         } else {
-            hand = g_hand_pose[h];
+            hand = klovrp_pose_read(&g_hand_pose[h]);
         }
         klovrp_dump_vrdevice();
         klovrp_hand_sweep(&head, &hand);
@@ -989,13 +1033,19 @@ void klovrp_GetControllerState2_entry(void);
 void klovrp_GetControllerHapticsDesc_entry(void);
 void klovrp_GetControllerState_entry(void);
 
-void *kl_ovrp_dlopen(const char *soname) {
-    if (!soname) return NULL;
+int kl_ovrp_claims(const char *soname) {
+    if (!soname) return 0;
     const char *b = strrchr(soname, '/');
     b = b ? b + 1 : soname;
     // Both spellings occur: Unity asks the ClassLoader for "OVRPlugin" and then
     // dlopens whatever path came back.
-    if (strcmp(b, "libOVRPlugin.so") != 0 && strcmp(b, "OVRPlugin") != 0) return NULL;
+    return strcmp(b, "libOVRPlugin.so") == 0 || strcmp(b, "OVRPlugin") == 0;
+}
+
+void *kl_ovrp_dlopen(const char *soname) {
+    if (!kl_ovrp_claims(soname)) return NULL;
+    const char *b = strrchr(soname, '/');
+    b = b ? b + 1 : soname;
     fprintf(stderr, "  [ovrp] guest dlopen(\"%s\") -> synthetic OVRPlugin "
                     "(the real one NEEDs libvrapi.so; see PLANNING 3.1)\n", b);
     return (void *)g_ovrp_handle;

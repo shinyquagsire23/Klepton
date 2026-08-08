@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The app's Info.plist base. Xcode still GENERATES the ordinary keys (bundle id,
+  version, scene manifest) and still merges every INFOPLIST_KEY_* build setting
+  from gen_xcodeproj.py on top of this file; what lives here is the part that
+  build settings cannot express, plus the privacy strings, which are grouped
+  with it so the whole TCC surface can be read in one place.
+
+  Why this file exists at all: on visionOS a missing usage description is not a
+  refused permission, it is a PROCESS KILL. The system sends SIGKILL and writes
+  a TCC-namespace crash report, so it presents as "the app died instantly for no
+  reason" rather than as a permissions problem — and none of it reproduces in
+  the Simulator, which does not enforce TCC. That cost a run to find:
+
+      Klepton-2026-08-07-161125.ips
+      namespace TCC — "This app has crashed because it attempted to access
+      privacy-sensitive data without a usage description. The app's Info.plist
+      must contain an NSAccessoryTrackingUsageDescription key..."
+
+  Note WHICH key that was. We declared hand tracking, which is the one that
+  looks like it needs consent, and were killed for accessory tracking — which
+  KleptonControllers requests even with zero controllers paired, because it
+  builds an AccessoryTrackingProvider from an empty list. The lesson is that
+  the trigger is *requesting* the authorization, not obtaining data, so the key
+  set has to match the providers we construct, not the data we end up using.
+
+  The set below is taken from ../VisionOSALVRClient/ALVRClient/Info.plist — the
+  user's own visionOS client, which runs on this same headset and has already
+  paid for this discovery once. Taking the whole set rather than adding them one
+  kill at a time is deliberate.
+-->
+<plist version="1.0">
+<dict>
+	<!-- THE SCENE MANIFEST — and specifically the immersive-space ROLE.
+	     Without this the app has no immersive scene session, and the failure is
+	     silent in every direction that can be checked from inside the app:
+	     openImmersiveSpace returns .opened, a CompositorLayer is created, its
+	     LayerRenderer reaches .running, queryDrawable(s) hands back a drawable
+	     with correct textures, slices, viewports and depth range, deviceAnchor
+	     is accepted, command buffers complete without error, and every frame
+	     presents. Nothing composites, because there is no immersive scene to
+	     composite into.
+	     Xcode generates the rest of this dictionary, but it generated
+	     UISceneConfigurations as an EMPTY dict — the window role only. That is
+	     what a `plutil -extract UIApplicationSceneManifest` on the built app
+	     showed, next to Apple's MetalImmersiveTemplate which declares the role
+	     below. It cost a session: the entire compositor was verified correct
+	     against a display that could never show it. -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationPreferredDefaultSceneSessionRole</key>
+		<string>UIWindowSceneSessionRoleApplication</string>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UISceneSessionRoleImmersiveSpaceApplication</key>
+			<array>
+				<dict>
+					<!-- Mixed, matching the app's default (Immersive.mixed).
+					     Declaring one style here and selecting another in
+					     SwiftUI is a mismatch worth avoiding: it is not obviously
+					     fatal, but this file's whole reason for existing is that
+					     scene declarations which disagree with the app fail
+					     silently. KL_FULL=1 selects .full at runtime and the
+					     scene accepts both (`in: .mixed, .full`). -->
+					<key>UISceneInitialImmersionStyle</key>
+					<string>UIImmersionStyleMixed</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+
+	<!-- ARKit providers we construct in KleptonCompositor.runARKit(). All three
+	     are required: worldTracking is unconditional, handTracking is added
+	     whenever the platform supports it, and the accessory provider is built
+	     even when no Sense controllers are paired. -->
+	<key>NSWorldSensingUsageDescription</key>
+	<string>Klepton reads the headset's own pose, which is the head pose the guest renders from.</string>
+	<key>NSHandsTrackingUsageDescription</key>
+	<string>Klepton maps your hands onto the guest's two Touch controllers.</string>
+	<key>NSAccessoryTrackingUsageDescription</key>
+	<string>Klepton maps PSVR2 Sense controllers onto the guest's two Touch controllers.</string>
+	<!-- Sense controllers reach us through GameController. ALVR carries the
+	     Bluetooth string for controllers the system does not surface as
+	     standard gamepads; declared here for the same reason the rest are —
+	     the cost of a missing one is a kill, and the cost of a spare is a
+	     string nobody reads. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Klepton connects to spatial controllers that are not visible to the system as standard game controllers.</string>
+
+	<!-- Array-valued, so it cannot be an INFOPLIST_KEY_ build setting — which
+	     is the reason this file exists rather than four more settings. Without
+	     it the Sense controllers are not offered to the app as spatial
+	     gamepads at all. -->
+	<key>GCSupportedGameControllers</key>
+	<array>
+		<dict>
+			<key>ProfileName</key>
+			<string>SpatialGamepad</string>
+		</dict>
+		<dict>
+			<key>ProfileName</key>
+			<string>ExtendedGamepad</string>
+		</dict>
+	</array>
+
+	<!-- The run's whole log is Documents/klepton-boot.log, and this makes it
+	     reachable from the Files app as well as from devicectl — worth having
+	     on a headset that is often not tethered to the Mac that built it. -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+</dict>
+</plist>

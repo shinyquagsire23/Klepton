@@ -1,6 +1,7 @@
 // See kl_app.h.
 #include <errno.h>
 #include <fcntl.h>
+#include <mach/mach.h>          // task_info(TASK_VM_INFO) — the heartbeat's footprint
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,10 +101,20 @@ int kl_app_configure(const char *resources, const char *container) {
     // ANGLE rides in the same Frameworks/ directory, so the app can answer
     // "where is ANGLE" itself rather than have the launcher guess at a path
     // that only exists on the device. Not forced: an explicit KL_ANGLE_DIR
-    // still wins, which is how a run points at a different build. This only
-    // says where ANGLE *is* — KL_GLFB is still what decides whether it is used,
-    // so an app without KL_GLFB set stays on the null driver exactly as before.
+    // still wins, which is how a run points at a different build.
     setenv("KL_ANGLE_DIR", g_dylibs, 0);
+
+    // ...and the app uses it by default. KL_GLFB stays opt-IN for the host,
+    // where the null driver is a legitimate answer — `make check` and every
+    // lifecycle loop run on it, and the reference renderer is a deliberate
+    // extra. In a shipped app it is not an answer at all: the null driver
+    // records GL calls and draws nothing, so a hand-launched Klepton would
+    // show a black immersive space and look broken.
+    //
+    // overwrite=0, so an explicit KL_GLFB=0 from run.sh or the launcher still
+    // selects the null driver — which is why kl_glfb_enabled() had to start
+    // reading the value rather than the presence.
+    setenv("KL_GLFB", "1", 0);
 
     snprintf(g_status, sizeof g_status, "configured");
     return 0;
@@ -136,18 +147,66 @@ static int open_log(void) {
 //
 // Wall clock rather than monotonic on purpose: a suspension is exactly the thing
 // a monotonic clock is designed to hide.
+//
+// The line also carries memory, because "killed" above has two causes that the
+// log cannot otherwise tell apart — jetsam and the watchdog both send SIGKILL,
+// and neither leaves anything behind. `foot` is our physical footprint, which is
+// the number jetsam actually meters; `avail` is what the OS says is left before
+// it acts. A run that ends with avail falling toward zero was killed for memory;
+// one that ends with avail still comfortable was killed for time.
 static const char *volatile g_phase = "start";
+
+// Bytes of headroom before this app is jetsammed, or -1 where the OS will not
+// say. os_proc_available_memory() is the app-process-only API and returns 0 in
+// contexts it does not apply to, which is not distinguishable from "none left" —
+// hence the explicit -1 rather than passing a bare 0 through to the log.
+// TARGET_OS_IPHONE, not __has_include: the header exists on macOS too, where the
+// function is marked unavailable — so an include test compiles and then fails at
+// the call.
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
+static long long kl_avail_memory(void) {
+#if TARGET_OS_IPHONE
+    size_t a = os_proc_available_memory();
+    return a ? (long long)a : -1;
+#else
+    return -1;
+#endif
+}
+
+static long long kl_phys_footprint(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS)
+        return -1;
+    return (long long)info.phys_footprint;
+}
+
 static void *heartbeat(void *arg) {
     (void)arg;
+    // Polled faster than it prints, so a phase change is reported when it
+    // happens rather than up to two seconds later. That matters here: the first
+    // device run to reach graphics died inside one 2 s interval, so the whole
+    // lifecycle was described by a single "phase=start" line.
+    const char *last_phase = NULL;
+    int ticks = 0;
     for (;;) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        struct tm tm;
-        localtime_r(&ts.tv_sec, &tm);
-        fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s\n",
-                tm.tm_hour, tm.tm_min, tm.tm_sec, g_phase);
-        fflush(stderr);
-        struct timespec iv = { 2, 0 };   // nanosleep: usleep is EINVAL at >= 1e6
+        const char *phase = g_phase;
+        if (phase != last_phase || ticks % 8 == 0) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm tm;
+            localtime_r(&ts.tv_sec, &tm);
+            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM avail=%lldM\n",
+                    tm.tm_hour, tm.tm_min, tm.tm_sec, phase,
+                    kl_phys_footprint() >> 20, kl_avail_memory() >> 20);
+            fflush(stderr);
+            last_phase = phase;
+        }
+        ticks++;
+        struct timespec iv = { 0, 250000000 };  // nanosleep: usleep is EINVAL at >= 1e6
         nanosleep(&iv, NULL);
     }
     return NULL;
@@ -169,6 +228,18 @@ static int fail(const char *msg) {
     fprintf(stderr, "FAIL: %s\n", msg);
     fflush(NULL);
     return 1;
+}
+
+// Open the log WITHOUT booting. kl_app_boot() does this itself, and for the
+// whole life of this file that was the only way to get one — which is fine
+// until something wants a log and deliberately does not want a guest. The
+// KL_TEMPLATE floor test is exactly that, and its absence was not a quiet
+// inconvenience: it left the container holding the PREVIOUS run's log, so the
+// floor test looked like it had produced no output when it had simply never
+// been able to write any, and the stale file read as a current result.
+int kl_app_open_log(void) {
+    if (!*g_log) return 1;                 // kl_app_configure was not called
+    return open_log();
 }
 
 int kl_app_boot(void) {
@@ -426,4 +497,171 @@ int kl_app_lifecycle(unsigned frames) {
     while (g_frames_pumped < frames && kl_app_frame() >= 0) { }
     kl_app_lifecycle_report();
     return 0;
+}
+
+// --- The guest on its own thread — PLANNING §12.12 --------------------------
+// See kl_app.h for what this is for. What is here is the handoff itself, and
+// it is deliberately in C rather than Swift for one reason above the language
+// boundary in §12.6: trap 1. Every thread that runs guest code must call
+// kl_thread_init() before it does — the TPIDR slot the veneered guest reads is
+// per-thread and this is where it is established. A Swift `Thread {}` that
+// called kl_app_frame() without it would fault in a way that looks exactly
+// like an x18 bug and is not, so the thread is created at the same place the
+// init happens and there is no way to get one without the other.
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    uint64_t        published;    // poses the compositor has offered
+    uint64_t        consumed;     // poses the guest has started a frame for
+    unsigned        limit;        // KL_FRAMES, or 0 for "until stopped"
+    int             stop;
+    int             state;        // kl_app_guest_state()
+    int             running;      // has the thread been spawned and not joined?
+    int             finished;     // has it left its loop and written the report?
+    pthread_t       thread;
+} g_guest = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+int kl_app_guest_state(void) {
+    pthread_mutex_lock(&g_guest.mu);
+    int s = g_guest.state;
+    pthread_mutex_unlock(&g_guest.mu);
+    return s;
+}
+
+static void guest_set_state(int s) {
+    pthread_mutex_lock(&g_guest.mu);
+    g_guest.state = s;
+    pthread_mutex_unlock(&g_guest.mu);
+}
+
+// Both exit paths run through here, so kl_app_guest_stop() can never be left
+// waiting on a thread that has already gone.
+static void guest_finished(void) {
+    pthread_mutex_lock(&g_guest.mu);
+    g_guest.state = -1;
+    g_guest.finished = 1;
+    pthread_cond_broadcast(&g_guest.cv);
+    pthread_mutex_unlock(&g_guest.mu);
+}
+
+static void *guest_thread(void *unused) {
+    (void)unused;
+    // Trap 1, before a single guest instruction runs on this thread.
+    kl_thread_init();
+    pthread_setname_np("Klepton Guest");
+
+    if (kl_app_lifecycle_begin() != 0) {
+        printf("[guest] lifecycle_begin failed: %s\n", g_status);
+        fflush(NULL);
+        guest_finished();
+        return NULL;
+    }
+    guest_set_state(1);
+    printf("\n=== guest thread running, one frame per published pose ===\n");
+    fflush(NULL);
+
+    for (;;) {
+        pthread_mutex_lock(&g_guest.mu);
+        while (!g_guest.stop && g_guest.published == g_guest.consumed)
+            pthread_cond_wait(&g_guest.cv, &g_guest.mu);
+        int stop = g_guest.stop;
+        // Coalesce, do not queue: take everything published since the last
+        // frame as a single turn. This is what makes "the guest is late" mean
+        // "frames were skipped" — which reprojection covers — rather than
+        // "frames are owed", which is a backlog that only grows.
+        g_guest.consumed = g_guest.published;
+        unsigned limit = g_guest.limit;
+        pthread_mutex_unlock(&g_guest.mu);
+        if (stop) break;
+
+        if (kl_app_frame() < 0) {
+            printf("[guest] nativeRender is gone — the frame loop ends here\n");
+            fflush(NULL);
+            break;
+        }
+        if (limit && g_frames_pumped >= limit) {
+            printf("[guest] reached KL_FRAMES=%u\n", limit);
+            fflush(NULL);
+            break;
+        }
+    }
+
+    // The report belongs to the guest's loop end, not the render loop's: with
+    // the two decoupled, "the run ended" has two meanings and these are the
+    // guest's numbers.
+    kl_app_lifecycle_report();
+    guest_finished();
+    return NULL;
+}
+
+int kl_app_guest_start(void) {
+    pthread_mutex_lock(&g_guest.mu);
+    if (g_guest.running) {
+        pthread_mutex_unlock(&g_guest.mu);
+        return fail("kl_app_guest_start was already run in this process");
+    }
+    const char *f = getenv("KL_FRAMES");
+    g_guest.limit = f ? (unsigned)strtoul(f, NULL, 10) : 0;
+    g_guest.running = 1;
+    g_guest.state = 0;
+    pthread_mutex_unlock(&g_guest.mu);
+
+    // User-interactive, because this thread is now the one producing frames.
+    // A plain pthread gets an unspecified QoS, and a guest demoted below the
+    // compositor is a guest that misses deadlines for scheduling reasons that
+    // would then be blamed on the shim.
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    int rc = pthread_create(&g_guest.thread, &attr, guest_thread, NULL);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        pthread_mutex_lock(&g_guest.mu);
+        g_guest.running = 0;
+        g_guest.state = -1;
+        pthread_mutex_unlock(&g_guest.mu);
+        return fail("could not create the guest frame thread");
+    }
+    return 0;
+}
+
+void kl_app_guest_publish(void) {
+    pthread_mutex_lock(&g_guest.mu);
+    g_guest.published++;
+    pthread_cond_signal(&g_guest.cv);
+    pthread_mutex_unlock(&g_guest.mu);
+}
+
+void kl_app_guest_stop(void) {
+    pthread_mutex_lock(&g_guest.mu);
+    if (!g_guest.running) { pthread_mutex_unlock(&g_guest.mu); return; }
+    g_guest.stop = 1;
+    g_guest.running = 0;
+    pthread_t t = g_guest.thread;
+    pthread_cond_broadcast(&g_guest.cv);
+
+    // Bounded, not a plain join. The guest can wedge — a Baselib futex nobody
+    // will post, the GC failing to stop the world — and that is a documented
+    // failure mode here, not a hypothetical. A render loop being torn down
+    // must not be the thing that hangs waiting for it: past the deadline the
+    // thread is left to whatever it is doing and the caller carries on without
+    // the report, which is an honest missing report rather than a silent hang
+    // that would read as a compositor bug.
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 10;
+    while (!g_guest.finished)
+        if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) break;
+    int finished = g_guest.finished;
+    pthread_mutex_unlock(&g_guest.mu);
+
+    if (finished) {
+        // Joined, not detached, in the normal case: the report is written on
+        // the way out and the caller's next act may be to hand the log to the UI.
+        pthread_join(t, NULL);
+    } else {
+        pthread_detach(t);
+        printf("[guest] did not stop within 10 s — carrying on without its report\n");
+        fflush(NULL);
+    }
 }

@@ -420,7 +420,10 @@ static void *view_guest_thread(void *arg) {
 // The guest runs on a spawned thread; the main thread runs SDL, because macOS
 // requires windowing on the main thread.
 static int view_run(void) {
-    if (!getenv("KL_GLFB")) {
+    // kl_env_on, not getenv: this has to agree with kl_glfb_enabled() about what
+    // KL_GLFB=0 means, or the viewer starts on the strength of a knob the
+    // renderer read as off and then displays nothing.
+    if (!kl_env_on("KL_GLFB", 0)) {
         fprintf(stderr, "KL_VIEW=1 requires KL_GLFB=1 — the viewer displays "
                         "what the reference renderer reads back\n");
         return 1;

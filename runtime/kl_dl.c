@@ -161,6 +161,39 @@ const char *kl_addr_image(const void *addr, size_t *offset) {
     return NULL;
 }
 
+// Would klb_dlopen() succeed for `path`? This is the question anything answering
+// an existence check on the guest's behalf has to ask, and it is strictly wider
+// than kl_can_load(): a library can be loadable two ways, and only one of them
+// is a file.
+//
+//   1. there is an image to load  — a translated dylib, or the ELF   (kl_can_load)
+//   2. this shim SERVES the name instead of loading anything         (below)
+//
+// Case 2 has no file anywhere, by design: OVRPlugin, the platform loader, GLES
+// and OpenSL ES are synthesized because the real ones need Quest system
+// libraries that do not exist here (PLANNING 3.1). On the host that stayed
+// invisible — the APK's own libOVRPlugin.so sits in the guest lib directory and
+// access() finds it, even though we never load a byte of it. In the bundle only
+// the five *translations* are embedded and the ELF tree is deliberately absent,
+// so the same question answered "no".
+//
+// That is what black-screened the device. ClassLoader.findLibrary("OVRPlugin")
+// returned null, so Unity took its fallback branch, could not get a path to
+// dlopen for the plugin handle, and gave up with "Oculus Plugin could not be
+// loaded." — no VRDevice, no SetupEyeTexture2, so the compositor's eye-texture
+// provider was never called and every frame composited black. The renderer was
+// healthy the whole time; it had nothing to show. Reproduced on the host in one
+// run by moving libOVRPlugin.so aside, which is the A/B if this regresses.
+//
+// Exactly the same bug as P5.4's "Failed to load Il2CPP." (see kl_can_load), one
+// library over and one cause deeper: that one was cured by asking kl_can_load
+// instead of stat(), and this is what kl_can_load itself could not see.
+int kl_can_dlopen(const char *path) {
+    if (!path) return 0;
+    return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||
+           kl_ovrplat_claims(path) || kl_mediandk_claims(path) || kl_can_load(path);
+}
+
 void *klb_dlopen(const char *path, int flags) {
     (void)flags;
     if (!path) return (void *)-1;                    // RTLD_DEFAULT-ish: whole process

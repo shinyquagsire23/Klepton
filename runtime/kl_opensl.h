@@ -10,6 +10,7 @@
 #include <stdio.h>
 
 void *kl_opensl_dlopen(const char *soname);   // NULL if not libOpenSLES.so
+int   kl_opensl_claims(const char *soname);   // the same test, without opening
 int   kl_opensl_is_handle(const void *h);
 void *kl_opensl_sym(const char *name);
 

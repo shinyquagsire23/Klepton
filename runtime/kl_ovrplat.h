@@ -42,6 +42,7 @@
 #include <stdio.h>
 
 void *kl_ovrplat_dlopen(const char *soname);   // NULL if not the platform loader
+int   kl_ovrplat_claims(const char *soname);   // the same test, without opening
 int   kl_ovrplat_is_handle(const void *h);
 void *kl_ovrplat_sym(const char *name);
 

@@ -1157,16 +1157,20 @@ static void *klegl_GetProcAddress(const char *name) { return kl_egl_sym(name); }
 // produced a NULL it called anyway.
 static const char g_gl_handle[] = "klepton-gles";
 
-void *kl_egl_dlopen(const char *soname) {
-    if (!soname) return NULL;
+int kl_egl_claims(const char *soname) {
+    if (!soname) return 0;
     const char *b = strrchr(soname, '/');
     b = b ? b + 1 : soname;
-    if (strcmp(b, "libGLESv2.so") == 0 || strcmp(b, "libGLESv3.so") == 0 ||
-        strcmp(b, "libGLESv1_CM.so") == 0 || strcmp(b, "libEGL.so") == 0) {
-        fprintf(stderr, "  [egl] guest dlopen(\"%s\") -> synthetic GL handle\n", b);
-        return (void *)g_gl_handle;
-    }
-    return NULL;
+    return strcmp(b, "libGLESv2.so") == 0 || strcmp(b, "libGLESv3.so") == 0 ||
+           strcmp(b, "libGLESv1_CM.so") == 0 || strcmp(b, "libEGL.so") == 0;
+}
+
+void *kl_egl_dlopen(const char *soname) {
+    if (!kl_egl_claims(soname)) return NULL;
+    const char *b = strrchr(soname, '/');
+    b = b ? b + 1 : soname;
+    fprintf(stderr, "  [egl] guest dlopen(\"%s\") -> synthetic GL handle\n", b);
+    return (void *)g_gl_handle;
 }
 
 int kl_egl_is_handle(const void *h) { return h == (const void *)g_gl_handle; }

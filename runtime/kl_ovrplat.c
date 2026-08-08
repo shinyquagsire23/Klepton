@@ -328,12 +328,18 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
 
 static const char g_plat_handle[] = "klepton-ovrplatformloader";
 
-void *kl_ovrplat_dlopen(const char *soname) {
-    if (!soname) return NULL;
+int kl_ovrplat_claims(const char *soname) {
+    if (!soname) return 0;
     const char *b = strrchr(soname, '/');
     b = b ? b + 1 : soname;
-    if (strcmp(b, "libovrplatformloader.so") != 0 && strcmp(b, "ovrplatformloader") != 0)
-        return NULL;
+    return strcmp(b, "libovrplatformloader.so") == 0 ||
+           strcmp(b, "ovrplatformloader") == 0;
+}
+
+void *kl_ovrplat_dlopen(const char *soname) {
+    if (!kl_ovrplat_claims(soname)) return NULL;
+    const char *b = strrchr(soname, '/');
+    b = b ? b + 1 : soname;
     fprintf(stderr, "  [plat] guest dlopen(\"%s\") -> synthetic Oculus Platform "
                     "(the real one forwards to com.oculus.horizon, which is not "
                     "here; see kl_ovrplat.h)\n", b);

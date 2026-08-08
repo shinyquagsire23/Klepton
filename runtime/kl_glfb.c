@@ -136,7 +136,11 @@ static int   g_w = 1832, g_h = 1920;      // one eye, Quest 2 per-eye default
 static unsigned g_presented;
 
 int kl_glfb_enabled(void) {
-    if (g_on < 0) g_on = getenv("KL_GLFB") != NULL;
+    // Value-aware, not presence-aware. Default off, which keeps every host loop
+    // and `make check` exactly as they were — but the visionOS app now turns
+    // this on for itself (kl_app_configure), so `KL_GLFB=0` has to be a real way
+    // back to the null driver rather than a second way to say "on".
+    if (g_on < 0) g_on = kl_env_on("KL_GLFB", 0);
     return g_on;
 }
 
@@ -1407,6 +1411,115 @@ static void klfb_TexSubImage3D(uint32_t target, int32_t level, int32_t xoff,
                              (uint32_t)format, (uint32_t)type, pixels);
 }
 
+// ----------------------------------------- the compressed-upload probe (ETC2)
+//
+// The Simulator dies inside ANGLE on a compressed upload — signal 10 in
+// _platform_memmove under TextureMtl::setPerSliceSubImage, from
+// glCompressedTexSubImage2D of 0x9279 at 2048x1024. A memmove overruns, so
+// something disagrees about how many bytes the call describes. Everything about
+// the *format* has already been ruled out (PLANNING §12.9): the emulated-format
+// table entry is gated on macOS/Catalyst rather than the simulator, the
+// simulator block maps ETC2 to native EAC, and a standalone
+// EAC_RGBA8_sRGB + replaceRegion with exactly the guest's 2 MB succeeds.
+//
+// What was never measured is the guest's own arithmetic. This computes the size
+// the dimensions imply and compares it with the imageSize the guest passed —
+// and separately checks the sub-region against the mip level's real extent,
+// because a region that overruns the level is the other way to make a correct
+// imageSize describe the wrong destination.
+//
+// Block geometry, not bytes-per-pixel: every format here is 4x4-blocked except
+// ASTC, whose footprint is in its enum. Returns 0 for "not a compressed format
+// I know", which is reported rather than guessed at.
+static int klfb_block_geom(uint32_t fmt, int *bw, int *bh, int *bytes) {
+    *bw = *bh = 4;
+    switch (fmt) {
+        case 0x9270: case 0x9271:                       // R11_EAC (+signed)
+        case 0x9274: case 0x9275:                       // RGB8_ETC2, SRGB8_ETC2
+        case 0x9276: case 0x9277:                       // ...A1 punchthrough
+            *bytes = 8;  return 1;
+        case 0x9272: case 0x9273:                       // RG11_EAC (+signed)
+        case 0x9278: case 0x9279:                       // RGBA8_ETC2_EAC, SRGB8_A8
+            *bytes = 16; return 1;
+        default: break;
+    }
+    // ASTC: 0x93B0-0x93BD LDR, 0x93D0-0x93DD sRGB, same footprint order. Always
+    // 16 bytes per block; only the block dimensions vary.
+    static const struct { int w, h; } astc[] = {
+        {4,4},{5,4},{5,5},{6,5},{6,6},{8,5},{8,6},{8,8},
+        {10,5},{10,6},{10,8},{10,10},{12,10},{12,12},
+    };
+    unsigned i = 0xffffffffu;
+    if (fmt >= 0x93B0 && fmt <= 0x93BD) i = fmt - 0x93B0;
+    if (fmt >= 0x93D0 && fmt <= 0x93DD) i = fmt - 0x93D0;
+    if (i < sizeof astc / sizeof *astc) {
+        *bw = astc[i].w; *bh = astc[i].h; *bytes = 16; return 1;
+    }
+    return 0;
+}
+
+// KL_GLFB_PROBE_CTEX=1 — also check each compressed upload against the
+// allocation glTexStorage2D recorded, which costs a GL query per upload.
+static int klfb_probe_ctex(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GLFB_PROBE_CTEX", 0);
+    return on;
+}
+
+static void (*g_real_CompressedTexSubImage2D)(uint32_t, int32_t, int32_t, int32_t,
+                                              int32_t, int32_t, uint32_t, int32_t,
+                                              const void *);
+
+static void klfb_CompressedTexSubImage2D(uint32_t target, int32_t level, int32_t xoff,
+                                         int32_t yoff, int32_t w, int32_t h,
+                                         int64_t format, int64_t imageSize,
+                                         const void *data) {
+    uint32_t fmt = (uint32_t)format;
+    int32_t  sz  = (int32_t)imageSize;
+    int bw, bh, bpb, known = klfb_block_geom(fmt, &bw, &bh, &bpb);
+    long expect = known ? (long)((w + bw - 1) / bw) * ((h + bh - 1) / bh) * bpb : -1;
+
+    // What the level is actually supposed to be, from the glTexStorage2D record.
+    //
+    // Behind its own knob, because unlike `expect` above this is not free: it is
+    // a glGetIntegerv per compressed upload, a synchronous round trip into
+    // ANGLE, and instrumentation that perturbs the thing it measures has bitten
+    // this file before. It cannot be folded into "only look when the size is
+    // already wrong" either — a region that overruns its mip level has a
+    // perfectly correct imageSize, and that is exactly the case still open.
+    int32_t bound = -1, tw = 0, th = 0;
+    uint32_t tfmt = 0;
+    int have = 0;
+    if ((klfb_probe_ctex() || klfb_trace_tex()) && a_glGetIntegerv) {
+        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &bound);
+        if (bound > 0) have = klfb_tex_info((uint32_t)bound, &tfmt, &tw, &th);
+    }
+    int32_t lw = have ? (tw >> level ? tw >> level : 1) : 0;
+    int32_t lh = have ? (th >> level ? th >> level : 1) : 0;
+
+    // Three ways this call can be wrong, each named separately so the log says
+    // which one rather than just "something is off".
+    const char *verdict = "";
+    if (!known)                        verdict = "  <-- UNKNOWN COMPRESSED FORMAT";
+    else if (expect != sz)             verdict = "  <-- SIZE MISMATCH";
+    else if (have && (xoff + w > lw || yoff + h > lh))
+                                       verdict = "  <-- REGION OVERRUNS LEVEL";
+    else if (have && fmt != tfmt)      verdict = "  <-- FORMAT != ALLOCATED";
+
+    // A verdict always prints, even with no knob set — a wrong upload is worth
+    // a line in any run. The knobs add the clean ones, which is what makes the
+    // host and the Simulator diffable.
+    if (klfb_trace_tex() || klfb_probe_ctex() || *verdict)
+        fprintf(stderr, "  [glfb] #%u glCompressedTexSubImage2D target=0x%04x "
+                        "level=%d %dx%d at %d,%d fmt=0x%04x imageSize=%d "
+                        "expect=%ld (tex=%d alloc 0x%04x %dx%d, level %dx%d)%s\n",
+                g_texcalls++, target, level, w, h, xoff, yoff, fmt, sz, expect,
+                bound, tfmt, tw, th, lw, lh, verdict);
+
+    if (g_real_CompressedTexSubImage2D)
+        g_real_CompressedTexSubImage2D(target, level, xoff, yoff, w, h, fmt, sz, data);
+}
+
 static void (*g_real_CompressedTexSubImage3D)(uint32_t, int32_t, int32_t, int32_t,
                                               int32_t, int32_t, int32_t, int32_t,
                                               uint32_t, int32_t, const void *);
@@ -2277,6 +2390,7 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glRenderbufferStorageMultisample", (void *)klfb_RenderbufferStorageMultisample, (void **)&g_real_RenderbufferStorageMultisample},
     {"glRenderbufferStorage",     (void *)klfb_RenderbufferStorage,     (void **)&g_real_RenderbufferStorage},
     {"glTexSubImage3D",           (void *)klfb_TexSubImage3D,           (void **)&g_real_TexSubImage3D},
+    {"glCompressedTexSubImage2D", (void *)klfb_CompressedTexSubImage2D, (void **)&g_real_CompressedTexSubImage2D},
     {"glCompressedTexSubImage3D", (void *)klfb_CompressedTexSubImage3D, (void **)&g_real_CompressedTexSubImage3D},
     // the shared-context compile lock — see the block above s10's numbers
     {"glShaderSource", (void *)klfb_ShaderSource, (void **)&g_real_ShaderSource},

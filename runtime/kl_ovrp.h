@@ -22,6 +22,7 @@
 #include <stdint.h>
 
 void *kl_ovrp_dlopen(const char *soname);   // NULL if this is not OVRPlugin
+int   kl_ovrp_claims(const char *soname);   // the same test, without opening
 int   kl_ovrp_is_handle(const void *h);
 void *kl_ovrp_sym(const char *name);
 

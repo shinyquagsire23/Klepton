@@ -10,8 +10,15 @@ void kl_unresolved_named(const char *name);     // kl_shim.c
 static const char g_md_handle[]  = "klepton-mediandk";
 static const char g_oma_handle[] = "klepton-openmaxal";
 
+int kl_mediandk_claims(const char *soname) {
+    if (!soname) return 0;
+    const char *b = strrchr(soname, '/');
+    b = b ? b + 1 : soname;
+    return strcmp(b, "libmediandk.so") == 0 || strcmp(b, "libOpenMAXAL.so") == 0;
+}
+
 void *kl_mediandk_dlopen(const char *soname) {
-    if (!soname) return NULL;
+    if (!kl_mediandk_claims(soname)) return NULL;
     const char *b = strrchr(soname, '/');
     b = b ? b + 1 : soname;
     if (strcmp(b, "libmediandk.so") == 0) {

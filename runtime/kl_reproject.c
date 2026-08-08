@@ -5,6 +5,7 @@
 // string, so it builds for the host and the device out of the same source list
 // and can be reasoned about (and, on the host, run) without a headset.
 #include <math.h>
+#include <stdlib.h>
 #include "kl_reproject.h"
 
 // The shader. Compiled from source at runtime by whichever compositor is
@@ -22,6 +23,7 @@ static const char kl_msl_reproject[] =
 "    float4x4 modelView;\n"
 "    float4   tangents;   // left, right, top, bottom — all positive\n"
 "    uint     slice;\n"
+"    float    depth;      // metres — see kl_reproject.h\n"
 "};\n"
 "\n"
 "struct VOut { float4 pos [[position]]; float2 uv; };\n"
@@ -36,17 +38,22 @@ static const char kl_msl_reproject[] =
 "{\n"
 "    // Triangle-strip corners: (0,0) (1,0) (0,1) (1,1).\n"
 "    float2 c = float2(float(vid & 1u), float((vid >> 1) & 1u));\n"
-"    const float d = 500.0;      // KL_REPROJECT_DEPTH\n"
+"    float d = u.depth;          // KL_REPROJECT_DEPTH\n"
 "    float x = mix(-u.tangents.x, u.tangents.y, c.x) * d;\n"
 "    float y = mix(-u.tangents.w, u.tangents.z, c.y) * d;\n"
 "    VOut o;\n"
 "    o.pos = u.projection * u.modelView * float4(x, y, -d, 1.0);\n"
-"    // Same mapping as the plain blit below, and for the same reason: the\n"
-"    // top of the picture is v = 0. Derived once, in the viewer, against a\n"
-"    // frame known to be the right way up — do not re-derive it from first\n"
-"    // principles about GL's origin, because ANGLE's Metal backend has\n"
-"    // already had its say about that by the time we see the texture.\n"
-"    o.uv = float2(c.x, 1.0 - c.y);\n"
+"    // Same mapping as the plain blit below, and for the same reason. Derived\n"
+"    // in the viewer against a frame known to be the right way up — do not\n"
+"    // re-derive it from first principles about GL's origin, because ANGLE's\n"
+"    // Metal backend has already had its say by the time we see the texture.\n"
+"    //\n"
+"    // The blit is the authority and this must track it. It was corrected to\n"
+"    // uv.y = p.y (the picture was upside down); this quad's c.y = 1 is UP,\n"
+"    // where the blit's p.y = 2 is also up, so the same convention written for\n"
+"    // this parameterisation is uv.y = c.y. The two disagreed for exactly as\n"
+"    // long as the reprojection pass had never run anywhere.\n"
+"    o.uv = float2(c.x, c.y);\n"
 "    return o;\n"
 "}\n"
 "\n"
@@ -56,6 +63,45 @@ static const char kl_msl_reproject[] =
 "                               constant KLReproj &u [[buffer(0)]])\n"
 "{\n"
 "    return tex.sample(samp, in.uv, u.slice);\n"
+"}\n"
+"\n"
+// The probe ladder (KL_CP_PROBE). Same library, same vertex function, so each
+// rung differs from the real pass in exactly one respect and nothing else moves.
+// A picture that is black tells you nothing about WHICH link is dark; these do.
+"fragment float4 kl_probe_solid_f(VOut in [[stage_in]])\n"
+"{\n"
+"    return float4(1.0, 0.0, 1.0, 1.0);            // magenta: geometry only\n"
+"}\n"
+"\n"
+// The real sample with alpha forced opaque. If this is visible and the real pass
+// is not, the guest's picture is arriving with alpha 0 and the fix is here.
+"fragment float4 kl_probe_opaque_f(VOut in [[stage_in]],\n"
+"                                  texture2d_array<float> tex [[texture(0)]],\n"
+"                                  sampler samp [[sampler(0)]],\n"
+"                                  constant KLReproj &u [[buffer(0)]])\n"
+"{\n"
+"    return float4(tex.sample(samp, in.uv, u.slice).rgb, 1.0);\n"
+"}\n"
+"\n"
+// The eye texture over the whole viewport, ignoring the quad, the poses and the
+// projection entirely — the viewer's proven path, on device. Visible here but
+// not at rung 2 means the picture is fine and the REPROJECTION GEOMETRY is what
+// is dark. Uses the same uv convention as kl_blit_v below.
+"vertex VOut kl_probe_full_v(uint vid [[vertex_id]])\n"
+"{\n"
+"    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+"    VOut o;\n"
+"    o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"    o.uv  = float2(p.x, p.y);\n"
+"    return o;\n"
+"}\n"
+"\n"
+"fragment float4 kl_probe_full_f(VOut in [[stage_in]],\n"
+"                                texture2d_array<float> tex [[texture(0)]],\n"
+"                                sampler samp [[sampler(0)]],\n"
+"                                constant KLReproj &u [[buffer(0)]])\n"
+"{\n"
+"    return float4(tex.sample(samp, in.uv, u.slice).rgb, 1.0);\n"
 "}\n";
 
 // The pass that existed before reprojection: a full-screen triangle, three
@@ -70,7 +116,7 @@ static const char kl_msl_blit[] =
 "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
 "    VOut o;\n"
 "    o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
-"    o.uv  = float2(p.x, 1.0 - p.y);\n"
+"    o.uv  = float2(p.x, p.y);\n"
 "    return o;\n"
 "}\n"
 "fragment float4 kl_blit_f(VOut in [[stage_in]],\n"
@@ -109,7 +155,20 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     kl_reproject_uniforms u;
     u.projection = projection;
     u.slice = slice;
-    u.pad[0] = u.pad[1] = u.pad[2] = 0;
+    u.pad[0] = u.pad[1] = 0;
+    // 2 m, not 500. The old value existed so the eye offset would be negligible,
+    // and with that offset now dropped above the quad fills the viewport at any
+    // distance — so the only thing left to choose it by is what the DISPLAY
+    // needs, and the display reprojects using depth. Reverse-Z with near = 0.1
+    // makes 500 m a depth of 0.0002, which is the "infinitely far" value a
+    // discarded frame has; 2 m is 0.05, which is the value measured to appear.
+    static float s_depth = 0.0f;
+    if (s_depth == 0.0f) {
+        const char *e = getenv("KL_REPROJECT_DEPTH");
+        float v = e ? (float)atof(e) : 0.0f;
+        s_depth = (v > 0.0f) ? v : 2.0f;
+    }
+    u.depth = s_depth;
 
     if (rendered && rendered->serial) {
         const float *t = rendered->tangents[(unsigned)eye > 1 ? 0 : eye];
@@ -143,8 +202,19 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     simd_float4x4 render_rot = rendered && rendered->serial
         ? klr_rotation_of_quat(rendered->qx, rendered->qy, rendered->qz, rendered->qw)
         : device_rot;
+    // device_from_view loses its translation too, and that is a correction of a
+    // real double-count rather than a simplification. The guest rendered THIS
+    // eye's picture from THIS eye's position — the offset is already in the
+    // pixels. Viewing a head-centred quad from an offset eye applies it a second
+    // time. At 500 m that error is negligible, which is exactly why the quad was
+    // put there; but 500 m is reverse-Z depth 0.1/500 = 0.0002, and the device
+    // discards a frame whose depth reads as infinity (measured: a quad at 0 with
+    // no depth write is invisible, the same quad at 0.05 appears). Dropping the
+    // offset makes the quad eye-centred, so it fills the viewport exactly at ANY
+    // distance and the depth becomes free to choose. See KL_REPROJECT_DEPTH.
+    simd_float4x4 view_rot = klr_rotation_of(device_from_view);
     simd_float4x4 chain = simd_mul(simd_mul(simd_inverse(render_rot), device_rot),
-                                   device_from_view);
+                                   view_rot);
     u.model_view = simd_inverse(chain);
     return u;
 }

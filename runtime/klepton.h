@@ -28,6 +28,12 @@ kl_image *kl_load_auto(const char *path);
 // the guest's behalf: with translations embedded, the .so path is a name the
 // loader resolves and not a file on disk. See the implementation comment.
 int kl_can_load(const char *path);
+// ...and the wider question the guest actually asks: could klb_dlopen() open it?
+// True for everything kl_can_load covers PLUS the libraries this shim serves
+// synthetically, which have no file anywhere. Answering an existence check for
+// the guest wants THIS one — see the implementation comment in kl_dl.c for the
+// black screen the difference caused. Defined in kl_dl.c.
+int kl_can_dlopen(const char *path);
 // Look up an exported symbol. NULL if absent.
 void      *kl_sym(kl_image *img, const char *name);
 // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.
@@ -66,6 +72,14 @@ void  kl_thread_init(void);
 void  kl_fatal_prepare(void);
 // Map a guest FILE* (an offset into our fake bionic __sF block) to a host stream.
 FILE *kl_host_file(void *guest);
+
+// Read a KL_* knob as a boolean, honouring its VALUE rather than merely its
+// presence: unset gives `dflt`, and "0"/"no"/"off"/"false"/"" are off. Most of
+// this runtime's knobs are historically presence-tested, which is fine for a
+// diagnostic that is either on or absent — but it makes `KL_FOO=0` turn KL_FOO
+// *on*, which is a trap the moment a knob acquires a default. Use this for any
+// knob that defaults on, and for any the shipping app sets on the user's behalf.
+int kl_env_on(const char *name, int dflt);
 // Build a code stub that tail-calls `handler` with `name` in x0, so whatever the
 // guest reached for names itself instead of arriving as one anonymous abort.
 // Used for unresolved ELF imports and for eglGetProcAddress's GL entry points.

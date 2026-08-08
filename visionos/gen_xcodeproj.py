@@ -73,7 +73,8 @@ B_C = oid("BC")
 # The Swift half of §12.6's split: the App/UI, and the Compositor Services
 # renderer P5b adds. A list rather than an id pair each, for the same reason
 # the guest libraries are one.
-SWIFT = [f"{NAME}App.swift", f"{NAME}Compositor.swift", f"{NAME}Controllers.swift"]
+SWIFT = [f"{NAME}App.swift", f"{NAME}Compositor.swift", f"{NAME}Controllers.swift",
+         f"{NAME}Template.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(
@@ -109,13 +110,22 @@ COMMON = f"""
 				DEVELOPMENT_TEAM = {TEAM};
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Info.plist;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/../runtime",
 				);
 				INFOPLIST_KEY_CFBundleDisplayName = Klepton;
-				INFOPLIST_KEY_NSHandsTrackingUsageDescription = "Klepton maps your hands onto the guest's two Touch controllers.";
-				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_GCSupportsControllerUserInteraction = YES;
+				// NOT UIApplicationSceneManifest_Generation. Setting it makes Xcode
+				// GENERATE the scene manifest and overwrite the one in Info.plist —
+				// with UISceneConfigurations as an EMPTY dict, i.e. the window role
+				// and no immersive-space role at all. The app then has no immersive
+				// scene session, and the failure is invisible from inside: the space
+				// "opens", a LayerRenderer runs, drawables arrive fully formed and
+				// every frame presents, into nothing. Apple's own template does not
+				// set this and declares the manifest by hand; so do we now
+				// (visionos/Info.plist). This was the black immersive space.
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -129,7 +139,14 @@ COMMON = f"""
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/{NAME}-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 7;
-				XROS_DEPLOYMENT_TARGET = 2.0;
+				// visionOS 26, not 2.0. The device runs 27 and the SDK is 26, and an
+				// app declaring a 2.0 minimum is asking the system for five-major-
+				// versions-ago behaviour — which for Compositor Services is not a
+				// detail: 26 reworked the drawable model (queryDrawables,
+				// Drawable.Target, CompositorContent, Metal 4 residency), and the
+				// pre-26 path is what a 2.0 app gets. It also makes those APIs
+				// unavailable at compile time, which is how it was noticed at all.
+				XROS_DEPLOYMENT_TARGET = 26.0;
 """
 
 PBX = f"""// !$*UTF8*$!

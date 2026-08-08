@@ -100,98 +100,85 @@ const char *const *kl_missing_imports(kl_image *img, unsigned *count) {
 // one reported "called an unresolved import" and nothing else — the single
 // place in this runtime where an unimplemented thing did not fail by name. That
 // name is exactly where the next milestone starts, so each missing symbol now
-// gets its own 32-byte trampoline that loads it and tail-calls the reporter:
+// gets its own cell, which loads the name and tail-calls the reporter:
 //
-//   0:  ldr x0, #16     // the reporter's argument: the symbol name
-//   4:  ldr x16, #20    // x16 is the intra-procedure-call scratch register,
-//   8:  br  x16         //   which is precisely what it is reserved for
-//   12: nop             // padding, so the two literals land 8-byte aligned
-//   16: .quad name
-//   24: .quad kl_unresolved_named
+//   0:  mov w16, #N              // this cell's index, baked in at build time
+//   4:  b   kl_stub_named_common // loads slots[N] -> x0, slots[N+1] -> x16, br
 //
 // Data imports get one too. They are not called, so the guest dereferences the
-// trampoline instead — but a wild pointer into a known page beats a wild
-// pointer into nothing, and the name is right there next to the code.
-#define KL_STUB_BYTES 32
-#define KL_STUB_POOL  (64 * 1024)          /* 2048 stubs; no image is close */
+// cell instead — but a wild pointer into a known page beats a wild pointer into
+// nothing, and the index identifies the name.
+// The cells are PRE-BUILT and signed with the binary — runtime/kl_stub_cells.S,
+// which carries the full rationale. Nothing here writes instructions any more:
+// a cell knows only its own index, and the allocator's whole job is to fill in
+// the { payload, target } pair the shared dispatcher will read.
+//
+// This used to be an mmap'd pool that we generated code into, which is a
+// SIGKILL on visionOS — AMFI answers "namespace CODESIGNING, Invalid Page" for
+// any pc that did not come from a signed file, whatever the page's permissions
+// are. Measured on device 2026-08-07; see kl_stub_cells.S for the report.
+#define KL_STUB_CELL_BYTES  8              /* mov w16,#i + b — see the .S */
+#define KL_STUB_NAMED_CELLS 2048
+#define KL_STUB_TRACE_CELLS 1024
 
 void kl_unresolved_named(const char *name);   // kl_shim.c
 
+// The cells (text, read-only, signed) and the slots the dispatcher reads
+// (data, written here). Both names are referenced from kl_stub_cells.S.
+extern char kl_stub_named_cells[];
+extern char kl_stub_trace_cells[];
+void *kl_stub_named_slots[KL_STUB_NAMED_CELLS * 2];
+void *kl_stub_trace_slots[KL_STUB_TRACE_CELLS * 2];
+
 static struct { char *name; void *stub; void *handler; } *g_stubs;
 static unsigned g_stub_n, g_stub_cap;
-static uint8_t *g_stub_rw, *g_stub_rx;
-static size_t   g_stub_off;
+static unsigned g_named_used, g_trace_used;
 static pthread_mutex_t g_stub_mu = PTHREAD_MUTEX_INITIALIZER;
 
-// The pool exists twice: an RX mapping the guest executes from, and an RW
-// alias of the same pages that stub_emit writes through. The old single
-// mapping had to be flipped RW->RX around every write, and any thread
-// executing an earlier stub during that window took an execute-protection
-// fault (SIGBUS, pc == fault address, in an anonymous mapping — the "parked"
-// fault from CLAUDE.md, which M6's concurrent render-thread stub traffic
-// finally reproduced reliably). Dual mapping removes the window entirely:
-// the execute view's permissions never change. The mutex is for the
-// allocator itself — the dedup scan and g_stub_off were racy in exactly the
-// same traffic. visionOS note: the RX/RW pair is a remap of our own
-// anonymous allocation, not MAP_JIT; whether that passes W^X policy on
-// device is a question for the port, not for this host-side fix.
-static int stub_pool_open(void) {
-    if (g_stub_rx) return 1;
-    vm_address_t rw = 0;
-    if (vm_allocate(mach_task_self(), &rw, KL_STUB_POOL,
-                    VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return 0;
-    vm_address_t rx = 0;
-    vm_prot_t cur, max;
-    if (vm_remap(mach_task_self(), &rx, KL_STUB_POOL, 0, VM_FLAGS_ANYWHERE,
-                 mach_task_self(), rw, FALSE, &cur, &max,
-                 VM_INHERIT_NONE) != KERN_SUCCESS ||
-        vm_protect(mach_task_self(), rx, KL_STUB_POOL, FALSE,
-                   VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
-        vm_deallocate(mach_task_self(), rw, KL_STUB_POOL);
-        return 0;
-    }
-    g_stub_rw = (uint8_t *)rw;
-    g_stub_rx = (uint8_t *)rx;
-    if (getenv("KL_TRACE_IMAGES"))
-        fprintf(stderr, "  [klepton] stub pool rx %p..%p (rw alias %p)\n",
-                (void *)g_stub_rx, (void *)(g_stub_rx + KL_STUB_POOL),
-                (void *)g_stub_rw);
-    return 1;
-}
-
-// Emit one stub cell and return its *executable* address. Caller holds
+// Claim one pre-built cell and point it at (payload, target). Caller holds
 // g_stub_mu. `payload` NULL means the owned copy of nm (kl_named_stub's
-// argument). i0/i1/i2 are the three instructions before the nop, so both
-// stub shapes share this allocator.
-static void *stub_emit(const char *nm, void *payload, void *target,
-                       uint32_t i0, uint32_t i1, uint32_t i2) {
+// argument). `trace` picks which of the two shapes — and therefore which cell
+// array and which dispatcher — the caller wants.
+//
+// The mutex still matters, for the same reason it always did: the dedup scan
+// and the bump counter are racy under M6's concurrent stub traffic (the render
+// thread calling existing stubs while the main thread creates new ones). What
+// it no longer has to protect is a W^X window, because there is no longer any
+// window: the cells are read-only text from the moment the binary is signed,
+// and only the slots array is written. That also retires the SIGBUS this code
+// used to produce when the pool was flipped RW->RX around each write.
+static void *stub_emit(const char *nm, void *payload, void *target, int trace) {
     for (unsigned i = 0; i < g_stub_n; i++)             // shared across images
         if (g_stubs[i].handler == target && strcmp(g_stubs[i].name, nm) == 0)
             return g_stubs[i].stub;
 
-    if (!stub_pool_open()) return NULL;
-    if (g_stub_off + KL_STUB_BYTES > KL_STUB_POOL) return NULL;
+    unsigned cap  = trace ? KL_STUB_TRACE_CELLS : KL_STUB_NAMED_CELLS;
+    unsigned *use = trace ? &g_trace_used : &g_named_used;
+    if (*use >= cap) {
+        // Exhaustion is now a fixed ceiling rather than a 64 KB pool, so say so
+        // by name instead of returning a silent NULL that becomes a generic
+        // "unresolved" a layer up.
+        fprintf(stderr, "  [klepton] out of %s stub cells (%u) — '%s' unnamed\n",
+                trace ? "trace" : "named", cap, nm);
+        return NULL;
+    }
 
     // The name lives in the image's strtab, which kl_unload would take with it.
     char *owned = strdup(nm);
     if (!owned) return NULL;
 
-    if (getenv("KL_TRACE_IMAGES"))
-        fprintf(stderr, "  [klepton] stub '%s' at +0x%zx\n", nm, g_stub_off);
-
-    uint8_t *w = g_stub_rw + g_stub_off;
-    uint32_t *code = (uint32_t *)w;
-    code[0] = i0;
-    code[1] = i1;
-    code[2] = i2;
-    code[3] = 0xD503201Fu;   // nop — the two literals land 8-byte aligned
+    unsigned idx = (*use)++;
     if (!payload) payload = owned;
-    memcpy(w + 16, &payload, 8);
-    memcpy(w + 24, &target, 8);
+    void **slots = trace ? kl_stub_trace_slots : kl_stub_named_slots;
+    slots[idx * 2]     = payload;
+    slots[idx * 2 + 1] = target;
 
-    uint8_t *s = g_stub_rx + g_stub_off;
-    sys_icache_invalidate(s, KL_STUB_BYTES);
-    g_stub_off += KL_STUB_BYTES;
+    void *s = (trace ? kl_stub_trace_cells : kl_stub_named_cells)
+              + (size_t)idx * KL_STUB_CELL_BYTES;
+
+    if (getenv("KL_TRACE_IMAGES"))
+        fprintf(stderr, "  [klepton] stub '%s' -> %s cell %u (%p)\n",
+                nm, trace ? "trace" : "named", idx, s);
 
     if (g_stub_n == g_stub_cap) {
         g_stub_cap = g_stub_cap ? g_stub_cap * 2 : 64;
@@ -212,10 +199,7 @@ static void *stub_emit(const char *nm, void *payload, void *target,
 void *kl_named_stub(const char *nm, void *handler) {
     if (!nm || !*nm || !handler) return kl_shim_lookup("__klepton_unresolved");
     pthread_mutex_lock(&g_stub_mu);
-    void *s = stub_emit(nm, NULL, handler,
-                        0x58000080u,    // ldr x0,  #16   (the name)
-                        0x580000B0u,    // ldr x16, #20   (x16 is the intra-
-                        0xD61F0200u);   // br  x16         procedure-call scratch)
+    void *s = stub_emit(nm, NULL, handler, 0 /* named */);
     pthread_mutex_unlock(&g_stub_mu);
     return s ? s : kl_shim_lookup("__klepton_unresolved");
 }
@@ -227,22 +211,17 @@ void *kl_named_stub(const char *nm, void *handler) {
 // kl_gl_trace_tramp (runtime/kl_gl_trace.S), which saves the argument registers,
 // logs, restores, and tail-branches to the real function.
 //
-//    0: ldr x16, #16    // x16 = descriptor    (the trampoline's one input)
-//    4: ldr x17, #20    // x17 = trampoline
-//    8: br  x17
-//   12: nop             // padding, so the two literals land 8-byte aligned
-//   16: .quad descriptor
-//   24: .quad trampoline
+//    0: mov w16, #N              // this cell's index
+//    4: b   kl_stub_trace_common // loads slots[N] -> x16, slots[N+1] -> x17, br
 //
-// Same 32-byte cell and same pool as kl_named_stub, so the two can be mixed
-// freely; dedup is on (trampoline, name) exactly as it is on (handler, name).
+// A SEPARATE cell array from kl_named_stub's, because the two shapes differ in
+// what they may clobber: this one has to leave x0-x7 alone (the real function
+// still needs its arguments), so the payload arrives in x16 rather than x0.
+// Dedup is on (trampoline, name) exactly as it is on (handler, name).
 void *kl_trace_stub(const char *nm, void *desc, void *tramp) {
     if (!nm || !*nm || !desc || !tramp) return NULL;
     pthread_mutex_lock(&g_stub_mu);
-    void *s = stub_emit(nm, desc, tramp,
-                        0x58000090u,    // ldr x16, #16   (descriptor)
-                        0x580000B1u,    // ldr x17, #20   (trampoline)
-                        0xD61F0220u);   // br  x17
+    void *s = stub_emit(nm, desc, tramp, 1 /* trace */);
     pthread_mutex_unlock(&g_stub_mu);
     return s;
 }

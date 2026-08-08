@@ -33,6 +33,14 @@
 // missing asset tree otherwise presents as a shim bug deep inside Unity.
 int kl_app_configure(const char *resources, const char *container);
 
+// Redirect stdout/stderr into the run's log file without booting a guest.
+// kl_app_boot() already does this; this is for callers that want the log and
+// deliberately do not want a guest — the KL_TEMPLATE floor test. Returns 0 on
+// success. Without it such a run leaves the PREVIOUS run's log in place, which
+// reads as "the new run produced nothing" rather than "the new run could not
+// write anything".
+int kl_app_open_log(void);
+
 // Run the boot sequence. Returns 0 if initJni completed with no unimplemented
 // JNI call. Everything printed goes to the log file below as well as stdout,
 // because an unimplemented JNI slot aborts the process by design and the
@@ -70,6 +78,42 @@ int kl_app_lifecycle(unsigned frames);
 int  kl_app_lifecycle_begin(void);
 int  kl_app_frame(void);
 void kl_app_lifecycle_report(void);
+
+// The guest on its own thread — PLANNING §12.12.
+//
+// Calling kl_app_frame() straight from the compositor's render loop, which is
+// what P5b did, means the guest's nativeRender runs *inside* Compositor
+// Services' submission window: the loop cannot present until the guest has
+// finished, so a late guest frame is a missed display frame rather than a
+// reprojected one. That defeats the reprojection pass, whose entire purpose is
+// to show the previous picture against a newer pose — it can never do that
+// while the thing it would reproject is the thing blocking the loop.
+//
+// So: _start spawns a thread that runs _begin and then one _frame per
+// *published* pose, and the compositor calls _publish where it used to call
+// _frame and carries straight on to its drawable.
+//
+// **The pacing is the design decision, and it is "skip", not "queue".**
+// Publishes coalesce: the guest runs at most one frame per publish and, when it
+// is behind, the publishes it missed are dropped rather than owed. A guest that
+// keeps up therefore behaves exactly as it does today (one frame per drawable,
+// against the freshest pose), and a guest that does not falls behind by dropped
+// frames instead of accumulating a backlog it can never work off.
+//
+// _start is once per process, as _begin is. It returns 0 if the thread was
+// spawned — not if the guest booted, which happens on the thread and is
+// reported through kl_app_guest_state(). _stop asks the thread to finish the
+// frame it is in, joins it, and only then returns, so the P5.4 report (which
+// belongs to the guest's loop end, not the render loop's) has been written by
+// the time the caller continues.
+int  kl_app_guest_start(void);
+void kl_app_guest_publish(void);
+void kl_app_guest_stop(void);
+
+// Where the guest thread has got to. 0 = still in _begin (nothing to present
+// yet), 1 = running frames, -1 = _begin failed or the loop has ended; in the
+// last case kl_app_status() says why.
+int  kl_app_guest_state(void);
 
 // Absolute path of the log kl_app_boot writes, valid after kl_app_configure.
 // The Swift side displays it and offers it for export.

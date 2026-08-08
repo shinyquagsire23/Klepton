@@ -1754,16 +1754,26 @@ static klj_val klj_ClassLoader_findLibrary(void *env, void *self, const klj_val 
         snprintf(path, sizeof path, "%s/%s", g_native_lib_dir, name);
     else
         snprintf(path, sizeof path, "%s/lib%s.so", g_native_lib_dir, name);
-    // kl_can_load, not stat: with klepton-ld translations embedded in a bundle
-    // the ELF tree is not on disk at all, so stat'ing the .so answers "absent"
-    // for a library the loader would load without trouble. That is what killed
-    // the first device lifecycle run — findLibrary("il2cpp") returned null,
-    // Unity never attempted the dlopen, and the symptom was
-    // "Failed to load Il2CPP." with nothing near the actual cause.
+    // kl_can_dlopen, not stat and not kl_can_load: the question Unity is really
+    // asking is "would the dlopen you are about to make succeed", and on this
+    // platform a library can be loadable without being a file. Two ways that
+    // happens, and each one cost a device run to learn:
+    //
+    //   - klepton-ld translations are embedded in the bundle and the ELF tree is
+    //     not, so stat'ing the .so answers "absent" for a library that loads
+    //     fine. That killed P5.4's first device lifecycle run: findLibrary
+    //     ("il2cpp") returned null, Unity never attempted the dlopen, and the
+    //     symptom was "Failed to load Il2CPP." nowhere near the stat.
+    //   - synthetic libraries (OVRPlugin, the platform loader, GLES, OpenSL ES)
+    //     have no file at all, anywhere. On the host the APK's own unused copy
+    //     happened to sit on disk and hid this; in the bundle nothing does.
+    //     findLibrary("OVRPlugin") -> null is what black-screened the device —
+    //     see kl_can_dlopen in kl_dl.c for the whole chain.
     //
     // The answer stays the .so path: the guest hands it straight back to dlopen,
-    // where kl_load_auto resolves it, so there is one resolver and not two.
-    int found = kl_can_load(path);
+    // where kl_load_auto or the serving gateway resolves it, so there is one
+    // resolver and not two.
+    int found = kl_can_dlopen(path);
     KLJ_LOG("ClassLoader.findLibrary(\"%s\") -> %s", name, found ? path : "null");
     return (klj_val){.l = found ? kl_jni_new_string(path) : NULL};
 }

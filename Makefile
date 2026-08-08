@@ -13,7 +13,7 @@ LDLIBS  := -lz
 # tests/t_boot.c does), so the boundary holds by construction rather than by
 # discipline. runtime/kl_view.c (SDL viewer) is host-only too and is named by
 # the t_boot rule alone.
-RUNTIME_SHIP := runtime/kl_image.c runtime/kl_shim.c runtime/kl_va.c \
+RUNTIME_SHIP := runtime/kl_image.c runtime/kl_stub_cells.S runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_va_handlers.c runtime/kl_va_thunks.S \
            runtime/kl_libc.c runtime/kl_pthread.c runtime/kl_dl.c \
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \

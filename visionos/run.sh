@@ -20,7 +20,23 @@ MODE="${1:-sim}"
 # drifting apart. KL_ANGLE_DIR is deliberately NOT here: only the app knows
 # where its own bundle is, so kl_app_configure sets it (and an explicit one
 # still wins, since it is set with overwrite=0).
-FORWARD="KL_FRAMES KL_PERMISSIVE KL_ALARM KL_GLFB KL_GLFB_MTL KL_GLFB_OUT"
+#
+# KL_IMMERSIVE was missing from this list until 2026-08-07, which made the
+# documented `KL_IMMERSIVE=1 ./run.sh` a no-op: the shell had it, the app never
+# did, and the run took P4's window-and-report path while looking like the
+# compositor had failed to come up.
+# Everything KL_* in this shell is forwarded, minus the few that belong to this
+# script rather than to the app. A hand-maintained allow-list was the previous
+# shape and it silently dropped KL_IMMERSIVE for a whole session: the shell had
+# it, the app never did, and the run took P4's window path while looking like the
+# compositor had failed to come up. A knob that is set and not delivered is worse
+# than one that does not exist, so the default is now "forward it".
+FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
+FORWARD=""
+for K in $(env | sed -n 's/^\(KL_[A-Za-z0-9_]*\)=.*/\1/p' | sort); do
+  case " $FORWARD_SKIP " in *" $K "*) continue ;; esac
+  FORWARD="$FORWARD $K"
+done
 
 echo "[1/5] runtime + guest translations…"
 (cd .. && make -s xros)
@@ -88,17 +104,37 @@ print(phys[0]["identifier"])
     [ -z "$V" ] || ENVJSON="$ENVJSON,\"$K\":\"$V\""
   done
   ENVJSON="$ENVJSON}"
-  if [ -z "${KL_FRAMES:-}" ]; then
+  # Which launch mode: --console only suits a run that ENDS. Two things make a
+  # run open-ended, and it used to be only one of them — KL_FRAMES. The app now
+  # opens the immersive space by default, and an immersive run has no frame
+  # budget to exhaust, so `./run.sh device` with no KL_FRAMES would have sat on
+  # a blocking --console forever waiting for an app that never exits.
+  OPEN_ENDED=""
+  [ -z "${KL_FRAMES:-}" ] || OPEN_ENDED=1
+  case "${KL_IMMERSIVE:-1}" in 0|no|off|false|"") ;; *) OPEN_ENDED=1 ;; esac
+  if [ -z "$OPEN_ENDED" ]; then
     # P4's shape: --console blocks until the app terminates, which for a UI app
     # means until it is quit by hand. Fine for a run that finishes in seconds.
     xcrun devicectl device process launch --device "$DEVID" --console \
-      --environment-variables "$ENVJSON" "$BUNDLE_ID"
+      --terminate-existing --environment-variables "$ENVJSON" "$BUNDLE_ID"
   else
     # A lifecycle run takes minutes and the app still never exits on its own, so
     # --console would just sit there waiting to be force-quit — and force-quitting
     # is indistinguishable from the run having finished. Launch detached and watch
     # the log instead: it is line-buffered precisely so it can be read live.
-    xcrun devicectl device process launch --device "$DEVID" \
+    # --terminate-existing is NOT optional. Without it, launching while the
+    # app is already running does not start a new process — it ACTIVATES the
+    # existing one, which keeps the environment it was launched with and the
+    # binary it already mapped. The launch reports success either way. So a
+    # rebuilt app with new knobs silently does not run, the log is not rewritten
+    # (it belongs to the old process, which has already finished writing), and
+    # what you are looking at in the headset is the PREVIOUS build.
+    #
+    # This cost a wrong conclusion: two runs of a new floor-test immersive space
+    # reported "black" that were the previous run still on screen. The earlier
+    # runs in the same session had relaunched correctly only because the process
+    # happened to have died first, which is what made it look reproducible.
+    xcrun devicectl device process launch --device "$DEVID" --terminate-existing \
       --environment-variables "$ENVJSON" "$BUNDLE_ID" | tail -2
     echo
     echo "    watching the log; it is done when it stops growing (Ctrl-C to stop)"
@@ -106,10 +142,24 @@ print(phys[0]["identifier"])
     last=-1; same=0
     for _ in $(seq 1 "${KL_WATCH:-120}"); do
       sleep 5
+      # Into a temp first, and never let a SHORTER log replace a longer one: a
+      # run that dies is relaunched by the system, and the fresh process
+      # truncates klepton-boot.log on its way up. Copying straight onto $LOCAL
+      # therefore replaces the crash we care about with the clean boot that
+      # followed it, a few seconds later — the evidence destroys itself while
+      # the poller reports steadily shrinking line counts.
+      TMPLOG="$LOCAL.new"
       xcrun devicectl device copy from --device "$DEVID" \
         --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
-        --source Documents/klepton-boot.log --destination "$LOCAL" >/dev/null 2>&1 || continue
-      n=$(wc -l < "$LOCAL" | tr -d ' ')
+        --source Documents/klepton-boot.log --destination "$TMPLOG" >/dev/null 2>&1 || continue
+      n=$(wc -l < "$TMPLOG" | tr -d ' ')
+      prev=0; [ -f "$LOCAL" ] && prev=$(wc -l < "$LOCAL" | tr -d ' ')
+      if [ "$n" -lt "$prev" ]; then
+        mv "$TMPLOG" "$LOCAL.relaunch"
+        echo "    app was relaunched ($n lines) — keeping the $prev-line log, new one in $LOCAL.relaunch"
+        break
+      fi
+      mv "$TMPLOG" "$LOCAL"
       printf '    %s lines\n' "$n"
       if [ "$n" = "$last" ]; then
         same=$((same+1))

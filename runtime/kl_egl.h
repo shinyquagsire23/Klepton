@@ -24,6 +24,9 @@ void kl_egl_set_gles_version(int major, int minor);
 // out a synthetic handle for the GL sonames and resolves symbols on it through
 // the same gateway eglGetProcAddress uses.
 void *kl_egl_dlopen(const char *soname);   // NULL if this is not a GL library
+// Same question with no side effects, for callers that only need to know
+// whether this gateway would serve the name. See kl_can_dlopen (klepton.h).
+int   kl_egl_claims(const char *soname);
 int   kl_egl_is_handle(const void *h);
 void *kl_egl_sym(const char *name);        // the gateway itself
 
