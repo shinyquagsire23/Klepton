@@ -74,7 +74,7 @@ B_C = oid("BC")
 # renderer P5b adds. A list rather than an id pair each, for the same reason
 # the guest libraries are one.
 SWIFT = [f"{NAME}App.swift", f"{NAME}Compositor.swift", f"{NAME}Controllers.swift",
-         f"{NAME}Template.swift"]
+         f"{NAME}Template.swift", f"{NAME}Audio.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(
@@ -131,7 +131,7 @@ COMMON = f"""
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = "-lz";
+				OTHER_LDFLAGS = "-lz -framework AudioToolbox";
 				PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID};
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;

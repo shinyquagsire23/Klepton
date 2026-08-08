@@ -394,6 +394,7 @@ static int recon_run(int view_pump) {
         return 0;   // the main thread prints the reports after the join
     kl_jni_report(stdout);
     kl_egl_report(stdout);
+    kl_opensl_report(stdout);
     kl_ovrp_report(stdout);
     kl_ovrplat_report(stdout);
     fflush(NULL);   // _exit does not flush stdio, and the report is the point
@@ -462,6 +463,7 @@ static int view_run(void) {
     pthread_join(guest, NULL);
     kl_jni_report(stdout);
     kl_egl_report(stdout);
+    kl_opensl_report(stdout);
     kl_ovrp_report(stdout);
     kl_ovrplat_report(stdout);
     return rc;

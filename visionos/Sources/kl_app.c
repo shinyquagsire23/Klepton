@@ -14,6 +14,7 @@
 #include "kl_jni.h"
 #include "kl_fault.h"
 #include "kl_egl.h"
+#include "kl_opensl.h"
 
 static char g_libdir[1024];
 static char g_assets[1024];
@@ -485,6 +486,7 @@ void kl_app_lifecycle_report(void) {
     printf("\n=== P5.4: the lifecycle ran on device ===\n");
     kl_jni_report(stdout);
     kl_egl_report(stdout);
+    kl_opensl_report(stdout);
     fflush(NULL);
     snprintf(g_status, sizeof g_status, "lifecycle ran, %u frames", g_frames_pumped);
 }

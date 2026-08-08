@@ -218,6 +218,23 @@ struct BootView: View {
             RunLoop.current.add(poll, forMode: .common)
 
             var result = kl_app_boot()
+
+            // The audio session, and the placement is deliberate on both sides.
+            //
+            // AFTER kl_app_boot, because boot is what opens (and truncates)
+            // Documents/klepton-boot.log — anything this prints earlier goes to
+            // a stderr nobody can retrieve from a headset. The first device run
+            // did exactly that: the session was configured correctly and the two
+            // lines saying so were invisible, which is the wrong way round for
+            // the one subsystem whose failure mode is silence.
+            //
+            // BEFORE the lifecycle, because that is when FMOD opens its OpenSL
+            // player, and kl_audio builds its output unit against the session's
+            // measured sample rate. A unit initialised against a guess starts
+            // successfully and produces nothing, with no error code anywhere in
+            // the path. There is a wide margin here: boot ends at initJni and
+            // the first [sl] line is thousands of log lines later.
+            KleptonAudio.start()
             // P5.4: carry on into the Android lifecycle when asked, in the same
             // process and on the same thread. Only after boot has reported, so a
             // lifecycle failure cannot be mistaken for a boot failure — and only

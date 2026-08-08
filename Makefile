@@ -1,6 +1,6 @@
 CC      := clang
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64
-LDLIBS  := -lz
+LDLIBS  := -lz -framework AudioToolbox
 # The host/ship split is a source-list boundary, not a runtime getenv (§12.2).
 #
 # RUNTIME_SHIP is everything that goes into the visionOS app bundle. It is the
@@ -17,7 +17,7 @@ RUNTIME_SHIP := runtime/kl_image.c runtime/kl_stub_cells.S runtime/kl_shim.c run
            runtime/kl_va_handlers.c runtime/kl_va_thunks.S \
            runtime/kl_libc.c runtime/kl_pthread.c runtime/kl_dl.c \
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
-           runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_ovrp.c \
+           runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c \
            runtime/kl_ovrplat.c runtime/kl_mediandk.c runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_il2cpp.c runtime/kl_fault.c
@@ -279,11 +279,13 @@ build/xrsim/libklepton.a: $(RUNTIME_SHIP)
 # a function nothing calls yet.
 build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -install_name @rpath/libklepton.dylib
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -install_name @rpath/libklepton.dylib
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -install_name @rpath/libklepton.dylib
 
 xros-device: build/xros/libklepton.dylib
 	@printf '  xros       '; xcrun vtool -show-build $< | grep -E 'platform' | tr -d '\n'

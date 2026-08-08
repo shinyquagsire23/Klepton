@@ -16,3 +16,8 @@
 #import "kl_glfb.h"
 #import "kl_ovrp.h"
 #import "kl_reproject.h"
+// ...and by one more for audio: kl_audio owns the CoreAudio output unit, but
+// the AVAudioSession it needs on this platform can only be configured from
+// Swift (KleptonAudio.swift). Three calls cross: the session's measured rate
+// going in, and the two ways the OS takes the stream away coming back.
+#import "kl_audio.h"

@@ -13,11 +13,14 @@
 // entry in the wrong slot is a call to the wrong function with no diagnostic
 // whatsoever.
 //
-// What this does NOT do is make a sound. The player consumes buffers on a
-// thread at real-time rate and calls the buffer-queue callback back, which is
-// all FMOD needs to keep its mixer running and stop the guest aborting. Binding
-// it to CoreAudio is a separate, later job — the point of this file is to get
-// past audio to the renderer.
+// This file used to end with "what this does NOT do is make a sound": the
+// feeder timed each buffer with usleep and dropped it, which was enough to keep
+// FMOD's mixer running. The PCM now goes to kl_audio.c, which owns a CoreAudio
+// output unit, and the *device* provides the clock — kl_audio_write blocks for
+// about as long as the audio it accepted takes to play. If no device can be
+// opened (or KL_AUDIO=0) the old usleep pacing is still here underneath, so the
+// null-audio behaviour every earlier measurement was taken against remains one
+// environment variable away.
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +28,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "klepton.h"
+#include "kl_audio.h"
 #include "kl_opensl.h"
 
 typedef uint32_t SLuint32;
@@ -210,17 +214,31 @@ static void *feeder(void *arg) {
             pthread_cond_timedwait(&p->wake, &p->lock, &ts);
             continue;
         }
+        const void *buf = p->q[p->head].buf;
         SLuint32 size = p->q[p->head].size;
         p->head = (p->head + 1) % KL_SL_QUEUE;
         p->count--;
         unsigned frame = (p->channels * p->bits) / 8;
         if (!frame) frame = 4;
         unsigned rate = p->rate ? p->rate : 48000;
-        useconds_t us = (useconds_t)((uint64_t)(size / frame) * 1000000ull / rate);
         unsigned generation = p->generation;
         pthread_mutex_unlock(&p->lock);
 
-        if (us) usleep(us > 100000 ? 100000 : us);   // cap, so a bogus size cannot wedge us
+        // Hand the PCM to the device, and let it be the clock. The buffer is
+        // FMOD's and it may reuse it the instant the callback below returns, so
+        // kl_audio_write copies rather than referencing — and it must therefore
+        // happen before the callback, not after.
+        //
+        // A short write (no device, KL_AUDIO=0, or a device that stopped
+        // draining) leaves the remainder to be paced the old way. That keeps one
+        // code path for both cases: with no audio, `played` is 0 and this is
+        // byte-for-byte the usleep loop it replaced.
+        size_t played = buf ? kl_audio_write(buf, size) : 0;
+        if (played < size) {
+            uint64_t rem = ((uint64_t)size - played) / frame;
+            useconds_t us = (useconds_t)(rem * 1000000ull / rate);
+            if (us) usleep(us > 100000 ? 100000 : us);   // cap, so a bogus size cannot wedge us
+        }
 
         // Re-check *after* the sleep and take the callback then, not before it.
         //
@@ -265,6 +283,11 @@ static SLresult obj_Realize(SLObjectItf self, SLboolean async) {
     if ((void *)self == (void *)&g_player) {
         kl_sl_player *p = &g_player;
         if (!p->started) {
+            // Open the device before the feeder exists, so its first buffer
+            // already has somewhere to go. A failure here is not fatal — the
+            // feeder falls back to pacing with usleep, which is what this
+            // player did for its whole life before kl_audio.c.
+            kl_audio_open(p->rate, p->channels, p->bits);
             p->started = p->running = 1;
             pthread_create(&p->thread, NULL, feeder, p);
         }
@@ -303,6 +326,11 @@ static const struct SLObjectItf_ g_obj_vt = {
 // ---- SLPlayItf ----
 static SLresult play_SetPlayState(SLPlayItf self, SLuint32 state) {
     (void)self;
+    // Before the lock, and before waiting: the feeder may be parked inside
+    // kl_audio_write waiting for the ring to drain, and that wait only ends
+    // when the sink stops being "playing". Doing this after player_wait_cb
+    // would be waiting for a thread we have not yet told to stop.
+    if (state != SL_PLAYSTATE_PLAYING) kl_audio_pause();
     pthread_mutex_lock(&g_player.lock);
     g_player.state = state;
     pthread_cond_signal(&g_player.wake);
@@ -310,6 +338,12 @@ static SLresult play_SetPlayState(SLPlayItf self, SLuint32 state) {
     // the stack, or it will run against buffers the guest is about to release.
     if (state != SL_PLAYSTATE_PLAYING) player_wait_cb(&g_player);
     pthread_mutex_unlock(&g_player.lock);
+    // The queued audio is dropped rather than drained, for the same reason the
+    // callback wait above exists: the guest stops precisely when it is about to
+    // release the buffers it enqueued, and real OpenSL does not go on playing
+    // them. Draining would sound better and be wrong.
+    if (state == SL_PLAYSTATE_PLAYING) kl_audio_play();
+    else                               kl_audio_flush();
     fprintf(stderr, "  [sl] play state -> %s\n",
             state == SL_PLAYSTATE_PLAYING ? "PLAYING" :
             state == SL_PLAYSTATE_PAUSED  ? "PAUSED" : "STOPPED");
@@ -396,12 +430,14 @@ static SLresult eng_CreateOutputMix(SLEngineItf self, SLObjectItf *out, SLuint32
 // memmove through a null pointer, several layers from the actual mistake.
 static void player_stop(kl_sl_player *p) {
     if (!p->started) return;
+    kl_audio_pause();          // so a feeder parked in kl_audio_write can be joined
     pthread_mutex_lock(&p->lock);
     p->running = 0;
     p->generation++;
     pthread_cond_signal(&p->wake);
     pthread_mutex_unlock(&p->lock);
     pthread_join(p->thread, NULL);
+    kl_audio_close();          // only after the join: the feeder is the producer
     p->started = 0;
     pthread_mutex_destroy(&p->lock);
     pthread_cond_destroy(&p->wake);
@@ -579,10 +615,13 @@ void kl_opensl_report(FILE *f) {
     static int done;
     if (done) return;
     done = 1;
-    if (!g_player.started && !g_nsl) return;
+    if (!g_player.started && !g_nsl && !g_buffers_consumed) return;
     fprintf(f, "\n=== OpenSL ES ===\n");
     fprintf(f, "  buffers consumed: %lu  (%u Hz, %u ch, %u bit)\n",
             g_buffers_consumed, g_player.rate, g_player.channels, g_player.bits);
+    // The buffer count is exactly the assertion that passed for months while
+    // nothing played; the line below is the one that says whether it was heard.
+    kl_audio_report(f);
     for (unsigned i = 0; i < g_nsl; i++)
         fprintf(f, "    unimplemented: %-32s x%u\n", g_sl[i].name, g_sl[i].calls);
 }
