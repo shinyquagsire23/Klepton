@@ -1,16 +1,17 @@
 # Environment variables
 
-Every environment variable the host tooling reads, found by grepping the C
-sources for `getenv` and reading each usage site. Grouped by area. The source
-is the authority; CLAUDE.md's knob table is a curated subset. Unless an entry
+Every environment variable the tooling reads — the C/Swift sources, the mains,
+and the wrapper scripts — found by grepping for `getenv`/`kl_env_*`/
+`ProcessInfo` and reading each usage site. Grouped by area. The source is the
+authority; CLAUDE.md keeps no knob table of its own and points here. Unless an entry
 says otherwise, presence of the variable (any value, even empty-but-set for the
 C `getenv` checks) turns the knob on, the default is off, and the reader is the
-`t_boot` binary via the runtime it links.
+`m_boot` binary via the runtime it links.
 
-## Boot / recon (`tests/t_boot.c`)
+## Boot / recon (`mains/m_boot.c`, the `m_boot` binary)
 
 - `KL_RECON_CHILD=1` — marks the re-exec'd recon child, so `main` skips the
-  guard test and the fork and goes straight to the guest run. Set by t_boot on
+  guard test and the fork and goes straight to the guest run. Set by m_boot on
   itself across the `execl`; not meant to be set by hand.
 - `KL_NOFORK=1` — run the recon in-process instead of in the re-exec'd child.
   Required under lldb (macOS lldb follows neither fork nor exec), at the cost
@@ -18,7 +19,7 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
 - `KL_SKIP_GUARD_TEST=1` — skip the DRM-guard self-test, which misreads under
   a debugger (the forked child's abort is intercepted and never reads as
   SIGABRT to `waitpid`). The guard in `kl_ovrplat.c` itself is unaffected.
-- `KL_FAULT_WAIT=1` — park in t_boot's fault handler on SIGSEGV/SIGBUS/
+- `KL_FAULT_WAIT=1` — park in m_boot's fault handler on SIGSEGV/SIGBUS/
   SIGABRT/SIGALRM and print the pid, for post-mortem `lldb -p` attach.
 - `KL_LIFECYCLE=1` — drive the UnityPlayer lifecycle sequence
   (nativeRecreateGfxState, nativeResume, nativeRender) instead of stopping
@@ -33,11 +34,15 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   0 instead of aborting. Read by `kl_jni.c` (via `kl_jni_set_permissive`),
   `kl_egl.c`, `kl_ovrp.c`, `kl_ovrplat.c`. Scouting only — the guest carries
   on with answers we invented. Does not apply to the DRM entitlement guard.
+- `KL_DYLIB_DIR=<dir>` — (`runtime/kl_image.c`) prefer `<dir>/<name>.dylib`
+  (klepton-ld output) over the ELF when loading each guest library — how
+  `make bootdylib*` runs the translated images. Unset, the runtime ELF loader
+  maps the `.so` directly.
 
 ## GL / null driver (`runtime/kl_egl.c`)
 
 - `KL_DUMP_SHADERS=<dir>` — after the frame pump, write every captured
-  `glShaderSource` text into `<dir>`. Read by t_boot; the dump runs in
+  `glShaderSource` text into `<dir>`. Read by m_boot; the dump runs in
   `kl_egl.c`. The only place Unity's GLSL ES exists in plain text.
 - `KL_DUMP_TEXTURES=<dir>` — write every uncompressed 8-bit
   `glTexSubImage2D` upload as a PNG under `<dir>`. Armed before the guest runs
@@ -137,6 +142,30 @@ answers GL and kl_glfb never initializes.
   viewing aid, not a fix — the content really is ~1e-3 while loading runs.
 - `KL_GLFB_GAMMA=<g>` — override the tone map's encode exponent (default
   1/2.2). Lower brightens mid-tones.
+- `KL_GLFB_MTL=1` — P5: the guest's eye textures become **MTLTextures we
+  allocate** on ANGLE's own device, via
+  `eglCreateImageKHR(EGL_METAL_TEXTURE_ANGLE)` — the host stand-in for
+  Compositor Services (`tests/t_mtl_provider.m`). With `KL_GLFB_OUT` set it
+  also writes `mtl_eye0.png`/`mtl_eye1.png` from the textures, tone-mapped like
+  the reference frames so the two are directly comparable.
+- `KL_GLFB_ERRSCAN=<code>` — name the call that **generates** a GL error
+  anywhere in the stream, not just the few ERRPROBE hand-wraps: the trace
+  trampoline logs before each call, so a non-zero glGetError entering call N
+  was produced by call N-1. `=1` reports every code; `=0x502` reports only that
+  one — necessary, because the sticky `TEXTURE_SRGB_DECODE_EXT` INVALID_ENUM
+  otherwise spends the whole budget thousands of calls early. This is what
+  found the base-vertex bug (40/40 votes). Note it *clears* the error flag, so
+  the guest's own glGetError sees nothing and Unity's spam stops — that
+  silence is the confirmation it is seeing the same errors.
+- `KL_GLFB_PROBE_CTEX=1` — log every **compressed** upload with the byte count
+  its dimensions imply, and check the region and format against what
+  `glTexStorage2D` allocated. A disagreement prints `SIZE MISMATCH` /
+  `REGION OVERRUNS LEVEL` / `FORMAT != ALLOCATED` with or without the knob —
+  the knob adds the *clean* lines, which is what makes two platforms diffable.
+  Costs a `glGetIntegerv` per upload, hence opt-in. This is what exonerated
+  the guest over the Simulator's ETC2 fault.
+- `KL_GLFB_LOG_UNITS=1` — log texture-unit traffic (the "Invalid texture
+  unit!" neighbourhood — see `KL_POKE_CAP` under Viewer).
 
 ## Networking (`runtime/kl_shim.c`)
 
@@ -154,7 +183,8 @@ gamelift region probes failed EINVAL in a retry storm.
   region probe retries 4× per region and gives up) and the run completes.
   The abort this used to cause was *not* a DNS bug — it was the empty
   `dl_iterate_phdr` breaking the guest's unwinder, so the `SocketException`
-  could never reach its handler. See CLAUDE.md trap 8.
+  could never reach its handler. See trap 8 (CLAUDE.md's traps index; the
+  full record is in `notes/TRAPS.md`).
 - `KL_NO_DL_PHDR=1` — restore the old empty `dl_iterate_phdr`. Any guest
   throw then aborts in `_Unwind_RaiseException` instead of being caught;
   this is the A/B for trap 8.
@@ -204,13 +234,16 @@ CLOCK_REALTIME. Forwarding either verbatim poisons guest time:
 - `KL_CONDWAIT_CAP_MS=<ms>` — clamp every guest condvar abstime to now+ms.
   Diagnostic only (proves a stuck waiter just needs to re-check its
   predicate); the rebase above is the fix.
+- `KL_NO_REBASE=1` — disable the monotonic→realtime abstime rebase in
+  `klb_pthread_cond_timedwait` entirely. Diagnostic for the capture deadlock;
+  breaks class-init waiters.
 
 ## Mutex map (`runtime/kl_pthread.c`) — deadlock instruments
 
 Mutexes are keyed by guest *address* (a stale slot index in reused or
 memcpy'd storage used to alias two logical mutexes onto one host object —
 the capture-path deadlock). Owner tracking is always on; these print from
-t_boot's fault handler on every fatal path:
+m_boot's fault handler on every fatal path:
 
 - mutex owners: guest address, holder tid (+thread name, ** EXITED ** if the
   holder died holding it), lock return address, and the holder's current
@@ -229,7 +262,7 @@ pcs to module+offset (host frames to host symbols — a thread parked in
 `__psynch_cvwait` reads as itself), and resolves libil2cpp generated-code pcs
 to managed method names via global-metadata.dat plus the Il2CppCodeGenModule
 table recovered from the loaded image (metadata v24.0 only, verified against
-Beat Saber 1.28). Read by t_boot; sampling wraps the frame pump, and the
+Beat Saber 1.28). Read by m_boot; sampling wraps the frame pump, and the
 report prints at pump end (or on the watchdog's SIGALRM, via the fault
 handler).
 
@@ -250,6 +283,9 @@ handler).
 - `KL_IL2CPP_METADATA=<path>` — host path to global-metadata.dat. Default is
   derived from the libdir argument (`<apk>/lib/arm64-v8a` →
   `<apk>/assets/bin/Data/Managed/Metadata/global-metadata.dat`).
+- `KL_RESOLVE=0xoff,0xoff,...` — (`tests/t_il2cpp.c`) init the managed
+  method-name resolver and print the resolution of each given libil2cpp
+  offset; the standalone probe for the sampler's resolver.
 
 ## Managed-side probe (`runtime/kl_mprobe.c`)
 
@@ -258,7 +294,8 @@ libil2cpp exports (domain → assembly → image → class → `MethodInfo` →
 `il2cpp_runtime_invoke`). Every other instrument measures the native side of the
 boundary; this one measures the far side, which is where a wrongly-encoded
 status answer actually shows up. It is what found the `ovrpResult`-vs-`ovrpBool`
-trap (CLAUDE.md trap 10) and named `MenuControllers` as the disabled object
+trap (trap 10 in CLAUDE.md's traps index / `notes/TRAPS.md`) and named
+`MenuControllers` as the disabled object
 behind "no controllers render". Diagnostic only, off unless asked for.
 
 - `KL_PROBE_INPUT=1` — turn it on. Each tick prints:
@@ -367,8 +404,48 @@ puts the camera on the ground with its hands underneath it.
   contract in one place, so a status predicate answered wrong can be found by
   name instead of by chasing `ldr x8, [x?, #N]` offsets. Reads a build-specific
   vaddr (`libunity+0x127a6c0`), which is why it is opt-in.
+- `KL_OVRP_IPD=<m>` — force a symmetric head→eye separation, overriding
+  whatever the frontend pushed. The guest's IPD arrives *only* through
+  `ovrp_GetNodePoseState` nodes 0/1 (PLANNING §12.17), so this is the A/B for
+  "is the compositor's number wrong" — and on the host, where nothing pushes
+  one, the only way to get stereo at all. Refused outside 0..0.2 m.
+- `KL_OVRP_STAGES=<n>` — eye-swapchain depth (default 3, clamped to
+  1..max). `=1` restores the single-buffered behaviour every pre-§12.19
+  measurement was taken against, and its tearing; each extra stage costs a
+  full-size RGBA16F two-slice eye texture (~160 MB at map resolution). The
+  A/B in both directions (PLANNING §12.19).
+- `KL_OVRP_LATCH=0` — restore the live per-call pose read instead of latching
+  head+hands once per frame at `ovrp_Update2` (the guest's real per-step latch
+  point). The A/B if the pinning is ever suspected of costing latency;
+  controller *buttons* stay live either way.
+- `KL_OVRP_EYE_CANT=0` — ignore the per-eye rotation the frontend pushes
+  (`kl_ovrp_set_eye_rotation`) and restore the dropped-cant behaviour as the
+  A/B. Identity by default, so host and headless runs are unchanged.
+- `KL_OVRP_QUEST_FOV=1` — keep the synthetic symmetric 90° frustum and the
+  Quest 2's 72 Hz instead of the display's own measured numbers (the visionOS
+  compositor's priming pass measures and logs both either way). A free A/B if
+  the real numbers send Unity somewhere unexpected.
 
-## Viewer (`runtime/kl_view.c`, `tests/t_boot.c`)
+## Reprojection (`runtime/kl_reproject.c`)
+
+The composite/timewarp pass — one file, compiled by both compositors
+(`KleptonCompositor.swift` on device, `kl_view_mtl.m` in the viewer).
+
+- `KL_REPROJECT_DEPTH=<m>` — how far out the reprojection quad is placed
+  (default 2.0 m). It must stay well clear of reverse-Z 0 or **visionOS
+  discards the frame** — 500 m is depth 0.0002 and is invisible (PLANNING
+  §12.16). Within that it is free, and it is one of the two knobs that set
+  apparent scale.
+- `KL_REPROJECT_MODE=off|inverse` — the bisection the pass never had. `off`
+  corrects nothing (the delta is dropped and the pass becomes the frustum fit
+  alone — if instability survives this, the timewarp is not causing it);
+  `inverse` applies the delta backwards (if THIS is the stable one, a sign is
+  wrong upstream and the question becomes which input). Both are wrong
+  pictures by construction; diagnostic only.
+- `KL_REPROJECT_NOCANT=1` — treat `device_from_view` as having no rotation;
+  the A/B for the eye-cant handling.
+
+## Viewer (`runtime/kl_view.c`, `mains/m_boot.c`)
 
 - `KL_POKE_CAP=<n>` — at frame-pump start, overwrite libunity's texture-unit
   cap (the value its `SetTexture` path checks before logging "Invalid texture
@@ -392,10 +469,44 @@ puts the camera on the ground with its hands underneath it.
   the gaze ray and the viewport centre is a crosshair. Off by default: the
   offset is the honest emulation and is what puts the in-game controller
   models where a body would hold them.
+- `KL_VIEW_CPU=1` — force the viewer's old readback path: `glReadPixels` the
+  whole eye, tone-map it, memcpy it to the sink, row-flip it, upload it.
+  Measured 23.5 fps against the hardware compositor's 54.7 on the same scene,
+  and it needs no Metal interop — which is what makes it the A/B when the
+  compositor shows the wrong picture.
+- `KL_VIEW_TIMEWARP=1` — composite the viewer's frame through the reprojection
+  pass, against the pose the guest *actually rendered it with* (`kl_ovrp`'s
+  stage-keyed record) instead of the current one — mouse-look motion between
+  the guest's frame and the composite is corrected here exactly as head motion
+  is on device. Default off: the plain blit is the path that reached gameplay,
+  and it is the A/B. Prints the delta in degrees every 120 composites — 0.00
+  means the guest is keeping up and the pass is a blit, which is a proven
+  identity (`make reproject`).
 
-## Audio
+## Audio (`runtime/kl_audio.c`)
 
-No environment variables. `kl_opensl.c` reads none.
+The CoreAudio output sink behind `kl_opensl.c`'s buffer queue (which itself
+reads no knobs). See PLANNING §12.18.
+
+- `KL_AUDIO=0` — no CoreAudio device at all: the OpenSL feeder goes back to
+  pacing each buffer with `usleep` and dropping it, which is what this runtime
+  did for its whole life before `kl_audio.c`. The A/B for anything that looks
+  like an audio-induced timing change — and read **by value** (`kl_env_on`),
+  since it defaults on.
+- `KL_AUDIO_DUMP=<path>` — tee exactly the frames the render callback will
+  hand the hardware into a WAV. The only way to check *what* is being played
+  rather than merely that something is: counts and peak levels cannot tell
+  music from a wrong resample ratio or swapped channels. Records what the
+  producer accepted, contiguously, so pauses are elided and the file is
+  shorter than the run.
+- `KL_AUDIO_LATENCY_MS=<n>` — how much audio the ring aims to hold (default
+  80, clamped 10..500). This is the whole latency budget — the ring itself is
+  a second long so a hiccup cannot wrap it, but the *fill target* is what the
+  producer blocks against. Raised automatically if FMOD's buffer turns out
+  larger than half of it.
+- `KL_AUDIO_TRACE=1` — one line every 200 writes: input/output frame counts,
+  ring fill in frames and ms, underruns. What to turn on when the sound is
+  present but wrong.
 
 ## x18 (`runtime/kl_x18.c`)
 
@@ -424,6 +535,37 @@ No environment variables. `kl_opensl.c` reads none.
 - `KL_TRACE_IMAGES=1` — log each loaded image's base and span, the stub pool
   mapping, and each emitted stub. Read by `kl_image.c`.
 
+## Steam Link (`mains/m_slink.c`, `build_run_slink.sh`)
+
+The wrapper's flags map onto these: `--gap` → `KL_GAP_ONLY=1 KL_NOFORK=1`,
+`--main` → `KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1`, `--view` adds `KL_VIEW=1`.
+See PLANNING §11.
+
+- `KL_SLINK_MAIN=1` — run phase 4 at all (onCreate → `nativeRunMain` →
+  `SDL_main` on its own thread). SL-1 (chain binds, `JNI_OnLoad`) stays the
+  unconditional gate; `KL_VIEW=1` implies this.
+- `KL_SLINK_ARGS="<space-separated argv>"` — `SDL_main`'s own options, which
+  the real activity fills from the launching intent's `sArgs` extra. Without
+  it the streaming client is being asked to stream nothing (PLANNING §11.12).
+  `--transport k_EStreamTransportUDP --server <ip>` is the pair that reaches a
+  connection attempt — `--transport` is load-bearing and its value is a
+  protobuf enum name (`k_EStreamTransport{None,UDP,UDPRelay,SDR,UDP_SNS,
+  UDPRelay_SNS}`).
+- `KL_SLINK_SIZE=WxH` — the panel size, published to SDL
+  (`nativeSetScreenResolution`), the `ANativeWindow` and ANGLE together via
+  one `slink_panel_size()` — the display is a group answer, and ANGLE is
+  sized before the guest's window surface exists.
+- `KL_SLINK_WAIT=<s>` — how long to let the app run once started.
+- `KL_SLINK_LIB` / `KL_SLINK_FN` — which library and entry `nativeRunMain`
+  drives (default `libmain.so` / `SDL_main`).
+- `KL_SLINK_LIBDIR=<dir>` — wrapper only: which unpacked APK libdir to point
+  the binary at (default `steamlink-android/lib/arm64-v8a`;
+  `steamlink-vr/lib/arm64-v8a` is the `make slink-vr` target).
+- `KL_GAP_ONLY=1` — map and relocate all seven libs, print what is
+  unresolved, stop before init: the shim work list, in seconds.
+- `KL_TIMEOUT=<s>` — wrapper only: the outer timeout around the run
+  (default 180).
+
 ## Spikes (`spikes/`)
 
 Standalone reproducers, not part of the runtime; each reads its own knobs.
@@ -440,6 +582,102 @@ Standalone reproducers, not part of the runtime; each reads its own knobs.
   skipping every other stage so a failure is attributable.
 - `S10_EYE=1` — run only the eye-sized SRGB8_ALPHA8 FBO draw-and-blit stage.
 - `S11_SIZE=WxH` — pbuffer size for s11_draw (default 1832x1920).
+
+## visionOS app (`visionos/Sources/*.swift`, `visionos/Sources/kl_app.c`)
+
+Read on the device/simulator; `visionos/run.sh` forwards every `KL_*` it sees
+except its own control vars (next section). See PLANNING §12.
+
+- `KL_IMMERSIVE=0` — the immersive space is the **default**; `=0` restores
+  P4's window-and-report shape, which has to stay takeable because it is the
+  measurement that localises a device regression.
+- `KL_AUTOBOOT=0` — autoboot is the default too; `=0` restores the
+  Boot-button-only shape, for attaching a debugger or starting a GPU capture
+  before the guest runs.
+- `KL_SYNC_GUEST=1` — drive the guest inline on the compositor thread, i.e.
+  P5b's shape before §12.12. The clock P5.4's device numbers were taken
+  against, and the A/B for anything that looks like a pacing regression.
+  Default is the guest on its own thread, one frame per published pose.
+- `KL_FULL=1` — `.full` immersion. `.mixed` is the default — the guest's world
+  is opaque so passthrough shows through nowhere it matters, and seeing the
+  room makes scale and IPD easier to judge. The scene manifest declares
+  `UIImmersionStyleMixed` to match; keep the two in step.
+- `KL_TEMPLATE=1` — the **floor test**: Apple's `MetalImmersiveTemplate` with a
+  blue fragment shader in its own immersive space, sharing nothing with the
+  compositor (`KleptonTemplate.swift`). Runs INSTEAD of booting the guest —
+  the known-good pixel on that display; reach for it before doubting
+  `KleptonCompositor`. `KL_TPL_MIXED=1` puts it in `.mixed`, `KL_TPL_NOMSAA=1`
+  renders straight into the drawable instead of resolving.
+- `KL_HAND_ROT="x,y,z"` — extra rotation in degrees, applied in the **grip's
+  own frame** to every hand pose after the wrist→grip correction — for the
+  part that is not a basis error (Beat Saber's `AdjustControllerTransform`
+  offset is game data we cannot read). One device run per candidate angle, no
+  rebuild. `KL_HAND_ROT_L`/`_R` override per hand, which is what a
+  *half*-wrong basis needs.
+- `KL_HAND_POS="x,y,z"` — the same, in metres — slides the hilt along the
+  grip's own axes. `KL_HAND_POS_L`/`_R` likewise.
+- `KL_HAND_MIRROR=1` — left hand back on ALVR's *mirrored* wrist→grip
+  constant. The default left constant is `R · Rx(180)`, forced by four
+  playtests (PLANNING §12.17c).
+- `KL_HAND_ANATOMICAL=1` — build the left grip frame from joint **positions**
+  (index/little knuckle + wrist) rather than any wrist-frame constant —
+  OpenXR's own basis, consistent between hands by construction. Off by default
+  only because it has never been confirmed on device.
+- `KL_PINCH_OPEN=<m>` / `KL_PINCH_CLOSED=<m>` — two-point calibration of the
+  fingertip-distance trigger: at or beyond `OPEN` (0.06) is 0.0, at or within
+  `CLOSED` (0.03) is 1.0. `CLOSED` is a **floor**, not a threshold — erring
+  wide costs sensitivity, erring narrow costs the click.
+- `KL_PINCH_SRC=system|distance` — which source may press the trigger.
+  Default is **both, OR'd**: the system's `.indirectPinch` and the fingertip
+  distance — each has been unreliable alone and their failures are
+  uncorrelated. Use to isolate one when the question is which is misbehaving.
+- `KL_PINCH_TRACE=0` — silence the pinch trace, which is **on by default**
+  during bring-up: one line every 2 s per hand — closest pinch reached, axis
+  value produced, frames asserted, or `no skeleton`. Those four distinguish
+  the four ways "the trigger does not click" can be true.
+- `KL_CP_PROBE=<n>` — bisection ladder for a dark compositor: 1 = clear only
+  (colour cycles R/G/B so a constant field cannot be misread), 2 = flat
+  magenta quad (geometry only), 3 = sampled with alpha forced to 1, 4 =
+  full-viewport blit. `KL_CP_NOFENCE=1` skips the guest fence wait; the
+  `alive:` line reports `cmdbuf done/committed` so "committed but never
+  executed" is visible.
+- `KL_CP_EYE=<0|1>` — composite ONLY that eye, leaving the other black. The
+  binocular-vs-temporal split for a doubled image: one second, halves the
+  search space (PLANNING §12.19).
+- `KL_CP_AMPLIFY=0` — one render pass per eye instead of the single
+  vertex-amplified composite. Takes foveation down with it (the rate map
+  needs the amplified pass).
+- `KL_CP_FORMAT=16` — drawable back to `rgba16Float`; the default is 8-bit
+  `bgra8Unorm_srgb` (ALVR's choice — half the composite bandwidth, hardware
+  sRGB encode on write). The guest's eye textures stay RGBA16F either way.
+- `KL_CP_FOVEATION=0` — no variable-rasterization-rate map and no
+  `maxRenderQuality` ceiling (the quality knob is only accepted alongside
+  foveation).
+- `KL_CP_QUALITY=<0..1>` — the render quality to request (default 1.0). The
+  ceiling costs memory and per-frame GPU time; the *running* quality is set
+  separately by the render loop.
+- `KL_CP_LOSSY=1` — lossy texture compression on the drawable-adjacent
+  textures; an experiment, default off.
+
+## Wrapper-script control vars (`visionos/run.sh`, `build_run_vpro.sh`)
+
+Read by the scripts themselves, never forwarded to the app.
+
+- `KL_SKIP_STAGE=1` — never stage assets, even on a target that has never had
+  them; `KL_STAGE=1` — always stage, whatever the stamp says. The 2.2 GB
+  upload is a ~20 s loop vs a ~20 min one; a reinstall rotates the data
+  container, which is what the stamp guards against.
+- `KL_LOG_OUT=<file>` — where the pulled log lands (device runs default
+  `/tmp/klepton-device.log`; `build_run_slink.sh` uses it too, default
+  `/tmp/slink.log`).
+- `KL_WATCH=<n>` — how many 5 s polls to watch the device log for
+  (default 120).
+- `KL_QUIET=<n>` — how many no-growth polls before declaring the run over
+  (default 32 ≈ 160 s). Must outlast `KL_ALARM`, or the poller declares the
+  run over before the watchdog that would explain it has fired.
+- `KL_KEEP_LONGEST=` (empty) — let a shorter fresh log overwrite a longer
+  previous one; default keeps the longest, because a launch that never
+  happened leaves the previous run's file in place.
 
 ## Host environment pass-through
 

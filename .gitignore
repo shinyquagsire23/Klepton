@@ -5,9 +5,12 @@
 /steamlink-vr/*
 *.apk
 
-# claude
+# claude — CLAUDE.md and its notes/ satellites are local working notes
 /.claude/*
 CLAUDE.md
+/notes/
+/planning/
+PLANNING.md
 
 # binaries
 *.dSYM/

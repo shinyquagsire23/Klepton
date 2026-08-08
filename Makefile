@@ -10,9 +10,9 @@ LDLIBS  := -lz -framework AudioToolbox
 #
 # RUNTIME_DIAG is host-only instrumentation: the sampling profiler and the
 # managed-side probe. Nothing in RUNTIME_SHIP includes their headers (only
-# tests/t_boot.c does), so the boundary holds by construction rather than by
+# tests/m_boot.c does), so the boundary holds by construction rather than by
 # discipline. runtime/kl_view.c (SDL viewer) is host-only too and is named by
-# the t_boot rule alone.
+# the m_boot rule alone.
 RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_va_handlers.c runtime/kl_va_thunks.S \
            runtime/kl_libc.c runtime/kl_libc_slink.c runtime/kl_pthread.c runtime/kl_dl.c \
@@ -47,34 +47,34 @@ load: build/t_load
 	  ./build/t_load $(LIBS)/$$f.so || true; echo; done
 
 # SL-1 — the second target's boot harness (PLANNING §11). Links the same
-# runtime as t_boot, minus the host-only diagnostics: this target has no
+# runtime as m_boot, minus the host-only diagnostics: this target has no
 # managed side to probe and no viewer yet.
 #
-# It links the SDL viewer for the same reason t_boot does: Steam Link is a FLAT
+# It links the SDL viewer for the same reason m_boot does: Steam Link is a FLAT
 # app, so the viewer is not a debugging aid here — it is the app's actual
 # output device. kl_view_mtl.m and tests/t_mtl_provider.m come with it because
 # kl_view.c references both; the mono path uses neither (no eye textures to
 # provide, and the readback sink needs no Metal interop), but the symbols must
 # resolve.
-build/t_slink: tests/t_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
+build/m_slink: mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
                runtime/kl_view_mtl.m runtime/klepton.h runtime/kl_jni.h \
                runtime/kl_view.h runtime/kl_view_mtl.h tests/t_mtl_provider.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
-	  tests/t_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
+	  mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
 	  runtime/kl_view_mtl.m \
 	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
 	  $(shell pkg-config --libs sdl3)
 
-slink: build/t_slink
-	./build/t_slink
+slink: build/m_slink
+	./build/m_slink
 
 # The VR build of the same app (steamlink-vr.apk, PLANNING §11.8). Same seven
 # libraries for the 2D half, so SL-1 is the same gate; libvrlink_scene is the
 # OpenXR NativeActivity and is NOT loaded by this target yet.
 SLVRLIBS := steamlink-vr/lib/arm64-v8a
-slink-vr: build/t_slink
-	./build/t_slink $(SLVRLIBS)
+slink-vr: build/m_slink
+	./build/m_slink $(SLVRLIBS)
 
 # SL-2: onCreate's whole sequence, through nativeRunMain into SDL_main, with the
 # app reaching its own renderer. Needs ANGLE (KL_GLFB=1) — the null GL driver
@@ -85,8 +85,8 @@ slink-vr: build/t_slink
 # last line is SUCCESS, not failure: it is the app having got all the way to
 # looking for a Steam machine to stream from. A picture needs a host (and then
 # AMediaCodec); everything before that point is what this gate covers.
-slink-main: build/t_slink
-	KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 ./build/t_slink $(SLVRLIBS)
+slink-main: build/m_slink
+	KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
 
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 	@mkdir -p build
@@ -95,25 +95,25 @@ build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 vatest: build/t_variadic
 	./build/t_variadic
 
-# kl_view.c is the KL_VIEW=1 interactive viewer (SDL3); only t_boot links it,
+# kl_view.c is the KL_VIEW=1 interactive viewer (SDL3); only m_boot links it,
 # so only this rule carries the pkg-config flags. kl_view.c compiles to a stub
 # without SDL3 headers, but the link flags below assume pkg-config finds sdl3.
 # tests/t_mtl_provider.m is the host stand-in for Compositor Services (P5.3):
 # Objective-C because it has to *create* MTLTextures. Host-only and diagnostic —
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
-build/t_boot: tests/t_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
+build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
               runtime/kl_view_mtl.m runtime/klepton.h runtime/kl_jni.h \
               runtime/kl_view.h runtime/kl_view_mtl.h tests/t_mtl_provider.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
-	  tests/t_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
+	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
 	  runtime/kl_view_mtl.m \
 	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
 	  $(shell pkg-config --libs sdl3)
 
-boot: build/t_boot
-	./build/t_boot $(LIBS)
+boot: build/m_boot
+	./build/m_boot $(LIBS)
 
 # ---- guest payloads we build ourselves ----
 #
@@ -180,7 +180,7 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/t_boot
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@echo "=== opus roundtrip ===" && ./build/t_opus $(LIBS)/libunityopus.so > build/opus.log && tail -3 build/opus.log
 	@echo "=== all guest libraries ===" && for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
@@ -194,7 +194,7 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/t_boot
 	   $(MAKE) -s guest | grep -E 'x18 sites|identical to the host|lost '; \
 	 else echo "=== guest differential: SKIPPED (set ANDROID_NDK_HOME) ==="; fi
 	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so beatsaber/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log
-	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/t_boot $(LIBS) > build/boot.log 2>/dev/null && \
+	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/m_boot $(LIBS) > build/boot.log 2>/dev/null && \
 	  grep -E 'guard verified|DLC enumeration|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|M3 EXIT|M4 \(partial\)' build/boot.log
 
 # ---- M1b / the visionOS port (PLANNING §12) ----
@@ -249,14 +249,14 @@ dylibs: build/klepton-ld
 	  fi; done
 KL_PLATFORM ?= macos
 
-# t_boot over the translated libraries. KL_DYLIB_DIR makes every guest-library
+# m_boot over the translated libraries. KL_DYLIB_DIR makes every guest-library
 # load prefer a translation when one exists, so this exercises kl_load_dylib
 # inside the real boot chain — the image registry, the DT_NEEDED walk and the
 # guest's own dlopen of libunity — rather than in t_opus's single-image case.
 # Mixed until the x18 pass lands; `make dylibs` prints which half is which.
 .PHONY: bootdylib
-bootdylib: dylibs build/t_boot
-	@KL_DYLIB_DIR=$(PWD)/build/dylibs ./build/t_boot $(LIBS) > build/bootdylib.log 2>&1; \
+bootdylib: dylibs build/m_boot
+	@KL_DYLIB_DIR=$(PWD)/build/dylibs ./build/m_boot $(LIBS) > build/bootdylib.log 2>&1; \
 	  echo "  exit=$$?"; \
 	  grep -aE 'loaded as a translated dylib|guard verified|natives registered:|ids requested:|M3 EXIT' \
 	    build/bootdylib.log
@@ -268,9 +268,9 @@ bootdylib: dylibs build/t_boot
 # and executes all 17,617 veneers out of a dyld-mapped, read-only __TEXT. Must
 # match the ELF baseline — exit 0 and 26 swaps under the null driver.
 .PHONY: bootdylib-life
-bootdylib-life: dylibs build/t_boot
+bootdylib-life: dylibs build/m_boot
 	@KL_DYLIB_DIR=$(PWD)/build/dylibs KL_FRAMES=30 KL_ALARM=60 KL_LIFECYCLE=1 \
-	  script -q /dev/null timeout 300 ./build/t_boot $(LIBS) > build/bootdylib-life.log 2>&1; \
+	  script -q /dev/null timeout 300 ./build/m_boot $(LIBS) > build/bootdylib-life.log 2>&1; \
 	  echo "  exit=$$?"; \
 	  grep -aE 'loaded as a translated dylib|eglSwapBuffers:' build/bootdylib-life.log
 

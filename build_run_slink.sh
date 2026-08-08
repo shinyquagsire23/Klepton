@@ -214,9 +214,9 @@ if [ -n "$VIEW" ]; then
   # No timeout: the run ends when the window is closed. The window IS the
   # output here, so the log is for afterwards rather than for watching.
   echo "            (window open — close it to end the run)"
-  script -q /dev/null ./build/t_slink "$LIBDIR" > "$LOG" 2>&1
+  script -q /dev/null ./build/t_slink "$LIBDIR" 2>&1 | tee "$LOG"
 else
-  timeout "$TIMEOUT" script -q /dev/null ./build/t_slink "$LIBDIR" > "$LOG" 2>&1
+  timeout "$TIMEOUT" script -q /dev/null ./build/t_slink "$LIBDIR"
 fi
 rc=$?
 echo
