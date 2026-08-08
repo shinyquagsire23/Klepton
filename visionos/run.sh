@@ -8,11 +8,49 @@
 #   KLEPTON_DEVICE=<udid>   skip device auto-detection
 #   KLEPTON_TEAM=<teamid>   override signing team
 #   KLEPTON_BUNDLE_ID=...   override bundle id
-#   KL_SKIP_STAGE=1         do not re-upload assets (device: they persist)
+#   KL_SKIP_STAGE=1         never stage, even on a target that has never had it
+#   KL_STAGE=1              always stage, whatever the stamp says
 set -euo pipefail
 cd "$(dirname "$0")"
 BUNDLE_ID="${KLEPTON_BUNDLE_ID:-dev.klepton.app}"
 MODE="${1:-sim}"
+
+# --- Staging: skip by default, but not blindly ------------------------------
+#
+# The 2.2 GB upload is a ~20 minute step and the assets change only when the APK
+# does, so re-running it every build is the difference between the device loop
+# working and not. Hence: skip by default.
+#
+# The trap that stops this being a plain `KL_SKIP_STAGE=1` default is that a
+# target which has NEVER been staged then launches with no assets, and Unity
+# does not report that as missing assets — it reports it three layers up as
+# "Not enough storage space to install required resources" (trap 6c). That is
+# an expensive sentence to debug when the real answer is "nothing was uploaded".
+#
+# So a stamp records that this target has been staged with this APK. No stamp
+# means stage; stamp means skip. The stamp is keyed on the APK's size and mtime,
+# so replacing beatsaber.apk re-stages on its own rather than needing to be
+# remembered. It cannot know about a data container the OS rotated underneath
+# us — KL_STAGE=1 is the answer to that, and the symptom is the same sentence.
+STAMP_DIR="build/staged"
+stage_stamp() {   # <target-key>
+  local apk="../beatsaber.apk" sig=""
+  [ -f "$apk" ] && sig=$(stat -f '%z-%m' "$apk" 2>/dev/null || true)
+  echo "$STAMP_DIR/$(echo "$1-$BUNDLE_ID-$sig" | tr -c 'A-Za-z0-9._-' '_')"
+}
+# stage_if_needed <target-key> <stage_assets.sh args...>
+stage_if_needed() {
+  local key="$1"; shift
+  local stamp; stamp=$(stage_stamp "$key")
+  if [ -n "${KL_SKIP_STAGE:-}" ]; then
+    echo "  assets: skipped (KL_SKIP_STAGE=1)"
+  elif [ -z "${KL_STAGE:-}" ] && [ -f "$stamp" ]; then
+    echo "  assets: already staged for this target and APK (KL_STAGE=1 to redo)"
+  else
+    ./stage_assets.sh "$@"
+    mkdir -p "$STAMP_DIR" && : > "$stamp"
+  fi
+}
 
 # Knobs forwarded from this shell into the app, on both the device and simulator
 # paths. A list rather than a line each, because the two paths spell the same
@@ -31,7 +69,7 @@ MODE="${1:-sim}"
 # it, the app never did, and the run took P4's window path while looking like the
 # compositor had failed to come up. A knob that is set and not delivered is worse
 # than one that does not exist, so the default is now "forward it".
-FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
+FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
 FORWARD=""
 for K in $(env | sed -n 's/^\(KL_[A-Za-z0-9_]*\)=.*/\1/p' | sort); do
   case " $FORWARD_SKIP " in *" $K "*) continue ;; esac
@@ -91,7 +129,7 @@ print(phys[0]["identifier"])
   echo "[4/5] installing…"
   xcrun devicectl device install app --device "$DEVID" "$APP" | tail -2
   # Installing can rotate the data container, so assets are staged *after*.
-  [ -n "${KL_SKIP_STAGE:-}" ] || ./stage_assets.sh "$DEVID"
+  stage_if_needed "$DEVID" "$DEVID"
 
   echo "[5/5] launching (report also renders on-screen)…"
   # KL_FRAMES carries the app past P4's initJni gate into the Android lifecycle
@@ -198,7 +236,7 @@ xcrun simctl install "$UDID" "$APP"
 # After install, not before: simctl rotates the data container on reinstall, so
 # assets staged earlier end up in an orphaned one and the app reports them
 # missing. Cost a confusing run once.
-[ -n "${KL_SKIP_STAGE:-}" ] || ./stage_assets.sh | tail -1
+stage_if_needed "sim-$UDID"
 
 echo "[5/5] launching…"
 # `env`, not a bare prefix: bash only treats NAME=value as an assignment when it

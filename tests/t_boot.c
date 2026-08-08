@@ -313,7 +313,15 @@ static int recon_run(int view_pump) {
             for (i = 0; fn && (view_pump ? !g_view_quit : i < frames); i++) {
                 struct timespec t0;
                 clock_gettime(CLOCK_MONOTONIC, &t0);
-                // The frame clock first: on Android the Choreographer's
+                // Pin this frame's poses first, so every ovrp_GetNodePoseState
+                // inside the frame answers the same thing and the pose recorded
+                // for timewarp is the one the picture was drawn from. On the
+                // host the frontend and the guest are usually the same thread,
+                // so this changes nothing — but the viewer is what proves the
+                // reprojection math before a device is available, and it can
+                // only prove it if it runs the same shape.
+                kl_ovrp_frame_latch();
+                // The frame clock next: on Android the Choreographer's
                 // doFrame is what wakes the engine for a frame, and
                 // nativeRender then draws what it decided. Ticking after
                 // rendering would hand every frame the previous one's time.

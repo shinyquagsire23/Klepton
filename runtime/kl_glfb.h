@@ -79,7 +79,52 @@ void kl_glfb_report_formats(void);
 // framebuffer with the picture" by looking for the FBO whose color attachment
 // is one of these (fb0 is black by construction — the VR frame goes to eye
 // textures, not the backbuffer).
-void kl_glfb_note_eye_texture(int eye, uint32_t tex);
+void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex);
+
+// Which swapchain stage the guest most recently RENDERED into, or -1 if that
+// has not been observed.
+//
+// This exists because the stage is the guest's choice and we had been guessing
+// it. With one stage the guess could not be wrong; with more than one it can,
+// and a wrong answer is not a missing picture but a *stale* one paired with a
+// *fresh* pose — reprojection then corrects by the wrong delta, which is
+// judder. So the stage is measured instead: kl_ovrp registers each (eye,stage)
+// texture name above, and the framebuffer thunks watch which of those names is
+// the draw target. See kl_ovrp.c's EndFrame, which files the frame's pose
+// record under whatever this reports.
+int kl_glfb_last_render_stage(void);
+
+// ...and the same observation with a window around it, which is what makes it
+// checkable rather than merely available.
+//
+// `kl_glfb_last_render_stage` is sticky, so it answers even for a frame that
+// drew into no eye texture at all — and that answer is the PREVIOUS frame's
+// stage, which is exactly the off-by-one that pairs a fresh pose with a stale
+// picture and shows up as doubling on head rotation. A sticky global cannot
+// report that it did not know; a window can.
+//
+// kl_ovrp opens a window at ovrp_BeginFrame and reads it at ovrp_EndFrame:
+//
+//   *mask   bit per stage bound as the draw target inside the window. Exactly
+//           one bit is the healthy case; zero means nothing was observed and
+//           the returned stage belongs to another frame; more than one means
+//           the frame committed to several stages and "one stage per frame" is
+//           not true for this guest.
+//   *binds  how many eye binds happened, for telling "did not draw" from "drew
+//           once" from "bounced".
+//   *tid    the thread that did the last of them. If it is not the thread
+//           calling EndFrame, the window bounds nothing and the association
+//           needs ordering rather than better observation.
+//
+// The return value is the last stage observed, sticky, as before.
+void     kl_glfb_begin_render_window(void);
+int      kl_glfb_render_stages(uint32_t *mask, uint32_t *binds, uint64_t *tid);
+
+// How many times `stage` has been committed to as the draw target over the
+// whole run. This is pure observation — it does not pass through the pose
+// bookkeeping — so a stage that stops being drawn into is visible here even
+// when every other counter still looks healthy.
+uint64_t kl_glfb_stage_draw_count(int stage);
 
 // ---------------------------------------------------------------------------
 // The Metal interop seam (P5). Proven on host and device before any of this

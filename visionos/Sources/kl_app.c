@@ -15,6 +15,7 @@
 #include "kl_fault.h"
 #include "kl_egl.h"
 #include "kl_opensl.h"
+#include "kl_ovrp.h"      // kl_ovrp_frame_latch — one pose per guest frame
 
 static char g_libdir[1024];
 static char g_assets[1024];
@@ -468,7 +469,15 @@ int kl_app_lifecycle_begin(void) {
 int kl_app_frame(void) {
     if (!g_render || !g_thiz) return -1;
     alarm(g_alarm_secs);
-    // The frame clock first: on Android the Choreographer's doFrame is what
+    // Pin this frame's poses before anything in the frame can ask. The
+    // compositor publishes a new pose every display frame from its own thread,
+    // and a guest frame is longer than a display frame whenever performance is
+    // short — so without this the head moves *inside* the frame and the pose
+    // recorded for timewarp is not the one the picture was drawn from. See
+    // kl_ovrp_frame_latch: the residual is a whole guest frame of rotation,
+    // corrected backwards, which is the doubling seen on device.
+    kl_ovrp_frame_latch();
+    // The frame clock next: on Android the Choreographer's doFrame is what
     // wakes the engine, and nativeRender then draws what it decided. Ticking
     // after would hand every frame the previous one's time.
     kl_jni_tick_choreographer();
@@ -487,6 +496,11 @@ void kl_app_lifecycle_report(void) {
     kl_jni_report(stdout);
     kl_egl_report(stdout);
     kl_opensl_report(stdout);
+    // The OVRPlugin surface, which t_boot has always printed and this never
+    // did — so the eye swapchain's own numbers, including whether the pose and
+    // the picture stayed associated, have never been readable from a device
+    // run. That is the one report the graphics work most needs.
+    kl_ovrp_report(stdout);
     fflush(NULL);
     snprintf(g_status, sizeof g_status, "lifecycle ran, %u frames", g_frames_pumped);
 }

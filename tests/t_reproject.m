@@ -78,6 +78,16 @@ static void check_math(void) {
     ok(kl_reproject_delta_degrees(&r, matrix_identity_float4x4) < 1e-3f,
        "no pose delta measures as 0 degrees");
 
+    // The quad's depth, named. This is the property that was settled wrongly
+    // once — the default was pulled in to 2 m on the belief that a far quad is
+    // discarded, when what had actually been measured was a quad with no depth
+    // WRITES. Reverse-Z with an infinite far plane puts 500 m at a small
+    // positive z, which is "far away" and not "clipped", and the two are only
+    // distinguishable by looking.
+    float z = kl_reproject_ndc_depth(&u);
+    ok(z > 0.0f && z < 1.0f,
+       "the default quad depth is inside the clip range, not beyond far");
+
     // A head that has yawed +10 degrees since the frame was rendered. Positive
     // rotation about +Y turns the head to the LEFT in a right-handed, -Z-forward
     // space, so the stale picture must move RIGHT in the view. The sign is the
@@ -292,6 +302,29 @@ static void check_pixels(void) {
     uint8_t out1[16] = {0};
     [dst getBytes:out1 bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
     ok(memcmp(out1, s1, 16) == 0, "slice 1 samples the other eye's picture");
+
+    // visible = 0 must draw NOTHING. This is how the visionOS pass expresses
+    // "this eye has no picture yet" now that both eyes share one encoder and
+    // one draw call — it can no longer just skip the draw. A collapse that
+    // does not actually collapse would smear one eye's quad with whatever the
+    // uniforms happened to contain, which on device is a wrong picture rather
+    // than a missing one.
+    u.visible = 0;
+    cmd = [q commandBuffer];
+    enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:ps];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
+    [enc setVertexBytes:&u length:sizeof u atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    uint8_t out2[16] = {0};
+    [dst getBytes:out2 bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
+    uint8_t cleared[16] = { 0,0,0,255, 0,0,0,255, 0,0,0,255, 0,0,0,255 };
+    ok(memcmp(out2, cleared, 16) == 0,
+       "visible = 0 collapses the quad — the clear survives");
 }
 
 int main(void) {

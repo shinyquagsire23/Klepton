@@ -83,10 +83,16 @@ static id<MTLRenderPipelineState> klvm_pipeline(const char *msl, const char *vfn
 // rendered with. That last one is what makes the reprojection pass reduce
 // exactly to the blit when nothing has moved — the quad's corners land on
 // NDC ±1 — so any difference in the picture is the pose delta and nothing else.
-static kl_reproject_uniforms klvm_uniforms(uint32_t slice) {
+//
+// `stage` is passed IN, not read here. kl_ovrp_last_complete_stage() advances
+// whenever the guest finishes a frame, so reading it a second time inside one
+// composite can return a different stage from the one whose texture is being
+// sampled — and then this builds the pose of one picture to place another. It
+// is a narrow window, but it is hit exactly when the guest is producing frames
+// fastest, and the result is a picture reprojected by a delta that was never
+// real. One read per composite, threaded through everything that needs it.
+static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice) {
     kl_ovrp_render_pose r;
-    int stage = kl_ovrp_last_complete_stage();
-    if (stage < 0) stage = 0;
     int have = kl_ovrp_stage_render_pose(stage, &r);
 
     // Where the head is now. Without KL_VIEW_TIMEWARP this is *defined* to be
@@ -203,11 +209,10 @@ static void klvm_read_stats(int src_w, int src_h) {
 // pose it is being shown at. Zero means the guest is keeping up and the pass is
 // a blit; anything else is motion the composite is now hiding. Printed rarely,
 // because it is a per-frame quantity and the interesting thing is its scale.
-static void klvm_note_delta(void) {
+static void klvm_note_delta(int stage) {
     static unsigned n;
     static float worst;
     kl_ovrp_render_pose r;
-    int stage = kl_ovrp_last_complete_stage();
     if (stage < 0 || !kl_ovrp_stage_render_pose(stage, &r)) return;
     float px, py, pz, qx, qy, qz, qw;
     kl_ovrp_get_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
@@ -228,8 +233,19 @@ int kl_viewmtl_present(int win_w, int win_h) {
     // eye textures at a different size partway through startup (1832x1920 ->
     // 2198x2304, measured), and a cached texture would silently become the
     // previous allocation.
+    // ...and the STAGE has to be re-read too, now that there is more than one.
+    // The eye swapchain is double-buffered (kl_ovrp.c, KLOVRP_STAGES_DEFAULT),
+    // so stage 0 holds every other frame; sampling it unconditionally shows
+    // half the frames and reads as a halved frame rate rather than as a bug.
+    // The last *complete* stage is the same thing the visionOS compositor asks
+    // for. It is read HERE and nowhere else in this composite: klvm_uniforms and
+    // klvm_note_delta used to ask again, and two reads of a value the guest is
+    // advancing pair one stage's picture with another stage's pose — the exact
+    // failure this stage-keying exists to prevent.
+    int stage = kl_ovrp_last_complete_stage();
+    if (stage < 0) stage = 0;
     int slice = 0;
-    void *texp = kl_glfb_eye_mtl_texture(0, 0, &slice);
+    void *texp = kl_glfb_eye_mtl_texture(0, stage, &slice);
     if (!texp) return 0;
     id<MTLTexture> src = (__bridge id<MTLTexture>)texp;
 
@@ -270,12 +286,12 @@ int kl_viewmtl_present(int win_w, int win_h) {
     [enc setFragmentSamplerState:g_samp atIndex:0];
     uint32_t sl = (uint32_t)slice;
     if (g_pipe_rp) {
-        kl_reproject_uniforms u = klvm_uniforms(sl);
+        kl_reproject_uniforms u = klvm_uniforms(stage, sl);
         [enc setRenderPipelineState:g_pipe_rp];
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-        klvm_note_delta();
+        klvm_note_delta(stage);
     } else {
         [enc setRenderPipelineState:g_pipe];
         [enc setFragmentBytes:&sl length:sizeof sl atIndex:0];

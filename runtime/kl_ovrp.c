@@ -12,6 +12,11 @@
 #include <pthread.h>
 #include "klepton.h"
 #include "kl_ovrp.h"
+// kl_glfb_note_eye_texture (the capture's eye-FBO seam) and
+// kl_glfb_last_render_stage (which stage the guest actually drew into — see
+// klovrp_EndFrame). Up here rather than beside SetupEyeTexture2 now that the
+// timewarp bookkeeping needs it too.
+#include "kl_glfb.h"
 
 #define KL_OVRP_MAX 512
 static struct { const char *name; unsigned calls; } g_ovrp[KL_OVRP_MAX];
@@ -150,8 +155,8 @@ static uint64_t klovrp_no(const char *name) {
 // describe the same hardware. What is described is the Quest 2 we already claim
 // to be through Build.MODEL — not the Vision Pro underneath — because every
 // Oculus branch in the guest is written against that.
-#define KL_OVRP_EYE_W    1832        // Quest 2 per-eye recommended render target
-#define KL_OVRP_EYE_H    1920
+#define KL_OVRP_EYE_W    (1832*1.5)        // Quest 2 per-eye recommended render target
+#define KL_OVRP_EYE_H    (1920*1.5)
 #define KL_OVRP_REFRESH  72.0f       // Quest 2 default display frequency
 
 // The version string Unity parses to gate optional features behind "is the
@@ -231,9 +236,11 @@ static uint64_t klovrp_GetEyeTextureSize(void) {
     return (uint64_t)KL_OVRP_EYE_W | ((uint64_t)KL_OVRP_EYE_H << 32);
 }
 
+int kl_ovrp_stage_count(void);
+
 static uint64_t klovrp_GetEyeTextureStageCount(void) {
     ovrp_hit("ovrp_GetEyeTextureStageCount");
-    return 1;
+    return (uint64_t)kl_ovrp_stage_count();
 }
 
 // libunity maps 3->22, 2->2, anything else->4 (0x9bcf40), so any value is
@@ -270,6 +277,45 @@ void kl_ovrp_set_eye_offset(int eye, float x, float y, float z) {
     if ((unsigned)eye > 1) return;
     g_eye_off[eye][0] = x; g_eye_off[eye][1] = y; g_eye_off[eye][2] = z;
 }
+
+// The eye's own ROTATION — the cant — which this seam used to drop on the floor.
+//
+// Vision Pro's displays are angled outward, so device_from_view is not a pure
+// translation: each eye is turned, oppositely, and its frustum tangents are
+// expressed in that turned frame (measured: l=1.7321 r=1.0000 for the left eye,
+// mirrored for the right — tan 60 out, tan 45 in). We were handing the guest
+// the turned frame's *tangents* while telling it the eye pointed straight
+// ahead, so it rendered the right shape of cone in the wrong direction.
+//
+// The composite then placed that picture and viewed it through the real canted
+// eye (kl_reproject.c's view_rot), which is the correct thing to do with the
+// picture it was given — and the result on screen is each eye's image rotated
+// by the cant, in opposite directions. Opposite per-eye rotation is the one
+// error the visual system cannot merge: it is seen as **two images**, not as
+// blur, which is what "doubling during head turns" was.
+//
+// Identity by default, so a host run and every headless test are unchanged.
+// KL_OVRP_EYE_CANT=0 restores the dropped-cant behaviour as the A/B.
+static float g_eye_rot[2][4] = { { 0, 0, 0, 1 }, { 0, 0, 0, 1 } };
+
+void kl_ovrp_set_eye_rotation(int eye, float qx, float qy, float qz, float qw) {
+    if ((unsigned)eye > 1) return;
+    // A zero quaternion is not a rotation; treat it as "none" rather than
+    // collapsing the eye's basis to nothing.
+    if (!(qx * qx + qy * qy + qz * qz + qw * qw > 1e-6f)) return;
+    g_eye_rot[eye][0] = qx; g_eye_rot[eye][1] = qy;
+    g_eye_rot[eye][2] = qz; g_eye_rot[eye][3] = qw;
+}
+
+static int klovrp_eye_cant(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("KL_OVRP_EYE_CANT");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 
 // KL_OVRP_IPD=<metres>: force a symmetric separation, ignoring whatever the
 // frontend pushed. The A/B for "is the compositor's number the wrong one" —
@@ -375,6 +421,10 @@ static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1,
 };
 static int g_head_set;              // has a frontend ever written a head pose?
+// The two hands, published by the same frontend in the same breath. Declared
+// here beside the head because the per-frame latch below promotes all three
+// together — they are one sample of one instant and must stay so.
+static klovrp_pose g_hand_pose[2];
 
 // --- The frontend/guest pose handoff, and why it is a seqlock now -----------
 //
@@ -443,12 +493,135 @@ static float klovrp_eye_height(void) {
     return g_tracking_origin == 0 ? 0.0f : h;
 }
 
-// The head pose as reported: the frontend's, or a synthesized one standing at
-// eye height when no frontend has spoken.
-static klovrp_pose klovrp_head(void) {
+// --- One pose per guest frame, and why the live one is wrong ---------------
+//
+// **This is what was left of the judder after the swapchain was fixed.**
+//
+// The frontend publishes a new pose every *display* frame, on its own thread
+// (PLANNING §12.12). The guest reads poses through ovrp_GetNodePoseState
+// whenever it likes during its own frame, and its frame is longer than a
+// display frame whenever performance is short. So within one guest frame the
+// answer to "where is the head" could change several times — and, worse, the
+// pose recorded for timewarp (klovrp_BeginFrame, which latched the live value)
+// was not necessarily any of the answers the guest was given.
+//
+// Reprojection subtracts the recorded pose from the display pose. If the guest
+// rendered from P(T1) and we recorded P(T2), the correction is wrong by exactly
+// P(T2) - P(T1): one guest frame of head rotation, applied backwards. A frame
+// that is over-corrected followed by one that is under-corrected is not blur,
+// it is **two images in two places** — the doubling seen on device during head
+// rotation, growing as the frame rate falls, which is precisely when T2 - T1
+// grows.
+//
+// So the guest gets ONE pose for the whole of its frame, promoted at its frame
+// boundary, and that is the pose recorded. The record is then truthful by
+// construction rather than by the two threads happening to be in step. This is
+// what a real runtime does — a frame's poses come from one predicted instant —
+// and it is the property kl_reproject.h's whole argument assumes.
+//
+// The hands come along for the ride: they are published in the same breath from
+// the same ARKit query, and a frame that draws the head from one instant and
+// the hands from another is incoherent in the same way, just less visibly.
+// Controller *buttons* stay live — an edge is not a pose, and freshness there
+// costs nothing.
+//
+// KL_OVRP_LATCH=0 restores the live read, which is every measurement taken
+// before this and the A/B if the pinning is ever suspected of costing latency.
+static klovrp_pose g_frame_head, g_frame_hand[2];
+static uint32_t    g_frame_pose_seq;
+static int         g_frame_latched;
+
+static int klovrp_latch_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("KL_OVRP_LATCH");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+// A seqlock of its own, because the writer is the *guest's* frame driver while
+// g_pose_seq's writer is the frontend. Sharing one counter between two writer
+// threads is exactly the bug that counter's comment warns about.
+static klovrp_pose klovrp_seq_read(const klovrp_pose *src, const uint32_t *seq) {
+    for (int try = 0; try < 8; try++) {
+        uint32_t s = __atomic_load_n(seq, __ATOMIC_ACQUIRE);
+        if (s & 1u) continue;
+        klovrp_pose v = *src;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(seq, __ATOMIC_RELAXED) == s) return v;
+    }
+    return *src;
+}
+
+// The head pose as PUBLISHED — where the frontend says the head is now. This is
+// the display side's question, not the guest's: the compositor asks it to
+// reproject towards, and the viewer asks it to drive its own composite.
+static klovrp_pose klovrp_head_published(void) {
     klovrp_pose h = klovrp_pose_read(&g_head_pose);
     if (!__atomic_load_n(&g_head_set, __ATOMIC_ACQUIRE)) h.py = klovrp_eye_height();
     return h;
+}
+
+// The head pose as the GUEST sees it: pinned for the whole of its frame.
+static klovrp_pose klovrp_head(void) {
+    if (klovrp_latch_enabled() && __atomic_load_n(&g_frame_latched, __ATOMIC_ACQUIRE)) {
+        klovrp_pose h = klovrp_seq_read(&g_frame_head, &g_frame_pose_seq);
+        if (!__atomic_load_n(&g_head_set, __ATOMIC_ACQUIRE)) h.py = klovrp_eye_height();
+        return h;
+    }
+    return klovrp_head_published();
+}
+
+// The shortest angle between two orientations, in degrees. Used only to report
+// how much motion the latch is absorbing.
+static float klovrp_quat_degrees(const klovrp_pose *a, const klovrp_pose *b) {
+    float d = a->qx * b->qx + a->qy * b->qy + a->qz * b->qz + a->qw * b->qw;
+    if (d < 0) d = -d;
+    if (d > 1.0f) d = 1.0f;
+    return 2.0f * acosf(d) * (180.0f / 3.14159265358979f);
+}
+
+// Promote the published poses to the ones this guest frame will see. Called at
+// the top of the guest's frame, before anything in it can ask.
+//
+// The number it reports is the measurement that justifies the whole mechanism:
+// how far the head moved during the *previous* guest frame, i.e. how wrong the
+// recorded pose used to be. At a comfortable frame rate it is a fraction of a
+// degree; when the guest is struggling it is whole degrees, and a whole degree
+// of mis-correction is plainly visible.
+void kl_ovrp_frame_latch(void) {
+    if (!klovrp_latch_enabled()) return;
+    klovrp_pose h = klovrp_pose_read(&g_head_pose);
+    klovrp_pose l = klovrp_pose_read(&g_hand_pose[0]);
+    klovrp_pose r = klovrp_pose_read(&g_hand_pose[1]);
+
+    static float worst;
+    static unsigned n;
+    if (__atomic_load_n(&g_frame_latched, __ATOMIC_ACQUIRE)) {
+        float moved = klovrp_quat_degrees(&g_frame_head, &h);
+        if (moved > worst) worst = moved;
+    }
+    if (++n % 300 == 0) {
+        fprintf(stderr, "  [ovrp] pose latch: worst %.2f deg of head motion "
+                        "inside one guest frame over the last 300\n", (double)worst);
+        worst = 0;
+    }
+
+    uint32_t s = __atomic_load_n(&g_frame_pose_seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_frame_pose_seq, s + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    g_frame_head = h; g_frame_hand[0] = l; g_frame_hand[1] = r;
+    __atomic_store_n(&g_frame_pose_seq, s + 2, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_frame_latched, 1, __ATOMIC_RELEASE);
+}
+
+// The hand pose as the guest sees it — pinned with the head, for the same
+// reason and at the same instant.
+static klovrp_pose klovrp_hand(int hand) {
+    if (klovrp_latch_enabled() && __atomic_load_n(&g_frame_latched, __ATOMIC_ACQUIRE))
+        return klovrp_seq_read(&g_frame_hand[hand], &g_frame_pose_seq);
+    return klovrp_pose_read(&g_hand_pose[hand]);
 }
 
 // v' = q ⊗ v ⊗ q⁻¹ for a unit quaternion, expanded — used to carry a
@@ -463,6 +636,19 @@ static void klovrp_qrot(const klovrp_pose *q, float vx, float vy, float vz,
     *oz = vz + q->qw * tz + (q->qx * ty - q->qy * tx);
 }
 
+// The Hamilton product, a then b applied as "b first, then a" — so
+// world_from_eye = world_from_device ⊗ device_from_view.
+static klovrp_pose klovrp_qmul(const klovrp_pose *a, const float b[4]) {
+    klovrp_pose r = *a;
+    float ax = a->qx, ay = a->qy, az = a->qz, aw = a->qw;
+    float bx = b[0],  by = b[1],  bz = b[2],  bw = b[3];
+    r.qw = aw * bw - ax * bx - ay * by - az * bz;
+    r.qx = aw * bx + ax * bw + ay * bz - az * by;
+    r.qy = aw * by - ax * bz + ay * bw + az * bx;
+    r.qz = aw * bz + ax * by - ay * bx + az * bw;
+    return r;
+}
+
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     klovrp_pose v = { px, py, pz, qx, qy, qz, qw };
@@ -470,12 +656,112 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
 }
 
+// The frontend's question — "where is the head NOW" — so it reads the published
+// pose, not the one pinned for the guest's frame. The viewer's composite uses
+// this as the pose to reproject *towards*, and reprojecting towards the pose
+// the picture was already drawn with would be a no-op.
 void kl_ovrp_get_head_pose(float *px, float *py, float *pz,
                            float *qx, float *qy, float *qz, float *qw) {
-    klovrp_pose h = klovrp_head();
+    klovrp_pose h = klovrp_head_published();
     if (px) *px = h.px; if (py) *py = h.py; if (pz) *pz = h.pz;
     if (qx) *qx = h.qx; if (qy) *qy = h.qy;
     if (qz) *qz = h.qz; if (qw) *qw = h.qw;
+}
+
+// --- ovrp_Update2: the guest's own latch point ---------------------------
+//
+// **This is the concrete signal we had been guessing around.** OVRPlugin's
+// contract is that tracking is sampled once per frame per *step* — the guest
+// calls ovrp_Update2(step, frameIndex, predictionSeconds), and every
+// ovrp_GetNodePoseState(step, node) afterwards returns that sample. Measured on
+// this title: 85 Update2 calls across 38 frames (two steps a frame) and 760
+// GetNodePoseState calls, i.e. twenty reads per frame off two samples.
+//
+// We were answering Update2 from the shared ignore-the-arguments handler and
+// serving every read from a live global that the frontend rewrites at display
+// rate. So the twenty reads inside one guest frame could return twenty
+// different poses, the Render and Physics steps collapsed into one drifting
+// value, and the pose recorded for timewarp was not necessarily any of the
+// answers the guest was actually given. Reprojection subtracts that record —
+// so the correction was against a pose that never rendered anything.
+//
+// Now the guest's own call is the boundary. Nothing here is inferred: the step,
+// the frame index and the moment all come from the guest.
+//
+//   ovrpStep_Render = -1, ovrpStep_Physics = 0   (OVRPlugin.Step)
+#define KLOVRP_STEP_RENDER (-1)
+#define KLOVRP_NSTEPS 2
+static inline int klovrp_step_ix(int step) { return step == KLOVRP_STEP_RENDER ? 0 : 1; }
+
+static klovrp_pose g_step_head[KLOVRP_NSTEPS];
+static klovrp_pose g_step_hand[KLOVRP_NSTEPS][2];
+static uint32_t    g_step_seq;
+static int         g_step_valid[KLOVRP_NSTEPS];
+static int         g_saw_update2;
+
+// The render step's sample, kept apart so BeginFrame can record exactly what
+// the guest was told to render with rather than re-reading anything.
+static klovrp_pose g_render_sample;
+
+static uint64_t klovrp_Update2(int step, int frame_index, double prediction) {
+    ovrp_hit("ovrp_Update2");
+    (void)frame_index; (void)prediction;
+    int ix = klovrp_step_ix(step);
+
+    klovrp_pose h = klovrp_pose_read(&g_head_pose);
+    if (!__atomic_load_n(&g_head_set, __ATOMIC_ACQUIRE)) h.py = klovrp_eye_height();
+    klovrp_pose l = klovrp_pose_read(&g_hand_pose[0]);
+    klovrp_pose r = klovrp_pose_read(&g_hand_pose[1]);
+
+    // How much the head moved between this frame's sample and the last one for
+    // the same step. This is the quantity the old code was silently absorbing
+    // into the timewarp delta, so it is worth being able to read.
+    static float worst;
+    static unsigned n;
+    if (ix == 0 && g_step_valid[0]) {
+        float moved = klovrp_quat_degrees(&g_step_head[0], &h);
+        if (moved > worst) worst = moved;
+        if (++n % 300 == 0) {
+            fprintf(stderr, "  [ovrp] Update2(Render): worst %.2f deg between "
+                            "consecutive samples over the last 300\n", (double)worst);
+            worst = 0;
+        }
+    }
+
+    uint32_t s = __atomic_load_n(&g_step_seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_step_seq, s + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    g_step_head[ix] = h;
+    g_step_hand[ix][0] = l; g_step_hand[ix][1] = r;
+    if (ix == 0) g_render_sample = h;
+    __atomic_store_n(&g_step_seq, s + 2, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_step_valid[ix], 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_saw_update2, 1, __ATOMIC_RELEASE);
+
+    // Return value deliberately UNCHANGED from the shared handler this replaces.
+    // OVRPlugin declares ovrp_Update2 returning Bool, where 0 is false, and both
+    // libunity and libil2cpp reference the name — which is trap 10's exact
+    // shape. It may well want OVRP_TRUE. But it has answered 0 for every
+    // measurement taken so far, and changing the latch and the return in one
+    // step would make the next device run unreadable. One variable at a time.
+    return OVRP_SUCCESS;
+}
+
+// The pose for a given step, as the guest was told it. Falls back to the live
+// value only where Update2 has never been seen — a headless run, or a guest
+// that does not use this part of the API.
+static klovrp_pose klovrp_step_head(int step) {
+    int ix = klovrp_step_ix(step);
+    if (__atomic_load_n(&g_step_valid[ix], __ATOMIC_ACQUIRE))
+        return klovrp_seq_read(&g_step_head[ix], &g_step_seq);
+    return klovrp_head();
+}
+
+static klovrp_pose klovrp_step_hand(int step, int hand) {
+    int ix = klovrp_step_ix(step);
+    if (__atomic_load_n(&g_step_valid[ix], __ATOMIC_ACQUIRE))
+        return klovrp_seq_read(&g_step_hand[ix][hand], &g_step_seq);
+    return klovrp_hand(hand);
 }
 
 // --- Timewarp bookkeeping ---------------------------------------------------
@@ -491,17 +777,92 @@ void kl_ovrp_get_head_pose(float *px, float *py, float *pz,
 #define KLOVRP_MAX_STAGES 4
 static struct {
     kl_ovrp_render_pose r[KLOVRP_MAX_STAGES];
+    // The frame between BeginFrame and EndFrame, whose stage is not known yet.
+    kl_ovrp_render_pose pending;
+    int                 pending_index;   // the GUEST's frame index
+    uint64_t            stage_disagree;  // index%%N vs the observed stage
+    // How the observation window closed, counted per frame. These are the
+    // numbers that say whether the pose↔picture association is *known* or
+    // merely available — see klovrp_EndFrame.
+    uint64_t            unobserved;      // the frame drew into no eye stage
+    uint64_t            multi;           // ...into more than one
+    uint64_t            cross_thread;    // drawn by a thread that is not this one
+    // Frames filed per stage, and how many took the counter fallback. The one
+    // number that says whether the swapchain is really cycling: a second stage
+    // that never receives a frame is memory spent to fix nothing, and the
+    // read-while-writing race it exists to remove is still there.
+    uint64_t            filed[KLOVRP_MAX_STAGES];
+    uint64_t            guessed;
     uint64_t            serial;         // frames begun
     int                 last_complete;  // stage of the last completed frame, -1 = none
     pthread_mutex_t     mu;
 } g_frames = { .last_complete = -1, .mu = PTHREAD_MUTEX_INITIALIZER };
 
-// How many swapchain stages we tell the guest it has. Raising this is a
-// deliberate act with a consequence: the stage a frame draws into is derived
-// below from our own frame counter, which is only *known* to agree with
-// libunity's own choice while there is exactly one stage to choose. Measure
-// which stage the guest actually renders into before raising it.
-#define KLOVRP_STAGES 1
+// How many swapchain stages we tell the guest it has.
+//
+// **This was 1, and one stage is a bug, not a simplification.** With a single
+// stage the guest renders every frame into the *same* eye texture — the one the
+// compositor is sampling for the frame before it. There is a fence in one
+// direction only (kl_glfb signals at eglSwapBuffers, the composite waits on it),
+// so "the guest has finished frame N" is ordered but "the composite has finished
+// reading frame N" is not: the guest's frame N+1 overwrites the texture while
+// the composite still has it bound, across two Metal queues that order nothing
+// between them. Standing still the two pictures are nearly identical and nothing
+// shows. **Turning your head, they differ — and the composite samples a mixture,
+// which is exactly the judder that should not be there.** It gets worse with
+// resolution, because a longer guest frame overlaps the composite for longer.
+//
+// Two stages is enough here and not by luck: the guest is driven one frame per
+// published pose (PLANNING §12.12), so it cannot run more than one frame ahead
+// of the compositor, and one spare buffer covers exactly that. KL_OVRP_STAGES
+// is the A/B — `=1` restores the single-buffered behaviour every measurement
+// before this was taken against, `=3` buys slack at the cost of another
+// full-size eye texture (RGBA16F, two slices — over 100 MB at the resolutions
+// this now runs at, which is why 3 is not the default).
+//
+// The old comment here warned that raising this makes the stage a *guess*:
+// "the stage a frame draws into is derived from our own frame counter, which is
+// only known to agree with libunity's own choice while there is exactly one
+// stage to choose." That warning was right, and the answer is not to guess but
+// to measure — see klovrp_EndFrame, which files each frame's record under the
+// stage kl_glfb watched the guest actually draw into.
+//
+// **The association is now proven rather than inferred** (PLANNING §12.19). The
+// observation is windowed — BeginFrame opens it, EndFrame closes it — so a
+// frame that drew into no eye stage is reported as such instead of silently
+// receiving the previous frame's answer, which is the exact off-by-one that
+// pairs a fresh pose with a stale picture. Measured on the host at two and three
+// stages, 300 frames each: every frame drew into exactly one stage, on the same
+// thread as EndFrame, and the guest's own frame index `% stages` agreed with the
+// observation on all 298 of them. Nothing here is a guess any more.
+//
+// **The default is 3, and the doubling that forced it down to 1 is gone.**
+// One stage single-buffers the eye textures: the guest's frame N+1 overwrites
+// the texture while the composite still has frame N bound, across two Metal
+// queues that order nothing between them, and turning your head that reads as
+// tearing. Two stages removed it and revealed the doubling; three made the
+// doubling worse, which is what identified the association as the cause. With
+// the association fixed and proven (above), depth is free to be what it should
+// be — and 3 rather than 2 because the guest is decoupled from the compositor
+// (PLANNING §12.12) and one spare buffer only just covers that, leaving nothing
+// for a frame that runs long.
+//
+// The cost is memory, and it is not small: an eye texture is RGBA16F with two
+// array slices, so at map resolution each stage is on the order of 160 MB and a
+// swapchain re-creation transiently holds two generations. KL_OVRP_STAGES is
+// the A/B in both directions.
+#define KLOVRP_STAGES_DEFAULT 3
+
+int kl_ovrp_stage_count(void) {
+    static int n;
+    if (!n) {
+        const char *e = getenv("KL_OVRP_STAGES");
+        n = e ? atoi(e) : KLOVRP_STAGES_DEFAULT;
+        if (n < 1) n = 1;
+        if (n > KLOVRP_MAX_STAGES) n = KLOVRP_MAX_STAGES;
+    }
+    return n;
+}
 
 // libunity's frame dispatcher (0x9bb808) calls BeginFrame, EndEye2 twice, then
 // EndFrame. This is where the pose the frame will be rendered with is fixed:
@@ -514,12 +875,19 @@ static struct {
 // the records in it.
 static uint64_t klovrp_BeginFrame(int guest_frame_index) {
     ovrp_hit("ovrp_BeginFrame");
-    (void)guest_frame_index;
-    klovrp_pose h = klovrp_head();
+    // The RENDER step's sample — the pose the guest was handed for this frame
+    // and rendered every eye from. Not a fresh read: a fresh read at this
+    // moment is a pose the picture was never drawn with, and reprojection
+    // subtracts whatever is recorded here.
+    klovrp_pose h = __atomic_load_n(&g_saw_update2, __ATOMIC_ACQUIRE)
+                    ? klovrp_step_head(KLOVRP_STEP_RENDER) : klovrp_head();
     pthread_mutex_lock(&g_frames.mu);
     uint64_t s = ++g_frames.serial;
-    int stage = (int)((s - 1) % KLOVRP_STAGES);
-    kl_ovrp_render_pose *r = &g_frames.r[stage];
+    // Into the PENDING record, not into a stage. Which stage this frame goes to
+    // is the guest's choice and is not knowable yet — it is read off the draw
+    // target at EndFrame. Filing it here under a guessed stage is what the old
+    // one-stage code got away with and what more than one stage would break.
+    kl_ovrp_render_pose *r = &g_frames.pending;
     r->px = h.px; r->py = h.py; r->pz = h.pz;
     r->qx = h.qx; r->qy = h.qy; r->qz = h.qz; r->qw = h.qw;
     // The frustum is recorded per frame rather than read live by the
@@ -528,23 +896,157 @@ static uint64_t klovrp_BeginFrame(int guest_frame_index) {
     // field of view, or it is resized by a change that happened after it.
     memcpy(r->tangents, g_eye_tan, sizeof r->tangents);
     r->serial = s;
-    r->stage = stage;
+    r->stage = -1;
     r->complete = 0;
+    // Unity's own frame counter — the number it picks its stage from.
+    g_frames.pending_index = guest_frame_index;
     pthread_mutex_unlock(&g_frames.mu);
+    // Open the observation window. Everything the guest binds as a draw target
+    // from here until EndFrame is what THIS frame committed to; a sticky
+    // "last stage" without a window answers with the previous frame's when this
+    // one drew nothing, and that answer is indistinguishable from a right one.
+    kl_glfb_begin_render_window();
     return OVRP_SUCCESS;
 }
 
 // The guest has finished submitting this frame's eyes. Only now is the stage
 // safe for a compositor to sample; before it, the record describes a picture
-// that is still being drawn.
+// that is still being drawn — and only now is the stage even *known*.
+//
+// The stage comes from kl_glfb, which watched which eye texture the guest bound
+// as its draw target. It is not derived from our own frame counter any more:
+// the counter agrees with the guest's cycle only by luck, and disagreeing means
+// pairing one frame's picture with another frame's pose, which reprojection
+// then "corrects" by a delta that was never real. Where the observation is
+// unavailable — the null GL driver, `make check`, any run without KL_GLFB —
+// the counter is still the fallback, and with a single stage it is exact.
 static uint64_t klovrp_EndFrame(int guest_frame_index) {
     ovrp_hit("ovrp_EndFrame");
-    (void)guest_frame_index;
+    // Close the observation window opened at BeginFrame. `observed` is still
+    // the sticky answer; `mask`/`binds` are what say whether it belongs to this
+    // frame, and they are the difference between an association that is known
+    // and one that is merely plausible.
+    uint32_t mask = 0, binds = 0;
+    uint64_t draw_tid = 0;
+    int observed = kl_glfb_render_stages(&mask, &binds, &draw_tid);
+    int stages = kl_ovrp_stage_count();
+    int nstages = __builtin_popcount(mask);
+
+    // The three ways the window can close badly, each named the first time it
+    // happens. All three are silent under a sticky global — that is the point.
+    if (kl_glfb_has_mtl_provider()) {
+        uint64_t self = 0;
+        pthread_threadid_np(NULL, &self);
+        static int said_none, said_multi, said_thread;
+        if (binds == 0) {
+            g_frames.unobserved++;
+            // Not held under the lock: these are diagnostics on the guest's own
+            // frame thread and a miscount is cheaper than a lock on this path.
+            if (!said_none && observed >= 0) {
+                said_none = 1;
+                fprintf(stderr, "  [ovrp] frame %d drew into NO eye stage between "
+                                "BeginFrame and EndFrame — it produced no new "
+                                "picture, so its pose is DROPPED rather than filed "
+                                "over a stage whose picture is older than it\n",
+                        guest_frame_index);
+            }
+        } else if (nstages > 1) {
+            g_frames.multi++;
+            if (!said_multi) {
+                said_multi = 1;
+                fprintf(stderr, "  [ovrp] frame %d drew into %d stages (mask 0x%x) "
+                                "— one pose per frame cannot describe that\n",
+                        guest_frame_index, nstages, mask);
+            }
+        }
+        if (binds && draw_tid && draw_tid != self) {
+            g_frames.cross_thread++;
+            if (!said_thread) {
+                said_thread = 1;
+                fprintf(stderr, "  [ovrp] eye draws are on thread %llu, EndFrame on "
+                                "%llu — the window bounds nothing and the stage is "
+                                "whatever that thread had reached\n",
+                        (unsigned long long)draw_tid, (unsigned long long)self);
+            }
+        }
+    }
+
+    // Only worth saying when something is actually sampling by stage. Under the
+    // null driver nothing renders and nothing composites, so an unobserved
+    // stage is the expected state rather than a warning — and a warning that
+    // fires on every diagnostic run is one nobody reads on the run that matters.
+    if (observed < 0 && stages > 1 && kl_glfb_has_mtl_provider()) {
+        // Loud, once. With one stage the counter is exact and this cannot
+        // matter; with more than one it is a guess, and a wrong guess files
+        // this frame's pose against the previous frame's picture — the same
+        // mismatch multiple stages exist to remove. If this line appears, the
+        // guest is attaching its eye textures through some entry point the
+        // framebuffer thunks do not watch, and KL_OVRP_STAGES=1 is the way
+        // back to a configuration that cannot be wrong.
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [ovrp] eye stage NOT observed — falling back to "
+                            "the frame counter with %d stages; if the picture "
+                            "judders, try KL_OVRP_STAGES=1\n", stages);
+        }
+    }
+    // **A frame that drew into no eye stage must not file anything.**
+    //
+    // Measured on device (PLANNING §12.19): it happens, and it never happens on
+    // the host, which is why every host measurement came back clean. Such a
+    // frame produced no new picture — so every stage still holds an image from
+    // an *earlier* frame, and writing this frame's pose over any of them makes
+    // the compositor reproject an old picture by a new pose. That is a delta
+    // that was never real, applied to one stage out of N, i.e. one frame in N
+    // displaced and the rest correct: temporal doubling whose period is the
+    // stage count. Dropping the record instead leaves every stage describing
+    // the picture it actually holds, and the compositor shows the previous
+    // frame again — which is what a frame that drew nothing *should* look like.
+    //
+    // Only when the observation has never worked at all (`observed < 0` — the
+    // null GL driver, `make check`, any run without KL_GLFB) does the counter
+    // remain the fallback. There, nothing composites and nothing reads these
+    // records, so the old behaviour is preserved rather than reasoned about.
+    int drop = binds == 0 && observed >= 0;
     pthread_mutex_lock(&g_frames.mu);
-    if (g_frames.serial) {
-        int stage = (int)((g_frames.serial - 1) % KLOVRP_STAGES);
-        g_frames.r[stage].complete = 1;
+    if (g_frames.serial && !drop) {
+        // In order of how much the answer is *known*:
+        //   the window saw exactly one stage      — measured, this frame's
+        //   the window saw several                — measured but ambiguous, take
+        //                                           the last and count it
+        //   the observation has never worked      — the counter, as before
+        int stage;
+        if (binds && nstages == 1)
+            stage = __builtin_ctz(mask);
+        else if (binds && observed >= 0 && observed < stages)
+            stage = observed;
+        else
+            stage = (int)((g_frames.serial - 1) % (unsigned)stages);
+        g_frames.pending.stage = stage;
+        g_frames.pending.complete = 1;
+        g_frames.r[stage] = g_frames.pending;
         g_frames.last_complete = stage;
+        g_frames.filed[stage]++;
+        if (!binds) g_frames.guessed++;
+
+        // **The measurement that decides how the stage should be derived.**
+        // Unity picks the stage it renders into from its own frame counter, and
+        // hands us that counter here and at BeginFrame. If `index % stages`
+        // agrees with the FBO we watched it draw into, then the index is the
+        // concrete answer and the sticky observation can go — and if they
+        // disagree, the difference IS the off-by-one that makes two stages
+        // double. Either way this stops being inferred.
+        int from_index = ((guest_frame_index % stages) + stages) % stages;
+        if (stages > 1 && observed >= 0) {
+            static unsigned n;
+            if (from_index != stage) g_frames.stage_disagree++;
+            if (n++ < 8 || (from_index != stage && g_frames.stage_disagree < 4))
+                fprintf(stderr, "  [ovrp] stage: guest frame %d %% %d = %d, "
+                                "observed %d%s\n", guest_frame_index, stages,
+                        from_index, observed,
+                        from_index == stage ? "" : "   <-- DISAGREE");
+        }
     }
     pthread_mutex_unlock(&g_frames.mu);
     return OVRP_SUCCESS;
@@ -557,6 +1059,22 @@ int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out) {
     if (have) *out = g_frames.r[stage];
     pthread_mutex_unlock(&g_frames.mu);
     return have;
+}
+
+// The association's health, live rather than at the end of the run.
+//
+// It belongs in the report too, but a device run normally ends by the immersive
+// space being invalidated rather than by the guest finishing, so the report is
+// the one thing that often does not get written. These go in the compositor's
+// 2-second line, which always does.
+void kl_ovrp_association_stats(uint64_t *dropped, uint64_t *multi,
+                               uint64_t *cross, uint64_t *disagree) {
+    pthread_mutex_lock(&g_frames.mu);
+    if (dropped)  *dropped  = g_frames.unobserved;
+    if (multi)    *multi    = g_frames.multi;
+    if (cross)    *cross    = g_frames.cross_thread;
+    if (disagree) *disagree = g_frames.stage_disagree;
+    pthread_mutex_unlock(&g_frames.mu);
 }
 
 int kl_ovrp_last_complete_stage(void) {
@@ -578,7 +1096,6 @@ int kl_ovrp_last_complete_stage(void) {
 // frontend starts driving them — and stay in the frustum wherever the head is.
 // These were absolute tracking-space coordinates until the FloorLevel origin
 // was measured, which put them below the floor and out of view.
-static klovrp_pose g_hand_pose[2];
 static int g_hand_set[2];
 
 // Buttons/touches are ovrpButton/ovrpTouch bit values straight from the
@@ -706,7 +1223,10 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     ovrp_hit("ovrp_GetNodePoseState");
     ovrp_log_arg("ovrp_GetNodePoseState", node, __builtin_return_address(0));
     memset(out, 0, 0x58);
-    klovrp_pose head = klovrp_head();
+    // The pose for the STEP the guest asked about, which is the sample it took
+    // at ovrp_Update2 — not a live global re-read twenty times a frame. The
+    // argument was being discarded; see klovrp_Update2.
+    klovrp_pose head = klovrp_step_head(step);
     const klovrp_pose *p = &head;
     klovrp_pose hand, eye;
     if (node == 0 || node == 1) {
@@ -717,7 +1237,13 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
         float dx, dy, dz, ox, oy, oz;
         klovrp_eye_offset(node, &dx, &dy, &dz);
         klovrp_qrot(&head, dx, dy, dz, &ox, &oy, &oz);
-        eye = head;
+        // ...and this eye's own orientation, not the head's. The eye is TURNED
+        // on this display (see kl_ovrp_set_eye_rotation), and the frustum we
+        // report for it through ovrp_GetNodeFrustum2 is expressed in that
+        // turned frame — so a node pose carrying the head's orientation
+        // describes an eye that does not exist, and the guest renders the right
+        // cone of directions pointing the wrong way.
+        eye = klovrp_eye_cant() ? klovrp_qmul(&head, g_eye_rot[node]) : head;
         eye.px = head.px + ox; eye.py = head.py + oy; eye.pz = head.pz + oz;
         p = &eye;
     } else if (node == 3 || node == 4) {
@@ -746,7 +1272,7 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
             hand.py = head.py + oy;
             hand.pz = head.pz + oz;
         } else {
-            hand = klovrp_pose_read(&g_hand_pose[h]);
+            hand = klovrp_step_hand(step, h);
         }
         klovrp_dump_vrdevice();
         klovrp_hand_sweep(&head, &hand);
@@ -986,7 +1512,7 @@ static uint64_t klovrp_GetNativeXrApiType(int *out) {
 // IVRDeviceCallback_CreateEyeTextureResources). fmt=2 maps to sRGB, matching
 // the eye-sized color textures Unity allocates for itself (0x8c43).
 #include "kl_egl.h"
-#include "kl_glfb.h"      // kl_glfb_note_eye_texture — the capture's eye-FBO seam
+
 // GL_RGBA16F: Unity renders the scene into an RGBA16F MSAA renderbuffer
 // (measured: fmt 0x881a, samples=4, via the blit probe), and ES 3.0 makes a
 // float->unorm blit INVALID_OPERATION — the eye texture must be float to
@@ -1007,7 +1533,7 @@ static uint64_t klovrp_SetupEyeTexture2(int eye, int stage, uintptr_t handle,
     // The capture reads the frame back from the FBO this texture is attached
     // to — tell kl_glfb which names are eyes (it is a no-op consumer when the
     // null driver is doing the "rendering").
-    kl_glfb_note_eye_texture(eye, (uint32_t)handle);
+    kl_glfb_note_eye_texture(eye, stage, (uint32_t)handle);
     // P5: when the host has MTLTextures for the compositor to sample, the eye
     // texture's storage IS one of them — glEGLImageTargetTexture2DOES in place of
     // glTexStorage2D, and nothing else about this function changes (PLANNING
@@ -1124,6 +1650,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetNativeXrApiType", (void *)klovrp_GetNativeXrApiType},
     {"ovrp_GetSystemDisplayAvailableFrequencies", (void *)klovrp_GetSystemDisplayAvailableFrequencies},
     {"ovrp_SetupEyeTexture2", (void *)klovrp_SetupEyeTexture2},
+    {"ovrp_Update2", (void *)klovrp_Update2},
     {"ovrp_GetControllerHapticsDesc", (void *)klovrp_GetControllerHapticsDesc_entry},
     {"ovrp_GetDepthCompositingSupported", (void *)klovrp_GetDepthCompositingSupported},
 };
@@ -1159,7 +1686,7 @@ static const char *const g_ovrp_result_ok[] = {
     // take no out-params. BeginFrame and EndFrame have moved to real
     // implementations above — they answer the same ovrpSuccess, but they are
     // where the timewarp bookkeeping is latched.
-    "ovrp_Update2", "ovrp_EndEye2",
+    "ovrp_EndEye2",
     "ovrp_RecenterTrackingOrigin",
     // Thread-scheduling hints from PlayerSettings, set once at init; void
     // configuration like the setters above.
@@ -1290,6 +1817,42 @@ void kl_ovrp_report(FILE *f) {
     for (unsigned i = 0; i < g_novrp; i++) if (g_ovrp[i].calls) called++;
     fprintf(f, "\n=== OVRPlugin surface (M6 work list) ===\n");
     fprintf(f, "  resolved: %u, of which called: %u\n", g_novrp, called);
+    // The eye swapchain. Frames should be spread across the stages: all of them
+    // on one stage means the guest is not cycling and the compositor is reading
+    // the texture the guest is writing (see KLOVRP_STAGES_DEFAULT).
+    pthread_mutex_lock(&g_frames.mu);
+    uint64_t serial = g_frames.serial, guessed = g_frames.guessed;
+    uint64_t unobserved = g_frames.unobserved, multi = g_frames.multi;
+    uint64_t cross = g_frames.cross_thread, disagree = g_frames.stage_disagree;
+    uint64_t filed[KLOVRP_MAX_STAGES];
+    memcpy(filed, g_frames.filed, sizeof filed);
+    pthread_mutex_unlock(&g_frames.mu);
+    if (serial) {
+        fprintf(f, "  eye swapchain: %d stage(s), frames per stage",
+                kl_ovrp_stage_count());
+        for (int i = 0; i < kl_ovrp_stage_count(); i++)
+            fprintf(f, " %llu", (unsigned long long)filed[i]);
+        fprintf(f, " (%llu begun, %llu filed on a guessed stage, "
+                   "%llu where the guest's frame index disagreed)\n",
+                (unsigned long long)serial, (unsigned long long)guessed,
+                (unsigned long long)disagree);
+        // What the GL side saw, independently of any of the bookkeeping above.
+        // A stage whose draw count stops climbing is a frozen picture, and that
+        // is a different bug from a mis-filed pose even though both look like
+        // doubling in the headset.
+        fprintf(f, "  eye draw targets observed per stage:");
+        for (int i = 0; i < kl_ovrp_stage_count(); i++)
+            fprintf(f, " %llu", (unsigned long long)kl_glfb_stage_draw_count(i));
+        fprintf(f, "\n");
+        // The association's own health. All three should be 0; each non-zero
+        // one names a different reason the pose filed against a stage may not
+        // be the pose its picture was drawn with.
+        fprintf(f, "  pose<->picture association: %llu frame(s) drew into no eye "
+                   "stage, %llu into several, %llu drawn off-thread%s\n",
+                (unsigned long long)unobserved, (unsigned long long)multi,
+                (unsigned long long)cross,
+                (unobserved || multi || cross) ? "" : "  (clean)");
+    }
     fprintf(f, "  --- called ---\n");
     for (unsigned i = 0; i < g_novrp; i++)
         if (g_ovrp[i].calls) fprintf(f, "    %-44s x%u\n", g_ovrp[i].name, g_ovrp[i].calls);

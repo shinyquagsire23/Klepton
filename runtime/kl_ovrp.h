@@ -45,13 +45,29 @@ int kl_ovrp_tracking_origin(void);
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
 
-// The same pose back out, as the guest would be told it right now — including
-// the standing-eye-height default a headless run gets. The compositor needs it
-// to measure how far the head has moved since a frame was rendered, and a
-// frontend that reads back what it wrote is measuring the thing the guest
-// actually saw rather than its own bookkeeping.
+// The pose the FRONTEND last published — where the head is now, including the
+// standing-eye-height default a headless run gets. This is the display side's
+// number: the viewer's composite reprojects towards it. It is deliberately not
+// the pose the guest is currently seeing, which is pinned per frame below.
 void kl_ovrp_get_head_pose(float *px, float *py, float *pz,
                            float *qx, float *qy, float *qz, float *qw);
+
+// Start a guest frame: promote the published poses to the ones the guest will
+// see for the whole of it.
+//
+// **Call this once, at the top of every guest frame, before anything in the
+// frame can ask for a pose.** The frontend publishes at display rate on its own
+// thread; without this the answer to "where is the head" changes *during* a
+// guest frame, and the pose recorded for timewarp is then not the pose the
+// picture was drawn from. Reprojection subtracts that record, so the error is
+// one guest frame of head rotation applied in the wrong direction — which is
+// visible as the image doubling during head turns, and grows exactly as the
+// frame rate falls. See the long comment in kl_ovrp.c.
+//
+// Idempotent in the sense that calling it more often than once per frame is not
+// unsafe, only less useful: each call re-pins to the newest published pose.
+// KL_OVRP_LATCH=0 disables it and restores the live read.
+void kl_ovrp_frame_latch(void);
 
 // M7 — the rest of the pose-in seam: the two Touch controllers. `hand` is
 // 0 = left (node 3), 1 = right (node 4). Poses live in the same tracking
@@ -110,6 +126,21 @@ int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out);
 // a caller has any business passing to the call above.
 int kl_ovrp_last_complete_stage(void);
 
+// How many swapchain stages we tell the guest it has (KL_OVRP_STAGES). The
+// answer to ovrp_GetEyeTextureStageCount, so it bounds every (eye, stage) key
+// in the system — a compositor iterating stages must use this rather than its
+// own idea of how many there are.
+int kl_ovrp_stage_count(void);
+
+// How the pose<->picture association is holding up, readable at any time.
+// `dropped` counts guest frames that drew into no eye stage and whose pose was
+// therefore not filed at all; `multi` those that drew into several; `cross`
+// those drawn by a thread other than the one ending the frame; `disagree` those
+// where the guest's own frame index and the observed draw target named
+// different stages. All four should be 0. Any argument may be NULL.
+void kl_ovrp_association_stats(uint64_t *dropped, uint64_t *multi,
+                               uint64_t *cross, uint64_t *disagree);
+
 // The frustum-in seam. By default kl_ovrp reports a coherent symmetric 90°
 // frustum, which is what every host run has used. A frontend that knows the
 // display's real per-eye field of view can push it here and the guest will
@@ -141,6 +172,17 @@ void kl_ovrp_set_eye_frustum(int eye, float left, float right, float top, float 
 // KL_OVRP_IPD=<metres> overrides both eyes with a symmetric ±IPD/2 and is the
 // A/B for "is the separation the compositor pushed the right one".
 void kl_ovrp_set_eye_offset(int eye, float x, float y, float z);
+
+// The other half of the same seam: this eye's ORIENTATION relative to the head
+// — the cant. On Vision Pro the displays are angled outward, so an eye is not
+// merely displaced from the head, it is turned; and the frustum reported for
+// that eye (kl_ovrp_set_eye_frustum) is expressed in the turned frame. Pushing
+// the tangents without the rotation describes an eye that does not exist, and
+// the guest then renders the correct shape of frustum aimed the wrong way.
+//
+// Identity until a frontend says otherwise, so host runs are unchanged.
+// KL_OVRP_EYE_CANT=0 ignores whatever is pushed here.
+void kl_ovrp_set_eye_rotation(int eye, float qx, float qy, float qz, float qw);
 
 // The display frequency the guest is told the headset runs at
 // (ovrp_GetSystemDisplayFrequency, and the single entry in

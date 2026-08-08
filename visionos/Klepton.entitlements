@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Memory. Both keys are supported on visionOS, neither needs Apple's approval
+  (Xcode's own capability database: supportedSDKs includes VISION_OS,
+  distributionApprovalRequired false), and automatic signing adds them to the
+  App ID on the next build with -allowProvisioningUpdates.
+
+  We want them because this app is not shaped like a normal one: it hosts a
+  whole other runtime. Measured on device at three swapchain stages, the
+  footprint is ~3.5 GB — IL2CPP's heap, Unity's assets and textures, ANGLE, and
+  ~490 MB of eye textures, with a transient spike at every loading transition
+  where two generations of the eye swapchain are briefly live at once.
+
+  increased-memory-limit
+      Raises the jetsam limit — how much the app may use before the OS kills it.
+      This is the one that matters for the transition spike.
+
+  extended-virtual-addressing
+      Raises the limit on address SPACE rather than resident memory. A separate
+      ceiling, and one this design leans on independently of footprint: the
+      guest ELF images are mmapped, the veneer pool and stub cells are mapped,
+      ANGLE maps its own, and the synthetic /proc tree is materialised on disk
+      and mapped too. Address space is cheap to consume and expensive to
+      discover you have run out of.
+
+  NOT increased-debugging-memory-limit: iOS only, no VISION_OS in its
+  supportedSDKs, and an entitlement the platform does not know is a
+  provisioning failure rather than a no-op.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+</dict>
+</plist>

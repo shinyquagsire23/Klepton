@@ -57,9 +57,12 @@
 #include <simd/simd.h>
 #include "kl_ovrp.h"
 
-// The distance the guest's picture is placed at, in metres. Far enough that the
-// eye offset and the dropped translation are irrelevant, near enough to stay
-// well inside any sane projection. ALVR uses the same 500 m for the same reason.
+// The distance the guest's picture is placed at, in metres. The quad is
+// eye-centred, so this does not affect our own picture at all — it is what the
+// SYSTEM's depth-based reprojection is told about our content, and placing it
+// far away is what keeps that correction rotational. See kl_reproject_build for
+// the full argument and for why the 2 m that sat here was a misattribution.
+// ALVR uses the same 500 m. KL_REPROJECT_DEPTH overrides it at runtime.
 #define KL_REPROJECT_DEPTH 500.0f
 
 // Matches the MSL struct in kl_reproject_msl(). Bound at buffer(0) for both
@@ -76,10 +79,29 @@ typedef struct {
     // the drawable's depth range — a quad beyond the far plane is clipped and
     // the display is simply black. KL_REPROJECT_DEPTH overrides it.
     float         depth;
-    uint32_t      pad[2];
+    // 0 collapses the quad off-screen instead of drawing it. This exists
+    // because the visionOS pass draws BOTH eyes in one encoder now (vertex
+    // amplification, see below) and can no longer simply skip one: an eye whose
+    // stage has no texture yet has to be expressed in the uniforms rather than
+    // by not issuing a draw. kl_reproject_build always sets it.
+    uint32_t      visible;
+    uint32_t      pad;
 } kl_reproject_uniforms;
 
 // The reprojection pass. Draw as a 4-vertex triangle strip, no vertex buffer.
+//
+// **Buffer(0) is an ARRAY of uniforms, one per amplified view**, indexed by
+// `[[amplification_id]]`. A foveated Compositor Services drawable hands out one
+// rasterization rate map for the whole layered render pass, and Metal applies a
+// rate map's layer N to render-target array index N — which a pass that binds a
+// single slice cannot address. So both eyes must be drawn in one pass with
+// renderTargetArrayLength = 2 and vertex amplification, which is also what
+// Apple's own template and ALVR do. A one-eye caller (the macOS viewer,
+// t_reproject) binds a single struct and gets amplification_id 0, unchanged.
+//
+// `slice` reaches the fragment stage through a flat varying rather than the
+// uniform buffer, for the same reason: the fragment shader has no
+// amplification_id to index with.
 const char *kl_reproject_msl(void);
 
 // The plain blit the viewer used before any of this existed: a full-screen
@@ -132,5 +154,15 @@ simd_float4 kl_reproject_tangents(simd_float4x4 projection);
 // value means frames are being reused.
 float kl_reproject_delta_degrees(const kl_ovrp_render_pose *rendered,
                                  simd_float4x4 origin_from_device);
+
+// The NDC depth (z/w) the quad's centre actually lands at, given built uniforms.
+//
+// This exists because "is the quad too far to be shown" was argued about for a
+// release and settled wrongly (see kl_reproject_build). It is one line of
+// arithmetic against the projection the drawable really handed us, so the
+// compositor can print it beside the drawable's own depthRange and the question
+// stops being a matter of opinion. Reverse-Z, so near maps towards 1 and far
+// towards 0; anything in [0,1] is inside the clip range.
+float kl_reproject_ndc_depth(const kl_reproject_uniforms *u);
 
 #endif

@@ -132,7 +132,7 @@ static void *g_dpy, *g_surf, *g_ctx, *g_cfg;
 static void *(*a_eglCreateContext)(void *, void *, void *, const int32_t *);
 static void *(*a_eglCreatePbufferSurface)(void *, void *, const int32_t *);
 static int   g_on = -1, g_ready;
-static int   g_w = 1832, g_h = 1920;      // one eye, Quest 2 per-eye default
+static int   g_w = 4000, g_h = 3200;      // one eye, Quest 2 per-eye default
 static unsigned g_presented;
 
 int kl_glfb_enabled(void) {
@@ -859,10 +859,29 @@ static void klfb_GenFramebuffers(int32_t n, uint32_t *ids) {
         fprintf(stderr, "  [glfb] t%llu glGenFramebuffers(%d) -> %u\n",
                 (unsigned long long)klfb_tid(), n, ids[0]);
 }
+// The stage observation, defined with the eye-texture table further down.
+static int  klfb_stage_of_tex(uint32_t tex);
+static int  klfb_stage_of_fbo(uint32_t fbo);
+static void klfb_map_fbo(uint32_t fbo, uint32_t tex);
+static void klfb_note_render_stage(int stage);
+static uint32_t g_draw_fb;
+
+// Is this target a DRAW binding? GL_FRAMEBUFFER binds both.
+static int klfb_is_draw_target(uint32_t target) {
+    return target == 0x8D40 /* FRAMEBUFFER */ || target == 0x8CA9 /* DRAW_FRAMEBUFFER */;
+}
+
 static void klfb_BindFramebuffer(uint32_t target, uint32_t fb) {
     if (klfb_trace_fbo())
         fprintf(stderr, "  [glfb] t%llu glBindFramebuffer(0x%x, %u)\n",
                 (unsigned long long)klfb_tid(), target, fb);
+    if (klfb_is_draw_target(target)) {
+        g_draw_fb = fb;
+        // Which stage this frame is going into. Sticky: a guest that binds an
+        // eye FBO and then bounces through others (shadow maps, post) has still
+        // last committed to this stage, and the next eye bind is what moves it.
+        klfb_note_render_stage(klfb_stage_of_fbo(fb));
+    }
     if (g_real_BindFramebuffer) g_real_BindFramebuffer(target, fb);
 }
 static void klfb_FramebufferTexture2D(uint32_t target, uint32_t attachment,
@@ -871,6 +890,14 @@ static void klfb_FramebufferTexture2D(uint32_t target, uint32_t attachment,
     if (klfb_trace_fbo())
         fprintf(stderr, "  [glfb] t%llu glFramebufferTexture2D(att=0x%x, tex=%u)\n",
                 (unsigned long long)klfb_tid(), attachment, texture);
+    // Colour attachment 0 only: the eye texture is what the picture lands in,
+    // and a depth or stencil attachment says nothing about which stage it is.
+    if (klfb_is_draw_target(target) && attachment == 0x8CE0 /* COLOR_ATTACHMENT0 */) {
+        klfb_map_fbo(g_draw_fb, texture);
+        // Unity may attach per frame rather than bind a pre-built FBO, so the
+        // attachment itself has to count as committing to a stage.
+        klfb_note_render_stage(klfb_stage_of_tex(texture));
+    }
     if (g_real_FramebufferTexture2D)
         g_real_FramebufferTexture2D(target, attachment, textarget, texture, level);
 }
@@ -1028,9 +1055,146 @@ static int klfb_tex_info(uint32_t name, uint32_t *fmt, int32_t *w, int32_t *h) {
 // color attachment is one of these.
 static uint32_t g_eye_tex[2];
 
-void kl_glfb_note_eye_texture(int eye, uint32_t tex) {
+// ...and by (eye, stage), which is what the stage observation needs. Each stage
+// is a distinct GL texture name — Unity asks for storage per (eye, stage)
+// through ovrp_SetupEyeTexture2 — so the name the guest draws into IS the
+// stage, with nothing to infer.
+#define KLFB_MAX_STAGES 4
+static uint32_t g_eye_tex_stage[2][KLFB_MAX_STAGES];
+
+void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex) {
     if (eye < 0 || eye > 1 || !tex) return;
     g_eye_tex[eye] = tex;
+    if ((unsigned)stage >= KLFB_MAX_STAGES) return;
+    // GL recycles names, and Unity re-creates the whole eye swapchain on
+    // resize. A name that used to mean some other (eye, stage) must stop
+    // answering for it the moment it is re-registered: klfb_stage_of_tex
+    // returns the FIRST match, so one stale entry files a frame's pose against
+    // a different stage's picture for the rest of the run — permanently, and
+    // silently, because every count still looks healthy.
+    for (int e = 0; e < 2; e++)
+        for (int s = 0; s < KLFB_MAX_STAGES; s++)
+            if (g_eye_tex_stage[e][s] == tex) g_eye_tex_stage[e][s] = 0;
+    g_eye_tex_stage[eye][stage] = tex;
+}
+
+// Which stage is the current draw target, and which was last drawn into.
+//
+// Two thunks maintain this between them: glFramebufferTexture2D says which
+// texture an FBO draws into, glBindFramebuffer says which FBO is current. The
+// map is tiny and the lookups are linear because there are two or three eye
+// FBOs in this title and the alternative is a hash table for six entries.
+//
+// The map stores the TEXTURE, not the stage it resolved to at the time. The
+// texture is the identity; the stage is a fact about the texture that changes
+// when Unity re-creates the swapchain, and an FBO whose attachment is unchanged
+// must follow it. Caching the resolved stage instead leaves entries that
+// outlive their meaning and answer confidently afterwards.
+#define KLFB_FBO_MAP 16
+static struct { uint32_t fbo, tex; } g_fbo_stage[KLFB_FBO_MAP];
+static int      g_render_stage = -1;    // the last eye stage actually bound for drawing
+
+int kl_glfb_last_render_stage(void) {
+    return __atomic_load_n(&g_render_stage, __ATOMIC_RELAXED);
+}
+
+// The stage an eye texture name belongs to, or -1.
+static int klfb_stage_of_tex(uint32_t tex) {
+    if (!tex) return -1;
+    for (int e = 0; e < 2; e++)
+        for (int s = 0; s < KLFB_MAX_STAGES; s++)
+            if (g_eye_tex_stage[e][s] == tex) return s;
+    return -1;
+}
+
+static int klfb_stage_of_fbo(uint32_t fbo) {
+    for (int i = 0; i < KLFB_FBO_MAP; i++)
+        if (g_fbo_stage[i].fbo == fbo) return klfb_stage_of_tex(g_fbo_stage[i].tex);
+    return -1;
+}
+
+static void klfb_map_fbo(uint32_t fbo, uint32_t tex) {
+    if (!fbo) return;
+    for (int i = 0; i < KLFB_FBO_MAP; i++)
+        if (g_fbo_stage[i].fbo == fbo) { g_fbo_stage[i].tex = tex; return; }
+    // Only eye FBOs earn one of the sixteen slots. This title has plenty of
+    // other framebuffers, and remembering the first sixteen it happens to
+    // create would leave no room for the ones the observation is about.
+    if (klfb_stage_of_tex(tex) < 0) return;
+    for (int i = 0; i < KLFB_FBO_MAP; i++)
+        if (!g_fbo_stage[i].fbo) { g_fbo_stage[i].fbo = fbo;
+                                   g_fbo_stage[i].tex = tex; return; }
+}
+
+// --- The observation window -------------------------------------------------
+//
+// `g_render_stage` alone is a sticky global, and a sticky global answers even
+// when nothing happened. That is the whole weakness of the association: at
+// ovrp_EndFrame it reports *a* stage whether or not this frame drew into one,
+// so a guest whose draws land outside the Begin..End window — a different
+// thread, an entry point these thunks do not watch — gets the previous frame's
+// answer with no way to tell.
+//
+// So the window is explicit. kl_ovrp opens one at BeginFrame and reads it at
+// EndFrame, and what comes back is not just "which stage" but *how many* eye
+// binds happened inside the window and on which thread. Those two numbers turn
+// three different failures into three different readings:
+//
+//   binds == 0        nothing drew into an eye texture between Begin and End.
+//                     The stage below is the PREVIOUS frame's, i.e. exactly the
+//                     off-by-one that pairs a fresh pose with a stale picture.
+//   two stages set    the frame committed to more than one stage, so "one
+//                     stage per frame" — which the pose record assumes — is
+//                     false for this title.
+//   tid != EndFrame's the draws are on another thread and the window bounds
+//                     nothing; ordering, not observation, is the problem.
+//
+// Counted rather than sampled, because the artefact this is chasing alternates:
+// a probe that fires every N frames sees one phase of it and reports it as the
+// steady state.
+static uint32_t g_render_mask;          // bit per stage drawn into, this window
+static uint32_t g_render_binds;         // eye binds this window
+static uint64_t g_render_tid;           // who did the last of them
+static uint64_t g_stage_binds[KLFB_MAX_STAGES];   // ...and for the whole run
+
+// pthread_threadid_np is cheap but not free, and this sits under every
+// glBindFramebuffer. Once per thread is enough — the id cannot change.
+static uint64_t klfb_tid_cached(void) {
+    static __thread uint64_t t;
+    if (!t) pthread_threadid_np(NULL, &t);
+    return t;
+}
+
+void kl_glfb_begin_render_window(void) {
+    __atomic_store_n(&g_render_mask, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_render_binds, 0, __ATOMIC_RELAXED);
+}
+
+int kl_glfb_render_stages(uint32_t *mask, uint32_t *binds, uint64_t *tid) {
+    if (mask)  *mask  = __atomic_load_n(&g_render_mask, __ATOMIC_RELAXED);
+    if (binds) *binds = __atomic_load_n(&g_render_binds, __ATOMIC_RELAXED);
+    if (tid)   *tid   = __atomic_load_n(&g_render_tid, __ATOMIC_RELAXED);
+    return __atomic_load_n(&g_render_stage, __ATOMIC_RELAXED);
+}
+
+uint64_t kl_glfb_stage_draw_count(int stage) {
+    if ((unsigned)stage >= KLFB_MAX_STAGES) return 0;
+    return __atomic_load_n(&g_stage_binds[stage], __ATOMIC_RELAXED);
+}
+
+// Called from both thunks: a stage is now the draw target. Reported once, so a
+// log says whether the observation is working at all rather than leaving the
+// counter fallback to be discovered by its symptoms.
+static void klfb_note_render_stage(int stage) {
+    if (stage < 0) return;
+    int was = __atomic_exchange_n(&g_render_stage, stage, __ATOMIC_RELAXED);
+    __atomic_fetch_or(&g_render_mask, 1u << stage, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_render_binds, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_stage_binds[stage], 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_render_tid, klfb_tid_cached(), __ATOMIC_RELAXED);
+    if (was < 0)
+        fprintf(stderr, "  [glfb] eye stage observed from the draw target "
+                        "(first: stage %d)\n", stage);
 }
 
 // ---------------------------------------------------------------------------

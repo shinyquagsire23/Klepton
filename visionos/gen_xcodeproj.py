@@ -29,6 +29,31 @@ import os, subprocess, sys, re
 HERE = os.path.dirname(os.path.abspath(__file__))
 NAME = "Klepton"
 BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", "dev.klepton.app")
+
+# Klepton.entitlements — the two memory capabilities (see that file for what
+# they buy and why this app wants them). **On by default: they fixed the
+# loading-transition kills on device, so a build without them is the unusual
+# one.**
+#
+# KLEPTON_ENTITLEMENTS=0 detaches them, and the reason to keep that escape hatch
+# is that this is an account setting as much as a build setting. Both keys need
+# an EXPLICIT App ID with the capabilities enabled on it; the team's *wildcard*
+# profile cannot carry capabilities at all, and attaching them to one does not
+# degrade — it fails the build outright:
+#
+#   error: Provisioning profile "iOS Team Provisioning Profile: *" doesn't
+#          support the Extended Virtual Addressing and Increased Memory Limit
+#          capability.
+#   error: Failed Registering Bundle Identifier: the app identifier
+#          "dev.klepton.app" cannot be registered to your development team
+#
+# That pair of errors means the App ID is not set up, not that the entitlements
+# are wrong. Enable both capabilities on it (Xcode > Settings > Accounts, or the
+# developer portal) — or build with KLEPTON_ENTITLEMENTS=0 to get moving without
+# them, at the cost of the memory headroom.
+ENTITLEMENTS = os.environ.get("KLEPTON_ENTITLEMENTS", "1") != "0"
+ENTITLEMENTS_SETTING = ("\t\t\t\tCODE_SIGN_ENTITLEMENTS = Klepton.entitlements;\n"
+                        if ENTITLEMENTS else "")
 GUEST = ["libmain", "lib_burst_generated", "libunityopus", "libunity", "libil2cpp"]
 ANGLE = ["ANGLE_libEGL", "ANGLE_libGLESv2"]
 # Both sets are embedded-not-linked, so the pbxproj treatment is identical and
@@ -105,7 +130,7 @@ fwchildren = "\n".join(f'\t\t\t\t{g["ref"]},' for g in guest)
 
 COMMON = f"""
 				CLANG_ENABLE_MODULES = YES;
-				CODE_SIGN_STYLE = Automatic;
+{ENTITLEMENTS_SETTING}				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = {TEAM};
 				ENABLE_PREVIEWS = NO;
@@ -378,6 +403,8 @@ def main():
         f.write(PBX)
     print(f"wrote {proj}")
     print(f"  DEVELOPMENT_TEAM = {TEAM or '(NOT DETECTED - set KLEPTON_TEAM)'}")
+    print(f"  CODE_SIGN_ENTITLEMENTS = "
+          f"{'Klepton.entitlements' if ENTITLEMENTS else '(none - KLEPTON_ENTITLEMENTS=0)'}")
     print(f"  PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID}")
     print(f"  embedded guest frameworks: {', '.join(GUEST)}")
     print(f"  embedded ANGLE:            {', '.join(ANGLE)}")
