@@ -66,6 +66,38 @@ KL_VTHUNK klv_open,               klh_open,              2
 KL_VTHUNK klv_fcntl,              klh_fcntl,             2
 KL_VTHUNK klv_ioctl,              klh_ioctl,             2
 
+// ---- JNI's plain varargs Call*Method family ----
+// These are NOT libc. They are JNIEnv vtable slots, and they need thunks for
+// precisely the same reason libc's do: a C guest calls
+// `(*env)->CallStaticBooleanMethod(env, cls, mid, ...)` and the variadic
+// arguments arrive in registers, with no va_list anywhere to forward.
+//
+// Beat Saber never reached these — Unity is C++, so jni.h's inline wrappers
+// va_start and call the ...V forms, which already receive an AAPCS64 descriptor
+// by reference. Steam Link is C. (PLANNING §11.5, §11.6.)
+//
+// Named GP args are 3 throughout: (env, obj|cls, methodID). The handlers in
+// kl_jni.c forward straight to the matching ...V implementation, so the return
+// value comes back in w0/x0/d0 untouched by the epilogue below.
+.macro KL_JNITHUNK Name
+    KL_VTHUNK klv_jni_Call\Name\()Method,       klh_jni_Call\Name\()Method,       3
+    KL_VTHUNK klv_jni_CallStatic\Name\()Method, klh_jni_CallStatic\Name\()Method, 3
+.endm
+
+KL_JNITHUNK Object
+KL_JNITHUNK Boolean
+KL_JNITHUNK Byte
+KL_JNITHUNK Char
+KL_JNITHUNK Short
+KL_JNITHUNK Int
+KL_JNITHUNK Long
+KL_JNITHUNK Float
+KL_JNITHUNK Double
+KL_JNITHUNK Void
+
+// A constructor takes (env, class, methodID) named, same as the rest.
+KL_VTHUNK klv_jni_NewObject, klh_jni_NewObject, 3
+
 // ---- long double returns ----
 // Linux/aarch64 returns `long double` (IEEE binary128) in q0; Darwin returns a
 // 64-bit double in d0. Compute in double, then widen into q0 for the guest.

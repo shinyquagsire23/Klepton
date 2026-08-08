@@ -79,6 +79,17 @@ void kl_jni_set_apk_path(const char *path);
 // it explicitly or Unity reads back a path like "//beatsaber/lib/arm64-v8a".
 void kl_jni_set_native_lib_dir(const char *dir);
 
+// One `SDL_ENV.<key>` <meta-data> entry from the app's AndroidManifest.xml, with
+// the prefix already stripped. SDLActivity.getManifestEnvironmentVariables()
+// walks these and calls nativeSetenv on each, so they are real behaviour and not
+// decoration — SDL_ANDROID_TRAP_BACK_BUTTON changes event routing, and
+// STEAM_LINK_VR is how Steam Link's own code knows which build it is.
+//
+// The caller supplies them because the two Steam Link APKs genuinely differ here
+// (the VR build adds STEAM_LINK_VR), so a table baked into the runtime would be
+// wrong for one of them. Same reasoning as kl_jni_set_activity_class().
+void kl_jni_add_manifest_env(const char *key, const char *value);
+
 // Everything the guest asked us for: classes found, natives registered, and
 // every method/field id it wanted. This is the M4 work list.
 void kl_jni_report(FILE *out);

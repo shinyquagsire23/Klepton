@@ -26,6 +26,16 @@
 #   ./build_run_slink.sh --gl         # ANGLE instead of the null GL driver. Steam
 #                                     #   Link is GLES2-only, so this is the real
 #                                     #   path once anything draws
+#   ./build_run_slink.sh --main       # SL-2: drive onCreate through nativeRunMain
+#                                     #   into SDL_main, so the app actually starts.
+#                                     #   Implies --gl (the null driver stops at
+#                                     #   glCheckFramebufferStatus by design)
+#   ./build_run_slink.sh --view       # ...and put it in a window (kl_view.c). Steam
+#                                     #   Link is a FLAT app, so the viewer is its
+#                                     #   real output device, not a debugging aid.
+#                                     #   Runs until you close the window: no
+#                                     #   timeout, because there is no deadline on
+#                                     #   a person looking at something
 #   ./build_run_slink.sh --nofork     # run in-process (required under lldb: macOS
 #                                     #   lldb follows neither fork nor exec)
 #   ./build_run_slink.sh --trace-fs   # log every guest file op ('=fail' via env)
@@ -43,12 +53,18 @@ LIBDIR="${KL_SLINK_LIBDIR:-steamlink-android/lib/arm64-v8a}"
 LOG="${KL_LOG_OUT:-/tmp/slink.log}"
 TIMEOUT="${KL_TIMEOUT:-180}"
 LOG_ONLY=""
+VIEW=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --gap)         export KL_GAP_ONLY=1; export KL_NOFORK=1; shift ;;
     --permissive)  export KL_PERMISSIVE=1; shift ;;
     --gl)          export KL_GLFB=1; shift ;;
+    # --main and --view both imply the real GL path: the null driver stops at
+    # glCheckFramebufferStatus, so SL-2 cannot be reached on it at all.
+    --main)        export KL_SLINK_MAIN=1; export KL_GLFB=1; export KL_NOFORK=1; shift ;;
+    --view)        export KL_VIEW=1; export KL_GLFB=1; export KL_NOFORK=1
+                   VIEW=1; shift ;;
     --nofork)      export KL_NOFORK=1; shift ;;
     --trace-fs)    export KL_TRACE_FS=1; shift ;;
     --trace-net)   export KL_TRACE_NET=1; shift ;;
@@ -98,6 +114,32 @@ summarise() {
       "$LOG" | sed 's/^ *//; s/^/    /' || true
     g -E '^  (natives registered|ids requested|classes found):' "$LOG" \
       | sed 's/^ *//; s/^/    /' || true
+  fi
+
+  # ---- SL-2: did the app actually start, and did it draw? ----
+  #
+  # Two numbers decide whether a window is black for an interesting reason.
+  # SWAPS is the honest one: no eglSwapBuffers means the guest never presented a
+  # frame, so nothing downstream — sink, compositor, window — can be at fault.
+  # And `SDL_main returned` means the guest EXITED, which for this app is the
+  # normal no-host outcome, not a crash. Printing them together is what stops a
+  # black window being mistaken for a rendering bug.
+  if g -q 'phase 4' "$LOG"; then
+    echo "  -- SL-2: the app --"
+    g -E 'Audio initialized|Video initialized|Desktop mode|Created .* renderer|Initialized player|present\]|guest is (MONO|STEREO)' \
+      "$LOG" | sed 's/^\[[0-9]*\/SDL\/APP\] //; s/^ *//; s/^/    /' | awk '!seen[$0]++' || true
+    local swaps
+    swaps=$(g -cE 'view: \[mono\] frame|eglSwapBuffers' "$LOG" 2>/dev/null || echo 0)
+    g -E 'MESSAGEBOX' "$LOG" | sed 's/^\[jni\] /    /' || true
+    if g -q 'nativeRunMain returned' "$LOG"; then
+      echo "    NOTE: SDL_main RETURNED — the guest exited on its own."
+      echo "          With no Steam host on the network that is the app's normal"
+      echo "          path, and it exits before drawing anything. A black window"
+      echo "          here is the guest not running, not the compositor."
+    fi
+    local lit
+    lit=$(g -oE 'lit=[0-9]+' "$LOG" | g -vE 'lit=0$' | head -1)
+    echo "    frames drawn: $(g -oE 'frame [0-9]+' "$LOG" | tail -1 | awk '{print $2+0}')${lit:+, $lit}"
   fi
 
   # ---- where it stopped, by name ----
@@ -168,7 +210,14 @@ echo "log       : $LOG"
 # buffer — you get a dozen lines and no report, which reads as a much earlier
 # failure than actually happened. A pipe straight to head/sed is the other half
 # of the same trap: the child forks, and the report arrives out of order.
-timeout "$TIMEOUT" script -q /dev/null ./build/t_slink "$LIBDIR" > "$LOG" 2>&1
+if [ -n "$VIEW" ]; then
+  # No timeout: the run ends when the window is closed. The window IS the
+  # output here, so the log is for afterwards rather than for watching.
+  echo "            (window open — close it to end the run)"
+  script -q /dev/null ./build/t_slink "$LIBDIR" > "$LOG" 2>&1
+else
+  timeout "$TIMEOUT" script -q /dev/null ./build/t_slink "$LIBDIR" > "$LOG" 2>&1
+fi
 rc=$?
 echo
 case $rc in

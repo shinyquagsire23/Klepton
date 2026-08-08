@@ -58,6 +58,7 @@
 #include <math.h>          // powf — the debug tone map in the capture path
 #include <zlib.h>
 #include "kl_glfb.h"
+#include "kl_present.h"
 #include "kl_egl.h"        // kl_gl_cap_* — the capability tables
 #include "klepton.h"       // kl_trace_stub, for the per-name GL call trace
 
@@ -1065,6 +1066,11 @@ static uint32_t g_eye_tex_stage[2][KLFB_MAX_STAGES];
 void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex) {
     if (eye < 0 || eye > 1 || !tex) return;
     g_eye_tex[eye] = tex;
+    // An eye pair is what distinguishes a VR guest from a flat one, and it is
+    // the stronger signal of the two kl_present watches: Unity creates an EGL
+    // window surface as well, being an Android app, so the window alone cannot
+    // tell them apart. See kl_present.h.
+    kl_present_note_eye_texture();
     if ((unsigned)stage >= KLFB_MAX_STAGES) return;
     // GL recycles names, and Unity re-creates the whole eye swapchain on
     // resize. A name that used to mean some other (eye, stage) must stop

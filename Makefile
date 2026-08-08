@@ -18,7 +18,7 @@ RUNTIME_SHIP := runtime/kl_image.c runtime/kl_stub_cells.S runtime/kl_shim.c run
            runtime/kl_libc.c runtime/kl_libc_slink.c runtime/kl_pthread.c runtime/kl_dl.c \
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
-           runtime/kl_ovrp_sret.S runtime/kl_reproject.c \
+           runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
            runtime/kl_ovrplat.c runtime/kl_mediandk.c runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_il2cpp.c runtime/kl_fault.c
 RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c
@@ -49,9 +49,22 @@ load: build/t_load
 # SL-1 — the second target's boot harness (PLANNING §11). Links the same
 # runtime as t_boot, minus the host-only diagnostics: this target has no
 # managed side to probe and no viewer yet.
-build/t_slink: tests/t_slink.c $(RUNTIME) runtime/klepton.h runtime/kl_jni.h
+#
+# It links the SDL viewer for the same reason t_boot does: Steam Link is a FLAT
+# app, so the viewer is not a debugging aid here — it is the app's actual
+# output device. kl_view_mtl.m and tests/t_mtl_provider.m come with it because
+# kl_view.c references both; the mono path uses neither (no eye textures to
+# provide, and the readback sink needs no Metal interop), but the symbols must
+# resolve.
+build/t_slink: tests/t_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
+               runtime/kl_view_mtl.m runtime/klepton.h runtime/kl_jni.h \
+               runtime/kl_view.h runtime/kl_view_mtl.h tests/t_mtl_provider.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tests/t_slink.c $(RUNTIME) $(LDLIBS)
+	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
+	  tests/t_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
+	  runtime/kl_view_mtl.m \
+	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
+	  $(shell pkg-config --libs sdl3)
 
 slink: build/t_slink
 	./build/t_slink
@@ -62,6 +75,18 @@ slink: build/t_slink
 SLVRLIBS := steamlink-vr/lib/arm64-v8a
 slink-vr: build/t_slink
 	./build/t_slink $(SLVRLIBS)
+
+# SL-2: onCreate's whole sequence, through nativeRunMain into SDL_main, with the
+# app reaching its own renderer. Needs ANGLE (KL_GLFB=1) — the null GL driver
+# stops at glCheckFramebufferStatus by design, so this is a real-GL gate.
+#
+# Expected: exit 0, "Created opengles2 renderer on android", "Initialized
+# player", and a MESSAGEBOX reporting no streaming host on the network. That
+# last line is SUCCESS, not failure: it is the app having got all the way to
+# looking for a Steam machine to stream from. A picture needs a host (and then
+# AMediaCodec); everything before that point is what this gate covers.
+slink-main: build/t_slink
+	KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 ./build/t_slink $(SLVRLIBS)
 
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 	@mkdir -p build

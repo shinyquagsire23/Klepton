@@ -35,6 +35,7 @@
 #include "kl_glfb.h"     // kl_glfb_last_frame_lit — the HUD's liveness signal
 #include "kl_view_mtl.h" // the hardware composite path
 #include "kl_ovrp.h"     // kl_ovrp_set_head_pose — the pose-in seam
+#include "kl_present.h"  // mono vs stereo — which shape of picture the guest makes
 
 #if __has_include(<SDL3/SDL.h>)
 #define KL_VIEW_HAVE_SDL 1
@@ -221,6 +222,20 @@ int kl_view_main(const char *libdir, int hw) {
     view_cpu_disp disp = {0};      // the readback path's staging; unused when hw
     int hw_up = 0, hw_warned = 0;  // the compositor starts lazily — see the loop
 
+    // Which SHAPE of picture the guest is producing (kl_present.h). This cannot
+    // be decided before the loop: the guest runs on another thread and has not
+    // created its window surface or its eye textures yet when we get here, so
+    // the mode is NONE for the first frames of every run. Hence the generation
+    // check inside the loop rather than a query outside it — and hence
+    // kl_present exposing a generation at all.
+    //
+    // Mono is a flat app (Steam Link): no pose to drive, no stereo, and the
+    // readback sink is the whole frame path. Driving kl_ovrp in that mode would
+    // be writing poses nothing will ever read, and the HUD would report a head
+    // position for an app that has no head.
+    unsigned pres_gen = ~0u;
+    int mono = 0;
+
     int done = 0;
     uint64_t t_prev = SDL_GetTicks();
     uint64_t t_start = t_prev, hud_last = t_prev;
@@ -229,6 +244,31 @@ int kl_view_main(const char *libdir, int hw) {
         float dt = (float)(t_now - t_prev) / 1000.0f;
         if (dt > 0.1f) dt = 0.1f;  // a stall is not a teleport
         t_prev = t_now;
+
+        // Act on a mode TRANSITION, once. On macOS that is only a window resize
+        // and which seams to drive; on visionOS the same edge is where a window
+        // would be opened or an immersive space dismissed, which is why the
+        // signal is a generation and not a polled value (kl_present.h).
+        if (kl_present_generation() != pres_gen) {
+            pres_gen = kl_present_generation();
+            kl_present_mode m = kl_present_mode_now();
+            mono = (m == KL_PRESENT_MONO);
+            if (mono) {
+                // Match the window to the guest's panel so its picture is shown
+                // 1:1 rather than letterboxed into a VR-shaped window.
+                int mw = 0, mh = 0;
+                kl_present_mono_size(&mw, &mh);
+                if (mw > 0 && mh > 0) {
+                    SDL_SetWindowSize(win, mw, mh);
+                    SDL_SetWindowTitle(win, "Klepton — 2D guest");
+                }
+                fprintf(stderr, "view: guest is MONO %dx%d — flat window, no pose\n",
+                        mw, mh);
+            } else if (m == KL_PRESENT_STEREO) {
+                SDL_SetWindowTitle(win, "Klepton — VR guest (one eye)");
+                fprintf(stderr, "view: guest is STEREO — driving pose and hands\n");
+            }
+        }
 
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -293,10 +333,10 @@ int kl_view_main(const char *libdir, int hw) {
             float syw = sinf(yaw * 0.5f), cyw = cosf(yaw * 0.5f);
             // q = yaw ⊗ pitch: quat multiply of (0,syw,0,cyw) and (sp,0,0,cp).
             hqx = cyw * sp; hqy = cp * syw; hqz = -syw * sp; hqw = cyw * cp;
-            kl_ovrp_set_head_pose(px, py, pz, hqx, hqy, hqz, hqw);
+            if (!mono) kl_ovrp_set_head_pose(px, py, pz, hqx, hqy, hqz, hqw);
         }
-
-        // M7 controller emulation. Both hands ride head-relative offsets
+        // M7 controller emulation — VR only; a flat guest has no hands.
+        // Both hands ride head-relative offsets
         // (rotated by the head quat) with the head's orientation — a menu
         // pointer, not a saber sim. ovrpButton bits (guest metadata):
         // One=0x1 Two=0x2 Three=0x4 Four=0x8; Primary(right): IndexTrigger
@@ -305,7 +345,7 @@ int kl_view_main(const char *libdir, int hw) {
         // (0x200000/0x400000/0x800000, stick dirs 0x1000000..0x8000000).
         // Mouse L = right trigger, mouse R = right grip, Z/X = A/B, C/V =
         // X/Y, G/H = left trigger/grip, arrows = right thumbstick.
-        {
+        if (!mono) {
             // KL_VIEW_AIM_AT_EYE=1 collapses both hands onto the head
             // position. Beat Saber's menu pointer (VRUIControls.
             // VRGraphicRaycaster) casts from the controller transform, so the
@@ -415,7 +455,15 @@ int kl_view_main(const char *libdir, int hw) {
                              (unsigned long long)kl_glfb_gpu_fence_value(),
                              kl_viewmtl_frames());
             else    snprintf(frames, sizeof frames, "frame %u", g_frame_seq);
-            fprintf(stderr,
+            // A flat guest has no pose, and printing one would invite the
+            // reader to debug a number that means nothing here. `lit` still
+            // matters in both modes — it is what separates a blank frame from
+            // a dead pipeline.
+            if (mono)
+                fprintf(stderr, "view: [mono] %s, lit=%lu\n",
+                        frames, kl_glfb_last_frame_lit());
+            else
+                fprintf(stderr,
                     "view: %s, pose (%.2f, %.2f, %.2f) yaw=%.1f pitch=%.1f, lit=%lu\n",
                     frames, px, py, pz,
                     (double)(yaw * 180.0f / (float)M_PI),

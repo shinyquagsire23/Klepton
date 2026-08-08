@@ -20,6 +20,7 @@
 // JavaVM and registers the SDLActivity surface. Phase 3 is reconnaissance —
 // it drives what SDLActivity.onCreate drives, and stops by name wherever the
 // shim ends. As in t_boot, that stop IS the measurement.
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +29,10 @@
 #include <unistd.h>
 #include "../runtime/klepton.h"
 #include "../runtime/kl_jni.h"
+#include "../runtime/kl_ndk.h"
 #include "../runtime/kl_fault.h"
+#include "../runtime/kl_glfb.h"
+#include "../runtime/kl_view.h"
 
 static const char *LIBDIR = "steamlink-android/lib/arm64-v8a";
 
@@ -38,6 +42,10 @@ static const char *LIBDIR = "steamlink-android/lib/arm64-v8a";
 static const char *ACTIVITY = "com/valvesoftware/steamlink/SteamLink";
 
 typedef int (*jni_onload_fn)(void *vm, void *reserved);
+
+// Set when the viewer's window closes; the phase-4 wait loop watches it so the
+// guest is not torn down while a window is still showing its output.
+static volatile int g_view_quit;
 
 static int fail(const char *msg) { fprintf(stderr, "FAIL: %s\n", msg); return 1; }
 
@@ -96,6 +104,165 @@ static void report_gap(void) {
     else printf("\n  %u unique unresolved names across the chain\n", grand);
 }
 
+// ---------------------------------------------------------------- phase 4 --
+// SDLActivity.onCreate's sequence, read out of the APK's own bytecode rather
+// than from SDL's upstream source, because Steam Link overrides three of the
+// hooks that decide it (see SL_MAIN_LIB below).
+//
+//   SDLSurface.surfaceChanged -> nativeSetScreenResolution(IIIIFF)
+//                             -> onNativeResize()
+//   SDLSurface.surfaceCreated -> onNativeSurfaceCreated()
+//   SDLMain.run [on mSDLThread] -> nativeInitMainThread()
+//                               -> SDLActivity.main() -> nativeRunMain(lib, fn, args)
+//                               -> nativeCleanupMainThread()
+//
+// The thread split is not incidental and folding it away would hang: SDL runs
+// the guest's main on mSDLThread and pumps events on the UI thread, and
+// SDL_main blocks on the event queue. Same shape as the HandlerThread lesson
+// in M4 — the guest blocks waiting for a thread we declined to create.
+#define SL_SDLA "org/libsdl/app/SDLActivity"
+
+// Steam Link's SteamLink activity OVERRIDES getMainSharedObject() and
+// getMainFunction(), and on steamlink-vr.apk they return "libshell_<abi>.so"
+// and "main" — Qt's entry point, not SDL's. Following that faithfully pulls in
+// five Qt6 libraries, libshell (26 MB) and a whole QtAndroid JNI surface, which
+// PLANNING §11.2 ruled out of scope and nothing since has made cheaper.
+//
+// We author the Java side, so we are not obliged to use the override. libmain.so
+// exports SDL_main, its DT_NEEDED is byte-identical between the two APKs and
+// names no Qt, and on the OLD apk SDL's own defaults selected exactly this
+// pair. So this IS §11.6's "option A", spelled explicitly now that the VR
+// build's activity would otherwise route around it. KL_SLINK_LIB / _FN
+// override, which is how the Qt path gets measured if it is ever wanted.
+#define SL_MAIN_LIB "libmain.so"
+#define SL_MAIN_FN  "SDL_main"
+
+typedef void (*v_env_cls)(void *, void *);
+
+// The panel we present, in one place. Three things must agree about it or SDL
+// reads a display that contradicts itself (the "group answer" rule): the
+// resolution given to nativeSetScreenResolution, the ANativeWindow geometry
+// SDL fetches through getNativeSurface, and ANGLE's own surface size.
+static void slink_panel_size(int *w, int *h) {
+    *w = 1280; *h = 800;
+    const char *e = getenv("KL_SLINK_SIZE");
+    if (e) sscanf(e, "%dx%d", w, h);
+}
+
+static void *sdl_thread_body(void *arg) {
+    void **slot = (void **)arg;
+    // Trap 1: any thread that runs guest code seeds bionic's stack-guard canary
+    // into TSD slot 5 first. This thread runs the whole of SDL_main.
+    kl_thread_init();
+
+    void *env = kl_jni_env(), *cls = kl_jni_class(SL_SDLA);
+
+    if (slot[0]) {
+        printf("  [sdl] nativeInitMainThread()\n");
+        fflush(NULL);
+        ((v_env_cls)slot[0])(env, cls);
+    }
+
+    const char *lib = getenv("KL_SLINK_LIB"); if (!lib) lib = SL_MAIN_LIB;
+    const char *fn  = getenv("KL_SLINK_FN");  if (!fn)  fn  = SL_MAIN_FN;
+
+    // SDL dlopens this by path and dlsyms the function out of it. The path has
+    // to be the one the image is REGISTERED under or kl_dl's dlopen will try to
+    // map a second copy: kl_jni_set_native_lib_dir() and the chain loader above
+    // both use LIBDIR, so build it the same way. (Trap 6c: absolute would be
+    // more Android-like, but the registry key is what must match.)
+    char libpath[1024];
+    snprintf(libpath, sizeof libpath, "%s/%s", LIBDIR, lib);
+    printf("  [sdl] nativeRunMain(\"%s\", \"%s\", NULL)\n", libpath, fn);
+    fflush(NULL);
+
+    kl_jni_local_frame_push();
+    int rc = ((int (*)(void *, void *, void *, void *, void *))slot[1])(
+        env, cls, kl_jni_new_string(libpath), kl_jni_new_string(fn), NULL);
+    kl_jni_local_frame_pop();
+
+    printf("  [sdl] nativeRunMain returned %d\n", rc);
+    fflush(NULL);
+
+    if (slot[2]) {
+        printf("  [sdl] nativeCleanupMainThread()\n");
+        fflush(NULL);
+        ((v_env_cls)slot[2])(kl_jni_env(), kl_jni_class(SL_SDLA));
+    }
+    return NULL;
+}
+
+// Look one up and say so. A native SDL3 did not register is a different failure
+// from one that aborts when called, and conflating them wastes a run.
+static void *want(const char *name) {
+    void *p = kl_jni_native(SL_SDLA, name, NULL);
+    printf("  %-28s %s\n", name, p ? "ok" : "NOT REGISTERED");
+    return p;
+}
+
+static void run_main_sequence(kl_image *sdl_img, kl_image *main_img) {
+    (void)sdl_img; (void)main_img;
+    printf("\n=== phase 4: onCreate -> SDL_main (KL_SLINK_MAIN) ===\n");
+    fflush(NULL);
+
+    void *setres  = want("nativeSetScreenResolution");
+    void *surfcr  = want("onNativeSurfaceCreated");
+    void *resize  = want("onNativeResize");
+    void *initmt  = want("nativeInitMainThread");
+    void *runmain = want("nativeRunMain");
+    void *cleanmt = want("nativeCleanupMainThread");
+    if (!runmain) { printf("  no nativeRunMain — cannot reach SDL_main\n"); return; }
+
+    void *env = kl_jni_env(), *cls = kl_jni_class(SL_SDLA);
+
+    // A plausible flat window. These are the numbers SDLSurface would have read
+    // off the Display; nothing downstream has been shown to care yet, so they
+    // are deliberately ordinary rather than a Quest's panel.
+    int w, h;
+    slink_panel_size(&w, &h);
+
+    if (setres) {
+        printf("  nativeSetScreenResolution(%d,%d, %d,%d, 2.0, 60.0)\n", w, h, w, h);
+        fflush(NULL);
+        kl_jni_local_frame_push();
+        ((void (*)(void *, void *, int, int, int, int, float, float))setres)(
+            env, cls, w, h, w, h, 2.0f, 60.0f);
+        kl_jni_local_frame_pop();
+    }
+    if (resize) { printf("  onNativeResize()\n"); fflush(NULL);
+                  kl_jni_local_frame_push(); ((v_env_cls)resize)(env, cls); kl_jni_local_frame_pop(); }
+    if (surfcr) { printf("  onNativeSurfaceCreated()\n"); fflush(NULL);
+                  kl_jni_local_frame_push(); ((v_env_cls)surfcr)(env, cls); kl_jni_local_frame_pop(); }
+
+    // ...and now the SDL thread, which is where SDL_main lives.
+    void *slot[3] = { initmt, runmain, cleanmt };
+    pthread_t th;
+    if (pthread_create(&th, NULL, sdl_thread_body, slot) != 0) {
+        printf("  pthread_create for the SDL thread failed\n");
+        return;
+    }
+
+    // The UI thread's job while SDL_main runs. There is no looper to pump yet —
+    // this is the recon shape, and what it measures is how far SDL_main gets
+    // before it blocks on something we have not built. KL_ALARM is the backstop.
+    //
+    // Under the viewer there is no deadline: SDL_main runs for as long as the
+    // window is open, and the loop ends when the user closes it. A fixed wait
+    // there would tear the guest down mid-frame a few seconds after it started.
+    unsigned secs = 0;
+    const char *lim = getenv("KL_SLINK_WAIT");
+    unsigned maxs = lim ? (unsigned)atoi(lim) : 10;
+    int windowed = getenv("KL_VIEW") != NULL;
+    struct timespec ts = { 0, 100 * 1000 * 1000 };
+    for (unsigned t = 0; windowed ? !g_view_quit : t < maxs * 10; t++) {
+        nanosleep(&ts, NULL);
+        if (++secs % 10 == 0) { kl_jni_drain_ui_tasks(); }
+    }
+    if (windowed) { printf("  (window closed)\n"); fflush(NULL); return; }
+    printf("  (UI thread waited %us; SDL thread not joined — see above for where it got to)\n", maxs);
+    fflush(NULL);
+}
+
 static int slink_run(void) {
     // Trap 1, and it bit immediately: every thread that runs guest code must
     // seed bionic's stack-guard canary into TSD slot 5 first. Without it the
@@ -119,6 +286,31 @@ static int slink_run(void) {
     // SDL3 still imports AAssetManager_open, so pointing this somewhere real
     // keeps a lookup from being a crash; an absent file is the honest answer.
     kl_jni_set_assets_dir("steamlink-android");
+
+    // The SDL_ENV.* <meta-data>, transcribed from the APK's own manifest — real
+    // behaviour, not decoration (SDL_ANDROID_TRAP_BACK_BUTTON routes the back
+    // button; STEAM_LINK_VR is the app's own build discriminator). The two APKs
+    // differ by exactly that last entry, which is why the runtime does not carry
+    // a baked-in table: it would be wrong for one of them.
+    kl_jni_add_manifest_env("SDL_JOYSTICK_HIDAPI", "1");
+    kl_jni_add_manifest_env("SDL_TV_REMOTE_AS_JOYSTICK", "0");
+    kl_jni_add_manifest_env("SDL_ANDROID_TRAP_BACK_BUTTON", "1");
+    kl_jni_add_manifest_env("SDL_ANDROID_ALLOW_RECREATE_ACTIVITY", "1");
+    if (strstr(LIBDIR, "steamlink-vr"))
+        kl_jni_add_manifest_env("STEAM_LINK_VR", "1");
+
+    // The panel, published BEFORE anything can bring ANGLE up. Doing this from
+    // eglCreateWindowSurface was too late and silently so: the guest touches EGL
+    // early enough that kl_glfb_init has already run by then, kl_glfb_set_size
+    // is a no-op once it has, and the guest ended up drawing a 1280x800 viewport
+    // into a 4000x3200 surface — which the capture then read in full, mostly
+    // empty. Nothing errored; the picture was just wrong.
+    {
+        int pw, ph;
+        slink_panel_size(&pw, &ph);
+        kl_ndk_set_window(pw, ph, 1 /* RGBA_8888 */);
+        kl_glfb_set_size(pw, ph);
+    }
 
     // ---- phase 1: the chain ----
     // Mapping and relocation are separated from DT_INIT_ARRAY on purpose, which
@@ -224,25 +416,107 @@ static int slink_run(void) {
     // activity class and every method id SDL3 will ever call back through.
     // It is the densest single JNI call in the app and therefore the right
     // place for the surface to start failing by name.
-    printf("\n=== recon: SDLActivity.nativeSetupJNI() ===\n");
+    printf("\n=== recon: SDL.setupJNI() ===\n");
     fflush(NULL);
-    kl_jni_local_frame_push();
-    // The jclass is the second argument, and this one is load-bearing: SDL3
-    // takes a global ref to it and resolves every static method it will ever
-    // call against it. NULL here reads as "GetStaticMethodID on
-    // <unknown-jclass>" in the report and would be a dangling class later.
-    ((void (*)(void *, void *))setup)(kl_jni_env(), kl_jni_class(SDLA));
-    kl_jni_local_frame_pop();
-    printf("  nativeSetupJNI returned\n");
+    // SDL.setupJNI() calls THREE natives, not one — SDLActivity's, then
+    // SDLAudioManager's, then SDLControllerManager's — and each caches its own
+    // jclass and its own method ids in file-static globals on the C side.
+    // Calling only the first leaves the other two sets NULL, and the failure
+    // surfaces much later and somewhere else: the audio backend calls a cached
+    // (class, methodID) pair that is still {NULL, NULL} and it presents as
+    // "Call*Method with a jmethodID we never issued", with no hint that a setup
+    // call was skipped. Cost one debugging round; do not trim this list.
+    static const char *const SETUP_CLASSES[] = {
+        "org/libsdl/app/SDLActivity",
+        "org/libsdl/app/SDLAudioManager",
+        "org/libsdl/app/SDLControllerManager",
+    };
+    for (size_t i = 0; i < sizeof SETUP_CLASSES / sizeof *SETUP_CLASSES; i++) {
+        void *fn = kl_jni_native(SETUP_CLASSES[i], "nativeSetupJNI", NULL);
+        printf("  %s.nativeSetupJNI %s\n", SETUP_CLASSES[i], fn ? "" : "NOT REGISTERED");
+        if (!fn) continue;
+        fflush(NULL);
+        kl_jni_local_frame_push();
+        // The jclass is the second argument, and this one is load-bearing: SDL3
+        // takes a global ref to it and resolves every static method it will ever
+        // call against it. NULL here reads as "GetStaticMethodID on
+        // <unknown-jclass>" in the report and would be a dangling class later.
+        ((void (*)(void *, void *))fn)(kl_jni_env(), kl_jni_class(SETUP_CLASSES[i]));
+        kl_jni_local_frame_pop();
+    }
+    printf("  setupJNI returned\n");
+
+    // ---- phase 4: the rest of onCreate, to SDL_main ----
+    // Behind a knob for the same reason KL_LIFECYCLE gates t_boot: SL-1 is a
+    // gate that must stay green, and everything below here is expected to stop
+    // by name until the shim catches up. `make slink` keeps measuring phases
+    // 1-3; KL_SLINK_MAIN=1 is the working loop.
+    // KL_VIEW implies it: opening a window for a guest whose main never runs
+    // would show a permanently black rectangle and read as a rendering bug.
+    if (getenv("KL_SLINK_MAIN") || getenv("KL_VIEW"))
+        run_main_sequence(sdl_img, main_img);
 
     printf("\n=== JNI surface ===\n");
     kl_jni_report(stdout);
     return 0;
 }
 
+// ---------------------------------------------------------------- KL_VIEW --
+// The viewer is not a debugging aid for this target the way it is for Beat
+// Saber — Steam Link is a FLAT app, so an SDL window is its actual output
+// device. The guest runs on a spawned thread and SDL owns the main thread,
+// because macOS requires windowing there.
+//
+// No fork and no re-exec: a windowed app never forks, and Metal's XPC shader
+// compiler refuses forked children anyway (the AGX story in CLAUDE.md).
+//
+// The frame path is the READBACK sink, deliberately. The hardware compositor
+// (kl_view_mtl.m) samples eye MTLTextures keyed by (eye, stage) out of kl_ovrp,
+// and a flat guest has none of that: no ovrp, no eye textures, no stages. Its
+// picture is the default framebuffer of an EGL window surface. Reading that
+// back needs no Metal interop at all, which is why it works today — giving the
+// mono path a zero-copy route means backing the window surface with an
+// EGLImage-bound MTLTexture, the same interop the eye textures use (§12.9).
+static void *slink_view_guest(void *arg) {
+    (void)arg;
+    kl_thread_init();
+    slink_run();
+    return NULL;
+}
+
+static int slink_view(void) {
+    if (!kl_env_on("KL_GLFB", 0)) {
+        fprintf(stderr, "KL_VIEW=1 requires KL_GLFB=1 — the null GL driver "
+                        "draws nothing, so the window would be black\n");
+        return 1;
+    }
+    if (!kl_view_available()) {
+        fprintf(stderr, "KL_VIEW=1 but t_slink was built without SDL3\n");
+        return 1;
+    }
+    // The sink has to be registered BEFORE the guest reaches its first swap,
+    // and kl_glfb only captures at all when a sink or a dump directory is set.
+    kl_glfb_set_frame_sink(kl_view_frame_sink, NULL);
+
+    pthread_t guest;
+    if (pthread_create(&guest, NULL, slink_view_guest, NULL)) {
+        fprintf(stderr, "view: pthread_create failed\n");
+        return 1;
+    }
+    int rc = kl_view_main(LIBDIR, 0 /* readback path — see above */);
+    g_view_quit = 1;
+    // The guest is inside SDL_main and does not return on its own; the process
+    // exiting is what ends it. Detach rather than join so closing the window
+    // closes the app, which is what a window close is supposed to mean.
+    pthread_detach(guest);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) LIBDIR = argv[1];
     kl_set_library_path(LIBDIR);
+
+    if (getenv("KL_VIEW")) return slink_view();
 
     if (getenv("KL_RECON_CHILD")) return slink_run();
 

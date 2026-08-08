@@ -31,6 +31,7 @@
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_glfb.h"
+#include "kl_present.h"
 
 // ---- the subset of EGL/egl.h we actually answer for ----
 #define EGL_FALSE                 0
@@ -1038,6 +1039,16 @@ static EGLSurface klegl_CreateWindowSurface(EGLDisplay dpy, EGLConfig cfg,
     int32_t w, h;
     kl_ndk_window_size(win, &w, &h);   // the size Unity will build its target from
     fprintf(stderr, "  [egl] window surface %dx%d\n", w, h);
+    // A guest asking for a window surface has a flat picture to put in it. That
+    // is only half the story for a VR guest — Unity creates one of these too,
+    // because it is an Android app — so kl_present treats an eye texture as the
+    // stronger signal and this as the fallback. See kl_present.h.
+    kl_present_note_window_surface(w, h);
+    // ...and under the real GL path, ANGLE's own surface has to be at least this
+    // big or the guest draws into a target smaller than the viewport it set. The
+    // setter is a no-op once ANGLE is up, and honours KL_GLFB_SIZE, so this
+    // neither fights an explicit override nor resizes a live surface.
+    kl_glfb_set_size(w, h);
     return new_surface(w, h, 0);
 }
 
@@ -1125,6 +1136,20 @@ static unsigned klegl_SwapBuffers(EGLDisplay dpy, EGLSurface s) {
 static unsigned klegl_SwapInterval(EGLDisplay dpy, int32_t interval) {
     (void)dpy; (void)interval; return EGL_TRUE;
 }
+
+// SDL3 calls this before creating a context; Unity never did, because it only
+// ever wanted the default. EGL_OPENGL_ES_API (0x30A0) is that default and is the
+// only API this runtime serves — there is no desktop GL and no OpenVG behind us.
+// Refusing anything else is the honest answer and keeps a guest that wanted a
+// different API from proceeding as though it had got one.
+#define EGL_OPENGL_ES_API 0x30A0
+static unsigned klegl_BindAPI(unsigned api) {
+    if (api == EGL_OPENGL_ES_API) return EGL_TRUE;
+    fprintf(stderr, "  [egl] eglBindAPI(0x%x): only EGL_OPENGL_ES_API is served\n", api);
+    g_error = EGL_BAD_PARAMETER;
+    return EGL_FALSE;
+}
+static unsigned klegl_QueryAPI(void) { return EGL_OPENGL_ES_API; }
 
 static int32_t klegl_GetError(void) { int e = g_error; g_error = EGL_SUCCESS; return e; }
 
@@ -1221,6 +1246,8 @@ static const struct { const char *name; void *fn; } g_egl[] = {
     E("eglSwapInterval",        klegl_SwapInterval),
     E("eglGetError",            klegl_GetError),
     E("eglGetProcAddress",      klegl_GetProcAddress),
+    E("eglBindAPI",             klegl_BindAPI),
+    E("eglQueryAPI",            klegl_QueryAPI),
 };
 
 void *kl_egl_lookup(const char *name) {
