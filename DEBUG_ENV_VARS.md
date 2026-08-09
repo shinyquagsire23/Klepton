@@ -454,6 +454,22 @@ puts the camera on the ground with its hands underneath it.
   Quest 2's 72 Hz instead of the display's own measured numbers (the visionOS
   compositor's priming pass measures and logs both either way). A free A/B if
   the real numbers send Unity somewhere unexpected.
+- `KL_VRR=1` — **foveated guest rendering** (host; `tests/t_mtl_provider.m`).
+  Builds an `MTLRasterizationRateMap` for the eye size and hands it to
+  `kl_glfb_set_eye_rate_map`, which registers it on the eye textures and on the
+  guest's multisampled scene target. The guest then rasterizes its expensive
+  pass at a reduced rate in the periphery: measured **51.7% of the fragments**
+  at the default falloff on a 2290x2400 eye. Off by default.
+  - The eye texture is left in a WARPED layout. `kl_view_mtl`'s composite
+    undoes it (the unwarp grid, `kl_reproject.h`); every other reader — the
+    `KL_GLFB_OUT` capture, `t_mtl_provider`'s readback — does not, so those show
+    the squeeze directly. That is the cheapest confirmation it engaged.
+  - `KL_ANGLE_VRR_TRACE=1` alongside it shows the ANGLE half: which render
+    passes found the map, and whether each eye resolve took the
+    physical-passthrough path (`passthrough=1`) rather than warping twice.
+- `KL_VRR_EDGE=<0..1>` — the rate at the edge of the eye, default 0.35 (the
+  fovea is always 1.0, falling off linearly). Lower is cheaper and blurrier in
+  the periphery; 1.0 is a map that does nothing.
 - `KL_OVRP_EYE_SCALE=<x>` — scale the per-eye render target size the guest is
   told to use (`ovrp_GetEyeTextureSize`), default 1.0, accepted in 0.05..4.0.
   Applies to whatever the frontend measured off the display

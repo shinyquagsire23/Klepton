@@ -1,8 +1,8 @@
 diff --git a/src/libANGLE/renderer/metal/FrameBufferMtl.mm b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
-index 2825a7c..40c159c 100644
+index 2825a7c..49f308d 100644
 --- a/src/libANGLE/renderer/metal/FrameBufferMtl.mm
 +++ b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
-@@ -29,6 +29,37 @@ namespace rx
+@@ -29,6 +29,33 @@ namespace rx
  {
  namespace
  {
@@ -28,19 +28,15 @@ index 2825a7c..40c159c 100644
 +    {
 +        return nil;
 +    }
-+    if (id<MTLRasterizationRateMap> map = mtl::GetRasterizationRateMapFor(texture->get()))
-+    {
-+        return map;
-+    }
 +    const mtl::MipmapNativeLevel &level = rt->getLevelIndex();
-+    return mtl::GetRasterizationRateMapForSize(texture->width(level), texture->height(level),
-+                                               rt->getRenderSamples());
++    return mtl::GetRasterizationRateMapForTarget(texture->get(), texture->width(level),
++                                                 texture->height(level), rt->getRenderSamples());
 +}
 +
  // Override clear color based on texture's write mask
  void OverrideMTLClearColor(const mtl::TextureRef &texture,
                             const mtl::ClearColorValue &clearColor,
-@@ -567,6 +598,48 @@ angle::Result FramebufferMtl::blit(const gl::Context *context,
+@@ -567,6 +594,56 @@ angle::Result FramebufferMtl::blit(const gl::Context *context,
      baseParams.unpackFlipX = false;
      baseParams.unpackFlipY = false;
  
@@ -72,9 +68,17 @@ index 2825a7c..40c159c 100644
 +            srcClippedDestArea.height == srcFramebufferDimensions.height &&
 +            srcFramebufferDimensions.width == dstFramebufferDimensions.width &&
 +            srcFramebufferDimensions.height == dstFramebufferDimensions.height;
++        // COLOUR ONLY. blitDepthFS and blitStencilFS sample through
++        // input.texCoords and do not honour the passthrough flag, so letting a
++        // depth or stencil blit through here would double-warp it in exactly
++        // the way the colour path just stopped doing — silently, and with
++        // nothing measuring it. Nothing in the guest forces depth passthrough
++        // (its eye resolve is GL_COLOR_BUFFER_BIT), so this refuses rather than
++        // implements it. Widening it means teaching those two shaders first,
++        // and giving `make vrr` a case that covers them.
 +        baseParams.physicalPassthrough =
 +            srcMap != nil && srcMap == dstMap && sameRect && !this->getFlipY() &&
-+            !srcFrameBuffer->getFlipY();
++            !srcFrameBuffer->getFlipY() && !blitDepthBuffer && !blitStencilBuffer;
 +        if (mtl::RasterizationRateTraceEnabled())
 +        {
 +            fprintf(stderr,
@@ -89,7 +93,7 @@ index 2825a7c..40c159c 100644
      return blitWithDraw(context, srcFrameBuffer, blitColorBuffer, blitDepthBuffer,
                          blitStencilBuffer, filter, baseParams);
  }
-@@ -1144,6 +1217,46 @@ angle::Result FramebufferMtl::prepareRenderPass(const gl::Context *context,
+@@ -1144,6 +1221,46 @@ angle::Result FramebufferMtl::prepareRenderPass(const gl::Context *context,
          desc.stencilAttachment = {};
      }
  
@@ -137,7 +141,7 @@ index 2825a7c..40c159c 100644
          mStencilRenderTarget == nullptr)
      {
 diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
-index 85cc743..a7b47bb 100644
+index 85cc743..a1d7f17 100644
 --- a/src/libANGLE/renderer/metal/mtl_common.h
 +++ b/src/libANGLE/renderer/metal/mtl_common.h
 @@ -113,7 +113,12 @@ constexpr size_t kDefaultAttributeSize = 4 * sizeof(float);
@@ -154,7 +158,7 @@ index 85cc743..a7b47bb 100644
  constexpr size_t kInlineConstDataMaxSize = 4 * 1024;
  constexpr size_t kDefaultUniformsMaxSize = 16 * 1024;
  constexpr uint32_t kMaxViewports         = 1;
-@@ -423,6 +428,60 @@ class Context : public ErrorHandler
+@@ -423,6 +428,70 @@ class Context : public ErrorHandler
      DisplayMtl *mDisplay;
  };
  
@@ -205,6 +209,16 @@ index 85cc743..a7b47bb 100644
 +                                                           uint32_t height,
 +                                                           uint32_t samples);
 +
++// Both keys, under ONE lock. This is the accessor render passes and blits
++// should use: the two-call form takes the registry mutex twice per render
++// target, and once anything is registered that is paid on every framebuffer
++// state sync the guest performs — not just on the two targets the feature is
++// actually about.
++id<MTLRasterizationRateMap> GetRasterizationRateMapForTarget(id<MTLTexture> texture,
++                                                             uint32_t width,
++                                                             uint32_t height,
++                                                             uint32_t samples);
++
 +// Fast out for the common case — no maps registered at all, so the per-render-pass
 +// lookup can be skipped entirely without taking the registry lock.
 +bool AnyRasterizationRateMapsRegistered();
@@ -216,7 +230,7 @@ index 85cc743..a7b47bb 100644
      do                                                                              \
      {                                                                               \
 diff --git a/src/libANGLE/renderer/metal/mtl_common.mm b/src/libANGLE/renderer/metal/mtl_common.mm
-index d5f657b..67c7dc8 100644
+index d5f657b..c1658d0 100644
 --- a/src/libANGLE/renderer/metal/mtl_common.mm
 +++ b/src/libANGLE/renderer/metal/mtl_common.mm
 @@ -11,8 +11,12 @@
@@ -232,7 +246,7 @@ index d5f657b..67c7dc8 100644
  #include "libANGLE/angletypes.h"
  #include "libANGLE/renderer/metal/DisplayMtl.h"
  
-@@ -87,5 +91,184 @@ mtl::CommandQueue &Context::cmdQueue()
+@@ -87,5 +91,211 @@ mtl::CommandQueue &Context::cmdQueue()
      return mDisplay->cmdQueue();
  }
  
@@ -317,6 +331,33 @@ index d5f657b..67c7dc8 100644
 +        }
 +    }
 +    return nil;
++}
++
++id<MTLRasterizationRateMap> GetRasterizationRateMapForTarget(id<MTLTexture> texture,
++                                                             uint32_t width,
++                                                             uint32_t height,
++                                                             uint32_t samples)
++{
++    if (!AnyRasterizationRateMapsRegistered())
++    {
++        return nil;
++    }
++    RateMapRegistry &registry = Registry();
++    std::lock_guard<std::mutex> guard(registry.lock);
++    for (id<MTLTexture> t = texture; t != nil; t = [t parentTexture])
++    {
++        auto it = registry.entries.find((void *)t);
++        if (it != registry.entries.end())
++        {
++            return it->second.second.get();
++        }
++    }
++    auto bs = registry.bySize.find(SizeKey(width, height));
++    if (bs == registry.bySize.end() || samples < bs->second.first)
++    {
++        return nil;
++    }
++    return bs->second.second.get();
 +}
 +
 +void SetRasterizationRateMapFor(id<MTLTexture> texture, id<MTLRasterizationRateMap> map)

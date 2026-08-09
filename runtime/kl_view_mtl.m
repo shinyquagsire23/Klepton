@@ -92,6 +92,84 @@ static id<MTLRenderPipelineState> klvm_pipeline(const char *msl, const char *vfn
 // is a narrow window, but it is hit exactly when the guest is producing frames
 // fastest, and the result is a picture reprojected by a delta that was never
 // real. One read per composite, threaded through everything that needs it.
+// The unwarp grid for the composite, cached.
+//
+// Rebuilt only when the rate map or the eye texture's size changes, which is
+// the point of doing the unwarp this way: a rate map is static, so the squeeze
+// is resolved once on the CPU into texture coordinates the rasterizer then
+// interpolates for free. See kl_reproject.h.
+static void klvm_s2p(void *ctx, float sx, float sy, float *px, float *py) {
+    id<MTLRasterizationRateMap> m = (__bridge id<MTLRasterizationRateMap>)ctx;
+    MTLSamplePosition p = [m mapScreenToPhysicalCoordinates:MTLSamplePositionMake(sx, sy)
+                                                   forLayer:0];
+    *px = p.x; *py = p.y;
+}
+
+static id<MTLBuffer> g_grid_buf;
+static void         *g_grid_map;
+static uint32_t      g_grid_w, g_grid_h, g_grid_verts;
+
+static id<MTLBuffer> klvm_grid_buffer(id<MTLTexture> src, uint32_t *out_verts) {
+    void *map = kl_glfb_eye_rate_map();
+    uint32_t tw = src ? (uint32_t)src.width : 0, th = src ? (uint32_t)src.height : 0;
+    if (!g_grid_buf || map != g_grid_map || tw != g_grid_w || th != g_grid_h) {
+        g_grid_map = map; g_grid_w = tw; g_grid_h = th;
+        uint32_t nx = 1, ny = 1;
+        if (map) {
+            // One cell per ZONE, so every grid vertex lands on a breakpoint of
+            // the piecewise-linear map and the unwarp is exact rather than a
+            // sampling of it. The zone counts travel with the map because a
+            // built MTLRasterizationRateMap does not report them.
+            id<MTLRasterizationRateMap> m = (__bridge id<MTLRasterizationRateMap>)map;
+            MTLSize scr = [m screenSize];
+            int zx = 0, zy = 0;
+            kl_glfb_eye_rate_zones(&zx, &zy);
+            if (zx > 0 && zy > 0) {
+                // The map's own zones. Exact: a rate map is piecewise linear
+                // with breakpoints at the zone boundaries, which are uniform in
+                // SCREEN space, so a screen-uniform grid of exactly this many
+                // cells has a vertex on every breakpoint.
+                nx = (uint32_t)zx; ny = (uint32_t)zy;
+            } else {
+                // A map we did not build does not report its zones — but the
+                // GRANULARITY cell count is recoverable, which is what ALVR's
+                // DummyMetalRenderer does to reconstruct a descriptor. Uniform
+                // in physical rather than screen space, so it is not
+                // zone-aligned and the unwarp is a dense sampling of the curve
+                // rather than an exact reproduction of it; at ~32px granules
+                // the residual is well under a texel.
+                MTLSize gran = [m physicalGranularity];
+                MTLSize phys = [m physicalSizeForLayer:0];
+                nx = gran.width  ? (uint32_t)(phys.width  / gran.width)  : 16;
+                ny = gran.height ? (uint32_t)(phys.height / gran.height) : 16;
+            }
+            if (nx < 1) nx = 1;
+            if (ny < 1) ny = 1;
+            if (nx > KL_REPROJECT_GRID_MAX) nx = KL_REPROJECT_GRID_MAX;
+            if (ny > KL_REPROJECT_GRID_MAX) ny = KL_REPROJECT_GRID_MAX;
+            uint32_t n = kl_reproject_grid_entries(nx, ny);
+            simd_float2 *tmp = calloc(n, sizeof *tmp);
+            kl_reproject_grid_build(tmp, nx, ny, (float)scr.width, (float)scr.height,
+                                    (float)tw, (float)th, klvm_s2p, map);
+            g_grid_buf = [g_dev newBufferWithBytes:tmp length:n * sizeof *tmp
+                                           options:MTLResourceStorageModeShared];
+            free(tmp);
+            fprintf(stderr, "  [view] unwarp grid %ux%u for a %ux%u eye texture "
+                            "(screen %lux%lu)\n", nx, ny, tw, th,
+                    (unsigned long)scr.width, (unsigned long)scr.height);
+        } else {
+            uint32_t n = kl_reproject_grid_entries(1, 1);
+            simd_float2 tmp[8];
+            kl_reproject_grid_identity(tmp);
+            g_grid_buf = [g_dev newBufferWithBytes:tmp length:n * sizeof *tmp
+                                           options:MTLResourceStorageModeShared];
+        }
+        g_grid_verts = kl_reproject_grid_vertices(nx, ny);
+    }
+    if (out_verts) *out_verts = g_grid_verts;
+    return g_grid_buf;
+}
+
 static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice) {
     kl_ovrp_render_pose r;
     int have = kl_ovrp_stage_render_pose(stage, &r);
@@ -291,7 +369,15 @@ int kl_viewmtl_present(int win_w, int win_h) {
         [enc setRenderPipelineState:g_pipe_rp];
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        // The unwarp grid. Identity until the guest's eye textures are
+        // foveated, at which point it carries the squeeze this pass has to
+        // undo (kl_reproject.h). A buffer rather than setVertexBytes: that
+        // path caps at 4 KB and a grid dense enough to land on the map's zone
+        // boundaries is bigger than that.
+        uint32_t gverts = 0;
+        id<MTLBuffer> gbuf = klvm_grid_buffer(src, &gverts);
+        [enc setVertexBuffer:gbuf offset:0 atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
         klvm_note_delta(stage);
     } else {
         [enc setRenderPipelineState:g_pipe];

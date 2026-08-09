@@ -180,6 +180,21 @@ static void check_shader(void) {
 //   - **The slice.** Both eyes share one array texture, and sampling the wrong
 //     slice shows the other eye — which looks like broken stereo, not like a
 //     wrong constant.
+// Bind the identity unwarp grid and draw the mesh.
+//
+// EVERY draw of this pass needs both — the vertex shader reads the grid's cell
+// counts out of buffer(1), so a draw that binds nothing and asks for a 4-vertex
+// strip (which is what these were before the grid existed) is degenerate rather
+// than merely unfoveated. One helper, so a new case cannot get half of it: the
+// slice-1 case did exactly that and the test caught it.
+static void klr_draw(id<MTLRenderCommandEncoder> enc) {
+    simd_float2 grid[kl_reproject_grid_entries(1, 1)];
+    kl_reproject_grid_identity(grid);
+    [enc setVertexBytes:grid length:sizeof grid atIndex:1];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+             vertexCount:kl_reproject_grid_vertices(1, 1)];
+}
+
 static void check_pixels(void) {
     printf("=== the pass, run ===\n");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -258,7 +273,10 @@ static void check_pixels(void) {
     [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:0];
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    // The identity unwarp grid: this test's source texture is not foveated, so
+    // the pass reduces to the two triangles it always drew. Bound anyway
+    // because there is one code path — see kl_reproject.h.
+    klr_draw(enc);
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
@@ -295,7 +313,7 @@ static void check_pixels(void) {
     [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:0];
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    klr_draw(enc);
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
@@ -316,7 +334,7 @@ static void check_pixels(void) {
     [enc setFragmentTexture:src atIndex:0];
     [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:0];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    klr_draw(enc);
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];

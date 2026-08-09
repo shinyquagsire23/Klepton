@@ -104,6 +104,77 @@ typedef struct {
 // amplification_id to index with.
 const char *kl_reproject_msl(void);
 
+// ---------------------------------------------------------------------------
+// The unwarp grid — how a FOVEATED eye texture gets read.
+//
+// When the guest renders through a rasterization rate map its eye texture is
+// stored WARPED: the fovea keeps its texels and the periphery is squeezed, so
+// texel (x, y) is no longer screen position (x, y). Something has to undo that,
+// and this pass is the only thing that reads the picture, so it does.
+//
+// **Not in the fragment shader.** The obvious implementation calls
+// `map_screen_to_physical_coordinates` per fragment, which pays a decoder
+// lookup on every pixel of both eyes at display rate. Instead the quad is
+// subdivided into a grid and each vertex carries a PRE-UNWARPED texture
+// coordinate; the rasterizer's own interpolation does the rest and the fragment
+// shader is unchanged — it still just samples at `in.uv`.
+//
+// **And it is exact, not an approximation.** A Metal rate map is piecewise
+// linear, with its breakpoints at the zone boundaries of the layer descriptor.
+// A grid whose vertices land on those boundaries therefore reproduces the map
+// exactly, because linear interpolation between two breakpoints is what the map
+// already is between them. Build the grid at the map's own zone count (or a
+// multiple of it) and there is no error to trade off.
+//
+// The coordinates are static for a given map, so this is built once — when the
+// map is made, not per frame.
+//
+// This is the shape ALVR uses for the same job, and PLANNING §12.8's note about
+// that code applies here too: the mechanism is what is taken.
+//
+// **Buffer layout**, bound at buffer(1) of the VERTEX stage:
+//
+//     [0]      = (nx, ny) as floats — the cell counts
+//     [1 + y*(nx+1) + x] = the texture coordinate for grid vertex (x, y)
+//
+// self-describing so the pass needs no extra uniform, and so a caller cannot
+// bind a table that disagrees with the vertex count it draws.
+#define KL_REPROJECT_GRID_MAX 64
+
+// Entries (each a simd_float2) a grid buffer needs, header included.
+static inline uint32_t kl_reproject_grid_entries(uint32_t nx, uint32_t ny) {
+    return 1u + (nx + 1u) * (ny + 1u);
+}
+
+// Vertices to draw. Two triangles a cell, six vertices, no index buffer —
+// MTLPrimitiveTypeTriangle, not a strip.
+static inline uint32_t kl_reproject_grid_vertices(uint32_t nx, uint32_t ny) {
+    return 6u * nx * ny;
+}
+
+// The 1x1 grid whose corners are (0,0)..(1,1): an unfoveated pass, and exactly
+// the picture this file drew before any of this existed. Always bind something —
+// there is one code path, and "no foveation" is the identity grid rather than a
+// second shader.
+void kl_reproject_grid_identity(simd_float2 *out);
+
+// Fill a grid from a rate map, without this file knowing what a rate map is.
+//
+// `fn` is the platform's screen->physical conversion — on Apple that is
+// `-[MTLRasterizationRateMap mapScreenToPhysicalCoordinates:forLayer:]`, which
+// exists on the CPU precisely so this can be precomputed. Both are in PIXELS.
+//
+// `tex_w`/`tex_h` are the eye texture's real dimensions, which the returned
+// coordinates are normalised against. They are the SCREEN size, not the
+// physical one: the runtime allocates eye textures at screen size and lets
+// Metal write the smaller physical region inside them, so that GL, the viewport
+// and the scissor all keep agreeing with each other (see kl_glfb.h).
+typedef void (*kl_reproject_s2p)(void *ctx, float sx, float sy, float *px, float *py);
+void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
+                             float screen_w, float screen_h,
+                             float tex_w, float tex_h,
+                             kl_reproject_s2p fn, void *ctx);
+
 // The plain blit the viewer used before any of this existed: a full-screen
 // triangle, no uniforms but the slice. Kept because it is the A/B — if the
 // reprojected picture is wrong, this is the one known to be right.

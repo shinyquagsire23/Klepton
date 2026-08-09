@@ -1382,7 +1382,12 @@ final class KleptonCompositor {
             // slice — arrives as a flat varying instead (kl_reproject.c).
             enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
         }
-        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        // The unwarp grid, bound to the VERTEX stage. Identity until the guest's
+        // eye textures are foveated; after that it carries the squeeze this pass
+        // has to undo. See unwarpGrid and kl_reproject.h.
+        let (gridBuf, gridVerts) = unwarpGrid(source)
+        enc.setVertexBuffer(gridBuf, offset: 0, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
         enc.endEncoding()
         return visible
     }
@@ -1515,6 +1520,91 @@ final class KleptonCompositor {
     ///
     /// The clamping lives in `kl_ovrp_set_eye_texture_size`, not here, so a host
     /// run through `t_mtl_provider` gets the same policy.
+
+    // MARK: - The unwarp grid
+
+    /// Screen -> physical, as `kl_reproject_grid_build` wants it. No captures,
+    /// so it converts to a C function pointer.
+    private static let screenToPhysical: kl_reproject_s2p = { ctx, sx, sy, px, py in
+        guard let ctx,
+              let map = Unmanaged<AnyObject>.fromOpaque(ctx)
+                  .takeUnretainedValue() as? MTLRasterizationRateMap else { return }
+        let p = map.physicalCoordinates(
+            screenCoordinates: MTLSamplePosition(x: sx, y: sy), layer: 0)
+        px?.pointee = p.x
+        py?.pointee = p.y
+    }
+
+    private var gridBuffer: MTLBuffer?
+    private var gridMap: UnsafeMutableRawPointer?
+    private var gridTexW = -1, gridTexH = -1
+    private var gridVertexCount = 0
+
+    /// The reprojection quad's mesh, with texture coordinates that already undo
+    /// the guest's foveation.
+    ///
+    /// Rebuilt only when the rate map or the eye texture's size changes — a rate
+    /// map is static, so the unwarp is resolved once here and the rasterizer
+    /// interpolates it for free, instead of every fragment paying a
+    /// `map_screen_to_physical_coordinates` decode. One cell per ZONE, so the
+    /// grid's vertices land on the map's own piecewise-linear breakpoints and
+    /// the result is exact rather than a sampling of the curve.
+    ///
+    /// Note this is the GUEST's map (kl_glfb_eye_rate_map), which has nothing to
+    /// do with the drawable's own foveation: Compositor Services rasterizes THIS
+    /// pass through its own map, set on the render pass descriptor. Two maps,
+    /// two purposes, deliberately detached.
+    private func unwarpGrid(_ source: MTLTexture?) -> (MTLBuffer?, Int) {
+        let map = kl_glfb_eye_rate_map()
+        let tw = source?.width ?? 0, th = source?.height ?? 0
+        if gridBuffer == nil || map != gridMap || tw != gridTexW || th != gridTexH {
+            gridMap = map; gridTexW = tw; gridTexH = th
+            var nx: UInt32 = 1, ny: UInt32 = 1
+            if let map, tw > 0, th > 0,
+               let rm = Unmanaged<AnyObject>.fromOpaque(map)
+                   .takeUnretainedValue() as? MTLRasterizationRateMap {
+                var zx: Int32 = 0, zy: Int32 = 0
+                kl_glfb_eye_rate_zones(&zx, &zy)
+                if zx <= 0 || zy <= 0 {
+                    // A map we did not build does not report its zones, but the
+                    // GRANULARITY cell count is recoverable — the trick ALVR's
+                    // DummyMetalRenderer uses to reconstruct a descriptor.
+                    // Uniform in physical rather than screen space, so it is a
+                    // dense sampling of the curve rather than zone-aligned and
+                    // exact; at ~32px granules the residual is under a texel.
+                    let gran = rm.physicalGranularity
+                    let phys = rm.physicalSize(layer: 0)
+                    zx = gran.width  > 0 ? Int32(phys.width  / gran.width)  : 16
+                    zy = gran.height > 0 ? Int32(phys.height / gran.height) : 16
+                }
+                let cap = Int32(KL_REPROJECT_GRID_MAX)
+                nx = UInt32(max(1, min(cap, zx)))
+                ny = UInt32(max(1, min(cap, zy)))
+                let n = Int(kl_reproject_grid_entries(nx, ny))
+                var table = [SIMD2<Float>](repeating: .zero, count: n)
+                let scr = rm.screenSize
+                table.withUnsafeMutableBufferPointer { buf in
+                    kl_reproject_grid_build(buf.baseAddress, nx, ny,
+                                            Float(scr.width), Float(scr.height),
+                                            Float(tw), Float(th),
+                                            Self.screenToPhysical, map)
+                }
+                gridBuffer = queue?.device.makeBuffer(bytes: table,
+                                                      length: n * MemoryLayout<SIMD2<Float>>.stride)
+                NSLog("[cp] unwarp grid \(nx)x\(ny) for a \(tw)x\(th) eye texture "
+                      + "(map screen \(scr.width)x\(scr.height))")
+            } else {
+                let n = Int(kl_reproject_grid_entries(1, 1))
+                var table = [SIMD2<Float>](repeating: .zero, count: n)
+                table.withUnsafeMutableBufferPointer { kl_reproject_grid_identity($0.baseAddress) }
+                gridBuffer = queue?.device.makeBuffer(bytes: table,
+                                                      length: n * MemoryLayout<SIMD2<Float>>.stride)
+            }
+            gridVertexCount = Int(kl_reproject_grid_vertices(nx, ny))
+        }
+        return (gridBuffer, gridVertexCount)
+    }
+
     private func pushEyeTextureSize(_ drawable: LayerRenderer.Drawable) {
         var w = 0, h = 0
         var source = "none"

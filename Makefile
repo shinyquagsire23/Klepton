@@ -461,9 +461,9 @@ vrr: build/s12_vrr
 # check` on purpose; it needs Metal's compiler service and the gate should not
 # take a dependency on that. See tests/t_reproject.m.
 build/t_reproject: tests/t_reproject.m runtime/kl_reproject.c runtime/kl_reproject.h \
-                   runtime/kl_ovrp.h
+                   runtime/kl_env.c runtime/kl_ovrp.h
 	$(CC) $(CFLAGS) -fobjc-arc -Iruntime -o $@ $< runtime/kl_reproject.c \
-	  -framework Metal -framework Foundation
+	  runtime/kl_env.c -framework Metal -framework Foundation
 
 .PHONY: reproject
 reproject: build/t_reproject

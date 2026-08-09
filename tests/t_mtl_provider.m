@@ -21,6 +21,7 @@
 #include <string.h>
 #include <math.h>
 #include <zlib.h>
+#include "../runtime/kl_env.h"
 #include "../runtime/kl_glfb.h"
 #include "t_mtl_provider.h"
 
@@ -32,6 +33,76 @@
 static id<MTLTexture> g_held[2][4];
 static int g_slice[2][4];
 static int g_dim[4][2];          // the size each stage's texture actually is
+
+// ---------------------------------------------------------------------------
+// Foveation on the host (KL_VRR=1).
+//
+// The host stand-in for what the visionOS compositor does: build a rate map for
+// the eye size and hand it to kl_glfb, which registers it on the eye textures
+// and on the guest's multisampled scene target. With it set, the guest
+// rasterizes its expensive pass at a reduced rate in the periphery and the eye
+// texture holds a WARPED picture — which only kl_view_mtl's composite undoes.
+// A KL_GLFB_OUT capture therefore shows the warp directly, and that is the
+// cheapest confirmation that any of this engaged at all.
+//
+// Off by default. This is a performance feature whose whole cost model wants
+// measuring on a device, and every readback path that is not the compositor
+// still reads the eye texture as if it were an ordinary image.
+#define KLMTL_VRR_ZONES 16
+
+static id<MTLRasterizationRateMap> g_rate;
+static int g_rate_w, g_rate_h;
+
+static void klmtl_quality(float *q, int n, float edge) {
+    for (int i = 0; i < n; i++) {
+        float t = n > 1 ? (2.f * ((float)i + 0.5f) / (float)n - 1.f) : 0.f;
+        if (t < 0) t = -t;
+        q[i] = 1.f - (1.f - edge) * t;
+    }
+}
+
+// Build (or rebuild) the map for a w x h eye and push it. Called when a texture
+// is allocated, so the map always matches the size the guest is rendering at —
+// Unity changes that size mid-run and a stale map would foveate against the
+// wrong screen size.
+static void klmtl_update_rate_map(id<MTLDevice> dev, int w, int h) {
+    if (!kl_env_on("KL_VRR", 0)) return;
+    if (g_rate && g_rate_w == w && g_rate_h == h) return;
+    if (![dev supportsRasterizationRateMapWithLayerCount:1]) {
+        fprintf(stderr, "  [mtl] this GPU has no variable rasterization rate — "
+                        "KL_VRR ignored\n");
+        return;
+    }
+    float edge = kl_env_float("KL_VRR_EDGE", 0.35f);
+    if (!(edge > 0.05f) || !(edge <= 1.0f)) edge = 0.35f;
+    float qx[KLMTL_VRR_ZONES], qy[KLMTL_VRR_ZONES];
+    klmtl_quality(qx, KLMTL_VRR_ZONES, edge);
+    klmtl_quality(qy, KLMTL_VRR_ZONES, edge);
+    MTLRasterizationRateLayerDescriptor *layer =
+        [[MTLRasterizationRateLayerDescriptor alloc]
+            initWithSampleCount:MTLSizeMake(KLMTL_VRR_ZONES, KLMTL_VRR_ZONES, 0)
+                     horizontal:qx vertical:qy];
+    MTLRasterizationRateMapDescriptor *d = [MTLRasterizationRateMapDescriptor
+        rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake((NSUInteger)w, (NSUInteger)h, 0)
+                                               layer:layer];
+    d.label = @"klepton guest foveation";
+    id<MTLRasterizationRateMap> m = [dev newRasterizationRateMapWithDescriptor:d];
+    if (!m) {
+        fprintf(stderr, "  [mtl] newRasterizationRateMapWithDescriptor %dx%d FAILED\n", w, h);
+        return;
+    }
+    MTLSize phys = [m physicalSizeForLayer:0];
+    fprintf(stderr, "  [mtl] foveation: screen %dx%d -> physical %lux%lu "
+                    "(%.1f%% of the fragments, edge rate %.2f)\n", w, h,
+            (unsigned long)phys.width, (unsigned long)phys.height,
+            100.0 * (double)(phys.width * phys.height) / ((double)w * (double)h), edge);
+    g_rate = m; g_rate_w = w; g_rate_h = h;
+    // Before the eye texture is bound: kl_glfb registers the map on each
+    // texture at bind time, and ANGLE caches a framebuffer's render pass
+    // descriptor, so a map that arrives later misses the first pass.
+    kl_glfb_set_eye_rate_map(w, h, KLMTL_VRR_ZONES, KLMTL_VRR_ZONES,
+                             (__bridge void *)m);
+}
 
 static int provide(int eye, int stage, int w, int h, kl_mtl_eye_texture *out, void *ctx) {
     (void)ctx;
@@ -75,6 +146,8 @@ static int provide(int eye, int stage, int w, int h, kl_mtl_eye_texture *out, vo
         g_dim[stage][0] = w;  g_dim[stage][1] = h;
         fprintf(stderr, "  [mtl] stage %d: RGBA16F %dx%d array, 2 slices (%.1f MB)\n",
                 stage, w, h, (double)w * h * 8 * 2 / (1024 * 1024));
+        // KL_VRR: the eye size is only known here, so the map is built here too.
+        klmtl_update_rate_map(dev, w, h);
     }
     out->texture = (__bridge void *)g_held[eye][stage];
     out->slice   = g_slice[eye][stage];
@@ -82,6 +155,7 @@ static int provide(int eye, int stage, int w, int h, kl_mtl_eye_texture *out, vo
     out->h       = g_dim[stage][1];
     return 1;
 }
+
 
 void kl_mtl_provider_install(void) {
     // KL_VIEW implies it: the viewer's hardware compositor samples exactly

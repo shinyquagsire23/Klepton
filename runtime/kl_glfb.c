@@ -1512,6 +1512,7 @@ static void (*a_SetRateMapForSize)(uint32_t w, uint32_t h, uint32_t min_samples,
 // there is no reason for the stages to differ from each other.
 static void *g_eye_rate_map;
 static int   g_eye_rate_w, g_eye_rate_h;
+static int   g_eye_rate_zx, g_eye_rate_zy;
 
 // The multisampled scene target is the one the size rule is for; a
 // single-sampled target of the same size is a post-processing intermediate and
@@ -1578,7 +1579,12 @@ void *kl_glfb_mtl_device(void) {
 
 void *kl_glfb_eye_rate_map(void) { return g_eye_rate_map; }
 
-void kl_glfb_set_eye_rate_map(int w, int h, void *rate_map) {
+void kl_glfb_eye_rate_zones(int *zones_x, int *zones_y) {
+    if (zones_x) *zones_x = g_eye_rate_zx;
+    if (zones_y) *zones_y = g_eye_rate_zy;
+}
+
+void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate_map) {
     if (!kl_glfb_init() || !mtl_resolve()) return;
     if (!a_SetRateMapForSize || !a_SetRateMap) {
         fprintf(stderr, "  [glfb] this ANGLE has no rasterization-rate entry points — "
@@ -1595,6 +1601,8 @@ void kl_glfb_set_eye_rate_map(int w, int h, void *rate_map) {
     g_eye_rate_map = rate_map;
     g_eye_rate_w   = rate_map ? w : 0;
     g_eye_rate_h   = rate_map ? h : 0;
+    g_eye_rate_zx  = rate_map ? zones_x : 0;
+    g_eye_rate_zy  = rate_map ? zones_y : 0;
 
     if (rate_map)
         a_SetRateMapForSize((uint32_t)w, (uint32_t)h, KL_RATE_MIN_SAMPLES, rate_map);
@@ -1606,8 +1614,9 @@ void kl_glfb_set_eye_rate_map(int w, int h, void *rate_map) {
             if (g_eye_mtl[e][s].tex)
                 a_SetRateMap(g_eye_mtl[e][s].tex, rate_map);
 
-    fprintf(stderr, "  [glfb] eye rate map %p for %dx%d (multisampled targets of that "
-                    "size, plus every bound eye texture)\n", rate_map, w, h);
+    fprintf(stderr, "  [glfb] eye rate map %p for %dx%d, %dx%d zones (multisampled "
+                    "targets of that size, plus every bound eye texture)\n",
+            rate_map, w, h, zones_x, zones_y);
 }
 
 void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice) {

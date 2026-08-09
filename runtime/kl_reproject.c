@@ -101,11 +101,27 @@ static const char kl_msl_reproject[] =
 "// single view binds a single struct and lands on index 0.\n"
 "vertex VOut kl_reproject_v(uint vid [[vertex_id]],\n"
 "                           ushort amp [[amplification_id]],\n"
-"                           constant KLReproj *ua [[buffer(0)]])\n"
+"                           constant KLReproj *ua [[buffer(0)]],\n"
+"                           constant float2 *grid [[buffer(1)]])\n"
 "{\n"
 "    constant KLReproj &u = ua[amp];\n"
-"    // Triangle-strip corners: (0,0) (1,0) (0,1) (1,1).\n"
-"    float2 c = float2(float(vid & 1u), float((vid >> 1) & 1u));\n"
+"    // The unwarp grid (kl_reproject.h): grid[0] is (nx, ny) and the texture\n"
+"    // coordinates follow, one per grid vertex, ALREADY UNWARPED on the CPU.\n"
+"    // A foveated eye texture is stored squeezed, and undoing that here — at a\n"
+"    // few thousand vertices — rather than in the fragment shader is the whole\n"
+"    // point: the rasterizer's interpolation does the work for free, and\n"
+"    // because a rate map is piecewise linear between its zone boundaries, a\n"
+"    // grid built on those boundaries is EXACT rather than an approximation.\n"
+"    //\n"
+"    // An unfoveated pass binds the 1x1 identity grid, and everything below\n"
+"    // reduces to the two triangles that used to be a 4-vertex strip.\n"
+"    uint nx = uint(grid[0].x), ny = uint(grid[0].y);\n"
+"    uint cell = vid / 6u, k = vid % 6u;\n"
+"    uint2 g = uint2(cell % nx, cell / nx);\n"
+"    // Two triangles a cell: (0,0)(1,0)(0,1) and (1,0)(1,1)(0,1).\n"
+"    g.x += (k == 1u || k == 3u || k == 4u) ? 1u : 0u;\n"
+"    g.y += (k == 2u || k == 4u || k == 5u) ? 1u : 0u;\n"
+"    float2 c = float2(g) / float2(float(nx), float(ny));\n"
 "    float d = u.depth;          // KL_REPROJECT_DEPTH\n"
 "    float x = mix(-u.tangents.x, u.tangents.y, c.x) * d;\n"
 "    float y = mix(-u.tangents.w, u.tangents.z, c.y) * d;\n"
@@ -123,7 +139,12 @@ static const char kl_msl_reproject[] =
 "    // where the blit's p.y = 2 is also up, so the same convention written for\n"
 "    // this parameterisation is uv.y = c.y. The two disagreed for exactly as\n"
 "    // long as the reprojection pass had never run anywhere.\n"
-"    o.uv = float2(c.x, c.y);\n"
+"    //\n"
+"    // Read from the grid rather than computed, which is what carries the\n"
+"    // unwarp. The identity grid holds exactly float2(c.x, c.y), so the\n"
+"    // convention derived above is preserved rather than re-derived — and the\n"
+"    // table is built in this same uv space, so nothing here flips.\n"
+"    o.uv = grid[1u + g.y * (nx + 1u) + g.x];\n"
 "    return o;\n"
 "}\n"
 "\n"
@@ -199,6 +220,51 @@ static const char kl_msl_blit[] =
 
 const char *kl_reproject_msl(void)      { return kl_msl_reproject; }
 const char *kl_reproject_blit_msl(void) { return kl_msl_blit; }
+
+// The unwarp grid. See kl_reproject.h for the layout and for why the unwarp
+// lives here — at grid vertices, precomputed — rather than in the fragment
+// shader.
+void kl_reproject_grid_identity(simd_float2 *out) {
+    if (!out) return;
+    out[0] = simd_make_float2(1.0f, 1.0f);      // 1 x 1 cells
+    out[1] = simd_make_float2(0.0f, 0.0f);
+    out[2] = simd_make_float2(1.0f, 0.0f);
+    out[3] = simd_make_float2(0.0f, 1.0f);
+    out[4] = simd_make_float2(1.0f, 1.0f);
+}
+
+void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
+                             float screen_w, float screen_h,
+                             float tex_w, float tex_h,
+                             kl_reproject_s2p fn, void *ctx) {
+    // A degenerate grid would be a pass that draws nothing, which is a black
+    // eye rather than an unfoveated one. Fall back to the identity, which is
+    // the correct picture for an unwarped texture and merely the wrong one for
+    // a warped one — the strictly better failure of the two.
+    if (!out) return;
+    if (!fn || nx == 0 || ny == 0 || nx > KL_REPROJECT_GRID_MAX ||
+        ny > KL_REPROJECT_GRID_MAX || !(tex_w > 0) || !(tex_h > 0) ||
+        !(screen_w > 0) || !(screen_h > 0)) {
+        kl_reproject_grid_identity(out);
+        return;
+    }
+    out[0] = simd_make_float2((float)nx, (float)ny);
+    for (uint32_t y = 0; y <= ny; y++) {
+        for (uint32_t x = 0; x <= nx; x++) {
+            // Grid vertex -> uv -> SCREEN pixels. Top-left origin throughout,
+            // which is both Metal's texture convention and the one
+            // mapScreenToPhysicalCoordinates speaks, so no axis is flipped
+            // anywhere in this function. The shader's separate question of
+            // which corner is "up" in clip space is about the POSITION and does
+            // not reach the coordinates built here.
+            float sx = screen_w * (float)x / (float)nx;
+            float sy = screen_h * (float)y / (float)ny;
+            float px = sx, py = sy;
+            fn(ctx, sx, sy, &px, &py);
+            out[1 + y * (nx + 1) + x] = simd_make_float2(px / tex_w, py / tex_h);
+        }
+    }
+}
 
 // The rotation of a pose, as a matrix, with the translation dropped. Dropping
 // it is the rotation-only decision in the header, not an oversight: a

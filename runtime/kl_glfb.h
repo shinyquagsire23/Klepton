@@ -228,7 +228,16 @@ void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice);
 // has to unwarp: the compositors, and every readback path
 // (`KL_GLFB_OUT`, t_mtl_provider). Until those do, leaving this unset is the
 // only correct configuration.
-void kl_glfb_set_eye_rate_map(int w, int h, void *rate_map);
+// `zones_x`/`zones_y` are the rate layer's sample counts — the number of equal
+// screen-space regions the map divides each axis into. They travel with the map
+// because a built MTLRasterizationRateMap does not report them, and the
+// compositor's unwarp needs them: a rate map is piecewise linear with its
+// breakpoints at those boundaries, so an unwarp grid of exactly this many cells
+// is EXACT, where any other count only samples the curve. See kl_reproject.h.
+void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate_map);
+
+// The zone counts the map in force was built with; both 0 when there is none.
+void kl_glfb_eye_rate_zones(int *zones_x, int *zones_y);
 
 // The map in force, or NULL. What a compositor's unwarp needs to build its
 // coordinate conversion from, and how a readback path knows the eye texture is
