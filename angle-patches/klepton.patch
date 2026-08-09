@@ -1,5 +1,143 @@
+diff --git a/src/libANGLE/renderer/metal/FrameBufferMtl.mm b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
+index 2825a7c..40c159c 100644
+--- a/src/libANGLE/renderer/metal/FrameBufferMtl.mm
++++ b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
+@@ -29,6 +29,37 @@ namespace rx
+ {
+ namespace
+ {
++// Klepton: the rate map a render target renders through, or nil.
++//
++// Two keys, in order: the texture itself (walking its view chain — see
++// mtl_common.mm), then its dimensions. The size rule is what reaches the guest's
++// multisampled scene renderbuffer, which ANGLE allocates itself and which
++// therefore has no MTLTexture anyone outside can name.
++//
++// Shared by prepareRenderPass, which decides whether a pass is foveated, and by
++// blit(), which decides whether a resolve between two of them is a
++// physical-to-physical copy. Those two answers have to come from the same
++// lookup or a blit can disagree with the passes on either side of it.
++id<MTLRasterizationRateMap> RateMapForRenderTarget(const RenderTargetMtl *rt)
++{
++    if (!rt || !mtl::AnyRasterizationRateMapsRegistered())
++    {
++        return nil;
++    }
++    const mtl::TextureRef texture = rt->getTexture();
++    if (!texture)
++    {
++        return nil;
++    }
++    if (id<MTLRasterizationRateMap> map = mtl::GetRasterizationRateMapFor(texture->get()))
++    {
++        return map;
++    }
++    const mtl::MipmapNativeLevel &level = rt->getLevelIndex();
++    return mtl::GetRasterizationRateMapForSize(texture->width(level), texture->height(level),
++                                               rt->getRenderSamples());
++}
++
+ // Override clear color based on texture's write mask
+ void OverrideMTLClearColor(const mtl::TextureRef &texture,
+                            const mtl::ClearColorValue &clearColor,
+@@ -567,6 +598,48 @@ angle::Result FramebufferMtl::blit(const gl::Context *context,
+     baseParams.unpackFlipX = false;
+     baseParams.unpackFlipY = false;
+ 
++    // Klepton: when the source and destination are rasterized through the SAME
++    // rate map, this blit must be a physical-to-physical copy.
++    //
++    // This is the guest's eye resolve. Its scene renders into a multisampled
++    // renderbuffer and reaches the eye texture only through here, so if both are
++    // foveated and this resamples through screen space, the content is warped
++    // twice and the picture is wrong.
++    //
++    // Deliberately narrow. It requires the two maps to be the *same object*, and
++    // the blit to be an unscaled, unflipped, whole-surface copy — anything else
++    // is a real resample that a texel-for-texel read would silently turn into a
++    // crop. Failing those, the blit stays as it was: wrong for foveated content,
++    // but wrong in the way it already was rather than newly broken.
++    if (mtl::AnyRasterizationRateMapsRegistered())
++    {
++        const RenderTargetMtl *srcRT = srcFrameBuffer->getColorReadRenderTarget(context);
++        const RenderTargetMtl *dstRT = mColorRenderTargets.empty() ? nullptr : mColorRenderTargets[0];
++        id<MTLRasterizationRateMap> srcMap = RateMapForRenderTarget(srcRT);
++        id<MTLRasterizationRateMap> dstMap = RateMapForRenderTarget(dstRT);
++        const bool sameRect =
++            adjustedSrcRect.x == 0 && adjustedSrcRect.y == 0 &&
++            adjustedSrcRect.width == static_cast<float>(srcFramebufferDimensions.width) &&
++            adjustedSrcRect.height == static_cast<float>(srcFramebufferDimensions.height) &&
++            srcClippedDestArea.x == 0 && srcClippedDestArea.y == 0 &&
++            srcClippedDestArea.width == srcFramebufferDimensions.width &&
++            srcClippedDestArea.height == srcFramebufferDimensions.height &&
++            srcFramebufferDimensions.width == dstFramebufferDimensions.width &&
++            srcFramebufferDimensions.height == dstFramebufferDimensions.height;
++        baseParams.physicalPassthrough =
++            srcMap != nil && srcMap == dstMap && sameRect && !this->getFlipY() &&
++            !srcFrameBuffer->getFlipY();
++        if (mtl::RasterizationRateTraceEnabled())
++        {
++            fprintf(stderr,
++                    "[angle-vrr] blit srcMap=%p dstMap=%p sameRect=%d flip=%d/%d -> "
++                    "passthrough=%d\n",
++                    (void *)srcMap, (void *)dstMap, sameRect ? 1 : 0,
++                    srcFrameBuffer->getFlipY() ? 1 : 0, this->getFlipY() ? 1 : 0,
++                    baseParams.physicalPassthrough ? 1 : 0);
++        }
++    }
++
+     return blitWithDraw(context, srcFrameBuffer, blitColorBuffer, blitDepthBuffer,
+                         blitStencilBuffer, filter, baseParams);
+ }
+@@ -1144,6 +1217,46 @@ angle::Result FramebufferMtl::prepareRenderPass(const gl::Context *context,
+         desc.stencilAttachment = {};
+     }
+ 
++    // Klepton: variable rasterization rate. A pass is foveated when its FIRST
++    // colour attachment has a map registered (mtl_common.mm). Deliberately not a
++    // per-attachment property: Metal takes one map for the whole render pass, so
++    // a second attachment carrying a different map cannot be honoured and
++    // silently rasterizing it through the first one would be a wrong picture.
++    // Refuse that case by dropping to unfoveated, which is merely slower.
++    desc.rasterizationRateMap = nil;
++    if (mtl::AnyRasterizationRateMapsRegistered() && desc.numColorAttachments > 0)
++    {
++        bool first = true;
++        for (uint32_t colorIndexGL = 0; colorIndexGL < maxColorAttachments; ++colorIndexGL)
++        {
++            const RenderTargetMtl *rt = mColorRenderTargets[colorIndexGL];
++            if (!rt || !enabledDrawBuffers.test(colorIndexGL))
++            {
++                continue;
++            }
++            id<MTLRasterizationRateMap> map = RateMapForRenderTarget(rt);
++            if (mtl::RasterizationRateTraceEnabled())
++            {
++                const mtl::TextureRef texture = rt->getTexture();
++                fprintf(stderr, "[angle-vrr] prepareRenderPass rt=%u tex=%p map=%p\n",
++                        colorIndexGL, texture ? (void *)texture->get() : NULL, (void *)map);
++            }
++            // `first` rather than a nil test: an unfoveated attachment followed
++            // by a foveated one is a DISAGREEMENT, and testing nil would read it
++            // as "nothing chosen yet" and adopt the second one's map.
++            if (first)
++            {
++                desc.rasterizationRateMap = map;
++                first                     = false;
++            }
++            else if (desc.rasterizationRateMap != map)
++            {
++                desc.rasterizationRateMap = nil;
++                break;
++            }
++        }
++    }
++
+     if (desc.numColorAttachments == 0 && mDepthRenderTarget == nullptr &&
+         mStencilRenderTarget == nullptr)
+     {
 diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
-index 85cc743..672e204 100644
+index 85cc743..a7b47bb 100644
 --- a/src/libANGLE/renderer/metal/mtl_common.h
 +++ b/src/libANGLE/renderer/metal/mtl_common.h
 @@ -113,7 +113,12 @@ constexpr size_t kDefaultAttributeSize = 4 * sizeof(float);
@@ -16,3 +154,616 @@ index 85cc743..672e204 100644
  constexpr size_t kInlineConstDataMaxSize = 4 * 1024;
  constexpr size_t kDefaultUniformsMaxSize = 16 * 1024;
  constexpr uint32_t kMaxViewports         = 1;
+@@ -423,6 +428,60 @@ class Context : public ErrorHandler
+     DisplayMtl *mDisplay;
+ };
+ 
++// Klepton: variable rasterization rate (foveated rendering).
++//
++// Upstream ANGLE has no notion of MTLRasterizationRateMap. Klepton renders the
++// guest's eye textures into MTLTextures it allocates itself, and wants those
++// passes rasterized through a rate map so the periphery costs fewer fragments.
++//
++// The association is kept OUT of mtl::Texture on purpose: a Texture is shared
++// with its views and its UsageRef, is built by nine different constructors, and
++// nothing in ANGLE would carry the map across a view. A side registry keyed on
++// the underlying id<MTLTexture> has none of that surface, and the lookup happens
++// once per render pass build, not per draw.
++//
++// Registered from outside ANGLE via the exported C entry points at the bottom of
++// mtl_common.mm; with nothing registered every path below is one atomic load.
++id<MTLRasterizationRateMap> GetRasterizationRateMapFor(id<MTLTexture> texture);
++
++// A null map unbinds. Both the texture and the map are retained while bound —
++// see the implementation for why the TEXTURE has to be.
++void SetRasterizationRateMapFor(id<MTLTexture> texture, id<MTLRasterizationRateMap> map);
++
++// The same thing keyed on a render target's DIMENSIONS instead of its identity.
++//
++// This exists because the target that actually matters cannot be named from
++// outside ANGLE. The guest's expensive pass renders into a multisampled
++// RENDERBUFFER that ANGLE allocates itself in response to
++// glRenderbufferStorageMultisample — there is no MTLTexture for the runtime to
++// hold, and no GL object it can hand us either without dragging gl::Context into
++// the Metal backend. Its size, though, is exactly the eye size, and so is the
++// eye texture's, which is precisely the pair that must share one map for the
++// resolve between them to stay a physical-to-physical copy.
++//
++// Checked only when the per-texture lookup misses.
++// `minSamples` qualifies the rule, and is not optional in practice. The guest
++// allocates OTHER render targets at the eye size — a post-processing chain reads
++// and writes full-resolution intermediates — and foveating one of those is a
++// wrong picture, because the guest samples it with screen-space coordinates that
++// know nothing about the warp. The scene target is distinguishable from all of
++// them by being MULTISAMPLED, so a rule of minSamples=2 hits it and nothing
++// else. Pass 1 to match any render target of that size.
++void SetRasterizationRateMapForSize(uint32_t width,
++                                    uint32_t height,
++                                    uint32_t minSamples,
++                                    id<MTLRasterizationRateMap> map);
++id<MTLRasterizationRateMap> GetRasterizationRateMapForSize(uint32_t width,
++                                                           uint32_t height,
++                                                           uint32_t samples);
++
++// Fast out for the common case — no maps registered at all, so the per-render-pass
++// lookup can be skipped entirely without taking the registry lock.
++bool AnyRasterizationRateMapsRegistered();
++
++// KL_ANGLE_VRR_TRACE=1. Read once: this is consulted on a per-render-pass path.
++bool RasterizationRateTraceEnabled();
++
+ #define ANGLE_MTL_CHECK(context, result, nserror)                                   \
+     do                                                                              \
+     {                                                                               \
+diff --git a/src/libANGLE/renderer/metal/mtl_common.mm b/src/libANGLE/renderer/metal/mtl_common.mm
+index d5f657b..67c7dc8 100644
+--- a/src/libANGLE/renderer/metal/mtl_common.mm
++++ b/src/libANGLE/renderer/metal/mtl_common.mm
+@@ -11,8 +11,12 @@
+ 
+ #include <dispatch/dispatch.h>
+ 
++#include <atomic>
+ #include <cstring>
++#include <mutex>
++#include <unordered_map>
+ 
++#include "common/apple/ObjCPtr.h"
+ #include "libANGLE/angletypes.h"
+ #include "libANGLE/renderer/metal/DisplayMtl.h"
+ 
+@@ -87,5 +91,184 @@ mtl::CommandQueue &Context::cmdQueue()
+     return mDisplay->cmdQueue();
+ }
+ 
++// Klepton: the variable-rasterization-rate registry. See mtl_common.h.
++namespace
++{
++
++struct RateMapRegistry
++{
++    std::mutex lock;
++    // Both sides retained. The MAP for the obvious reason; the TEXTURE because
++    // the map is keyed on its address and a released texture's address can be
++    // handed straight back out by the allocator — a stale entry would then
++    // silently foveate a completely unrelated render target, which is a wrong
++    // picture with nothing anywhere reporting it. Retaining costs a leak if the
++    // caller forgets to unbind, and a leak is the better failure.
++    std::unordered_map<void *, std::pair<angle::ObjCPtr<id<MTLTexture>>,
++                                         angle::ObjCPtr<id<MTLRasterizationRateMap>>>>
++        entries;
++    // Keyed on (width << 32) | height. No texture to retain here, so no lifetime
++    // question — a size is not an address and cannot be recycled into a
++    // different object.
++    std::unordered_map<uint64_t,
++                       std::pair<uint32_t, angle::ObjCPtr<id<MTLRasterizationRateMap>>>>
++        bySize;
++    // Read on every render pass build, written only when a binding changes, so
++    // the overwhelmingly common "nothing registered" case never takes the lock.
++    // Counts BOTH tables — a size rule alone must still switch the lookup on.
++    std::atomic<size_t> count{0};
++
++    void recount() { count.store(entries.size() + bySize.size(), std::memory_order_relaxed); }
++};
++
++static uint64_t SizeKey(uint32_t width, uint32_t height)
++{
++    return (static_cast<uint64_t>(width) << 32) | height;
++}
++
++RateMapRegistry &Registry()
++{
++    static RateMapRegistry *registry = new RateMapRegistry();
++    return *registry;
++}
++
++}  // anonymous namespace
++
++bool AnyRasterizationRateMapsRegistered()
++{
++    return Registry().count.load(std::memory_order_relaxed) != 0;
++}
++
++bool RasterizationRateTraceEnabled()
++{
++    static const bool enabled = getenv("KL_ANGLE_VRR_TRACE") != nullptr;
++    return enabled;
++}
++
++id<MTLRasterizationRateMap> GetRasterizationRateMapFor(id<MTLTexture> texture)
++{
++    if (!texture || !AnyRasterizationRateMapsRegistered())
++    {
++        return nil;
++    }
++    RateMapRegistry &registry = Registry();
++    std::lock_guard<std::mutex> guard(registry.lock);
++    // Walk the view chain, not just the texture handed in. A texture that
++    // reaches a render pass is very often NOT the object the caller registered:
++    // an EGLImage-backed GL texture (EGL_ANGLE_metal_texture_client_buffer, which
++    // is how the guest's eye textures arrive) becomes a texture VIEW of ours to
++    // carry the requested internalformat and array slice, and ANGLE makes
++    // further views of its own for sRGB-linear and stencil reads. Every one of
++    // them is a distinct id<MTLTexture> with the SAME storage, which is what the
++    // map actually belongs to. Keying on identity alone measured as "no map
++    // registered" with the registration plainly right — a full pass of the spike
++    // failed on exactly this.
++    for (id<MTLTexture> t = texture; t != nil; t = [t parentTexture])
++    {
++        auto it = registry.entries.find((void *)t);
++        if (it != registry.entries.end())
++        {
++            return it->second.second.get();
++        }
++    }
++    return nil;
++}
++
++void SetRasterizationRateMapFor(id<MTLTexture> texture, id<MTLRasterizationRateMap> map)
++{
++    if (!texture)
++    {
++        return;
++    }
++    RateMapRegistry &registry = Registry();
++    std::lock_guard<std::mutex> guard(registry.lock);
++    if (map)
++    {
++        registry.entries[(void *)texture] = {texture, map};
++    }
++    else
++    {
++        registry.entries.erase((void *)texture);
++    }
++    registry.recount();
++    if (RasterizationRateTraceEnabled())
++    {
++        fprintf(stderr, "[angle-vrr] register tex=%p map=%p (%zu bound)\n", (void *)texture,
++                (void *)map, registry.entries.size());
++    }
++}
++
++void SetRasterizationRateMapForSize(uint32_t width,
++                                    uint32_t height,
++                                    uint32_t minSamples,
++                                    id<MTLRasterizationRateMap> map)
++{
++    if (width == 0 || height == 0)
++    {
++        return;
++    }
++    RateMapRegistry &registry = Registry();
++    std::lock_guard<std::mutex> guard(registry.lock);
++    if (map)
++    {
++        registry.bySize[SizeKey(width, height)] = {minSamples < 1 ? 1 : minSamples, map};
++    }
++    else
++    {
++        registry.bySize.erase(SizeKey(width, height));
++    }
++    registry.recount();
++    if (RasterizationRateTraceEnabled())
++    {
++        fprintf(stderr, "[angle-vrr] register size=%ux%u minSamples=%u map=%p (%zu size rules)\n",
++                width, height, minSamples, (void *)map, registry.bySize.size());
++    }
++}
++
++id<MTLRasterizationRateMap> GetRasterizationRateMapForSize(uint32_t width,
++                                                           uint32_t height,
++                                                           uint32_t samples)
++{
++    if (!AnyRasterizationRateMapsRegistered())
++    {
++        return nil;
++    }
++    RateMapRegistry &registry = Registry();
++    std::lock_guard<std::mutex> guard(registry.lock);
++    auto it = registry.bySize.find(SizeKey(width, height));
++    if (it == registry.bySize.end() || samples < it->second.first)
++    {
++        return nil;
++    }
++    return it->second.second.get();
++}
++
+ }  // namespace mtl
+ }  // namespace rx
++
++// The entry points Klepton resolves by dlsym. Deliberately outside every ANGLE
++// namespace and taking void* rather than id<> so the caller needs no ANGLE and
++// no Objective-C headers — kl_glfb.c is plain C.
++//
++// Passing a null map unbinds, which the caller MUST do before releasing the
++// texture (see the retain note above).
++extern "C" __attribute__((visibility("default"))) void ANGLEMetalSetRasterizationRateMap(
++    void *mtlTexture,
++    void *mtlRateMap)
++{
++    rx::mtl::SetRasterizationRateMapFor((id<MTLTexture>)mtlTexture,
++                                        (id<MTLRasterizationRateMap>)mtlRateMap);
++}
++
++// Every colour render target of exactly this size gets this map. See the header
++// for why the size, and not the object, is the workable key for the guest's
++// multisampled scene target.
++extern "C" __attribute__((visibility("default"))) void ANGLEMetalSetRasterizationRateMapForSize(
++    uint32_t width,
++    uint32_t height,
++    uint32_t minSamples,
++    void *mtlRateMap)
++{
++    rx::mtl::SetRasterizationRateMapForSize(width, height, minSamples,
++                                            (id<MTLRasterizationRateMap>)mtlRateMap);
++}
+diff --git a/src/libANGLE/renderer/metal/mtl_render_utils.h b/src/libANGLE/renderer/metal/mtl_render_utils.h
+index 1ae4533..eaccdb0 100644
+--- a/src/libANGLE/renderer/metal/mtl_render_utils.h
++++ b/src/libANGLE/renderer/metal/mtl_render_utils.h
+@@ -87,6 +87,12 @@ struct BlitParams
+     bool srcYFlipped = false;  // source texture has data flipped in Y direction
+     bool unpackFlipX = false;  // flip texture data copying process in X direction
+     bool unpackFlipY = false;  // flip texture data copying process in Y direction
++
++    // Klepton: both sides of this blit are rasterized through the SAME
++    // rasterization rate map, so the source already holds warped content and
++    // resampling it through screen-space coordinates would warp it twice. Copy
++    // physical texel to physical texel instead. Set by FramebufferMtl::blit.
++    bool physicalPassthrough = false;
+ };
+ 
+ struct ColorBlitParams : public BlitParams
+diff --git a/src/libANGLE/renderer/metal/mtl_render_utils.mm b/src/libANGLE/renderer/metal/mtl_render_utils.mm
+index 0710ffe..ad3916b 100644
+--- a/src/libANGLE/renderer/metal/mtl_render_utils.mm
++++ b/src/libANGLE/renderer/metal/mtl_render_utils.mm
+@@ -59,7 +59,11 @@ struct BlitParamsUniform
+     int srcLevel         = 0;
+     int srcLayer         = 0;
+     uint8_t dstLuminance = 0;  // dest texture is luminace
+-    uint8_t padding[7];
++    // Klepton: copy physical texel to physical texel instead of resampling
++    // through screen space. Only correct when source and destination carry the
++    // same rasterization rate map. See blit.metal's blitSourceCoords.
++    uint8_t physicalPassthrough = 0;
++    uint8_t padding[6];
+ };
+ 
+ struct BlitStencilToBufferParamsUniform
+@@ -591,8 +595,9 @@ void SetupBlitWithDrawUniformData(RenderCommandEncoder *cmdEncoder,
+     // e.g., a clipped triangle, would produce various texture sampling artifacts on that hardware.
+ 
+     BlitParamsUniform uniformParams;
+-    uniformParams.srcLevel = params.srcLevel.get();
+-    uniformParams.srcLayer = params.srcLayer;
++    uniformParams.srcLevel            = params.srcLevel.get();
++    uniformParams.srcLayer            = params.srcLayer;
++    uniformParams.physicalPassthrough = params.physicalPassthrough ? 1 : 0;
+     if (isColorBlit)
+     {
+         const ColorBlitParams *colorParams = static_cast<const ColorBlitParams *>(&params);
+diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.h b/src/libANGLE/renderer/metal/mtl_state_cache.h
+index 329402d..aea9ec5 100644
+--- a/src/libANGLE/renderer/metal/mtl_state_cache.h
++++ b/src/libANGLE/renderer/metal/mtl_state_cache.h
+@@ -743,6 +743,12 @@ struct RenderPassDesc
+     uint32_t rasterSampleCount   = 1;
+     uint32_t defaultWidth        = 0;
+     uint32_t defaultHeight       = 0;
++
++    // Klepton: variable rasterization rate. Non-owning — the registry in
++    // mtl_common.mm holds the reference, and FramebufferMtl::prepareRenderPass
++    // is the only thing that fills this in. nil on every unfoveated pass, which
++    // is all of them upstream.
++    __unsafe_unretained id<MTLRasterizationRateMap> rasterizationRateMap = nil;
+ };
+ 
+ }  // namespace mtl
+diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.mm b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+index ec81f97..39b8d35 100644
+--- a/src/libANGLE/renderer/metal/mtl_state_cache.mm
++++ b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+@@ -580,6 +580,14 @@ bool RenderPassDesc::equalIgnoreLoadStoreOptions(const RenderPassDesc &other) co
+         return false;
+     }
+ 
++    // Klepton: a rate map change is a render pass change. It cannot be set on an
++    // encoder after the fact, so an in-flight pass has to be ended and restarted
++    // — which is exactly what a false here causes.
++    if (rasterizationRateMap != other.rasterizationRateMap)
++    {
++        return false;
++    }
++
+     return depthAttachment.equalIgnoreLoadStoreOptions(other.depthAttachment) &&
+            stencilAttachment.equalIgnoreLoadStoreOptions(other.stencilAttachment);
+ }
+@@ -600,7 +608,8 @@ bool RenderPassDesc::operator==(const RenderPassDesc &other) const
+     }
+     return depthAttachment == other.depthAttachment &&
+            stencilAttachment == other.stencilAttachment && defaultWidth == other.defaultWidth &&
+-           defaultHeight == other.defaultHeight && rasterSampleCount == other.rasterSampleCount;
++           defaultHeight == other.defaultHeight && rasterSampleCount == other.rasterSampleCount &&
++           rasterizationRateMap == other.rasterizationRateMap;
+ }
+ 
+ // Convert to Metal object
+@@ -627,6 +636,19 @@ void RenderPassDesc::convertToMetalDesc(MTLRenderPassDescriptor *objCDesc,
+     ToObjC(depthAttachment, objCDesc.depthAttachment);
+     ToObjC(stencilAttachment, objCDesc.stencilAttachment);
+ 
++    // Klepton: variable rasterization rate. Metal then rasterizes into the
++    // (smaller) physical region of the attachment while the viewport, the
++    // scissor and every screen-space coordinate stay in the map's SCREEN space —
++    // which is why nothing else in this conversion changes. Whoever samples the
++    // result afterwards is responsible for the unwarp.
++    objCDesc.rasterizationRateMap = rasterizationRateMap;
++    if (RasterizationRateTraceEnabled())
++    {
++        fprintf(stderr, "[angle-vrr] convertToMetalDesc map=%p -> objc %p (rtW=%u rtH=%u)\n",
++                (void *)rasterizationRateMap, (void *)objCDesc.rasterizationRateMap, defaultWidth,
++                defaultHeight);
++    }
++
+     if ((defaultWidth | defaultHeight) != 0)
+     {
+         objCDesc.renderTargetWidth        = defaultWidth;
+diff --git a/src/libANGLE/renderer/metal/shaders/blit.metal b/src/libANGLE/renderer/metal/shaders/blit.metal
+index c8dfd29..abbce55 100644
+--- a/src/libANGLE/renderer/metal/shaders/blit.metal
++++ b/src/libANGLE/renderer/metal/shaders/blit.metal
+@@ -34,7 +34,11 @@ struct BlitParams
+     int srcLevel;  // Source texture level.
+     int srcLayer;  // Source texture layer.
+     bool dstLuminance;  // destination texture is luminance. Unused by depth & stencil blitting.
+-    uint8_t padding[7];
++    // Klepton: source and destination carry the SAME rasterization rate map, so
++    // this blit must copy physical texel to physical texel rather than resample
++    // through screen space. See blitSourceCoords below.
++    bool physicalPassthrough;
++    uint8_t padding[6];
+ };
+ 
+ struct BlitVSOut
+@@ -62,10 +66,38 @@ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
+     return coords;
+ }
+ 
++// Klepton: which source texel this fragment reads.
++//
++// Normally the interpolated texCoords, scaled to the source's dimensions. But
++// when both sides of the blit are rasterized through the SAME rasterization
++// rate map, the source's content is already stored warped, and texCoords are
++// screen-space — so resampling through them warps it a second time. (Measured:
++// a half-screen quad arrives 125 wide where a passthrough gives 189.)
++//
++// In that case the correct read is the fragment's OWN physical position:
++// destination physical texel p takes source physical texel p, which is an
++// identity in physical space and needs no rate map decoder at all. This is only
++// valid because the two maps are identical — it is not a general unwarp.
++template <typename SrcTexture2d>
++static uint2 blitSourceCoords(SrcTexture2d srcTexture,
++                              float2 texCoords,
++                              float4 position,
++                              constant BlitParams &options)
++{
++    if (options.physicalPassthrough)
++    {
++        return uint2(position.xy);
++    }
++    return getImageCoords(srcTexture, texCoords);
++}
++
+ template <typename T>
+-static inline vec<T, 4> blitSampleTextureMS(texture2d_ms<T> srcTexture, float2 texCoords)
++static inline vec<T, 4> blitSampleTextureMS(texture2d_ms<T> srcTexture,
++                                            float2 texCoords,
++                                            float4 position,
++                                            constant BlitParams &options)
+ {
+-    uint2 coords = getImageCoords(srcTexture, texCoords);
++    uint2 coords = blitSourceCoords(srcTexture, texCoords, position, options);
+     return resolveTextureMS(srcTexture, coords);
+ }
+ 
+@@ -106,14 +138,28 @@ static inline vec<T, 4> blitReadTexture(BLIT_COLOR_FS_PARAMS(T))
+     switch (kSourceTextureType)
+     {
+         case kTextureType2D:
+-            output = srcTexture2d.sample(textureSampler, input.texCoords, level(options.srcLevel));
++            // A physical passthrough is a texel fetch, not a sample: filtering
++            // would blend across the rate map's zone boundaries, which is
++            // precisely the resampling this mode exists to avoid.
++            if (options.physicalPassthrough)
++            {
++                output = srcTexture2d.read(
++                    blitSourceCoords(srcTexture2d, input.texCoords, input.position, options),
++                    options.srcLevel);
++            }
++            else
++            {
++                output =
++                    srcTexture2d.sample(textureSampler, input.texCoords, level(options.srcLevel));
++            }
+             break;
+         case kTextureType2DArray:
+             output = srcTexture2dArray.sample(textureSampler, input.texCoords, options.srcLayer,
+                                               level(options.srcLevel));
+             break;
+         case kTextureType2DMultisample:
+-            output = blitSampleTextureMS(srcTexture2dMS, input.texCoords);
++            output =
++                blitSampleTextureMS(srcTexture2dMS, input.texCoords, input.position, options);
+             break;
+         case kTextureTypeCube:
+             output = srcTextureCube.sample(textureSampler,
+diff --git a/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_autogen.metal b/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_autogen.metal
+index c1b0128..4f75696 100644
+--- a/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_autogen.metal
++++ b/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_autogen.metal
+@@ -251,7 +251,8 @@ struct BlitParams
+     int srcLevel;
+     int srcLayer;
+     bool dstLuminance;
+-    uint8_t padding[7];
++    bool physicalPassthrough;
++    uint8_t padding[6];
+ };
+ struct BlitVSOut
+ {
+@@ -273,10 +274,25 @@ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
+     uint2 coords = uint2(texCoords * float2(dimens));
+     return coords;
+ }
++template <typename SrcTexture2d>
++static uint2 blitSourceCoords(SrcTexture2d srcTexture,
++                              float2 texCoords,
++                              float4 position,
++                              constant BlitParams &options)
++{
++    if (options.physicalPassthrough)
++    {
++        return uint2(position.xy);
++    }
++    return getImageCoords(srcTexture, texCoords);
++}
+ template <typename T>
+-static inline vec<T, 4> blitSampleTextureMS(texture2d_ms<T> srcTexture, float2 texCoords)
++static inline vec<T, 4> blitSampleTextureMS(texture2d_ms<T> srcTexture,
++                                            float2 texCoords,
++                                            float4 position,
++                                            constant BlitParams &options)
+ {
+-    uint2 coords = getImageCoords(srcTexture, texCoords);
++    uint2 coords = blitSourceCoords(srcTexture, texCoords, position, options);
+     return resolveTextureMS(srcTexture, coords);
+ }
+ template <typename T>
+@@ -296,14 +312,25 @@ static inline vec<T, 4> blitReadTexture(BlitVSOut input [[stage_in]], texture2d<
+     switch (kSourceTextureType)
+     {
+         case kTextureType2D:
+-            output = srcTexture2d.sample(textureSampler, input.texCoords, level(options.srcLevel));
++            if (options.physicalPassthrough)
++            {
++                output = srcTexture2d.read(
++                    blitSourceCoords(srcTexture2d, input.texCoords, input.position, options),
++                    options.srcLevel);
++            }
++            else
++            {
++                output =
++                    srcTexture2d.sample(textureSampler, input.texCoords, level(options.srcLevel));
++            }
+             break;
+         case kTextureType2DArray:
+             output = srcTexture2dArray.sample(textureSampler, input.texCoords, options.srcLayer,
+                                               level(options.srcLevel));
+             break;
+         case kTextureType2DMultisample:
+-            output = blitSampleTextureMS(srcTexture2dMS, input.texCoords);
++            output =
++                blitSampleTextureMS(srcTexture2dMS, input.texCoords, input.position, options);
+             break;
+         case kTextureTypeCube:
+             output = srcTextureCube.sample(textureSampler,
+diff --git a/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_src_autogen.h b/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_src_autogen.h
+index 3d70820..b9edac8 100644
+--- a/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_src_autogen.h
++++ b/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_src_autogen.h
+@@ -8,6 +8,8 @@
+ 
+ // C++ string version of combined Metal default shaders.
+ 
++
++
+ static char gDefaultMetallibSrc[] = R"(
+ # include <simd/simd.h>
+ # include <metal_stdlib>
+@@ -252,7 +254,8 @@ struct BlitParams
+     int srcLevel;
+     int srcLayer;
+     bool dstLuminance;
+-    uint8_t padding[7];
++    bool physicalPassthrough;
++    uint8_t padding[6];
+ };
+ struct BlitVSOut
+ {
+@@ -274,10 +277,25 @@ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
+     uint2 coords = uint2(texCoords * float2(dimens));
+     return coords;
+ }
++template <typename SrcTexture2d>
++static uint2 blitSourceCoords(SrcTexture2d srcTexture,
++                              float2 texCoords,
++                              float4 position,
++                              constant BlitParams &options)
++{
++    if (options.physicalPassthrough)
++    {
++        return uint2(position.xy);
++    }
++    return getImageCoords(srcTexture, texCoords);
++}
+ template <typename T>
+-static inline vec<T, 4> blitSampleTextureMS(texture2d_ms<T> srcTexture, float2 texCoords)
++static inline vec<T, 4> blitSampleTextureMS(texture2d_ms<T> srcTexture,
++                                            float2 texCoords,
++                                            float4 position,
++                                            constant BlitParams &options)
+ {
+-    uint2 coords = getImageCoords(srcTexture, texCoords);
++    uint2 coords = blitSourceCoords(srcTexture, texCoords, position, options);
+     return resolveTextureMS(srcTexture, coords);
+ }
+ template <typename T>
+@@ -297,14 +315,25 @@ static inline vec<T, 4> blitReadTexture(BlitVSOut input [[stage_in]], texture2d<
+     switch (kSourceTextureType)
+     {
+         case kTextureType2D:
+-            output = srcTexture2d.sample(textureSampler, input.texCoords, level(options.srcLevel));
++            if (options.physicalPassthrough)
++            {
++                output = srcTexture2d.read(
++                    blitSourceCoords(srcTexture2d, input.texCoords, input.position, options),
++                    options.srcLevel);
++            }
++            else
++            {
++                output =
++                    srcTexture2d.sample(textureSampler, input.texCoords, level(options.srcLevel));
++            }
+             break;
+         case kTextureType2DArray:
+             output = srcTexture2dArray.sample(textureSampler, input.texCoords, options.srcLayer,
+                                               level(options.srcLevel));
+             break;
+         case kTextureType2DMultisample:
+-            output = blitSampleTextureMS(srcTexture2dMS, input.texCoords);
++            output =
++                blitSampleTextureMS(srcTexture2dMS, input.texCoords, input.position, options);
+             break;
+         case kTextureTypeCube:
+             output = srcTextureCube.sample(textureSampler,

@@ -198,4 +198,41 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
 // pass samples, and what a test reads back to check the guest's frame arrived.
 void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice);
 
+// ---------------------------------------------------------------------------
+// Foveation — variable rasterization rate for the guest's own rendering.
+//
+// `rate_map` is an id<MTLRasterizationRateMap> the PLATFORM built, on the same
+// MTLDevice as the eye textures, for a screen size of `w` x `h`. The runtime
+// never constructs one, for the same reason it never constructs an MTLTexture:
+// that keeps this file plain C and puts the Metal object where the display
+// numbers are (KleptonCompositor.swift on device, t_mtl_provider.m on host).
+// NULL turns foveation off again.
+//
+// Two registrations, because the guest's per-eye chain has two render targets
+// and they must share ONE map (measured, PLANNING §12.22):
+//
+//   * the eye texture, by identity, as each one is bound;
+//   * the guest's multisampled SCENE target, by size — ANGLE allocates that
+//     renderbuffer itself in response to glRenderbufferStorageMultisample, so
+//     there is no object anyone outside ANGLE can name. The rule is qualified
+//     by sample count so it hits only that target: the guest also allocates
+//     single-sampled post-processing intermediates at the eye size, and
+//     foveating one of THOSE is a wrong picture, because the guest samples it
+//     with screen-space coordinates that know nothing about the warp.
+//
+// Sharing the map is what keeps the resolve between them a physical-to-physical
+// copy rather than a second warp — see the passthrough mode in
+// angle-patches/klepton.patch, and `make vrr` Q6, which measures it.
+//
+// **The eye texture is left in a WARPED layout by this**, so whoever samples it
+// has to unwarp: the compositors, and every readback path
+// (`KL_GLFB_OUT`, t_mtl_provider). Until those do, leaving this unset is the
+// only correct configuration.
+void kl_glfb_set_eye_rate_map(int w, int h, void *rate_map);
+
+// The map in force, or NULL. What a compositor's unwarp needs to build its
+// coordinate conversion from, and how a readback path knows the eye texture is
+// not an ordinary image.
+void *kl_glfb_eye_rate_map(void);
+
 #endif

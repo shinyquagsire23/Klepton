@@ -162,6 +162,16 @@ answers GL and kl_glfb never initializes.
   Compositor Services (`tests/t_mtl_provider.m`). With `KL_GLFB_OUT` set it
   also writes `mtl_eye0.png`/`mtl_eye1.png` from the textures, tone-mapped like
   the reference frames so the two are directly comparable.
+- `KL_ANGLE_VRR_TRACE=1` — read by **our patched ANGLE**, not by the runtime
+  (`angle-patches/klepton.patch`, `vendor/src/libANGLE/renderer/metal/`). Logs
+  the variable-rasterization-rate seam: every rate map bound or unbound through
+  `ANGLEMetalSetRasterizationRateMap`, the per-framebuffer lookup in
+  `FramebufferMtl::prepareRenderPass` (with the render target's *actual*
+  `id<MTLTexture>`, which is a texture VIEW of the one that was registered), and
+  the map as it reaches `MTLRenderPassDescriptor`. Read once and cached, so it
+  costs nothing when unset. The three lines together answer the only question
+  that matters when foveation silently does nothing: was the map registered, was
+  it found, and did it reach Metal. `make vrr` is the standalone gate.
 - `KL_GLFB_ERRSCAN=<code>` — name the call that **generates** a GL error
   anywhere in the stream, not just the few ERRPROBE hand-wraps: the trace
   trampoline logs before each call, so a non-zero glGetError entering call N
@@ -444,6 +454,20 @@ puts the camera on the ground with its hands underneath it.
   Quest 2's 72 Hz instead of the display's own measured numbers (the visionOS
   compositor's priming pass measures and logs both either way). A free A/B if
   the real numbers send Unity somewhere unexpected.
+- `KL_OVRP_EYE_SCALE=<x>` — scale the per-eye render target size the guest is
+  told to use (`ovrp_GetEyeTextureSize`), default 1.0, accepted in 0.05..4.0.
+  Applies to whatever the frontend measured off the display
+  (`kl_ovrp_set_eye_texture_size`); with nothing pushed the size stays the
+  Quest 2's 2290x2400 and this does nothing. The cheapest resolution knob
+  there is — Unity then applies its **own** ~1.2x on top of the result.
+- `KL_OVRP_EYE_MAX=<px>` — cap on the longer axis of that size, default 3072,
+  0 to disable. Vision Pro's logical per-eye resolution is far larger than a
+  Quest's, and the guest allocates stages x eyes of RGBA16F at whatever it is
+  told, so an uncapped number turns straight into hundreds of MiB and into fill
+  cost. The aspect ratio is preserved when it clamps, because the frustum
+  tangents pushed alongside would otherwise disagree with the picture's shape.
+  Every change logs the requested size, the applied size and the resulting
+  swapchain MiB.
 
 ### Haptics (`runtime/kl_ovrp.c` — the seam that runs OUT of the guest)
 

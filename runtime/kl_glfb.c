@@ -1499,6 +1499,26 @@ static unsigned (*a_eglQueryDeviceAttribEXT)(void *, int32_t, intptr_t *);
 static void (*a_glEGLImageTargetTexture2DOES)(uint32_t, void *);
 static void (*a_glBindTexture_mtl)(uint32_t, uint32_t);
 
+// Foveation. These two are OURS — they exist only in the patched ANGLE
+// (angle-patches/klepton.patch), so a NULL here means the loaded libGLESv2
+// predates the patch rather than that anything is broken, and it is worth
+// saying so by name rather than silently not foveating.
+static void (*a_SetRateMap)(void *texture, void *map);
+static void (*a_SetRateMapForSize)(uint32_t w, uint32_t h, uint32_t min_samples, void *map);
+
+// The map in force, and the eye size it was built for. One map for both eyes
+// and every stage: the two render targets in a per-eye chain have to share one
+// or the resolve between them stops being a physical-to-physical copy, and
+// there is no reason for the stages to differ from each other.
+static void *g_eye_rate_map;
+static int   g_eye_rate_w, g_eye_rate_h;
+
+// The multisampled scene target is the one the size rule is for; a
+// single-sampled target of the same size is a post-processing intermediate and
+// must NOT be foveated. See kl_glfb.h.
+#define KL_RATE_MIN_SAMPLES 2
+
+
 static kl_glfb_mtl_provider g_mtl_provider;
 static void *g_mtl_provider_ctx;
 // One record per (eye, stage). Stage count is ovrp_GetEyeTextureStageCount's
@@ -1524,6 +1544,12 @@ static int mtl_resolve(void) {
     a_eglQueryDeviceAttribEXT  = asym("eglQueryDeviceAttribEXT");
     a_glEGLImageTargetTexture2DOES = asym("glEGLImageTargetTexture2DOES");
     a_glBindTexture_mtl        = asym("glBindTexture");
+    // Ours, from angle-patches/klepton.patch. Deliberately NOT in the return
+    // below: an ANGLE without them can still do the interop, it just cannot
+    // foveate, and failing the whole Metal path over that would trade a
+    // performance feature for the picture.
+    a_SetRateMap        = asym("ANGLEMetalSetRasterizationRateMap");
+    a_SetRateMapForSize = asym("ANGLEMetalSetRasterizationRateMapForSize");
     return a_eglCreateImageKHR && a_glEGLImageTargetTexture2DOES
         && a_eglQueryDeviceAttribEXT && a_glBindTexture_mtl;
 }
@@ -1548,6 +1574,40 @@ void *kl_glfb_mtl_device(void) {
     }
     dev = (void *)mtl;
     return dev;
+}
+
+void *kl_glfb_eye_rate_map(void) { return g_eye_rate_map; }
+
+void kl_glfb_set_eye_rate_map(int w, int h, void *rate_map) {
+    if (!kl_glfb_init() || !mtl_resolve()) return;
+    if (!a_SetRateMapForSize || !a_SetRateMap) {
+        fprintf(stderr, "  [glfb] this ANGLE has no rasterization-rate entry points — "
+                        "foveation is unavailable (is it the patched build?)\n");
+        return;
+    }
+    // Retire the previous size rule before installing another: the eye size
+    // changes under us when Unity re-creates its swapchain, and a rule left
+    // behind on the old size would foveate a target nothing unwarps.
+    if (g_eye_rate_w && (g_eye_rate_w != w || g_eye_rate_h != h || !rate_map))
+        a_SetRateMapForSize((uint32_t)g_eye_rate_w, (uint32_t)g_eye_rate_h,
+                            KL_RATE_MIN_SAMPLES, NULL);
+
+    g_eye_rate_map = rate_map;
+    g_eye_rate_w   = rate_map ? w : 0;
+    g_eye_rate_h   = rate_map ? h : 0;
+
+    if (rate_map)
+        a_SetRateMapForSize((uint32_t)w, (uint32_t)h, KL_RATE_MIN_SAMPLES, rate_map);
+
+    // Eye textures already bound do not come back through the bind path, so
+    // re-register (or clear) each of them here.
+    for (int e = 0; e < 2; e++)
+        for (int s = 0; s < KL_MTL_MAX_STAGES; s++)
+            if (g_eye_mtl[e][s].tex)
+                a_SetRateMap(g_eye_mtl[e][s].tex, rate_map);
+
+    fprintf(stderr, "  [glfb] eye rate map %p for %dx%d (multisampled targets of that "
+                    "size, plus every bound eye texture)\n", rate_map, w, h);
 }
 
 void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice) {
@@ -1592,6 +1652,12 @@ void kl_glfb_release_eye_texture(int eye, int stage) {
     void    *img    = g_eye_mtl[eye][stage].image;
     if (!gl_tex && !img) return;                 // never bound, or already gone
 
+    // Unbind the map first. The registry RETAINS the texture it is keyed on, so
+    // a binding left behind here outlives the storage it describes — and worse,
+    // the address can be recycled into an unrelated texture that would then be
+    // silently foveated (mtl_common.mm says why it retains).
+    if (g_eye_mtl[eye][stage].tex && a_SetRateMap)
+        a_SetRateMap(g_eye_mtl[eye][stage].tex, NULL);
     if (img && a_eglDestroyImageKHR) a_eglDestroyImageKHR(g_dpy, img);
     if (gl_tex) {
         static void (*r_DeleteTextures)(int32_t, const uint32_t *);
@@ -1694,6 +1760,11 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
     g_eye_mtl[eye][stage].slice  = t.slice;
     g_eye_mtl[eye][stage].image  = img;
     g_eye_mtl[eye][stage].gl_tex = gl_tex;
+    // Foveation, if a map is in force. Before the guest renders into this
+    // texture, not after: ANGLE caches a framebuffer's render pass descriptor
+    // and only rebuilds it on a GL state sync, so a map bound afterwards misses
+    // the first pass with nothing reporting it (notes/VISIONOS.md).
+    if (g_eye_rate_map && a_SetRateMap) a_SetRateMap(t.texture, g_eye_rate_map);
     fprintf(stderr, "  [glfb] eye=%d stage=%d tex=%u is now backed by MTLTexture %p "
                     "slice %d (%dx%d fmt 0x%x)\n",
             eye, stage, gl_tex, t.texture, t.slice, w, h, internal_fmt);

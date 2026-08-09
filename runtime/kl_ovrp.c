@@ -225,10 +225,60 @@ static float klovrp_GetSystemDisplayFrequency(void) {
     return g_display_hz;
 }
 
+// The per-eye render target size. Quest 2's recommendation until a frontend
+// measures the display it is actually running on — see kl_ovrp.h.
+static int g_eye_w = (int)KL_OVRP_EYE_W;
+static int g_eye_h = (int)KL_OVRP_EYE_H;
+
+void kl_ovrp_set_eye_texture_size(int w, int h) {
+    // A degenerate size is a measurement that went wrong, and it would reach
+    // Unity as a swapchain allocation. Keep the Quest default instead: the
+    // wrong resolution renders, a zero one does not.
+    if (w <= 0 || h <= 0) return;
+    const int req_w = w, req_h = h;
+
+    // Unity applies its own resolution scale on top of whatever we say
+    // (measured 1.2x), and allocates stages x eyes of RGBA16F at the result. A
+    // display with a much larger logical resolution than a Quest therefore
+    // turns straight into hundreds of MiB and into fill cost, so what the
+    // display asks for is scaled and capped rather than taken on trust.
+    float scale = kl_env_float("KL_OVRP_EYE_SCALE", 1.0f);
+    if (scale > 0.05f && scale <= 4.0f) {
+        w = (int)((float)w * scale + 0.5f);
+        h = (int)((float)h * scale + 0.5f);
+    }
+    int cap = kl_env_int("KL_OVRP_EYE_MAX", 3072);
+    if (cap > 0 && (w > cap || h > cap)) {
+        // Preserve the aspect ratio: clamping the axes independently would
+        // change the shape of the picture, and the frustum tangents pushed
+        // alongside this would then disagree with it.
+        float k = (float)cap / (float)(w > h ? w : h);
+        w = (int)((float)w * k + 0.5f);
+        h = (int)((float)h * k + 0.5f);
+    }
+    if (w == g_eye_w && h == g_eye_h) return;
+
+    // Logged every change, not once: each one costs the guest a swapchain
+    // rebuild, and how many of those happen is exactly the question §12.21 was
+    // about. The MiB figure is the whole swapchain Unity will hold.
+    double mib = (double)w * h * 8.0 * 2.0 * kl_ovrp_stage_count() / (1024 * 1024);
+    fprintf(stderr, "  [ovrp] eye texture size %dx%d -> %dx%d; the display asked "
+                    "for %dx%d (scale %.2f, cap %d). %.0f MiB of swapchain, "
+                    "before Unity's own ~1.2x\n",
+            g_eye_w, g_eye_h, w, h, req_w, req_h, scale, cap, mib);
+    g_eye_w = w;
+    g_eye_h = h;
+}
+
+void kl_ovrp_eye_texture_size(int *w, int *h) {
+    if (w) *w = g_eye_w;
+    if (h) *h = g_eye_h;
+}
+
 // Packed return: width in the low 32 bits, height in the high (0x9bce58).
 static uint64_t klovrp_GetEyeTextureSize(void) {
     ovrp_hit("ovrp_GetEyeTextureSize");
-    return (uint64_t)KL_OVRP_EYE_W | ((uint64_t)KL_OVRP_EYE_H << 32);
+    return (uint64_t)(uint32_t)g_eye_w | ((uint64_t)(uint32_t)g_eye_h << 32);
 }
 
 int kl_ovrp_stage_count(void);

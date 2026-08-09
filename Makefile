@@ -444,6 +444,18 @@ build/s11_mtltex: spikes/s11_mtltex.m
 mtltex: build/s11_mtltex
 	@./build/s11_mtltex
 
+# S1.2 — foveation: does ANGLE rasterize through an MTLRasterizationRateMap we
+# own? The gate for the whole variable-rate arc, and the thing that says
+# angle-patches/klepton.patch's Metal-backend half actually engages. Needs the
+# PATCHED ANGLE (`make angle-debug`); it names that as the failure if the entry
+# point is missing rather than reporting the design as broken.
+build/s12_vrr: spikes/s12_vrr.m
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $< -framework Metal -framework Foundation
+
+.PHONY: vrr
+vrr: build/s12_vrr
+	@./build/s12_vrr
+
 # Timewarp — the composite/reprojection pass, checked without a headset: the
 # matrices, and that the shared shader actually compiles. Separate from `make
 # check` on purpose; it needs Metal's compiler service and the gate should not

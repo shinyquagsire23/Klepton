@@ -258,4 +258,31 @@ void kl_ovrp_set_eye_rotation(int eye, float qx, float qy, float qz, float qw);
 void kl_ovrp_set_display_frequency(float hz);
 float kl_ovrp_display_frequency(void);
 
+// The per-eye render target size the guest is told to use
+// (ovrp_GetEyeTextureSize). Defaults to the Quest 2's recommended 2290x2400,
+// for the same reason everything else here describes a Quest 2.
+//
+// The display underneath is not a Quest 2 and its drawables are a different
+// shape, so a frontend that can measure the real thing should push it — the
+// hardcoded pair is a guess that happens to be close, and on visionOS it is
+// wrong in both axes. `w`/`h` are in the order ovrp reports them, i.e. the same
+// order klovrp_GetEyeTextureSize packs; kl_ovrp.c's SetupEyeTexture2 explains
+// the transposition that happens further down.
+//
+// **Size is not free.** Unity allocates a swapchain of these — stages x eyes,
+// RGBA16F — and then applies its OWN resolution scale on top (measured: 1.2x,
+// which is where the second generation in a run's logs comes from). A display
+// whose logical resolution is much larger than a Quest's therefore multiplies
+// straight into hundreds of MiB and into fill cost, so this is clamped
+// (KL_OVRP_EYE_MAX) and scalable (KL_OVRP_EYE_SCALE) rather than trusted, and
+// what was asked for versus what is being reported is logged once.
+//
+// Unlike the display frequency this MAY be pushed late: Unity re-creates the
+// eye swapchain when the size changes, which a run's logs show it doing three
+// times before the menu is up. Pushing before the guest boots is still better —
+// it is one fewer rebuild, and each one used to leak a whole generation
+// (PLANNING §12.21).
+void kl_ovrp_set_eye_texture_size(int w, int h);
+void kl_ovrp_eye_texture_size(int *w, int *h);
+
 #endif

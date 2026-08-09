@@ -1497,6 +1497,50 @@ final class KleptonCompositor {
     /// frame, and again each frame because it costs two stores and the user can
     /// change the fit of the headset mid-run.
     ///
+    /// Tell the guest how big its eye render targets should be.
+    ///
+    /// Everything else about the synthetic headset describes a Quest 2 on
+    /// purpose — `Build.MODEL`, `ovrp_GetSystemHeadsetType`, the version string
+    /// — because every Oculus branch in the guest is written against one. The
+    /// eye SIZE is different in kind: nothing in the guest branches on it, it is
+    /// just a resolution, and the hardcoded 2290x2400 is wrong in both axes for
+    /// the display actually underneath. So this is measured rather than claimed.
+    ///
+    /// **Which number.** With foveation on, the drawable's colour textures are
+    /// the PHYSICAL size — already reduced — while the rate map's `screenSize`
+    /// is the logical resolution the fovea is rasterized at. The guest should be
+    /// sized against the latter: matching the physical size would throw away
+    /// exactly the resolution `maxRenderQuality` was set to buy. Without a rate
+    /// map there is no distinction and the texture size is the answer.
+    ///
+    /// The clamping lives in `kl_ovrp_set_eye_texture_size`, not here, so a host
+    /// run through `t_mtl_provider` gets the same policy.
+    private func pushEyeTextureSize(_ drawable: LayerRenderer.Drawable) {
+        var w = 0, h = 0
+        var source = "none"
+        if let rm = drawable.rasterizationRateMaps.first {
+            w = Int(rm.screenSize.width); h = Int(rm.screenSize.height)
+            source = "rate map screenSize"
+        } else if let t = drawable.colorTextures.first {
+            w = t.width; h = t.height
+            source = "colour texture"
+        }
+        guard w > 0, h > 0 else {
+            NSLog("[cp] no drawable size to push — the guest keeps its default eye size")
+            return
+        }
+        // The per-view viewport, logged rather than used. In a layered drawable
+        // each view is a whole slice and the viewport is the full texture, so it
+        // says the same thing; in a dedicated one it would not, and this is the
+        // line that would show that before it became a wrong-sized picture.
+        if let vp = drawable.views.first?.textureMap.viewport {
+            NSLog(String(format: "[cp] eye size from %@: %dx%d "
+                                 + "(view[0] viewport %.0fx%.0f, %d colour texture(s))",
+                         source, w, h, vp.width, vp.height, drawable.colorTextures.count))
+        }
+        kl_ovrp_set_eye_texture_size(Int32(w), Int32(h))
+    }
+
     private func pushEyeOffsets(_ drawable: LayerRenderer.Drawable) {
         for (i, view) in drawable.views.enumerated() where i < 2 {
             let t = view.transform.columns.3
@@ -1602,6 +1646,11 @@ final class KleptonCompositor {
                     kl_reproject_tangents(drawable.computeProjection(viewIndex: $0))
                 }
                 pushEyeOffsets(drawable)
+                // Before the guest boots, so it allocates the right swapchain
+                // once instead of rebuilding when the size changes under it —
+                // and each of those rebuilds used to leak a whole generation
+                // (PLANNING §12.21).
+                pushEyeTextureSize(drawable)
             }
             // Every drawable the frame carries, not just the one measured from:
             // a frame that leaves one unpresented is a frame half-written.
