@@ -55,11 +55,51 @@ enum Immersive {
     static func bump() -> Int { closures += 1; return closures }
 }
 
+/// What backgrounding means for this process: the end of it.
+///
+/// ALVR's shape, and for the same reason. Everything the guest is holding when
+/// the app goes away is either unresumable or expensive to re-establish — the
+/// ARKit session, the Compositor Services layer, the ANGLE context and the eye
+/// swapchain behind it, FMOD's OpenSL player, and a Unity engine that has been
+/// told it is on a Quest and never expects the display to leave. Resuming that
+/// correctly is a project of its own; resuming it *incorrectly* is a class of
+/// bug that reports itself as "the second run is broken" long after the cause.
+/// Exiting makes every launch the first launch.
+///
+/// `KL_EXIT_ON_BACKGROUND=0` keeps the old behaviour, which is what a debugging
+/// session wants when the headset comes off with a capture still open.
+enum Lifecycle {
+    static func scenePhaseChanged(to phase: ScenePhase) {
+        NSLog("[app] scene phase -> \(phase)")
+        guard phase == .background else { return }
+        guard klEnvOn("KL_EXIT_ON_BACKGROUND", default: true) else {
+            NSLog("[app] backgrounded; KL_EXIT_ON_BACKGROUND=0, staying alive")
+            return
+        }
+        NSLog("[app] backgrounded — exiting (KL_EXIT_ON_BACKGROUND)")
+        // Flush before exit rather than relying on it. The guest's log is a
+        // file in the container (kl_app.c redirects stdout/stderr there) and it
+        // is the only account of the run that survives; `exit` does flush
+        // stdio, but it also runs atexit handlers and static destructors inside
+        // a guest whose threads are still live, and one of those blocking would
+        // turn a clean exit into a watchdog kill with a truncated log.
+        fflush(nil)
+        exit(0)
+    }
+}
+
 @main
 struct KleptonApp: App {
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some Scene {
         WindowGroup { BootView() }
             .defaultSize(width: 1100, height: 900)
+            // On the app's phase, not this window's: closing the boot window
+            // while the immersive space is up is not backgrounding, and must
+            // not be treated as it. The log line above every decision is what
+            // makes that distinction checkable on a device rather than assumed.
+            .onChange(of: scenePhase) { _, phase in Lifecycle.scenePhaseChanged(to: phase) }
 
         // The floor test — KL_TEMPLATE=1. Its own space and its own renderer,
         // sharing nothing with the one below, so a picture here says the

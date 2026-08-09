@@ -671,6 +671,14 @@ except its own control vars (next section). See PLANNING §12.
 - `KL_AUTOBOOT=0` — autoboot is the default too; `=0` restores the
   Boot-button-only shape, for attaching a debugger or starting a GPU capture
   before the guest runs.
+- `KL_EXIT_ON_BACKGROUND=0` — stay alive when the app is backgrounded. The
+  **default is to `exit(0)`**, ALVR's shape: everything the guest holds across a
+  suspend (the ARKit session, the Compositor Services layer, ANGLE's context and
+  the eye swapchain, FMOD's player, a Unity engine that does not expect the
+  display to leave) is either unresumable or expensive to re-establish, so every
+  launch is made a first launch. Set `=0` when the headset has to come off with a
+  capture or a debugger still attached. Either way the phase change is logged
+  (`[app] scene phase -> …`).
 - `KL_SYNC_GUEST=1` — drive the guest inline on the compositor thread, i.e.
   P5b's shape before §12.12. The clock P5.4's device numbers were taken
   against, and the A/B for anything that looks like a pacing regression.
