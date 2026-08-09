@@ -9,9 +9,9 @@ import struct, re, sys, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Both targets. Steam Link's working set only — libshell and Qt are out of
-# scope (PLANNING §11.2), and pulling them in would generate forwards for a
-# 22 MB dependency nothing loads.
+# Both targets, and for Steam Link BOTH front doors — the streaming client and
+# the 2D configuration frontend. See the fourth entry for why the frontend is no
+# longer excluded.
 TARGETS = [
     (os.path.join(ROOT, 'beatsaber/lib/arm64-v8a'),
      ['libmain', 'lib_burst_generated', 'libunityopus', 'libunity', 'libil2cpp']),
@@ -26,6 +26,22 @@ TARGETS = [
      ['libmain', 'libSDL3', 'libSDL3_ttf', 'libSDL3_image',
       'libh264bitstream', 'libhevcbitstream', 'libc++_shared',
       'libvrlink_scene']),
+    # ...and the app's OTHER front door: the 2D configuration frontend, which is
+    # what SteamLink.getMainSharedObject() actually names. §11.2 declared libshell
+    # and Qt out of scope, and the comment above used to say so; that was priced
+    # against the wrong question. The frontend is the only half of this app with
+    # pixels of its own — the streaming client draws nothing without a Steam host
+    # on the LAN — and its libc surface turns out to be small (zlib, a few
+    # Linux-only syscall wrappers) rather than "a 22 MB dependency nothing loads".
+    #
+    # libplugins_platforms_qvirtual is Valve's own Qt platform plugin and is
+    # listed for the same reason libvrlink_scene is: it is dlopen'd rather than
+    # DT_NEEDED'd, so nothing else would bring its imports into this set.
+    (os.path.join(ROOT, 'steamlink-vr/lib/arm64-v8a'),
+     ['libshell_arm64-v8a', 'libsteamwebrtc', 'libSDL3_mixer',
+      'libQt6Core_arm64-v8a', 'libQt6Gui_arm64-v8a', 'libQt6Network_arm64-v8a',
+      'libQt6Widgets_arm64-v8a', 'libQt6Svg_arm64-v8a',
+      'libplugins_platforms_qvirtual_arm64-v8a']),
 ]
 
 def undefined_symbols(path):
@@ -70,7 +86,7 @@ __errno environ gettid __system_property_find __system_property_get __system_pro
 prctl sched_getaffinity sched_setaffinity stat fstat lstat statfs uname sigaction
 __FD_ISSET_chk __FD_SET_chk __ctype_get_mb_cur_max lseek64 getpwuid getpwuid_r
 opendir readdir closedir setjmp longjmp strtold wcstold strtold_l
-swprintf vprintf vsscanf execl syscall sysconf fopen access mkdir unlink rename
+swprintf vprintf vsscanf execl system syscall sysconf fopen access mkdir unlink rename
 dlopen dlsym dlclose dlerror dladdr dl_iterate_phdr
 memrchr memalign
 fputc fputs fwrite fread fclose fflush fgets getc feof ferror clearerr
@@ -80,6 +96,9 @@ __stack_chk_fail
 clock_gettime clock_getres gettimeofday
 
 getauxval fegetenv fesetenv feholdexcept feupdateenv statvfs fstatvfs sendfile
+eventfd eventfd_read eventfd_write ppoll accept4 pipe2 dup3 memfd_create clone
+inotify_init inotify_init1 inotify_add_watch inotify_rm_watch
+__assert2 __FD_CLR_chk __fgets_chk __pthread_cleanup_push __pthread_cleanup_pop
 epoll_create epoll_create1 epoll_ctl epoll_wait openat __open_2
 __memmove_chk __strncpy_chk __strncpy_chk2 __strcat_chk __read_chk __vsprintf_chk
 sincosf sincos putchar getchar fdatasync __cmsg_nxthdr __cxa_thread_atexit_impl

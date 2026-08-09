@@ -198,6 +198,11 @@ Built for the loading-pace investigation; all default off.
   hypothesis died: bulk reads stop within seconds; the only continuing trickle
   is libunity re-reading `/proc/cpuinfo` once per frame.
 - `KL_TRACE_SLEEP=1` — once a second: usleep count/mean/max.
+- `KL_TRACE_SYSCONF=1` — every `sysconf()` the guest asks and the answer given.
+  What to reach for when a guest sizes a thread pool or a heap to zero.
+- `KL_TRACE_THREADS=1` — one line per guest `pthread_create`: entry, arg, stack
+  size, detached, result. The entry pointer symbolises against the load
+  addresses phase 1 prints, so it names which subsystem the thread belongs to.
 - `KL_TRACE_FUTEX=1` — once a second: futex waits split timeout-vs-woken, and
   wakes. The loading crawl came with zero timeouts — the wake path is healthy.
 - `KL_USLEEP_CAP=<usec>` — clamp every guest usleep. Proved the ~5 ms polling
@@ -469,6 +474,13 @@ The composite/timewarp pass — one file, compiled by both compositors
   the gaze ray and the viewport centre is a crosshair. Off by default: the
   offset is the honest emulation and is what puts the in-game controller
   models where a body would hold them.
+- `KL_VIEW_POKE="fx,fy@secs"` — mono guests only. One synthetic click at
+  fractional window coordinates, `secs` after the guest goes mono, delivered
+  through the same `SDLActivity.onNativeMouse` a real click uses. Hover, press
+  and release land on three separate frames, which is load-bearing: pressed and
+  released inside one iteration takes a button's highlight and produces no
+  click. Exists so the input path can be proved without posting a CGEvent at
+  the desktop, which clicks whatever window is really under that point.
 - `KL_VIEW_CPU=1` — force the viewer's old readback path: `glReadPixels` the
   whole eye, tone-map it, memcpy it to the sink, row-flip it, upload it.
   Measured 23.5 fps against the hardware compositor's 54.7 on the same scene,
@@ -544,6 +556,13 @@ See PLANNING §11.
 - `KL_SLINK_MAIN=1` — run phase 4 at all (onCreate → `nativeRunMain` →
   `SDL_main` on its own thread). SL-1 (chain binds, `JNI_OnLoad`) stays the
   unconditional gate; `KL_VIEW=1` implies this.
+- `KL_SLINK_SHELL=1` — open the OTHER front door: the 2D **configuration
+  frontend** (`libshell_arm64-v8a.so` -> `main`, Qt6) instead of the streaming
+  client (`libmain.so` -> `SDL_main`). VR APK only — the old one ships Qt5 with
+  the stock `qtforandroid` QPA, the VR one ships Qt6 with Valve's own `qvirtual`,
+  which imports no JNI at all. `./build_run_slink.sh --shell` sets it and picks
+  the tree. The shell draws its own UI with no Steam host on the network; the
+  client draws nothing at all without one.
 - `KL_SLINK_ARGS="<space-separated argv>"` — `SDL_main`'s own options, which
   the real activity fills from the launching intent's `sArgs` extra. Without
   it the streaming client is being asked to stream nothing (PLANNING §11.12).

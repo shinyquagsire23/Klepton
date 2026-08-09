@@ -121,7 +121,13 @@ const char *const *kl_missing_imports(kl_image *img, unsigned *count) {
 // any pc that did not come from a signed file, whatever the page's permissions
 // are. Measured on device 2026-08-07; see kl_stub_cells.S for the report.
 #define KL_STUB_CELL_BYTES  8              /* mov w16,#i + b — see the .S */
-#define KL_STUB_NAMED_CELLS 2048
+// 2048 was sized for Beat Saber's five libraries. Steam Link's Qt chain is a
+// different order of magnitude — libQt6Widgets ALONE exhausted it, and past
+// exhaustion an import silently becomes an unnamed stub, i.e. the one thing the
+// whole M4 method depends on (failing BY NAME) stops working. Raised to 16384;
+// the ceiling is 65536, above which `mov w16,#N` stops being a single movz and
+// the cell stride in kl_stub_cells.S would have to change.
+#define KL_STUB_NAMED_CELLS 16384
 #define KL_STUB_TRACE_CELLS 1024
 
 void kl_unresolved_named(const char *name);   // kl_shim.c

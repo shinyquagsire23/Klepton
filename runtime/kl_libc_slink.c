@@ -23,8 +23,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <poll.h>
+#include <stdatomic.h>
 #include <sys/event.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/un.h>
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -499,11 +504,19 @@ void *klb___cmsg_nxthdr(void *mhdr, void *cmsg) {
     return next;
 }
 
-// C++11 thread_local destructors. Darwin's runtime has the same facility under
-// a different name and with the same three-argument shape.
-int __cxa_thread_atexit(void (*fn)(void *), void *obj, void *dso);
+// C++11 thread_local destructors. Darwin's own facility is dyld's
+// `_tlv_atexit`, not libc++abi's `__cxa_thread_atexit` — the latter happens to
+// be exported on macOS and is NOT on xrOS, which is a link error rather than a
+// runtime one, and is the second half of what broke `make xros`.
+//
+// `_tlv_atexit` takes no DSO handle. Nothing is lost: the handle exists so a
+// runtime can run a library's thread-locals' destructors when that library is
+// unloaded early, and guest images are never unloaded here.
+extern void _tlv_atexit(void (*fn)(void *), void *obj);
 int klb___cxa_thread_atexit_impl(void (*fn)(void *), void *obj, void *dso) {
-    return __cxa_thread_atexit(fn, obj, dso);
+    (void)dso;
+    _tlv_atexit(fn, obj);
+    return 0;
 }
 
 // bionic exports the three standard streams as `FILE *` VARIABLES, so what the
@@ -597,3 +610,259 @@ wint_t klb_ungetwc(wint_t c, void *f)      { return ungetwc(c, kl_host_file(f));
 wint_t klb_fputwc(wchar_t c, void *f)      { return fputwc(c, kl_host_file(f)); }
 wint_t klb_putwc(wchar_t c, void *f)       { return fputwc(c, kl_host_file(f)); }
 int   klb_fwide(void *f, int mode)         { return fwide(kl_host_file(f), mode); }
+
+// ---------------------------------------------------------------- Qt / libshell
+//
+// The 2D configuration frontend (libshell + Qt6) reaches a fourth category
+// beyond the three in this file's header: Linux SYSCALL WRAPPERS that Darwin
+// simply does not have. Qt's event dispatcher, file watcher and process code
+// are written against them directly.
+//
+// The rule below is the project's usual one — answer honestly, never with a
+// silent zero (trap 6d). Where Darwin has the facility under another shape we
+// build it; where it genuinely has no equivalent we fail with the errno Qt
+// already handles, because Qt has a fallback for every one of these and taking
+// the fallback is a better outcome than pretending.
+
+// ---- eventfd ----
+//
+// Qt uses it for exactly one thing: waking a blocked event dispatcher from
+// another thread (QEventDispatcherUNIXPrivate's wakeup channel). That is the
+// self-pipe trick with a nicer API, so a self-connected AF_UNIX datagram socket
+// reproduces it faithfully with the property that matters — ONE descriptor,
+// readable as soon as it has been written, closable with plain close().
+//
+// The socketpair alternative needs a side table to find the write end and leaks
+// the partner when the guest closes the fd; this has neither problem.
+//
+// What is NOT reproduced is the 64-bit counter: eventfd accumulates, this
+// queues datagrams. eventfd_read below drains everything pending and sums it,
+// which matches for every use Qt makes of it. A guest using eventfd as a
+// SEMAPHORE (EFD_SEMAPHORE) would see different behaviour — none does, and the
+// flag is refused below rather than ignored.
+#define LX_EFD_SEMAPHORE 1
+#define LX_EFD_CLOEXEC   0x80000
+#define LX_EFD_NONBLOCK  0x800
+
+int klb_eventfd(unsigned int initval, int flags) {
+    if (flags & LX_EFD_SEMAPHORE) {   // see above: we do not implement counting
+        errno = EINVAL;
+        return -1;
+    }
+    int s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+
+    // A name is needed only long enough to bind and connect; the connection
+    // outlives the unlink, so nothing is left in the filesystem.
+    static _Atomic unsigned seq;
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
+    snprintf(a.sun_path, sizeof a.sun_path, "%s/kl-efd-%d-%u",
+             tmp, (int)getpid(), atomic_fetch_add(&seq, 1));
+    unlink(a.sun_path);
+    if (bind(s, (struct sockaddr *)&a, sizeof a) < 0
+        || connect(s, (struct sockaddr *)&a, sizeof a) < 0) {
+        int e = errno; unlink(a.sun_path); close(s); errno = e;
+        return -1;
+    }
+    unlink(a.sun_path);
+
+    if (flags & LX_EFD_CLOEXEC)  fcntl(s, F_SETFD, FD_CLOEXEC);
+    if (flags & LX_EFD_NONBLOCK) fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);
+    for (unsigned i = 0; i < initval; i++) {   // initval is 0 in every real use
+        uint64_t one = 1;
+        if (send(s, &one, sizeof one, 0) < 0) break;
+    }
+    return s;
+}
+
+int klb_eventfd_read(int fd, uint64_t *value) {
+    uint64_t total = 0, v;
+    ssize_t r = recv(fd, &v, sizeof v, 0);       // honours the fd's blocking mode
+    if (r != (ssize_t)sizeof v) return -1;
+    total = v;
+    // Drain the rest without blocking, so one read clears the channel the way a
+    // real eventfd does rather than leaving it spuriously readable.
+    for (;;) {
+        r = recv(fd, &v, sizeof v, MSG_DONTWAIT);
+        if (r != (ssize_t)sizeof v) break;
+        total += v;
+    }
+    if (value) *value = total;
+    return 0;
+}
+
+int klb_eventfd_write(int fd, uint64_t value) {
+    ssize_t w = send(fd, &value, sizeof value, 0);
+    return w == (ssize_t)sizeof value ? 0 : -1;
+}
+
+// ---- ppoll ----
+//
+// poll() with a timespec and an optional signal mask. The mask swap is NOT
+// atomic with the wait here, which is the whole point of ppoll on Linux — but
+// the race it closes is "a signal arrives between unblocking and polling", and
+// nothing in this process delivers signals to the guest's event threads (the
+// guest's own fatal handlers are not installed by default, trap 5). Qt passes
+// NULL for the mask in the dispatcher path; the mask is honoured for the sake
+// of a caller that does pass one, rather than being silently dropped.
+int klb_ppoll(struct pollfd *fds, unsigned long nfds, const struct timespec *ts,
+              const void *sigmask) {
+    int ms = -1;
+    if (ts) {
+        long long m = (long long)ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
+        // A non-zero timespec below a millisecond must not round to "return
+        // immediately" — Qt uses sub-ms timeouts and a 0 here would spin.
+        if (m == 0 && (ts->tv_sec || ts->tv_nsec)) m = 1;
+        ms = m > INT_MAX ? INT_MAX : (int)m;
+    }
+    if (!sigmask) return poll(fds, (nfds_t)nfds, ms);
+
+    sigset_t saved;
+    pthread_sigmask(SIG_SETMASK, (const sigset_t *)sigmask, &saved);
+    int r = poll(fds, (nfds_t)nfds, ms);
+    int e = errno;
+    pthread_sigmask(SIG_SETMASK, &saved, NULL);
+    errno = e;
+    return r;
+}
+
+// ---- the three "...and set these flags atomically" variants ----
+// Darwin has the base call and F_SETFD/F_SETFL, so these are the base call plus
+// a follow-up. Not atomic against fork() in another thread; nothing here forks.
+// The flag words are the GUEST's (Linux) numbering — trap 4, and the same
+// values that made fcntl() wrong until it was fixed.
+#define LX_SOCK_NONBLOCK 0x800
+#define LX_SOCK_CLOEXEC  0x80000
+
+static int apply_linux_fd_flags(int fd, int flags) {
+    if (fd < 0) return fd;
+    if (flags & LX_SOCK_CLOEXEC)  fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (flags & LX_SOCK_NONBLOCK) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    return fd;
+}
+
+int klb_accept4(int s, struct sockaddr *addr, socklen_t *alen, int flags) {
+    return apply_linux_fd_flags(accept(s, addr, alen), flags);
+}
+
+int klb_pipe2(int fds[2], int flags) {
+    if (pipe(fds) < 0) return -1;
+    apply_linux_fd_flags(fds[0], flags);
+    apply_linux_fd_flags(fds[1], flags);
+    return 0;
+}
+
+int klb_dup3(int from, int to, int flags) {
+    // dup3 differs from dup2 in one observable way besides the flags: it is an
+    // error rather than a no-op when the two descriptors are equal.
+    if (from == to) { errno = EINVAL; return -1; }
+    if (dup2(from, to) < 0) return -1;
+    return apply_linux_fd_flags(to, flags);
+}
+
+// ---- memfd_create ----
+// An anonymous file that can be ftruncate'd and mmap'd. shm_open gives exactly
+// that once the name is unlinked; the fd keeps the object alive.
+int klb_memfd_create(const char *name, unsigned int flags) {
+    static _Atomic unsigned seq;
+    char nm[64];
+    snprintf(nm, sizeof nm, "/kl-memfd-%d-%u", (int)getpid(), atomic_fetch_add(&seq, 1));
+    (void)name;                                    // Linux's is a debug label only
+    int fd = shm_open(nm, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return -1;
+    shm_unlink(nm);
+    if (flags & LX_SOCK_CLOEXEC) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+
+// ---- inotify ----
+// No Darwin equivalent that maps onto it (kqueue watches descriptors, not
+// paths, and cannot watch a directory's contents the way inotify does). Qt's
+// QFileSystemWatcher probes each backend and falls back to a polling engine
+// when one is unavailable, so ENOSYS selects a working path — where a fake
+// success would give it a watch that never fires.
+int klb_inotify_init(void)               { errno = ENOSYS; return -1; }
+int klb_inotify_init1(int f)             { (void)f; errno = ENOSYS; return -1; }
+int klb_inotify_add_watch(int fd, const char *p, uint32_t m) {
+    (void)fd; (void)p; (void)m; errno = ENOSYS; return -1;
+}
+int klb_inotify_rm_watch(int fd, int wd)  { (void)fd; (void)wd; errno = ENOSYS; return -1; }
+
+// ---- clone ----
+// The raw Linux thread/process primitive. Qt reaches it only through forkfd for
+// QProcess, which has a fork()+pipe fallback. Refused rather than approximated:
+// its argument shape (a child stack pointer and a flag word selecting what is
+// shared) has no honest Darwin translation, and getting it half right would
+// produce a process whose memory sharing is not what the caller asked for.
+int klb_clone(void) { errno = ENOSYS; return -1; }
+
+// ---- __assert2 ----
+// bionic's assert. Fatal by definition, so it goes through kl_fatal_prepare for
+// trap 5's reason: the guest's own signal handlers expect a Linux ucontext and
+// hang on Darwin's.
+void klb___assert2(const char *file, int line, const char *fn, const char *msg) {
+    fprintf(stderr, "  [klepton] guest assertion failed: %s:%d: %s: %s\n",
+            file ? file : "?", line, fn ? fn : "?", msg ? msg : "?");
+    fflush(NULL);
+    kl_fatal_prepare();
+    abort();
+}
+
+// ---- two more of the FORTIFY family ----
+// Same contract as the ones above: the compiler passes the destination's known
+// size as an extra argument and the runtime is expected to trap an overflow
+// rather than perform it.
+void klb___FD_CLR_chk(int fd, fd_set *set, size_t set_size) {
+    if (fd < 0 || (size_t)fd >= set_size * 8) {
+        fprintf(stderr, "  [klepton] __FD_CLR_chk: fd %d out of range\n", fd);
+        kl_fatal_prepare();
+        abort();
+    }
+    FD_CLR(fd, set);
+}
+
+char *klb___fgets_chk(char *dst, int supplied, void *stream, size_t dst_len) {
+    if (supplied < 0 || (size_t)supplied > dst_len) {
+        fprintf(stderr, "  [klepton] __fgets_chk: %d bytes into a %zu-byte buffer\n",
+                supplied, dst_len);
+        kl_fatal_prepare();
+        abort();
+    }
+    return fgets(dst, supplied, kl_host_file(stream));
+}
+
+// ---- __pthread_cleanup_push / _pop ----
+//
+// bionic's shape, and it is not glibc's: the cleanup record is allocated by the
+// CALLER (on its stack, inside the pthread_cleanup_push macro) and bionic only
+// links it into a per-thread list. So the layout below is part of the ABI and
+// is transcribed from bionic's <pthread.h>, not invented.
+//
+// The list is maintained because pop(0) — pop without executing — is common and
+// must still unlink. What we do not do is run these on pthread_cancel: nothing
+// in this project cancels a thread, and Darwin's cancellation points would not
+// walk our list anyway.
+typedef struct kl_pthread_cleanup {
+    struct kl_pthread_cleanup *prev;
+    void (*routine)(void *);
+    void *arg;
+} kl_pthread_cleanup;
+
+static _Thread_local kl_pthread_cleanup *g_cleanups;
+
+void klb___pthread_cleanup_push(void *c, void (*routine)(void *), void *arg) {
+    kl_pthread_cleanup *rec = (kl_pthread_cleanup *)c;
+    if (!rec) return;
+    rec->routine = routine;
+    rec->arg     = arg;
+    rec->prev    = g_cleanups;
+    g_cleanups   = rec;
+}
+
+void klb___pthread_cleanup_pop(void *c, int execute) {
+    kl_pthread_cleanup *rec = (kl_pthread_cleanup *)c;
+    if (!rec) return;
+    g_cleanups = rec->prev;
+    if (execute && rec->routine) rec->routine(rec->arg);
+}

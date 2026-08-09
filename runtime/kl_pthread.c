@@ -179,6 +179,27 @@ static void mtx_wait_leave(void) {
     }
 }
 
+// ---------- the return-code convention, and a trap it hides ----------
+//
+// pthread functions do NOT set errno — they RETURN the error code. So the errno
+// translation that klb_errno() performs for the rest of libc never applied
+// here, and the codes diverge above 34 exactly as they do everywhere else.
+//
+// It bit at Qt's QWaitCondition. pthread_cond_timedwait timed out legitimately,
+// we returned Darwin's ETIMEDOUT (60), Qt compared against Linux's (110), did
+// not recognise it as a timeout and reported it as a hard failure —
+// `QWaitCondition::wait(): cv wait failure (Operation timed out)`, printed by
+// its own strerror of the number we handed it, over and over. Byte-for-byte the
+// sem_timedwait story already recorded in CLAUDE.md, in the neighbouring API.
+//
+// The three that actually differ and are reachable from a pthread call:
+//   EDEADLK   Darwin 11  -> Linux 35   (pthread_join on self, recursive lock)
+//   EAGAIN    Darwin 35  -> Linux 11   (pthread_create out of resources)
+//   ETIMEDOUT Darwin 60  -> Linux 110  (the timed waits)
+// EBUSY/EINVAL/EPERM/ENOMEM are below 34 and identical, which is why this went
+// unnoticed for so long: the common failures all happened to agree.
+static inline int px(int r) { return r ? kl_errno_to_linux(r) : 0; }
+
 int klb_pthread_mutex_init(void *m, const void *a) {
     (void)a;
     // POSIX: init of an existing mutex is UB. Fresh host object either way;
@@ -197,7 +218,7 @@ int klb_pthread_mutex_init(void *m, const void *a) {
 int klb_pthread_mutex_lock(void *m) {
     mtx_entry *e = mtx_entry_for(m);
     mtx_wait_enter(m, __builtin_return_address(0));
-    int r = pthread_mutex_lock(e->m);
+    int r = px(pthread_mutex_lock(e->m));
     mtx_wait_leave();
     if (r == 0) {
         atomic_store(&e->locksite, __builtin_return_address(0));
@@ -209,11 +230,11 @@ int klb_pthread_mutex_unlock(void *m)  {
     mtx_entry *e = mtx_entry_for(m);
     atomic_store(&e->owner, NULL);
     atomic_store(&e->locksite, NULL);
-    return pthread_mutex_unlock(e->m);
+    return px(pthread_mutex_unlock(e->m));
 }
 int klb_pthread_mutex_trylock(void *m) {
     mtx_entry *e = mtx_entry_for(m);
-    int r = pthread_mutex_trylock(e->m);
+    int r = px(pthread_mutex_trylock(e->m));
     if (r == 0) {
         atomic_store(&e->locksite, __builtin_return_address(0));
         atomic_store(&e->owner, (void *)pthread_self());
@@ -305,14 +326,14 @@ int klb_pthread_mutexattr_settype(int *a, int t)  { *a = t; return 0; }
 // ---------- condition variable ----------
 int klb_pthread_cond_init(void *c, const void *a)  { (void)a; g_cnd_recycle(c); cnd(c); return 0; }
 int klb_pthread_cond_destroy(void *p) { g_cnd_recycle(p); return 0; }
-int klb_pthread_cond_signal(void *c)    { return pthread_cond_signal(cnd(c)); }
-int klb_pthread_cond_broadcast(void *c) { return pthread_cond_broadcast(cnd(c)); }
+int klb_pthread_cond_signal(void *c)    { return px(pthread_cond_signal(cnd(c))); }
+int klb_pthread_cond_broadcast(void *c) { return px(pthread_cond_broadcast(cnd(c))); }
 int klb_pthread_cond_wait(void *c, void *m) {
     // A cond wait releases the mutex while sleeping; reflect that in the
     // owner table or every sleeper reads as a holder.
     mtx_entry *e = mtx_entry_for(m);
     atomic_store(&e->owner, NULL);
-    int r = pthread_cond_wait(cnd(c), e->m);
+    int r = px(pthread_cond_wait(cnd(c), e->m));
     atomic_store(&e->locksite, __builtin_return_address(0));
     atomic_store(&e->owner, (void *)pthread_self());
     return r;
@@ -387,7 +408,7 @@ int klb_pthread_cond_timedwait(void *c, void *m, const struct timespec *ts) {
     // owner table or every sleeper reads as a holder.
     mtx_entry *e = mtx_entry_for(m);
     atomic_store(&e->owner, NULL);
-    int r = pthread_cond_timedwait(cnd(c), e->m, ts);
+    int r = px(pthread_cond_timedwait(cnd(c), e->m, ts));
     atomic_store(&e->locksite, __builtin_return_address(0));
     atomic_store(&e->owner, (void *)pthread_self());
     return r;
@@ -399,14 +420,14 @@ int klb_pthread_condattr_setclock(long *a, int clk)    { (void)a; (void)clk; ret
 // ---------- rwlock ----------
 int klb_pthread_rwlock_init(void *l, const void *a) { (void)a; g_rwl_recycle(l); rwl(l); return 0; }
 int klb_pthread_rwlock_destroy(void *p) { g_rwl_recycle(p); return 0; }
-int klb_pthread_rwlock_rdlock(void *l) { return pthread_rwlock_rdlock(rwl(l)); }
-int klb_pthread_rwlock_wrlock(void *l) { return pthread_rwlock_wrlock(rwl(l)); }
-int klb_pthread_rwlock_unlock(void *l) { return pthread_rwlock_unlock(rwl(l)); }
+int klb_pthread_rwlock_rdlock(void *l) { return px(pthread_rwlock_rdlock(rwl(l))); }
+int klb_pthread_rwlock_wrlock(void *l) { return px(pthread_rwlock_wrlock(rwl(l))); }
+int klb_pthread_rwlock_unlock(void *l) { return px(pthread_rwlock_unlock(rwl(l))); }
 // SDL3 reaches for the try- forms; Beat Saber never did. Same side-table
 // indirection as the blocking pair — a bionic rwlock is 56 bytes of 4-byte
 // aligned int32 (trap 3), so what lives in it is an index, not a handle.
-int klb_pthread_rwlock_tryrdlock(void *l) { return pthread_rwlock_tryrdlock(rwl(l)); }
-int klb_pthread_rwlock_trywrlock(void *l) { return pthread_rwlock_trywrlock(rwl(l)); }
+int klb_pthread_rwlock_tryrdlock(void *l) { return px(pthread_rwlock_tryrdlock(rwl(l))); }
+int klb_pthread_rwlock_trywrlock(void *l) { return px(pthread_rwlock_trywrlock(rwl(l))); }
 
 // ---------- attributes ----------
 // bionic pthread_attr_t: { uint32 flags; void* stack_base; size_t stack_size;
@@ -449,7 +470,7 @@ int klb_pthread_key_create(int *out, void (*dtor)(void *)) {
 }
 int klb_pthread_key_delete(int k) {
     if (k < 0 || k >= atomic_load(&g_nkeys)) return EINVAL;
-    return pthread_key_delete(g_keys[k]);
+    return px(pthread_key_delete(g_keys[k]));
 }
 void *klb_pthread_getspecific(int k) {
     return (k >= 0 && k < atomic_load(&g_nkeys)) ? pthread_getspecific(g_keys[k]) : NULL;
@@ -523,18 +544,30 @@ int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
     }
     tramp *t = malloc(sizeof *t);
     t->fn = fn; t->arg = arg;
-    int rc = pthread_create(out, &da, thread_tramp, t);
+    int rc = px(pthread_create(out, &da, thread_tramp, t));
     pthread_attr_destroy(&da);
     if (rc) free(t);
+    // KL_TRACE_THREADS=1. "Which guest threads exist" is the question a hang
+    // asks first, and `sample` only answers it for threads that were actually
+    // created — a thread the guest never started leaves no trace at all, which
+    // reads identically to a thread that exited. The entry pointer is printed
+    // because it symbolises against the chain's load addresses (see
+    // report_image in m_slink.c) and so names WHICH pool or subsystem it was.
+    static int trace = -1;
+    if (trace < 0) trace = kl_env_on("KL_TRACE_THREADS", 0);
+    if (trace)
+        fprintf(stderr, "  [thr] pthread_create entry=%p arg=%p stack=%zu%s -> %d\n",
+                (void *)fn, arg, ga ? ga->stack_size : 0,
+                (ga && (ga->flags & BIONIC_ATTR_DETACHED)) ? " detached" : "", rc);
     return rc;
 }
-int   klb_pthread_join(pthread_t t, void **r)  { return pthread_join(t, r); }
-int   klb_pthread_detach(pthread_t t)          { return pthread_detach(t); }
+int   klb_pthread_join(pthread_t t, void **r)  { return px(pthread_join(t, r)); }
+int   klb_pthread_detach(pthread_t t)          { return px(pthread_detach(t)); }
 void  klb_pthread_exit(void *r)                { thread_unregister(pthread_self()); pthread_exit(r); }
 pthread_t klb_pthread_self(void)               { return pthread_self(); }
 int   klb_pthread_equal(pthread_t a, pthread_t b) { return pthread_equal(a, b); }
 int   klb_pthread_kill(pthread_t t, int sig)   {
-    int r = pthread_kill(t, sig);
+    int r = px(pthread_kill(t, sig));
     if (kl_env_on("KL_TRACE_SIG", 0))
         fprintf(stderr, "  [sig] pthread_kill(%p, %d) -> %d%s\n", (void *)t, sig, r,
                 r ? " FAILED" : "");

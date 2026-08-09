@@ -122,4 +122,13 @@ void kl_jni_tick_choreographer(void);
 void kl_jni_local_frame_push(void);
 void kl_jni_local_frame_pop(void);
 
+// The String constant `android/os/Build`.<field> reports, or NULL if this build
+// does not describe that field. Exists so the OTHER way of asking the same
+// question — __system_property_get("ro.product.model") over libc — can be
+// answered from the same table instead of from a second copy of the answer.
+// Two sources of one fact is the "group answers" hazard: Steam Link asks BOTH
+// ways and compares (CShellSystem::BIsVRHeadset), so a drift between them is
+// not cosmetic, it is a contradiction the guest can see.
+const char *kl_jni_build_string(const char *field);
+
 #endif

@@ -1274,7 +1274,17 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
         if (want == 'L') {
             size_t idx = (size_t)(f - g_fields);
             if (idx < KLJ_MAX_FIELDS) {
-                if (!g_field_cache[idx]) g_field_cache[idx] = kl_jni_new_string(f->sval);
+                if (!g_field_cache[idx]) {
+                    g_field_cache[idx] = kl_jni_new_string(f->sval);
+                    // Pinned, because the cache outlives the read. A caller that
+                    // does GetStringUTFChars/Release and then DeleteLocalRef —
+                    // correct JNI, and what libshell does with ShellWifiInfo's
+                    // m_sSSID — would otherwise retire the slot we keep handing
+                    // back, and every later read returns the corpse:
+                    // "expected a java/lang/String, got an untagged pointer".
+                    // Same rule as every other host-held singleton here.
+                    klj_as_object(g_field_cache[idx])->pinned = 1;
+                }
                 return (klj_val){.l = g_field_cache[idx]};
             }
             return (klj_val){.l = kl_jni_new_string(f->sval)};
@@ -1489,8 +1499,39 @@ static const klj_field g_fields[] = {
     KLJ_FFLT("android/util/DisplayMetrics", "scaledDensity",  KLJ_DISPLAY_DENSITY),
     KLJ_FFLT("android/util/DisplayMetrics", "xdpi",           KLJ_DISPLAY_XDPI),
     KLJ_FFLT("android/util/DisplayMetrics", "ydpi",           KLJ_DISPLAY_YDPI),
+
+    // Steam Link's ShellWifiInfo, read field-by-field off the object that
+    // getWifiInfo() returns. These four values are not invented: they are
+    // exactly what the app's own ShellWifiInfo.Update() writes when
+    // WifiManager.getConnectionInfo() returns null — i.e. Android's answer on a
+    // device that is not associated with a Wi-Fi network, which is the truth
+    // here (the host reaches the LAN however it reaches it; we model no
+    // WifiManager). Strength is calculateSignalLevel(-127, 3) = 0, the same
+    // constant that path passes.
+    //
+    // Claiming a network would be the invented-positive kind of answer: the
+    // shell shows link quality from these and would report a signal we have not
+    // measured. "Not on Wi-Fi" is also the strictly-conservative direction —
+    // Steam Link's own advice for a wired host is that it is the better case.
+    KLJ_FINT("com/valvesoftware/steamlink/SteamLink$ShellWifiInfo", "m_nNetworkID", -1),
+    KLJ_FINT("com/valvesoftware/steamlink/SteamLink$ShellWifiInfo", "m_nFrequency", -1),
+    KLJ_FINT("com/valvesoftware/steamlink/SteamLink$ShellWifiInfo", "m_nStrength",   0),
+    KLJ_FSTR("com/valvesoftware/steamlink/SteamLink$ShellWifiInfo", "m_sSSID",      ""),
     {.cls = NULL},
 };
+
+// The Build.* String constants, readable from outside the JNI surface. See the
+// declaration in kl_jni.h for why this exists rather than a second table in
+// kl_libc.c: __system_property_get is the OTHER way to ask the same question,
+// and Steam Link asks both ways.
+const char *kl_jni_build_string(const char *field) {
+    for (const klj_field *f = g_fields; f->cls; f++)
+        if (f->sval && strcmp(f->name, field) == 0
+            && (strcmp(f->cls, "android/os/Build") == 0
+                || strcmp(f->cls, "android/os/Build$VERSION") == 0))
+            return f->sval;
+    return NULL;
+}
 
 // ------------------------------------------------------------ Java class impls
 // Host implementations of the Java methods the guest actually calls. This stays
@@ -2249,6 +2290,23 @@ static klj_val klj_Process_setThreadPriority(void *env, void *self, const klj_va
                             (int)a[0].j);
     return (klj_val){0};
 }
+// SDL's own wrapper for the same operation, and it lands in the same place:
+// it is Process.setThreadPriority(THREAD_PRIORITY_AUDIO or _URGENT_AUDIO) on
+// the CALLING thread, which Darwin has no by-tid equivalent for. Recorded, not
+// applied — see klj_Process_setThreadPriority above for why.
+//
+// Worth noting what this does NOT cost us: SDL raises the priority of a thread
+// that feeds the audio device, and our audio path does not use it. kl_audio.c's
+// CoreAudio render callback runs on the OS's own realtime thread and the device
+// provides the clock, so the guest's feeder is a producer into a ring rather
+// than something with a deadline.
+static klj_val klj_SDLAM_audioSetThreadPriority(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n > 1) KLJ_LOG("SDLAudioManager.audioSetThreadPriority(recording=%d, device=%d) "
+                       "— not applied on Darwin", (int)a[0].j, (int)a[1].j);
+    return (klj_val){0};
+}
+
 static klj_val klj_Process_myTid(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     uint64_t tid = 0;
@@ -4366,6 +4424,21 @@ static klj_val klj_SL_streamingComplete(void *env, void *self, const klj_val *a,
     return (klj_val){.j = 0};
 }
 
+// The activity's single ShellWifiInfo (`getWifiInfo()` is a plain field read of
+// `mWifiInfo`, so the object identity is stable and observable). Its four
+// public fields are read straight off the object by libshell — they are in
+// g_fields, where the values and the reasoning live.
+#define KLJ_WIFIINFO "com/valvesoftware/steamlink/SteamLink$ShellWifiInfo"
+static klj_val klj_SL_getWifiInfo(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *obj;
+    if (!obj) {
+        obj = klj_new_object_data(KLJ_WIFIINFO, NULL);
+        klj_as_object(obj)->pinned = 1;   // the activity holds it for its life
+    }
+    return (klj_val){.l = obj};
+}
+
 static const klj_binding g_bindings[] = {
     {KLJ_SDLA, "getContext", "()Landroid/app/Activity;", klj_SDLA_getContext},
     {KLJ_SDLA, "getManifestEnvironmentVariables", "()Z", klj_SDLA_getManifestEnv},
@@ -4401,11 +4474,50 @@ static const klj_binding g_bindings[] = {
     {"com/valvesoftware/steamlink/VirtualHere", "acquire",
      "(Landroid/content/Context;)Lcom/valvesoftware/steamlink/VirtualHere;", klj_SDLA_null},
     {"com/valvesoftware/steamlink/SteamLink", "streamingComplete", "(I)V", klj_SL_streamingComplete},
+    // The first thing libshell's main() asks, and it is answered TRUTHFULLY
+    // rather than conveniently. The method is not a capability probe: its body
+    // is `getIntent().getStringExtra("returnFrom").equals("vrlink")`, i.e. "did
+    // the VR activity hand control back to me". We launch this activity
+    // directly, from nothing, with no extras — so false is what the real
+    // Android would compute, not a stub's shrug.
+    //
+    // It is also the fork that decides what this run can show. True sends the
+    // shell down the returning-from-VR path (§11.9's handoff, which we have not
+    // synthesized); false is the plain 2D configuration frontend, which is the
+    // whole reason for opening this front door.
+    {"com/valvesoftware/steamlink/SteamLink", "wasLaunchedFromVRLink", "()Z", klj_SDLA_false},
+    {"com/valvesoftware/steamlink/SteamLink", "getWifiInfo",
+     "()L" KLJ_WIFIINFO ";", klj_SL_getWifiInfo},
+    // Both are one-line reads of an intent extra — getStringExtra("displayTitle")
+    // and ("displayMessage") — that another activity sets when it hands this one
+    // a message to show on the way in. We launch it directly with no extras, so
+    // null is what Android would compute, and getStringExtra returns null for an
+    // absent key rather than "". Not a stub: the same answer as the real thing.
+    {"com/valvesoftware/steamlink/SteamLink", "getMessageTitle", "()Ljava/lang/String;",
+     klj_SDLA_null},
+    {"com/valvesoftware/steamlink/SteamLink", "getMessageText", "()Ljava/lang/String;",
+     klj_SDLA_null},
     // Steam Link's own. Part of the display panel's group answer: the panel we
     // describe is 1280x800, so 4K playback is not something it can display, and
     // claiming otherwise would have the app negotiate a stream its own window
     // cannot show.
     {"com/valvesoftware/steamlink/SteamLinkUtils", "canDisplay4KVideo", "()Z", klj_SL_canDisplay4K},
+    // ...and the same group's HDR half, which asks the same question of the same
+    // panel. Its body walks Display.getHdrCapabilities().getSupportedHdrTypes()
+    // looking for HDR10, and our synthetic display advertises no HDR types at
+    // all — so false is what it would compute, not a refusal. Answering true
+    // would have the client negotiate an HDR stream and then tone-map it onto
+    // an SDR window, which is the 4K mistake in a different colour space.
+    {"com/valvesoftware/steamlink/SteamLinkUtils", "canDisplayHDRVideo", "(ZZ)Z", klj_SDLA_false},
+    // The overlay SurfaceView's visibility. On Android these post a Runnable to
+    // the UI thread and BLOCK on Object.wait() until it has run — the caller's
+    // contract is "the surface is now in that state", not "a request was sent".
+    // We present one surface and it is the window, so both states are already
+    // true and returning immediately IS that contract. What must not happen is
+    // the literal translation: queueing a task and waiting would hang, because
+    // the visibility this waits on is a second view we do not have.
+    {"com/valvesoftware/steamlink/SteamLink", "showOverlaySurface", "()V", klj_SDLA_null},
+    {"com/valvesoftware/steamlink/SteamLink", "hideOverlaySurface", "()V", klj_SDLA_null},
 
     {"com/unity3d/player/ReflectionHelper", "getFieldID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Field;", klj_ReflectionHelper_getFieldID},
     {"com/unity3d/player/ReflectionHelper", "getMethodID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Method;", klj_ReflectionHelper_getMethodID},
@@ -4534,6 +4646,8 @@ static const klj_binding g_bindings[] = {
     {"android/app/AlertDialog$Builder", "setMessage",
      "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;", klj_AlertBuilder_setMessage},
 
+    {"org/libsdl/app/SDLAudioManager", "audioSetThreadPriority", "(ZI)V",
+     klj_SDLAM_audioSetThreadPriority},
     {"android/os/Process", "setThreadPriority", "(II)V", klj_Process_setThreadPriority},
     {"android/os/Process", "setThreadPriority", "(I)V",  klj_Process_setThreadPriority},
     {"android/os/Process", "myTid",             "()I",   klj_Process_myTid},

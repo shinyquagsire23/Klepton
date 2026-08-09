@@ -88,6 +88,23 @@ slink-vr: build/m_slink
 slink-main: build/m_slink
 	KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
 
+# SL-4: the OTHER front door. The 2D configuration frontend — libshell + Qt6,
+# which is what SteamLink.getMainSharedObject() actually names — instead of the
+# streaming client. The point of it is that it has pixels of its own: the client
+# draws nothing without a Steam host on the LAN (§11.11, zero swaps ever), and
+# the shell draws Qt Widgets locally.
+#
+# VR APK only, and not for arbitrary reasons: the old APK ships Qt5 with the
+# stock qtforandroid QPA (a whole QtAndroid JNI surface), the VR APK ships Qt6
+# with Valve's own `qvirtual` QPA, which imports no JNI at all.
+slink-shell: build/m_slink
+	KL_SLINK_SHELL=1 KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
+
+# ...and the work list for it, which is the number that matters first: map and
+# relocate all fourteen, print what is still unresolved, stop before init.
+slink-shell-gap: build/m_slink
+	KL_SLINK_SHELL=1 KL_GAP_ONLY=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
+
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(LDLIBS)

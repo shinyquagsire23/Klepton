@@ -6,48 +6,15 @@
 // has to arrive as a *signed Mach-O*, mapped by dyld, and this tool is what
 // produces it.
 //
-// WHAT IT EMITS, AND WHY IT IS SHAPED THIS WAY
-//
-// PLANNING §4.0.2 originally proposed emitting MH_OBJECT and letting ld64 do
-// the final link, so that chained fixups, the exports trie and function starts
-// would be the linker's problem. M1a's measurement retired that: **zero
-// relocations target __TEXT** — every one of them lands in the RW image — so
-// there is nothing for dyld to fix up at all. The runtime already applies the
-// 1795 ELF relocations itself and will keep doing so. That removes the only
-// reason to want ld64 in the loop, and ld64 in exchange gives us far too little
-// control over the one thing that actually constrains this layout:
-//
-//   THE GUEST'S text->data DELTA MUST BE PRESERVED EXACTLY.
-//
-// ADRP+ADD pairs in guest text bake that delta in as an immediate. For
-// libunityopus.so the RW image sits at ELF vaddr 0x97010 — which is *not*
-// 16 KB-aligned, so the RW content cannot be placed at a Mach-O segment
-// boundary. The resolution is to shift the whole ELF image by a constant S and
-// let the RW content land at a non-zero offset *inside* __DATA:
-//
-//   macho vmaddr of ELF vaddr V   ==   S + V          (one constant, all V)
-//
-//   S = 0x4000        Mach-O header and load commands live below the image
-//   __TEXT   vmaddr 0        the ELF r-x LOADs, at S
-//   __DATA   vmaddr 0x98000  16 KB-aligned; RW content at +0x3010 within it
-//
-// Segment boundaries stay aligned, the delta is untouched, and the image is
-// byte-for-byte the ELF's. Segments are made contiguous in VM (each extends to
-// the next one's start) rather than leaving holes, because dyld is happier with
-// a gapless image and the padding is a few zeroed pages.
 //
 // The runtime finds the embedded image through the __TEXT,__klelf section, so
 // no exported symbol — and therefore no exports trie — is needed. See
 // kl_load_dylib() in kl_image.c for the other half.
 //
-// WHAT IS DONE OFFLINE HERE THAT THE RUNTIME USED TO DO
 //
-// The S0.1 TLS rewrite (`mrs xN, tpidr_el0` -> `tpidrro_el0`) patches guest
-// text, which a mapped-by-dyld __TEXT will not permit. It moves here. The S0.5
-// x18 veneer pass has the same problem and will move here too (PLANNING §12.2);
-// libunityopus.so has 0 x18 sites, so P1 does not need it yet, and this tool
-// refuses an image that does have them rather than emitting one that would be
-// silently wrong.
+// klepton-ld also handles x18 -> TLS patching due to macOS vs Android x18
+// reservation differences -- macOS clears x18, Android doesn't, and TLS is
+// easy enough to dereference in x18's place.
 //
 // Usage:
 //   klepton-ld <input.so> -o <output.dylib> [--platform macos|visionos|
@@ -198,7 +165,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // ---- the text rewrites that used to happen at load time ----
+    // ---- the text rewrites ----
     // Executable *sections*, not the executable segment: the r-x LOAD starts at
     // file offset 0 and also spans .rodata, .rela.dyn and .eh_frame, and
     // rewriting a word that merely looks like an instruction in there would

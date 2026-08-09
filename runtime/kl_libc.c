@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/sysctl.h>
@@ -24,6 +25,8 @@
 #include <ctype.h>
 #include "klepton.h"
 #include "kl_va.h"
+#include "kl_jni.h"     // kl_jni_build_string — the Build.* half of the system
+                        // properties below, so the two cannot drift apart
 
 static void warn_once(const char *what) {
     static const char *seen[64]; static int n = 0;
@@ -122,9 +125,83 @@ char ***klb_environ_ptr(void) { return &environ; }   // registered as data below
 
 // ---------- Android-only ----------
 int  klb_gettid(void) { uint64_t t = 0; pthread_threadid_np(NULL, &t); return (int)t; }
-const void *klb_sysprop_find(const char *n)  { (void)n; return NULL; }
-int  klb_sysprop_get(const char *n, char *v) { (void)n; if (v) v[0] = 0; return 0; }
-void klb_sysprop_read(const void *p, char *n, char *v) { (void)p; if (n) n[0]=0; if (v) v[0]=0; }
+// ---- __system_property_* ----
+//
+// This used to answer empty for everything, which is not a neutral answer. It
+// is a SECOND answer, disagreeing with the first: Build.MANUFACTURER/MODEL over
+// JNI already say "Oculus" / "Quest 2" (a settled decision — see g_fields in
+// kl_jni.c), and ro.product.manufacturer/model are the same facts asked through
+// libc. Steam Link asks both ways, so the disagreement was visible to the guest.
+//
+// It was also a crash. CShellSystem::GetDeviceName() is
+//   mfr = get("ro.product.manufacturer"); mdl = get("ro.product.model");
+//   name = mdl.startsWith(mfr) ? mdl : mfr + " " + mdl;
+// and with both empty it faulted (SIGBUS in GetDeviceName+0x264, reached from
+// BIsVRHeadset <- LoadStreamingSettings <- CShellApplication::BInit <- main) —
+// the first thing the 2D shell does after Qt comes up. Trap 6d exactly: a
+// silent zero is worse than an error, because nothing near the fault mentions
+// a property.
+//
+// Only ro.product.* is mapped, and each entry names the Build field it must
+// agree with rather than repeating its value. Anything else still answers
+// empty, which for a property that genuinely is not set IS the truth — bionic
+// returns 0 for an unset property and callers handle it.
+static const struct { const char *prop, *build_field; } g_sysprops[] = {
+    {"ro.product.manufacturer", "MANUFACTURER"},
+    {"ro.product.brand",        "BRAND"},
+    {"ro.product.model",        "MODEL"},
+    {"ro.product.device",       "DEVICE"},
+    {"ro.product.name",         "PRODUCT"},
+    {"ro.hardware",             "HARDWARE"},
+    {"ro.build.id",             "ID"},
+    {"ro.build.display.id",     "DISPLAY"},
+    {"ro.build.type",           "TYPE"},
+    {"ro.build.tags",           "TAGS"},
+    {"ro.build.fingerprint",    "FINGERPRINT"},
+    {"ro.build.version.release","RELEASE"},
+    {"ro.build.version.incremental", "INCREMENTAL"},
+    {"ro.build.version.codename",    "CODENAME"},
+};
+
+static const char *sysprop_value(const char *n) {
+    if (!n) return NULL;
+    for (size_t i = 0; i < sizeof g_sysprops / sizeof *g_sysprops; i++)
+        if (strcmp(n, g_sysprops[i].prop) == 0)
+            return kl_jni_build_string(g_sysprops[i].build_field);
+    return NULL;
+}
+
+// find/read are the two-step form of the same lookup. The "handle" we hand back
+// is the table entry's own name pointer, which is a stable string constant for
+// the life of the process — trap 3 does not apply, because nothing stores this
+// in guest memory sized for a 32-bit index; bionic's prop_info* is opaque and
+// only ever passed straight back to __system_property_read.
+const void *klb_sysprop_find(const char *n) {
+    if (!n) return NULL;
+    for (size_t i = 0; i < sizeof g_sysprops / sizeof *g_sysprops; i++)
+        if (strcmp(n, g_sysprops[i].prop) == 0 && sysprop_value(n))
+            return g_sysprops[i].prop;
+    return NULL;
+}
+
+// PROP_VALUE_MAX is 92 in bionic and the caller's buffer is that size. Truncate
+// rather than overrun; every value we serve is far shorter.
+#define KLB_PROP_VALUE_MAX 92
+
+int klb_sysprop_get(const char *n, char *v) {
+    const char *val = sysprop_value(n);
+    if (!v) return val ? (int)strlen(val) : 0;
+    if (!val) { v[0] = 0; return 0; }
+    int len = snprintf(v, KLB_PROP_VALUE_MAX, "%s", val);
+    if (len >= KLB_PROP_VALUE_MAX) len = KLB_PROP_VALUE_MAX - 1;
+    return len;
+}
+
+void klb_sysprop_read(const void *p, char *n, char *v) {
+    const char *prop = (const char *)p;
+    if (n) { if (prop) snprintf(n, 32, "%s", prop); else n[0] = 0; }
+    if (v) klb_sysprop_get(prop, v);
+}
 int  klb_prctl(int op, ...)                  { (void)op; return 0; }
 int  klb_sched_getaffinity(int p, size_t sz, void *m) {
     (void)p; if (m && sz) memset(m, 0xFF, sz);       // pretend every CPU is available
@@ -247,7 +324,12 @@ static const struct { int guest, host; const char *name; } g_sysconf[] = {
 
 long klb_sysconf(int guest_name) {
     for (unsigned i = 0; i < sizeof g_sysconf / sizeof g_sysconf[0]; i++)
-        if (g_sysconf[i].guest == guest_name) return sysconf(g_sysconf[i].host);
+        if (g_sysconf[i].guest == guest_name) {
+            long v = sysconf(g_sysconf[i].host);
+            if (kl_env_on("KL_TRACE_SYSCONF", 0))
+                fprintf(stderr, "  [libc] sysconf(%s) -> %ld\n", g_sysconf[i].name, v);
+            return v;
+        }
     // bionic's _SC_AVPHYS_PAGES (0x63) has no Darwin equivalent and lands here.
     // -1 is sysconf's own "no such name", which is the truthful answer; the log
     // line is what keeps it from being a silent zero.
@@ -629,6 +711,13 @@ int    klb_getpwuid_r(unsigned uid, void *pw, char *buf, size_t n, void **res) {
 }
 int    klb_execl(const char *p, const char *a, ...) { (void)p; (void)a;
                                                       warn_once("execl"); errno = ENOSYS; return -1; }
+// system(): hand-written rather than forwarded, because visionOS marks it
+// __API_UNAVAILABLE — a generated KL_FWD does not compile for xrOS at all,
+// which is how the Steam Link libc sweep broke `make xros`. Refusing is also
+// the right answer on every platform: there is no shell to run a command in
+// under AMFI, and execl already answers ENOSYS for the same reason. 127 is
+// what a real system() returns when the shell cannot execute the command.
+int    klb_system(const char *cmd) { (void)cmd; warn_once("system"); return 127; }
 // ---------- raw syscalls ----------
 // Note the signature: fixed arity, not `...`. AAPCS64 passes variadic arguments
 // in x0-x7, which is exactly where a fixed-arity Darwin function reads its own,
@@ -650,9 +739,22 @@ int    klb_execl(const char *p, const char *a, ...) { (void)p; (void)a;
 #define KL_SYS_futex 98                 // aarch64 Linux
 
 enum {
-    KL_FUTEX_WAIT = 0, KL_FUTEX_WAKE = 1, KL_FUTEX_WAIT_BITSET = 9,
-    KL_FUTEX_WAKE_BITSET = 10,
+    KL_FUTEX_WAIT = 0, KL_FUTEX_WAKE = 1, KL_FUTEX_WAKE_OP = 5,
+    KL_FUTEX_WAIT_BITSET = 9, KL_FUTEX_WAKE_BITSET = 10,
     KL_FUTEX_PRIVATE_FLAG = 128, KL_FUTEX_CLOCK_REALTIME = 256,
+};
+
+// FUTEX_WAKE_OP's `val3` packs a whole little instruction:
+//   op(4) | cmp(4) | oparg(12) | cmparg(12)
+// and the kernel performs `*uaddr2 = *uaddr2 OP oparg` atomically, wakes
+// `val` waiters on uaddr, and — if the value uaddr2 held BEFORE the operation
+// satisfies `oldval CMP cmparg` — wakes `val2` more on uaddr2.
+enum {
+    KL_FUTEX_OP_SET = 0, KL_FUTEX_OP_ADD = 1, KL_FUTEX_OP_OR = 2,
+    KL_FUTEX_OP_ANDN = 3, KL_FUTEX_OP_XOR = 4,
+    KL_FUTEX_OP_OPARG_SHIFT = 8,        // OR'd into op: oparg means (1 << oparg)
+    KL_FUTEX_OP_CMP_EQ = 0, KL_FUTEX_OP_CMP_NE = 1, KL_FUTEX_OP_CMP_LT = 2,
+    KL_FUTEX_OP_CMP_LE = 3, KL_FUTEX_OP_CMP_GT = 4, KL_FUTEX_OP_CMP_GE = 5,
 };
 
 #define KL_FUTEX_BUCKETS 256
@@ -739,8 +841,13 @@ int klb_gettimeofday(struct klb_timeval *tv, void *tz) {
 }
 
 
-static long kl_futex_impl(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts);
-static long kl_futex(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts) {
+// The tail three arguments are overloaded by op, exactly as the kernel
+// overloads them: `ts` is a timeout for the WAIT family and the second wake
+// count (val2) for WAKE_OP, and uaddr2/val3 are only read by WAKE_OP.
+static long kl_futex_impl(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts,
+                          int32_t *uaddr2, uint32_t val3);
+static long kl_futex(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts,
+                     int32_t *uaddr2, uint32_t val3) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, futex_init);
     // KL_TRACE_FUTEX=1: once a second, waits (split by timeout expiry vs
@@ -761,16 +868,45 @@ static long kl_futex(int32_t *uaddr, int op, uint32_t val, const struct timespec
                     w, (unsigned long long)atomic_load(&timeouts),
                     (unsigned long long)atomic_load(&woken), wk);
         // Result accounting happens on the way out below via these two.
-        long r = kl_futex_impl(uaddr, op, val, ts);
+        long r = kl_futex_impl(uaddr, op, val, ts, uaddr2, val3);
         if (is_wait) {
             if (r == 0) atomic_fetch_add(&woken, 1);
             else if (errno == ETIMEDOUT) atomic_fetch_add(&timeouts, 1);
         }
         return r;
     }
-    return kl_futex_impl(uaddr, op, val, ts);
+    return kl_futex_impl(uaddr, op, val, ts, uaddr2, val3);
 }
-static long kl_futex_impl(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts) {
+
+// The read-modify-write half of FUTEX_WAKE_OP, returning the value uaddr2 held
+// BEFORE it — which is what the comparison is made against. Every case is a
+// single atomic so it composes with the guest's own atomics on the same word;
+// a load/store pair would lose a concurrent release.
+static int32_t futex_op_apply(int opcode, int32_t *uaddr2, int32_t oparg) {
+    switch (opcode) {
+    case KL_FUTEX_OP_SET:  return __atomic_exchange_n(uaddr2, oparg, __ATOMIC_SEQ_CST);
+    case KL_FUTEX_OP_ADD:  return __atomic_fetch_add(uaddr2, oparg, __ATOMIC_SEQ_CST);
+    case KL_FUTEX_OP_OR:   return __atomic_fetch_or(uaddr2, oparg, __ATOMIC_SEQ_CST);
+    case KL_FUTEX_OP_ANDN: return __atomic_fetch_and(uaddr2, ~oparg, __ATOMIC_SEQ_CST);
+    case KL_FUTEX_OP_XOR:  return __atomic_fetch_xor(uaddr2, oparg, __ATOMIC_SEQ_CST);
+    }
+    return 0;
+}
+
+static int futex_op_cmp(int cmp, int32_t oldval, int32_t cmparg) {
+    switch (cmp) {
+    case KL_FUTEX_OP_CMP_EQ: return oldval == cmparg;
+    case KL_FUTEX_OP_CMP_NE: return oldval != cmparg;
+    case KL_FUTEX_OP_CMP_LT: return oldval <  cmparg;
+    case KL_FUTEX_OP_CMP_LE: return oldval <= cmparg;
+    case KL_FUTEX_OP_CMP_GT: return oldval >  cmparg;
+    case KL_FUTEX_OP_CMP_GE: return oldval >= cmparg;
+    }
+    return 0;
+}
+
+static long kl_futex_impl(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts,
+                          int32_t *uaddr2, uint32_t val3) {
     int      base = op & ~(KL_FUTEX_PRIVATE_FLAG | KL_FUTEX_CLOCK_REALTIME);
     unsigned b    = futex_bucket(uaddr);
 
@@ -819,9 +955,60 @@ static long kl_futex_impl(int32_t *uaddr, int op, uint32_t val, const struct tim
         // A broadcast makes the true count unobservable. Every caller uses this
         // only as "at least one was woken", so the requested count is returned.
         return (long)val;
-    default:
+
+    // "Modify a second word, wake on the first, and conditionally wake on the
+    // second too" — one syscall so the release side of a semaphore needs no
+    // lock. Qt's QSemaphore::release() is built on it, and refusing it is a
+    // wake that never arrives: libshell's 2D frontend deadlocked in
+    // QImage::smoothScaled (Qt parallelises the scale across QThreadPool and
+    // joins on a QSemaphore) while constructing its very first panel. Nothing
+    // in the hang mentions futex — see the trap record.
+    case KL_FUTEX_WAKE_OP: {
+        if (!uaddr2) { errno = EFAULT; return -1; }
+        // `ts` is not a pointer for this op — the kernel reuses the timeout
+        // slot as the second wake count.
+        uint32_t val2   = (uint32_t)(uintptr_t)ts;
+        int      opcode = (int)((val3 >> 28) & 0xf);
+        int      cmp    = (int)((val3 >> 24) & 0xf);
+        int32_t  oparg  = (int32_t)((val3 >> 12) & 0xfff);
+        int32_t  cmparg = (int32_t)(val3 & 0xfff);
+        if (opcode & KL_FUTEX_OP_OPARG_SHIFT) {
+            opcode &= ~KL_FUTEX_OP_OPARG_SHIFT;
+            oparg = (int32_t)(1u << (oparg & 31));
+        }
+        unsigned b2 = futex_bucket(uaddr2);
+
+        // The RMW and the wake of uaddr2's own waiters share one critical
+        // section, because a waiter on uaddr2 compares and sleeps holding this
+        // same lock — that is what closes the gap the futex contract otherwise
+        // leaves. Broadcasting unconditionally (rather than only when the
+        // comparison holds) costs a recheck in threads that then sleep again,
+        // and futex explicitly permits spurious wakeups.
+        pthread_mutex_lock(&g_futex[b2].m);
+        int32_t oldval = futex_op_apply(opcode, uaddr2, oparg);
+        pthread_cond_broadcast(&g_futex[b2].c);
+        pthread_mutex_unlock(&g_futex[b2].m);
+
+        if (b != b2) {
+            pthread_mutex_lock(&g_futex[b].m);
+            pthread_cond_broadcast(&g_futex[b].c);
+            pthread_mutex_unlock(&g_futex[b].m);
+        }
+        return (long)val + (futex_op_cmp(cmp, oldval, cmparg) ? (long)val2 : 0);
+    }
+    default: {
+        // Trap 6d, in the one place it is most expensive: a futex op we do not
+        // implement is a WAKE that never arrives, and ENOSYS is returned to a
+        // caller that has already decided a waiter needs waking. Nothing near
+        // the hang mentions futex. Name the op, once each.
+        static _Atomic unsigned seen;
+        unsigned bit = 1u << (base & 31);
+        if (!(atomic_fetch_or(&seen, bit) & bit))
+            fprintf(stderr, "  [futex] unimplemented op %d (raw 0x%x) — refused; "
+                            "a waiter on %p will not be woken\n", base, op, (void *)uaddr);
         errno = ENOSYS;
         return -1;
+    }
     }
 }
 
@@ -833,10 +1020,13 @@ static void syscall_warn_once(long n) {
 }
 
 long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
-    (void)a4; (void)a5; (void)a6;
+    // futex is the only syscall here that reads past the fourth argument, and
+    // the two it reads used to be discarded — which made FUTEX_WAKE_OP
+    // impossible to implement rather than merely unimplemented.
     if (n == KL_SYS_futex)
         return kl_futex((int32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3,
-                        (const struct timespec *)(uintptr_t)a4);
+                        (const struct timespec *)(uintptr_t)a4,
+                        (int32_t *)(uintptr_t)a5, (uint32_t)a6);
     syscall_warn_once(n);
     errno = ENOSYS;
     return -1;
@@ -938,6 +1128,113 @@ int kl_open_flags(int lx) {
     if (lx & LX_O_CLOEXEC)   d |= O_CLOEXEC;
     return d;
 }
+// ---- fcntl / ioctl: trap 4, in the two calls that had been left raw ----
+//
+// open() has translated its flags since M2. fcntl() did not, and it is the SAME
+// flag words: F_SETFL takes exactly what open() takes. The guest passes Linux's
+// O_NONBLOCK (0x800); on Darwin 0x800 is O_EXCL. So
+//   fcntl(fd, F_SETFL, O_NONBLOCK)
+// SUCCEEDED, returned 0, set a meaningless bit, and left the socket BLOCKING.
+//
+// Measured cost: Steam Link's 2D shell hung with `main` stuck in
+// CDiscoverySocket::BReceive -> recvfrom, four frames under
+// CShellApplication::BInit, waiting forever for a LAN datagram that a
+// non-blocking read would have declined in a microsecond. Nothing errored, and
+// the failure looked like "the app has no UI" rather than "a flag was wrong".
+// Same shape as trap 6d and trap 16b: a wrong number that SUCCEEDS meaning
+// something else.
+//
+// The reverse direction matters too — F_GETFL's RESULT is a flag word the guest
+// will read with Linux's numbering, and the read-modify-write
+// `fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)` is the common idiom, so
+// getting only one side right corrupts the other flags.
+// Unlike warn_once() this keys on the NUMBER, because the interesting thing
+// about an unrecognised command is which one it was.
+static void fcntl_warn_once(const char *fn, long cmd) {
+    static struct { const char *fn; long cmd; } seen[32]; static int n = 0;
+    for (int i = 0; i < n; i++) if (seen[i].fn == fn && seen[i].cmd == cmd) return;
+    if (n < 32) seen[n++] = (typeof(seen[0])){fn, cmd};
+    fprintf(stderr, "  [klepton] %s: unrecognised Linux request 0x%lx — refused "
+                    "(add a translation rather than passing it through)\n", fn, cmd);
+}
+
+static int open_flags_to_linux(int d) {
+    int lx = d & 0x3;
+    if (d & O_CREAT)     lx |= LX_O_CREAT;
+    if (d & O_EXCL)      lx |= LX_O_EXCL;
+    if (d & O_NOCTTY)    lx |= LX_O_NOCTTY;
+    if (d & O_TRUNC)     lx |= LX_O_TRUNC;
+    if (d & O_APPEND)    lx |= LX_O_APPEND;
+    if (d & O_NONBLOCK)  lx |= LX_O_NONBLOCK;
+    if (d & O_DIRECTORY) lx |= LX_O_DIRECTORY;
+    if (d & O_NOFOLLOW)  lx |= LX_O_NOFOLLOW;
+    if (d & O_CLOEXEC)   lx |= LX_O_CLOEXEC;
+    return lx;
+}
+
+// The command numbers diverge too, and not uniformly: the first five agree and
+// then Linux and Darwin swap the {GETOWN,SETOWN} pair against the lock family.
+#define LX_F_DUPFD 0
+#define LX_F_GETFD 1
+#define LX_F_SETFD 2
+#define LX_F_GETFL 3
+#define LX_F_SETFL 4
+#define LX_F_GETLK 5
+#define LX_F_SETLK 6
+#define LX_F_SETLKW 7
+#define LX_F_SETOWN 8
+#define LX_F_GETOWN 9
+#define LX_F_DUPFD_CLOEXEC 1030
+
+int kl_fcntl(int fd, int cmd, uintptr_t arg) {
+    switch (cmd) {
+    case LX_F_SETFL:
+        // The only translated-argument case, and the one that bit.
+        return fcntl(fd, F_SETFL, kl_open_flags((int)arg));
+    case LX_F_GETFL: {
+        int d = fcntl(fd, F_GETFL);
+        return d < 0 ? d : open_flags_to_linux(d);
+    }
+    // FD_CLOEXEC is 1 on both, and these three take no flag word we own.
+    case LX_F_DUPFD:         return fcntl(fd, F_DUPFD, (int)arg);
+    case LX_F_GETFD:         return fcntl(fd, F_GETFD);
+    case LX_F_SETFD:         return fcntl(fd, F_SETFD, (int)arg);
+    case LX_F_DUPFD_CLOEXEC: return fcntl(fd, F_DUPFD_CLOEXEC, (int)arg);
+    case LX_F_SETOWN:        return fcntl(fd, F_SETOWN, (int)arg);
+    case LX_F_GETOWN:        return fcntl(fd, F_GETOWN);
+    // struct flock is laid out differently on the two platforms (Linux leads
+    // with l_type/l_whence, Darwin with l_start/l_len), so forwarding the
+    // pointer would silently lock a different range. Trap 7's class. Refuse by
+    // name until something actually needs it — no guest has yet.
+    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW:
+        warn_once("fcntl file locking (struct flock layout differs) — refused");
+        errno = EINVAL;
+        return -1;
+    default:
+        fcntl_warn_once("fcntl", cmd);
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+// Same class of bug, same fix. Only the two request codes any guest here has
+// used are translated; anything else is reported rather than passed through,
+// because an untranslated ioctl request is not a near miss — the encoding packs
+// direction and size, so a wrong code addresses a different driver operation.
+#define LX_FIONREAD 0x541B
+#define LX_FIONBIO  0x5421
+
+int kl_ioctl(int fd, unsigned long req, uintptr_t arg) {
+    switch (req) {
+    case LX_FIONREAD: return ioctl(fd, FIONREAD, (void *)arg);
+    case LX_FIONBIO:  return ioctl(fd, FIONBIO,  (void *)arg);
+    default:
+        fcntl_warn_once("ioctl", (long)req);
+        errno = ENOTTY;
+        return -1;
+    }
+}
+
 int klb_madvise(void *a, size_t n, int advice) {
     if (advice == 8) advice = MADV_FREE;         // Linux MADV_FREE
     return madvise(a, n, advice);

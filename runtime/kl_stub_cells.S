@@ -87,7 +87,7 @@ _kl_stub_trace_common:
 .align 4
 _kl_stub_named_cells:
 .set cell_i, 0
-.rept 2048
+.rept 16384                      // must equal KL_STUB_NAMED_CELLS in kl_image.c
     mov  w16, #cell_i
     b    _kl_stub_named_common
 .set cell_i, cell_i + 1

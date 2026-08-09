@@ -28,6 +28,10 @@ For graphics, GLES 3.2 is translated to a vendored ANGLE GLES 3.0 (with its Meta
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+While both Android and macOS reserve x18, some (a lot of) older Android applications still use x18, and macOS zeros x18 on context switches. All usage of x18 is patched by `klepton-ld` so that per-library TLS slots are used instead.
+
+Klepton also has the ability to load and patch `.so` files at runtime with `mmap`, but this is only really useful on macOS where JIT is actually allowed. It's likely that some applications will require JIT if they happen to utilize scripting runtimes that expect it (LuaJIT, V8, whatever else).
+
 ## Building
 
 ```bash

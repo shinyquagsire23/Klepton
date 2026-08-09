@@ -51,9 +51,11 @@ cd "$(dirname "$0")"
 
 LIBDIR="${KL_SLINK_LIBDIR:-steamlink-android/lib/arm64-v8a}"
 LOG="${KL_LOG_OUT:-/tmp/slink.log}"
-TIMEOUT="${KL_TIMEOUT:-180}"
+TIMEOUT="${KL_TIMEOUT:-10}"
 LOG_ONLY=""
 VIEW=""
+SHELL_MODE=""
+LIBDIR_SET=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -63,6 +65,10 @@ while [ $# -gt 0 ]; do
     # --main and --view both imply the real GL path: the null driver stops at
     # glCheckFramebufferStatus, so SL-2 cannot be reached on it at all.
     --main)        export KL_SLINK_MAIN=1; export KL_GLFB=1; export KL_NOFORK=1; shift ;;
+    # The other front door: the 2D configuration frontend (libshell + Qt6)
+    # instead of the streaming client. VR APK only, so it selects that LIBDIR
+    # unless one was given explicitly.
+    --shell)       export KL_SLINK_SHELL=1; SHELL_MODE=1; shift ;;
     --view)        export KL_VIEW=1; export KL_GLFB=1; export KL_NOFORK=1
                    VIEW=1; shift ;;
     --nofork)      export KL_NOFORK=1; shift ;;
@@ -70,12 +76,20 @@ while [ $# -gt 0 ]; do
     --trace-net)   export KL_TRACE_NET=1; shift ;;
     --alarm)       export KL_ALARM="$2"; shift 2 ;;
     --timeout)     TIMEOUT="$2"; shift 2 ;;
-    --libdir)      LIBDIR="$2"; shift 2 ;;
+    --libdir)      LIBDIR="$2"; LIBDIR_SET=1; shift 2 ;;
     --log)         LOG_ONLY=1; shift ;;
     -h|--help)     sed -n '2,35p' "$0"; exit 0 ;;
     *)             echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
   esac
 done
+
+# --shell only exists on the VR APK: the old one ships Qt5 + the stock
+# qtforandroid QPA, the VR one ships Qt6 + Valve's own qvirtual. Selecting the
+# tree here rather than making the caller remember it, but never overriding an
+# explicit --libdir.
+if [ -n "$SHELL_MODE" ] && [ -z "$LIBDIR_SET" ]; then
+  LIBDIR="steamlink-vr/lib/arm64-v8a"
+fi
 
 # LC_ALL=C everywhere below, and grep -a: the log carries guest bytes, and
 # without both grep bails with "illegal byte sequence" and silently shows
@@ -185,12 +199,12 @@ summarise() {
 if [ -n "$LOG_ONLY" ]; then summarise; exit 0; fi
 
 # Gate on the BUILD's exit status, not on the binary existing. A failed
-# incremental build leaves the last good ./build/t_slink in place, so running
+# incremental build leaves the last good ./build/m_slink in place, so running
 # anyway would test the previous code and report it as the new code's result —
 # the same trap visionos/run.sh had (CLAUDE.md, "Verify the artifact").
-echo "building  : build/t_slink"
+echo "building  : build/m_slink"
 BUILDLOG="${LOG%.log}-build.log"
-make build/t_slink > "$BUILDLOG" 2>&1
+make build/m_slink > "$BUILDLOG" 2>&1
 build_rc=$?
 g -E 'error|warning:' "$BUILDLOG" | sed 's/^/  /' | head -20
 if [ $build_rc -ne 0 ]; then
@@ -198,7 +212,7 @@ if [ $build_rc -ne 0 ]; then
   exit 1
 fi
 
-KNOBS="${KL_GAP_ONLY:+KL_GAP_ONLY=1 }${KL_PERMISSIVE:+KL_PERMISSIVE=1 }${KL_GLFB:+KL_GLFB=$KL_GLFB }${KL_NOFORK:+KL_NOFORK=1 }${KL_ALARM:+KL_ALARM=$KL_ALARM }${KL_TRACE_FS:+KL_TRACE_FS=1 }${KL_TRACE_NET:+KL_TRACE_NET=1 }"
+KNOBS="${KL_SLINK_SHELL:+KL_SLINK_SHELL=1 }${KL_GAP_ONLY:+KL_GAP_ONLY=1 }${KL_PERMISSIVE:+KL_PERMISSIVE=1 }${KL_GLFB:+KL_GLFB=$KL_GLFB }${KL_NOFORK:+KL_NOFORK=1 }${KL_ALARM:+KL_ALARM=$KL_ALARM }${KL_TRACE_FS:+KL_TRACE_FS=1 }${KL_TRACE_NET:+KL_TRACE_NET=1 }"
 echo "libdir    : $LIBDIR"
 echo "knobs     : ${KNOBS:-(none — the default run)}"
 echo "log       : $LOG"
@@ -214,9 +228,9 @@ if [ -n "$VIEW" ]; then
   # No timeout: the run ends when the window is closed. The window IS the
   # output here, so the log is for afterwards rather than for watching.
   echo "            (window open — close it to end the run)"
-  script -q /dev/null ./build/t_slink "$LIBDIR" 2>&1 | tee "$LOG"
+  script -q /dev/null ./build/m_slink "$LIBDIR" 2>&1 | tee "$LOG"
 else
-  timeout "$TIMEOUT" script -q /dev/null ./build/t_slink "$LIBDIR"
+  timeout "$TIMEOUT" script -q /dev/null ./build/m_slink "$LIBDIR"
 fi
 rc=$?
 echo

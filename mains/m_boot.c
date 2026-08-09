@@ -31,7 +31,7 @@
 #include "../runtime/kl_mprobe.h"
 #include "../runtime/kl_il2cpp.h"
 #include "../runtime/kl_fault.h"
-#include "t_mtl_provider.h"
+#include "../tests/t_mtl_provider.h"
 
 static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
 

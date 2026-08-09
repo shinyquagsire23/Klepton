@@ -41,6 +41,7 @@ int getentropy(void *buffer, size_t size);
 #endif
 #include <utime.h>
 #include <pwd.h>
+#include <grp.h>        // getgrgid — Qt6Core's QFileSystemEngine asks for it
 #include <zlib.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
@@ -585,7 +586,7 @@ X(klb_opendir) X(klb_readdir) X(klb_closedir)
 X(klb_FD_ISSET_chk) X(klb_FD_SET_chk) X(klb_ctype_mb_cur_max) X(klb_lseek64)
 X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename)
 X(klh_android_log_print)
-X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_syscall) X(klb_swprintf)
+X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_system) X(klb_syscall) X(klb_swprintf)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
 X(klb_mmap) X(klb_madvise)
 X(klb_pthread_mutex_init) X(klb_pthread_mutex_lock) X(klb_pthread_mutex_unlock)
@@ -624,6 +625,13 @@ X(klb_fileno) X(klb_fgetc) X(klb_ungetc) X(klb_getwc) X(klb_fgetwc)
 X(klb_ungetwc) X(klb_fputwc) X(klb_putwc) X(klb_fwide)
 X(klb_pthread_rwlock_tryrdlock) X(klb_pthread_rwlock_trywrlock)
 X(klb___register_atfork) X(klb___gnu_strerror_r) X(klb___write_chk)
+// ...and what the 2D frontend (libshell + Qt6) adds on top of it.
+X(klb_eventfd) X(klb_eventfd_read) X(klb_eventfd_write) X(klb_ppoll)
+X(klb_accept4) X(klb_pipe2) X(klb_dup3) X(klb_memfd_create) X(klb_clone)
+X(klb_inotify_init) X(klb_inotify_init1)
+X(klb_inotify_add_watch) X(klb_inotify_rm_watch)
+X(klb___assert2) X(klb___FD_CLR_chk) X(klb___fgets_chk)
+X(klb___pthread_cleanup_push) X(klb___pthread_cleanup_pop)
 #undef X
 extern char **environ;
 // A VARIABLE, not a function, so it cannot ride the X() macro above.
@@ -659,7 +667,8 @@ static const kl_entry g_shim[] = {
     E("recvfrom", kl_recvfrom), E("getpeername", kl_getpeername),
     E("getsockname", kl_getsockname),
     E("strtold", klv_strtold), E("wcstold", klv_wcstold), E("strtold_l", klv_strtold_l),
-    E("swprintf", klb_swprintf), E("execl", klb_execl), E("syscall", klb_syscall),
+    E("swprintf", klb_swprintf), E("execl", klb_execl), E("system", klb_system),
+    E("syscall", klb_syscall),
 
     // guest va_list consumers
     E("vfprintf", kl_vfprintf), E("vsnprintf", kl_vsnprintf), E("vasprintf", kl_vasprintf),
@@ -724,6 +733,26 @@ static const kl_entry g_shim[] = {
     E("fputwc", klb_fputwc), E("putwc", klb_putwc), E("fwide", klb_fwide),
     E("pthread_rwlock_tryrdlock", klb_pthread_rwlock_tryrdlock),
     E("pthread_rwlock_trywrlock", klb_pthread_rwlock_trywrlock),
+
+    // ---- ...and what the 2D configuration frontend (libshell + Qt6) adds ----
+    // Linux syscall wrappers with no Darwin name. Qt's event dispatcher, file
+    // watcher and process code call them directly. Rationale per function in
+    // kl_libc_slink.c; the short version is that each is either rebuilt out of
+    // what Darwin does have, or refused with the errno Qt already has a
+    // fallback for. None is a silent success.
+    E("eventfd", klb_eventfd),
+    E("eventfd_read", klb_eventfd_read), E("eventfd_write", klb_eventfd_write),
+    E("ppoll", klb_ppoll),
+    E("accept4", klb_accept4), E("pipe2", klb_pipe2), E("dup3", klb_dup3),
+    E("memfd_create", klb_memfd_create),
+    E("clone", klb_clone),
+    E("inotify_init", klb_inotify_init), E("inotify_init1", klb_inotify_init1),
+    E("inotify_add_watch", klb_inotify_add_watch),
+    E("inotify_rm_watch", klb_inotify_rm_watch),
+    E("__assert2", klb___assert2),
+    E("__FD_CLR_chk", klb___FD_CLR_chk), E("__fgets_chk", klb___fgets_chk),
+    E("__pthread_cleanup_push", klb___pthread_cleanup_push),
+    E("__pthread_cleanup_pop", klb___pthread_cleanup_pop),
     // The standard streams are `FILE *` VARIABLES in bionic, so the table entry
     // is the address OF the pointer — one level of indirection that, got wrong,
     // hands the guest a FILE whose first field is a function pointer. Same trap

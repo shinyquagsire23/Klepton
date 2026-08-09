@@ -36,6 +36,7 @@
 #include "kl_view_mtl.h" // the hardware composite path
 #include "kl_ovrp.h"     // kl_ovrp_set_head_pose — the pose-in seam
 #include "kl_present.h"  // mono vs stereo — which shape of picture the guest makes
+#include "kl_jni.h"      // the mono input path: SDLActivity's registered natives
 #include "kl_env.h"
 
 #if __has_include(<SDL3/SDL.h>)
@@ -99,6 +100,180 @@ int kl_view_available(void) {
 }
 
 #ifdef KL_VIEW_HAVE_SDL
+
+// ---- mono input: the window's pointer and keys, into the guest ---------------
+//
+// A flat guest has no pose to drive, so the mouse means what it means on a
+// desktop: it is the pointer. The route is the guest's OWN Android input path
+// — `SDLActivity.onNativeMouse` / `onNativeKeyDown` / `onNativeKeyUp`, which
+// SDL3 registered with us at JNI_OnLoad — rather than anything invented. That
+// keeps this honest in the way the rest of the shim is: we synthesize the Java
+// side, so the events arrive exactly as SDLSurface.onTouch would have sent
+// them, and SDL's own Android backend does the translating.
+//
+// It also means this costs nothing for a guest that is not SDL: the lookups
+// return NULL for Unity (which registers no such natives) and every call below
+// is a no-op. The natives are resolved once, lazily, because RegisterNatives
+// runs long after this file's first line.
+//
+// android.view.MotionEvent's constants, spelled rather than guessed — SDL3's
+// Android_OnMouse switches on the action and derives WHICH button changed by
+// diffing the button-state mask against the last one, so the state passed here
+// must be the state AFTER the transition, not the button that caused it.
+#define KL_AMOTION_DOWN        0
+#define KL_AMOTION_UP          1
+#define KL_AMOTION_MOVE        2
+#define KL_AMOTION_HOVER_MOVE  7
+#define KL_AMOTION_SCROLL      8
+#define KL_ABUTTON_PRIMARY     1
+#define KL_ABUTTON_SECONDARY   2
+#define KL_ABUTTON_TERTIARY    4
+
+#define KL_VIEW_SDLA "org/libsdl/app/SDLActivity"
+
+typedef void (*kl_fn_mouse)(void *env, void *cls, int32_t state, int32_t action,
+                            float x, float y, uint8_t relative);
+typedef void (*kl_fn_key)(void *env, void *cls, int32_t keycode);
+
+static struct {
+    int         resolved;
+    kl_fn_mouse mouse;
+    kl_fn_key   key_down, key_up;
+    void       *env, *cls;
+} g_mono_in;
+
+static void view_mono_input_resolve(void) {
+    if (g_mono_in.resolved) return;
+    g_mono_in.resolved = 1;
+    g_mono_in.mouse    = (kl_fn_mouse)kl_jni_native(KL_VIEW_SDLA, "onNativeMouse", NULL);
+    g_mono_in.key_down = (kl_fn_key)kl_jni_native(KL_VIEW_SDLA, "onNativeKeyDown", NULL);
+    g_mono_in.key_up   = (kl_fn_key)kl_jni_native(KL_VIEW_SDLA, "onNativeKeyUp", NULL);
+    if (!g_mono_in.mouse) {
+        fprintf(stderr, "view: [mono] the guest registered no %s.onNativeMouse — "
+                        "the window is display-only\n", KL_VIEW_SDLA);
+        return;
+    }
+    g_mono_in.env = kl_jni_env();
+    g_mono_in.cls = kl_jni_class(KL_VIEW_SDLA);
+    fprintf(stderr, "view: [mono] pointer and keys go to the guest\n");
+}
+
+// Window points -> the guest's surface pixels. The window is resized to the
+// guest's panel on the mode transition, so this is usually 1:1 — but only
+// usually: a Retina drawable and a user-resized window both break it, and a
+// pointer that lands in the wrong place is the kind of bug that reads as "the
+// UI ignores clicks".
+static void view_mono_scale(SDL_Window *win, float *x, float *y) {
+    int ww = 0, wh = 0, gw = 0, gh = 0;
+    SDL_GetWindowSize(win, &ww, &wh);
+    kl_present_mono_size(&gw, &gh);
+    if (ww > 0 && gw > 0) *x = *x * (float)gw / (float)ww;
+    if (wh > 0 && gh > 0) *y = *y * (float)gh / (float)wh;
+}
+
+static void view_mono_mouse(SDL_Window *win, int32_t state, int32_t action,
+                            float x, float y) {
+    view_mono_input_resolve();
+    if (!g_mono_in.mouse) return;
+    view_mono_scale(win, &x, &y);
+    kl_jni_local_frame_push();
+    g_mono_in.mouse(g_mono_in.env, g_mono_in.cls, state, action, x, y, 0);
+    kl_jni_local_frame_pop();
+}
+
+// SDL scancode -> Android keycode. Only what a configuration UI is driven with:
+// navigation, activation, dismissal, and enough of a keyboard to type a host
+// address or a PIN. Anything absent is dropped rather than guessed at — a wrong
+// keycode is a keypress the guest acts on, which is worse than none.
+static int32_t view_mono_keycode(SDL_Scancode sc) {
+    if (sc >= SDL_SCANCODE_A && sc <= SDL_SCANCODE_Z)
+        return 29 + (sc - SDL_SCANCODE_A);            // KEYCODE_A .. KEYCODE_Z
+    if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9)
+        return 8 + (sc - SDL_SCANCODE_1);             // KEYCODE_1 .. KEYCODE_9
+    switch (sc) {
+    case SDL_SCANCODE_0:          return 7;           // KEYCODE_0
+    case SDL_SCANCODE_RETURN:
+    case SDL_SCANCODE_KP_ENTER:   return 66;          // KEYCODE_ENTER
+    case SDL_SCANCODE_BACKSPACE:  return 67;          // KEYCODE_DEL
+    case SDL_SCANCODE_TAB:        return 61;          // KEYCODE_TAB
+    case SDL_SCANCODE_SPACE:      return 62;          // KEYCODE_SPACE
+    case SDL_SCANCODE_UP:         return 19;          // KEYCODE_DPAD_UP
+    case SDL_SCANCODE_DOWN:       return 20;          // KEYCODE_DPAD_DOWN
+    case SDL_SCANCODE_LEFT:       return 21;          // KEYCODE_DPAD_LEFT
+    case SDL_SCANCODE_RIGHT:      return 22;          // KEYCODE_DPAD_RIGHT
+    case SDL_SCANCODE_PERIOD:     return 56;          // KEYCODE_PERIOD
+    case SDL_SCANCODE_COMMA:      return 55;          // KEYCODE_COMMA
+    case SDL_SCANCODE_MINUS:      return 69;          // KEYCODE_MINUS
+    // Escape is the BACK button, not KEYCODE_ESCAPE: that is what a headset or
+    // a phone gives this app, and the manifest's own SDL_ANDROID_TRAP_BACK_BUTTON
+    // says Steam Link handles it itself.
+    case SDL_SCANCODE_ESCAPE:     return 4;           // KEYCODE_BACK
+    default:                      return 0;
+    }
+}
+
+// KL_VIEW_POKE="fx,fy@secs" — one synthetic click at fractional window
+// coordinates, `secs` after the guest goes mono. It exists because the
+// alternative for proving this path is posting a CGEvent at the real desktop,
+// which clicks whatever window is actually under that point — it found an
+// editor the first time it was tried. This drives the same three calls a real
+// click drives, so it proves the path and not just the plumbing.
+static void view_mono_poke(SDL_Window *win, uint64_t t_mono, uint64_t t_now) {
+    static int   parsed;
+    static float fx, fy;
+    static unsigned delay_ms;
+    static int   fired;
+    if (fired) return;
+    if (!parsed) {
+        parsed = 1;
+        const char *s = kl_env_str("KL_VIEW_POKE", NULL);
+        if (!s || sscanf(s, "%f,%f@%u", &fx, &fy, &delay_ms) < 2) { fired = 1; return; }
+        delay_ms *= 1000;
+        fprintf(stderr, "view: [mono] KL_VIEW_POKE: one click at (%.3f, %.3f) "
+                        "after %u ms\n", (double)fx, (double)fy, delay_ms);
+    }
+    if (!t_mono || t_now - t_mono < delay_ms) return;
+
+    // Three steps on three different frames, not three calls in a row. A real
+    // click hovers, holds for ~100 ms and releases, and the guest's event loop
+    // has to RUN in between: pressed and released within one of our iterations
+    // is a click Qt can sample as never having happened (measured — the button
+    // took its highlight and nothing else). The hover step is separate for the
+    // same reason: Qt decides what a press lands on from where the pointer
+    // already is.
+    static int step;
+    static uint64_t t_step;
+    if (step && t_now - t_step < 150) return;
+    t_step = t_now;
+
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(win, &ww, &wh);
+    float x = fx * (float)ww, y = fy * (float)wh;
+    switch (step++) {
+    case 0:
+        fprintf(stderr, "view: [mono] poke click at %.0f,%.0f of %dx%d\n",
+                (double)x, (double)y, ww, wh);
+        view_mono_mouse(win, 0, KL_AMOTION_HOVER_MOVE, x, y);
+        break;
+    case 1:
+        view_mono_mouse(win, KL_ABUTTON_PRIMARY, KL_AMOTION_DOWN, x, y);
+        break;
+    default:
+        view_mono_mouse(win, 0, KL_AMOTION_UP, x, y);
+        fired = 1;
+        break;
+    }
+}
+
+static void view_mono_key(int down, SDL_Scancode sc) {
+    view_mono_input_resolve();
+    kl_fn_key fn = down ? g_mono_in.key_down : g_mono_in.key_up;
+    int32_t code = view_mono_keycode(sc);
+    if (!fn || !code) return;
+    kl_jni_local_frame_push();
+    fn(g_mono_in.env, g_mono_in.cls, code);
+    kl_jni_local_frame_pop();
+}
 
 // ---- the readback path's display (KL_VIEW_CPU=1) ----------------------------
 // Everything in here is what the hardware path does not do: a row flip of the
@@ -219,6 +394,8 @@ int kl_view_main(const char *libdir, int hw) {
     float yaw = 0, pitch = 0;
     int mouselook = 0;
     int mouse_l = 0, mouse_r = 0;   // right-hand trigger / grip
+    int32_t mono_buttons = 0;       // the flat path's Android button-state mask
+    uint64_t t_mono = 0;            // when the guest went mono — KL_VIEW_POKE's zero
 
     view_cpu_disp disp = {0};      // the readback path's staging; unused when hw
     int hw_up = 0, hw_warned = 0;  // the compositor starts lazily — see the loop
@@ -265,6 +442,14 @@ int kl_view_main(const char *libdir, int hw) {
                 }
                 fprintf(stderr, "view: guest is MONO %dx%d — flat window, no pose\n",
                         mw, mh);
+                // Resolve the input natives HERE rather than on the first
+                // event: by the mode transition the guest has run JNI_OnLoad
+                // (that is what created the window surface), so the lookup can
+                // succeed, and reporting it now means every run says whether
+                // the window is interactive instead of only the runs someone
+                // moved the mouse in.
+                view_mono_input_resolve();
+                t_mono = t_now;
             } else if (m == KL_PRESENT_STEREO) {
                 SDL_SetWindowTitle(win, "Klepton — VR guest (one eye)");
                 fprintf(stderr, "view: guest is STEREO — driving pose and hands\n");
@@ -273,6 +458,48 @@ int kl_view_main(const char *libdir, int hw) {
 
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            // Mono and stereo want OPPOSITE things from the same events. A VR
+            // guest wants the mouse captured and read as relative turn; a flat
+            // one wants an ordinary absolute pointer it can click a button
+            // with, and capturing it would hide the cursor over a UI that has
+            // one. So the split is here rather than inside each case.
+            if (mono) {
+                switch (ev.type) {
+                case SDL_EVENT_QUIT:
+                    done = 1;
+                    break;
+                case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                case SDL_EVENT_MOUSE_BUTTON_UP: {
+                    int down = ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+                    int bit = ev.button.button == SDL_BUTTON_RIGHT  ? KL_ABUTTON_SECONDARY
+                            : ev.button.button == SDL_BUTTON_MIDDLE ? KL_ABUTTON_TERTIARY
+                                                                    : KL_ABUTTON_PRIMARY;
+                    if (down) mono_buttons |= bit; else mono_buttons &= ~bit;
+                    view_mono_mouse(win, mono_buttons,
+                                    down ? KL_AMOTION_DOWN : KL_AMOTION_UP,
+                                    ev.button.x, ev.button.y);
+                    break;
+                }
+                case SDL_EVENT_MOUSE_MOTION:
+                    // Dragging is MOVE, hovering is HOVER_MOVE — Qt needs the
+                    // hover half to light up a button before it is clicked.
+                    view_mono_mouse(win, mono_buttons,
+                                    mono_buttons ? KL_AMOTION_MOVE : KL_AMOTION_HOVER_MOVE,
+                                    ev.motion.x, ev.motion.y);
+                    break;
+                case SDL_EVENT_MOUSE_WHEEL:
+                    view_mono_mouse(win, mono_buttons, KL_AMOTION_SCROLL,
+                                    ev.wheel.x, ev.wheel.y);
+                    break;
+                case SDL_EVENT_KEY_DOWN:
+                    view_mono_key(1, ev.key.scancode);
+                    break;
+                case SDL_EVENT_KEY_UP:
+                    view_mono_key(0, ev.key.scancode);
+                    break;
+                }
+                continue;
+            }
             switch (ev.type) {
             case SDL_EVENT_QUIT:                       // includes Cmd-Q
                 done = 1;
@@ -307,6 +534,8 @@ int kl_view_main(const char *libdir, int hw) {
                 break;
             }
         }
+
+        if (mono) view_mono_poke(win, t_mono, t_now);
 
         // Movement, in the yaw plane: forward is (−sin yaw, 0, −cos yaw) and
         // right is (cos yaw, 0, −sin yaw) under the convention above. R/Space
