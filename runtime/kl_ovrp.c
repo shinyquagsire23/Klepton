@@ -10,6 +10,7 @@
 #include <string.h>
 #include <math.h>
 #include <pthread.h>
+#include <time.h>
 #include "klepton.h"
 #include "kl_ovrp.h"
 // kl_glfb_note_eye_texture (the capture's eye-FBO seam) and
@@ -1451,12 +1452,348 @@ uint64_t klovrp_GetControllerState_impl(int mask, void *out) {
     return OVRP_SUCCESS;
 }
 
-// 24-byte ovrpHapticsDesc by value via x8; the real plugin zeroes it exactly
-// like this when haptics are unavailable, and we have no haptics backend.
+// ---------------------------------------------------------------------------
+// M8 — haptics: the seam running the OTHER way
+//
+// Every other entry point in this file answers a question the guest asked.
+// These three are the guest telling us to do something to the hardware, so the
+// seam is inverted: the guest fills a queue here, and the frontend drains it
+// once a frame (kl_ovrp_haptics_pull) and plays it on whatever it has.
+//
+// **This title drives the BUFFERED path, not the vibration one.** Its
+// global-metadata.dat carries OVRHaptics / OVRHapticsClip / OVRHapticsOutput
+// and the whole OVRHaptics.Config property set — SampleRateHz,
+// SampleSizeInBytes, MinimumSafeSamplesQueued, MinimumBufferSamplesCount,
+// OptimalBufferSamplesCount, MaximumBufferSamplesCount — which is Oculus's
+// sample-stream API rather than the one-shot OVRInput.SetControllerVibration:
+//
+//   ovrp_GetControllerHapticsDesc  -- how fast, how wide, how deep. Read ONCE,
+//                                     at OVRHaptics's static init.
+//   ovrp_GetControllerHapticsState -- how much is still queued and how much
+//                                     room is left. Every frame, per hand.
+//   ovrp_SetControllerHaptics      -- here are N amplitude samples.
+//
+// **The descriptor is load-bearing, and zeroing it is not a neutral answer.**
+// OVRHapticsOutput sizes its native sample buffer at MaximumBufferSamplesCount,
+// paces itself to keep OptimalBufferSamplesCount queued, and clamps what it
+// sends to the SamplesAvailable we report. A zeroed descriptor plus a zeroed
+// state is therefore a coherent "this controller cannot vibrate": the managed
+// side keeps queueing clips into a zero-length buffer and never calls
+// SetControllerHaptics at all. That is what was happening, and it is why there
+// was nothing downstream to implement until these two answered honestly.
+//
+// The numbers below are Touch's, which is the controller we claim to be
+// everywhere else (Build.MODEL, ovrp_GetSystemHeadsetType) — 320 Hz, one
+// unsigned byte per sample, buffers of 1..256 samples with 20 the pace target
+// and 5 the don't-let-it-run-dry mark. Reporting a Sense controller's real
+// capabilities instead would be more literally true and would put Unity's
+// pacing maths somewhere this title has never been.
+//
+// **How to tell we read the two struct layouts the right way round**, which is
+// the one thing here that is an ABI claim rather than a measurement: with the
+// descriptor answered, SetControllerHaptics calls start arriving, and their
+// SamplesCount lands at or below OptimalBufferSamplesCount (20). A transposed
+// descriptor shows up immediately as counts of 1 or 256. For the state struct
+// the failure is silent instead — swap SamplesAvailable and SamplesQueued and
+// the guest computes "0 samples of room" forever and sends nothing — so that
+// one has KL_HAPTICS_SWAP_STATE=1 as its A/B, and KL_HAPTICS_TRACE=1 prints
+// both halves of the conversation.
+#define KLOVRP_HAP_RATE     320        // samples per second
+#define KLOVRP_HAP_MAX      256        // MaximumBufferSamplesCount, and our ring
+#define KLOVRP_HAP_OPTIMAL  20         // OptimalBufferSamplesCount
+#define KLOVRP_HAP_SAFE     5          // MinimumSafeSamplesQueued
+#define KLOVRP_HAP_MINBUF   1          // MinimumBufferSamplesCount
+
+// The shortest span worth waking the frontend's haptics engine for, and the
+// longest one pulse may cover. The floor is ALVR's (0.032 s) and exists
+// because the guest tops its queue up EVERY frame: at 90 Hz that is three or
+// four new samples a time, and handing a CoreHaptics engine a stream of 11 ms
+// events is a series of restarts rather than a buzz. We can afford to wait —
+// the queue runs ~60 ms ahead of the sound, which is the whole point of a
+// buffered API. The ceiling is ALVR's too, and is a safety rail: a single
+// event that runs for half a second is already longer than any note cut.
+#define KLOVRP_HAP_MIN_S    0.032f
+#define KLOVRP_HAP_MAX_S    0.5f
+
+// Deltas only, never compared against anything outside this file, so which
+// Darwin monotonic clock this is does not matter — CACurrentMediaTime() on the
+// frontend side is a different epoch and is deliberately not mixed in.
+static double klovrp_mono(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// One ring per hand. The guest pushes from its own thread, the frontend pulls
+// from the render thread, and GetControllerHapticsState is read from a third,
+// so the mutex is not defensive.
+static struct klovrp_haptics {
+    pthread_mutex_t mu;
+    uint8_t  s[KLOVRP_HAP_MAX];
+    int      head;          // index of the next sample due to play
+    int      count;         // samples queued, playing forward from head
+    int      published;     // how many of those the frontend already has
+    double   t_head;        // monotonic instant at which s[head] plays
+    int      fed;           // did the guest queue anything since the last pull?
+    // The legacy vibration path, kept SEPARATE from the ring above rather than
+    // folded into it. It has to be: this title calls
+    // ovrp_SetControllerVibration(mask, 0, 0) on both hands EVERY FRAME — an
+    // idle "nothing should be buzzing" — while OVRHaptics feeds the ring from
+    // the same managed frame. Serving the stop by clearing the queue would let
+    // one path silently erase the other's clip sixty times a second, and the
+    // symptom would be haptics that are merely intermittent rather than absent.
+    float    vib_amp;       // 0 = not vibrating
+    double   vib_until;     // when this vibration lapses if not refreshed
+    double   vib_pub;       // vibration handed to the frontend up to this instant
+    uint64_t pushes, samples, pulses;
+    float    peak;
+} g_hap[2] = {
+    { .mu = PTHREAD_MUTEX_INITIALIZER }, { .mu = PTHREAD_MUTEX_INITIALIZER },
+};
+
+static int klovrp_hap_trace(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_HAPTICS_TRACE", 0);
+    return on;
+}
+
+// Retire the samples whose moment has passed. This is what makes the state we
+// report a real answer rather than a guess: the queue drains on the wall clock
+// at exactly the rate we told the guest it would, so its own prediction of
+// SamplesQueued (OVRHapticsOutput checks ours against it every frame) agrees.
+// Call with the lock held.
+static void klovrp_hap_drain(struct klovrp_haptics *h, double now) {
+    if (h->count <= 0) {
+        h->count = 0; h->published = 0; h->t_head = now;
+        return;
+    }
+    double due = (now - h->t_head) * KLOVRP_HAP_RATE;
+    if (due < 1.0) return;
+    int adv = (int)due;
+    if (adv > h->count) adv = h->count;
+    h->head = (h->head + adv) % KLOVRP_HAP_MAX;
+    h->count -= adv;
+    h->published -= adv;
+    if (h->published < 0) h->published = 0;
+    h->t_head += (double)adv / KLOVRP_HAP_RATE;
+    if (h->count == 0) h->t_head = now;
+}
+
+// Which hands a controller mask names. Active means "whatever is connected",
+// and we report both Touch controllers connected, so it means both.
+static int klovrp_hap_hands(int mask) {
+    uint32_t m = (uint32_t)mask;
+    if (m & OVRP_CTRL_ACTIVE) m |= OVRP_CTRL_LTOUCH | OVRP_CTRL_RTOUCH;
+    // LHand/RHand (0x20/0x40) name the hand-tracking "controllers" the same
+    // enum carries; they are the same two hands to us.
+    int hands = 0;
+    if (m & (OVRP_CTRL_LTOUCH | 0x20u)) hands |= 1;
+    if (m & (OVRP_CTRL_RTOUCH | 0x40u)) hands |= 2;
+    return hands;
+}
+
+static void klovrp_hap_enqueue(int hand, const uint8_t *s, int n) {
+    struct klovrp_haptics *h = &g_hap[hand];
+    double now = klovrp_mono();
+    pthread_mutex_lock(&h->mu);
+    klovrp_hap_drain(h, now);
+    int dropped = 0;
+    for (int i = 0; i < n; i++) {
+        if (h->count >= KLOVRP_HAP_MAX) { dropped = n - i; break; }
+        h->s[(h->head + h->count) % KLOVRP_HAP_MAX] = s[i];
+        h->count++;
+        if (s[i] / 255.0f > h->peak) h->peak = s[i] / 255.0f;
+    }
+    h->fed = 1;
+    h->pushes++;
+    h->samples += (uint64_t)(n - dropped);
+    pthread_mutex_unlock(&h->mu);
+    if (dropped && klovrp_hap_trace())
+        fprintf(stderr, "  [ovrp] haptics: hand %d queue full, dropped %d "
+                        "sample(s) — the guest ignored SamplesAvailable\n",
+                hand, dropped);
+}
+
+// (mask = w0, HapticsBuffer by value = x1/x2). The buffer is
+// { void *Samples; int SamplesCount; } — 16 bytes, so AAPCS64 passes it in two
+// registers rather than by reference, which is why the count arrives as a
+// second scalar and not through a pointer. Returns ovrpBool, not ovrpResult
+// (managed OVRPlugin tests it against Bool.True).
+static uint64_t klovrp_SetControllerHaptics(int mask, const void *samples,
+                                            uint64_t count) {
+    ovrp_hit("ovrp_SetControllerHaptics");
+    int n = (int)(uint32_t)count;
+    if (!samples || n <= 0) return 1;
+    if (n > KLOVRP_HAP_MAX) n = KLOVRP_HAP_MAX;   // the guest was told the ceiling
+    int hands = klovrp_hap_hands(mask);
+    if (klovrp_hap_trace())
+        fprintf(stderr, "  [ovrp] haptics: SetControllerHaptics(mask=0x%x) "
+                        "%d sample(s), first=%u\n",
+                (unsigned)mask, n, ((const uint8_t *)samples)[0]);
+    if (hands & 1) klovrp_hap_enqueue(0, samples, n);
+    if (hands & 2) klovrp_hap_enqueue(1, samples, n);
+    return 1;
+}
+
+// The legacy level API: (mask = w0, frequency = s0, amplitude = s1), ovrpBool.
+// A vibration set here runs until it is changed — OVRInput's own contract is
+// that a caller which means to sustain one keeps calling — so what is recorded
+// is a level and a lapse time, not a finite buffer.
+//
+// **Measured on this title: it arrives with amplitude 0 on both hands every
+// single frame** (3138 calls across 3000 frames), i.e. as a per-frame "stop"
+// rather than as the way anything is actually played. That is what forced the
+// two sources apart; see the `vib_amp` comment on the struct.
+//
+// KL_HAPTICS_VIB_LAPSE=<seconds> is the ceiling on an un-refreshed vibration,
+// default 2 s. The real API has one of about that; ours matters more, because a
+// frontend that has already been handed a pulse cannot be told to stop.
+//
+// The frequency argument is dropped, deliberately. OVRPlugin's 0..1 is a
+// selector between two fixed Touch motor rates; a Sense controller's second
+// axis is CoreHaptics *sharpness*, which is not the same quantity, and there is
+// no measurement here that would justify a mapping between them.
+static uint64_t klovrp_SetControllerVibration(int mask, float frequency,
+                                              float amplitude) {
+    ovrp_hit("ovrp_SetControllerVibration");
+    int hands = klovrp_hap_hands(mask);
+    static float lapse = -1.0f;
+    if (lapse < 0.0f) lapse = kl_env_float("KL_HAPTICS_VIB_LAPSE", 2.0f);
+    float a = amplitude < 0.0f ? 0.0f : amplitude > 1.0f ? 1.0f : amplitude;
+    double now = klovrp_mono();
+    for (int hand = 0; hand < 2; hand++) {
+        if (!(hands & (1 << hand))) continue;
+        struct klovrp_haptics *h = &g_hap[hand];
+        pthread_mutex_lock(&h->mu);
+        float was = h->vib_amp;
+        h->vib_amp = a;
+        h->vib_until = a > 0.0f ? now + lapse : 0.0;
+        // Starting from rest owes the frontend a pulse immediately; refreshing
+        // an already-running vibration must NOT reset the accumulator or a
+        // caller that re-asserts it every frame would re-trigger every frame.
+        if (a > 0.0f && was <= 0.0f) h->vib_pub = now;
+        pthread_mutex_unlock(&h->mu);
+        // Traced on the EDGE only. The per-frame idle stop above would
+        // otherwise bury every other line in this subsystem.
+        if (klovrp_hap_trace() && (was > 0.0f) != (a > 0.0f))
+            fprintf(stderr, "  [ovrp] haptics: hand %d vibration %s "
+                            "(freq=%.2f, amp=%.2f)\n",
+                    hand, a > 0.0f ? "on" : "off",
+                    (double)frequency, (double)a);
+    }
+    return 1;
+}
+
+// ovrpHapticsState is { int SamplesAvailable; int SamplesQueued; } — 8 bytes,
+// so it comes home in x0 with SamplesAvailable in the low word. This used to
+// sit in the answer-zero list, which reads as "no room, nothing queued": the
+// managed side clamps what it sends to SamplesAvailable, so zero room meant it
+// never sent anything at all.
+static uint64_t klovrp_GetControllerHapticsState(int mask) {
+    ovrp_hit("ovrp_GetControllerHapticsState");
+    int hands = klovrp_hap_hands(mask);
+    int hand = (hands & 1) ? 0 : 1;          // one hand per call, left first
+    struct klovrp_haptics *h = &g_hap[hand];
+    double now = klovrp_mono();
+    pthread_mutex_lock(&h->mu);
+    klovrp_hap_drain(h, now);
+    int queued = h->count;
+    pthread_mutex_unlock(&h->mu);
+    int available = KLOVRP_HAP_MAX - queued;
+
+    static int swap = -1;
+    if (swap < 0) swap = kl_env_on("KL_HAPTICS_SWAP_STATE", 0);
+    uint32_t lo = swap ? (uint32_t)queued : (uint32_t)available;
+    uint32_t hi = swap ? (uint32_t)available : (uint32_t)queued;
+    return (uint64_t)lo | ((uint64_t)hi << 32);
+}
+
+// 24-byte ovrpHapticsDesc by value via x8. See the block comment above for why
+// every field of this matters and why zeroing it silenced the whole path.
 uint64_t klovrp_GetControllerHapticsDesc_impl(int mask, void *out) {
     ovrp_hit("ovrp_GetControllerHapticsDesc");
-    memset(out, 0, 0x18);
+    (void)mask;                                  // one controller model, both hands
+    int32_t *d = out;
+    d[0] = KLOVRP_HAP_RATE;                      // SampleRateHz
+    d[1] = 1;                                    // SampleSizeInBytes
+    d[2] = KLOVRP_HAP_SAFE;                      // MinimumSafeSamplesQueued
+    d[3] = KLOVRP_HAP_MINBUF;                    // MinimumBufferSamplesCount
+    d[4] = KLOVRP_HAP_OPTIMAL;                   // OptimalBufferSamplesCount
+    d[5] = KLOVRP_HAP_MAX;                       // MaximumBufferSamplesCount
     return OVRP_SUCCESS;
+}
+
+// The buffered source. Returns the span it is handing out, 0 if it has
+// nothing to say yet. Call with the lock held.
+static float klovrp_hap_take_buffered(struct klovrp_haptics *h, float *amp) {
+    int fed = h->fed;
+    h->fed = 0;
+    int pending = h->count - h->published;
+    if (pending <= 0) return 0.0f;
+    float span = (float)pending / KLOVRP_HAP_RATE;
+    // Hold a short span back while the guest is still feeding — the tail of a
+    // clip arrives on the first pull that sees no new samples, so nothing is
+    // ever stranded in the queue.
+    if (span < KLOVRP_HAP_MIN_S && fed) return 0.0f;
+    if (span > KLOVRP_HAP_MAX_S) {
+        span = KLOVRP_HAP_MAX_S;
+        pending = (int)(KLOVRP_HAP_MAX_S * KLOVRP_HAP_RATE);
+    }
+    // The PEAK, not the mean: what a hand feels across a 30 ms window is the
+    // attack, and averaging one over a window that includes the silence before
+    // it turns every sharp cut into a soft push.
+    int peak = 0;
+    for (int i = 0; i < pending; i++) {
+        int v = h->s[(h->head + h->published + i) % KLOVRP_HAP_MAX];
+        if (v > peak) peak = v;
+    }
+    h->published += pending;
+    *amp = peak / 255.0f;
+    return span;
+}
+
+// ...and the level source, in chunks, because a level has no natural end: a
+// running vibration owes the frontend one pulse per elapsed chunk, and the
+// accumulator (`vib_pub`) is what stops a caller that re-asserts it every frame
+// from re-triggering every frame. Chunks are short so that a stop takes effect
+// promptly — nothing can cancel a pulse already handed over. Lock held.
+#define KLOVRP_HAP_VIB_CHUNK 0.1f
+static float klovrp_hap_take_level(struct klovrp_haptics *h, double now, float *amp) {
+    if (h->vib_amp <= 0.0f) return 0.0f;
+    if (now >= h->vib_until) { h->vib_amp = 0.0f; return 0.0f; }
+    double owed = now - h->vib_pub;
+    if (owed < KLOVRP_HAP_VIB_CHUNK) return 0.0f;
+    float span = (float)owed;
+    if (span > KLOVRP_HAP_MAX_S) span = KLOVRP_HAP_MAX_S;
+    h->vib_pub += span;
+    *amp = h->vib_amp;
+    return span;
+}
+
+int kl_ovrp_haptics_pull(int hand, float *amplitude, float *seconds) {
+    if ((unsigned)hand > 1) return 0;
+    struct klovrp_haptics *h = &g_hap[hand];
+    double now = klovrp_mono();
+    pthread_mutex_lock(&h->mu);
+    klovrp_hap_drain(h, now);
+    float amp = 0, span = klovrp_hap_take_buffered(h, &amp);
+    if (span <= 0.0f) {
+        // Only when the buffered path has nothing. The two are alternatives,
+        // not a mix: they are different APIs describing the same actuator, and
+        // in any frame where both had something to say the sample stream is the
+        // one that knows the shape of the effect. Nothing observed so far uses
+        // both at once — the vibration calls this title makes are all stops.
+        span = klovrp_hap_take_level(h, now, &amp);
+    }
+    if (span > 0.0f && amp > 0.0f) h->pulses++;
+    pthread_mutex_unlock(&h->mu);
+    if (span <= 0.0f || amp <= 0.0f) return 0;
+    if (amplitude) *amplitude = amp;
+    if (seconds) *seconds = span;
+    if (klovrp_hap_trace())
+        fprintf(stderr, "  [ovrp] haptics: pull hand %d amp %.2f for %.0f ms\n",
+                hand, (double)amp, (double)span * 1000.0);
+    return 1;
 }
 
 // ovrpResult with a bool OUT-PARAM (OVRP_1_18_0), NOT the bare ovrpBool its
@@ -1667,6 +2004,12 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_SetupEyeTexture2", (void *)klovrp_SetupEyeTexture2},
     {"ovrp_Update2", (void *)klovrp_Update2},
     {"ovrp_GetControllerHapticsDesc", (void *)klovrp_GetControllerHapticsDesc_entry},
+    // M8 — haptics out. All three must be real together: the descriptor sizes
+    // the guest's buffer, the state paces it, and only then does it ever call
+    // the setter. See the block comment above klovrp_SetControllerHaptics.
+    {"ovrp_GetControllerHapticsState", (void *)klovrp_GetControllerHapticsState},
+    {"ovrp_SetControllerHaptics", (void *)klovrp_SetControllerHaptics},
+    {"ovrp_SetControllerVibration", (void *)klovrp_SetControllerVibration},
     {"ovrp_GetDepthCompositingSupported", (void *)klovrp_GetDepthCompositingSupported},
 };
 
@@ -1726,9 +2069,6 @@ static const char *const g_ovrp_result_ok[] = {
     "ovrp_Media_Initialize", "ovrp_Media_SetMrcAudioSampleRate",
     "ovrp_Media_SetMrcInputVideoBufferType", "ovrp_Media_GetMrcInputVideoBufferType",
     "ovrp_Media_SetMrcActivationMode",
-    // 8-byte state struct home in x0; zero = no haptic samples queued or
-    // playing, which is true.
-    "ovrp_GetControllerHapticsState",
 };
 
 static const char *const g_ovrp_bool_yes[] = {
@@ -1760,8 +2100,6 @@ static const char *const g_ovrp_bool_yes[] = {
     // Setup calls whose return the guest ignores (0x9bba0c, 0x9bcd5c); 1 for
     // consistency with the other "it worked" answers.
     "ovrp_SetupDistortionWindow3", "ovrp_SetupDisplayObjects",
-    // Haptics commands we accept and drop — no haptics backend yet (M8).
-    "ovrp_SetControllerHaptics", "ovrp_SetControllerVibration",
 };
 
 static const char *const g_ovrp_bool_no[] = {
@@ -1832,6 +2170,24 @@ void kl_ovrp_report(FILE *f) {
     for (unsigned i = 0; i < g_novrp; i++) if (g_ovrp[i].calls) called++;
     fprintf(f, "\n=== OVRPlugin surface (M6 work list) ===\n");
     fprintf(f, "  resolved: %u, of which called: %u\n", g_novrp, called);
+    // Haptics, both halves in one line per hand: what the guest queued and what
+    // a frontend took. Pushes with no pulses is a headless or hand-tracked run
+    // and is fine; ZERO pushes on a run that cut notes means the guest never
+    // got past the descriptor, which is the failure this line exists to name.
+    for (int hand = 0; hand < 2; hand++) {
+        pthread_mutex_lock(&g_hap[hand].mu);
+        uint64_t pushes = g_hap[hand].pushes, samples = g_hap[hand].samples;
+        uint64_t pulses = g_hap[hand].pulses;
+        float hpeak = g_hap[hand].peak;
+        pthread_mutex_unlock(&g_hap[hand].mu);
+        if (!pushes && !pulses) continue;
+        fprintf(f, "  haptics %s: %llu buffer(s) / %llu samples queued "
+                   "(%.1f s at %d Hz), peak %.2f, %llu pulse(s) played\n",
+                hand ? "right" : "left",
+                (unsigned long long)pushes, (unsigned long long)samples,
+                (double)samples / KLOVRP_HAP_RATE, KLOVRP_HAP_RATE,
+                (double)hpeak, (unsigned long long)pulses);
+    }
     // The eye swapchain. Frames should be spread across the stages: all of them
     // on one stage means the guest is not cycling and the compositor is reading
     // the texture the guest is writing (see KLOVRP_STAGES_DEFAULT).

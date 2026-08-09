@@ -197,8 +197,10 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics
 	@echo "=== variadic ABI ===" && ./build/t_variadic
+	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
+	@head -3 build/haptics.log && tail -1 build/haptics.log
 	@echo "=== opus roundtrip ===" && ./build/t_opus $(LIBS)/libunityopus.so > build/opus.log && tail -3 build/opus.log
 	@echo "=== all guest libraries ===" && for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
 	  printf '%-24s' $$f; ./build/t_load $(LIBS)/$$f.so 2>/dev/null | grep -E '^  imports:'; done
@@ -454,6 +456,18 @@ build/t_reproject: tests/t_reproject.m runtime/kl_reproject.c runtime/kl_reproje
 .PHONY: reproject
 reproject: build/t_reproject
 	@./build/t_reproject
+
+# M8 — the haptics seam's model, with no guest and no headset: the three
+# OVRPlugin entry points AS THE GUEST RESOLVES THEM (through kl_ovrp_sym, so
+# the struct returns go through the real sret thunk), the queue behind them,
+# and the pulses a frontend pulls. Fast and deterministic; part of `check`.
+build/t_haptics: tests/t_haptics.c $(RUNTIME) runtime/kl_ovrp.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Iruntime -o $@ tests/t_haptics.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: haptics
+haptics: build/t_haptics
+	@./build/t_haptics
 
 # A *vendored debug build* of ANGLE lives in vendor/ (gitignored) — the Metal
 # backend can be stepped into, which is what the AGX-abort investigation needs

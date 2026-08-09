@@ -23,6 +23,14 @@ func klEnvOn(_ name: String, default dflt: Bool) -> Bool {
     return !["", "0", "no", "off", "false"].contains(v.lowercased())
 }
 
+/// The same for a scalar — `kl_env_float()`'s twin. An unparseable value falls
+/// back to the default rather than to zero: a typo in a gain knob that silently
+/// means "off" is the kind of thing that gets diagnosed as broken hardware.
+func klEnvFloat(_ name: String, _ dflt: Float) -> Float {
+    guard let v = ProcessInfo.processInfo.environment[name], let f = Float(v) else { return dflt }
+    return f
+}
+
 enum Immersive {
     static let id = "KleptonImmersive"
     // Default ON. Klepton runs a VR title, so the immersive space is the app —

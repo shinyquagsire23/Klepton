@@ -100,6 +100,33 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
                                   float stick_x, float stick_y);
 
 // ---------------------------------------------------------------------------
+// M8 — haptics: the one seam that runs OUT of the guest
+//
+// Everything above is the frontend answering questions. This is the guest
+// giving an order: it queues an amplitude envelope through OVRPlugin's buffered
+// haptics API (320 Hz, one byte a sample — kl_ovrp.c documents the whole
+// contract and why every field of the descriptor is load-bearing), and a
+// frontend that has something to vibrate drains it here.
+//
+// **Call this once per hand per frame.** It returns 1 when there is a pulse to
+// play, filling `amplitude` (0..1, the PEAK across the span) and `seconds`
+// (how long that span covers, 32 ms..0.5 s). It returns 0 far more often than
+// not — when nothing is queued, and also while a clip is still being fed and
+// the span so far is too short to be worth starting an engine for. Neither is
+// an error and neither loses anything: the queue runs ~60 ms ahead of what the
+// hand feels, and the tail of a clip is flushed by the first call that sees no
+// new samples.
+//
+// It is a DRAIN, not a query — what it returns is handed out once. Two callers
+// would each get half a pulse.
+//
+// Frequency is deliberately not part of this seam. OVRPlugin's is a selector
+// between two fixed Touch motor rates, and the second axis a Sense controller
+// actually has is CoreHaptics sharpness, which is a different quantity; there
+// is no measurement here that would justify mapping one onto the other.
+int kl_ovrp_haptics_pull(int hand, float *amplitude, float *seconds);
+
+// ---------------------------------------------------------------------------
 // Timewarp bookkeeping — PLANNING §12.1(3)
 //
 // Reprojection needs exactly one thing the compositor cannot work out for

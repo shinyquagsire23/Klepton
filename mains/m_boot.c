@@ -309,6 +309,7 @@ static int recon_run(int view_pump) {
                     (unsigned)strtoul(senv, NULL, 10), meta);
             }
             const long frame_ns = 1000000000L / 72;
+            unsigned haptic_pulses = 0;
             unsigned i;
             for (i = 0; fn && (view_pump ? !g_view_quit : i < frames); i++) {
                 struct timespec t0;
@@ -333,6 +334,17 @@ static int recon_run(int view_pump) {
                 ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2);
                 kl_jni_local_frame_pop();
                 kl_jni_drain_ui_tasks();
+                // The haptics seam's host end. Nothing on macOS can vibrate, so
+                // this only drains and counts — but draining is the point: it
+                // is what makes the host a working A/B for the whole path down
+                // to the actuator, and KL_HAPTICS_TRACE=1 then prints the same
+                // pulses a headset would have played. (The queue does not need
+                // it to stay healthy; it retires samples on the wall clock
+                // whether anyone is listening or not.)
+                for (int hand = 0; hand < 2; hand++) {
+                    float amp, secs;
+                    if (kl_ovrp_haptics_pull(hand, &amp, &secs)) haptic_pulses++;
+                }
                 // KL_PROBE_INPUT: ask Unity's own managed API what it sees —
                 // joystick count, the bound axes, the XR node poses. Between
                 // frames on the thread that just ran one, which is where
@@ -352,6 +364,9 @@ static int recon_run(int view_pump) {
             alarm(0);
             if (sampling) kl_sample_stop_report(stdout);
             printf("  pumped %u frames\n", i);
+            if (haptic_pulses)
+                printf("  haptic pulses drained: %u (nothing to play them on "
+                       "here — see kl_ovrp.h)\n", haptic_pulses);
             // P5.3's gate. Not "did the interop bind" — that is reported when it
             // happens — but "did the guest's rendering arrive in the MTLTexture".
             // The lit count uses the same luma threshold as kl_glfb's capture, so

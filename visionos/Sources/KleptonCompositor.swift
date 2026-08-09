@@ -423,6 +423,12 @@ final class KleptonCompositor {
             if let a = hands.rightHand, a.isTracked { right = a }
         }
         controllers.update(leftHand: left, rightHand: right, at: presentationTime)
+        // ...and the same seam in the other direction: whatever the guest
+        // queued for the controllers to play. Here rather than inside `update`
+        // because it has nothing to do with the anchors that call takes — it is
+        // output, and the only thing it shares with the input half is being
+        // once a frame.
+        controllers.pumpHaptics()
     }
 
     // MARK: - Setup

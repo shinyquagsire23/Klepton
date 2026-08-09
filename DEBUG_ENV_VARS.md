@@ -431,6 +431,32 @@ puts the camera on the ground with its hands underneath it.
   compositor's priming pass measures and logs both either way). A free A/B if
   the real numbers send Unity somewhere unexpected.
 
+### Haptics (`runtime/kl_ovrp.c` — the seam that runs OUT of the guest)
+
+The guest queues an amplitude envelope through OVRPlugin's buffered haptics API
+(320 Hz, one byte a sample); `kl_ovrp_haptics_pull` hands it to whatever the
+frontend has. Platform-independent — the visionOS playback knobs are in the
+visionOS section.
+
+- `KL_HAPTICS_TRACE=1` — both halves of the conversation: every buffer the
+  guest queues (and its first sample), every pulse pulled, and every *edge* of
+  the legacy vibration API. Edges only for that last one on purpose — this
+  title calls `ovrp_SetControllerVibration(mask, 0, 0)` on both hands every
+  single frame as an idle "nothing should be buzzing", and tracing those would
+  bury everything else.
+- `KL_HAPTICS_SWAP_STATE=1` — swap the two words of `ovrpHapticsState`
+  (`SamplesAvailable` / `SamplesQueued`). The A/B for the one ABI claim in this
+  subsystem that fails **silently**: get the order backwards and the guest
+  computes "no room" forever and queues nothing, which is indistinguishable
+  from a title that simply has no haptics. If `KL_HAPTICS_TRACE` shows state
+  queries but never a buffer, try this. (The descriptor's field order fails
+  loudly instead — the buffers that do arrive would carry a `SamplesCount` of 1
+  or 256 rather than the 20 it paces to.)
+- `KL_HAPTICS_VIB_LAPSE=<seconds>` — how long an un-refreshed
+  `ovrp_SetControllerVibration` level runs before it lapses, default 2 (the
+  real API's own ceiling is about that). It matters more here than there: a
+  frontend that has already been handed a pulse cannot be told to stop.
+
 ## Reprojection (`runtime/kl_reproject.c`)
 
 The composite/timewarp pass — one file, compiled by both compositors
@@ -680,6 +706,18 @@ except its own control vars (next section). See PLANNING §12.
   during bring-up: one line every 2 s per hand — closest pinch reached, axis
   value produced, frames asserted, or `no skeleton`. Those four distinguish
   the four ways "the trigger does not click" can be true.
+- `KL_HAPTICS_OFF=1` — do not play the guest's haptics. The pull still runs
+  (nothing backs up either way — the queue retires on the clock), so this is
+  purely "is the buzzing the guest's, or ours". Playback is CoreHaptics on a
+  `GCDeviceHaptics` engine per hand; **hands cannot be vibrated**, so a
+  hand-tracked run drains the queue and drops it.
+- `KL_HAPTICS_GAIN=<0..1>` — scales every pulse's intensity. Default **0.25**,
+  which is ALVR's own PSVR2 scale (it uses 0.7 for everything else): the Sense
+  actuators are strong enough that a guest amplitude of 1.0 played at full
+  intensity is not what the guest meant by it.
+- `KL_HAPTICS_SHARPNESS=<0..1>` — CoreHaptics's second axis, which OVRPlugin
+  has no equivalent of (kl_ovrp.h says why frequency is not in the seam).
+  Default 1.0, ALVR's constant: crisp, which is what a note cut is.
 - `KL_CP_PROBE=<n>` — bisection ladder for a dark compositor: 1 = clear only
   (colour cycles R/G/B so a constant field cannot be misread), 2 = flat
   magenta quad (geometry only), 3 = sampled with alpha forced to 1, 4 =
