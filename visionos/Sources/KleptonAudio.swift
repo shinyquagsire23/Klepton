@@ -52,6 +52,9 @@ enum KleptonAudio {
             try session.setPreferredSampleRate(48000)
             try session.setPreferredIOBufferDuration(0.010)
             try session.setActive(true)
+            // After activation, which is the order ALVR uses and the order the
+            // session's own routing decisions are made in.
+            try Self.directStereo(session)
         } catch {
             NSLog("[au] AVAudioSession setup failed: \(error) — expect silence")
         }
@@ -100,9 +103,53 @@ enum KleptonAudio {
             NSLog("[au] media services were reset — reconfiguring from scratch")
             try? session.setCategory(.playback, mode: .default)
             try? session.setActive(true)
+            // A reset invalidates every audio object in the process, and the
+            // spatial experience is one of them — without this the sound comes
+            // back correct in every respect except where it is.
+            try? Self.directStereo(session)
             kl_audio_session_ready(session.sampleRate)
             _ = kl_audio_restart()
         }
+    }
+
+    /// Take the system's spatial audio out of the path: two channels, played
+    /// where the guest mixed them.
+    ///
+    /// **This is why the sound followed the window.** visionOS spatialises app
+    /// audio by default, and the sound stage it spatialises *into* is anchored
+    /// to the app's scene — so a stereo mix that the guest has already panned
+    /// for a head-mounted listener gets panned a second time, towards a window,
+    /// by a system that has no idea where anything in the guest's world is. It
+    /// is not a mixing bug and no gain change fixes it; the whole scene simply
+    /// sits wherever the window is.
+    ///
+    /// `.bypassed` is the escape hatch, and it is the same one ALVR uses
+    /// (`EventHandler.fixAudioForDirectStereo`) for the same reason: the audio
+    /// arrives already spatialised by something that knows the scene, so the
+    /// only correct thing the OS can do with it is play it. Beat Saber's FMOD
+    /// mix is exactly that — `kl_opensl.c` hands us a finished stereo buffer.
+    ///
+    /// `setPreferredOutputNumberOfChannels(2)` goes with it: bypassing the
+    /// spatialiser on a route that has offered more than two channels would
+    /// otherwise leave the mix to be spread across them by whatever downmix
+    /// happens to be in the way.
+    ///
+    /// ALVR's other two calls are deliberately NOT imported. It takes
+    /// `.playAndRecord` and `.voiceChat` because it needs the microphone for
+    /// SteamVR; we do not, and `.playAndRecord` would hand the ringer switch a
+    /// veto over the music this app exists to play.
+    ///
+    /// `KL_AUDIO_SPATIAL=1` leaves the system's spatialiser in, which is the
+    /// A/B if the sound is ever wrong in a way that is not "in the wrong
+    /// place".
+    private static func directStereo(_ session: AVAudioSession) throws {
+        guard ProcessInfo.processInfo.environment["KL_AUDIO_SPATIAL"] != "1" else {
+            NSLog("[au] KL_AUDIO_SPATIAL=1 — leaving the system spatialiser in the path")
+            return
+        }
+        try session.setPreferredOutputNumberOfChannels(2)
+        try session.setIntendedSpatialExperience(.bypassed)
+        NSLog("[au] direct stereo: system spatialisation bypassed, 2 ch preferred")
     }
 
     private static func observe(_ name: Notification.Name,

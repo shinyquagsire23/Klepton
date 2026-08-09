@@ -16,6 +16,7 @@
 #include "kl_egl.h"
 #include "kl_opensl.h"
 #include "kl_ovrp.h"      // kl_ovrp_frame_latch — one pose per guest frame
+#include "kl_env.h"
 
 static char g_libdir[1024];
 static char g_assets[1024];
@@ -269,8 +270,8 @@ int kl_app_boot(void) {
     // Strict: an unimplemented *call* is fatal, so the run stops exactly where
     // the surface genuinely ends. Lookups are not — the guest resolves plenty
     // it never calls.
-    kl_jni_set_permissive(getenv("KL_PERMISSIVE") != NULL);
-    kl_egl_dump_textures(getenv("KL_DUMP_TEXTURES"));
+    kl_jni_set_permissive(kl_env_on("KL_PERMISSIVE", 0));
+    kl_egl_dump_textures(kl_env_str("KL_DUMP_TEXTURES", NULL));
 
     printf("=== Klepton on visionOS — P4 ===\n");
     printf("  libraries : %s\n", g_libdir);
@@ -409,8 +410,7 @@ int kl_app_lifecycle_begin(void) {
     g_phase = "proc";
     report_proc();
 
-    const char *aenv = getenv("KL_ALARM");
-    unsigned alarm_secs = aenv ? (unsigned)strtoul(aenv, NULL, 10) : 120;
+    unsigned alarm_secs = kl_env_int("KL_ALARM", 120);
     g_alarm_secs = alarm_secs;
 
     // The order UnityPlayerActivity drives, exactly as t_boot's recon does:
@@ -616,8 +616,7 @@ int kl_app_guest_start(void) {
         pthread_mutex_unlock(&g_guest.mu);
         return fail("kl_app_guest_start was already run in this process");
     }
-    const char *f = getenv("KL_FRAMES");
-    g_guest.limit = f ? (unsigned)strtoul(f, NULL, 10) : 0;
+    g_guest.limit = kl_env_uint("KL_FRAMES", 0);
     g_guest.running = 1;
     g_guest.state = 0;
     pthread_mutex_unlock(&g_guest.mu);

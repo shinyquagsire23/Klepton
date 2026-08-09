@@ -9,7 +9,16 @@
 //
 //    * **PSVR2 Sense controllers**, when paired. Poses come from ARKit's
 //      `AccessoryTrackingProvider`, buttons from GameController. This is the
-//      real answer — it is the only source that has buttons at all.
+//      real answer — it is the only source that has buttons at all, the only
+//      one whose pose the platform publishes as a proper `.grip`, and the only
+//      one that reports velocity.
+//
+//  **Every pose here is predicted to the frame's presentation time**, the same
+//  instant `queryDeviceAnchor(atTimestamp:)` gives the head. Reading the last
+//  anchor an async stream delivered instead — which is what this did — caps the
+//  controllers at the tracker's delivery rate rather than the display's, and a
+//  pose repeated across three frames of a 90 Hz picture does not read as
+//  latency, it reads as the hands running at 30 Hz.
 //    * **Hands**, always. `HandTrackingProvider`'s skeleton supplies the grip
 //      pose (the middle-finger metacarpal, so a hilt is gripped rather than
 //      swinging off the wrist), and the index trigger comes from the system's
@@ -46,6 +55,13 @@ struct KleptonHandState {
     var indexTrigger: Float = 0
     var handTrigger: Float = 0
     var stick: SIMD2<Float> = .zero
+    /// Tracking-space linear (m/s) and angular (rad/s) velocity, for the
+    /// ovrpPoseStatef fields libunity forwards to `XRNodeState.velocity`.
+    /// Only the Sense controllers report these — a `HandAnchor` carries no
+    /// motion at all, and differentiating a pose stream to invent one produces
+    /// a number that looks physical and is mostly tracker noise.
+    var linearVelocity: SIMD3<Float> = .zero
+    var angularVelocity: SIMD3<Float> = .zero
     /// Whether a Sense controller supplied this, as opposed to a hand anchor.
     /// Only a Sense controller can press anything, so this is also "are the
     /// buttons meaningful".
@@ -148,9 +164,18 @@ private let klGripFromWrist: [simd_quatf] = {
 }()
 
 /// `KL_HAND_ROT="x,y,z"` (degrees) and `KL_HAND_POS="x,y,z"` (metres): a further
-/// rotation and offset in the *grip's own* frame, applied to every hand pose
+/// rotation and offset in the *grip's own* frame, applied to every **hand** pose
 /// after the correction above. `KL_HAND_ROT_L` / `KL_HAND_ROT_R` (and the `POS`
 /// pair) override it for one hand.
+///
+/// **Hands only.** This used to be applied to the Sense controllers' poses as
+/// well, and that was wrong in a way that is easy to miss: the default offset
+/// below is a *hand* correction — the metacarpal midpoint is not where a
+/// controller's tracked origin sits — while `AccessoryAnchor`'s `.grip` already
+/// **is** "where the hand holds this", published by the platform. Sharing the
+/// knob therefore pushed every Sense pose 4 cm down its own hilt for a reason
+/// that does not apply to it, and made the two paths impossible to tune
+/// independently. The Sense path has `KL_SENSE_ROT` / `KL_SENSE_POS`.
 ///
 /// Per-hand, because the errors that are left are not guaranteed to be
 /// symmetric — the shared correction above is a claim about a convention, and
@@ -178,36 +203,127 @@ private struct KLHandTune {
 
     private static func make(_ hand: Int) -> KLHandTune {
         var t = KLHandTune()
-        let env = ProcessInfo.processInfo.environment
-        let suffix = hand == 0 ? "_L" : "_R"
-        // The per-hand key wins where it is set; the shared one is the default.
-        func triple(_ key: String) -> (SIMD3<Float>, String)? {
-            for k in [key + suffix, key] {
-                guard let s = env[k] else { continue }
-                let f = s.split(separator: ",")
-                    .compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
-                guard f.count == 3 else {
-                    NSLog("[cp] \(k)=\(s) is not three comma-separated numbers — ignored")
-                    continue
-                }
-                return (SIMD3<Float>(f[0], f[1], f[2]), k)
-            }
-            return nil
-        }
-        if let (d, k) = triple("KL_HAND_ROT") {
-            let r = d * .pi / 180
-            // X then Y then Z, in the grip's own frame.
-            t.rot = simd_quatf(angle: r.x, axis: [1, 0, 0])
-                  * simd_quatf(angle: r.y, axis: [0, 1, 0])
-                  * simd_quatf(angle: r.z, axis: [0, 0, 1])
+        if let (d, k) = klEnvTriple("KL_HAND_ROT", hand) {
+            t.rot = klEulerXYZ(d)
             NSLog("[cp] \(k): hand \(hand) extra grip rotation \(d) degrees")
         }
-        if let (p, k) = triple("KL_HAND_POS") {
+        if let (p, k) = klEnvTriple("KL_HAND_POS", hand) {
             t.pos = p
             NSLog("[cp] \(k): hand \(hand) extra grip offset \(p) m")
         }
         return t
     }
+}
+
+/// `"x,y,z"` from `<key><_L|_R>` or `<key>`, whichever is set — the per-hand key
+/// wins. Shared by both tuning structs so a knob means the same thing on either
+/// path.
+private func klEnvTriple(_ key: String, _ hand: Int) -> (SIMD3<Float>, String)? {
+    let env = ProcessInfo.processInfo.environment
+    for k in [key + (hand == 0 ? "_L" : "_R"), key] {
+        guard let s = env[k] else { continue }
+        let f = s.split(separator: ",")
+            .compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+        guard f.count == 3 else {
+            NSLog("[cp] \(k)=\(s) is not three comma-separated numbers — ignored")
+            continue
+        }
+        return (SIMD3<Float>(f[0], f[1], f[2]), k)
+    }
+    return nil
+}
+
+/// Degrees to a quaternion, X then Y then Z in the frame being corrected.
+private func klEulerXYZ(_ degrees: SIMD3<Float>) -> simd_quatf {
+    let r = degrees * .pi / 180
+    return simd_quatf(angle: r.x, axis: [1, 0, 0])
+         * simd_quatf(angle: r.y, axis: [0, 1, 0])
+         * simd_quatf(angle: r.z, axis: [0, 0, 1])
+}
+
+/// The Sense controllers' own correction — `KL_SENSE_ROT` / `KL_SENSE_POS`, in
+/// the grip's frame, per hand with `_L`/`_R`.
+///
+/// Separate from `KLHandTune` because the two paths start from different
+/// places. `AccessoryAnchor`'s `.grip` is the platform's own answer to "where
+/// does a hand hold this and which way does it point", so it needs no
+/// hand-shaped compensation at all — what it needs is the gap between Apple's
+/// grip convention and the pose an *Oculus Touch* controller would have
+/// reported, which is the thing the guest is actually built against and which
+/// nothing on this platform can tell us.
+///
+/// Two of the three defaults are ALVR's, from `WorldTracker.swift`
+/// (`controllerToAlvrDeviceMotion`) — the same controller, the same anchor, the
+/// same OS:
+///
+///   * **5.037 degrees about X.** Not a guess: it is the tilt in SteamVR's own
+///     PSVR2 controller model JSON, i.e. the offset between the tracked frame
+///     and the handle a user perceives.
+///   * **(0.002, 0, -0.01) m**, the origin nudge ALVR applies with it.
+///
+/// The third is this guest's, and it is the larger one:
+///
+///   * **`hiltPitch`, -35 degrees about X.** Measured the only way it can be —
+///     by playing, and reading the number back off Beat Saber's own in-game
+///     controller adjustment, where 35 degrees on X is what put the hilts
+///     straight. It is a *convention* gap rather than a comfort angle: the
+///     platform's `.grip` is where the hand holds the controller, and what the
+///     guest is built against is the pose an Oculus Touch would have reported,
+///     which is not the same frame and cannot be derived from here.
+///
+///     **Negative**, because the first device run at +35 pitched the hilts
+///     backward — the game's adjustment is applied in Unity's left-handed
+///     frame and ours is not, so the magnitude carries over and the sign does
+///     not.
+///
+/// Which leaves the two constants pulling opposite ways, for -29.96 total. If
+/// the residual after a playtest looks like about five degrees *forward*, the
+/// likely reading is that ALVR's PSVR2 tilt wants this frame's sign too: that
+/// would make -40.04, and Beat Saber's own
+/// `OculusVRHelper.AdjustControllerTransform` pitches a Touch controller by 40
+/// degrees. `KL_SENSE_PITCH=-45.037` is that experiment in one run.
+private struct KLSenseTune {
+    /// ALVR's PSVR2 comfort tilt and this guest's hilt pitch, kept apart so the
+    /// log line and the source agree on where each degree came from.
+    static let psvr2Tilt: Float = 5.037
+    static let hiltPitch: Float =
+        ProcessInfo.processInfo.environment["KL_SENSE_PITCH"].flatMap { Float($0) } ?? -35
+
+    var rot = klEulerXYZ(SIMD3<Float>(psvr2Tilt + hiltPitch, 0, 0))
+    var pos = SIMD3<Float>(0.002, 0, -0.01)
+
+    static let shared: [KLSenseTune] = [make(0), make(1)]
+
+    private static func make(_ hand: Int) -> KLSenseTune {
+        var t = KLSenseTune()
+        if hand == 0 {
+            NSLog(String(format: "[cp] Sense grip pitch %.3f deg about X "
+                         + "(%.3f PSVR2 tilt + %.3f hilt; KL_SENSE_PITCH, "
+                         + "KL_SENSE_ROT override)",
+                         psvr2Tilt + hiltPitch, psvr2Tilt, hiltPitch))
+        }
+        if let (d, k) = klEnvTriple("KL_SENSE_ROT", hand) {
+            t.rot = klEulerXYZ(d)
+            NSLog("[cp] \(k): hand \(hand) Sense grip rotation \(d) degrees")
+        }
+        if let (p, k) = klEnvTriple("KL_SENSE_POS", hand) {
+            t.pos = p
+            NSLog("[cp] \(k): hand \(hand) Sense grip offset \(p) m")
+        }
+        return t
+    }
+
+    /// `KL_SENSE_VEL_FRAME=world` — treat `AccessoryAnchor.velocity` as already
+    /// being in tracking space instead of the accessory's own frame.
+    ///
+    /// The default follows ALVR, which rotates both velocities by the grip
+    /// orientation before using them, i.e. reads them as controller-local.
+    /// Apple documents neither frame, and the two differ only in *direction*
+    /// (the magnitude is the same either way), so this is the knob that settles
+    /// it on device: shake the controller along one axis and see which reading
+    /// stays pointed the way your hand went.
+    static let velocityIsLocal =
+        ProcessInfo.processInfo.environment["KL_SENSE_VEL_FRAME"] != "world"
 }
 
 final class KleptonControllers {
@@ -218,7 +334,28 @@ final class KleptonControllers {
     // stream, while buttons are polled synchronously on the render thread, so
     // the two halves genuinely do cross threads and the lock is not defensive.
     private let lock = NSLock()
-    private var accessoryPose: [Int: (SIMD3<Float>, simd_quatf)] = [:]
+
+    /// The most recent anchor per hand — **the object, not the pose it carried**.
+    ///
+    /// This used to be the resolved `(position, orientation)` pair, and that is
+    /// what capped the controllers at the anchor stream's own rate. The stream
+    /// is a *sensor* feed: it delivers when the tracker has something new, which
+    /// on this platform is far below display rate, so a render loop reading the
+    /// last delivered pose repeats each sample for several frames. Hands do not
+    /// hold still for two frames at a time, so what that looks like is not
+    /// smooth-but-late motion, it is a controller stepping — 30 Hz motion inside
+    /// a 90 Hz picture.
+    ///
+    /// Keeping the anchor keeps `AccessoryTrackingProvider.predictAnchor(for:at:)`
+    /// available, which is the platform's own extrapolator: ask it for the
+    /// frame's *presentation* time and every frame gets its own pose, forward to
+    /// where the controller will be when the light reaches the eye. That is the
+    /// same thing `queryDeviceAnchor(atTimestamp:)` already does for the head —
+    /// the controllers were simply never given the equivalent.
+    private var accessoryAnchor: [Int: AccessoryAnchor] = [:]
+    /// Held so the render thread can predict against it. `makeAccessoryProvider`
+    /// is the only writer, and it runs before the session that feeds it.
+    private var accessoryProvider: AccessoryTrackingProvider?
 
     private(set) var senseConnected = false
     private var tracked: [GCController] = []
@@ -270,14 +407,22 @@ final class KleptonControllers {
         }
         senseConnected = !accessories.isEmpty
         NSLog("[cp] spatial controllers: \(accessories.map { $0.name })")
-        return AccessoryTrackingProvider(accessories: accessories)
+        let p = AccessoryTrackingProvider(accessories: accessories)
+        lock.lock(); accessoryProvider = p; lock.unlock()
+        return p
     }
 
     /// Drop the pose for any hand whose controller has gone away, so a
     /// disconnect cannot leave the guest holding the last pose forever. The
     /// hand-tracking fallback takes over on the next frame.
     func forgetAccessoryPoses() {
-        lock.lock(); accessoryPose.removeAll(); lock.unlock()
+        lock.lock()
+        accessoryAnchor.removeAll()
+        // The provider goes too: predicting against a provider whose session is
+        // being torn down and rebuilt is the one way a stale anchor could still
+        // produce a fresh-looking pose after the controller is gone.
+        accessoryProvider = nil
+        lock.unlock()
         for i in 0...1 {
             lock.lock(); state[i] = KleptonHandState(); lock.unlock()
         }
@@ -299,44 +444,74 @@ final class KleptonControllers {
             case .right: hand = 1
             default:     hand = 1
             }
-            // The anchor's OWN transform is the accessory's base — the middle
-            // of the plastic — and pointing a laser out of that is the same
-            // class of bug as pointing it out of the wrist. `.grip` is the
-            // location the platform defines for "where a hand holds this", in
-            // the convention the guest already wants, so no correction follows
-            // it (ALVR applies none either; only a 5-degree PSVR2 comfort tilt,
-            // which is what KL_HAND_ROT is for). A controller that does not
-            // publish a grip — a stylus — falls back to its base.
-            let m = anchor.accessory.locations.contains(.grip)
-                ? anchor.coordinateSpace(for: .grip, correction: .rendered)
-                        .ancestorFromSpaceTransformFloat().matrix
-                : anchor.originFromAnchorTransform
+            // The anchor itself is stored, not the pose read off it: the pose
+            // this frame wants is the *predicted* one, and only the anchor can
+            // be predicted. See `accessoryAnchor` and `sensePose`.
+            //
             // Through a non-async helper: taking a lock directly inside an
             // async function is an error in Swift 6 mode, and the fix is not to
             // suppress it — the critical section genuinely must not span a
             // suspension point, and pushing it into a synchronous function is
             // what guarantees that.
-            store(hand: hand, removed: update.event == .removed, transform: m)
+            store(hand: hand, removed: update.event == .removed, anchor: anchor)
         }
     }
 
-    private func store(hand: Int, removed: Bool, transform m: simd_float4x4) {
+    private func store(hand: Int, removed: Bool, anchor: AccessoryAnchor) {
         lock.lock()
         defer { lock.unlock() }
-        accessoryPose[hand] = removed ? nil
-            : KleptonControllers.tuned(SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z),
-                                       simd_quatf(m), hand: hand)
+        accessoryAnchor[hand] = removed ? nil : anchor
+    }
+
+    /// This hand's Sense controller, predicted to `time` and corrected: grip
+    /// pose plus the motion that goes with it, all in tracking space.
+    ///
+    /// `time` is a `CACurrentMediaTime()`-domain instant — the frame's
+    /// presentation time, the same one `queryDeviceAnchor(atTimestamp:)` gets
+    /// for the head, so the hands and the head describe one instant rather than
+    /// two. Falling back to the raw anchor if prediction refuses keeps a
+    /// controller that has just appeared (or one the tracker has lost) visible
+    /// instead of snapping it to the synthetic head-relative pose.
+    private func sensePose(hand: Int, at time: TimeInterval)
+        -> (SIMD3<Float>, simd_quatf, SIMD3<Float>, SIMD3<Float>)? {
+        lock.lock()
+        let stored = accessoryAnchor[hand]
+        let provider = accessoryProvider
+        lock.unlock()
+        guard let stored, let provider else { return nil }
+        let a = provider.predictAnchor(for: stored, at: time) ?? stored
+
+        // `.grip` is the location the platform defines for "where a hand holds
+        // this" — the anchor's own transform is the middle of the plastic, and
+        // pointing a saber out of that is the same class of bug as pointing one
+        // out of the wrist. A controller that publishes no grip (a stylus)
+        // falls back to its base.
+        let m = a.accessory.locations.contains(.grip)
+            ? a.coordinateSpace(for: .grip, correction: .rendered)
+                .ancestorFromSpaceTransformFloat().matrix
+            : a.originFromAnchorTransform
+        let raw = simd_quatf(m)
+        let t = KLSenseTune.shared[hand]
+        let q = simd_normalize(raw * t.rot)
+        let p = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z) + raw.act(t.pos)
+
+        // Motion, rotated out of the accessory's own frame if that is what it
+        // is in — by the UNCORRECTED orientation, because the correction above
+        // is a change of convention applied to the pose we report, not a claim
+        // about the frame the tracker measured in.
+        var v = a.velocity, w = a.angularVelocity
+        if KLSenseTune.velocityIsLocal { v = raw.act(v); w = raw.act(w) }
+        return (p, q, v, w)
     }
 
     /// Apply the KL_HAND_ROT / KL_HAND_POS tuning, in the grip's own frame.
-    /// The one place both pose sources pass through, so a tuned angle means the
-    /// same thing whether it came from a Sense controller or a hand.
     private static func tuned(_ p: SIMD3<Float>, _ q: simd_quatf,
                               hand: Int) -> (SIMD3<Float>, simd_quatf) {
         let t = KLHandTune.shared[hand]
         let q2 = q * t.rot
         return (p + q2.act(t.pos), q2)
     }
+
 
     /// The hand's **anatomical** frame, built out of joint positions rather than
     /// out of anyone's frame convention — OpenXR's grip basis, by its own
@@ -513,6 +688,10 @@ final class KleptonControllers {
             state[i].buttons = 0; state[i].touches = 0
             state[i].indexTrigger = 0; state[i].handTrigger = 0
             state[i].stick = .zero; state[i].fromController = false
+            // Only the Sense path writes these, and it rewrites them below;
+            // a hand that falls back must report no motion rather than the
+            // motion its controller had before it was put down.
+            state[i].linearVelocity = .zero; state[i].angularVelocity = .zero
         }
         lock.unlock()
 
@@ -580,8 +759,9 @@ final class KleptonControllers {
             st.buttons = bits
             st.touches = touch | bits
 
+            // Buttons only. The pose is resolved in update(), where the frame's
+            // presentation time is known and the anchor can be predicted to it.
             lock.lock()
-            if let p = accessoryPose[hand] { st.position = p.0; st.orientation = p.1 }
             state[hand] = st
             lock.unlock()
         }
@@ -778,17 +958,23 @@ final class KleptonControllers {
     ///
     /// The hand anchors are the fallback: used for a hand's *pose* and its
     /// pinch trigger, and only where a Sense controller has not supplied one.
-    func update(leftHand: HandAnchor?, rightHand: HandAnchor?) {
+    ///
+    /// `presentationTime` is when the frame being built will be shown. Every
+    /// pose here is predicted to it, so the controllers move at display rate
+    /// and describe the same instant the head pose does.
+    func update(leftHand: HandAnchor?, rightHand: HandAnchor?,
+                at presentationTime: TimeInterval) {
         pollButtons()
 
         for hand in 0...1 {
             lock.lock()
             var st = state[hand]
-            let accPose = accessoryPose[hand]
             lock.unlock()
 
+            let accPose = sensePose(hand: hand, at: presentationTime)
             if let accPose {
                 st.position = accPose.0; st.orientation = accPose.1
+                st.linearVelocity = accPose.2; st.angularVelocity = accPose.3
             } else if let anchor = (hand == 0 ? leftHand : rightHand) {
                 let (p, q) = gripPose(anchor, hand: hand)
                 st.position = p; st.orientation = q
@@ -843,8 +1029,12 @@ final class KleptonControllers {
             }
 
             if let p = st.position, let q = st.orientation {
-                kl_ovrp_set_hand_pose(Int32(hand), p.x, p.y, p.z,
-                                      q.imag.x, q.imag.y, q.imag.z, q.real)
+                kl_ovrp_set_hand_motion(Int32(hand), p.x, p.y, p.z,
+                                        q.imag.x, q.imag.y, q.imag.z, q.real,
+                                        st.linearVelocity.x, st.linearVelocity.y,
+                                        st.linearVelocity.z,
+                                        st.angularVelocity.x, st.angularVelocity.y,
+                                        st.angularVelocity.z)
             }
             kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
                                          st.indexTrigger, st.handTrigger,

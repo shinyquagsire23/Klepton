@@ -76,6 +76,25 @@ void kl_ovrp_frame_latch(void);
 // bits); triggers are 0..1, thumbstick -1..1 on both axes.
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
+
+// ...and the same pose WITH its motion. ovrpPoseStatef carries velocity and
+// angular velocity beside the pose (kl_ovrp.c documents the layout), libunity
+// copies both into the XR node state, and Unity hands them to managed code as
+// `XRNodeState.velocity` / `angularVelocity` and `OVRInput.GetLocalController-
+// Velocity`. Leaving them zero is not neutral — it is the assertion that a
+// controller which is plainly moving is stationary, which is what anything
+// doing swing physics or velocity-predicted rendering believes.
+//
+// Both are in the SAME tracking space as the pose (world, not controller-local
+// — the frontend rotates them out of whatever frame its tracker used), linear
+// in m/s and angular in rad/s about the world axes, which is OVRPlugin's own
+// convention. `kl_ovrp_set_hand_pose` is this with zero motion, and the two
+// write through one seqlock update so a reader can never pair this frame's
+// pose with last frame's velocity.
+void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
+                             float qx, float qy, float qz, float qw,
+                             float vx, float vy, float vz,
+                             float avx, float avy, float avz);
 void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
                                   float index_trigger, float hand_trigger,
                                   float stick_x, float stick_y);

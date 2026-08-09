@@ -253,12 +253,6 @@ final class KleptonCompositor {
     private var reprojectFrames = 0
     private var worstDelta: Float = 0
 
-    // KL_OVRP_QUEST_FOV=1 keeps the synthetic symmetric 90° frustum and the
-    // Quest 2's 72 Hz instead of the display's own, which is the A/B if the
-    // real numbers turn out to send Unity somewhere unexpected. The priming
-    // pass still runs and still logs what it measured.
-    private let keepQuestDisplay = klEnvOn("KL_OVRP_QUEST_FOV", default: false)
-
     // KL_SYNC_GUEST=1 restores P5b's shape: kl_app_frame() called inline on
     // this thread, inside the submission window. That is the clock P5.4's
     // device numbers were measured against, so it stays reachable — and it is
@@ -414,13 +408,21 @@ final class KleptonCompositor {
         // from the hand skeleton (the metacarpal a fist closes around) and so
         // is the pinch trigger, and neither is recoverable from the anchor
         // origin alone.
+        //
+        // Predicted to the presentation time, like the head above and like the
+        // Sense controllers inside `update`. `latestAnchors` is the last sample
+        // the tracker delivered, which arrives well below display rate — so a
+        // 90 Hz render loop reading it draws the same hand pose for two or
+        // three frames running, and hands do not hold still that long. That
+        // reads as the hands running at a third of the frame rate, which is
+        // exactly what it is.
         var left: HandAnchor?, right: HandAnchor?
         if HandTrackingProvider.isSupported {
-            let hands = handTracking.latestAnchors
+            let hands = handTracking.handAnchors(at: presentationTime)
             if let a = hands.leftHand,  a.isTracked { left  = a }
             if let a = hands.rightHand, a.isTracked { right = a }
         }
-        controllers.update(leftHand: left, rightHand: right)
+        controllers.update(leftHand: left, rightHand: right, at: presentationTime)
     }
 
     // MARK: - Setup
@@ -621,30 +623,6 @@ final class KleptonCompositor {
             // shaderRead because this file's composite pass samples it back.
             desc.usage = [.renderTarget, .shaderRead]
             desc.storageMode = .private
-
-            // --- On framebuffer compression, and why it does not help here ---
-            //
-            // We already get it: `allowGPUOptimizedContents` defaults to true
-            // and we never opt out, so these render targets are losslessly
-            // compressed. Metal's own documentation is explicit that this buys
-            // nothing in footprint — "Losslessly compressed textures may benefit
-            // from reduced bandwidth usage ... but do not benefit from reduced
-            // storage requirements." So the ~160 MB a stage costs is what an
-            // RGBA16F 2-slice array at map resolution costs, compressed or not.
-            //
-            // `compressionType = .lossy` is the one that does reduce storage,
-            // and this descriptor satisfies every constraint the header lists:
-            // private storage, GPU-optimized contents allowed, 2D array, and a
-            // usage of renderTarget|shaderRead with no PixelFormatView,
-            // ShaderWrite or ShaderAtomic. Two things are still unknown and
-            // neither can be looked up — whether this GPU supports lossy for
-            // rgba16Float (the header says to verify per format and exposes no
-            // query for it), and whether ANGLE's EGL_ANGLE_metal_texture_client_
-            // buffer import tolerates a lossy texture the guest then renders
-            // into through GL. So it is opt-in, and `allocatedSize` below is
-            // what says whether it did anything: if the number does not fall,
-            // the request was ignored and the risk was taken for nothing.
-            if klEnvOn("KL_CP_LOSSY", default: false) { desc.compressionType = .lossy }
 
             guard let t = device.makeTexture(descriptor: desc) else {
                 NSLog("[cp] could not allocate eye \(eye) stage \(stage) \(w)x\(h)")
@@ -1507,9 +1485,6 @@ final class KleptonCompositor {
     /// frame, and again each frame because it costs two stores and the user can
     /// change the fit of the headset mid-run.
     ///
-    /// Not gated on `keepQuestDisplay`: that knob keeps the synthetic *frustum*
-    /// and frame rate, and an eye separation is neither. Use KL_OVRP_IPD to
-    /// override this one.
     private func pushEyeOffsets(_ drawable: LayerRenderer.Drawable) {
         for (i, view) in drawable.views.enumerated() where i < 2 {
             let t = view.transform.columns.3
@@ -1630,7 +1605,7 @@ final class KleptonCompositor {
                                  + "(%.1f x %.1f degrees)", i, t.x, t.y, t.z, t.w,
                          (atan(t.x) + atan(t.y)) * 180 / .pi,
                          (atan(t.z) + atan(t.w)) * 180 / .pi))
-            if !keepQuestDisplay { kl_ovrp_set_eye_frustum(Int32(i), t.x, t.y, t.z, t.w) }
+            kl_ovrp_set_eye_frustum(Int32(i), t.x, t.y, t.z, t.w)
         }
 
         // The frame interval, as the median of the gaps between successive
@@ -1641,10 +1616,9 @@ final class KleptonCompositor {
         if let mid = gaps.isEmpty ? nil : gaps[gaps.count / 2], mid > 0 {
             displayPeriod = mid          // what the cadence check measures against
             let hz = Float(1.0 / mid)
-            NSLog(String(format: "[cp] display %.2f Hz measured over %d frames%@",
-                         hz, gaps.count,
-                         keepQuestDisplay ? " (not pushed: KL_OVRP_QUEST_FOV)" : ""))
-            if !keepQuestDisplay { kl_ovrp_set_display_frequency(hz) }
+            NSLog(String(format: "[cp] display %.2f Hz measured over %d frames",
+                         hz, gaps.count))
+            kl_ovrp_set_display_frequency(hz)
         } else {
             NSLog("[cp] could not measure the display rate — the guest keeps "
                   + "\(kl_ovrp_display_frequency()) Hz")

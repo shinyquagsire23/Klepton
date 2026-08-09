@@ -519,6 +519,13 @@ reads no knobs). See PLANNING §12.18.
 - `KL_AUDIO_TRACE=1` — one line every 200 writes: input/output frame counts,
   ring fill in frames and ms, underruns. What to turn on when the sound is
   present but wrong.
+- `KL_AUDIO_SPATIAL=1` — visionOS only. Leave the system's spatialiser in the
+  path. The default is `setIntendedSpatialExperience(.bypassed)` plus two
+  preferred output channels (`KleptonAudio.directStereo`, imported from ALVR's
+  `fixAudioForDirectStereo`): the guest hands us a mix it has already panned
+  for a head-mounted listener, and visionOS otherwise pans it a second time
+  into a sound stage anchored to the app's scene — which is the sound following
+  the window. Turn this on only to A/B that.
 
 ## x18 (`runtime/kl_x18.c`)
 
@@ -635,6 +642,25 @@ except its own control vars (next section). See PLANNING §12.
   *half*-wrong basis needs.
 - `KL_HAND_POS="x,y,z"` — the same, in metres — slides the hilt along the
   grip's own axes. `KL_HAND_POS_L`/`_R` likewise.
+  **Both `KL_HAND_*` knobs are hand-tracking only**; they used to apply to the
+  Sense controllers too, which silently pushed every Sense pose 4 cm down its
+  own hilt for a reason that belongs to the metacarpal midpoint and not to a
+  pose the platform publishes. The Sense path has its own pair:
+- `KL_SENSE_ROT="x,y,z"` / `KL_SENSE_POS="x,y,z"` — degrees and metres, in the
+  grip's frame, applied to `AccessoryAnchor`'s `.grip` pose. Replaces the
+  default outright. `_L`/`_R` per hand.
+- `KL_SENSE_PITCH=<deg>` — just the X term of that rotation, which is the one
+  that has ever needed changing. Default **-35**: the magnitude is Beat Saber's
+  own in-game controller adjustment, the sign is device-measured (+35 pitched
+  the hilts backward — the game applies its adjustment in Unity's left-handed
+  frame). It stacks with ALVR's +5.037° PSVR2 model tilt, so the default pair is
+  `-29.963,0,0` and `0.002,0,-0.01`. If a playtest leaves about five degrees
+  forward, try `KL_SENSE_PITCH=-45.037` (= -40.04 total, Beat Saber's own
+  Oculus Touch constant).
+- `KL_SENSE_VEL_FRAME=world` — read `AccessoryAnchor.velocity`/`angularVelocity`
+  as already being in tracking space. Default treats them as accessory-local
+  and rotates them by the grip orientation, which is what ALVR does; Apple
+  documents neither, and the two differ only in direction.
 - `KL_HAND_MIRROR=1` — left hand back on ALVR's *mirrored* wrist→grip
   constant. The default left constant is `R · Rx(180)`, forced by four
   playtests (PLANNING §12.17c).

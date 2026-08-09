@@ -149,8 +149,8 @@ static uint64_t klovrp_no(const char *name) {
 // describe the same hardware. What is described is the Quest 2 we already claim
 // to be through Build.MODEL — not the Vision Pro underneath — because every
 // Oculus branch in the guest is written against that.
-#define KL_OVRP_EYE_W    (1832*1.5)        // Quest 2 per-eye recommended render target
-#define KL_OVRP_EYE_H    (1920*1.5)
+#define KL_OVRP_EYE_W    (1832*1.25)        // Quest 2 per-eye recommended render target
+#define KL_OVRP_EYE_H    (1920*1.25)
 #define KL_OVRP_REFRESH  72.0f       // Quest 2 default display frequency
 
 // The version string Unity parses to gate optional features behind "is the
@@ -408,9 +408,19 @@ static uint64_t klovrp_GetNodeOrientationValid(int n, uint32_t *o) {
 // The head pose the frontend last gave us (kl_ovrp_set_head_pose — the seam
 // declared in kl_ovrp.h). Identity by default, so a headless run sees exactly
 // what it always saw.
-typedef struct { float px, py, pz, qx, qy, qz, qw; } klovrp_pose;
+// Motion rides in the same struct as the pose, and that is the point: every
+// latch in this file (the frontend seqlock, the per-frame pin, the per-step
+// sample) copies a klovrp_pose by value, so velocity that lives here is
+// automatically coherent with the orientation it belongs to. A parallel array
+// would have to repeat all three latches and would eventually disagree with
+// one of them. Zero for the head and the eyes, which have no velocity source.
+typedef struct {
+    float px, py, pz, qx, qy, qz, qw;
+    float vx, vy, vz;        // linear velocity, m/s, tracking space
+    float avx, avy, avz;     // angular velocity, rad/s, tracking-space axes
+} klovrp_pose;
 static klovrp_pose g_head_pose = {
-    0, 0, 0, 0, 0, 0, 1,
+    0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
 };
 static int g_head_set;              // has a frontend ever written a head pose?
 // The two hands, published by the same frontend in the same breath. Declared
@@ -641,7 +651,9 @@ static klovrp_pose klovrp_qmul(const klovrp_pose *a, const float b[4]) {
 
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw };
+    // No velocity: DeviceAnchor does not report one, and the head's motion is
+    // not a field the guest reads for node 9 anyway.
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0 };
     klovrp_pose_write(&g_head_pose, &v);
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
 }
@@ -1096,12 +1108,19 @@ static struct {
     float    index_trigger, hand_trigger, stick_x, stick_y;
 } g_input[2];
 
-void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
-                           float qx, float qy, float qz, float qw) {
+void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
+                             float qx, float qy, float qz, float qw,
+                             float vx, float vy, float vz,
+                             float avx, float avy, float avz) {
     if ((unsigned)hand > 1) return;
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz };
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
+}
+
+void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
+                           float qx, float qy, float qz, float qw) {
+    kl_ovrp_set_hand_motion(hand, px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0);
 }
 
 void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
@@ -1272,6 +1291,15 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     f[2] = p->qz; f[3] = p->qw;      // quat w at +0x0c
     f[4] = p->px; f[5] = p->py;      // position at +0x10
     f[6] = p->pz;
+    // Velocity at +0x1c and angular velocity at +0x34, both of which were left
+    // zero until now. libunity copies all four vectors straight into its XR
+    // node state, so a zero here is not "unknown", it is "not moving" — and
+    // Unity's own code differentiates nothing, it trusts what the plugin says.
+    // Acceleration (+0x28) and angular acceleration (+0x40) stay zero: no
+    // tracker on this platform reports them, and a difference-of-differences
+    // estimate off a 90 Hz pose stream is noise wearing a physical name.
+    f[7]  = p->vx;  f[8]  = p->vy;  f[9]  = p->vz;
+    f[13] = p->avx; f[14] = p->avy; f[15] = p->avz;
     return OVRP_SUCCESS;
 }
 
