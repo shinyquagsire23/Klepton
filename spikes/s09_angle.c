@@ -31,19 +31,17 @@
 #include <stdint.h>
 #include <unistd.h>
 
-// The vendored debug build (vendor/out/Debug, see Makefile `angle-debug`)
-// is preferred when present; otherwise borrow Chrome's prebuilt.
+// The vendored build (vendor/out/Debug, see Makefile `angle-debug`), always —
+// same policy and same reason as runtime/kl_glfb.c: our ANGLE is patched, so
+// quietly substituting another one on the machine would make this spike report
+// on something other than what the runtime actually loads. KL_ANGLE_DIR
+// overrides deliberately.
 #define ANGLE_VENDORED_DIR "vendor/out/Debug"
-#define ANGLE_DEFAULT_DIR \
-    "/Applications/Google Chrome.app/Contents/Frameworks/" \
-    "Google Chrome Framework.framework/Libraries"
 
 static const char *kl_angle_dir(void) {
     const char *dir = getenv("KL_ANGLE_DIR");
     if (dir) return dir;
-    if (access(ANGLE_VENDORED_DIR "/libEGL.dylib", R_OK) == 0)
-        return ANGLE_VENDORED_DIR;
-    return ANGLE_DEFAULT_DIR;
+    return ANGLE_VENDORED_DIR;
 }
 
 // ---- the EGL/GLES constants we need, spelled out so there is nothing to include

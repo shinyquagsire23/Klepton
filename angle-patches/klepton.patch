@@ -1,0 +1,18 @@
+diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
+index 85cc743..672e204 100644
+--- a/src/libANGLE/renderer/metal/mtl_common.h
++++ b/src/libANGLE/renderer/metal/mtl_common.h
+@@ -113,7 +113,12 @@ constexpr size_t kDefaultAttributeSize = 4 * sizeof(float);
+ 
+ // Metal limits
+ constexpr uint32_t kMaxShaderBuffers     = 31;
+-constexpr uint32_t kMaxShaderSamplers    = 16;
++// 16 upstream; raised to 32 (combined 64) for Klepton: Unity's HLSLCC-baked
++// sampler bindings reach unit 35 on post-processing passes (Uber + bloom
++// pyramid + dirt + noise). Per-stage Metal slots are allocated per-shader
++// sequentially (see ProgramExecutableMtl::updateTextures), so the raise only
++// widens GL-side validation; M1 allows 128 textures/stage underneath.
++constexpr uint32_t kMaxShaderSamplers    = 32;
+ constexpr size_t kInlineConstDataMaxSize = 4 * 1024;
+ constexpr size_t kDefaultUniformsMaxSize = 16 * 1024;
+ constexpr uint32_t kMaxViewports         = 1;

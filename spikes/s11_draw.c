@@ -47,16 +47,16 @@
 #define GL_FLOAT 0x1406
 #define GL_FALSE 0
 
+// The vendored build (vendor/out/Debug, `make angle-debug`), always: ours is
+// patched (angle-patches/), so silently measuring a different ANGLE on the
+// machine would report on something the runtime never loads. KL_ANGLE_DIR
+// overrides deliberately.
 #define ANGLE_VENDORED_DIR "vendor/out/Debug"
-#define ANGLE_DEFAULT_DIR \
-    "/Applications/Google Chrome.app/Contents/Frameworks/" \
-    "Google Chrome Framework.framework/Libraries"
 
 static const char *angle_dir(void) {
     const char *d = getenv("KL_ANGLE_DIR");
     if (d) return d;
-    if (access(ANGLE_VENDORED_DIR "/libEGL.dylib", R_OK) == 0) return ANGLE_VENDORED_DIR;
-    return ANGLE_DEFAULT_DIR;
+    return ANGLE_VENDORED_DIR;
 }
 
 static void *g_egl, *g_gles;

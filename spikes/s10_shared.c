@@ -118,19 +118,16 @@
 #define GL_TEXTURE_SWIZZLE_B   0x8E44
 #define GL_TEXTURE_SWIZZLE_A   0x8E45
 
-// The vendored debug build (vendor/angle/out/Debug, see Makefile `angle-debug`)
-// is preferred when present; otherwise borrow Chrome's prebuilt.
+// The vendored build (vendor/out/Debug, `make angle-debug`), always: ours is
+// patched (angle-patches/), so silently measuring a different ANGLE on the
+// machine would report on something the runtime never loads. KL_ANGLE_DIR
+// overrides deliberately.
 #define ANGLE_VENDORED_DIR "vendor/out/Debug"
-#define ANGLE_DEFAULT_DIR \
-    "/Applications/Google Chrome.app/Contents/Frameworks/" \
-    "Google Chrome Framework.framework/Libraries"
 
 static const char *kl_angle_dir(void) {
     const char *dir = getenv("KL_ANGLE_DIR");
     if (dir) return dir;
-    if (access(ANGLE_VENDORED_DIR "/libEGL.dylib", R_OK) == 0)
-        return ANGLE_VENDORED_DIR;
-    return ANGLE_DEFAULT_DIR;
+    return ANGLE_VENDORED_DIR;
 }
 
 // ---- ANGLE entry points ------------------------------------------------------

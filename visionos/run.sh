@@ -78,6 +78,10 @@ done
 
 echo "[1/5] runtime + guest translations…"
 (cd .. && make -s xros)
+# Keep the embedded ANGLE current, but only when the checkout is already
+# there: this must not turn `run.sh` into a surprise 12 GB clone. Without it,
+# mkangle.sh below stops and names the bootstrap command instead.
+if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
 ./mkguest.sh | tail -1
 ./mkangle.sh | tail -1
 

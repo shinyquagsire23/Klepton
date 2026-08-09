@@ -34,12 +34,20 @@ Klepton also has the ability to load and patch `.so` files at runtime with `mmap
 
 ## Building
 
+See [`BUILDING.md`](BUILDING.md) for the full guide. The short version:
+
+```bash
+brew install pkg-config sdl3 apktool          # host dependencies
+apktool d -f -o beatsaber beatsaber.apk       # you supply the APK; see BUILDING.md
+make check                                    # full regression sweep
+```
+
+Quick run scripts:
+
 ```bash
 ./build_run_viewer.sh # build and run macOS Beat Saber frontend
 ./build_run_vpro.sh   # build and run Vision Pro Beat Saber frontend
-./build_run_slink.sh  # macOS Steam VR Link frontend (WIP)
-
-make check            # full regression sweep
+./build_run_slink.sh --shell --view  # macOS Steam VR Link frontend (WIP)
 ```
 
 ## Status

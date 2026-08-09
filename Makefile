@@ -393,8 +393,8 @@ build/Klepton.xcframework: build/xros/libklepton.a build/xrsim/libklepton.a \
 # way); §12.1(1). ANGLE emits ios_framework_bundle on iOS, so the output is
 # already the .framework packaging §4.0.1 wants.
 .PHONY: angle-ios angle-ios-sim angle-xros
-angle-ios:
-	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" && \
+angle-ios: angle-fetch
+	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
 	  gn gen out/ios --args='is_debug=false target_os="ios" target_cpu="arm64" \
 	    target_environment="device" ios_enable_code_signing=false \
 	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
@@ -405,8 +405,8 @@ angle-ios:
 # loop for P5.3 — a device round trip is minutes, the simulator is seconds — and
 # an xcframework with no matching slice fails as an arch mismatch rather than as
 # a missing slice.
-angle-ios-sim:
-	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" && \
+angle-ios-sim: angle-fetch
+	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
 	  gn gen out/ios-sim --args='is_debug=false target_os="ios" target_cpu="arm64" \
 	    target_environment="simulator" ios_enable_code_signing=false \
 	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
@@ -470,27 +470,132 @@ haptics: build/t_haptics
 	@./build/t_haptics
 
 # A *vendored debug build* of ANGLE lives in vendor/ (gitignored) — the Metal
-# backend can be stepped into, which is what the AGX-abort investigation needs
-# (CLAUDE.md "The live problem"). The loaders (kl_glfb.c, s09, s10) prefer
-# vendor/out/Debug when it exists and fall back to Chrome's prebuilt;
-# KL_ANGLE_DIR overrides both.
+# backend can be stepped into, which is what the AGX-abort investigation needs.
+# Every loader (kl_glfb.c and the s09/s10/s11/s13 spikes) uses vendor/out/Debug
+# and nothing else: ours is PATCHED (angle-patches/), so falling back to another
+# ANGLE on the machine would swap the thing under test for a different one.
+# KL_ANGLE_DIR still overrides, deliberately.
 #
-# vendor/ is a shallow ANGLE checkout (fetch --no-history) with depot_tools in
-# vendor/depot_tools. This target reproduces the whole thing; it is a one-time
-# setup cost (checkout ~12 GB, build ~30-60 min).
+# vendor/ is a shallow ANGLE checkout with depot_tools in vendor/depot_tools.
+# `make angle-fetch` produces it; this target only builds. One-time setup cost:
+# checkout ~12 GB, build ~30-60 min.
 .PHONY: angle-debug
-angle-debug:
-	@test -d vendor/depot_tools || git clone --depth 1 \
-	  https://chromium.googlesource.com/chromium/tools/depot_tools.git \
-	  vendor/depot_tools
-	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" && \
-	  test -f .gclient || fetch --no-history angle; \
-	  gclient sync --no-history; \
-	  gn gen out/Debug --args='is_debug=true target_cpu="arm64"'; \
+angle-debug: angle-fetch
+	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
+	  gn gen out/Debug --args='is_debug=true target_cpu="arm64"' && \
 	  autoninja -C out/Debug libEGL libGLESv2
 
-# `make angle` / `make shared` exercise whichever ANGLE the loaders pick
-# (vendored debug build if present, else Chrome's prebuilt).
+# ---- vendor/ — the ANGLE checkout, which we MODIFY ----
+#
+# ANGLE is not a submodule and cannot be one: DEPS pulls ~40 further
+# repositories plus CIPD and GCS blobs and pins them itself, which is gclient's
+# job and not git's. So the checkout is a make step instead.
+#
+# It has to be safe to re-run against a tree with local work in it, because
+# there IS local work in it — Klepton raises ANGLE's Metal sampler limit today,
+# and variable rasterization rate rendering lands in the same backend. Four
+# things make that safe:
+#
+#   * the solution is "managed": False, so `gclient sync` resolves DEPS and
+#     never touches ANGLE's own git. Managed — the default, and what a
+#     hand-written `fetch angle` gives you — resets the checkout to the pinned
+#     revision, and uncommitted work is simply gone.
+#   * DEPOT_TOOLS_UPDATE=0, or depot_tools silently updates itself past its
+#     pin and the two halves of the toolchain drift apart.
+#   * the ANGLE clone happens ONCE. If vendor/.git exists this target never
+#     writes to it: no fetch, no checkout, no reset.
+#   * the sync is stamped, so a healthy tree is a fast no-op rather than a
+#     multi-minute re-resolve. `make angle-sync` forces it.
+#
+# Our delta lives in angle-patches/klepton.patch, which IS tracked in this
+# repo. It is applied to a fresh checkout and re-exported by `make angle-save`.
+# That file, not the gitignored vendor/ tree, is what makes the modification
+# reproducible — treat an unsaved change in vendor/ as unbacked-up.
+#
+# The `.` solution name is load-bearing: it puts ANGLE at the vendor root,
+# which is what every path here assumes. depot_tools' own `fetch angle` writes
+# "angle" instead and checks out into vendor/angle/.
+ANGLE_URL    := https://chromium.googlesource.com/angle/angle.git
+ANGLE_COMMIT := 25e721127e1c6c4c6fa0182b5c234b2c88971175
+DEPOT_URL    := https://chromium.googlesource.com/chromium/tools/depot_tools.git
+DEPOT_COMMIT := 6afa997717b2c0e1382e1465bedbe1a6855b9388
+ANGLE_PATCH  := angle-patches/klepton.patch
+ANGLE_STAMP  := vendor/.klepton-synced
+
+.PHONY: angle-fetch angle-sync angle-save angle-status angle-all
+angle-fetch: $(ANGLE_STAMP)
+
+# Everything ANGLE, in one command: pull + patch + all three slices. This is
+# the build-it-once target for someone who is not developing ANGLE itself.
+# Each half is idempotent, so re-running is cheap once it is current.
+angle-all: angle-debug angle-xros angle-xrsim
+	@echo "  ANGLE: host (out/Debug), visionOS device (out/xros), simulator (out/xrsim)"
+
+$(ANGLE_STAMP):
+	@mkdir -p vendor
+	@if [ -d vendor/.git ]; then \
+	  echo "  [angle] vendor/ is already a checkout — leaving its git untouched"; \
+	else \
+	  echo "  [angle] cloning ANGLE @ $(ANGLE_COMMIT) (this is the ~12 GB step)"; \
+	  git -C vendor init -q && git -C vendor remote add origin $(ANGLE_URL) && \
+	  { git -C vendor fetch -q --depth 1 origin $(ANGLE_COMMIT) || \
+	    git -C vendor fetch -q origin; } && \
+	  git -C vendor checkout -q -B klepton $(ANGLE_COMMIT) || exit 1; \
+	  if [ -s $(ANGLE_PATCH) ]; then \
+	    git -C vendor apply $(PWD)/$(ANGLE_PATCH) || exit 1; \
+	    echo "  [angle] applied $(ANGLE_PATCH)"; \
+	  fi; \
+	fi
+	@if [ ! -d vendor/depot_tools/.git ]; then \
+	  echo "  [angle] cloning depot_tools @ $(DEPOT_COMMIT)"; \
+	  git clone -q $(DEPOT_URL) vendor/depot_tools && \
+	  git -C vendor/depot_tools checkout -q $(DEPOT_COMMIT) || exit 1; \
+	fi
+	@printf '%s\n' 'solutions = [' '  {' '    "name": ".",' \
+	  '    "url": "$(ANGLE_URL)",' '    "deps_file": "DEPS",' \
+	  '    "managed": False,' '    "custom_vars": {},' '  },' ']' \
+	  > vendor/.gclient
+	@echo "  [angle] gclient sync (DEPS only — managed:False)"
+	@cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
+	  gclient sync --no-history
+	@date > $@
+	@$(MAKE) -s angle-status
+
+# Force the DEPS re-resolve the stamp otherwise skips — after bumping the pin,
+# or when a build fails on something DEPS should have provided.
+angle-sync:
+	@rm -f $(ANGLE_STAMP)
+	@$(MAKE) -s angle-fetch
+
+# Export vendor/'s delta against the pin into the tracked patch. This is the
+# "do not lose it" button: everything in vendor/ is gitignored, so an ANGLE
+# change that has not been through here exists in exactly one place on one
+# machine. Committed-on-top and uncommitted changes are captured together, as
+# one diff against the pin — granularity lives in vendor/'s own branch.
+angle-save:
+	@test -d vendor/.git || { echo "  vendor/ not checked out — 'make angle-fetch'"; exit 1; }
+	@mkdir -p angle-patches
+	@git -C vendor diff $(ANGLE_COMMIT) > $(ANGLE_PATCH)
+	@printf '  wrote %s — %s file(s), %s lines\n' "$(ANGLE_PATCH)" \
+	  "$$(git -C vendor diff --name-only $(ANGLE_COMMIT) | wc -l | tr -d ' ')" \
+	  "$$(wc -l < $(ANGLE_PATCH) | tr -d ' ')"
+
+angle-status:
+	@if [ ! -d vendor/.git ]; then echo "  vendor/    absent — run 'make angle-fetch'"; else \
+	  printf '  pin        %s\n' "$(ANGLE_COMMIT)"; \
+	  printf '  HEAD       %s (%s)\n' "$$(git -C vendor rev-parse --short HEAD)" \
+	    "$$(git -C vendor rev-parse --abbrev-ref HEAD)"; \
+	  printf '  modified   %s file(s) vs the pin\n' \
+	    "$$(git -C vendor diff --name-only $(ANGLE_COMMIT) | wc -l | tr -d ' ')"; \
+	  if [ -f $(ANGLE_PATCH) ]; then \
+	    if git -C vendor diff $(ANGLE_COMMIT) | diff -q - $(ANGLE_PATCH) >/dev/null 2>&1; \
+	      then echo "  patch      $(ANGLE_PATCH) is up to date"; \
+	      else echo "  patch      DIFFERS from vendor/ — run 'make angle-save'"; fi; \
+	  else echo "  patch      $(ANGLE_PATCH) missing — run 'make angle-save'"; fi; \
+	fi
+
+# `make angle` / `make shared` exercise the vendored debug build — build it
+# with `make angle-debug` first.
 .PHONY: angle
 angle: build/s09_angle
 	@./build/s09_angle

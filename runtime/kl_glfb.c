@@ -94,19 +94,23 @@
 #define GL_RENDERER      0x1F01
 #define GL_VERSION       0x1F02
 
-// The vendored debug build (vendor/angle/out/Debug, see Makefile `angle-debug`)
-// is preferred when present; otherwise borrow Chrome's prebuilt.
+// We use the VENDORED ANGLE, always — `make angle-debug` (which pulls and
+// patches the checkout first). It is not interchangeable with a stock build:
+// angle-patches/klepton.patch raises the Metal backend's kMaxShaderSamplers
+// from 16 to 32 because Unity's HLSLCC-baked sampler bindings reach unit 35 on
+// the post-processing passes, and a stock ANGLE fails GL-side validation there.
+//
+// So there is deliberately NO silent fallback to some other ANGLE on the
+// machine. Loading Chrome's prebuilt because ours was missing would trade a
+// clear "you have not built ANGLE yet" for a rendering bug hunted somewhere
+// else entirely. KL_ANGLE_DIR still overrides, for pointing at a different
+// build ON PURPOSE.
 #define ANGLE_VENDORED_DIR "vendor/out/Debug"
-#define ANGLE_DEFAULT_DIR \
-    "/Applications/Google Chrome.app/Contents/Frameworks/" \
-    "Google Chrome Framework.framework/Libraries"
 
 static const char *kl_angle_dir(void) {
     const char *dir = kl_env_str("KL_ANGLE_DIR", NULL);
     if (dir) return dir;
-    if (access(ANGLE_VENDORED_DIR "/libEGL.dylib", R_OK) == 0)
-        return ANGLE_VENDORED_DIR;
-    return ANGLE_DEFAULT_DIR;
+    return ANGLE_VENDORED_DIR;
 }
 
 // ANGLE arrives in two shapes and the port needs both: a bare dylib on macOS,
@@ -207,8 +211,11 @@ int kl_glfb_init(void) {
     g_gles_lib = angle_dlopen(dir, "libGLESv2");
     if (!g_egl_lib || !g_gles_lib) {
         fprintf(stderr, "  [glfb] cannot load ANGLE from %s\n         (%s)\n"
-                        "         set KL_ANGLE_DIR to a Chromium app's Libraries "
-                        "directory; staying on the null driver\n", dir, dlerror());
+                        "         build it with 'make angle-debug' — that pulls and "
+                        "patches the checkout too.\n"
+                        "         (KL_ANGLE_DIR overrides, but a stock ANGLE is not "
+                        "equivalent: see angle-patches/.)\n"
+                        "         staying on the null driver\n", dir, dlerror());
         return 0;
     }
 
