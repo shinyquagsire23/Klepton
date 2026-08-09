@@ -787,6 +787,257 @@ static void klfb_note_format(uint32_t fmt, int32_t w, int32_t h, int32_t d,
     }
 }
 
+// ------------------------------------------------------ the GL object census
+//
+// KL_GL_CENSUS=<swaps> prints, every N eglSwapBuffers, how many GL objects the
+// guest has created and how many it has deleted, per class, plus the bytes of
+// texture and renderbuffer storage still live.
+//
+// Why this exists: every gen/delete goes straight to ANGLE (kl_glfb_sym hands
+// the guest ANGLE's own pointers), so nothing at this seam knows whether the
+// guest's objects are being reclaimed. That is fine until something grows
+// across scene loads, at which point the first question — "is the leak the
+// guest's, ANGLE's, or ours?" — has no instrument to answer it. A live count
+// that climbs by the same amount at each loading transition names the class;
+// a flat one exonerates the whole GL path in one run.
+//
+// The counts are exact. The bytes are an *estimate over immutable allocations
+// only*: glTexStorage2D/3D and glRenderbufferStorage(Multisample), which is
+// where the large targets in this title come from. Storage taken through
+// glTexImage2D is counted as a call, not as bytes, and printed separately so
+// the number is never quietly incomplete.
+#define KLFB_CENSUS_KINDS 7
+enum { KLC_TEX, KLC_FBO, KLC_RBO, KLC_BUF, KLC_VAO, KLC_SHADER, KLC_PROG };
+static const char *const g_census_kind[KLFB_CENSUS_KINDS] = {
+    "textures", "framebuffers", "renderbuffers", "buffers",
+    "vertex arrays", "shaders", "programs",
+};
+static struct { unsigned long made, killed; } g_census[KLFB_CENSUS_KINDS];
+static unsigned long g_census_teximage;      // allocations whose bytes we do not model
+
+// name -> bytes, for the two immutable-storage families. Kept in one table
+// because a texture name and a renderbuffer name live in different spaces and
+// the kind disambiguates. Grows; entries are removed on delete, so this table
+// is itself a leak detector — if it never shrinks, neither does the VRAM.
+typedef struct { uint8_t kind; uint32_t name; uint64_t bytes; } klfb_vram;
+static klfb_vram *g_vram;
+static unsigned   g_vram_n, g_vram_cap;
+static uint64_t   g_vram_bytes[KLFB_CENSUS_KINDS];
+static pthread_mutex_t g_census_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Bits per pixel for the formats this guest allocates. Anything unlisted is
+// counted at zero and tallied, rather than guessed at: a wrong multiplier
+// would make the total look authoritative while being fiction.
+static unsigned long g_census_unknown_fmt;
+static unsigned klfb_fmt_bits(uint32_t fmt) {
+    // The ASTC LDR block formats are two contiguous runs (linear, then sRGB) in
+    // the same block-size order, and every block is 128 bits — so the bits per
+    // pixel is 128/(w*h) and the table is the block dimensions, not a case each.
+    static const uint8_t astc[14][2] = {
+        {4,4},{5,4},{5,5},{6,5},{6,6},{8,5},{8,6},{8,8},
+        {10,5},{10,6},{10,8},{10,10},{12,10},{12,12},
+    };
+    if (fmt >= 0x93B0 && fmt <= 0x93BD) {
+        const uint8_t *b = astc[fmt - 0x93B0];
+        return 128 / (unsigned)(b[0] * b[1]);
+    }
+    if (fmt >= 0x93D0 && fmt <= 0x93DD) {
+        const uint8_t *b = astc[fmt - 0x93D0];
+        return 128 / (unsigned)(b[0] * b[1]);
+    }
+    switch (fmt) {
+    case 0x8229 /* R8 */:      case 0x8F94 /* R8_SNORM */:
+    case 0x8D48 /* STENCIL_INDEX8 */:                           return 8;
+    case 0x822B /* RG8 */:     case 0x822D /* R16F */:
+    case 0x8D62 /* RGB565 */:  case 0x8056 /* RGBA4 */:
+    case 0x8057 /* RGB5_A1 */: case 0x81A5 /* DEPTH_COMPONENT16 */: return 16;
+    case 0x8051 /* RGB8 */:    case 0x8C41 /* SRGB8 */:         return 24;
+    case 0x8058 /* RGBA8 */:   case 0x8C43 /* SRGB8_ALPHA8 */:
+    case 0x822E /* R32F */:    case 0x822F /* RG16F */:
+    case 0x8C3A /* R11F_G11F_B10F */: case 0x8C3D /* RGB9_E5 */:
+    case 0x81A6 /* DEPTH_COMPONENT24 */: case 0x81A7 /* DEPTH_COMPONENT32 */:
+    case 0x88F0 /* DEPTH24_STENCIL8 */:  case 0x8CAC /* DEPTH_COMPONENT32F */:
+                                                                return 32;
+    case 0x881B /* RGB16F */:                                   return 48;
+    case 0x881A /* RGBA16F */: case 0x8230 /* RG32F */:
+    case 0x8CAD /* DEPTH32F_STENCIL8 */:                        return 64;
+    case 0x8815 /* RGB32F */:                                   return 96;
+    case 0x8814 /* RGBA32F */:                                  return 128;
+    case 0x9274 /* COMPRESSED_RGB8_ETC2 */:
+    case 0x9275 /* COMPRESSED_SRGB8_ETC2 */:
+    case 0x9270 /* COMPRESSED_R11_EAC */:                       return 4;
+    case 0x9278 /* COMPRESSED_RGBA8_ETC2_EAC */:
+    case 0x9279 /* COMPRESSED_SRGB8_ALPHA8_ETC2_EAC */:
+    case 0x9272 /* COMPRESSED_RG11_EAC */:                      return 8;
+    }
+    g_census_unknown_fmt++;
+    return 0;
+}
+
+// Bytes an immutable allocation reserves. A mip chain is the base level times
+// 4/3 in the limit; levels>1 uses that bound rather than summing, which is
+// within a few per cent and cannot be wrong in the direction that hides a leak.
+static uint64_t klfb_storage_bytes(uint32_t fmt, int32_t w, int32_t h,
+                                   int32_t d, int32_t levels) {
+    if (w <= 0 || h <= 0 || d <= 0) return 0;
+    uint64_t px = (uint64_t)w * (uint64_t)h * (uint64_t)d;
+    uint64_t bytes = px * klfb_fmt_bits(fmt) / 8;
+    if (levels > 1) bytes = bytes * 4 / 3;
+    return bytes;
+}
+
+static int klfb_census_every(void) {
+    static int n = -1;
+    if (n < 0) {
+        n = kl_env_int("KL_GL_CENSUS", 0);
+        if (n < 0) n = 0;
+    }
+    return n;
+}
+
+// Caller must not hold g_census_lock.
+static void klfb_vram_note(int kind, uint32_t name, uint64_t bytes) {
+    if (!klfb_census_every() || !name) return;
+    pthread_mutex_lock(&g_census_lock);
+    for (unsigned i = 0; i < g_vram_n; i++)
+        if (g_vram[i].kind == kind && g_vram[i].name == name) {
+            // Re-specified storage replaces, it does not add.
+            g_vram_bytes[kind] -= g_vram[i].bytes;
+            g_vram[i].bytes = bytes;
+            g_vram_bytes[kind] += bytes;
+            pthread_mutex_unlock(&g_census_lock);
+            return;
+        }
+    if (g_vram_n == g_vram_cap) {
+        unsigned cap = g_vram_cap ? g_vram_cap * 2 : 256;
+        klfb_vram *p = realloc(g_vram, cap * sizeof *p);
+        if (!p) { pthread_mutex_unlock(&g_census_lock); return; }
+        g_vram = p; g_vram_cap = cap;
+    }
+    g_vram[g_vram_n++] = (klfb_vram){(uint8_t)kind, name, bytes};
+    g_vram_bytes[kind] += bytes;
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+static void klfb_vram_forget(int kind, uint32_t name) {
+    uint64_t freed = 0;
+    pthread_mutex_lock(&g_census_lock);
+    for (unsigned i = 0; i < g_vram_n; i++)
+        if (g_vram[i].kind == kind && g_vram[i].name == name) {
+            freed = g_vram[i].bytes;
+            g_vram_bytes[kind] -= freed;
+            g_vram[i] = g_vram[--g_vram_n];
+            break;
+        }
+    pthread_mutex_unlock(&g_census_lock);
+    // The large allocations are the ones a leak is made of, and "was it ever
+    // released" is not answerable from a running total. Naming each big release
+    // makes the absence of one a visible fact rather than an inference.
+    if (freed >= (16u << 20))
+        fprintf(stderr, "  [census] released %s %u: %llu MiB\n",
+                g_census_kind[kind], name, (unsigned long long)(freed >> 20));
+}
+
+static void klfb_census_made(int kind, int32_t n) {
+    if (n > 0) __atomic_fetch_add(&g_census[kind].made, (unsigned long)n,
+                                  __ATOMIC_RELAXED);
+}
+static void klfb_census_killed(int kind, int32_t n) {
+    if (n > 0) __atomic_fetch_add(&g_census[kind].killed, (unsigned long)n,
+                                  __ATOMIC_RELAXED);
+}
+
+void kl_glfb_gl_census(FILE *f) {
+    if (!klfb_census_every()) return;
+    fprintf(f, "  [census] GL objects live (made - deleted):");
+    for (int k = 0; k < KLFB_CENSUS_KINDS; k++)
+        fprintf(f, " %s %lu/%lu", g_census_kind[k],
+                g_census[k].made - g_census[k].killed, g_census[k].made);
+    // Read without the lock, deliberately. This also runs from kl_egl_report,
+    // which every fatal path goes through, and a diagnostic that can block on
+    // the way to reporting a crash costs the whole report — the lock is held
+    // across a realloc in the allocation path, so that is not hypothetical.
+    // The cost of not taking it is three scalars that may be one allocation
+    // stale, which changes no conclusion this number is used for.
+    uint64_t tex = g_vram_bytes[KLC_TEX], rbo = g_vram_bytes[KLC_RBO];
+    unsigned tracked = g_vram_n;
+    fprintf(f, "\n  [census] immutable storage live: textures %llu MiB, "
+               "renderbuffers %llu MiB (%u allocations tracked)",
+            (unsigned long long)(tex >> 20), (unsigned long long)(rbo >> 20),
+            tracked);
+    if (g_census_teximage)
+        fprintf(f, ", %lu glTexImage* allocations unmeasured", g_census_teximage);
+    if (g_census_unknown_fmt)
+        fprintf(f, ", %lu allocations of unknown format", g_census_unknown_fmt);
+    fprintf(f, "\n");
+}
+
+// The gen/delete pairs. Six near-identical thunks per family is worse than a
+// macro here: the only thing that varies is which counter moves, and a typo in
+// one hand-written copy is a census that lies about exactly one class.
+#define KLFB_GENDEL(Name, KIND)                                               \
+    static void (*g_real_Gen##Name)(int32_t, uint32_t *);                     \
+    static void (*g_real_Delete##Name)(int32_t, const uint32_t *);            \
+    static void klfb_Gen##Name(int32_t n, uint32_t *ids) {                    \
+        if (g_real_Gen##Name) g_real_Gen##Name(n, ids);                       \
+        klfb_census_made(KIND, n);                                            \
+    }                                                                         \
+    static void klfb_Delete##Name(int32_t n, const uint32_t *ids) {           \
+        klfb_census_killed(KIND, n);                                          \
+        if (klfb_census_every() && ids &&                                     \
+            ((KIND) == KLC_TEX || (KIND) == KLC_RBO))                         \
+            for (int32_t i = 0; i < n; i++) klfb_vram_forget(KIND, ids[i]);   \
+        if (g_real_Delete##Name) g_real_Delete##Name(n, ids);                 \
+    }
+
+KLFB_GENDEL(Textures,     KLC_TEX)
+KLFB_GENDEL(Renderbuffers, KLC_RBO)
+KLFB_GENDEL(Buffers,      KLC_BUF)
+KLFB_GENDEL(VertexArrays, KLC_VAO)
+// glGenFramebuffers already has a thunk (the FBO trace); only the delete half
+// is new, and the gen half calls klfb_census_made itself.
+static void (*g_real_DeleteFramebuffers)(int32_t, const uint32_t *);
+static void klfb_DeleteFramebuffers(int32_t n, const uint32_t *ids) {
+    klfb_census_killed(KLC_FBO, n);
+    if (g_real_DeleteFramebuffers) g_real_DeleteFramebuffers(n, ids);
+}
+
+// Counted, not modelled. Mutable storage is per-level and re-specifiable, so a
+// byte figure would need a level table; the count is here so that a leak taking
+// this route cannot hide behind a census that only knows about glTexStorage*.
+// Nine arguments, all in registers bar the last pointer, so the natural
+// signature is safe (unlike glTexSubImage3D above).
+static void (*g_real_TexImage2D)(uint32_t, int32_t, int32_t, int32_t, int32_t,
+                                 int32_t, uint32_t, uint32_t, const void *);
+static void klfb_TexImage2D(uint32_t target, int32_t level, int32_t ifmt,
+                            int32_t w, int32_t h, int32_t border, uint32_t fmt,
+                            uint32_t type, const void *pixels) {
+    if (level == 0) g_census_teximage++;
+    if (g_real_TexImage2D)
+        g_real_TexImage2D(target, level, ifmt, w, h, border, fmt, type, pixels);
+}
+
+static uint32_t (*g_real_CreateShader)(uint32_t);
+static uint32_t klfb_CreateShader(uint32_t type) {
+    klfb_census_made(KLC_SHADER, 1);
+    return g_real_CreateShader ? g_real_CreateShader(type) : 0;
+}
+static void (*g_real_DeleteShader)(uint32_t);
+static void klfb_DeleteShader(uint32_t s) {
+    klfb_census_killed(KLC_SHADER, 1);
+    if (g_real_DeleteShader) g_real_DeleteShader(s);
+}
+static uint32_t (*g_real_CreateProgram)(void);
+static uint32_t klfb_CreateProgram(void) {
+    klfb_census_made(KLC_PROG, 1);
+    return g_real_CreateProgram ? g_real_CreateProgram() : 0;
+}
+static void (*g_real_DeleteProgram)(uint32_t);
+static void klfb_DeleteProgram(uint32_t p) {
+    klfb_census_killed(KLC_PROG, 1);
+    if (g_real_DeleteProgram) g_real_DeleteProgram(p);
+}
+
 // KL_GLFB_NOSRGB=1 substitutes GL_RGBA8 for GL_SRGB8_ALPHA8 at allocation. The
 // census found the guest's eye-sized render target is SRGB8_ALPHA8, and sRGB is a
 // case Metal's fixed-function blit cannot always service — it falls back to a
@@ -853,6 +1104,7 @@ static uint64_t klfb_tid(void) { uint64_t t = 0; pthread_threadid_np(NULL, &t); 
 
 static void klfb_GenFramebuffers(int32_t n, uint32_t *ids) {
     if (g_real_GenFramebuffers) g_real_GenFramebuffers(n, ids);
+    klfb_census_made(KLC_FBO, n);
     if (ids)
         for (int32_t i = 0; i < n; i++)
             if (ids[i] > g_fbomax) g_fbomax = ids[i];
@@ -986,7 +1238,11 @@ static void klfb_TexStorage2D(uint32_t target, int32_t levels, uint32_t fmt,
     if (a_glGetIntegerv) {
         int32_t bound = -1;
         a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &bound);
-        if (bound > 0) klfb_note_tex_storage((uint32_t)bound, fmt, w, h);
+        if (bound > 0) {
+            klfb_note_tex_storage((uint32_t)bound, fmt, w, h);
+            klfb_vram_note(KLC_TEX, (uint32_t)bound,
+                           klfb_storage_bytes(fmt, w, h, 1, levels));
+        }
     }
     if (g_real_TexStorage2D) g_real_TexStorage2D(target, levels, fmt, w, h);
 }
@@ -994,6 +1250,16 @@ static void klfb_TexStorage3D(uint32_t target, int32_t levels, uint32_t fmt,
                               int32_t w, int32_t h, int32_t d) {
     klfb_note_format(fmt, w, h, d, "glTexStorage3D");
     fmt = klfb_maybe_unsrgb(fmt);
+    if (a_glGetIntegerv && klfb_census_every()) {
+        // 2D_ARRAY and 3D have their own binding points; the target says which.
+        int32_t bound = -1;
+        a_glGetIntegerv(target == 0x8C1A /* TEXTURE_2D_ARRAY */ ? 0x8C1D
+                                                               : 0x806A /* 3D */,
+                        &bound);
+        if (bound > 0)
+            klfb_vram_note(KLC_TEX, (uint32_t)bound,
+                           klfb_storage_bytes(fmt, w, h, d, levels));
+    }
     if (g_real_TexStorage3D) g_real_TexStorage3D(target, levels, fmt, w, h, d);
 }
 
@@ -1233,7 +1499,8 @@ static void *g_mtl_provider_ctx;
 // §12.1(3)'s "key the pose to the stage" warning bite, so the array is indexed
 // by stage from the start rather than retrofitted later.
 #define KL_MTL_MAX_STAGES 4
-static struct { void *tex; int slice; void *image; } g_eye_mtl[2][KL_MTL_MAX_STAGES];
+static struct { void *tex; int slice; void *image; uint32_t gl_tex; }
+    g_eye_mtl[2][KL_MTL_MAX_STAGES];
 
 void kl_glfb_set_mtl_provider(kl_glfb_mtl_provider fn, void *ctx) {
     g_mtl_provider = fn;
@@ -1280,6 +1547,63 @@ void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice) {
     if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) return NULL;
     if (out_slice) *out_slice = g_eye_mtl[eye][stage].slice;
     return g_eye_mtl[eye][stage].tex;
+}
+
+// The teardown half, called from ovrp_DestroyEyeTexture — the only thing in the
+// trace that ever says an eye texture is finished with. Two references have to
+// go for the storage to be reclaimed, and dropping either one alone reclaims
+// nothing:
+//
+//   - the EGLImage, which is ANGLE's handle on the MTLTexture, and
+//   - the GL texture, which took a reference of its own at
+//     glEGLImageTargetTexture2DOES and keeps it until the name is deleted.
+//
+// The provider's own reference then goes when it replaces its cache entry, and
+// only at that point does the memory actually come back. That is why the leak
+// looked like the provider's: it *was* releasing on reallocation, into a
+// texture ANGLE still held.
+//
+// The GL delete needs a current context, and this call arrives on the guest's
+// render thread inside its graphics teardown, where there is one. If there
+// isn't, the delete is a silent GL no-op — so it is reported rather than
+// assumed.
+void kl_glfb_release_eye_texture(int eye, int stage) {
+    // KL_EYE_RELEASE=0 restores the old behaviour — the teardown call arrives
+    // and nothing is released. The A/B is worth a knob: this is the difference
+    // between a swapchain per loading transition and one swapchain, and the
+    // cost of being wrong about the ownership is a texture the guest still
+    // wants. Compare `frames per stage` in the OVRPlugin report either way.
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_EYE_RELEASE", 1);
+    if (!on) return;
+    if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) {
+        fprintf(stderr, "  [glfb] release eye=%d stage=%d: out of range, "
+                        "nothing released\n", eye, stage);
+        return;
+    }
+    uint32_t gl_tex = g_eye_mtl[eye][stage].gl_tex;
+    void    *img    = g_eye_mtl[eye][stage].image;
+    if (!gl_tex && !img) return;                 // never bound, or already gone
+
+    if (img && a_eglDestroyImageKHR) a_eglDestroyImageKHR(g_dpy, img);
+    if (gl_tex) {
+        static void (*r_DeleteTextures)(int32_t, const uint32_t *);
+        static void *(*r_GetCurrentContext)(void);
+        if (!r_DeleteTextures) {
+            r_DeleteTextures = asym("glDeleteTextures");
+            r_GetCurrentContext = asym("eglGetCurrentContext");
+        }
+        if (r_GetCurrentContext && !r_GetCurrentContext())
+            fprintf(stderr, "  [glfb] release eye=%d stage=%d: no current context, "
+                            "the GL texture %u keeps its storage\n",
+                    eye, stage, gl_tex);
+        if (r_DeleteTextures) r_DeleteTextures(1, &gl_tex);
+        klfb_vram_forget(KLC_TEX, gl_tex);
+        klfb_census_killed(KLC_TEX, 1);
+    }
+    g_eye_mtl[eye][stage] = (typeof(g_eye_mtl[0][0])){0};
+    fprintf(stderr, "  [glfb] eye=%d stage=%d released (GL texture %u, image %p)\n",
+            eye, stage, gl_tex, img);
 }
 
 int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
@@ -1339,19 +1663,45 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
         if (a_eglDestroyImageKHR) a_eglDestroyImageKHR(g_dpy, img);
         return 0;
     }
-    // The EGLImage is kept, not destroyed: it is the binding between the GL
-    // texture and the MTLTexture, and Unity keeps the texture for the process
-    // lifetime. Releasing it here is the kind of thing that works right up until
-    // the first reallocation. (If Unity re-creates eye textures on resize, the
-    // previous image for this slot is released first.)
+    // A backstop, and in this title an unexercised one: every measured
+    // replacement is preceded by ovrp_DestroyEyeTexture, so this slot is empty
+    // by the time a new texture arrives (24 binds, 18 teardowns — the six
+    // without a teardown are the first generation, which has no predecessor).
+    // It exists because the guest never calls glDeleteTextures on these names
+    // itself: if a teardown ever goes missing, destroying only the EGLImage —
+    // which is all this used to do — leaves ANGLE's texture holding the
+    // MTLTexture, and the provider's release then reclaims nothing. It says so
+    // when it fires, because a silent backstop is how a leak comes back.
+    //
+    // The same name re-bound to new storage is not a replacement, so it falls
+    // through to the image destroy alone.
+    if (g_eye_mtl[eye][stage].gl_tex && g_eye_mtl[eye][stage].gl_tex != gl_tex) {
+        fprintf(stderr, "  [glfb] eye=%d stage=%d replaced with no teardown "
+                        "(GL texture %u -> %u) — releasing the old one here\n",
+                eye, stage, g_eye_mtl[eye][stage].gl_tex, gl_tex);
+        kl_glfb_release_eye_texture(eye, stage);   // no-op under KL_EYE_RELEASE=0
+    }
     if (g_eye_mtl[eye][stage].image && a_eglDestroyImageKHR)
         a_eglDestroyImageKHR(g_dpy, g_eye_mtl[eye][stage].image);
-    g_eye_mtl[eye][stage].tex   = t.texture;
-    g_eye_mtl[eye][stage].slice = t.slice;
-    g_eye_mtl[eye][stage].image = img;
+    g_eye_mtl[eye][stage].tex    = t.texture;
+    g_eye_mtl[eye][stage].slice  = t.slice;
+    g_eye_mtl[eye][stage].image  = img;
+    g_eye_mtl[eye][stage].gl_tex = gl_tex;
     fprintf(stderr, "  [glfb] eye=%d stage=%d tex=%u is now backed by MTLTexture %p "
                     "slice %d (%dx%d fmt 0x%x)\n",
             eye, stage, gl_tex, t.texture, t.slice, w, h, internal_fmt);
+    // The eye textures take their storage through the EGLImage, not through
+    // glTexStorage*, so the census would otherwise be blind to the single
+    // largest allocation in the process. One eye is one slice of the shared
+    // array, so the per-name figure is w*h*bpp and the pair adds up to the
+    // whole texture. glDeleteTextures on the old name is what removes it —
+    // which makes this the measurement of whether the guest lets go of the old
+    // swapchain at all.
+    klfb_vram_note(KLC_TEX, gl_tex, klfb_storage_bytes(internal_fmt, w, h, 1, 1));
+    // Unity re-creates the eye swapchain at every loading transition, which is
+    // exactly the event a leak hunt wants a census either side of. Rare enough
+    // to print unconditionally when the census is on.
+    if (klfb_census_every()) kl_glfb_gl_census(stderr);
     return 1;
 }
 
@@ -1449,6 +1799,14 @@ static void klfb_RenderbufferStorageMultisample(uint32_t target, int32_t samples
                         "fmt=0x%x %dx%d samples=%d (storage wiped)\n", rb, fmt,
                 w, h, samples);
     }
+    if (a_glGetIntegerv && klfb_census_every()) {
+        int32_t rb = -1;
+        a_glGetIntegerv(0x8CA7 /* RENDERBUFFER_BINDING */, &rb);
+        if (rb > 0)
+            klfb_vram_note(KLC_RBO, (uint32_t)rb,
+                           klfb_storage_bytes(fmt, w, h, 1, 1) *
+                               (uint64_t)(samples > 0 ? samples : 1));
+    }
     if (g_real_RenderbufferStorageMultisample)
         g_real_RenderbufferStorageMultisample(target, samples, fmt, w, h);
 }
@@ -1459,6 +1817,13 @@ static void klfb_RenderbufferStorage(uint32_t target, uint32_t fmt,
         a_glGetIntegerv(0x8CA7, &rb);
         fprintf(stderr, "  [glfb] glRenderbufferStorage rb=%d fmt=0x%x %dx%d "
                         "(storage wiped)\n", rb, fmt, w, h);
+    }
+    if (a_glGetIntegerv && klfb_census_every()) {
+        int32_t rb = -1;
+        a_glGetIntegerv(0x8CA7, &rb);
+        if (rb > 0)
+            klfb_vram_note(KLC_RBO, (uint32_t)rb,
+                           klfb_storage_bytes(fmt, w, h, 1, 1));
     }
     if (g_real_RenderbufferStorage) g_real_RenderbufferStorage(target, fmt, w, h);
 }
@@ -2570,6 +2935,22 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glTexParameteri", (void *)klfb_TexParameteri, (void **)&g_real_TexParameteri},
     {"glGenFramebuffers", (void *)klfb_GenFramebuffers, (void **)&g_real_GenFramebuffers},
     {"glBindFramebuffer", (void *)klfb_BindFramebuffer, (void **)&g_real_BindFramebuffer},
+    // the object census — every gen/delete pair, so a class that never shrinks
+    // names itself (KL_GL_CENSUS)
+    {"glDeleteFramebuffers", (void *)klfb_DeleteFramebuffers, (void **)&g_real_DeleteFramebuffers},
+    {"glGenTextures",     (void *)klfb_GenTextures,     (void **)&g_real_GenTextures},
+    {"glDeleteTextures",  (void *)klfb_DeleteTextures,  (void **)&g_real_DeleteTextures},
+    {"glGenRenderbuffers",    (void *)klfb_GenRenderbuffers,    (void **)&g_real_GenRenderbuffers},
+    {"glDeleteRenderbuffers", (void *)klfb_DeleteRenderbuffers, (void **)&g_real_DeleteRenderbuffers},
+    {"glGenBuffers",      (void *)klfb_GenBuffers,      (void **)&g_real_GenBuffers},
+    {"glDeleteBuffers",   (void *)klfb_DeleteBuffers,   (void **)&g_real_DeleteBuffers},
+    {"glGenVertexArrays", (void *)klfb_GenVertexArrays, (void **)&g_real_GenVertexArrays},
+    {"glDeleteVertexArrays", (void *)klfb_DeleteVertexArrays, (void **)&g_real_DeleteVertexArrays},
+    {"glCreateShader",  (void *)klfb_CreateShader,  (void **)&g_real_CreateShader},
+    {"glDeleteShader",  (void *)klfb_DeleteShader,  (void **)&g_real_DeleteShader},
+    {"glCreateProgram", (void *)klfb_CreateProgram, (void **)&g_real_CreateProgram},
+    {"glDeleteProgram", (void *)klfb_DeleteProgram, (void **)&g_real_DeleteProgram},
+    {"glTexImage2D",    (void *)klfb_TexImage2D,    (void **)&g_real_TexImage2D},
     {"glFramebufferTexture2D", (void *)klfb_FramebufferTexture2D, (void **)&g_real_FramebufferTexture2D},
     // the hybrid query family — ours if the capability tables describe the
     // pname, ANGLE's otherwise (see the gateway comment below)

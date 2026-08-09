@@ -83,6 +83,20 @@ answers GL and kl_glfb never initializes.
   `glTexSubImage2D` call with arguments and a sequence number.
 - `KL_GLFB_TRACE_FBO=1` — log the FBO lifecycle (`glGenFramebuffers`,
   `glBindFramebuffer`, `glFramebufferTexture2D`) with thread ids.
+- `KL_GL_CENSUS=<swaps>` — the GL object census, printed every N
+  `eglSwapBuffers`, at every eye-swapchain rebuild, and once in the exit
+  report. Per class (textures, framebuffers, renderbuffers, buffers, vertex
+  arrays, shaders, programs): how many the guest created and how many it
+  deleted, plus the immutable texture and renderbuffer storage still live and
+  a line naming every release of 16 MiB or more. Every gen/delete goes
+  straight to ANGLE, so this is the only thing at the seam that can say
+  whether the guest's GL objects come back — the first question when memory
+  climbs across scene loads. Unset = off, and costs nothing.
+- `KL_EYE_RELEASE=0` — do *not* release an eye texture when
+  `ovrp_DestroyEyeTexture` says to (the pre-2026-08-09 behaviour, which leaked
+  a whole swapchain — 250-380 MiB — per loading transition). The A/B for that
+  fix; with it off, watch `KL_GL_CENSUS`'s live texture MiB climb at every
+  rebuild and never come down.
 - `KL_GLFB_NOSRGB=1` — allocate `GL_RGBA8` where the guest asked for
   `GL_SRGB8_ALPHA8`. A probe; a captured frame is then wrong (un-decoded
   sRGB).

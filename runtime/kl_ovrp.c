@@ -1941,6 +1941,27 @@ static uint64_t klovrp_SetupEyeTexture2(int eye, int stage, uintptr_t handle,
     return 1;
 }
 
+// The other half of SetupEyeTexture2, and for a long time a no-op — which is
+// what made the eye swapchain a per-loading-transition leak. Unity re-creates
+// the swapchain whenever the eye size changes (measured: three times before the
+// menu is even up), and each generation is three stages of a two-slice RGBA16F
+// array — 250-380 MiB. Nothing else releases it: the guest never calls
+// glDeleteTextures on the names it hands down here, because on a real Quest the
+// storage belongs to VrApi and *this call* is where it dies. So it has to die
+// here too, or every transition leaks a whole swapchain (§12.21).
+//
+// Two ints, x0 and x1, passed straight through from libunity's wrapper at
+// 0x9bbbdc; the return is ignored (it answers 1 unconditionally either way).
+// Which of the two is the eye and which the stage is measured, not assumed —
+// kl_glfb_release_eye_texture takes them in the order this call site uses and
+// refuses anything out of range rather than releasing the wrong slot.
+static uint64_t klovrp_DestroyEyeTexture(int eye, int stage) {
+    ovrp_hit("ovrp_DestroyEyeTexture");
+    fprintf(stderr, "  [ovrp] DestroyEyeTexture(eye=%d stage=%d)\n", eye, stage);
+    kl_glfb_release_eye_texture(eye, stage);
+    return OVRP_SUCCESS;
+}
+
 // libunity reads the RETURNED pointer's +0x118/+0x11c first and early-outs
 // when they are zero (0x9bcc58) — an out-param it is not: returning 0 here
 // segfaulted at [x0+0xcc]. A zeroed static struct is the complete honest
@@ -2031,6 +2052,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetNativeXrApiType", (void *)klovrp_GetNativeXrApiType},
     {"ovrp_GetSystemDisplayAvailableFrequencies", (void *)klovrp_GetSystemDisplayAvailableFrequencies},
     {"ovrp_SetupEyeTexture2", (void *)klovrp_SetupEyeTexture2},
+    {"ovrp_DestroyEyeTexture", (void *)klovrp_DestroyEyeTexture},
     {"ovrp_Update2", (void *)klovrp_Update2},
     {"ovrp_GetControllerHapticsDesc", (void *)klovrp_GetControllerHapticsDesc_entry},
     // M8 — haptics out. All three must be real together: the descriptor sizes
@@ -2081,8 +2103,6 @@ static const char *const g_ovrp_result_ok[] = {
     // Called even with texture-array support answered 0 — recorded state,
     // like the other setters.
     "ovrp_SetEyeTextureArrayEnabled",
-    // Teardown; return ignored (0x9bbbf4).
-    "ovrp_DestroyEyeTexture",
     // Pushed by the C# side despite GetDepthCompositingSupported=0; recorded
     // state, like the other setters.
     "ovrp_SetDepthProjInfo",

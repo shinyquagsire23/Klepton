@@ -865,14 +865,20 @@ final class KleptonCompositor {
                 var read = false
                 if eyesLock.try() { mine = eyes[Self.key(eye, s)]; eyesLock.unlock(); read = true }
                 let mineTex = mine.map { Unmanaged.passUnretained($0.texture).toOpaque() }
-                if read && guestTex != mineTex { bad = true }
+                // A nil guest texture is not a disagreement: between
+                // ovrp_DestroyEyeTexture and the next SetupEyeTexture2 the slot
+                // is deliberately empty, and this cache still holds the old
+                // texture on purpose — compositing the last good frame through
+                // a loading transition is better than a black one. Only two
+                // *different* live textures mean the two sides have diverged.
+                if read && guestTex != nil && guestTex != mineTex { bad = true }
                 // Only the low bits: two pointers into the same heap differ
                 // there, and a full 64-bit address per eye per stage makes the
                 // line unreadable at the moment it matters most.
                 let tag = guestTex.map { String(UInt(bitPattern: $0) & 0xffffff, radix: 16) } ?? "nil"
                 out += " e\(eye)=\(tag)"
                 if !read { out += "?" }
-                else if guestTex != mineTex { out += "!=SAMPLED" }
+                else if guestTex != nil && guestTex != mineTex { out += "!=SAMPLED" }
             }
             out += " |"
         }

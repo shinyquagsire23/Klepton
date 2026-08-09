@@ -6,6 +6,7 @@
 #ifndef KL_GLFB_H
 #define KL_GLFB_H
 #include <stdint.h>
+#include <stdio.h>
 
 int  kl_glfb_enabled(void);
 int  kl_glfb_init(void);
@@ -74,12 +75,26 @@ uint64_t kl_glfb_gpu_fence_value(void);
 // makes this the population that matters. Safe to call when nothing was allocated.
 void kl_glfb_report_formats(void);
 
+// The GL object census (KL_GL_CENSUS=<swaps>): per class, how many objects the
+// guest has created and how many it has deleted, plus the immutable texture and
+// renderbuffer storage still live. Every gen/delete goes straight to ANGLE, so
+// without this nothing at the seam can say whether the guest's GL objects are
+// being reclaimed — which is the first question when memory climbs across scene
+// loads. A no-op unless KL_GL_CENSUS is set; safe to call at any time.
+void kl_glfb_gl_census(FILE *f);
+
 // The eye-texture seam, texture identity out. kl_ovrp's SetupEyeTexture2 calls
 // this with the GL texture name Unity handed down; the capture finds "the
 // framebuffer with the picture" by looking for the FBO whose color attachment
 // is one of these (fb0 is black by construction — the VR frame goes to eye
 // textures, not the backbuffer).
 void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex);
+
+// ...and the teardown half, from ovrp_DestroyEyeTexture. Drops both references
+// that keep an eye texture's storage alive — the EGLImage and the GL texture —
+// so the provider's own release on reallocation can actually reclaim it. A
+// no-op for a slot that was never bound; out-of-range says so and does nothing.
+void kl_glfb_release_eye_texture(int eye, int stage);
 
 // Which swapchain stage the guest most recently RENDERED into, or -1 if that
 // has not been observed.

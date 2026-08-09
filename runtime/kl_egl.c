@@ -1121,6 +1121,15 @@ static EGLSurface klegl_GetCurrentSurface(int32_t which) {
 static unsigned klegl_SwapBuffers(EGLDisplay dpy, EGLSurface s) {
     (void)dpy; (void)s;
     g_frames++;
+    // The GL object census, on the frame clock: a class whose live count climbs
+    // at every loading transition is the leak, and a flat one exonerates the GL
+    // path. No-op unless KL_GL_CENSUS names an interval (kl_glfb.h).
+    {
+        static int every = -1;
+        if (every < 0) every = kl_env_int("KL_GL_CENSUS", 0);
+        if (every > 0 && g_frames % (unsigned long)every == 0)
+            kl_glfb_gl_census(stderr);
+    }
     // A swap is where a frame is finished, so it is where the reference renderer
     // captures. No-op unless KL_GLFB_OUT names a directory — or a frontend is
     // attached: a frame sink (the readback path) or a GPU fence (KL_VIEW=1's
@@ -1212,6 +1221,9 @@ void kl_egl_report(FILE *f) {
     done = 1;
     fprintf(f, "\n=== EGL / GL surface ===\n");
     fprintf(f, "  eglSwapBuffers: %lu\n", g_frames);
+    // A run that dies of memory wants this in the report, not only every Nth
+    // swap: the last census before the abort is the one that names the class.
+    kl_glfb_gl_census(f);
     unsigned called = 0;
     for (unsigned i = 0; i < g_ngl; i++) if (g_gl[i].calls) called++;
     fprintf(f, "  GL entry points resolved: %u, of which called: %u\n", g_ngl, called);
