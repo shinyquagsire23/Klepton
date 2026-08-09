@@ -1504,16 +1504,44 @@ uint64_t klovrp_GetControllerState_impl(int mask, void *out) {
 #define KLOVRP_HAP_SAFE     5          // MinimumSafeSamplesQueued
 #define KLOVRP_HAP_MINBUF   1          // MinimumBufferSamplesCount
 
-// The shortest span worth waking the frontend's haptics engine for, and the
-// longest one pulse may cover. The floor is ALVR's (0.032 s) and exists
-// because the guest tops its queue up EVERY frame: at 90 Hz that is three or
-// four new samples a time, and handing a CoreHaptics engine a stream of 11 ms
-// events is a series of restarts rather than a buzz. We can afford to wait —
-// the queue runs ~60 ms ahead of the sound, which is the whole point of a
-// buffered API. The ceiling is ALVR's too, and is a safety rail: a single
-// event that runs for half a second is already longer than any note cut.
-#define KLOVRP_HAP_MIN_S    0.032f
-#define KLOVRP_HAP_MAX_S    0.5f
+// --- The playback model, and the one this replaced ------------------------
+//
+// **This is an envelope follower, not a pulse batcher, and the difference was
+// measured on hardware.** The first version tried to hand the frontend whole
+// pulses: hold samples back until at least 32 ms of them had accumulated
+// (ALVR's floor — an actuator cannot say anything in 10 ms), then emit one
+// event at the PEAK of that span. Two things were wrong with it, and both were
+// obvious the moment a Sense controller was in hand:
+//
+//  1. **The threshold could never be met.** `OVRHapticsOutput` runs in
+//     low-latency mode: it keeps `MinimumSafeSamplesQueued` plus one frame's
+//     worth queued — 5 + 4 = **9 samples, 28 ms** — and tops up a few samples
+//     per frame. 28 ms is less than the 32 ms we were waiting for, so the span
+//     test essentially never fired and emission fell to the tie-break case
+//     ("the guest fed nothing since the last pull"), which is a race between
+//     the guest's frame rate and the compositor's.
+//  2. **Worse, the wait lost the samples.** Retirement ran on the clock and
+//     simply dropped what it retired, so a clip could be entirely consumed by
+//     the queue's own drain before the hold ever released it. A note cut is
+//     ~100 ms; most of it evaporated, and what came out was the tail — a blip,
+//     or nothing at all. Held blades still buzzed because that stream never
+//     stops, so the race fires often enough to feel continuous. That exactly
+//     matches what the headset reported: constant vibration fine, note cuts
+//     blippy with no decay, and sometimes silent.
+//
+// So retirement IS playback now. A sample that comes due is a sample the hand
+// should be feeling, and `klovrp_hap_drain` accumulates what it retires into a
+// level the frontend reads each frame. Nothing is buffered on our side and
+// nothing can be dropped; the shape of the clip survives at whatever rate the
+// frontend asks (90 Hz against a 320 Hz envelope, so ~3 samples a window).
+//
+// The floor stays, because ALVR's reason for it stands — "controllers can't do
+// 10ms vibrations" — but it is now a floor on how long a level is HELD, not on
+// how long we wait before reporting one. A 10 ms burst is reported at once and
+// then held for the rest of the 32 ms, which is a drive the actuator can act
+// on rather than a request it ignores.
+#define KLOVRP_HAP_MIN_ON   0.032f     // KL_HAPTICS_MIN_MS
+#define KLOVRP_HAP_MAX_S    0.5f       // the longest window we will describe
 
 // Deltas only, never compared against anything outside this file, so which
 // Darwin monotonic clock this is does not matter — CACurrentMediaTime() on the
@@ -1532,9 +1560,15 @@ static struct klovrp_haptics {
     uint8_t  s[KLOVRP_HAP_MAX];
     int      head;          // index of the next sample due to play
     int      count;         // samples queued, playing forward from head
-    int      published;     // how many of those the frontend already has
     double   t_head;        // monotonic instant at which s[head] plays
-    int      fed;           // did the guest queue anything since the last pull?
+    // What has come due since the frontend last looked. Written by the drain —
+    // which runs from the guest's own state queries as well as from the pull,
+    // so it must accumulate rather than overwrite — and consumed by the pull.
+    float    level;         // peak of those samples, 0..1
+    double   last_pull;     // so the pull can say what window its level covers
+    // ALVR's floor, as a hold rather than a wait. See the model comment above.
+    float    held;
+    double   hold_until;
     // The legacy vibration path, kept SEPARATE from the ring above rather than
     // folded into it. It has to be: this title calls
     // ovrp_SetControllerVibration(mask, 0, 0) on both hands EVERY FRAME — an
@@ -1544,7 +1578,6 @@ static struct klovrp_haptics {
     // symptom would be haptics that are merely intermittent rather than absent.
     float    vib_amp;       // 0 = not vibrating
     double   vib_until;     // when this vibration lapses if not refreshed
-    double   vib_pub;       // vibration handed to the frontend up to this instant
     uint64_t pushes, samples, pulses;
     float    peak;
 } g_hap[2] = {
@@ -1557,24 +1590,32 @@ static int klovrp_hap_trace(void) {
     return on;
 }
 
-// Retire the samples whose moment has passed. This is what makes the state we
-// report a real answer rather than a guess: the queue drains on the wall clock
-// at exactly the rate we told the guest it would, so its own prediction of
-// SamplesQueued (OVRHapticsOutput checks ours against it every frame) agrees.
+// Retire the samples whose moment has passed — **which is the same thing as
+// playing them**, so their peak is accumulated into `level` on the way out
+// rather than discarded. That equivalence is the whole model: the queue drains
+// on the wall clock at exactly the rate we told the guest it would (so
+// OVRHapticsOutput's own per-frame prediction of SamplesQueued agrees with what
+// we report), and every sample it drains is one the hand should have felt.
+//
+// Runs from the pull AND from the guest's own state queries, twice a frame, so
+// it accumulates into `level` and only the pull clears it.
+//
 // Call with the lock held.
 static void klovrp_hap_drain(struct klovrp_haptics *h, double now) {
-    if (h->count <= 0) {
-        h->count = 0; h->published = 0; h->t_head = now;
-        return;
-    }
+    if (h->count <= 0) { h->count = 0; h->t_head = now; return; }
     double due = (now - h->t_head) * KLOVRP_HAP_RATE;
     if (due < 1.0) return;
     int adv = (int)due;
     if (adv > h->count) adv = h->count;
+    // The PEAK across the retired run, not its mean: what a hand feels across a
+    // few milliseconds is the attack, and averaging one over a window that
+    // includes the silence before it turns every sharp cut into a soft push.
+    for (int i = 0; i < adv; i++) {
+        float v = h->s[(h->head + i) % KLOVRP_HAP_MAX] / 255.0f;
+        if (v > h->level) h->level = v;
+    }
     h->head = (h->head + adv) % KLOVRP_HAP_MAX;
     h->count -= adv;
-    h->published -= adv;
-    if (h->published < 0) h->published = 0;
     h->t_head += (double)adv / KLOVRP_HAP_RATE;
     if (h->count == 0) h->t_head = now;
 }
@@ -1604,7 +1645,6 @@ static void klovrp_hap_enqueue(int hand, const uint8_t *s, int n) {
         h->count++;
         if (s[i] / 255.0f > h->peak) h->peak = s[i] / 255.0f;
     }
-    h->fed = 1;
     h->pushes++;
     h->samples += (uint64_t)(n - dropped);
     pthread_mutex_unlock(&h->mu);
@@ -1626,10 +1666,20 @@ static uint64_t klovrp_SetControllerHaptics(int mask, const void *samples,
     if (!samples || n <= 0) return 1;
     if (n > KLOVRP_HAP_MAX) n = KLOVRP_HAP_MAX;   // the guest was told the ceiling
     int hands = klovrp_hap_hands(mask);
-    if (klovrp_hap_trace())
-        fprintf(stderr, "  [ovrp] haptics: SetControllerHaptics(mask=0x%x) "
-                        "%d sample(s), first=%u\n",
-                (unsigned)mask, n, ((const uint8_t *)samples)[0]);
+    // The whole buffer's shape, not just its first byte. The open question this
+    // answers: does this title's note-cut clip carry a DECAY, or is it a square
+    // burst whose fade on a Quest is the LRA's own ring-down? The two want
+    // different things from a Sense controller, and one line of trace settles
+    // it — a decaying clip prints a falling row, a square one a flat row.
+    if (klovrp_hap_trace()) {
+        const uint8_t *s = samples;
+        int lo = 255, hi = 0;
+        for (int i = 0; i < n; i++) { if (s[i] < lo) lo = s[i]; if (s[i] > hi) hi = s[i]; }
+        fprintf(stderr, "  [ovrp] haptics: SetControllerHaptics(mask=0x%x) %d "
+                        "sample(s), %u..%u:", (unsigned)mask, n, lo, hi);
+        for (int i = 0; i < n && i < 32; i++) fprintf(stderr, " %u", s[i]);
+        fprintf(stderr, "%s\n", n > 32 ? " ..." : "");
+    }
     if (hands & 1) klovrp_hap_enqueue(0, samples, n);
     if (hands & 2) klovrp_hap_enqueue(1, samples, n);
     return 1;
@@ -1667,11 +1717,10 @@ static uint64_t klovrp_SetControllerVibration(int mask, float frequency,
         pthread_mutex_lock(&h->mu);
         float was = h->vib_amp;
         h->vib_amp = a;
+        // Refreshing pushes the lapse out; it does not re-trigger anything.
+        // The pull reads this as a level, so a caller re-asserting it every
+        // frame and one asserting it once behave identically.
         h->vib_until = a > 0.0f ? now + lapse : 0.0;
-        // Starting from rest owes the frontend a pulse immediately; refreshing
-        // an already-running vibration must NOT reset the accumulator or a
-        // caller that re-asserts it every frame would re-trigger every frame.
-        if (a > 0.0f && was <= 0.0f) h->vib_pub = now;
         pthread_mutex_unlock(&h->mu);
         // Traced on the EDGE only. The per-frame idle stop above would
         // otherwise bury every other line in this subsystem.
@@ -1723,51 +1772,10 @@ uint64_t klovrp_GetControllerHapticsDesc_impl(int mask, void *out) {
     return OVRP_SUCCESS;
 }
 
-// The buffered source. Returns the span it is handing out, 0 if it has
-// nothing to say yet. Call with the lock held.
-static float klovrp_hap_take_buffered(struct klovrp_haptics *h, float *amp) {
-    int fed = h->fed;
-    h->fed = 0;
-    int pending = h->count - h->published;
-    if (pending <= 0) return 0.0f;
-    float span = (float)pending / KLOVRP_HAP_RATE;
-    // Hold a short span back while the guest is still feeding — the tail of a
-    // clip arrives on the first pull that sees no new samples, so nothing is
-    // ever stranded in the queue.
-    if (span < KLOVRP_HAP_MIN_S && fed) return 0.0f;
-    if (span > KLOVRP_HAP_MAX_S) {
-        span = KLOVRP_HAP_MAX_S;
-        pending = (int)(KLOVRP_HAP_MAX_S * KLOVRP_HAP_RATE);
-    }
-    // The PEAK, not the mean: what a hand feels across a 30 ms window is the
-    // attack, and averaging one over a window that includes the silence before
-    // it turns every sharp cut into a soft push.
-    int peak = 0;
-    for (int i = 0; i < pending; i++) {
-        int v = h->s[(h->head + h->published + i) % KLOVRP_HAP_MAX];
-        if (v > peak) peak = v;
-    }
-    h->published += pending;
-    *amp = peak / 255.0f;
-    return span;
-}
-
-// ...and the level source, in chunks, because a level has no natural end: a
-// running vibration owes the frontend one pulse per elapsed chunk, and the
-// accumulator (`vib_pub`) is what stops a caller that re-asserts it every frame
-// from re-triggering every frame. Chunks are short so that a stop takes effect
-// promptly — nothing can cancel a pulse already handed over. Lock held.
-#define KLOVRP_HAP_VIB_CHUNK 0.1f
-static float klovrp_hap_take_level(struct klovrp_haptics *h, double now, float *amp) {
-    if (h->vib_amp <= 0.0f) return 0.0f;
-    if (now >= h->vib_until) { h->vib_amp = 0.0f; return 0.0f; }
-    double owed = now - h->vib_pub;
-    if (owed < KLOVRP_HAP_VIB_CHUNK) return 0.0f;
-    float span = (float)owed;
-    if (span > KLOVRP_HAP_MAX_S) span = KLOVRP_HAP_MAX_S;
-    h->vib_pub += span;
-    *amp = h->vib_amp;
-    return span;
+static float klovrp_hap_min_on(void) {
+    static float s = -1.0f;
+    if (s < 0.0f) s = kl_env_float("KL_HAPTICS_MIN_MS", KLOVRP_HAP_MIN_ON * 1000.0f) / 1000.0f;
+    return s;
 }
 
 int kl_ovrp_haptics_pull(int hand, float *amplitude, float *seconds) {
@@ -1776,22 +1784,43 @@ int kl_ovrp_haptics_pull(int hand, float *amplitude, float *seconds) {
     double now = klovrp_mono();
     pthread_mutex_lock(&h->mu);
     klovrp_hap_drain(h, now);
-    float amp = 0, span = klovrp_hap_take_buffered(h, &amp);
-    if (span <= 0.0f) {
-        // Only when the buffered path has nothing. The two are alternatives,
-        // not a mix: they are different APIs describing the same actuator, and
-        // in any frame where both had something to say the sample stream is the
-        // one that knows the shape of the effect. Nothing observed so far uses
-        // both at once — the vibration calls this title makes are all stops.
-        span = klovrp_hap_take_level(h, now, &amp);
+
+    float amp = h->level;
+    h->level = 0.0f;
+    // The level API covers the same window. Taken as a maximum rather than as
+    // an alternative: they are two descriptions of one actuator, and the louder
+    // of two simultaneous claims is the safe merge. In practice only one is
+    // ever live — every vibration call this title makes is a stop.
+    if (h->vib_amp > 0.0f) {
+        if (now >= h->vib_until) h->vib_amp = 0.0f;      // lapsed, unrefreshed
+        else if (h->vib_amp > amp) amp = h->vib_amp;
     }
-    if (span > 0.0f && amp > 0.0f) h->pulses++;
+
+    // ALVR's floor: an actuator cannot act on a burst shorter than about 32 ms,
+    // so a level that appears is held for at least that long instead of being
+    // reported once and dropped. Beat Saber's note cut is longer than this, so
+    // the hold only ever extends the tail of one — it does not invent a buzz.
+    if (amp > 0.0f) {
+        h->held = amp;
+        h->hold_until = now + klovrp_hap_min_on();
+    } else if (now < h->hold_until) {
+        amp = h->held;
+    }
+
+    // The window this level describes. The frontend needs it to know how long
+    // to drive for if it cannot follow a level continuously.
+    float span = (float)(h->last_pull > 0 ? now - h->last_pull : klovrp_hap_min_on());
+    if (span > KLOVRP_HAP_MAX_S) span = KLOVRP_HAP_MAX_S;
+    if (span <= 0.0f) span = klovrp_hap_min_on();
+    h->last_pull = now;
+    if (amp > 0.0f) h->pulses++;
     pthread_mutex_unlock(&h->mu);
-    if (span <= 0.0f || amp <= 0.0f) return 0;
+
+    if (amp <= 0.0f) return 0;
     if (amplitude) *amplitude = amp;
     if (seconds) *seconds = span;
     if (klovrp_hap_trace())
-        fprintf(stderr, "  [ovrp] haptics: pull hand %d amp %.2f for %.0f ms\n",
+        fprintf(stderr, "  [ovrp] haptics: hand %d level %.2f over %.0f ms\n",
                 hand, (double)amp, (double)span * 1000.0);
     return 1;
 }

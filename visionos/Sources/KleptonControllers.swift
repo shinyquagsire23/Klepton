@@ -784,19 +784,37 @@ final class KleptonControllers {
     //  drains the queue and drops it. That is not a gap to fill later — it is
     //  what the hardware is.
     //
-    //  Shaped after ALVR's `WorldTracker.sendGamepadHaptics`, which is the
-    //  reference for this platform: one `CHHapticEngine` per hand off
-    //  `GCController.haptics`, and one short `.hapticContinuous` event per
-    //  pulse rather than a long-lived player driven by dynamic parameters. The
-    //  streaming shape would be the better fit for an envelope in principle,
-    //  and it is not what the one implementation known to work on a PSVR2 Sense
-    //  does; the batching that keeps this from becoming a restart per frame
-    //  lives on the C side, where the queue's own lead time is known.
+    //  The engine comes from ALVR (`GCController.haptics` →
+    //  `createEngine(withLocality:)`), the *driving* does not, and the
+    //  difference was forced by a headset. ALVR's source is discrete events
+    //  from a server — one amplitude, one duration — so it plays each as its
+    //  own short `.hapticContinuous`. Ours is a continuous 320 Hz envelope, and
+    //  playing that as a run of short events is a restart per frame: a held
+    //  buzz survives it, a note cut comes out as a blip with no decay.
+    //
+    //  So: **one long-lived looping player per hand, and the envelope is sent
+    //  to it as a dynamic intensity parameter each frame.** No restarts, no
+    //  gaps, and the shape of the clip is what reaches the hand. The player is
+    //  paused after a second of silence and resumed on demand, so an idle run
+    //  is not holding an actuator open.
+    //
+    //  `KL_HAPTICS_PULSE=1` restores the discrete shape (ALVR's, plus its 32 ms
+    //  floor) — the A/B if the continuous player ever misbehaves on hardware,
+    //  and the automatic fallback if the advanced player cannot be made.
 
-    /// One engine per hand, created on that hand's first pulse. Guarded by
-    /// `lock` because `stoppedHandler` fires on CoreHaptics's own queue.
+    /// One engine and one player per hand, created on that hand's first pulse.
+    /// Guarded by `lock` because `stoppedHandler` fires on CoreHaptics's own
+    /// queue.
     private var hapticEngine: [Int: CHHapticEngine] = [:]
-    private var hapticPulses = [0, 0]
+    private var hapticPlayer: [Int: CHHapticAdvancedPatternPlayer] = [:]
+    /// Per hand: is the player started, is it paused, when did it last go
+    /// silent, and the burst being logged.
+    private var hapticRunning = [false, false]
+    private var hapticSilentSince: [TimeInterval] = [0, 0]
+    private var hapticBurstPeak: [Float] = [0, 0]
+    private var hapticBurstStart: [TimeInterval] = [0, 0]
+    private var hapticBursts = [0, 0]
+    private var hapticPulseMode = [false, false]     // fell back to discrete?
     private var notedHaptics = Set<String>()
 
     /// `KL_HAPTICS_OFF=1` turns the path off outright — the pull still runs, so
@@ -811,6 +829,16 @@ final class KleptonControllers {
     /// no equivalent of (see kl_ovrp.h on why frequency is not in the seam).
     /// 1.0 is ALVR's constant: crisp, which is what a note cut is.
     private static let sharpness = klEnvFloat("KL_HAPTICS_SHARPNESS", 1.0)
+    /// `KL_HAPTICS_PULSE=1` — drive with discrete per-frame events (ALVR's
+    /// shape) instead of one continuous player. The A/B if the buzz is ever
+    /// wrong in a way the envelope does not explain, and what a hand falls back
+    /// to on its own if the continuous player cannot be made or started.
+    private static let pulseMode = klEnvOn("KL_HAPTICS_PULSE", default: false)
+    /// The floor a discrete event is never shorter than — ALVR's "controllers
+    /// can't do 10ms vibrations". The continuous path gets the same floor from
+    /// kl_ovrp's side, where it is a hold on the level instead.
+    /// `KL_HAPTICS_MIN_MS` moves both.
+    private static let minOn = klEnvFloat("KL_HAPTICS_MIN_MS", 32) / 1000
 
     /// Which hand a controller is, by vendor name — the same rule `pollButtons`
     /// uses, and in one place so the two cannot drift apart. GCController does
@@ -820,26 +848,84 @@ final class KleptonControllers {
         (c.vendorName ?? "").hasSuffix("(L)") ? 0 : 1
     }
 
-    /// Drain both hands and play what comes out. Called once a frame from the
-    /// compositor, beside `update`.
+    /// Follow both hands' envelopes. Called once a frame from the compositor,
+    /// beside `update`.
+    ///
+    /// The pull is a LEVEL — what the hand should be feeling right now — not an
+    /// event to schedule. Draining it unconditionally, even with playback off,
+    /// keeps the two sides in step.
     func pumpHaptics() {
+        let now = ProcessInfo.processInfo.systemUptime
         for hand in 0...1 {
             var amplitude: Float = 0, seconds: Float = 0
-            guard kl_ovrp_haptics_pull(Int32(hand), &amplitude, &seconds) != 0 else { continue }
+            let live = kl_ovrp_haptics_pull(Int32(hand), &amplitude, &seconds) != 0
             guard Self.hapticsEnabled else { continue }
-            play(hand: hand, amplitude: amplitude, seconds: seconds)
+            let level = live ? min(max(amplitude * Self.gain, 0), 1) : 0
+            traceBurst(hand: hand, level: level, at: now)
+            if Self.pulseMode || hapticPulseMode[hand] {
+                if level > 0 { playPulse(hand: hand, level: level, seconds: seconds) }
+            } else {
+                drive(hand: hand, level: level, at: now)
+            }
         }
     }
 
-    private func play(hand: Int, amplitude: Float, seconds: Float) {
+    /// The continuous path: hold one looping player per hand and move its
+    /// intensity. Starting it costs a `start`; every frame after that is one
+    /// `sendParameters`, which is what keeps the envelope unbroken.
+    private func drive(hand: Int, level: Float, at now: TimeInterval) {
+        if level <= 0 {
+            guard hapticRunning[hand] else { return }
+            // Silence first, then pause once it has been quiet a while: pausing
+            // immediately would make every gap between two clips a stop/start
+            // pair, which is the restart this design exists to avoid.
+            send(hand: hand, level: 0)
+            if hapticSilentSince[hand] == 0 { hapticSilentSince[hand] = now }
+            if now - hapticSilentSince[hand] > 1.0 {
+                try? hapticPlayer[hand]?.pause(atTime: CHHapticTimeImmediate)
+                hapticRunning[hand] = false
+                hapticSilentSince[hand] = 0
+            }
+            return
+        }
+        hapticSilentSince[hand] = 0
+        if !hapticRunning[hand] {
+            guard let player = hapticsPlayer(for: hand) else { return }
+            do { try player.start(atTime: CHHapticTimeImmediate) }
+            catch {
+                NSLog("[cp] haptics: hand \(hand) player would not start: \(error)"
+                      + " — falling back to discrete pulses")
+                hapticPulseMode[hand] = true
+                playPulse(hand: hand, level: level, seconds: Self.minOn)
+                return
+            }
+            hapticRunning[hand] = true
+        }
+        send(hand: hand, level: level)
+    }
+
+    private func send(hand: Int, level: Float) {
+        guard let player = hapticPlayer[hand] else { return }
+        do {
+            try player.sendParameters([CHHapticDynamicParameter(
+                parameterID: .hapticIntensityControl, value: level, relativeTime: 0)],
+                atTime: CHHapticTimeImmediate)
+        } catch {
+            NSLog("[cp] haptics: hand \(hand) parameter send failed: \(error)"
+                  + " — dropping the engine")
+            dropHapticsEngine(hand)
+        }
+    }
+
+    /// ALVR's shape, kept as the fallback and the A/B: one short continuous
+    /// event per frame, never shorter than the floor.
+    private func playPulse(hand: Int, level: Float, seconds: Float) {
         guard let engine = hapticsEngine(for: hand) else { return }
-        let intensity = min(max(amplitude * Self.gain, 0), 1)
-        guard intensity > 0, seconds > 0 else { return }
         do {
             let event = CHHapticEvent(eventType: .hapticContinuous, parameters: [
-                CHHapticEventParameter(parameterID: .hapticIntensity, value: intensity),
+                CHHapticEventParameter(parameterID: .hapticIntensity, value: level),
                 CHHapticEventParameter(parameterID: .hapticSharpness, value: Self.sharpness),
-            ], relativeTime: 0, duration: Double(seconds))
+            ], relativeTime: 0, duration: Double(max(seconds, Self.minOn)))
             let pattern = try CHHapticPattern(events: [event], parameters: [])
             try engine.makePlayer(with: pattern).start(atTime: CHHapticTimeImmediate)
         } catch {
@@ -849,15 +935,51 @@ final class KleptonControllers {
             // frame for the rest of the run. A rebuild is one lazy `createEngine`.
             NSLog("[cp] haptics: hand \(hand) pulse failed: \(error) — dropping the engine")
             dropHapticsEngine(hand)
+        }
+    }
+
+    /// One line per BURST rather than per frame: at 90 Hz a held buzz would
+    /// otherwise be ninety log lines a second, and what is worth reading is the
+    /// shape — how loud it got and how long it lasted. The first burst per hand
+    /// is the one that matters most; it is the only evidence the whole chain
+    /// (guest clip → queue → pull → engine) reached an actuator.
+    private func traceBurst(hand: Int, level: Float, at now: TimeInterval) {
+        if level > 0 {
+            if hapticBurstStart[hand] == 0 { hapticBurstStart[hand] = now; hapticBurstPeak[hand] = 0 }
+            hapticBurstPeak[hand] = max(hapticBurstPeak[hand], level)
             return
         }
-        hapticPulses[hand] += 1
-        // The first pulse per hand is the one worth seeing on device: it is the
-        // only evidence that the whole chain — guest clip, queue, pull, engine —
-        // reached an actuator. After that, every 200th.
-        if hapticPulses[hand] == 1 || hapticPulses[hand] % 200 == 0 {
-            NSLog(String(format: "[cp] haptics: hand %d pulse %d — %.2f for %.0f ms",
-                         hand, hapticPulses[hand], intensity, seconds * 1000))
+        guard hapticBurstStart[hand] != 0 else { return }
+        let ms = (now - hapticBurstStart[hand]) * 1000
+        hapticBursts[hand] += 1
+        if hapticBursts[hand] <= 3 || hapticBursts[hand] % 100 == 0 {
+            NSLog(String(format: "[cp] haptics: hand %d burst %d — peak %.2f over %.0f ms",
+                         hand, hapticBursts[hand], hapticBurstPeak[hand], ms))
+        }
+        hapticBurstStart[hand] = 0
+    }
+
+    private func hapticsPlayer(for hand: Int) -> CHHapticAdvancedPatternPlayer? {
+        if let existing = hapticPlayer[hand] { return existing }
+        guard let engine = hapticsEngine(for: hand) else { return nil }
+        do {
+            // Intensity 1.0 in the pattern, because the dynamic parameter
+            // SCALES it — an event authored quieter would cap everything below.
+            // The event's own duration is irrelevant: the player loops.
+            let event = CHHapticEvent(eventType: .hapticContinuous, parameters: [
+                CHHapticEventParameter(parameterID: .hapticIntensity, value: 1.0),
+                CHHapticEventParameter(parameterID: .hapticSharpness, value: Self.sharpness),
+            ], relativeTime: 0, duration: 1.0)
+            let player = try engine.makeAdvancedPlayer(
+                with: CHHapticPattern(events: [event], parameters: []))
+            player.loopEnabled = true
+            hapticPlayer[hand] = player
+            return player
+        } catch {
+            NSLog("[cp] haptics: hand \(hand) has no continuous player (\(error))"
+                  + " — falling back to discrete pulses")
+            hapticPulseMode[hand] = true
+            return nil
         }
     }
 
@@ -910,6 +1032,11 @@ final class KleptonControllers {
     private func dropHapticsEngine(_ hand: Int) {
         lock.lock()
         let engine = hapticEngine.removeValue(forKey: hand)
+        // The player belongs to the engine; keeping it past one would be a
+        // player on a dead engine, which throws on every frame's parameter send.
+        hapticPlayer.removeValue(forKey: hand)
+        hapticRunning[hand] = false
+        hapticSilentSince[hand] = 0
         lock.unlock()
         engine?.stop()
     }
@@ -919,6 +1046,9 @@ final class KleptonControllers {
         lock.lock()
         let engines = hapticEngine
         hapticEngine.removeAll()
+        hapticPlayer.removeAll()
+        hapticRunning = [false, false]
+        hapticSilentSince = [0, 0]
         lock.unlock()
         for (_, e) in engines { e.stop() }
     }

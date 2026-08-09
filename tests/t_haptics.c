@@ -97,31 +97,37 @@ int main(void) {
     hstate r = get_state(RTOUCH);
     CHECK(r.queued == 0, "the right hand queued %d from a left-hand push", r.queued);
 
-    // 4. 20 samples is 62 ms, past the 32 ms floor, so it comes out whole.
+    // 4. Nothing has come due yet, so there is nothing to feel yet: the pull
+    //    reports what the last window PLAYED, not what is scheduled.
     float amp = 0, secs = 0;
-    CHECK(kl_ovrp_haptics_pull(0, &amp, &secs), "no pulse from a 20-sample push");
-    printf("  pulse: %.2f for %.0f ms\n", (double)amp, (double)secs * 1000);
+    CHECK(!kl_ovrp_haptics_pull(0, &amp, &secs),
+          "a level was reported before any sample had come due");
+
+    // 5. **The bug this model exists to prevent.** Wait out the clip WITHOUT
+    //    pulling, exactly as a slow frame would, then pull once. Every one of
+    //    those 20 samples has now been retired by the clock — and the hand must
+    //    still be told about them. The first implementation dropped whatever
+    //    the drain retired, so a note cut evaporated between frames and came
+    //    out as a blip or as silence.
+    nap(0.08);                             // 20 samples is 62 ms
+    s = get_state(LTOUCH);
+    CHECK(s.queued == 0, "%d sample(s) left after the clip's own duration", s.queued);
+    CHECK(kl_ovrp_haptics_pull(0, &amp, &secs),
+          "a clip that played out between two pulls was lost");
+    printf("  level: %.2f over %.0f ms\n", (double)amp, (double)secs * 1000);
     CHECK(amp > 0.75f && amp < 0.82f, "amplitude %.3f, expected 200/255", (double)amp);
-    CHECK(secs > 0.055f && secs < 0.07f, "span %.4f s, expected 20/320", (double)secs);
 
-    // 5. A pull is a DRAIN: the same samples do not come out twice.
-    CHECK(!kl_ovrp_haptics_pull(0, &amp, &secs), "the same samples pulled twice");
-
-    // 6. The short-span hold, and that nothing is stranded by it. Five samples
-    //    is 15 ms — under the floor — so the first pull holds it back while the
-    //    guest may still be feeding, and the next one flushes the tail.
-    push(LTOUCH, 128, 5);
-    CHECK(!kl_ovrp_haptics_pull(0, &amp, &secs), "a 15 ms span was not held back");
-    CHECK(kl_ovrp_haptics_pull(0, &amp, &secs), "the held tail was never flushed");
-    CHECK(amp > 0.47f && amp < 0.53f, "tail amplitude %.3f, expected 128/255", (double)amp);
+    // 6. A window is reported once... but ALVR's floor holds the level up for
+    //    32 ms after the samples run out, because an actuator cannot act on a
+    //    shorter burst. So the drop to silence comes after the hold, not
+    //    immediately.
+    CHECK(kl_ovrp_haptics_pull(0, &amp, &secs), "the 32 ms hold did not hold");
+    nap(0.05);
+    CHECK(!kl_ovrp_haptics_pull(0, &amp, &secs), "the level never returned to silence");
 
     // 7. **The regression guard.** A per-frame vibration stop must leave the
-    //    buffered queue alone. See the header comment.
-    //
-    //    Measured as a difference, because a pull does not retire anything —
-    //    only the clock does, so what is queued here is everything pushed above
-    //    that has not yet had its moment. That is the model working, and a test
-    //    that asserted an absolute count would be asserting the sleep schedule.
+    //    buffered queue alone. This title sends one every frame on both hands
+    //    while OVRHaptics is feeding the sample path.
     push(LTOUCH, 255, 20);
     hstate before = get_state(LTOUCH);
     set_vibration(LTOUCH | RTOUCH, 0.0f, 0.0f);
@@ -129,8 +135,9 @@ int main(void) {
     CHECK(s.queued >= before.queued - 1,
           "a vibration stop emptied the sample queue (%d -> %d)",
           before.queued, s.queued);
+    nap(0.08);
     CHECK(kl_ovrp_haptics_pull(0, &amp, &secs),
-          "a vibration stop swallowed the buffered pulse");
+          "a vibration stop swallowed the buffered clip");
     CHECK(amp > 0.98f, "amplitude %.3f after the stop, expected 1.0", (double)amp);
 
     // 8. The peak, not the mean. A clip that is mostly silence with one loud
@@ -142,16 +149,38 @@ int main(void) {
         buf[3] = 255;
         hbuffer b = { buf, 20 };
         set_haptics(RTOUCH, b);
-        CHECK(kl_ovrp_haptics_pull(1, &amp, &secs), "no pulse from a spiked clip");
+        nap(0.08);
+        CHECK(kl_ovrp_haptics_pull(1, &amp, &secs), "no level from a spiked clip");
         CHECK(amp > 0.98f, "amplitude %.3f from a spiked clip — averaged, not peaked",
               (double)amp);
     }
 
-    // 9. The queue retires on the wall clock at the rate we told the guest it
-    //    would, whether or not anything is draining it. This is what keeps
-    //    `available` honest on a host with no actuator at all — and it is also
-    //    why everything above could keep pushing without ever running the
-    //    buffer dry. Let what is left of that lapse first.
+    // 9. The envelope survives across windows. A ramp pulled twice, half way
+    //    through, must report a lower level first and a higher one second —
+    //    which is the whole difference between a shaped clip and the flat block
+    //    the peak-per-clip version produced.
+    nap(0.2);
+    (void)kl_ovrp_haptics_pull(0, &amp, &secs);        // clear the hold
+    {
+        uint8_t ramp[64];
+        for (int i = 0; i < 64; i++) ramp[i] = (uint8_t)(i * 4);   // 0 -> 252
+        hbuffer b = { ramp, 64 };                                  // 200 ms
+        set_haptics(LTOUCH, b);
+        nap(0.10);
+        float first = 0;
+        CHECK(kl_ovrp_haptics_pull(0, &first, &secs), "no level from the ramp's first half");
+        nap(0.12);
+        float second = 0;
+        CHECK(kl_ovrp_haptics_pull(0, &second, &secs), "no level from the ramp's second half");
+        printf("  ramp: %.2f then %.2f\n", (double)first, (double)second);
+        CHECK(second > first + 0.2f,
+              "the ramp came out flat (%.2f then %.2f) — the envelope was collapsed",
+              (double)first, (double)second);
+    }
+
+    // 10. The queue retires on the wall clock at the rate we told the guest it
+    //     would, whether or not anything is draining it. This is what keeps
+    //     `available` honest on a host with no actuator at all.
     nap(0.5);
     s = get_state(LTOUCH);
     CHECK(s.queued == 0, "%d sample(s) survived a 500 ms idle", s.queued);
@@ -163,20 +192,19 @@ int main(void) {
     CHECK(s.queued == 0, "%d sample(s) still queued 300 ms after a 200 ms clip",
           s.queued);
 
-    // 10. The level API. It owes a pulse per elapsed chunk rather than one per
-    //     call, so a caller re-asserting it every frame does not re-trigger it
-    //     every frame — and it lapses on its own if never refreshed.
+    // 11. The level API reads as a level: asserting it once and re-asserting it
+    //     every frame behave identically, and it lapses if never refreshed.
+    nap(0.1);
+    (void)kl_ovrp_haptics_pull(1, &amp, &secs);       // clear any hold
     set_vibration(RTOUCH, 0.5f, 0.75f);
-    CHECK(!kl_ovrp_haptics_pull(1, &amp, &secs),
-          "a vibration produced a pulse before any time had passed");
-    nap(0.15);
-    set_vibration(RTOUCH, 0.5f, 0.75f);    // the re-assert, as a guest would
     CHECK(kl_ovrp_haptics_pull(1, &amp, &secs), "a running vibration produced nothing");
     CHECK(amp > 0.73f && amp < 0.77f, "vibration amplitude %.3f, expected 0.75",
           (double)amp);
+    set_vibration(RTOUCH, 0.5f, 0.75f);    // the re-assert, as a guest would
+    CHECK(kl_ovrp_haptics_pull(1, &amp, &secs), "a re-asserted vibration stopped");
     set_vibration(RTOUCH, 0.0f, 0.0f);
-    nap(0.15);
-    CHECK(!kl_ovrp_haptics_pull(1, &amp, &secs), "a stopped vibration kept pulsing");
+    nap(0.05);                             // past the 32 ms hold
+    CHECK(!kl_ovrp_haptics_pull(1, &amp, &secs), "a stopped vibration kept buzzing");
 
     printf(fails ? "\nFAIL: %d check(s)\n" : "\nPASS: the haptics seam behaves\n",
            fails);

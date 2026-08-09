@@ -108,17 +108,33 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
 // contract and why every field of the descriptor is load-bearing), and a
 // frontend that has something to vibrate drains it here.
 //
-// **Call this once per hand per frame.** It returns 1 when there is a pulse to
-// play, filling `amplitude` (0..1, the PEAK across the span) and `seconds`
-// (how long that span covers, 32 ms..0.5 s). It returns 0 far more often than
-// not — when nothing is queued, and also while a clip is still being fed and
-// the span so far is too short to be worth starting an engine for. Neither is
-// an error and neither loses anything: the queue runs ~60 ms ahead of what the
-// hand feels, and the tail of a clip is flushed by the first call that sees no
-// new samples.
+// **It is an envelope follower, and it must be called once per hand per
+// frame.** It returns 1 when the hand should be buzzing right now, filling
+// `amplitude` (0..1 — the PEAK of the samples that came due since the previous
+// call) and `seconds` (how long that window was). The frontend's job is to
+// drive the actuator at that level until the next call: this is a LEVEL, not an
+// event to schedule, and a caller that plays each one as an independent pulse
+// gets a restart per frame.
 //
-// It is a DRAIN, not a query — what it returns is handed out once. Two callers
-// would each get half a pulse.
+// It is a DRAIN, not a query — a window is reported once. Two callers would
+// each see half the envelope.
+//
+// Not calling it is safe and loses nothing structural: the guest's queue
+// retires on the clock either way, so `SamplesAvailable` stays honest on a host
+// with no actuator. What is lost is the samples themselves, which is correct —
+// there was nothing to feel them.
+//
+// **Do not reintroduce batching here.** The obvious-looking optimisation — hold
+// samples back until enough accumulate to be worth one pulse — was the first
+// implementation and it failed on hardware in two ways at once: OVRHapticsOutput
+// keeps only ~28 ms queued in low-latency mode, so a 32 ms threshold never
+// fired; and the wait let the queue's own drain retire a clip before it was
+// ever handed over. Note cuts came out as blips or as nothing while a held
+// buzz was fine. kl_ovrp.c has the full account.
+//
+// ALVR's floor is honoured, as a hold: once a level appears it is reported for
+// at least KL_HAPTICS_MIN_MS (32 ms) even if the samples ran out sooner,
+// because an actuator cannot act on a 10 ms burst.
 //
 // Frequency is deliberately not part of this seam. OVRPlugin's is a selector
 // between two fixed Touch motor rates, and the second axis a Sense controller

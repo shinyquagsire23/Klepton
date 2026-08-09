@@ -434,16 +434,27 @@ puts the camera on the ground with its hands underneath it.
 ### Haptics (`runtime/kl_ovrp.c` — the seam that runs OUT of the guest)
 
 The guest queues an amplitude envelope through OVRPlugin's buffered haptics API
-(320 Hz, one byte a sample); `kl_ovrp_haptics_pull` hands it to whatever the
-frontend has. Platform-independent — the visionOS playback knobs are in the
-visionOS section.
+(320 Hz, one byte a sample); `kl_ovrp_haptics_pull` is an **envelope follower**
+that reports what came due since the frontend last asked. Platform-independent
+— the visionOS playback knobs are in the visionOS section.
+
+- `KL_HAPTICS_MIN_MS=<ms>` — how long a level is held after its samples run
+  out, default 32. ALVR's number and ALVR's reason: *"controllers can't do 10ms
+  vibrations"*. It is a floor on the DRIVE, not on how long we wait before
+  reporting one — waiting was the first design and it lost note cuts entirely
+  (PLANNING §12.20). The same knob sets the floor on a discrete pulse's
+  duration in the visionOS fallback path.
 
 - `KL_HAPTICS_TRACE=1` — both halves of the conversation: every buffer the
-  guest queues (and its first sample), every pulse pulled, and every *edge* of
-  the legacy vibration API. Edges only for that last one on purpose — this
-  title calls `ovrp_SetControllerVibration(mask, 0, 0)` on both hands every
-  single frame as an idle "nothing should be buzzing", and tracing those would
-  bury everything else.
+  guest queues **printed as samples** (up to 32, with its min..max), every
+  level pulled, and every *edge* of the legacy vibration API. Edges only for
+  that last one on purpose — this title calls
+  `ovrp_SetControllerVibration(mask, 0, 0)` on both hands every single frame as
+  an idle "nothing should be buzzing", and tracing those would bury everything
+  else. The sample row answers the one open question about the source: a
+  note-cut clip that carries its own **decay** prints a falling row, a square
+  burst (whose fade on a Quest would be the LRA's ring-down, not data) prints a
+  flat one.
 - `KL_HAPTICS_SWAP_STATE=1` — swap the two words of `ovrpHapticsState`
   (`SamplesAvailable` / `SamplesQueued`). The A/B for the one ABI claim in this
   subsystem that fails **silently**: get the order backwards and the guest
@@ -718,6 +729,14 @@ except its own control vars (next section). See PLANNING §12.
 - `KL_HAPTICS_SHARPNESS=<0..1>` — CoreHaptics's second axis, which OVRPlugin
   has no equivalent of (kl_ovrp.h says why frequency is not in the seam).
   Default 1.0, ALVR's constant: crisp, which is what a note cut is.
+- `KL_HAPTICS_PULSE=1` — drive with a discrete `.hapticContinuous` event per
+  frame (ALVR's shape, floored at `KL_HAPTICS_MIN_MS`) instead of the default:
+  **one long-lived looping player per hand whose intensity follows the guest's
+  envelope**. ALVR's source is discrete server events; ours is a continuous
+  320 Hz stream, and playing that as a run of short events is a restart per
+  frame — which is what a note cut felt like on device before §12.20. A hand
+  also falls back to this on its own if the continuous player cannot be made
+  or started, and says so in the log.
 - `KL_CP_PROBE=<n>` — bisection ladder for a dark compositor: 1 = clear only
   (colour cycles R/G/B so a constant field cannot be misread), 2 = flat
   magenta quad (geometry only), 3 = sampled with alpha forced to 1, 4 =
