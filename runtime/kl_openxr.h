@@ -51,4 +51,13 @@ void *kl_openxr_lookup(const char *name);
 // shape kl_ovrp_report prints for M6.
 void kl_openxr_report(FILE *f);
 
+// SL-16 — the reference-space algebra, checked with no session, no guest and no
+// Steam host. Returns non-zero if every invariant holds; `make xrspace`.
+//
+// It is a gate rather than a run because the failure it catches is a silently
+// wrong POSE: every call succeeded, the picture was correct, and the only
+// instrument that could see it was a person turning their head — which on this
+// arc costs a fresh pairing and cannot be repeated identically.
+int kl_openxr_space_selftest(FILE *f);
+
 #endif

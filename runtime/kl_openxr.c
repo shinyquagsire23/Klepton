@@ -1256,21 +1256,121 @@ static const char *klxr_ref_space_name(int t) {
     }
 }
 
-// The y of a reference space's origin in the tracking space kl_ovrp answers in.
+// Which spaces the guest actually asks to be located, and in what — recorded
+// the first time each combination is seen, because at 90 Hz this can only be a
+// census.
+//
+// The list of resolved entry points cannot answer this and reading it as if it
+// could has cost time before (SL-14): a guest resolves plenty it never calls,
+// and `xrLocateViews` appearing there says nothing about which space it passes.
+// The distinction is the whole question. A guest that locates its views in VIEW
+// space is asking "where are the eyes relative to the head" — an eye-to-head —
+// and one that locates them in LOCAL is asking where they are in the world.
+// Those two answers differ by the standing height, and answering the first with
+// the second puts that height into the eye-to-head: a lever arm the head then
+// swings around instead of turning in place.
+//
+// Returns 1 the first time a combination is seen, and nothing else: the caller
+// prints the line, in one fprintf, once it also has the answer it gave. Split
+// across the computation it would be split in the log too — the guest logs from
+// several threads and one landed in the middle of the first version of this.
+static int klxr_locate_seen(const char *call, int sp_type, int base_type) {
+    static struct { const char *call; int sp, base; } seen[16];
+    static int n;
+    for (int i = 0; i < n; i++)
+        if (seen[i].call == call && seen[i].sp == sp_type && seen[i].base == base_type)
+            return 0;
+    if (n == (int)(sizeof seen / sizeof seen[0])) return 0;
+    seen[n].call = call; seen[n].sp = sp_type; seen[n].base = base_type; n++;
+    return 1;
+}
+
+// Quaternion and pose algebra. Locating one space in another is a rigid
+// transform, and the moment VIEW is one of the two it is a transform with a
+// rotation in it — which is why this is here rather than a subtraction.
+static XrQuaternionf klxr_qconj(XrQuaternionf q) {
+    return (XrQuaternionf){-q.x, -q.y, -q.z, q.w};
+}
+
+static XrQuaternionf klxr_qmul(XrQuaternionf a, XrQuaternionf b) {
+    return (XrQuaternionf){
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+    };
+}
+
+static XrVector3f klxr_qrot(XrQuaternionf q, XrVector3f v) {
+    // v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v), the usual form that
+    // needs no matrix and no normalisation.
+    float tx = 2.0f * (q.y * v.z - q.z * v.y);
+    float ty = 2.0f * (q.z * v.x - q.x * v.z);
+    float tz = 2.0f * (q.x * v.y - q.y * v.x);
+    return (XrVector3f){
+        v.x + q.w * tx + (q.y * tz - q.z * ty),
+        v.y + q.w * ty + (q.z * tx - q.x * tz),
+        v.z + q.w * tz + (q.x * ty - q.y * tx),
+    };
+}
+
+// b expressed in a's frame: inverse(a) * b.
+static XrPosef klxr_pose_rel(XrPosef a, XrPosef b) {
+    XrQuaternionf inv = klxr_qconj(a.orientation);
+    XrVector3f d = { b.position.x - a.position.x,
+                     b.position.y - a.position.y,
+                     b.position.z - a.position.z };
+    XrPosef out;
+    out.position = klxr_qrot(inv, d);
+    out.orientation = klxr_qmul(inv, b.orientation);
+    return out;
+}
+
+// Where a space's origin is, as a pose in the tracking space kl_ovrp answers in.
 //
 // That space is floor-relative: y = 0 is the floor and the head stands at
-// KL_OVRP_EYE_HEIGHT above it. So STAGE is the tracking space unchanged, and
-// LOCAL — whose origin OpenXR puts where the head started, at eye level — is
-// that same space raised by the standing height. VIEW has no fixed origin at
-// all; it IS the head, so it never appears here as a base.
+// KL_OVRP_EYE_HEIGHT above it. So STAGE is the tracking space unchanged, LOCAL
+// — whose origin OpenXR puts where the head started, at eye level — is that
+// same space raised by the standing height, and VIEW *is the head*, pose and
+// all.
 //
-// Getting this wrong is not subtle in the end result and is very subtle in the
-// code: an app that places its UI in LOCAL and is answered STAGE puts every
-// panel on the floor.
-static float klxr_space_origin_y(const klxr_space *sp) {
-    if (!sp) return 0.0f;
-    if (sp->reference_type == KLXR_REF_SPACE_LOCAL) return kl_ovrp_eye_height();
-    return 0.0f;    // STAGE, and the tracking space itself
+// VIEW being a whole pose rather than a y displacement is the point of this
+// function. It used to be a single float, with a comment asserting that VIEW
+// "never appears here as a base" — and this guest passes VIEW as the base to
+// xrLocateViews, which is how a client asks for its eye-to-head. Answered with
+// a y of zero, the eye-to-head came back carrying the standing height, so the
+// eye sat 1.7 m from the point it was rotated about and the head swung through
+// a large arc instead of turning in place. The census above is what settles
+// which spaces a guest actually asks about; do not assume it confines itself to
+// the two static ones.
+//
+// Getting the static two wrong is not subtle in the end result and is very
+// subtle here: an app that places its UI in LOCAL and is answered STAGE puts
+// every panel on the floor.
+static XrPosef klxr_space_pose(const klxr_space *sp) {
+    XrPosef base = { {0, 0, 0, 1}, {0, 0, 0} };   // STAGE, and the tracking space
+    if (!sp) return base;
+    if (sp->reference_type == KLXR_REF_SPACE_VIEW) {
+        kl_ovrp_get_guest_head_pose(&base.position.x, &base.position.y,
+                                    &base.position.z, &base.orientation.x,
+                                    &base.orientation.y, &base.orientation.z,
+                                    &base.orientation.w);
+    } else if (sp->reference_type == KLXR_REF_SPACE_LOCAL) {
+        base.position.y = kl_ovrp_eye_height();
+    }
+
+    // ...and the pose the guest asked its space to sit at within that reference
+    // space. Every space this guest creates is at the identity, so composing it
+    // costs nothing here — but a field we store and never read is a trap for
+    // the next guest, and a recentre is exactly the sort of thing a client sets
+    // once and then relies on for the rest of the session.
+    XrPosef out;
+    XrVector3f off = klxr_qrot(base.orientation, sp->offset.position);
+    out.position = (XrVector3f){ base.position.x + off.x,
+                                 base.position.y + off.y,
+                                 base.position.z + off.z };
+    out.orientation = klxr_qmul(base.orientation, sp->offset.orientation);
+    return out;
 }
 
 static XrResult klxr_CreateReferenceSpace(void *session,
@@ -2082,37 +2182,46 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
     if (r != KLXR_SUCCESS || capacity == 0) return r;
     if (!views) return KLXR_ERROR_VALIDATION_FAILURE;
 
-    // The views are wanted in `base`'s frame, and the two reference spaces
-    // differ by the standing eye height — see klxr_space_origin_y.
-    float base_y = klxr_space_origin_y(base);
+    // The views are wanted in `base`'s frame, so each eye is composed out of the
+    // tracking space and into that one — see klxr_space_pose. When `base` is
+    // VIEW this is the eye-to-head, and it must come back with no standing
+    // height in it, which is what the census below prints.
+    int say = klxr_locate_seen("xrLocateViews", -1, base->reference_type);
+    XrPosef base_pose = klxr_space_pose(base);
 
     for (uint32_t e = 0; e < 2; e++) {
         float px, py, pz, qx, qy, qz, qw, tan[4];
         kl_ovrp_eye_view((int)e, &px, &py, &pz, &qx, &qy, &qz, &qw, tan);
         klxr_log_chain("xrLocateViews", views[e].next);
+        XrPosef eye = { {qx, qy, qz, qw}, {px, py, pz} };
         views[e].type = XR_TYPE_VIEW;
-        views[e].pose.position.x = px;
-        views[e].pose.position.y = py - base_y;
-        views[e].pose.position.z = pz;
-        views[e].pose.orientation.x = qx; views[e].pose.orientation.y = qy;
-        views[e].pose.orientation.z = qz; views[e].pose.orientation.w = qw;
+        views[e].pose = klxr_pose_rel(base_pose, eye);
         views[e].fov.angleLeft  = -atanf(tan[0]);
         views[e].fov.angleRight =  atanf(tan[1]);
         views[e].fov.angleUp    =  atanf(tan[2]);
         views[e].fov.angleDown  = -atanf(tan[3]);
     }
+    if (say)
+        fprintf(stderr, "  [xr] xrLocateViews in %s: eye 0 at (%.3f %.3f %.3f), "
+                        "eye 1 at (%.3f %.3f %.3f)\n",
+                klxr_ref_space_name(base->reference_type),
+                views[0].pose.position.x, views[0].pose.position.y,
+                views[0].pose.position.z, views[1].pose.position.x,
+                views[1].pose.position.y, views[1].pose.position.z);
     return KLXR_SUCCESS;
 }
 
 // Where one space is, relative to another.
 //
-// Three cases, and the only interesting one is VIEW: the head. LOCAL and STAGE
-// are both fixed frames of the tracking space, differing by the standing eye
-// height, so locating one in the other is that offset and nothing else. An
-// action space is anchored to a controller, and we have no controllers — so it
-// is located with no valid bits, which is the specified way to say "this is not
-// being tracked right now" and is exactly what xrGetActionStatePose already
-// reports about the action behind it.
+// Both spaces are put into the tracking space and one is composed into the
+// other, which is klxr_space_pose and klxr_pose_rel and nothing else here. The
+// pair that used to be special-cased — VIEW located in a static space — is just
+// the case where the left operand carries a rotation, and the pair that used to
+// be impossible to express — anything located in VIEW — now falls out. An
+// action space is anchored to a controller, and we have no controllers, so it
+// is located with no valid bits: the specified way to say "this is not being
+// tracked right now", and exactly what xrGetActionStatePose already reports
+// about the action behind it.
 static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
                                  XrSpaceLocation *location) {
     klxr_space *sp = klxr_space_of(space);
@@ -2128,19 +2237,21 @@ static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
     location->pose.position = (XrVector3f){0, 0, 0};
     location->locationFlags = 0;
 
-    if (sp->reference_type == 0) return KLXR_SUCCESS;   // action space: untracked
-
-    float base_y = klxr_space_origin_y(bs);
-    if (sp->reference_type == KLXR_REF_SPACE_VIEW) {
-        float px, py, pz, qx, qy, qz, qw;
-        kl_ovrp_get_guest_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
-        location->pose.position = (XrVector3f){px, py - base_y, pz};
-        location->pose.orientation = (XrQuaternionf){qx, qy, qz, qw};
-    } else {
-        location->pose.position.y = klxr_space_origin_y(sp) - base_y;
+    int say = klxr_locate_seen("xrLocateSpace", sp->reference_type, bs->reference_type);
+    const char *in = klxr_ref_space_name(bs->reference_type);
+    if (sp->reference_type == 0) {
+        if (say) fprintf(stderr, "  [xr] xrLocateSpace: action space in %s: untracked\n", in);
+        return KLXR_SUCCESS;                            // action space: untracked
     }
+
+    location->pose = klxr_pose_rel(klxr_space_pose(bs), klxr_space_pose(sp));
     location->locationFlags = KLXR_SPACE_ORIENTATION_VALID | KLXR_SPACE_POSITION_VALID |
                               KLXR_SPACE_ORIENTATION_TRACKED | KLXR_SPACE_POSITION_TRACKED;
+    if (say)
+        fprintf(stderr, "  [xr] xrLocateSpace: %s in %s: (%.3f %.3f %.3f)\n",
+                klxr_ref_space_name(sp->reference_type), in,
+                location->pose.position.x, location->pose.position.y,
+                location->pose.position.z);
     return KLXR_SUCCESS;
 }
 
@@ -2290,4 +2401,127 @@ void *kl_openxr_lookup(const char *name) {
     if (!row) return NULL;      // a lookup must still be able to say no
     row->resolved++;
     return row->fn;
+}
+
+// --- SL-16: the space algebra, with no session and no guest -----------------
+//
+// `make xrspace`. This gate exists because the bug it catches does not look
+// like a bug from anywhere else: the runtime answered every call, returned
+// success, and the picture was correct. What was wrong was a pose, and the only
+// instrument that could see it was a human turning their head — which, on this
+// arc, costs a fresh Steam pairing to arrange and cannot be repeated
+// identically. So the invariant is asserted here instead, in a second.
+//
+// The invariant is the one klxr_space_pose exists to keep: an answer given
+// RELATIVE to the head must not contain the head's own position. Location in
+// VIEW space used to be modelled as a y displacement of zero, which meant the
+// eye-to-head came back as the eye's absolute position in the tracking space —
+// so SteamVR rotated the eye about a point as far away as the head was from the
+// origin, and the view swung through an arc instead of turning in place.
+static int klxr_st_pos(FILE *f, const char *what, XrVector3f p,
+                       float x, float y, float z) {
+    int ok = fabsf(p.x - x) <= 1e-4f && fabsf(p.y - y) <= 1e-4f &&
+             fabsf(p.z - z) <= 1e-4f;
+    fprintf(f, "  %s %-44s (%.3f %.3f %.3f)", ok ? "ok  " : "FAIL", what,
+            p.x, p.y, p.z);
+    if (!ok) fprintf(f, ", expected (%.3f %.3f %.3f)", x, y, z);
+    fputc('\n', f);
+    return ok;
+}
+
+static klxr_space klxr_st_space(int type, float ox, float oy, float oz) {
+    klxr_space s;
+    memset(&s, 0, sizeof s);
+    s.magic = KLXR_MAGIC_SPACE;
+    s.reference_type = type;
+    s.offset.orientation = (XrQuaternionf){0, 0, 0, 1};
+    s.offset.position = (XrVector3f){ox, oy, oz};
+    return s;
+}
+
+int kl_openxr_space_selftest(FILE *f) {
+    klxr_space view  = klxr_st_space(KLXR_REF_SPACE_VIEW, 0, 0, 0);
+    klxr_space stage = klxr_st_space(KLXR_REF_SPACE_STAGE, 0, 0, 0);
+    klxr_space local = klxr_st_space(KLXR_REF_SPACE_LOCAL, 0, 0, 0);
+    float eh = kl_ovrp_eye_height();
+    int ok = 1;
+
+    // Said out loud because it is 0 here and that makes one assertion below a
+    // weak one: kl_ovrp_eye_height answers 0 until a guest asks for a
+    // floor-level tracking origin through OVRPlugin, and an OpenXR guest never
+    // speaks OVRPlugin. So on this path LOCAL and STAGE genuinely coincide, and
+    // "LOCAL in STAGE" checks that they agree rather than that the height is
+    // right. A guest that separates them will separate them here too.
+    fprintf(f, "  standing eye height: %.3f m (LOCAL is STAGE raised by this)\n", eh);
+
+    // Two head poses, and the second is chosen so that a leak shows up as a
+    // wildly different number rather than a slightly wrong one: away from the
+    // origin on all three axes, and yawed 90 degrees so that a leaked x becomes
+    // a z. A leak of a metre reads as a metre.
+    static const struct { float p[3], q[4]; const char *name; } heads[] = {
+        { {0, 0, 0},           {0, 0, 0, 1},                   "head at the origin" },
+        { {2.0f, 1.6f, -3.0f}, {0, 0.70710678f, 0, 0.70710678f}, "head yawed 90 deg, 3.6 m out" },
+    };
+    XrVector3f e2h[2][2];
+
+    for (int h = 0; h < 2; h++) {
+        kl_ovrp_set_head_pose(heads[h].p[0], heads[h].p[1], heads[h].p[2],
+                              heads[h].q[0], heads[h].q[1], heads[h].q[2],
+                              heads[h].q[3]);
+        kl_ovrp_frame_latch();
+        fprintf(f, "  --- %s ---\n", heads[h].name);
+
+        // VIEW located in STAGE *is* the head: this is the answer that is
+        // supposed to carry the head's position, and it is the control for the
+        // ones below that are not.
+        XrPosef head_in_stage = klxr_pose_rel(klxr_space_pose(&stage),
+                                              klxr_space_pose(&view));
+        ok &= klxr_st_pos(f, "VIEW in STAGE is the head", head_in_stage.position,
+                          heads[h].p[0], heads[h].p[1], heads[h].p[2]);
+
+        // ...and the eye-to-head is not. Whatever the eye offset happens to be,
+        // an eye is a few centimetres from the head and nothing else.
+        for (int e = 0; e < 2; e++) {
+            float px, py, pz, qx, qy, qz, qw, tan[4];
+            kl_ovrp_eye_view(e, &px, &py, &pz, &qx, &qy, &qz, &qw, tan);
+            XrPosef eye = { {qx, qy, qz, qw}, {px, py, pz} };
+            e2h[h][e] = klxr_pose_rel(klxr_space_pose(&view), eye).position;
+            float d = sqrtf(e2h[h][e].x * e2h[h][e].x + e2h[h][e].y * e2h[h][e].y +
+                            e2h[h][e].z * e2h[h][e].z);
+            int near = d < 0.2f;
+            fprintf(f, "  %s eye %d to head is %.4f m from it%s\n",
+                    near ? "ok  " : "FAIL", e, d,
+                    near ? "" : " — the head's own position is in it");
+            ok &= near;
+        }
+
+        // LOCAL and STAGE are both fixed frames, so they differ by the standing
+        // height and by nothing the head does.
+        XrPosef local_in_stage = klxr_pose_rel(klxr_space_pose(&stage),
+                                               klxr_space_pose(&local));
+        ok &= klxr_st_pos(f, "LOCAL in STAGE is the standing height",
+                          local_in_stage.position, 0, eh, 0);
+
+        // poseInReferenceSpace, which nothing read at all until SL-16. In VIEW
+        // it must be ROTATED by the head, not merely added to it: a metre in
+        // front of a head yawed 90 degrees is a metre along -x, not along -z.
+        klxr_space ahead = klxr_st_space(KLXR_REF_SPACE_VIEW, 0, 0, -1.0f);
+        XrPosef a = klxr_pose_rel(klxr_space_pose(&stage), klxr_space_pose(&ahead));
+        float fx = heads[h].p[0] - (h ? 1.0f : 0.0f);
+        float fz = heads[h].p[2] - (h ? 0.0f : 1.0f);
+        ok &= klxr_st_pos(f, "a space 1 m in front of the head", a.position,
+                          fx, heads[h].p[1], fz);
+    }
+
+    // The regression itself, stated as one comparison: moving and turning the
+    // head must not change where the eyes are relative to it.
+    for (int e = 0; e < 2; e++) {
+        int same = fabsf(e2h[0][e].x - e2h[1][e].x) <= 1e-4f &&
+                   fabsf(e2h[0][e].y - e2h[1][e].y) <= 1e-4f &&
+                   fabsf(e2h[0][e].z - e2h[1][e].z) <= 1e-4f;
+        fprintf(f, "  %s eye %d to head is unchanged by moving the head\n",
+                same ? "ok  " : "FAIL", e);
+        ok &= same;
+    }
+    return ok;
 }

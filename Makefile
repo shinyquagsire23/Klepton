@@ -183,6 +183,19 @@ build/t_hevc: tests/t_hevc.c $(RUNTIME) runtime/kl_vtdec.h
 hevc: build/t_hevc
 	./build/t_hevc
 
+# SL-16: the OpenXR reference-space gate. The pose a runtime answers with is not
+# visible from anywhere else — every call succeeds and the picture is correct
+# either way — so the one thing that could see the eye-to-head carrying the
+# head's own position was a person turning their head in a live stream, at the
+# cost of a fresh pairing. Asserted here instead, with no guest, no headset and
+# no Steam host. Seconds; in `make check`.
+build/t_xrspace: tests/t_xrspace.c $(RUNTIME) runtime/kl_openxr.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_xrspace.c $(RUNTIME) $(LDLIBS)
+
+xrspace: build/t_xrspace
+	./build/t_xrspace
+
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(LDLIBS)
@@ -275,10 +288,12 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
 	@grep -E '=== HEVC|30 access units' build/hevc.log && tail -1 build/hevc.log
+	@./build/t_xrspace > build/xrspace.log 2>&1 || { cat build/xrspace.log; exit 1; }
+	@head -2 build/xrspace.log && tail -1 build/xrspace.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
 	@head -3 build/haptics.log && tail -1 build/haptics.log
 	@echo "=== opus roundtrip ===" && ./build/t_opus $(LIBS)/libunityopus.so > build/opus.log && tail -3 build/opus.log
