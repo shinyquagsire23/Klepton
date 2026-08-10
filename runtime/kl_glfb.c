@@ -575,27 +575,119 @@ static void (*g_real_GetShaderInfoLog)(uint32_t, int32_t, int32_t *, char *);
 static struct { uint32_t name; char *src; } g_fb_shaders[KLFB_MAX_SHADERS];
 static unsigned g_fb_nshaders;
 
+// A GLSL identifier character — the test that keeps a rename inside whole words.
+#define KLFB_IDENT(c) (((c) >= 'a' && (c) <= 'z') || ((c) >= 'A' && (c) <= 'Z') || \
+                       ((c) >= '0' && (c) <= '9') || (c) == '_')
+
+// ---- explicit uniform locations: remembered, not merely thrown away --------
+//
+// The strip below is required — layout(location=N) on a *uniform* is ES 3.1
+// syntax and the ANGLE context behind this renderer is ES 3.0 — and for Unity
+// it is a semantic no-op, because Unity resolves every uniform by name through
+// glGetUniformLocation. Steam Link does not. Measured: it does not call
+// glGetUniformLocation ONCE in a whole run, on either driver. It writes to the
+// numbers it pinned in the shader text.
+//
+// So stripping the pins silently re-points every uniform the guest sets. Its
+// pointer shader pins `length` at 1 and the linker's own order puts a mat4
+// there, which at least raises GL_INVALID_OPERATION (~12 a frame, glutils.cpp:
+// 205, and that error is what led here). The video shader is the one that
+// matters and it fails without a sound: it pins
+// `uniform samplerExternalOES tex0` at 2, a sampler written with glUniform1i
+// takes any integer without complaint, and a sampler that never receives its
+// texture unit reads unit 0 — so the quad that should show the decoded stream
+// samples something else entirely, and every eye texture reads back black.
+//
+// The pin is therefore recorded here, resolved to the linker's own location at
+// glLinkProgram, and applied to every glUniform* call. The guest keeps its own
+// numbering throughout and never learns ours.
+#define KLFB_PIN_SHADERS 64
+#define KLFB_PINS        32
+static struct { uint32_t shader; unsigned n;
+                struct { int32_t at; char name[40]; } p[KLFB_PINS]; }
+    g_shader_pins[KLFB_PIN_SHADERS];
+static unsigned g_shader_pins_n;
+
+static int klfb_pin_slot(uint32_t shader) {
+    for (unsigned i = 0; i < g_shader_pins_n; i++)
+        if (g_shader_pins[i].shader == shader) return (int)i;
+    if (g_shader_pins_n >= KLFB_PIN_SHADERS) return -1;
+    int i = (int)g_shader_pins_n++;
+    g_shader_pins[i].shader = shader;
+    g_shader_pins[i].n = 0;
+    return i;
+}
+
+// A shader name can be re-sourced, and the rewrite runs once per
+// glShaderSource — so the second source must replace the first's pins, not
+// append to them.
+static void klfb_pin_reset(uint32_t shader) {
+    for (unsigned i = 0; i < g_shader_pins_n; i++)
+        if (g_shader_pins[i].shader == shader) g_shader_pins[i].n = 0;
+}
+
+static void klfb_pin_note(uint32_t shader, int32_t at, const char *name) {
+    int i = klfb_pin_slot(shader);
+    if (i < 0 || g_shader_pins[i].n >= KLFB_PINS) return;
+    unsigned k = g_shader_pins[i].n++;
+    g_shader_pins[i].p[k].at = at;
+    snprintf(g_shader_pins[i].p[k].name, sizeof g_shader_pins[i].p[k].name,
+             "%s", name);
+}
+
 // If the layout qualifier starting at `p` ("layout(...)") directly precedes a
-// `uniform` declaration, remove it (and the spaces between) in place and
-// return the new scan position; otherwise return NULL. Used to strip explicit
-// uniform locations: layout(location=N) on a *uniform* is legal GLSL only
-// from ES 3.1 on ("only valid on program inputs and outputs" here), and
-// Unity resolves sampler locations with glGetUniformLocation regardless, so
-// the pin is a no-op semantically. in/out declarations keep their qualifiers
-// — those ARE program inputs/outputs and ES 3.0 wants them.
-static char *klfb_strip_uniform_layout(char *p) {
+// `uniform` declaration, record the pin, then remove the qualifier (and the
+// spaces between) in place and return the new scan position; otherwise return
+// NULL. in/out declarations keep their qualifiers — those ARE program
+// inputs/outputs and ES 3.0 wants them, so they never reach the strip.
+static char *klfb_strip_uniform_layout(char *p, uint32_t shader) {
     char *close = strchr(p, ')');
     if (!close) return NULL;
     char *q = close + 1;
     while (*q == ' ' || *q == '\t') q++;
     if (strncmp(q, "uniform", 7) != 0) return NULL;
+
+    // The number, before it goes: "layout(location = N)" and Unity's
+    // "UNITY_LOCATION(N)" both put it between the parens.
+    int32_t at = -1;
+    {
+        const char *loc = NULL;
+        for (const char *d = p; d + 8 <= close; d++)
+            if (strncmp(d, "location", 8) == 0) { loc = d + 8; break; }
+        if (!loc && strncmp(p, "UNITY_LOCATION(", 15) == 0) loc = p + 14;
+        while (loc && loc < close && (*loc == ' ' || *loc == '=' || *loc == '('))
+            loc++;
+        if (loc && loc < close && *loc >= '0' && *loc <= '9')
+            at = (int32_t)strtol(loc, NULL, 10);
+    }
+    // ...and the name it pins: the identifier that ends the declaration, before
+    // any array subscript. Read backwards from the ';' rather than counting
+    // type tokens forwards, because the type may carry a precision qualifier
+    // ("uniform mediump sampler2D _MainTex;").
+    const char *semi = at >= 0 && shader ? strchr(q, ';') : NULL;
+    if (semi) {
+        const char *e = semi;
+        while (e > q && (e[-1] == ' ' || e[-1] == '\t')) e--;
+        if (e > q && e[-1] == ']') {                  // an array: back over "[n]"
+            const char *b = e;
+            while (b > q && b[-1] != '[') b--;
+            if (b > q) {
+                e = b - 1;
+                while (e > q && (e[-1] == ' ' || e[-1] == '\t')) e--;
+            }
+        }
+        const char *s = e;
+        while (s > q && KLFB_IDENT(s[-1])) s--;
+        if (e > s && (size_t)(e - s) < 40) {
+            char name[40];
+            memcpy(name, s, (size_t)(e - s));
+            name[e - s] = 0;
+            klfb_pin_note(shader, at, name);
+        }
+    }
     memmove(p, q, strlen(q) + 1);
     return p;
 }
-
-// A GLSL identifier character — the test that keeps a rename inside whole words.
-#define KLFB_IDENT(c) (((c) >= 'a' && (c) <= 'z') || ((c) >= 'A' && (c) <= 'Z') || \
-                       ((c) >= '0' && (c) <= '9') || (c) == '_')
 
 // GLSL built-in function names that this guest also declares as variables, with
 // the replacement each gets. The replacements are the same width as the names
@@ -606,10 +698,120 @@ static const struct { const char *from, *to; } g_glsl_builtin_vars[] = {
     {"length", "kl_len"},
 };
 
+// ...and the other end of the pin: what the linker actually chose.
+//
+// Built at glLinkProgram, because that is the first moment a name has a
+// location at all, and read by every glUniform* thunk. A program the guest
+// pinned nothing in gets no entry, and g_prog_pins_n == 0 is the fast out for
+// every guest that resolves uniforms by name (Beat Saber does; this costs it
+// one predictable compare per uniform call).
+#define KLFB_PIN_PROGS 64
+static struct { uint32_t prog; unsigned n;
+                struct { int32_t pinned, actual; } m[KLFB_PINS * 2]; }
+    g_prog_pins[KLFB_PIN_PROGS];
+static unsigned g_prog_pins_n;
+
+static int32_t (*g_real_GetUniformLocation)(uint32_t, const char *);
+
+// The location ANGLE gave `name`, allowing for the built-in rename above — a
+// uniform called `length` is in the program as `kl_len`, and the pin still
+// names it the way the shader author wrote it.
+static int32_t klfb_actual_loc(uint32_t prog, const char *name) {
+    if (!g_real_GetUniformLocation) return -1;
+    int32_t loc = g_real_GetUniformLocation(prog, name);
+    if (loc >= 0) return loc;
+    for (size_t i = 0; i < sizeof g_glsl_builtin_vars / sizeof g_glsl_builtin_vars[0]; i++)
+        if (strcmp(name, g_glsl_builtin_vars[i].from) == 0)
+            return g_real_GetUniformLocation(prog, g_glsl_builtin_vars[i].to);
+    return -1;
+}
+
+static void klfb_pins_link(uint32_t program) {
+    if (!g_shader_pins_n) return;
+    static void (*r_GetAttachedShaders)(uint32_t, int32_t, int32_t *, uint32_t *);
+    if (!r_GetAttachedShaders) r_GetAttachedShaders = asym("glGetAttachedShaders");
+    // The guest may never resolve glGetUniformLocation — this one does not —
+    // so the thunk's real slot can still be empty here. Resolve it ourselves.
+    if (!g_real_GetUniformLocation)
+        g_real_GetUniformLocation = (void *)asym("glGetUniformLocation");
+    if (!r_GetAttachedShaders || !g_real_GetUniformLocation) return;
+
+    uint32_t sh[8]; int32_t ns = 0;
+    r_GetAttachedShaders(program, 8, &ns, sh);
+    if (ns <= 0) return;
+
+    unsigned slot = 0;
+    for (; slot < g_prog_pins_n; slot++)
+        if (g_prog_pins[slot].prog == program) break;
+    if (slot == g_prog_pins_n) {
+        if (g_prog_pins_n >= KLFB_PIN_PROGS) return;
+        g_prog_pins_n++;
+    }
+    g_prog_pins[slot].prog = program;
+    g_prog_pins[slot].n = 0;
+
+    unsigned lost = 0;
+    for (int32_t i = 0; i < ns && i < 8; i++)
+        for (unsigned s = 0; s < g_shader_pins_n; s++) {
+            if (g_shader_pins[s].shader != sh[i]) continue;
+            for (unsigned k = 0; k < g_shader_pins[s].n; k++) {
+                const char *name = g_shader_pins[s].p[k].name;
+                int32_t at = g_shader_pins[s].p[k].at;
+                int32_t actual = klfb_actual_loc(program, name);
+                if (actual < 0) { lost++; continue; }   // optimised away
+                if (g_prog_pins[slot].n < KLFB_PINS * 2) {
+                    g_prog_pins[slot].m[g_prog_pins[slot].n].pinned = at;
+                    g_prog_pins[slot].m[g_prog_pins[slot].n].actual = actual;
+                    g_prog_pins[slot].n++;
+                }
+                // An array pinned at N occupies N, N+1, ... and the guest may
+                // write any of them; the linker's own elements are found the
+                // same way the spec says the guest would.
+                for (int e = 1; e < 16; e++) {
+                    char el[48];
+                    snprintf(el, sizeof el, "%s[%d]", name, e);
+                    int32_t a = klfb_actual_loc(program, el);
+                    if (a < 0) break;
+                    if (g_prog_pins[slot].n >= KLFB_PINS * 2) break;
+                    g_prog_pins[slot].m[g_prog_pins[slot].n].pinned = at + e;
+                    g_prog_pins[slot].m[g_prog_pins[slot].n].actual = a;
+                    g_prog_pins[slot].n++;
+                }
+            }
+        }
+    if (g_prog_pins[slot].n || lost)
+        fprintf(stderr, "  [glfb] program %u pins %u uniform location%s "
+                        "explicitly%s — honoured\n", program,
+                g_prog_pins[slot].n, g_prog_pins[slot].n == 1 ? "" : "s",
+                lost ? " (plus some the linker optimised away)" : "");
+}
+
+// Which program is current, per thread — glUniform* writes into it, and the
+// remap is program-scoped. Maintained by klfb_UseProgram rather than queried,
+// because a glGetIntegerv under every uniform call is not free and this is on
+// the guest's per-draw path.
+static __thread uint32_t g_cur_prog;
+
+// The guest's location -> the linker's. Unpinned locations pass through: a
+// guest that pins some uniforms and looks up others is asking about ours in
+// the second case, and rewriting those would be the same bug in the mirror.
+static int32_t klfb_remap_loc(int32_t loc) {
+    if (!g_prog_pins_n || loc < 0 || !g_cur_prog) return loc;
+    for (unsigned i = 0; i < g_prog_pins_n; i++) {
+        if (g_prog_pins[i].prog != g_cur_prog) continue;
+        for (unsigned j = 0; j < g_prog_pins[i].n; j++)
+            if (g_prog_pins[i].m[j].pinned == loc)
+                return g_prog_pins[i].m[j].actual;
+        return loc;
+    }
+    return loc;
+}
+
 // Returns buf rewritten in place (it only ever shrinks), or NULL if no rule
 // applied.
-static char *klfb_rewrite_glsl(char *buf) {
+static char *klfb_rewrite_glsl(char *buf, uint32_t shader) {
     int changed = 0;
+    klfb_pin_reset(shader);
     if (strncmp(buf, "#version 3", 10) == 0 &&
         buf[10] >= '0' && buf[10] <= '9' && buf[11] >= '0' && buf[11] <= '9' &&
         (buf[10] > '0' || buf[11] > '0') && strncmp(buf + 12, " es", 3) == 0) {
@@ -643,12 +845,12 @@ static char *klfb_rewrite_glsl(char *buf) {
     // form is unambiguous; the literal form goes through the uniform check.
     p = buf;
     while ((p = strstr(p, "UNITY_LOCATION("))) {
-        char *q = klfb_strip_uniform_layout(p);
+        char *q = klfb_strip_uniform_layout(p, shader);
         if (q) { p = q; changed = 1; } else p += 5;
     }
     p = buf;
     while ((p = strstr(p, "layout(location = "))) {
-        char *q = klfb_strip_uniform_layout(p);
+        char *q = klfb_strip_uniform_layout(p, shader);
         if (q) { p = q; changed = 1; } else p += 8;
     }
 
@@ -757,7 +959,7 @@ static void klfb_ShaderSource(uint32_t shader, int32_t count,
                 if (strings[i] && len) { memcpy(buf + off, strings[i], len); off += len; }
             }
             buf[off] = 0;
-            char *rewritten = klfb_rewrite_glsl(buf);
+            char *rewritten = klfb_rewrite_glsl(buf, shader);
             int stored = 0;
             if (g_fb_nshaders < KLFB_MAX_SHADERS) {
                 pthread_mutex_lock(&g_compile_lock);
@@ -830,6 +1032,10 @@ static void klfb_LinkProgram(uint32_t program) {
     if (!g_real_LinkProgram) return;
     pthread_mutex_lock(&g_compile_lock);
     g_real_LinkProgram(program);
+    // The pins the rewrite took out of the shader text become a translation
+    // table here — this is the first moment a name has a location to translate
+    // to. See the block above klfb_strip_uniform_layout.
+    klfb_pins_link(program);
     // KL_GLFB_DUMP_PROGRAM=N: print the sources that were linked into program
     // N. The timeline names programs by number ("the frame's last draw is
     // program 7"); this turns the number into the shader text.
@@ -1456,6 +1662,20 @@ void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex) {
         for (int s = 0; s < KLFB_MAX_STAGES; s++)
             if (g_eye_tex_stage[e][s] == tex) g_eye_tex_stage[e][s] = 0;
     g_eye_tex_stage[eye][stage] = tex;
+}
+
+// Which of an eye's images the guest most recently PRESENTED.
+//
+// kl_glfb_note_eye_texture registers a whole swapchain, and the last call wins,
+// so g_eye_tex ends up naming whichever image was registered last — image 2 of
+// 3, i.e. the right picture one frame in three. That is fine for "is this an
+// eye texture at all" and useless for "read the frame the guest just drew".
+// The OpenXR path knows exactly which image that is (xrReleaseSwapchainImage
+// says so) and says it here, so the capture reads the presented image rather
+// than whichever one the rotation happens to be pointing at.
+void kl_glfb_set_live_eye_texture(int eye, uint32_t tex) {
+    if (eye < 0 || eye > 1 || !tex) return;
+    g_eye_tex[eye] = tex;
 }
 
 // Which stage is the current draw target, and which was last drawn into.
@@ -3349,6 +3569,7 @@ static void (*g_real_UseProgram)(uint32_t);
 static void klfb_UseProgram(uint32_t p) {
     if (a_glGetError) while (a_glGetError()) {}
     if (g_real_UseProgram) g_real_UseProgram(p);
+    g_cur_prog = p;                       // what the uniform remap is scoped to
     klfb_err_say("glUseProgram", p);
 }
 // The other half of the external-image retarget in klfb_rewrite_glsl. The
@@ -3383,15 +3604,57 @@ static void klfb_BindTexture(uint32_t t, uint32_t n) {
 // guest: it still asks for `length` and still gets the location of the uniform it
 // declared. Only a miss is retried, so a shader we did not rewrite is untouched
 // and a real -1 stays -1.
-static int32_t (*g_real_GetUniformLocation)(uint32_t, const char *);
+// ...and every answer it gives is recorded, so a uniform call that fails can say
+// where its location CAME from. "Location 2 is a mat4" is only half a finding:
+// the other half is which program the guest was looking at when it asked, and
+// nothing else on the path knows that.
+#define KLFB_LOCS 512
+static struct { uint32_t prog; int32_t loc; char name[48]; } g_uloc[KLFB_LOCS];
+static unsigned g_uloc_n;
+
 static int32_t klfb_GetUniformLocation(uint32_t prog, const char *name) {
-    if (!g_real_GetUniformLocation) return -1;
-    int32_t loc = g_real_GetUniformLocation(prog, name);
-    if (loc >= 0 || !name) return loc;
-    for (size_t i = 0; i < sizeof g_glsl_builtin_vars / sizeof g_glsl_builtin_vars[0]; i++)
-        if (strcmp(name, g_glsl_builtin_vars[i].from) == 0)
-            return g_real_GetUniformLocation(prog, g_glsl_builtin_vars[i].to);
+    if (!g_real_GetUniformLocation || !name) return -1;
+    int32_t loc = klfb_actual_loc(prog, name);
+    // A program with pins answers in the guest's own numbering, or the two
+    // halves of a guest that both pins and asks would disagree with each other.
+    if (loc >= 0)
+        for (unsigned i = 0; i < g_prog_pins_n; i++)
+            if (g_prog_pins[i].prog == prog)
+                for (unsigned j = 0; j < g_prog_pins[i].n; j++)
+                    if (g_prog_pins[i].m[j].actual == loc)
+                        return g_prog_pins[i].m[j].pinned;
+    if (loc >= 0) {
+        pthread_mutex_lock(&g_compile_lock);
+        unsigned i = 0;
+        for (; i < g_uloc_n; i++)
+            if (g_uloc[i].prog == prog && g_uloc[i].loc == loc) break;
+        if (i == g_uloc_n && g_uloc_n < KLFB_LOCS) g_uloc_n++;
+        if (i < KLFB_LOCS) {
+            g_uloc[i].prog = prog; g_uloc[i].loc = loc;
+            snprintf(g_uloc[i].name, sizeof g_uloc[i].name, "%s", name);
+        }
+        pthread_mutex_unlock(&g_compile_lock);
+    }
     return loc;
+}
+
+// What the guest was told about this program, in the order it asked. Appends to
+// `out`. Printing only the matching location was not enough: the answer to "why
+// is the guest writing a float at location 1" turned out to be that it never
+// asked for location 1 at all, and only the whole list says so.
+static void klfb_locs_say(uint32_t prog, char *out, size_t n) {
+    size_t at = strlen(out);
+    pthread_mutex_lock(&g_compile_lock);
+    at += (size_t)snprintf(out + at, n - at, " — it was told:");
+    int any = 0;
+    for (unsigned i = 0; i < g_uloc_n && at + 40 < n; i++)
+        if (g_uloc[i].prog == prog) {
+            at += (size_t)snprintf(out + at, n - at, " %s=%d",
+                                   g_uloc[i].name, g_uloc[i].loc);
+            any = 1;
+        }
+    if (!any) snprintf(out + at, n - at, " nothing (it never asked)");
+    pthread_mutex_unlock(&g_compile_lock);
 }
 static void (*g_real_BindSampler)(uint32_t, uint32_t);
 static void klfb_BindSampler(uint32_t u, uint32_t s) {
@@ -3399,9 +3662,50 @@ static void klfb_BindSampler(uint32_t u, uint32_t s) {
     if (g_real_BindSampler) g_real_BindSampler(u, s);
     klfb_err_say("glBindSampler", s);
 }
+// The uniform family, every entry point of it, for one reason: each one carries
+// a location the guest may have pinned in the shader, and a location the guest
+// pinned means something different to the linker. klfb_remap_loc is the whole
+// body — it is the identity for any guest that resolves uniforms by name, which
+// is why this can be unconditional. The two hand-written members below
+// (glUniform1i, glUniform1f) also carry error probes and predate this.
+#define KLFB_UNIFORM_N(fn, T, N, PARAMS, ARGS)                                \
+    static void (*g_real_##fn) PARAMS;                                        \
+    static void klfb_##fn PARAMS {                                            \
+        if (g_real_##fn) g_real_##fn ARGS;                                    \
+    }
+#define KLFB_U1(fn, T) KLFB_UNIFORM_N(fn, T, 1, (int32_t l, T a), \
+                                      (klfb_remap_loc(l), a))
+#define KLFB_U2(fn, T) KLFB_UNIFORM_N(fn, T, 2, (int32_t l, T a, T b), \
+                                      (klfb_remap_loc(l), a, b))
+#define KLFB_U3(fn, T) KLFB_UNIFORM_N(fn, T, 3, (int32_t l, T a, T b, T c), \
+                                      (klfb_remap_loc(l), a, b, c))
+#define KLFB_U4(fn, T) KLFB_UNIFORM_N(fn, T, 4, (int32_t l, T a, T b, T c, T d), \
+                                      (klfb_remap_loc(l), a, b, c, d))
+#define KLFB_UV(fn, T) KLFB_UNIFORM_N(fn, T, 0, (int32_t l, int32_t n, const T *v), \
+                                      (klfb_remap_loc(l), n, v))
+#define KLFB_UM(fn)    KLFB_UNIFORM_N(fn, float, 0, \
+                                      (int32_t l, int32_t n, uint8_t t, const float *v), \
+                                      (klfb_remap_loc(l), n, t, v))
+
+KLFB_U2(Uniform2f, float) KLFB_U3(Uniform3f, float) KLFB_U4(Uniform4f, float)
+KLFB_U2(Uniform2i, int32_t) KLFB_U3(Uniform3i, int32_t) KLFB_U4(Uniform4i, int32_t)
+KLFB_U1(Uniform1ui, uint32_t) KLFB_U2(Uniform2ui, uint32_t)
+KLFB_U3(Uniform3ui, uint32_t) KLFB_U4(Uniform4ui, uint32_t)
+KLFB_UV(Uniform1fv, float) KLFB_UV(Uniform2fv, float)
+KLFB_UV(Uniform3fv, float) KLFB_UV(Uniform4fv, float)
+KLFB_UV(Uniform1iv, int32_t) KLFB_UV(Uniform2iv, int32_t)
+KLFB_UV(Uniform3iv, int32_t) KLFB_UV(Uniform4iv, int32_t)
+KLFB_UV(Uniform1uiv, uint32_t) KLFB_UV(Uniform2uiv, uint32_t)
+KLFB_UV(Uniform3uiv, uint32_t) KLFB_UV(Uniform4uiv, uint32_t)
+KLFB_UM(UniformMatrix2fv) KLFB_UM(UniformMatrix3fv) KLFB_UM(UniformMatrix4fv)
+KLFB_UM(UniformMatrix2x3fv) KLFB_UM(UniformMatrix3x2fv)
+KLFB_UM(UniformMatrix2x4fv) KLFB_UM(UniformMatrix4x2fv)
+KLFB_UM(UniformMatrix3x4fv) KLFB_UM(UniformMatrix4x3fv)
+
 static void (*g_real_Uniform1i)(int32_t, int32_t);
 static void klfb_Uniform1i(int32_t loc, int32_t v) {
     if (a_glGetError) while (a_glGetError()) {}
+    loc = klfb_remap_loc(loc);
     if (g_real_Uniform1i) g_real_Uniform1i(loc, v);
     static int said;
     if (said < 30 && a_glGetError) {
@@ -3415,6 +3719,55 @@ static void klfb_Uniform1i(int32_t loc, int32_t v) {
         }
     }
 }
+// glUniform1f is INVALID_OPERATION about twelve times a frame on the Steam Link
+// VR path (glutils.cpp:205, ~17k a run), and the error code alone cannot say
+// which of its three causes it is: no current program, a location belonging to
+// a different program, or a location whose uniform is not a float. So name the
+// uniform. glGetActiveUniform indexes the CURRENT program's own list, and
+// glGetUniformLocation maps each name back to a location — if none of them
+// matches, the location came from somewhere else, and that is the answer.
+static void (*g_real_Uniform1f)(int32_t, float);
+static void klfb_Uniform1f(int32_t loc, float v) {
+    if (a_glGetError) while (a_glGetError()) {}
+    loc = klfb_remap_loc(loc);
+    if (g_real_Uniform1f) g_real_Uniform1f(loc, v);
+    static int said;
+    if (said >= 20 || !a_glGetError) return;
+    uint32_t e = a_glGetError();
+    if (!e) return;
+    said++;
+    int32_t prog = -1;
+    if (a_glGetIntegerv) a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &prog);
+
+    static void (*r_GetProgramiv)(uint32_t, uint32_t, int32_t *);
+    static void (*r_GetActiveUniform)(uint32_t, uint32_t, int32_t, int32_t *,
+                                      int32_t *, uint32_t *, char *);
+    if (!r_GetProgramiv) {
+        r_GetProgramiv = asym("glGetProgramiv");
+        r_GetActiveUniform = asym("glGetActiveUniform");
+    }
+    char who[512];
+    snprintf(who, sizeof who, "no current program");
+    if (prog > 0 && r_GetProgramiv && r_GetActiveUniform && g_real_GetUniformLocation) {
+        int32_t n = 0;
+        r_GetProgramiv((uint32_t)prog, 0x8B86 /* ACTIVE_UNIFORMS */, &n);
+        snprintf(who, sizeof who, "no uniform of program %d has location %d "
+                                  "(it has %d)", prog, loc, n);
+        for (int32_t i = 0; i < n; i++) {
+            char name[96] = ""; int32_t len = 0, size = 0; uint32_t type = 0;
+            r_GetActiveUniform((uint32_t)prog, (uint32_t)i, (int32_t)sizeof name,
+                               &len, &size, &type, name);
+            if (g_real_GetUniformLocation((uint32_t)prog, name) != loc) continue;
+            snprintf(who, sizeof who, "`%s` of program %d is type 0x%x[%d], "
+                                      "not a float", name, prog, type, size);
+            break;
+        }
+    }
+    if (prog > 0) klfb_locs_say((uint32_t)prog, who, sizeof who);
+    fprintf(stderr, "  [glfb] ERRSRC glUniform1f(loc=%d, %g) -> 0x%x — %s\n",
+            loc, (double)v, e, who);
+}
+
 static void (*g_real_GenerateMipmap)(uint32_t);
 static void klfb_GenerateMipmap(uint32_t t) {
     if (a_glGetError) while (a_glGetError()) {}
@@ -3430,7 +3783,22 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
                                      (void **)&g_real_EGLImageTargetTexture2DOES},
     {"glBindSampler", (void *)klfb_BindSampler, (void **)&g_real_BindSampler},
     {"glGetUniformLocation", (void *)klfb_GetUniformLocation, (void **)&g_real_GetUniformLocation},
+    // the uniform family — every one of them, so an explicitly pinned location
+    // is translated to the linker's own (see klfb_strip_uniform_layout)
     {"glUniform1i",   (void *)klfb_Uniform1i,   (void **)&g_real_Uniform1i},
+    {"glUniform1f",   (void *)klfb_Uniform1f,   (void **)&g_real_Uniform1f},
+#define KLFB_UT(fn) {"gl" #fn, (void *)klfb_##fn, (void **)&g_real_##fn}
+    KLFB_UT(Uniform2f), KLFB_UT(Uniform3f), KLFB_UT(Uniform4f),
+    KLFB_UT(Uniform2i), KLFB_UT(Uniform3i), KLFB_UT(Uniform4i),
+    KLFB_UT(Uniform1ui), KLFB_UT(Uniform2ui), KLFB_UT(Uniform3ui), KLFB_UT(Uniform4ui),
+    KLFB_UT(Uniform1fv), KLFB_UT(Uniform2fv), KLFB_UT(Uniform3fv), KLFB_UT(Uniform4fv),
+    KLFB_UT(Uniform1iv), KLFB_UT(Uniform2iv), KLFB_UT(Uniform3iv), KLFB_UT(Uniform4iv),
+    KLFB_UT(Uniform1uiv), KLFB_UT(Uniform2uiv), KLFB_UT(Uniform3uiv), KLFB_UT(Uniform4uiv),
+    KLFB_UT(UniformMatrix2fv), KLFB_UT(UniformMatrix3fv), KLFB_UT(UniformMatrix4fv),
+    KLFB_UT(UniformMatrix2x3fv), KLFB_UT(UniformMatrix3x2fv),
+    KLFB_UT(UniformMatrix2x4fv), KLFB_UT(UniformMatrix4x2fv),
+    KLFB_UT(UniformMatrix3x4fv), KLFB_UT(UniformMatrix4x3fv),
+#undef KLFB_UT
     {"glGenerateMipmap", (void *)klfb_GenerateMipmap, (void **)&g_real_GenerateMipmap},
     {"glFlush",  (void *)klfb_Flush,  (void **)&g_real_Flush},
     {"glDrawElements", (void *)klfb_DrawElements, (void **)&g_real_DrawElements},
@@ -4205,6 +4573,43 @@ static int klfb_write_png(const char *path, const uint8_t *px,
     return 1;
 }
 
+// Make a texture readable without going through anything the guest bound.
+//
+// The FBO scan below asks "which of the guest's framebuffers has an eye texture
+// attached", and on the OpenXR path that question can have no answer while the
+// frame is perfectly fine: a swapchain rotates three images, and the FBO's
+// attachment is whatever the guest last pointed it at, not necessarily the
+// image it just presented. Falling back to fb0 there is the worst possible
+// answer, because fb0 is black by construction — a run with pictures and a run
+// with none read identically. Attaching the named image to a framebuffer of our
+// own removes the guest from the question entirely.
+//
+// Returns the framebuffer, bound as READ_FRAMEBUFFER, or 0. The caller restores
+// the previous binding.
+static uint32_t klfb_read_from_texture(uint32_t tex) {
+    static void (*r_GenFramebuffers)(int32_t, uint32_t *);
+    static void (*r_BindFramebuffer)(uint32_t, uint32_t);
+    static void (*r_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t, uint32_t,
+                                          int32_t);
+    static uint32_t (*r_CheckFramebufferStatus)(uint32_t);
+    if (!r_GenFramebuffers) {
+        r_GenFramebuffers = asym("glGenFramebuffers");
+        r_BindFramebuffer = asym("glBindFramebuffer");
+        r_FramebufferTexture2D = asym("glFramebufferTexture2D");
+        r_CheckFramebufferStatus = asym("glCheckFramebufferStatus");
+    }
+    if (!tex || !r_GenFramebuffers || !r_BindFramebuffer ||
+        !r_FramebufferTexture2D || !r_CheckFramebufferStatus) return 0;
+    static uint32_t probe_fb;
+    if (!probe_fb) r_GenFramebuffers(1, &probe_fb);
+    if (!probe_fb) return 0;
+    r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, probe_fb);
+    r_FramebufferTexture2D(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */,
+                           0x0DE1 /* TEXTURE_2D */, tex, 0);
+    if (r_CheckFramebufferStatus(0x8CA8) != 0x8CD5) return 0;
+    return probe_fb;
+}
+
 static unsigned glfb_capture_now(const char *dir) {
     if (!g_ready || !a_glReadPixels) return 0;
     if (a_glFinish) a_glFinish();
@@ -4257,8 +4662,22 @@ static unsigned glfb_capture_now(const char *dir) {
                 }
             }
         }
-        if (!src_fb)   // not found: put the guest's binding back
-            a_BindFramebuffer(0x8CA8, (uint32_t)(read_fb >= 0 ? read_fb : 0));
+        if (!src_fb) {
+            // No framebuffer of the guest's has it attached any more — the
+            // OpenXR case above. Read the named image directly rather than
+            // falling back to fb0, which is black whatever happened.
+            uint32_t live = g_eye_tex[0] ? g_eye_tex[0] : g_eye_tex[1];
+            src_fb = klfb_read_from_texture(live);
+            if (src_fb) {
+                int32_t tw = 0, th = 0;
+                if (klfb_tex_info(live, NULL, &tw, &th) && tw > 0 && th > 0) {
+                    src_w = tw;
+                    src_h = th;
+                }
+            } else {   // not found either: put the guest's binding back
+                a_BindFramebuffer(0x8CA8, (uint32_t)(read_fb >= 0 ? read_fb : 0));
+            }
+        }
     }
 
     size_t   stride = (size_t)src_w * 4;
@@ -4367,6 +4786,34 @@ static unsigned glfb_capture_now(const char *dir) {
     }
     g_last_frame_lit = lit;
 
+    // ...and WHERE the light is, in sixteenths, top row first. A picture that
+    // fills a quarter of the target and a target with nothing in it are the
+    // same single "0 lit" number otherwise, and the census that produced that
+    // number was also reading a 1280x800 corner of a 1536x1536 eye. Cheap
+    // enough to be unconditional: one pass over a buffer already in cache.
+    char blocks[128] = "";
+    {
+        unsigned long bsum[16] = {0};
+        for (int32_t y = 0; y < src_h; y++) {
+            int by = (int)((int64_t)y * 4 / src_h);
+            if (by > 3) by = 3;
+            const uint8_t *row = px + (size_t)y * src_w * 4;
+            for (int32_t x = 0; x < src_w; x++) {
+                int bx = (int)((int64_t)x * 4 / src_w);
+                if (bx > 3) bx = 3;
+                bsum[by * 4 + bx] += row[x * 4] + row[x * 4 + 1] + row[x * 4 + 2];
+            }
+        }
+        unsigned long n = (unsigned long)src_w * (unsigned long)src_h / 16 * 3;
+        size_t at = 0;
+        for (int by = 3; by >= 0 && at + 24 < sizeof blocks; by--) {   // top row
+            at += (size_t)snprintf(blocks + at, sizeof blocks - at, " |");
+            for (int bx = 0; bx < 4; bx++)                             // ...first
+                at += (size_t)snprintf(blocks + at, sizeof blocks - at, " %lu",
+                                       n ? bsum[by * 4 + bx] / n : 0UL);
+        }
+    }
+
     // The sink half of the readback/output split: with a frontend registered
     // the buffer IS the output — hand it over and count the frame presented.
     // The sink runs on this (GL) thread inside the guest's frame, so it must
@@ -4464,10 +4911,11 @@ static unsigned glfb_capture_now(const char *dir) {
         }
     }
     uint64_t cap_tid = 0; pthread_threadid_np(NULL, &cap_tid);
-    fprintf(stderr, "  [glfb] %s: %u/%u lit, mean luma %lu%s "
-                    "[draw_fb=%d read_fb=%d src=fb%u fb_status=0x%x viewport %dx%d+%d+%d] (captured on t%llu)\n", path, lit,
+    fprintf(stderr, "  [glfb] %s: %u/%u lit, mean luma %lu%s blocks%s "
+                    "[draw_fb=%d read_fb=%d src=fb%u %dx%d fb_status=0x%x viewport %dx%d+%d+%d] (captured on t%llu)\n", path, lit,
             (unsigned)(src_w * src_h), sum / ((unsigned long)src_w * src_h * 3),
-            err_buf, draw_fb, read_fb, src_fb, fb_status, vp[2], vp[3], vp[0], vp[1],
+            err_buf, blocks, draw_fb, read_fb, src_fb, src_w, src_h, fb_status,
+            vp[2], vp[3], vp[0], vp[1],
             (unsigned long long)cap_tid);
     free(px); free(raw); free(cb);
     return ++g_presented;

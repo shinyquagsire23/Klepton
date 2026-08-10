@@ -1671,6 +1671,9 @@ typedef struct {
     uint32_t tex[KLXR_SWAPCHAIN_IMAGES];
     int      count;
     int      acquired;        // index the app currently holds, -1 when none
+    int      last_released;   // ...and the last one it handed BACK, which is the
+                              // image it drew: by xrEndFrame the guest's own
+                              // framebuffer may already point at the next one
     int      next_index;      // round-robin, which is all "which is free" means
                               // here: nothing else reads these images yet
     int      eye;             // which eye this swapchain was registered as, -1 if not
@@ -1786,6 +1789,7 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
     sc->usage = info->usageFlags;
     sc->count = KLXR_SWAPCHAIN_IMAGES;
     sc->acquired = -1;
+    sc->last_released = -1;
     sc->eye = -1;
 
     klxr_gl_init();
@@ -1902,6 +1906,7 @@ static XrResult klxr_ReleaseSwapchainImage(void *swapchain,
     if (!sc) return KLXR_ERROR_HANDLE_INVALID;
     if (info) klxr_log_chain("xrReleaseSwapchainImage", info->next);
     if (sc->acquired < 0) return KLXR_ERROR_CALL_ORDER_INVALID;
+    sc->last_released = sc->acquired;
     sc->acquired = -1;
     return KLXR_SUCCESS;
 }
@@ -1986,6 +1991,16 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     s->frame_begun = 0;
     s->frames_ended++;
 
+    // Which projection layer the capture reads. This guest submits more than
+    // one — measured: two, each with a left and a right view — and only one of
+    // them holds the streamed picture. Nothing in the submission says which, so
+    // the capture takes the first (the base layer, composited furthest back)
+    // and KL_XR_CAPTURE_LAYER moves it without a rebuild, because a run that
+    // reads the wrong one costs a fresh Steam pairing to repeat.
+    static int cap_layer = -1;
+    if (cap_layer < 0) cap_layer = kl_env_int("KL_XR_CAPTURE_LAYER", 0);
+    uint32_t proj_layers = 0;
+
     for (uint32_t i = 0; i < info->layerCount; i++) {
         const XrCompositionLayerBaseHeader *layer = info->layers[i];
         if (!layer) continue;
@@ -1998,15 +2013,28 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         }
         const XrCompositionLayerProjection *proj =
             (const XrCompositionLayerProjection *)layer;
+        uint32_t li = proj_layers++;
         for (uint32_t v = 0; v < proj->viewCount && v < 2; v++) {
             klxr_swapchain *sc = klxr_swapchain_of(proj->views[v].subImage.swapchain);
             if (!sc) continue;
+            // The image the guest DREW is the one it released, not the one its
+            // framebuffer still points at — the swapchain has three and the
+            // next acquire has not happened yet. Named every frame, because the
+            // rotation moves every frame; the registration below is once.
+            if ((int)li == cap_layer && sc->last_released >= 0 &&
+                sc->last_released < sc->count)
+                kl_glfb_set_live_eye_texture((int)v, sc->tex[sc->last_released]);
             if (sc->eye == (int)v) continue;            // already this eye
             sc->eye = (int)v;
             for (int k = 0; k < sc->count; k++)
                 kl_glfb_note_eye_texture(sc->eye, k, sc->tex[k]);
-            fprintf(stderr, "  [xr] eye %u <- swapchain %ux%u images (%u %u %u)\n",
-                    v, sc->width, sc->height, sc->tex[0], sc->tex[1], sc->tex[2]);
+            const XrRect2Di *r = &proj->views[v].subImage.imageRect;
+            fprintf(stderr, "  [xr] layer %u eye %u <- swapchain %ux%u images "
+                            "(%u %u %u) rect %dx%d+%d+%d slice %u%s\n",
+                    li, v, sc->width, sc->height, sc->tex[0], sc->tex[1], sc->tex[2],
+                    r->extent.width, r->extent.height, r->offset.x, r->offset.y,
+                    proj->views[v].subImage.imageArrayIndex,
+                    (int)li == cap_layer ? " [captured]" : "");
         }
     }
 

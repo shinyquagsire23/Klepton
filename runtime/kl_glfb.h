@@ -90,6 +90,13 @@ void kl_glfb_gl_census(FILE *f);
 // textures, not the backbuffer).
 void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex);
 
+// ...and which of an eye's images the guest most recently PRESENTED. Registering
+// a swapchain leaves "the eye texture" naming whichever image was registered
+// last — one of three, so the capture reads the picture the guest drew one frame
+// in three and black the rest. The OpenXR path knows which image it presented
+// (xrReleaseSwapchainImage names it) and says so here.
+void kl_glfb_set_live_eye_texture(int eye, uint32_t tex);
+
 // ...and the teardown half, from ovrp_DestroyEyeTexture. Drops both references
 // that keep an eye texture's storage alive — the EGLImage and the GL texture —
 // so the provider's own release on reallocation can actually reclaim it. A

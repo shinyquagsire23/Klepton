@@ -616,6 +616,13 @@ that reports what came due since the frontend last asked. Platform-independent
   the Steam host as `VTE_AVAILABLE_FRAMETIMES_US`, the host asks for a rate,
   and the negotiation is visible in the guest's own log
   (`Server requested refresh rate 90.0 was not available. Using 72.0`).
+- `KL_XR_CAPTURE_LAYER=N` — which projection layer `KL_GLFB_OUT` reads (default
+  0, `runtime/kl_openxr.c`). Steam Link's VR client submits **four** projection
+  layers a frame — two 1536x1536 pairs for its panels and two 2290x2400 pairs
+  for the eyes — and nothing in the submission says which holds what, so this
+  moves the capture without a rebuild. That matters because a streaming run
+  costs a fresh Steam pairing to repeat. The `[xr] layer N eye M <- swapchain`
+  lines say what each one is, and mark the captured one.
 - `KL_XR_REFRESH_EXT=0` — stop advertising `XR_FB_display_refresh_rate`
   (`runtime/kl_openxr.c`), putting the runtime back to before SL-11. The A/B
   for anything that changes when the client can answer the host's rate

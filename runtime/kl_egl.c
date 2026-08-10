@@ -637,7 +637,18 @@ static void klgl_GetInfoLog(uint32_t obj, int32_t bufSize, int32_t *length, char
 // so a zeroed stub would collapse every uniform onto slot 0.
 static int32_t g_gl_loc;
 static int32_t klgl_GetLocation(uint32_t program, const char *name) {
-    (void)program; (void)name;
+    // A synthetic location is a plausible-looking number that means nothing to a
+    // real driver, so a guest that reaches this while ANGLE is running writes
+    // one uniform into another's slot with no error until far away. Under the
+    // null driver that is the whole arrangement and says nothing; under
+    // KL_GLFB it is a bug, and this line should never print.
+    static int said;
+    if (kl_glfb_enabled() && said < 40) {
+        said++;
+        fprintf(stderr, "  [gl] null driver served glGetUniformLocation(program "
+                        "%u, `%s`) -> synthetic %d, while ANGLE is running\n",
+                program, name ? name : "(null)", g_gl_loc);
+    }
     return g_gl_loc++;
 }
 
