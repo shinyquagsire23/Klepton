@@ -218,7 +218,27 @@ void kl_ovrp_set_display_frequency(float hz) {
     g_display_hz = hz;
 }
 
-float kl_ovrp_display_frequency(void) { return g_display_hz; }
+// KL_DISPLAY_HZ=<hz> forces it. On the host there is no headset to measure, so
+// the 72 above is the Quest-2 fiction the rest of the device description keeps
+// up; this is how a host run says "pretend the panel runs at what the thing on
+// the other end of the wire is asking for". Read once, and through the same
+// 30..240 sanity check as the setter, so a typo cannot poison pacing math.
+float kl_ovrp_display_frequency(void) {
+    static int checked;
+    if (!checked) {
+        checked = 1;
+        const char *e = getenv("KL_DISPLAY_HZ");
+        if (e && *e) {
+            float hz = strtof(e, NULL);
+            if (hz >= 30.0f && hz <= 240.0f) {
+                fprintf(stderr, "  [ovrp] display frequency forced to %.1f Hz "
+                                "by KL_DISPLAY_HZ\n", (double)hz);
+                g_display_hz = hz;
+            }
+        }
+    }
+    return g_display_hz;
+}
 
 static float klovrp_GetSystemDisplayFrequency(void) {
     ovrp_hit("ovrp_GetSystemDisplayFrequency");

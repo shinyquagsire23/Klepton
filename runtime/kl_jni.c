@@ -1296,6 +1296,7 @@ static klj_val klj_appinfo_dataDir(void);
 static klj_val klj_appinfo_splitSourceDirs(void);
 static klj_val klj_metaData_field(void);
 static klj_val klj_currentActivity_field(void);
+static klj_val klj_porterduff_clear(void);
 
 // ---- written fields ----
 // g_fields describes the device, and a description does not change. But some
@@ -1482,6 +1483,7 @@ static const klj_field g_fields[] = {
     // Context was, not another instance of the class — Unity passes one to native
     // code and reads the other back, then compares them.
     KLJ_FFN("com/unity3d/player/UnityPlayer", "currentActivity", "Ljava/lang/Object;", klj_currentActivity_field),
+    KLJ_FFN("android/graphics/PorterDuff$Mode", "CLEAR", "Landroid/graphics/PorterDuff$Mode;", klj_porterduff_clear),
 
     KLJ_FFN("android/content/pm/PackageItemInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),
     KLJ_FFN("android/content/pm/ApplicationInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),
@@ -1767,6 +1769,17 @@ static klj_val klj_singleton(const char *cls, void **slot) {
     return (klj_val){.l = *slot};
 }
 
+// Android's application context is a longer-lived object than the Activity, but
+// every context here is the same synthetic bag of services, so one singleton
+// answers both. It matters only that it IS a Context: the guest passes it to a
+// WebView constructor, and everything it then asks of it lands on the
+// Context bindings below.
+static klj_val klj_Activity_getApplicationContext(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *appctx;
+    return klj_singleton("android/content/Context", &appctx);
+}
+
 static klj_val klj_Activity_getIntent(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *intent;
@@ -1839,6 +1852,73 @@ static klj_val klj_Intent_addCategory(void *env, void *self, const klj_val *a, i
     KLJ_LOG("Intent.addCategory(\"%s\")", c ? c : "(null)");
     return (klj_val){.l = self};
 }
+// ---- WebView, and what it honestly is here ----------------------------------
+//
+// The VR client's in-headset UI is an Android WebView rendered to a texture:
+// it constructs one, sizes it, draws it into a Canvas backed by a Bitmap, and
+// copies that Bitmap's pixels into a direct ByteBuffer it uploads as a panel.
+// There is no browser in this process and no plan to embed one, so the answer
+// is the platform-absent answer the rest of the shim already gives: the object
+// exists, every call is accepted, and it draws NOTHING — the guest's pixel
+// buffer comes back exactly as it went in, which is a transparent panel.
+//
+// That is a deliberate cosmetic gap and not a fabrication: it grants nothing,
+// asserts nothing about content, and the video panel is a different surface
+// (SVLDecoder -> AImageReader -> EGLImage). If the UI ever becomes the thing
+// under test, this is the seam to grow — a real WKWebView drawn into the same
+// buffer would slot in here without the guest noticing.
+static int g_webview_draws;
+static klj_val klj_WebView_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    KLJ_LOG("WebView.<init> — no browser is embedded; this panel draws nothing");
+    return (klj_val){.l = self};
+}
+static klj_val klj_WebView_loadUrl(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *u = n > 0 ? klj_str(a[0].l) : NULL;
+    KLJ_LOG("WebView.loadUrl(\"%s\") — accepted and dropped", u ? u : "(null)");
+    return (klj_val){.j = 0};
+}
+static klj_val klj_WebView_getSettings(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *settings;
+    return klj_singleton("android/webkit/WebSettings", &settings);
+}
+// draw(Canvas): the one call that would produce pixels. It does not, and it
+// says so once rather than every frame.
+static klj_val klj_WebView_draw(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    if (!g_webview_draws++)
+        KLJ_LOG("WebView.draw — nothing to draw; the panel stays transparent");
+    return (klj_val){.j = 0};
+}
+// klj_void_noop is further down — it is the shared void handler, and these
+// bindings use it rather than adding a second one.
+static klj_val klj_false(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+// Bitmap/Canvas: handles with no backing store, because nothing ever writes to
+// them. copyPixelsToBuffer therefore leaves the guest's buffer untouched —
+// which is the correct consequence of a WebView that drew nothing, not a
+// separate decision.
+static klj_val klj_Bitmap_createBitmap(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("Bitmap.createBitmap(%d, %d) — handle only, no pixel store",
+            n > 0 ? (int)a[0].j : 0, n > 1 ? (int)a[1].j : 0);
+    static void *bmp;
+    return klj_singleton("android/graphics/Bitmap", &bmp);
+}
+static klj_val klj_BitmapConfig_valueOf(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *cfg;
+    return klj_singleton("android/graphics/Bitmap$Config", &cfg);
+}
+static klj_val klj_Canvas_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = self};
+}
+
 static klj_val klj_Intent_setPackage(void *env, void *self, const klj_val *a, int n) {
     (void)env;
     const char *p = n > 0 ? klj_str(a[0].l) : NULL;
@@ -3163,6 +3243,32 @@ static klj_val klj_AudioManager_getStreamVolume(void *env, void *self, const klj
     return (klj_val){.j = 15};
 }
 
+// ...and the rest of the volume model, which has to agree with the line above:
+// the music stream runs 0..15 and sits at 15. Reporting a different maximum
+// here than getStreamVolume answers against would make the guest compute a
+// fraction greater than one, which is the display-panel group-answer rule in
+// yet another subsystem.
+static klj_val klj_AudioManager_getStreamMinVolume(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_AudioManager_getStreamMaxVolume(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 15};
+}
+// Writes are accepted and dropped. The host's own volume is the user's, not
+// the guest's to set, and kl_audio.c mixes at unity gain — so honouring these
+// would mean turning down a device the person is also using for everything
+// else. The read-back above is unaffected because nothing here records state.
+static klj_val klj_AudioManager_setStreamVolume(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("AudioManager.setStreamVolume(stream %lld, %lld) — accepted and dropped; "
+            "the host device's volume is the user's",
+            n > 0 ? (long long)(int32_t)a[0].j : -1,
+            n > 1 ? (long long)(int32_t)a[1].j : -1);
+    return (klj_val){.j = 0};
+}
+
 static klj_val klj_UnityPlayer_getLaunchURL(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     // null, and that is the answer rather than a placeholder: the app was not
@@ -3591,6 +3697,41 @@ static klj_val klj_void_noop(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.j = 0};
 }
 
+// WebView's message channel — the two-way bridge between the guest's C++ and
+// the page it would have loaded. Android returns a pair of entangled ports; the
+// guest keeps port 0, posts port 1 into the document, and waits for the page to
+// talk back. Both ports are real objects here and neither ever delivers
+// anything, because there is no document (see the WebView block above). That is
+// the same answer as an unanswered channel on a page that never finished
+// loading, which is a state the guest must already tolerate.
+static klj_val klj_WebView_createWebMessageChannel(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *ports;
+    if (!ports) {
+        ports = klj_new_array('L', "android/webkit/WebMessagePort", 2);
+        klj_as_object(ports)->pinned = 1;
+        klj_array *arr = klj_arr(ports);
+        for (int i = 0; i < 2; i++) {
+            void *p = kl_jni_new_object("android/webkit/WebMessagePort");
+            klj_as_object(p)->pinned = 1;
+            ((void **)arr->data)[i] = p;
+        }
+        KLJ_LOG("WebView.createWebMessageChannel — two ports, and nothing will "
+                "ever arrive on them");
+    }
+    return (klj_val){.l = ports};
+}
+
+// WebView.getProgress — the page load percentage. There is no page, so nothing
+// has loaded, and 0 is the truthful answer. Answering 100 would be asserting
+// that a document we never fetched finished rendering, which is exactly the
+// kind of invented answer this shim refuses to give; if the guest ever blocks
+// waiting for it, the block is the measurement.
+static klj_val klj_WebView_getProgress(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
 // Uri.decode — percent-decoding, implemented rather than stubbed because it is a
 // pure function with one right answer.
 //
@@ -3646,6 +3787,14 @@ void *kl_jni_activity(void) {
         ((klj_object *)activity)->pinned = 1;   // singleton; survives any frame pop
     }
     return activity;
+}
+
+// PorterDuff.Mode.CLEAR — the blend mode the guest hands Canvas.drawColor to
+// wipe its WebView bitmap. Our Canvas has no pixel store, so the mode is never
+// read; it has to be a non-null object of the right class and nothing more.
+static klj_val klj_porterduff_clear(void) {
+    static void *mode;
+    return klj_singleton("android/graphics/PorterDuff$Mode", &mode);
 }
 
 static klj_val klj_currentActivity_field(void) {
@@ -5046,6 +5195,13 @@ static const klj_binding g_bindings[] = {
      "(Landroid/hardware/input/InputManager$InputDeviceListener;Landroid/os/Handler;)V",
      klj_InputManager_registerListener},
     {"android/media/AudioManager", "getStreamVolume", "(I)I", klj_AudioManager_getStreamVolume},
+    {"android/media/AudioManager", "getStreamMinVolume", "(I)I", klj_AudioManager_getStreamMinVolume},
+    {"android/media/AudioManager", "getStreamMaxVolume", "(I)I", klj_AudioManager_getStreamMaxVolume},
+    {"android/media/AudioManager", "setStreamVolume", "(III)V", klj_AudioManager_setStreamVolume},
+    {"android/media/AudioManager", "setStreamMute", "(IZ)V", klj_void_noop},
+    {"android/media/AudioManager", "isStreamMute", "(I)Z", klj_false},
+    {"android/media/AudioManager", "isMicrophoneMute", "()Z", klj_false},
+    {"android/media/AudioManager", "setMicrophoneMute", "(Z)V", klj_void_noop},
     {"com/unity3d/player/UnityPlayer", "getLaunchURL", "()Ljava/lang/String;", klj_UnityPlayer_getLaunchURL},
     {"java/lang/Integer", "parseInt", "(Ljava/lang/String;)I", klj_Integer_parseInt},
     {"android/media/AudioManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", klj_AudioManager_getProperty},
@@ -5072,6 +5228,8 @@ static const klj_binding g_bindings[] = {
     {"java/lang/StringBuilder", "append", "(F)Ljava/lang/StringBuilder;", klj_SB_append_F},
 
     {"android/app/Activity",   "getIntent",  "()Landroid/content/Intent;", klj_Activity_getIntent},
+    {"android/app/Activity",   "getApplicationContext", "()Landroid/content/Context;",
+     klj_Activity_getApplicationContext},
     {"android/app/Activity",   "runOnUiThread", "(Ljava/lang/Runnable;)V", klj_Activity_runOnUiThread},
     {"android/app/Activity",   "getWindow", "()Landroid/view/Window;",     klj_Activity_getWindow},
     {"android/app/Activity",   "setRequestedOrientation", "(I)V", klj_Activity_setRequestedOrientation},
@@ -5187,6 +5345,61 @@ static const klj_binding g_bindings[] = {
     {"android/content/Intent", "getExtras",  "()Landroid/os/Bundle;",      klj_Intent_getExtras},
     {"android/content/Intent", "<init>",     "(Ljava/lang/String;)V",      klj_Intent_init},
     {"android/content/Intent", "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_addCategory},
+    // The in-headset UI panel — see the WebView block above for why every one
+    // of these is accepted and none of them produces a pixel.
+    {"android/webkit/WebView", "<init>", "(Landroid/content/Context;)V", klj_WebView_init},
+    {"android/webkit/WebView", "loadUrl", "(Ljava/lang/String;)V", klj_WebView_loadUrl},
+    {"android/webkit/WebView", "getSettings", "()Landroid/webkit/WebSettings;", klj_WebView_getSettings},
+    {"android/webkit/WebView", "draw", "(Landroid/graphics/Canvas;)V", klj_WebView_draw},
+    {"android/webkit/WebView", "setBackgroundColor", "(I)V", klj_void_noop},
+    {"android/webkit/WebView", "setLayerType", "(ILandroid/graphics/Paint;)V", klj_void_noop},
+    {"android/webkit/WebView", "measure", "(II)V", klj_void_noop},
+    {"android/webkit/WebView", "setMeasuredDimension", "(II)V", klj_void_noop},
+    {"android/webkit/WebView", "layout", "(IIII)V", klj_void_noop},
+    {"android/webkit/WebView", "onPause",  "()V", klj_void_noop},
+    {"android/webkit/WebView", "onResume", "()V", klj_void_noop},
+    {"android/webkit/WebView", "setWebChromeClient", "(Landroid/webkit/WebChromeClient;)V", klj_void_noop},
+    {"android/webkit/WebView", "dispatchTouchEvent", "(Landroid/view/MotionEvent;)Z", klj_false},
+    // The WebSettings surface, in full: these are every `set*` name the guest
+    // binary carries that belongs to this class, and all of them are void
+    // setters on a browser that is not here.
+    {"android/webkit/WebSettings", "setJavaScriptEnabled", "(Z)V", klj_void_noop},
+    {"android/webkit/WebSettings", "setUseWideViewPort", "(Z)V", klj_void_noop},
+    {"android/webkit/WebSettings", "setLoadWithOverviewMode", "(Z)V", klj_void_noop},
+    {"android/webkit/WebSettings", "setLoadsImagesAutomatically", "(Z)V", klj_void_noop},
+    {"android/webkit/WebSettings", "setMediaPlaybackRequiresUserGesture", "(Z)V", klj_void_noop},
+    {"android/webkit/WebView", "setVisibility", "(I)V", klj_void_noop},
+    {"android/webkit/WebView", "getProgress", "()I", klj_WebView_getProgress},
+    {"android/webkit/WebView", "createWebMessageChannel", "()[Landroid/webkit/WebMessagePort;",
+     klj_WebView_createWebMessageChannel},
+    {"android/webkit/WebMessagePort", "setWebMessageCallback",
+     "(Landroid/webkit/WebMessagePort$WebMessageCallback;Landroid/os/Handler;)V", klj_void_noop},
+    {"android/webkit/WebView", "postWebMessage",
+     "(Landroid/webkit/WebMessage;Landroid/net/Uri;)V", klj_void_noop},
+    {"android/webkit/WebMessagePort", "postMessage", "(Landroid/webkit/WebMessage;)V", klj_void_noop},
+    {"android/graphics/Bitmap", "createBitmap",
+     "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;", klj_Bitmap_createBitmap},
+    {"android/graphics/Bitmap$Config", "valueOf",
+     "(Ljava/lang/String;)Landroid/graphics/Bitmap$Config;", klj_BitmapConfig_valueOf},
+    {"android/graphics/Bitmap", "copyPixelsToBuffer", "(Ljava/nio/Buffer;)V", klj_void_noop},
+    {"android/graphics/Canvas", "<init>", "(Landroid/graphics/Bitmap;)V", klj_Canvas_init},
+    {"android/graphics/Canvas", "drawColor", "(ILandroid/graphics/PorterDuff$Mode;)V", klj_void_noop},
+    {"android/graphics/Canvas", "scale", "(FFFF)V", klj_void_noop},
+
+    // The view hierarchy the WebView is hung in. Three classes, and the guest
+    // never reads anything back out of them — it builds the tree, hands it to
+    // the Activity, and from then on only ever calls draw(). So a constructor
+    // that returns the object it was given is the whole of it.
+    {"android/widget/RelativeLayout", "<init>", "(Landroid/content/Context;)V", klj_Canvas_init},
+    {"android/widget/RelativeLayout$LayoutParams", "<init>", "(II)V", klj_Canvas_init},
+    {"android/widget/RelativeLayout", "setLayerType", "(ILandroid/graphics/Paint;)V", klj_void_noop},
+    {"android/widget/RelativeLayout", "measure", "(II)V", klj_void_noop},
+    {"android/widget/RelativeLayout", "layout", "(IIII)V", klj_void_noop},
+    {"android/widget/RelativeLayout", "draw", "(Landroid/graphics/Canvas;)V", klj_void_noop},
+    {"android/widget/RelativeLayout", "addView",
+     "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V", klj_void_noop},
+    {"android/app/Activity", "setContentView", "(Landroid/view/View;)V", klj_void_noop},
+
     {"android/content/Intent", "setPackage",  "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_setPackage},
     {"android/content/Intent", "addFlags",    "(I)Landroid/content/Intent;",                 klj_Intent_addFlags},
     {"android/content/Context", "getAssets", "()Landroid/content/res/AssetManager;", klj_Context_getAssets},

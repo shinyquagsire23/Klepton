@@ -25,6 +25,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
            runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_vtdec.c \
+           runtime/kl_aaudio.c \
            runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_il2cpp.c runtime/kl_fault.c
 RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c
@@ -146,17 +147,18 @@ slink-vr-scene: build/m_slink
 # **This target exits NON-ZERO on success**, unlike the other three slink gates.
 # Since SL-10 the stop is not ours at all: it is the guest's own DebuggerBreak
 # (`brk #1` at libvrlink_scene+0x15b798, so SIGTRAP rather than SIGABRT) after
-# it rejects the SYNTHETIC token above — "Unknown / confusing key identifier".
-# That is the same class of correct-behaviour stop as SL-9's "No sArgs and
-# release build panic": a fabricated credential is refused, which is what a
-# credential is for. Measured, so it is not re-derived: the token is URL-safe
-# base64 (alphabet `...0123456789-_`, no padding) and InitCrypt decodes it into
-# a caller-sized vector, but the failing message prints only its FIRST FOUR
-# characters whatever its length, and four base64 characters cannot decode to
-# the >= 5 bytes the check at +0x15b5cc demands — so the shape is not simply
-# "make the token longer". A real sArgs from a live pairing run
-# (notes/STEAMLINK.md, SL-6's recipe) is the way past this, and is the standing
-# pickup item.
+# it rejects the SYNTHETIC token above. That is the same class of
+# correct-behaviour stop as SL-9's "No sArgs and release build panic": a
+# fabricated credential is refused, which is what a credential is for.
+#
+# With a REAL sArgs (SL-11: notes/STEAMLINK.md carries the pairing -> handoff
+# loop) it goes considerably further and exits 0 — the session is accepted, the
+# UDP data link connects, the Steam host replies, AAudio comes up, and the run
+# reaches the stream scene's WebView pre-flight. Measured from the disassembly
+# so it is not re-derived: InitCrypt scans for SEVEN `~` and the int it logs is
+# the whole sArgs length; the token begins with a FOUR-CHARACTER key identifier
+# (`MID0`), which is why the failure message prints four characters — it is not
+# a truncated print, and "make the token longer" was never the shape of it.
 #
 # Read the last "fault:"/"fatal:" line, not make's exit code.
 KL_SLINK_SARGS ?= 192.168.1.50~10400~10400~0,0,1~~~~dGVzdA==

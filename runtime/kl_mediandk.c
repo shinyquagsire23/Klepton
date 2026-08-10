@@ -278,6 +278,12 @@ typedef struct {
 #define KLM_READER_MAGIC 0x4b4c5244u   /* 'KLRD' */
 
 static klm_reader *g_reader;        // for the report; this guest makes one
+// Lifetime totals. The per-object counters die with the object, and the run
+// where "did anything decode?" matters most is the CLEAN one — where the app
+// shuts down and deletes both the codec and the reader before anything gets
+// to report. These outlive that. (SL-11: an empty media report read as "the
+// decoder was never fed" when it only meant "teardown got there first".)
+static unsigned g_life_in, g_life_out, g_life_rendered, g_life_published, g_life_acquired;
 
 // Android delivers onImageAvailable on a thread that is NOT the one that
 // released the buffer, and that is load-bearing rather than incidental. This
@@ -408,6 +414,7 @@ static void klm_AImageReader_delete(void *reader) {
     kl_ndk_window_free(r->window);
     pthread_mutex_destroy(&r->lock);
     pthread_cond_destroy(&r->cv);
+    g_life_published += r->n_queued; g_life_acquired += r->n_acquired;
     if (g_reader == r) g_reader = NULL;
     r->magic = 0;
     free(r);
@@ -462,6 +469,7 @@ typedef struct {
 #define KLM_CODEC_MAGIC 0x4b4c4344u    /* 'KLCD' */
 
 static klm_codec *g_codec;
+
 
 static void *klm_AMediaCodec_createDecoderByType(const char *mime) {
     klm_codec *c = calloc(1, sizeof *c);
@@ -553,6 +561,7 @@ static int klm_AMediaCodec_delete(void *codec) {
     pthread_mutex_unlock(&c->lock);
     kl_vtdec_destroy(c->dec);
     pthread_mutex_destroy(&c->lock);
+    g_life_in += c->n_in; g_life_out += c->n_out; g_life_rendered += c->n_rendered;
     if (g_codec == c) g_codec = NULL;
     c->magic = 0;
     free(c);
@@ -691,17 +700,19 @@ static void klm_ATrace_endSection(void) { }
 // ---------------------------------------------------------------------------
 
 void kl_mediandk_report(FILE *f) {
-    if (!g_codec && !g_reader) return;
+    unsigned in = g_life_in + (g_codec ? g_codec->n_in : 0);
+    unsigned out = g_life_out + (g_codec ? g_codec->n_out : 0);
+    unsigned rendered = g_life_rendered + (g_codec ? g_codec->n_rendered : 0);
+    unsigned published = g_life_published + (g_reader ? g_reader->n_queued : 0);
+    unsigned acquired = g_life_acquired + (g_reader ? g_reader->n_acquired : 0);
+    if (!in && !out && !published && !g_codec && !g_reader) return;
     fprintf(f, "\n=== media (AMediaCodec / AImageReader) ===\n");
-    if (g_codec)
-        fprintf(f, "  codec \"%s\": %u buffers queued, %u frames dequeued, "
-                   "%u rendered\n",
-                g_codec->mime, g_codec->n_in, g_codec->n_out, g_codec->n_rendered);
-    if (g_reader)
-        fprintf(f, "  reader: %u published, %u acquired, %u dropped as stale, "
-                   "%d held\n",
-                g_reader->n_queued, g_reader->n_acquired, g_reader->n_dropped,
-                g_reader->count);
+    fprintf(f, "  codec \"%s\": %u buffers queued, %u frames dequeued, %u rendered%s\n",
+            g_codec ? g_codec->mime : "video/hevc", in, out, rendered,
+            g_codec ? "" : "  (codec deleted; totals are for the whole run)");
+    fprintf(f, "  reader: %u published, %u acquired, %u dropped as stale, %d held\n",
+            published, acquired, g_reader ? g_reader->n_dropped : 0,
+            g_reader ? g_reader->count : 0);
     kl_vtdec_report(f);
 }
 

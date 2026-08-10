@@ -68,6 +68,7 @@ int getentropy(void *buffer, size_t size);
 #include "kl_opensl.h"
 #include "kl_openxr.h"
 #include "kl_mediandk.h"
+#include "kl_aaudio.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
 #include "kl_jni.h"
@@ -700,6 +701,56 @@ static int kl_bind(int fd, const struct sockaddr *sa, socklen_t len) {
                 fd, host, r, r ? strerror(errno) : "ok");
     return r;
 }
+// A datagram socket that has been connect()ed, being sendto()'d with an
+// explicit destination anyway. **Linux allows it and Darwin does not** — BSD's
+// udp_send refuses with EISCONN, Linux's udp_sendmsg just uses the address it
+// was handed. That is a behavioural divergence rather than a struct layout or
+// a flag number, which is what made it invisible until a guest depended on it:
+// Steam Link's SVL transport connects its UDP socket and then sends through
+// sendto() forever, so every packet failed, the client counted 51 in a row and
+// tore the link down — "TX Failure Streak Hit 51; Aborting and reconnecting",
+// looping for the whole run with no video. Nothing in the log said "sendto",
+// and the natural reading was that the host had stopped listening.
+//
+// The destination is checked against the connected peer rather than assumed:
+// same peer means send() is exactly what Linux would have done, and a
+// different one is a real divergence we cannot paper over, so it keeps the
+// error and says so by name.
+static ssize_t kl_sendto_connected(int fd, const void *buf, size_t n, int dflags,
+                                   const struct sockaddr *sa) {
+    struct sockaddr_storage peer;
+    socklen_t plen = sizeof peer;
+    if (getpeername(fd, (struct sockaddr *)&peer, &plen) != 0) { errno = EISCONN; return -1; }
+
+    int same = 0;
+    if (peer.ss_family == sa->sa_family) {
+        if (peer.ss_family == AF_INET) {
+            const struct sockaddr_in *p = (const struct sockaddr_in *)&peer;
+            const struct sockaddr_in *d = (const struct sockaddr_in *)sa;
+            same = p->sin_port == d->sin_port &&
+                   p->sin_addr.s_addr == d->sin_addr.s_addr;
+        } else if (peer.ss_family == AF_INET6) {
+            const struct sockaddr_in6 *p = (const struct sockaddr_in6 *)&peer;
+            const struct sockaddr_in6 *d = (const struct sockaddr_in6 *)sa;
+            same = p->sin6_port == d->sin6_port &&
+                   memcmp(&p->sin6_addr, &d->sin6_addr, sizeof p->sin6_addr) == 0;
+        }
+    }
+    if (!same) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [net] sendto() to an address other than the connected "
+                            "peer on fd %d: Darwin refuses this and Linux allows it\n", fd);
+        errno = EISCONN;
+        return -1;
+    }
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [net] sendto() on a connected socket -> send() "
+                        "(Linux permits the destination, BSD returns EISCONN)\n");
+    return send(fd, buf, n, dflags);
+}
+
 static ssize_t kl_sendto(int fd, const void *buf, size_t n, int flags,
                          const struct sockaddr *sa, socklen_t len) {
     struct sockaddr_storage hs;
@@ -711,6 +762,8 @@ static ssize_t kl_sendto(int fd, const void *buf, size_t n, int flags,
     int nosig = 0, dflags = kl_msg_flags(flags, &nosig);
     if (nosig) kl_no_sigpipe(fd);
     ssize_t r = sendto(fd, buf, n, dflags, sa, len);
+    if (r < 0 && errno == EISCONN && sa)
+        r = kl_sendto_connected(fd, buf, n, dflags, sa);
     if (kl_net_trace())
         fprintf(stderr, "  [net] sendto(fd=%d, %zu B, flags=0x%x->0x%x, %s) -> %zd%s\n",
                 fd, n, flags, dflags, host, r, r < 0 ? strerror(errno) : "");
@@ -871,6 +924,12 @@ static ssize_t kl_sendmsg(int fd, const void *gmsg, int flags) {
     if (nosig) kl_no_sigpipe(fd);
     h.msg_flags = 0;
     ssize_t r = sendmsg(fd, &h, dflags);
+    if (r < 0 && errno == EISCONN && h.msg_name) {
+        // Same divergence as kl_sendto's — a named send on a connected socket.
+        // Retry with the name dropped, which is what Linux effectively did.
+        h.msg_name = NULL; h.msg_namelen = 0;
+        r = sendmsg(fd, &h, dflags);
+    }
     if (kl_net_trace())
         fprintf(stderr, "  [net] sendmsg(fd=%d, %d iov, %u B ctl, flags=0x%x->0x%x, %s) -> %zd%s\n",
                 fd, (int)h.msg_iovlen, (unsigned)h.msg_controllen, flags, dflags,
@@ -1380,5 +1439,12 @@ void *kl_shim_lookup(const char *name) {
          !strncmp(name, "AHardwareBuffer_", 16) || !strncmp(name, "ATrace_", 7) ||
          !strncmp(name, "AMEDIAFORMAT_", 13)))
         return kl_mediandk_lookup(name);
+
+    // Tier 9: libaaudio (SL-11) — the audio half of the same client. Another
+    // DT_NEEDED bound at relocation time, and another lookup that says no to
+    // what it does not serve. "AAudio" cannot collide with tier 8's prefixes,
+    // so the order of these two tests does not matter.
+    if (!strncmp(name, "AAudio", 6))
+        return kl_aaudio_lookup(name);
     return NULL;
 }

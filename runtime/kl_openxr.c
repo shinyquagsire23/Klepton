@@ -428,7 +428,9 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
        one below was added because that line named it and the guest then       \
        called the null pointer it got back. */                                 \
     X(xrInitializeLoaderKHR)                                                   \
-    X(xrGetOpenGLESGraphicsRequirementsKHR)
+    X(xrGetOpenGLESGraphicsRequirementsKHR)                                    \
+    X(xrEnumerateDisplayRefreshRatesFB) X(xrGetDisplayRefreshRateFB)           \
+    X(xrRequestDisplayRefreshRateFB)
 
 // ------------------------------------------------------------------ bookkeeping
 // One row per entry point: resolved counts lookups, called counts calls. The
@@ -623,8 +625,37 @@ static klxr_instance *klxr_inst(void *h) {
 static const struct { const char *name; uint32_t version; } g_extensions[] = {
     { "XR_KHR_opengl_es_enable",       10 },
     { "XR_KHR_android_create_instance", 3 },
+    // XR_FB_display_refresh_rate is the exception to the paragraph above, and
+    // it is here because absence turned out NOT to be handled gracefully after
+    // all (SL-11). The guest prints "XR_EXT_display_refresh_rate is not
+    // available on this runtime" and carries on — but the thing it carried on
+    // to was "[SVLClientXR] Supported refresh rates was empty!", and it
+    // publishes that empty list to the Steam host as
+    // VTE_AVAILABLE_FRAMETIMES_US. A host told the client can present at no
+    // rate at all never starts sending video: the link came up, the control
+    // channel exchanged updates, and the decoder was configured and then never
+    // handed a single buffer.
+    //
+    // Claiming it is truthful because we can answer it truthfully: the display
+    // frequency is measured (kl_ovrp_set_display_frequency, pushed by the
+    // compositor's primeDisplay) and it is the SAME number the OVRP side
+    // reports, so the two XR APIs cannot disagree about the panel — SL-9's
+    // rule for eye poses, in the one other place a headset property is
+    // answered twice.
+    { "XR_FB_display_refresh_rate",     1 },
 };
-#define KLXR_EXT_COUNT ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
+#define KLXR_EXT_ALL ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
+
+// KL_XR_REFRESH_EXT=0 hides XR_FB_display_refresh_rate again — the A/B for the
+// finding above, and it works by count because that extension is deliberately
+// the last entry. Advertising it changes what the client publishes to the
+// Steam host, so this is the knob that says whether a change in host behaviour
+// came from here.
+static uint32_t klxr_ext_count(void) {
+    const char *e = getenv("KL_XR_REFRESH_EXT");
+    return (e && !strcmp(e, "0")) ? KLXR_EXT_ALL - 1 : KLXR_EXT_ALL;
+}
+#define KLXR_EXT_COUNT (klxr_ext_count())
 
 // The two-call idiom, which every enumerate in OpenXR uses and which is easy to
 // get subtly wrong: capacityInput 0 means "just tell me the count" and must
@@ -880,6 +911,49 @@ static klxr_session *klxr_sess(void *h) {
     klxr_session *s = (klxr_session *)h;
     return (s && s->magic == KLXR_MAGIC_SESSION) ? s : NULL;
 }
+
+// ---------------------------------------------------------- XR_FB_display_refresh_rate
+//
+// One rate, and it is the one the display actually runs at. Offering a menu we
+// cannot switch between would be a promise — the same reasoning, and the same
+// single source, as ovrp_GetSystemDisplayAvailableFrequencies in kl_ovrp.c.
+//
+// The Steam host asks for a rate it prefers (90 Hz here); the client compares
+// it against this list, picks what it can do, and tells the host. That
+// negotiation is the whole point of the extension for this guest, and an empty
+// list is not a neutral answer to it.
+enum { KLXR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB = -1000101000 };
+
+static XrResult klxr_EnumerateDisplayRefreshRatesFB(void *session, uint32_t capacity,
+                                                    uint32_t *count_out, float *rates) {
+    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    XrResult r = klxr_two_call(capacity, count_out, 1);
+    if (r == KLXR_SUCCESS && capacity >= 1 && rates)
+        rates[0] = kl_ovrp_display_frequency();
+    return r;
+}
+
+static XrResult klxr_GetDisplayRefreshRateFB(void *session, float *rate) {
+    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!rate) return KLXR_ERROR_VALIDATION_FAILURE;
+    *rate = kl_ovrp_display_frequency();
+    return KLXR_SUCCESS;
+}
+
+// 0.0f is the spec's "give me the system default", which is the only rate we
+// have anyway. Anything else has to match it: accepting a rate we do not run at
+// would make the guest pace its frames against a clock that does not exist.
+static XrResult klxr_RequestDisplayRefreshRateFB(void *session, float rate) {
+    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    float have = kl_ovrp_display_frequency();
+    if (rate != 0.0f && fabsf(rate - have) > 0.5f) {
+        fprintf(stderr, "  [xr] xrRequestDisplayRefreshRateFB(%.1f) — the display "
+                        "runs at %.1f; refused\n", (double)rate, (double)have);
+        return KLXR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB;
+    }
+    return KLXR_SUCCESS;
+}
+
 
 // XrTime is int64 nanoseconds on a monotonic clock the runtime chooses. It must
 // be the SAME clock the guest's own timing uses, for the reason the
@@ -2023,6 +2097,11 @@ static void klxr_install(void) {
                                    (void *)klxr_EnumerateViewConfigurationViews},
         {"xrGetOpenGLESGraphicsRequirementsKHR",
                                    (void *)klxr_GetOpenGLESGraphicsRequirementsKHR},
+        {"xrEnumerateDisplayRefreshRatesFB",
+                                   (void *)klxr_EnumerateDisplayRefreshRatesFB},
+        {"xrGetDisplayRefreshRateFB", (void *)klxr_GetDisplayRefreshRateFB},
+        {"xrRequestDisplayRefreshRateFB",
+                                   (void *)klxr_RequestDisplayRefreshRateFB},
         // the session, and the state machine xrPollEvent drives
         {"xrCreateSession",        (void *)klxr_CreateSession},
         {"xrDestroySession",       (void *)klxr_DestroySession},

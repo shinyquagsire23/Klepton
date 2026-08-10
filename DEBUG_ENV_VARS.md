@@ -597,6 +597,21 @@ that reports what came due since the frontend last asked. Platform-independent
   real API's own ceiling is about that). It matters more here than there: a
   frontend that has already been handed a pulse cannot be told to stop.
 
+- `KL_DISPLAY_HZ=<hz>` — force the display frequency the guest is told the
+  headset runs at, 30..240. It defaults to the Quest 2's 72, which is the
+  device we describe everywhere else, and on the host there is no panel to
+  measure; on visionOS the compositor's priming pass pushes the real number.
+  It matters beyond pacing for Steam Link: the VR client publishes this list to
+  the Steam host as `VTE_AVAILABLE_FRAMETIMES_US`, the host asks for a rate,
+  and the negotiation is visible in the guest's own log
+  (`Server requested refresh rate 90.0 was not available. Using 72.0`).
+- `KL_XR_REFRESH_EXT=0` — stop advertising `XR_FB_display_refresh_rate`
+  (`runtime/kl_openxr.c`), putting the runtime back to before SL-11. The A/B
+  for anything that changes when the client can answer the host's rate
+  question at all: without the extension the client publishes an EMPTY rate
+  list, and a host told the client can present at no rate never starts sending
+  video.
+
 ## Reprojection (`runtime/kl_reproject.c`)
 
 The composite/timewarp pass — one file, compiled by both compositors
@@ -679,6 +694,15 @@ reads no knobs). See PLANNING §12.18.
   did for its whole life before `kl_audio.c`. The A/B for anything that looks
   like an audio-induced timing change — and read **by value** (`kl_env_on`),
   since it defaults on.
+- `KL_AAUDIO_BURST=<frames>` — the frames-per-callback the AAudio surface
+  (`runtime/kl_aaudio.c`) reports and asks the guest's data callback to fill.
+  Default 240, which is 5 ms at 48 kHz and the unit Steam Link's own jitter
+  buffer is configured in multiples of. Clamped to 32..8192. AAudio is a *pull*
+  API, unlike OpenSL's buffer queue, so this is the size of every call INTO the
+  guest; the device is still the clock, because the feeder paces on
+  `kl_audio_write`. There is no knob for the input direction: capture streams
+  are refused by design (no microphone is presented — see `kl_aaudio.h`), which
+  the guest logs as `AAUDIO_ERROR_UNAVAILABLE` and carries on from.
 - `KL_AUDIO_DUMP=<path>` — tee exactly the frames the render callback will
   hand the hardware into a WAV. The only way to check *what* is being played
   rather than merely that something is: counts and peak levels cannot tell
@@ -783,16 +807,32 @@ See PLANNING §11.
   one of the right shape is enough to get past scene setup, a real one is
   needed for an actual stream. `make slink-vr-run` carries a synthetic default.
 
-  Since SL-10 the synthetic one no longer gets as far: the decoder now comes up
-  and the run reaches `SVLDataLink::InitCrypt`, which rejects the fake token
-  ("Unknown / confusing key identifier") and `DebuggerBreak()`s — SIGTRAP, from
-  the guest, and correct behaviour rather than a shim failure. Measured so it is
-  not re-derived: the token is **URL-safe base64** (alphabet ends `...789-_`, no
-  `=` padding) decoded in place into a caller-sized vector, and the rejection
-  message prints only its **first four characters whatever its length**, so the
-  fix is not "make the token longer" — four base64 characters cannot decode to
-  the ≥ 5 bytes the check at `libvrlink_scene+0x15b5cc` demands. A real `sArgs`
-  from a live pairing run is the way past it.
+  Since SL-10 the synthetic one no longer gets as far: the decoder comes up and
+  the run reaches `SVLDataLink::InitCrypt`, which rejects the fake token and
+  `DebuggerBreak()`s — SIGTRAP, from the guest, and correct behaviour rather
+  than a shim failure. A real `sArgs` from a live pairing run is the way past
+  it, and SL-11 measured the format from `InitCrypt` itself
+  (`libvrlink_scene+0x15b368`), correcting two guesses SL-10 made from the
+  outside:
+
+  - The string is scanned for **seven** `~` separators and the token is
+    everything after the seventh; the `int` argument the log prints
+    (`InitCrypt(...,82,1)`) is the **length of the whole sArgs string**, so a
+    stray character picked up while copying it out of a log shows up there.
+    Extract it with `tr -d '\r'` — runs go through `script`, so the log lines
+    end `"\r`, and 82 quietly becomes 84.
+  - "Unknown / confusing key identifier: %s" prints four characters because the
+    token *begins with a four-character key identifier* (`MID0` on every token
+    this host has issued), which the guest copies into a five-byte buffer. It
+    is **not** a truncated print of the whole token, and the token's length is
+    not the problem.
+  - The rest is base64 with the URL-safe alphabet (`...789-_`, and `+` is
+    **not** accepted — converting to the standard alphabet makes it worse),
+    decoded to at least 5 bytes for transport mode 1 (XOR0) or 68 characters
+    for mode 2.
+
+  A token that fails with **"XOR0 transport specified, but len too short"**
+  after all that is trap 19, not a bad token — see notes/TRAPS.md.
 - `KL_SLINK_START_INFO` / `KL_SLINK_ORIG_PACKAGE` / `KL_SLINK_ORIG_ACTIVITY` —
   the other three extras from the same Intent. Unset means absent, and absent
   is not the same as empty: with none of the four set, `getExtras()` answers

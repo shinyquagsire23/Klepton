@@ -568,7 +568,22 @@ int klb___cxa_thread_atexit_impl(void (*fn)(void *), void *obj, void *dso) {
 #define KLB_CT_B 0x80   /* blank */
 
 static unsigned char g_ctype[257];
-const unsigned char *klb_ctype_ptr = g_ctype + 1;   // the table entry is &this
+// The table entry is &this — and this points at the BASE of the 257-byte array,
+// not one past it. bionic's <ctype.h> writes `_ctype_[__ch + 1]`, so the +1 is
+// the *caller's*, and applying it here too shifts the whole table by one
+// character.
+//
+// That is exactly what it did, silently, for the whole project (SL-11): every
+// inline isalnum/isdigit/ispunct the guest evaluated answered for the character
+// AFTER the one it asked about. Letters and digits mostly survive it — 'A'
+// reads 'B', still alpha — which is why nothing broke for a year. The tell is
+// the boundaries: 'z' reads '{' and '9' reads ':', both punctuation, so exactly
+// two of the sixty-four base64 characters classify as "not a character".
+// Steam Link's SVL token decoder is a hand-written base64 that stops at the
+// first character it does not recognise, so a session token decoded only as far
+// as its first 'z' or '9' — which made an authorized session fail InitCrypt or
+// not, depending on where in the token the host had happened to put a 'z'.
+const unsigned char *klb_ctype_ptr = g_ctype;
 
 __attribute__((constructor)) static void kl_build_ctype(void) {
     for (int c = -1; c < 256; c++) {

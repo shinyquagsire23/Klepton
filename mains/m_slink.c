@@ -34,6 +34,8 @@
 #include "../runtime/kl_fault.h"
 #include "../runtime/kl_glfb.h"
 #include "../runtime/kl_view.h"
+#include "../runtime/kl_mediandk.h"
+#include "../runtime/kl_aaudio.h"
 
 static const char *LIBDIR = "steamlink-android/lib/arm64-v8a";
 
@@ -811,6 +813,11 @@ static int slink_run(void) {
 
     printf("\n=== JNI surface ===\n");
     kl_jni_report(stdout);
+    // The video and audio paths report on the abort path through kl_fault.c,
+    // which a clean exit never takes — and a clean exit is exactly the run
+    // where "did anything actually decode?" is the question (SL-11).
+    kl_mediandk_report(stdout);
+    kl_aaudio_report(stdout);
     return 0;
 }
 
