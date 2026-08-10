@@ -146,8 +146,12 @@ answers GL and kl_glfb never initializes.
   the read) — become inspectable, not just lit-counts. Reads are clipped to
   the `KL_GLFB_SIZE` buffers, so oversized attachments dump their top-left.
 - `KL_GLFB_DUMP_SINK=<dir>` — with a frame sink registered (the viewer), write
-  every 100th sink buffer to `<dir>/sink_NNNNN.png`. A black window with
+  every Nth sink buffer to `<dir>/sink_NNNNN.png`. A black window with
   content in these files is an SDL-side problem; black files are capture-side.
+- `KL_GLFB_DUMP_SINK_EVERY=N` — the interval above (default 100). The default is
+  ~17 s of a 2D UI at the shell's frame rate, which is far too coarse to see
+  what a `KL_VIEW_POKE` click did; 10 is the useful value when driving a
+  frontend.
 - `KL_GLFB_RAWSTATS=0` — silence the per-60-captures line reporting the eye
   texture's raw (pre-tone-map) min/max/mean. On by default; it is how the
   "very dark" picture was shown to be 1e-3 linear content, not a bad curve.
@@ -598,13 +602,21 @@ The composite/timewarp pass — one file, compiled by both compositors
   the gaze ray and the viewport centre is a crosshair. Off by default: the
   offset is the honest emulation and is what puts the in-game controller
   models where a body would hold them.
-- `KL_VIEW_POKE="fx,fy@secs"` — mono guests only. One synthetic click at
-  fractional window coordinates, `secs` after the guest goes mono, delivered
+- `KL_VIEW_POKE="fx,fy@secs[;fx,fy@secs]..."` — mono guests only. A sequence of
+  synthetic clicks (up to 12) at fractional window coordinates, delivered
   through the same `SDLActivity.onNativeMouse` a real click uses. Hover, press
   and release land on three separate frames, which is load-bearing: pressed and
   released inside one iteration takes a button's highlight and produces no
   click. Exists so the input path can be proved without posting a CGEvent at
   the desktop, which clicks whatever window is really under that point.
+  Every `secs` is measured from the SAME zero — the mono transition — not from
+  the click before it, so a run is described by when each screen is expected
+  rather than by gaps that have to be re-derived when an earlier screen gets
+  slower. A poke whose deadline has already passed fires as soon as the one
+  before it finishes, so the order is always the written one. This is what
+  drives Steam Link's shell to pairing:
+  `KL_VIEW_POKE="0.599,0.576@28;0.498,0.840@31"` picks the host tile and then
+  *Start Pairing*.
 - `KL_VIEW_CPU=1` — force the viewer's old readback path: `glReadPixels` the
   whole eye, tone-map it, memcpy it to the sink, row-flip it, upload it.
   Measured 23.5 fps against the hardware compositor's 54.7 on the same scene,

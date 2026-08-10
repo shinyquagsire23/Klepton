@@ -212,27 +212,46 @@ static int32_t view_mono_keycode(SDL_Scancode sc) {
     }
 }
 
-// KL_VIEW_POKE="fx,fy@secs" — one synthetic click at fractional window
-// coordinates, `secs` after the guest goes mono. It exists because the
-// alternative for proving this path is posting a CGEvent at the real desktop,
-// which clicks whatever window is actually under that point — it found an
-// editor the first time it was tried. This drives the same three calls a real
-// click drives, so it proves the path and not just the plumbing.
+// KL_VIEW_POKE="fx,fy@secs[;fx,fy@secs]..." — a SEQUENCE of synthetic clicks at
+// fractional window coordinates, each `secs` after the guest goes mono. It
+// exists because the alternative for proving this path is posting a CGEvent at
+// the real desktop, which clicks whatever window is actually under that point —
+// it found an editor the first time it was tried. This drives the same three
+// calls a real click drives, so it proves the path and not just the plumbing.
+//
+// A sequence rather than a single click because the interesting screens are not
+// the first one: the shell's host list is two clicks in, and pairing is three.
+// Every `secs` is measured from the SAME zero (the mono transition), not from
+// the previous click, so a run is described by when each screen is expected
+// rather than by durations that have to be re-derived when an earlier one gets
+// slower. A poke whose deadline has already passed fires as soon as the one
+// before it finishes, so the order is always the written one.
+#define KL_VIEW_POKE_MAX 12
+
 static void view_mono_poke(SDL_Window *win, uint64_t t_mono, uint64_t t_now) {
-    static int   parsed;
-    static float fx, fy;
-    static unsigned delay_ms;
-    static int   fired;
-    if (fired) return;
+    static int      parsed;
+    static struct { float fx, fy; unsigned delay_ms; } poke[KL_VIEW_POKE_MAX];
+    static int      npoke, cur;
+
+    if (parsed && cur >= npoke) return;
     if (!parsed) {
         parsed = 1;
         const char *s = kl_env_str("KL_VIEW_POKE", NULL);
-        if (!s || sscanf(s, "%f,%f@%u", &fx, &fy, &delay_ms) < 2) { fired = 1; return; }
-        delay_ms *= 1000;
-        fprintf(stderr, "view: [mono] KL_VIEW_POKE: one click at (%.3f, %.3f) "
-                        "after %u ms\n", (double)fx, (double)fy, delay_ms);
+        while (s && *s && npoke < KL_VIEW_POKE_MAX) {
+            float fx, fy; unsigned secs = 0;
+            if (sscanf(s, "%f,%f@%u", &fx, &fy, &secs) < 2) break;
+            poke[npoke].fx = fx; poke[npoke].fy = fy;
+            poke[npoke].delay_ms = secs * 1000;
+            npoke++;
+            const char *next = strchr(s, ';');
+            s = next ? next + 1 : NULL;
+        }
+        if (npoke)
+            fprintf(stderr, "view: [mono] KL_VIEW_POKE: %d click%s queued\n",
+                    npoke, npoke == 1 ? "" : "s");
+        if (cur >= npoke) return;
     }
-    if (!t_mono || t_now - t_mono < delay_ms) return;
+    if (!t_mono || t_now - t_mono < poke[cur].delay_ms) return;
 
     // Three steps on three different frames, not three calls in a row. A real
     // click hovers, holds for ~100 ms and releases, and the guest's event loop
@@ -248,11 +267,12 @@ static void view_mono_poke(SDL_Window *win, uint64_t t_mono, uint64_t t_now) {
 
     int ww = 0, wh = 0;
     SDL_GetWindowSize(win, &ww, &wh);
-    float x = fx * (float)ww, y = fy * (float)wh;
+    float x = poke[cur].fx * (float)ww, y = poke[cur].fy * (float)wh;
     switch (step++) {
     case 0:
-        fprintf(stderr, "view: [mono] poke click at %.0f,%.0f of %dx%d\n",
-                (double)x, (double)y, ww, wh);
+        fprintf(stderr, "view: [mono] poke %d/%d click at %.0f,%.0f of %dx%d "
+                        "(t+%.1fs)\n", cur + 1, npoke, (double)x, (double)y,
+                ww, wh, (double)(t_now - t_mono) / 1000.0);
         view_mono_mouse(win, 0, KL_AMOTION_HOVER_MOVE, x, y);
         break;
     case 1:
@@ -260,7 +280,8 @@ static void view_mono_poke(SDL_Window *win, uint64_t t_mono, uint64_t t_now) {
         break;
     default:
         view_mono_mouse(win, 0, KL_AMOTION_UP, x, y);
-        fired = 1;
+        step = 0;
+        cur++;
         break;
     }
 }

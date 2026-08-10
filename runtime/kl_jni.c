@@ -2936,6 +2936,172 @@ static klj_val klj_Context_checkPermission(void *env, void *self, const klj_val 
     return (klj_val){.j = 0};      // PackageManager.PERMISSION_GRANTED
 }
 
+// Activity.checkSelfPermission(String) — "may I use this, right now". Two
+// separate reasons to say no, and they are not interchangeable, so the log says
+// which one applied:
+//
+//   not declared   Android returns DENIED for a permission the app never put in
+//                  its manifest, whatever the user did. Granting one would be
+//                  inventing a capability out of nothing.
+//   no hardware    declared, but the device we present does not have the part.
+//                  We present a Quest 2 (the settled decision), which has hand
+//                  tracking and no eye or face tracker — so the eye/face
+//                  permissions are denied for the same reason
+//                  PackageManager.hasSystemFeature answers no to everything but
+//                  low-latency audio. These have to agree: a granted permission
+//                  for a sensor that reports nothing is the group-answer mistake
+//                  the display panel and the GLES capability set already avoid.
+//
+// Everything else the app declared is granted. That is what a Quest reports for
+// this app by the time someone is pairing: the dangerous ones (RECORD_AUDIO for
+// stream microphone input, the ACCESS_*_LOCATION that reading an SSID needs)
+// were requested at first run, and there is no user here to ask.
+static const char *const g_manifest_permissions[] = {
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.ACCESS_NETWORK_STATE",
+    "android.permission.ACCESS_WIFI_STATE",
+    "android.permission.BLUETOOTH_CONNECT",
+    "android.permission.CHANGE_NETWORK_STATE",
+    "android.permission.INTERNET",
+    "android.permission.MODIFY_AUDIO_SETTINGS",
+    "android.permission.RECORD_AUDIO",
+    "android.permission.VIBRATE",
+    "android.permission.WAKE_LOCK",
+    "com.oculus.permission.EYE_TRACKING",
+    "com.oculus.permission.FACE_TRACKING",
+    "com.oculus.permission.HAND_TRACKING",
+    "com.oculus.permission.RENDER_MODEL",
+    "com.oculus.permission.WIFI_LOCK",
+    "com.picovr.permission.EYE_TRACKING",
+    "com.picovr.permission.FACE_TRACKING",
+    "org.khronos.openxr.permission.OPENXR",
+    "org.khronos.openxr.permission.OPENXR_SYSTEM",
+};
+
+// Declared, but not on the headset we claim to be. Vendor-prefixed twice over
+// because the manifest carries both the Oculus and the Pico spelling of each.
+static const char *const g_absent_hardware_permissions[] = {
+    "com.oculus.permission.EYE_TRACKING",
+    "com.oculus.permission.FACE_TRACKING",
+    "com.picovr.permission.EYE_TRACKING",
+    "com.picovr.permission.FACE_TRACKING",
+};
+
+static int klj_permission_state(const char *p, const char **why) {
+    for (size_t i = 0; i < sizeof g_absent_hardware_permissions /
+                           sizeof *g_absent_hardware_permissions; i++)
+        if (strcmp(p, g_absent_hardware_permissions[i]) == 0) {
+            *why = " (the Quest 2 we present has no such sensor)";
+            return 0;
+        }
+    for (size_t i = 0; i < sizeof g_manifest_permissions /
+                           sizeof *g_manifest_permissions; i++)
+        if (strcmp(p, g_manifest_permissions[i]) == 0) { *why = ""; return 1; }
+    *why = " (not declared in the guest's manifest)";
+    return 0;
+}
+
+static klj_val klj_Context_checkSelfPermission(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *p = n > 0 ? klj_str(a[0].l) : "", *why = "";
+    int granted = klj_permission_state(p, &why);
+    KLJ_LOG("Activity.checkSelfPermission(\"%s\") -> %s%s", p,
+            granted ? "GRANTED" : "DENIED", why);
+    return (klj_val){.j = granted ? 0 : (uint64_t)(int64_t)-1};
+}
+
+// SteamLink.startVRLink(String) — the 2D->VR handoff of PLANNING §11.9, and by
+// the time it is called the hard part has already succeeded: the shell paired,
+// the host sent its authorization proof request, and the answer was
+// k_ERemoteDeviceStreamingSuccess. Its body (smali, SteamLink.smali:1676) is an
+// Intent for `com.valvesoftware.steamlinkvr/android.app.NativeActivity` carrying
+// sOriginalPackage / sOriginalActivity / sStartInfo / sArgs, a startActivity,
+// and finishAndRemoveTask on this one.
+//
+// We cannot honour that: the VR activity is a second front door that does not
+// exist here yet (no synthetic OpenXR runtime, no AMediaCodec), and launching
+// nothing while telling the shell it launched something would end the run
+// silently — the shell finishes itself immediately afterwards, so the app would
+// simply disappear with no picture and no reason given.
+//
+// So it stops by name, like every other unimplemented call. What it does FIRST
+// is print the payload, because that string is the authorized session and it is
+// expensive to get back: reaching this line costs a pairing round trip with a
+// real Steam host and a person typing a PIN. `~` is the field separator the
+// guest itself splits on, and field 3 is what it forwards as sStartInfo.
+static klj_val klj_SL_startVRLink(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *args = n > 0 ? klj_str(a[0].l) : "";
+    KLJ_LOG("SteamLink.startVRLink: the shell paired and the host authorized the "
+            "session — this is the 2D -> VR handoff (PLANNING §11.9)");
+    KLJ_LOG("  sArgs = \"%s\"", args ? args : "");
+    if (args) {
+        int  field = 0;
+        const char *p = args;
+        while (field < 16) {
+            const char *sep = strchr(p, '~');
+            KLJ_LOG("  sArgs[%d] = \"%.*s\"%s", field,
+                    sep ? (int)(sep - p) : (int)strlen(p), p,
+                    field == 3 ? "   <- forwarded as sStartInfo" : "");
+            if (!sep) break;
+            p = sep + 1; field++;
+        }
+    }
+    KLJ_LOG("  the VR activity (com.valvesoftware.steamlinkvr/android.app.NativeActivity) "
+            "is not stood up — this is the next arc, not a regression");
+    kl_fatal_prepare(); abort();
+}
+
+// Activity.requestPermissions(String[], int) — the runtime prompt. On Android
+// this RETURNS IMMEDIATELY and the answer arrives later on the main thread, at
+// onRequestPermissionsResult; returning is therefore the whole of the
+// synchronous contract, and anything more would be this call pretending to be
+// the dialog.
+//
+// There is no user to prompt, so the answer is the one checkSelfPermission just
+// gave — a prompt cannot turn "no such sensor" into yes. What must not happen is
+// silence: the guest asked a question, and a request that never resolves is a
+// wait that never ends (trap 6d's class). The delivery path is not invented
+// either, it is read off the guest's own SDLActivity bytecode:
+// onRequestPermissionsResult computes `grantResults[0] == PERMISSION_GRANTED`
+// and calls the static native nativePermissionResult(requestCode, granted). We
+// call that native with the same two values.
+//
+// Deliberately synchronous, where Android is not. Deferring it means a queue
+// entry kind that does not exist yet (g_ui_tasks holds Runnables and Messages),
+// and this caller — Valve's own code, which requested two permissions and
+// carried straight on — does not block on the answer. If a future caller does
+// re-enter badly, this is the line to move onto the main looper.
+static klj_val klj_Activity_requestPermissions(void *env, void *self, const klj_val *a, int n) {
+    (void)self;
+    klj_array *arr = n > 0 ? klj_arr(a[0].l) : NULL;
+    int32_t    code = n > 1 ? (int32_t)a[1].j : 0;
+    int        all_granted = 1;
+
+    for (int i = 0; arr && arr->kind == 'L' && i < arr->len; i++) {
+        const char *p = klj_str(((void **)arr->data)[i]), *why = "";
+        int granted = klj_permission_state(p ? p : "", &why);
+        if (!granted) all_granted = 0;
+        KLJ_LOG("Activity.requestPermissions[%d] \"%s\" -> %s%s", i, p ? p : "",
+                granted ? "GRANTED" : "DENIED", why);
+    }
+
+    // grantResults[0] is what SDLActivity actually reads, so a mixed request is
+    // reported by its first element — but only all-granted is answered true, to
+    // avoid a partial grant reading as a whole one.
+    void (*result)(void *, void *, int32_t, uint8_t) =
+        (void (*)(void *, void *, int32_t, uint8_t))
+            kl_jni_native("org/libsdl/app/SDLActivity", "nativePermissionResult", NULL);
+    KLJ_LOG("Activity.requestPermissions(code=%d) -> nativePermissionResult(%d, %s)%s",
+            code, code, all_granted ? "true" : "false",
+            result ? "" : " — SKIPPED, the guest registered no such native");
+    if (result) result(kl_jni_env(), kl_jni_class("org/libsdl/app/SDLActivity"), code,
+                       (uint8_t)(all_granted ? 1 : 0));
+    (void)env;
+    return (klj_val){.j = 0};
+}
+
 // ---- javax.net.ssl ----
 // The game's HTTPS stack (unitytls) resolves TrustManagerFactory during boot.
 // On Android these calls hand back the *system* trust store, which does not
@@ -4518,6 +4684,21 @@ static const klj_binding g_bindings[] = {
     // the visibility this waits on is a second view we do not have.
     {"com/valvesoftware/steamlink/SteamLink", "showOverlaySurface", "()V", klj_SDLA_null},
     {"com/valvesoftware/steamlink/SteamLink", "hideOverlaySurface", "()V", klj_SDLA_null},
+    // Reached by pressing *Start Pairing*: the shell checks a permission before
+    // it opens the socket. Bound on SteamLink rather than on Context because a
+    // binding is matched on the full (class, name, signature) triple and this is
+    // where the guest resolves it. See klj_Context_checkSelfPermission for why
+    // the answer is the manifest's and not a blanket yes.
+    {"com/valvesoftware/steamlink/SteamLink", "checkSelfPermission", "(Ljava/lang/String;)I",
+     klj_Context_checkSelfPermission},
+    {"com/valvesoftware/steamlink/SteamLink", "requestPermissions", "([Ljava/lang/String;I)V",
+     klj_Activity_requestPermissions},
+    // §11.9's handoff, reached: the shell has paired, the host has answered
+    // k_ERemoteDeviceStreamingSuccess, and this is the 2D frontend handing the
+    // authorized session to the VR half. See klj_SL_startVRLink — it stops, but
+    // it prints the payload first, because that string IS the session.
+    {"com/valvesoftware/steamlink/SteamLink", "startVRLink", "(Ljava/lang/String;)V",
+     klj_SL_startVRLink},
 
     {"com/unity3d/player/ReflectionHelper", "getFieldID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Field;", klj_ReflectionHelper_getFieldID},
     {"com/unity3d/player/ReflectionHelper", "getMethodID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Method;", klj_ReflectionHelper_getMethodID},

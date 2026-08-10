@@ -3971,14 +3971,21 @@ static unsigned glfb_capture_now(const char *dir) {
     // be a memcpy, not a render. Everything below stays the default output:
     // PNG to KL_GLFB_OUT, unchanged when no sink is registered.
     if (g_frame_sink) {
-        // KL_GLFB_DUMP_SINK=<dir>: write every 100th sink frame to a PNG.
-        // The sink and the PNG path share this px buffer, so a window that
-        // shows black while these files show content is an SDL-side problem,
-        // not a capture-side one.
+        // KL_GLFB_DUMP_SINK=<dir>: write every Nth sink frame to a PNG
+        // (KL_GLFB_DUMP_SINK_EVERY, default 100). The sink and the PNG path
+        // share this px buffer, so a window that shows black while these files
+        // show content is an SDL-side problem, not a capture-side one.
+        // The interval is a knob because the default is ~17 s of a 2D UI at
+        // the shell's frame rate — far too coarse to see what a click did.
         static const char *sink_dir;
-        static int sink_dir_init;
-        if (!sink_dir_init) { sink_dir = kl_env_str("KL_GLFB_DUMP_SINK", NULL); sink_dir_init = 1; }
-        if (sink_dir && g_presented % 100 == 0) {
+        static int sink_dir_init, sink_every;
+        if (!sink_dir_init) {
+            sink_dir = kl_env_str("KL_GLFB_DUMP_SINK", NULL);
+            sink_every = kl_env_int("KL_GLFB_DUMP_SINK_EVERY", 100);
+            if (sink_every < 1) sink_every = 1;
+            sink_dir_init = 1;
+        }
+        if (sink_dir && g_presented % (unsigned)sink_every == 0) {
             char spath[600];
             snprintf(spath, sizeof spath, "%s/sink_%05u.png", sink_dir, g_presented);
             klfb_write_png(spath, px, src_w, src_h);
