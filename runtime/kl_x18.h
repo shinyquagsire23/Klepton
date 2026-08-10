@@ -110,6 +110,10 @@ typedef struct {
     unsigned sites;     // instructions found naming x18
     unsigned patched;   // veneers installed
     unsigned refused;   // sites left alone — still broken, and reported by name
+    unsigned data_words; // words that decode as an x18 site but sit in data
+                         // (trap 0b's second detector — NOT refusals: these
+                         // were never instructions, and patching them is the
+                         // corruption the detector exists to prevent)
 } kl_x18_stats;
 
 // Check the assumptions the emitted code depends on: thread-pointer alignment
@@ -137,6 +141,11 @@ int  kl_x18_emit(void *code, size_t size, uint64_t code_va,
 // `code` is where it is mapped now. Idempotent per range only in the sense that
 // it should be called once, before the segment is made read-execute.
 int  kl_x18_patch(void *code, size_t size, kl_x18_stats *st);
+
+// Trap 0d's second detector, exposed so tests/t_x18.c reports the same verdict
+// the loader acts on. `index` is a WORD index into `code`; the window is
+// clamped to the buffer, so pass the same chunk the scanner is walking.
+int kl_x18_is_data(const void *code, size_t size, size_t index);
 
 // Count x18 sites without emitting anything — klepton-ld sizes its pool with it.
 unsigned kl_x18_count(const void *code, size_t size);

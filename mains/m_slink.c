@@ -127,6 +127,10 @@ static void report_image(const char *soname, kl_image *img) {
            soname, kl_base(img), kl_span(img) / 1048576.0, total,
            st->tls_rewrites, st->x18_patched, st->x18_sites);
     if (st->x18_refused) printf(" (refused %u)", st->x18_refused);
+    // Trap 0b: words that decode as x18 sites but sit in data. Named here
+    // because the number is how the second detector is watched — silence would
+    // make a change of mind about what is code invisible.
+    if (st->x18_data_words) printf(" (data %u)", st->x18_data_words);
     printf("  imports %u bound / %u unresolved\n",
            st->imports_bound, st->imports_missing);
 }

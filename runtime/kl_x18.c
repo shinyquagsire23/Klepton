@@ -405,15 +405,80 @@ int kl_x18_init(void) {
     return 0;
 }
 
-unsigned kl_x18_count(const void *code, size_t size) {
+// ---------- trap 0b, second detector: is this word's NEIGHBOURHOOD code? ----
+//
+// kl_x18_data_ranges finds data inside executable sections from sized
+// STT_OBJECT symbols, and symbol coverage is the ceiling on what that can see.
+// Steam Link's libshell_arm64-v8a.so is where the ceiling showed: it carries
+// CRYPTOGAMS assembly whose constant tables — AES, GHASH, the ChaCha20
+// "expand 32-byte k" block, several banner strings — sit in .text as LOCAL
+// labels with no symbol at all. Twelve of that library's fourteen apparent x18
+// sites were words of those tables, and patching them replaced crypto
+// constants with branches. The symptom was a TLS handshake that got as far as
+// the server's first encrypted record and then answered `bad_record_mac`,
+// 25 MB and one subsystem away from here.
+//
+// The discriminator is the A64 top-level encoding group, bits [28:25]: groups
+// 0b0000, 0b0001 and 0b0011 are unallocated (0b0010 is SVE, which nothing here
+// targets, so it is counted too). Real code contains none; random table data
+// hits one about three words in sixteen.
+//
+// It is a window test, not a per-word test, because a single word must stay
+// patchable wherever it legitimately appears. Measured over every real site in
+// both Beat Saber targets — 17,619 of them, in-FDE and out — the count in a
+// +/-16-word window is ZERO, every time. Over libshell's twelve false
+// positives it is 3 to 12. The threshold is 2 rather than 1 purely for margin
+// against a literal pool landing inside the window; nothing observed needs it.
+//
+// A missed real site is the other half of trap 0 and must not be silent, so
+// every refusal is counted and `make check`'s veneer totals are the gate: they
+// are exact numbers, and this rule must not move them.
+#define KLX_WIN_HALF   16
+#define KLX_WIN_LIMIT  2
+
+static int klx_unallocated(uint32_t w) {
+    unsigned op0 = (w >> 25) & 0xf;
+    return op0 <= 3;                       // 0/1/3 unallocated, 2 = SVE
+}
+// `i` is a word index into `w`; the window is clamped to the chunk, which is a
+// whole executable section minus its known data ranges, so clamping only ever
+// bites at a section edge.
+static int klx_looks_like_data(const uint32_t *w, size_t n, size_t i) {
+    size_t lo = i > KLX_WIN_HALF ? i - KLX_WIN_HALF : 0;
+    size_t hi = i + KLX_WIN_HALF + 1 < n ? i + KLX_WIN_HALF + 1 : n;
+    unsigned bad = 0;
+    for (size_t k = lo; k < hi; k++)
+        if (klx_unallocated(w[k]) && ++bad >= KLX_WIN_LIMIT) return 1;
+    return 0;
+}
+
+// Exposed so the offline tool reports the same verdict the loader acts on —
+// two answers to "is this word data" is how the pair drifts.
+int kl_x18_is_data(const void *code, size_t size, size_t index) {
+    return klx_looks_like_data((const uint32_t *)code, size / 4, index);
+}
+
+// One survey feeding both the count and the emitter, so a chunk with no real
+// sites still reports its data words. The emitter returns early in that case —
+// correctly, there is nothing to veneer — and counting there alone silently
+// undercounted, which is the one thing this number must not do.
+static unsigned klx_survey(const void *code, size_t size, unsigned *data) {
     const uint32_t *w = (const uint32_t *)code;
-    unsigned n = 0;
-    for (size_t i = 0; i + 4 <= size; i += 4, w++) {
+    size_t n = size / 4;
+    unsigned c = 0;
+    if (data) *data = 0;
+    for (size_t i = 0; i < n; i++) {
         klx_info in;
-        klx_decode(*w, &in);
-        if (in.nfields) n++;
+        klx_decode(w[i], &in);
+        if (!in.nfields) continue;
+        if (klx_looks_like_data(w, n, i)) { if (data) (*data)++; continue; }
+        c++;
     }
-    return n;
+    return c;
+}
+
+unsigned kl_x18_count(const void *code, size_t size) {
+    return klx_survey(code, size, NULL);
 }
 
 // ---------- instruction encoders ----------
@@ -507,7 +572,7 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
     uint32_t *w = (uint32_t *)code;
     size_t    n = size / 4;
 
-    unsigned want = kl_x18_count(code, size);
+    unsigned want = klx_survey(code, size, &st->data_words);
     st->sites = want;
     if (pool_used) *pool_used = 0;
     if (!want || !veneer_enabled()) return 0;
@@ -518,6 +583,10 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
         klx_info in;
         klx_decode(w[i], &in);
         if (!in.nfields) continue;
+        // Not a refusal: a refusal is an x18 site we could not veneer, and this
+        // is a word that was never an instruction. Already tallied by the
+        // survey above, so only skipped here.
+        if (klx_looks_like_data(w, n, i)) continue;
 
         uint64_t spc = code_va + (uint64_t)i * 4;
         uint64_t vpc = pool_va + (uint64_t)((uint8_t *)out - (uint8_t *)pool);
@@ -592,7 +661,9 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
 int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
     memset(st, 0, sizeof *st);
 
-    unsigned want = kl_x18_count(code, size);
+    // Same reason as in kl_x18_emit: the data-word tally has to survive the
+    // "nothing to veneer here" path, or a chunk of pure data reports nothing.
+    unsigned want = klx_survey(code, size, &st->data_words);
     st->sites = want;
     if (!want || !veneer_enabled()) return 0;
     if (g_slot < 0 && kl_x18_init() != 0) return -1;

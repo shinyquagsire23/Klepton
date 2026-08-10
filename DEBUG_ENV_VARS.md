@@ -199,8 +199,23 @@ sockaddr carrier, and the addrinfo list (same struct layout on both — only the
 sockaddrs inside need converting). Without all three, Unity's Ping and the
 gamelift region probes failed EINVAL in a retry storm.
 
-- `KL_TRACE_NET=1` — log `socket`/`getaddrinfo`/`connect` with arguments and
-  durations. Read by `kl_shim.c`.
+- `KL_TRACE_NET=1` — log `socket`/`bind`/`getaddrinfo`/`connect` with
+  arguments and durations, and every `send`/`recv`/`sendto`/`recvfrom`/
+  `sendmsg`/`recvmsg` with its byte count, its peer, and its MSG_* flag word
+  both before and after translation. Read by `kl_shim.c`.
+- `KL_TRACE_NET_HEX=<n>` — alongside each of those, the first `n` bytes of the
+  payload in hex and ASCII. Counts alone cannot tell a discovery probe from its
+  own broadcast echo (identical lengths), nor say which TLS record a handshake
+  died on; both questions came up in one session and both needed the bytes.
+- `KL_NET_BIND_REMAP=<from>:<to>[,...]` — bind a guest listening port
+  somewhere else. A **host-development** knob, off by default: on the headset
+  the guest is alone, but on a Mac that is *also* a Steam host, Steam owns UDP
+  `*:27036` and Steam Link's discovery socket wants the same port. Darwin lets
+  the two wildcard sockets coexist, then delivers arriving IPv4 packets to the
+  AF_INET socket as the more specific match — so every discovery reply is lost
+  and the app reports no computers on the network. `kl_bind` names that
+  collision when it sees it. Steam answers to whatever source port asked
+  (measured), so `27036:27136` restores discovery with Steam still running.
 - `KL_NET_OFFLINE=1` — getaddrinfo fails `EAI_NONAME` and connect fails
   `ENETUNREACH` immediately: a headset with no network. The guest takes its
   own offline path (curl reports "Could not resolve host", the GameLift
@@ -640,7 +655,16 @@ reads no knobs). See PLANNING §12.18.
 
 - `KL_X18=0` — disable x18 veneering (also `n`/`N`, matched on the first
   character). The survey counts sites either way, so an A/B run compares like
-  with like. Default on.
+  with like. Default on. This is the A/B that identified the veneer pass as
+  the cause of Steam Link's failing TLS handshake: with it off the handshake
+  completed, with it on the guest answered `bad_record_mac`.
+- `KL_HWCAP=<hex>` — override the measured `getauxval(AT_HWCAP)` outright
+  (`kl_libc_slink.c`). An A/B, not a tuning knob: the bits select whole
+  hand-written assembly implementations, so `KL_HWCAP=0x3` (FP|ASIMD only)
+  moves BoringSSL onto its portable C path. That is what separated "our
+  runtime mishandles ARM crypto assembly" from "the fault is elsewhere" —
+  the failure survived, and the cause turned out to be corrupted constants
+  rather than corrupted code.
 
 ## Signals / tracing
 

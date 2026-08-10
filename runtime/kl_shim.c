@@ -59,6 +59,7 @@ int getentropy(void *buffer, size_t size);
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <ifaddrs.h>
 #include "klepton.h"
 #include "kl_env.h"
 #include "kl_va.h"
@@ -297,6 +298,34 @@ static int kl_ipv6_optname(int opt) {
     default: return opt;
     }
 }
+// ---------- interface 0 means different things on the two kernels ----------
+// Linux takes ipv6mr_interface == 0 (and sin6_scope_id == 0) as "you pick";
+// Darwin takes it literally and rejects the operation, because a link-local
+// IPv6 destination is meaningless without a link. Steam Link's discovery
+// socket joins ff02::1 with interface 0 and got EADDRNOTAVAIL — the guest
+// printed "Couldn't set IPV6_ADD_MEMBERSHIP on discovery network socket" —
+// and its later sendto to [ff02::1]:27036 failed ENETUNREACH for the same
+// reason. So the choice Linux would have made is made here instead: the first
+// up, multicast-capable, non-loopback interface.
+static unsigned kl_default_mcast_if(void) {
+    static unsigned idx; static int done;
+    if (done) return idx;
+    done = 1;
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return 0;
+    for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        if (!(p->ifa_flags & IFF_UP) || !(p->ifa_flags & IFF_MULTICAST)) continue;
+        if (p->ifa_flags & IFF_LOOPBACK) continue;
+        unsigned i = if_nametoindex(p->ifa_name);
+        if (i) { idx = i; break; }
+    }
+    freeifaddrs(ifa);
+    if (!idx) fprintf(stderr, "  [klepton] no multicast-capable interface found; "
+                              "IPv6 multicast will stay unavailable to the guest\n");
+    return idx;
+}
+
 // One place, so set and get cannot drift into disagreeing about an option.
 static int kl_sock_level_opt(int *level, int opt) {
     if (*level == 1) { *level = SOL_SOCKET; return kl_sock_optname(opt); }
@@ -306,7 +335,20 @@ static int kl_sock_level_opt(int *level, int opt) {
     return opt;                             // IPPROTO_TCP: NODELAY agrees at 1
 }
 static int kl_setsockopt(int fd, int level, int opt, const void *val, socklen_t len) {
+    int glevel = level;
     int ropt = kl_sock_level_opt(&level, opt);
+    // struct ipv6_mreq matches on both platforms (in6_addr then a u32 index),
+    // so only the zero index has to be filled in; the guest's buffer is const
+    // and stays untouched.
+    struct ipv6_mreq mreq;
+    if (glevel == IPPROTO_IPV6 && (opt == 20 || opt == 21) &&
+        val && len == sizeof mreq) {
+        memcpy(&mreq, val, sizeof mreq);
+        if (mreq.ipv6mr_interface == 0) {
+            mreq.ipv6mr_interface = kl_default_mcast_if();
+            val = &mreq;
+        }
+    }
     int r = setsockopt(fd, level, ropt, val, len);
     if (r) fprintf(stderr, "  [sock] setsockopt(fd=%d level=%d opt=%d->%d) FAILED: %s\n",
                    fd, level, opt, ropt, strerror(errno));
@@ -333,6 +375,26 @@ static int kl_net_offline(void) {
     static int off = -1;
     if (off < 0) off = kl_env_on("KL_NET_OFFLINE", 0);
     return off;
+}
+// KL_TRACE_NET_HEX=<n>: the first n bytes of every payload, alongside the
+// [net] line. A discovery probe and its own broadcast echo are the same length,
+// and a TLS record is identified by its first five bytes — neither question can
+// be answered from counts.
+static int kl_net_hex(void) {
+    static int n = -1;
+    if (n < 0) n = kl_env_int("KL_TRACE_NET_HEX", 0);
+    return n;
+}
+static void kl_hexdump(const char *tag, const void *buf, ssize_t n) {
+    int lim = kl_net_hex();
+    if (lim <= 0 || n <= 0 || !buf) return;
+    if (n > lim) n = lim;
+    const uint8_t *p = buf;
+    fprintf(stderr, "       %s ", tag);
+    for (ssize_t i = 0; i < n; i++) fprintf(stderr, "%02x", p[i]);
+    fprintf(stderr, "  |");
+    for (ssize_t i = 0; i < n; i++) fputc(p[i] >= 0x20 && p[i] < 0x7f ? p[i] : '.', stderr);
+    fprintf(stderr, "|\n");
 }
 static void kl_sa_to_guest(struct sockaddr *sa, socklen_t *len);
 static int kl_getaddrinfo(const char *node, const char *serv,
@@ -375,15 +437,112 @@ static int kl_sa_to_host(struct sockaddr_storage *dst, const struct sockaddr *sa
     memmove((uint8_t *)dst + 2, (const uint8_t *)sa + 2, (size_t)len - 2);
     dst->ss_family = (uint8_t)fam;
     dst->ss_len = (uint8_t)len;
+    // The other half of the interface-0 divergence: a link-local IPv6
+    // destination (ff02::/16 multicast, fe80::/10 unicast) carries its link in
+    // sin6_scope_id, and Linux fills a zero in from the routing table where
+    // Darwin returns ENETUNREACH. Only link-local addresses are touched —
+    // a scope on a global address would be wrong, not merely unhelpful.
+    if (fam == AF_INET6 && len >= sizeof(struct sockaddr_in6)) {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)dst;
+        const uint8_t *a = in6->sin6_addr.s6_addr;
+        int linklocal = (a[0] == 0xff && (a[1] & 0x0f) == 0x02) ||
+                        (a[0] == 0xfe && (a[1] & 0xc0) == 0x80);
+        if (linklocal && in6->sin6_scope_id == 0)
+            in6->sin6_scope_id = kl_default_mcast_if();
+    }
     return 0;
 }
 static void kl_sa_to_guest(struct sockaddr *sa, socklen_t *len) {
-    if (!sa || !len) return;
+    if (!sa || !len || *len < 2) return;   // memmove below reads *len - 2
     unsigned fam = sa->sa_family;
     if (fam == AF_INET6) fam = 10;
     memmove((uint8_t *)sa + 2, (const uint8_t *)sa + 2, (size_t)*len - 2);
     *(uint16_t *)sa = (uint16_t)fam;
 }
+// A HOST sockaddr, printed. Shared by every traced call so one address never
+// formats two ways.
+static void kl_sa_fmt(char *out, size_t n, const struct sockaddr *sa) {
+    if (!sa || !n) return;
+    snprintf(out, n, "?");
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *)sa;
+        char ip[INET_ADDRSTRLEN] = "?";
+        inet_ntop(AF_INET, &in->sin_addr, ip, sizeof ip);
+        snprintf(out, n, "%s:%d", ip, ntohs(in->sin_port));
+    } else if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)sa;
+        char ip[INET6_ADDRSTRLEN] = "?";
+        inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof ip);
+        snprintf(out, n, "[%s]:%d", ip, ntohs(in6->sin6_port));
+    }
+}
+
+// ---------- MSG_* flags: trap 16b's class, on the send/recv path ----------
+// The four message-passing calls take a flag word, and the two platforms
+// number it differently AND OVERLAPPINGLY, so a forwarded flag does not fail —
+// it asks for a different thing:
+//
+//   Linux MSG_DONTWAIT 0x40   == Darwin MSG_WAITALL 0x40     (worst: a poll
+//                                                             becomes a block)
+//   Linux MSG_EOR      0x80   == Darwin MSG_DONTWAIT 0x80
+//   Linux MSG_WAITALL  0x100  == Darwin MSG_EOF     0x100    (shuts the socket
+//                                                             down on send)
+//   Linux MSG_CTRUNC   0x8    == Darwin MSG_EOR     0x8
+//   Linux MSG_TRUNC    0x20   == Darwin MSG_CTRUNC  0x20
+//   Linux MSG_NOSIGNAL 0x4000 == Darwin MSG_RCVMORE 0x4000
+//
+// Only the bits with a real Darwin meaning are carried; MSG_NOSIGNAL is
+// DROPPED and answered by SO_NOSIGPIPE on the fd instead (Darwin's equivalent
+// is a socket option, not a per-call flag). Anything unrecognised is dropped
+// and named once — passing it through is what this comment is about.
+#define LX_MSG_OOB       0x1
+#define LX_MSG_PEEK      0x2
+#define LX_MSG_DONTROUTE 0x4
+#define LX_MSG_CTRUNC    0x8
+#define LX_MSG_TRUNC     0x20
+#define LX_MSG_DONTWAIT  0x40
+#define LX_MSG_EOR       0x80
+#define LX_MSG_WAITALL   0x100
+#define LX_MSG_CONFIRM   0x800
+#define LX_MSG_NOSIGNAL  0x4000
+#define LX_MSG_MORE      0x8000
+
+static void kl_net_warn_once(const char *fn, long v) {
+    static struct { const char *fn; long v; } seen[32]; static int n;
+    for (int i = 0; i < n; i++) if (seen[i].fn == fn && seen[i].v == v) return;
+    if (n < 32) seen[n++] = (typeof(seen[0])){fn, v};
+    fprintf(stderr, "  [klepton] %s: unrecognised Linux flag/value 0x%lx — dropped "
+                    "(add a translation rather than passing it through)\n", fn, v);
+}
+
+// Returns the Darwin flag word; *nosignal is set when the caller asked for
+// MSG_NOSIGNAL, which the fd-level SO_NOSIGPIPE answers.
+static int kl_msg_flags(int lx, int *nosignal) {
+    int d = 0;
+    if (nosignal) *nosignal = 0;
+    if (lx & LX_MSG_OOB)       { d |= MSG_OOB;       lx &= ~LX_MSG_OOB; }
+    if (lx & LX_MSG_PEEK)      { d |= MSG_PEEK;      lx &= ~LX_MSG_PEEK; }
+    if (lx & LX_MSG_DONTROUTE) { d |= MSG_DONTROUTE; lx &= ~LX_MSG_DONTROUTE; }
+    if (lx & LX_MSG_CTRUNC)    { d |= MSG_CTRUNC;    lx &= ~LX_MSG_CTRUNC; }
+    if (lx & LX_MSG_TRUNC)     { d |= MSG_TRUNC;     lx &= ~LX_MSG_TRUNC; }
+    if (lx & LX_MSG_DONTWAIT)  { d |= MSG_DONTWAIT;  lx &= ~LX_MSG_DONTWAIT; }
+    if (lx & LX_MSG_EOR)       { d |= MSG_EOR;       lx &= ~LX_MSG_EOR; }
+    if (lx & LX_MSG_WAITALL)   { d |= MSG_WAITALL;   lx &= ~LX_MSG_WAITALL; }
+    if (lx & LX_MSG_NOSIGNAL)  { if (nosignal) *nosignal = 1; lx &= ~LX_MSG_NOSIGNAL; }
+    // MSG_CONFIRM is a Linux ARP hint and MSG_MORE a corking hint; both are
+    // advisory, and dropping them changes throughput, never correctness.
+    lx &= ~(LX_MSG_CONFIRM | LX_MSG_MORE);
+    if (lx) kl_net_warn_once("msg flags", lx);
+    return d;
+}
+// Darwin has no per-call MSG_NOSIGNAL; the fd carries it. Set once per socket
+// so a guest that wrote MSG_NOSIGNAL gets what it asked for — a failed write
+// rather than a SIGPIPE that kills the process.
+static void kl_no_sigpipe(int fd) {
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+}
+
 static int kl_socket(int domain, int type, int protocol) {
     // bionic AF_INET6=10 -> Darwin 30; SOCK_* types agree.
     if (domain == 10) domain = AF_INET6;
@@ -408,18 +567,7 @@ static int kl_connect(int fd, const struct sockaddr *sa, socklen_t len) {
     struct sockaddr_storage hs;
     if (kl_sa_to_host(&hs, sa, len) == 0) {
         sa = (struct sockaddr *)&hs;
-        if (hs.ss_family == AF_INET) {
-            const struct sockaddr_in *in = (const struct sockaddr_in *)&hs;
-            inet_ntop(AF_INET, &in->sin_addr, host, sizeof host);
-            char *hp = host + strlen(host);
-            snprintf(hp, sizeof host - (hp - host), ":%d", ntohs(in->sin_port));
-        } else if (hs.ss_family == AF_INET6) {
-            const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)&hs;
-            host[0] = '[';
-            inet_ntop(AF_INET6, &in6->sin6_addr, host + 1, sizeof host - 20);
-            char *hp = host + strlen(host);
-            snprintf(hp, sizeof host - (hp - host), "]:%d", ntohs(in6->sin6_port));
-        }
+        kl_sa_fmt(host, sizeof host, (const struct sockaddr *)&hs);
     }
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -432,18 +580,162 @@ static int kl_connect(int fd, const struct sockaddr *sa, socklen_t len) {
                 sa ? ((const struct sockaddr_storage *)sa)->ss_family : -1, (int)len);
     return r;
 }
-// The other sockaddr carriers, same conversion. msg_name inside msghdr is
-// left alone until a guest proves it uses sendmsg/recvmsg with an address.
+// A guest binding a fixed port is normally alone on the device. Here it is not:
+// developing against a Steam host on the SAME Mac puts Steam's own UDP *:27036
+// under Steam Link's [::]:27036, and because both ask for address reuse the
+// bind SUCCEEDS. Every unicast reply to that port is then delivered to one
+// socket of the two, and losing that draw reads as "no computers on the
+// network" — a conclusion about the LAN drawn from a conflict on localhost.
+//
+// So it is detected and named. The probe is a throwaway socket bound WITHOUT
+// reuse: if that fails EADDRINUSE the port already has an owner. It runs
+// before the real bind, because afterwards our own socket is an owner and the
+// probe could no longer tell the two apart.
+static void kl_bind_conflict_check(int fd, const struct sockaddr *sa, socklen_t len) {
+    int type = 0; socklen_t tl = sizeof type;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) != 0) return;
+    int port = 0;
+    if (sa->sa_family == AF_INET)  port = ntohs(((const struct sockaddr_in *)sa)->sin_port);
+    if (sa->sa_family == AF_INET6) port = ntohs(((const struct sockaddr_in6 *)sa)->sin6_port);
+    if (!port) return;                          // ephemeral: nothing to collide with
+    int busy = 0;
+    int p = socket(sa->sa_family, type, 0);
+    if (p >= 0) {
+        busy = bind(p, sa, len) != 0 && errno == EADDRINUSE;
+        close(p);
+    }
+    // ...and the same port in the OTHER family, when the guest is binding the
+    // IPv6 wildcard. Darwin lets [::] and 0.0.0.0 hold one port side by side
+    // even with no reuse flags, so a family-matched probe cannot see an IPv4
+    // owner — but an incoming v4 packet still goes to the AF_INET socket as the
+    // more specific match, which is precisely how the replies were lost. The
+    // first version of this check probed only the guest's own family and was
+    // therefore silent about the one case it exists for.
+    if (!busy && sa->sa_family == AF_INET6 &&
+        memcmp(&((const struct sockaddr_in6 *)sa)->sin6_addr, &in6addr_any,
+               sizeof in6addr_any) == 0) {
+        int v6o = 1; socklen_t vl = sizeof v6o;
+        getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6o, &vl);
+        if (!v6o) {                             // dual-stack: v4 traffic is in scope
+            struct sockaddr_in v4;
+            memset(&v4, 0, sizeof v4);
+            v4.sin_len = sizeof v4;
+            v4.sin_family = AF_INET;
+            v4.sin_port = htons((uint16_t)port);
+            v4.sin_addr.s_addr = INADDR_ANY;
+            int q = socket(AF_INET, type, 0);
+            if (q >= 0) {
+                busy = bind(q, (struct sockaddr *)&v4, sizeof v4) != 0 && errno == EADDRINUSE;
+                close(q);
+            }
+        }
+    }
+    if (!busy) return;
+    char host[80] = "?";
+    kl_sa_fmt(host, sizeof host, sa);
+    static int said[8]; static unsigned nsaid;
+    for (unsigned i = 0; i < nsaid; i++) if (said[i] == port) return;
+    if (nsaid < 8) said[nsaid++] = port;
+    fprintf(stderr, "  [klepton] bind(%s): ANOTHER PROCESS ON THIS HOST ALREADY HOLDS "
+                    "THAT PORT. This bind still succeeds — Darwin lets the two "
+                    "wildcards coexist — but an arriving IPv4 packet goes to the "
+                    "AF_INET socket as the more specific match, so the guest will "
+                    "silently miss replies.%s\n",
+            host, port == 27036 ? "  Port 27036 is Steam's own discovery port: quit "
+                                  "the local Steam client, or set KL_NET_BIND_REMAP="
+                                  "27036:27136 to move the guest off it." : "");
+}
+
+// KL_NET_BIND_REMAP=<from>:<to>[,<from>:<to>...] — bind a listening port
+// somewhere else. A HOST-DEVELOPMENT knob and off by default: on the headset
+// the guest is alone and nothing collides. It exists because the collision
+// above has no other way out — Steam's discovery responder answers to whatever
+// source port asked (measured), so moving the guest off 27036 keeps discovery
+// working while a Steam host runs on the same Mac. It does forfeit Steam's
+// unsolicited broadcasts to 27036, which is why it is not the default.
+static int kl_bind_remap(int port) {
+    static char buf[128]; static int loaded;
+    if (!loaded) {
+        loaded = 1;
+        const char *e = kl_env_str("KL_NET_BIND_REMAP", NULL);
+        if (e) snprintf(buf, sizeof buf, "%s", e);
+    }
+    if (!buf[0]) return port;
+    for (const char *p = buf; *p; ) {
+        int from = 0, to = 0, n = 0;
+        if (sscanf(p, "%d:%d%n", &from, &to, &n) == 2 && from == port) {
+            static int said;
+            if (!said++) fprintf(stderr, "  [klepton] KL_NET_BIND_REMAP: guest port "
+                                         "%d bound as %d instead\n", from, to);
+            return to;
+        }
+        const char *c = strchr(p, ',');
+        if (!c) break;
+        p = c + 1;
+    }
+    return port;
+}
+
+// The other sockaddr carriers, same conversion.
 static int kl_bind(int fd, const struct sockaddr *sa, socklen_t len) {
     struct sockaddr_storage hs;
-    if (kl_sa_to_host(&hs, sa, len) == 0) { sa = (struct sockaddr *)&hs; }
-    return bind(fd, sa, len);
+    char host[80] = "?";
+    if (kl_sa_to_host(&hs, sa, len) == 0) {
+        sa = (struct sockaddr *)&hs;
+        if (hs.ss_family == AF_INET) {
+            struct sockaddr_in *v4 = (struct sockaddr_in *)&hs;
+            v4->sin_port = htons((uint16_t)kl_bind_remap(ntohs(v4->sin_port)));
+        } else if (hs.ss_family == AF_INET6) {
+            struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&hs;
+            v6->sin6_port = htons((uint16_t)kl_bind_remap(ntohs(v6->sin6_port)));
+        }
+        kl_sa_fmt(host, sizeof host, (const struct sockaddr *)&hs);
+        kl_bind_conflict_check(fd, sa, len);
+    }
+    int r = bind(fd, sa, len);
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] bind(fd=%d, %s) -> %d (%s)\n",
+                fd, host, r, r ? strerror(errno) : "ok");
+    return r;
 }
 static ssize_t kl_sendto(int fd, const void *buf, size_t n, int flags,
                          const struct sockaddr *sa, socklen_t len) {
     struct sockaddr_storage hs;
-    if (sa && kl_sa_to_host(&hs, sa, len) == 0) { sa = (struct sockaddr *)&hs; }
-    return sendto(fd, buf, n, flags, sa, len);
+    char host[80] = "-";
+    if (sa && kl_sa_to_host(&hs, sa, len) == 0) {
+        sa = (struct sockaddr *)&hs;
+        kl_sa_fmt(host, sizeof host, (const struct sockaddr *)&hs);
+    }
+    int nosig = 0, dflags = kl_msg_flags(flags, &nosig);
+    if (nosig) kl_no_sigpipe(fd);
+    ssize_t r = sendto(fd, buf, n, dflags, sa, len);
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] sendto(fd=%d, %zu B, flags=0x%x->0x%x, %s) -> %zd%s\n",
+                fd, n, flags, dflags, host, r, r < 0 ? strerror(errno) : "");
+    kl_hexdump("->", buf, r);
+    return r;
+}
+// send/recv carry the same flag word and were forwarded raw. curl's every
+// write is send(..., MSG_NOSIGNAL) on Linux, which arrived here as Darwin's
+// MSG_RCVMORE.
+static ssize_t kl_send(int fd, const void *buf, size_t n, int flags) {
+    int nosig = 0, dflags = kl_msg_flags(flags, &nosig);
+    if (nosig) kl_no_sigpipe(fd);
+    ssize_t r = send(fd, buf, n, dflags);
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] send(fd=%d, %zu B, flags=0x%x->0x%x) -> %zd%s\n",
+                fd, n, flags, dflags, r, r < 0 ? strerror(errno) : "");
+    kl_hexdump("->", buf, r);
+    return r;
+}
+static ssize_t kl_recv(int fd, void *buf, size_t n, int flags) {
+    int dflags = kl_msg_flags(flags, NULL);
+    ssize_t r = recv(fd, buf, n, dflags);
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] recv(fd=%d, %zu B, flags=0x%x->0x%x) -> %zd%s\n",
+                fd, n, flags, dflags, r, r < 0 ? strerror(errno) : "");
+    kl_hexdump("<-", buf, r);
+    return r;
 }
 static int kl_accept(int fd, struct sockaddr *sa, socklen_t *len) {
     int r = accept(fd, sa, len);
@@ -452,8 +744,190 @@ static int kl_accept(int fd, struct sockaddr *sa, socklen_t *len) {
 }
 static ssize_t kl_recvfrom(int fd, void *buf, size_t n, int flags,
                            struct sockaddr *sa, socklen_t *len) {
-    ssize_t r = recvfrom(fd, buf, n, flags, sa, len);
-    if (r >= 0) kl_sa_to_guest(sa, len);
+    int dflags = kl_msg_flags(flags, NULL);
+    ssize_t r = recvfrom(fd, buf, n, dflags, sa, len);
+    char host[80] = "-";
+    if (r >= 0 && sa && len) {
+        kl_sa_fmt(host, sizeof host, sa);
+        kl_sa_to_guest(sa, len);
+    }
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] recvfrom(fd=%d, %zu B, flags=0x%x->0x%x) -> %zd from %s%s\n",
+                fd, n, flags, dflags, r, host, r < 0 ? strerror(errno) : "");
+    kl_hexdump("<-", buf, r);
+    return r;
+}
+
+// ---------- sendmsg / recvmsg: struct msghdr diverges ----------
+// These were plain forwards, and the layouts do not match. Linux (LP64) makes
+// msg_iovlen and msg_controllen size_t and puts msg_flags at +48; Darwin makes
+// both int and puts msg_flags at +44. Little-endian hides the first two for
+// small values — but msg_flags does not overlap at all, so a forwarded recvmsg
+// writes MSG_TRUNC/MSG_CTRUNC into the guest's padding and the guest reads
+// whatever was at +48.
+//
+// The ancillary data diverges the same way one level down: Linux cmsghdr leads
+// with a size_t cmsg_len (16-byte header, 8-byte alignment), Darwin with a
+// socklen_t (12-byte header, 4-byte alignment) — and the option TYPE numbers
+// differ on top of that (IP_PKTINFO is 8 on Linux, 26 here). So the control
+// buffer is rebuilt, not aliased. This is the path Steam's UDP discovery uses
+// to learn which local interface a reply arrived on.
+typedef struct {
+    void     *msg_name;
+    uint32_t  msg_namelen;
+    uint32_t  _pad;
+    struct iovec *msg_iov;
+    uint64_t  msg_iovlen;
+    void     *msg_control;
+    uint64_t  msg_controllen;
+    int32_t   msg_flags;
+    uint32_t  _pad2;
+} kl_lx_msghdr;
+typedef struct { uint64_t cmsg_len; int32_t cmsg_level; int32_t cmsg_type; } kl_lx_cmsghdr;
+#define KL_LX_CMSG_ALIGN(n) (((n) + 7u) & ~7u)
+
+// Linux cmsg_type -> Darwin, per level. Same table shape as kl_ip_optname and
+// for the same reason: the numbers overlap, so an untranslated type is a
+// different message rather than an unknown one.
+static int kl_cmsg_type_to_host(int level, int type) {
+    if (level == IPPROTO_IP) {
+        switch (type) {
+        case 8:  return IP_PKTINFO;             // Linux IP_PKTINFO
+        case 1:  return IP_TOS;
+        case 2:  return IP_TTL;
+        default: kl_net_warn_once("cmsg IPPROTO_IP type", type); return -1;
+        }
+    }
+    if (level == IPPROTO_IPV6) {
+        switch (type) {
+        case 50: return 46;                     // IPV6_PKTINFO
+        case 52: return 36;                     // IPV6_HOPLIMIT
+        case 67: return IPV6_TCLASS;
+        default: kl_net_warn_once("cmsg IPPROTO_IPV6 type", type); return -1;
+        }
+    }
+    kl_net_warn_once("cmsg level", level);
+    return -1;
+}
+static int kl_cmsg_type_to_guest(int level, int type) {
+    if (level == IPPROTO_IP) {
+        if (type == IP_PKTINFO) return 8;
+        if (type == IP_TOS)     return 1;
+        if (type == IP_TTL)     return 2;
+    } else if (level == IPPROTO_IPV6) {
+        if (type == 46) return 50;
+        if (type == 36) return 52;
+        if (type == IPV6_TCLASS) return 67;
+    }
+    return type;
+}
+// The payloads themselves agree: struct in_pktinfo and struct in6_pktinfo have
+// the same members in the same order on both platforms, so only the header and
+// the type number are rewritten.
+static ssize_t kl_sendmsg(int fd, const void *gmsg, int flags) {
+    const kl_lx_msghdr *g = gmsg;
+    if (!g) { errno = EFAULT; return -1; }
+    struct msghdr h;
+    memset(&h, 0, sizeof h);
+    struct sockaddr_storage hs;
+    char host[80] = "-";
+    if (g->msg_name && g->msg_namelen &&
+        kl_sa_to_host(&hs, g->msg_name, g->msg_namelen) == 0) {
+        h.msg_name = &hs;
+        h.msg_namelen = g->msg_namelen;
+        kl_sa_fmt(host, sizeof host, (const struct sockaddr *)&hs);
+    }
+    h.msg_iov = g->msg_iov;                     // struct iovec agrees
+    h.msg_iovlen = (int)g->msg_iovlen;
+
+    char cbuf[512];
+    if (g->msg_control && g->msg_controllen) {
+        size_t out = 0;
+        const uint8_t *p = g->msg_control;
+        const uint8_t *end = p + g->msg_controllen;
+        while (p + sizeof(kl_lx_cmsghdr) <= end) {
+            const kl_lx_cmsghdr *lc = (const kl_lx_cmsghdr *)p;
+            if (lc->cmsg_len < sizeof *lc || p + lc->cmsg_len > end) break;
+            size_t dlen = (size_t)lc->cmsg_len - sizeof *lc;
+            int dtype = kl_cmsg_type_to_host(lc->cmsg_level, lc->cmsg_type);
+            if (dtype >= 0 && out + CMSG_SPACE(dlen) > sizeof cbuf)
+                kl_net_warn_once("sendmsg control buffer overflow, cmsg dropped",
+                                 (long)dlen);
+            if (dtype >= 0 && out + CMSG_SPACE(dlen) <= sizeof cbuf) {
+                struct cmsghdr *dc = (struct cmsghdr *)(cbuf + out);
+                dc->cmsg_len = (socklen_t)CMSG_LEN(dlen);
+                dc->cmsg_level = lc->cmsg_level;
+                dc->cmsg_type = dtype;
+                memcpy(CMSG_DATA(dc), p + sizeof *lc, dlen);
+                out += CMSG_SPACE(dlen);
+            }
+            p += KL_LX_CMSG_ALIGN(lc->cmsg_len);
+        }
+        if (out) { h.msg_control = cbuf; h.msg_controllen = (socklen_t)out; }
+    }
+    int nosig = 0, dflags = kl_msg_flags(flags, &nosig);
+    if (nosig) kl_no_sigpipe(fd);
+    h.msg_flags = 0;
+    ssize_t r = sendmsg(fd, &h, dflags);
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] sendmsg(fd=%d, %d iov, %u B ctl, flags=0x%x->0x%x, %s) -> %zd%s\n",
+                fd, (int)h.msg_iovlen, (unsigned)h.msg_controllen, flags, dflags,
+                host, r, r < 0 ? strerror(errno) : "");
+    return r;
+}
+static ssize_t kl_recvmsg(int fd, void *gmsg, int flags) {
+    kl_lx_msghdr *g = gmsg;
+    if (!g) { errno = EFAULT; return -1; }
+    struct msghdr h;
+    memset(&h, 0, sizeof h);
+    struct sockaddr_storage hs;
+    if (g->msg_name && g->msg_namelen) { h.msg_name = &hs; h.msg_namelen = sizeof hs; }
+    h.msg_iov = g->msg_iov;
+    h.msg_iovlen = (int)g->msg_iovlen;
+    char cbuf[512];
+    if (g->msg_control && g->msg_controllen) {
+        h.msg_control = cbuf;
+        h.msg_controllen = (socklen_t)(g->msg_controllen < sizeof cbuf
+                                       ? g->msg_controllen : sizeof cbuf);
+    }
+    ssize_t r = recvmsg(fd, &h, kl_msg_flags(flags, NULL));
+    char host[80] = "-";
+    if (r >= 0) {
+        if (h.msg_name && h.msg_namelen) {
+            socklen_t nl = h.msg_namelen;
+            kl_sa_fmt(host, sizeof host, (const struct sockaddr *)&hs);
+            if (nl > g->msg_namelen) nl = g->msg_namelen;
+            memcpy(g->msg_name, &hs, nl);
+            kl_sa_to_guest(g->msg_name, &nl);
+            g->msg_namelen = nl;
+        } else {
+            g->msg_namelen = 0;
+        }
+        size_t out = 0;
+        for (struct cmsghdr *dc = h.msg_control ? CMSG_FIRSTHDR(&h) : NULL;
+             dc; dc = CMSG_NXTHDR(&h, dc)) {
+            size_t dlen = (size_t)dc->cmsg_len - (size_t)((uint8_t *)CMSG_DATA(dc) - (uint8_t *)dc);
+            size_t need = KL_LX_CMSG_ALIGN(sizeof(kl_lx_cmsghdr) + dlen);
+            if (out + need > g->msg_controllen) { h.msg_flags |= MSG_CTRUNC; break; }
+            kl_lx_cmsghdr *lc = (kl_lx_cmsghdr *)((uint8_t *)g->msg_control + out);
+            lc->cmsg_len = sizeof *lc + dlen;
+            lc->cmsg_level = dc->cmsg_level;
+            lc->cmsg_type = kl_cmsg_type_to_guest(dc->cmsg_level, dc->cmsg_type);
+            memcpy(lc + 1, CMSG_DATA(dc), dlen);
+            out += need;
+        }
+        g->msg_controllen = out;
+        // ...and the output flags, at the offset the GUEST reads them from.
+        int lf = 0;
+        if (h.msg_flags & MSG_TRUNC)  lf |= LX_MSG_TRUNC;
+        if (h.msg_flags & MSG_CTRUNC) lf |= LX_MSG_CTRUNC;
+        if (h.msg_flags & MSG_OOB)    lf |= LX_MSG_OOB;
+        if (h.msg_flags & MSG_EOR)    lf |= LX_MSG_EOR;
+        g->msg_flags = lf;
+    }
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] recvmsg(fd=%d, flags=0x%x) -> %zd from %s%s\n",
+                fd, flags, r, host, r < 0 ? strerror(errno) : "");
     return r;
 }
 static int kl_getpeername(int fd, struct sockaddr *sa, socklen_t *len) {
@@ -665,6 +1139,8 @@ static const kl_entry g_shim[] = {
     E("socket", kl_socket),
     E("bind", kl_bind), E("sendto", kl_sendto), E("accept", kl_accept),
     E("recvfrom", kl_recvfrom), E("getpeername", kl_getpeername),
+    E("sendmsg", kl_sendmsg), E("recvmsg", kl_recvmsg),
+    E("send", kl_send), E("recv", kl_recv),
     E("getsockname", kl_getsockname),
     E("strtold", klv_strtold), E("wcstold", klv_wcstold), E("strtold_l", klv_strtold_l),
     E("swprintf", klb_swprintf), E("execl", klb_execl), E("system", klb_system),

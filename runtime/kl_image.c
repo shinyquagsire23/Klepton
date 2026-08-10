@@ -268,11 +268,22 @@ const void *kl_phdrs(kl_image *i, unsigned *count) {
 // Darwin keeps the thread pointer in TPIDRRO_EL0; TPIDR_EL0 is clobbered by the
 // kernel on preemption. The two encodings differ by exactly one bit (0x20).
 // 98% of these sites are -fstack-protector prologues reading bionic slot 5.
+// It runs on the same chunks as the x18 pass and carries the same trap 0b/0d
+// exposure: a word of a constant table that happens to match this pattern gets
+// a bit flipped, and the corrupted constant surfaces somewhere else entirely.
+// One in 2^27 words matches by chance, so it has not bitten — but the detector
+// exists now, and having one of the two rewriters checked and the other not is
+// how a class comes back. The order matters too: this must consult the
+// unmodified buffer, which it does, since it is the first pass over a chunk.
 static void rewrite_tls(uint8_t *p, size_t n, kl_stats *st) {
     uint32_t *w = (uint32_t *)p;
-    for (size_t i = 0; i + 4 <= n; i += 4, w++) {
-        if ((*w & 0xffffffe0u) == 0xd53bd040u) { *w |= 0x20u; st->tls_rewrites++; }
-        else if (*w == 0xd4000001u) { st->svc_sites++; }        // svc #0 — report only
+    size_t words = n / 4;
+    for (size_t i = 0; i < words; i++) {
+        if ((w[i] & 0xffffffe0u) == 0xd53bd040u) {
+            if (kl_x18_is_data(w, n, i)) { st->x18_data_words++; continue; }
+            w[i] |= 0x20u;
+            st->tls_rewrites++;
+        } else if (w[i] == 0xd4000001u) { st->svc_sites++; }    // svc #0 — report only
     }
 }
 
@@ -661,6 +672,7 @@ kl_image *kl_load(const char *path) {
             img->stats.x18_sites   += xs.sites;
             img->stats.x18_patched += xs.patched;
             img->stats.x18_refused += xs.refused;
+            img->stats.x18_data_words += xs.data_words;
         }
     }
     sys_icache_invalidate(img->base, img->span);

@@ -128,7 +128,22 @@ unsigned long klb_getauxval(unsigned long type) {
     static int done;
     switch (type) {
     case AT_HWCAP:
-        if (!done) { hwcap = build_hwcap(); done = 1; }
+        if (!done) {
+            hwcap = build_hwcap();
+            // KL_HWCAP=<hex>: override the measured value outright. This is an
+            // A/B, not a tuning knob — the bits select whole hand-written
+            // assembly implementations (BoringSSL's aes_hw_* / gcm_*_v8 are
+            // gated on AES|PMULL), so clearing them moves the guest onto its
+            // portable C path. That is the one measurement that separates "our
+            // runtime mishandles that assembly" from "the fault is elsewhere".
+            const char *o = getenv("KL_HWCAP");
+            if (o && *o) {
+                hwcap = strtoul(o, NULL, 0);
+                fprintf(stderr, "  [klepton] getauxval(AT_HWCAP) forced to 0x%lx "
+                                "by KL_HWCAP\n", hwcap);
+            }
+            done = 1;
+        }
         return hwcap;
     case AT_HWCAP2:  return 0;               // nothing in HWCAP2 is measurable here
     case AT_PAGESZ:  return (unsigned long)getpagesize();

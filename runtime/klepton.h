@@ -55,6 +55,11 @@ typedef struct {
     // S0.5: guest instructions naming x18, and how many were redirected to a
     // veneer. Anything refused is still exposed to trap 0.
     unsigned x18_sites, x18_patched, x18_refused;
+    // Words that decode as an x18 site but sit in DATA inside an
+    // executable section (trap 0b). Not sites and not refusals — reported
+    // separately because a number moving here means the second detector
+    // changed its mind about what is code.
+    unsigned x18_data_words;
 } kl_stats;
 const kl_stats *kl_get_stats(kl_image *img);
 

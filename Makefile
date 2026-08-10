@@ -162,9 +162,9 @@ guest: build/t_guest build/guest_torture.so
 # S0.5 — the x18 decoder, checked against objdump over every guest library.
 # Deliberately not linked against the runtime: it reads ELF files, it does not
 # load them, so a decoder bug cannot hide behind a working loader.
-build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h
+build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tests/t_x18.c runtime/kl_x18.c
+	$(CC) $(CFLAGS) -o $@ tests/t_x18.c runtime/kl_x18.c runtime/kl_env.c
 
 x18: build/t_x18
 	python3 tools/check_x18.py build/t_x18 $(LIBS)/libunity.so $(LIBS)/libil2cpp.so \

@@ -44,6 +44,7 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 // is exactly what the rewritten word disassembles to.
 #define TEST_REG 9
 
+static unsigned long g_data;
 static unsigned long g_words, g_sites, g_refused, g_rd, g_wr, g_rw;
 
 static void scan(const char *path) {
@@ -104,6 +105,15 @@ static void scan(const char *path) {
                 g_words++;
                 if (info.ok && info.nfields == 0) continue;    // nothing to do here
                 if (!info.ok) g_refused++;
+                // Trap 0d: decodes as a site, but its neighbourhood is not code,
+                // so the loader will not veneer it. Counted apart from the real
+                // sites, which is what makes this total comparable with the
+                // loader's — but the ROW IS STILL PRINTED. check_x18.py matches
+                // these rows against objdump, and objdump cannot tell data from
+                // code either, so suppressing them reads as a decoder MISS. The
+                // decoder's answer for such a word is still worth checking; what
+                // changed is only whether anything acts on it.
+                else if (kl_x18_is_data(w, csz, k)) g_data++;
                 else {
                     g_sites++;
                     if (info.roles == KLX_R) g_rd++;
@@ -125,7 +135,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) scan(argv[i]);
     fprintf(stderr,
             "[t_x18] %lu words scanned, %lu x18 sites (%lu read-only, %lu write-only, "
-            "%lu read-write), %lu encodings refused\n",
-            g_words, g_sites, g_rd, g_wr, g_rw, g_refused);
+            "%lu read-write), %lu encodings refused, %lu data words (trap 0d)\n",
+            g_words, g_sites, g_rd, g_wr, g_rw, g_refused, g_data);
     return 0;
 }
