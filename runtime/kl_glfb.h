@@ -199,6 +199,29 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
 void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice);
 
 // ---------------------------------------------------------------------------
+// The decoded-video image (SL-13) — the guest's eglCreateImageKHR over an
+// AHardwareBuffer, which here is a VideoToolbox CVPixelBuffer. kl_egl.c serves
+// the guest-facing entry points; the ANGLE work is here because this file owns
+// the display, the config and the entry-point resolution.
+//
+// `pixels` is a CVPixelBufferRef (void* so callers need not include CoreVideo).
+// NULL means the frame could not be made samplable and the caller must say so to
+// the guest rather than hand it an image that will not sample. See kl_glfb.c for
+// why this is an IOSurface pbuffer and not an EGLImage: ANGLE's Metal backend
+// has neither external images nor Android buffers.
+void *kl_glfb_image_from_pixels(void *pixels, int *out_w, int *out_h);
+void  kl_glfb_image_destroy(void *image);
+
+// Bind `image` to whatever the current context has bound to GL_TEXTURE_2D —
+// which is where the guest's glBindTexture(GL_TEXTURE_EXTERNAL_OES, ...) landed
+// after klfb_detarget. This is what glEGLImageTargetTexture2DOES becomes.
+int   kl_glfb_image_bind(void *image);
+
+// Is this handle one of ours? Asked of pointers the guest chose, so it is a
+// registry lookup and not a magic-word peek through a foreign pointer.
+int   kl_glfb_is_image(const void *h);
+
+// ---------------------------------------------------------------------------
 // Foveation — variable rasterization rate for the guest's own rendering.
 //
 // `rate_map` is an id<MTLRasterizationRateMap> the PLATFORM built, on the same

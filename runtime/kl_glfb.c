@@ -57,6 +57,9 @@
 #include <unistd.h>
 #include <math.h>          // powf — the debug tone map in the capture path
 #include <zlib.h>
+// The decoded-video image path (SL-13) — an AHardwareBuffer here is a
+// CVPixelBuffer, and what ANGLE can take is the IOSurface behind it.
+#include <CoreVideo/CoreVideo.h>
 #include "kl_glfb.h"
 #include "kl_present.h"
 #include "kl_egl.h"        // kl_gl_cap_* — the capability tables
@@ -1926,6 +1929,267 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// The decoded-video image (SL-13). An AHardwareBuffer — which is one of our
+// CVPixelBuffers, see kl_mediandk.h — sampled as a GL texture.
+//
+// The guest's sequence is Android's, and every step of it is missing here:
+//
+//     buf = eglGetNativeClientBufferANDROID(ahardwarebuffer)
+//     img = eglCreateImageKHR(dpy, NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, buf, ...)
+//     glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex)
+//     glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, img)
+//
+// ANGLE's Metal backend has no external images at all (SL-10, DisplayMtl.mm:984)
+// and no notion of an Android buffer, so there is nothing to forward to. What it
+// *does* have is EGL_ANGLE_iosurface_client_buffer, and a VideoToolbox pixel
+// buffer is IOSurface-backed by construction (kl_vtdec.c asks for it) — so the
+// image becomes a pbuffer over the same IOSurface, and the target call becomes
+// eglBindTexImage. DisplayMtl's own comment is the licence: "Metal can bind
+// IOSurfaces to regular 2D textures", which is why its configs report
+// bindToTextureTarget == EGL_TEXTURE_2D rather than the rectangle target the
+// desktop-GL backend needs.
+//
+// The guest cannot tell the difference. Its sampler is already a plain
+// `sampler2D` on GL_TEXTURE_2D by the time this runs (klfb_rewrite_glsl and
+// klfb_detarget did that in SL-10), and BGRA output means the YUV→RGB conversion
+// an external image would have promised has already happened in the decoder.
+#define EGL_IOSURFACE_ANGLE_        0x3454
+#define EGL_IOSURFACE_PLANE_ANGLE_  0x345A
+#define EGL_TEXTURE_TYPE_ANGLE_     0x345C
+#define EGL_TEXTURE_FORMAT_         0x3080
+#define EGL_TEXTURE_RGBA_           0x305E
+#define EGL_TEXTURE_TARGET_         0x3081
+#define EGL_TEXTURE_2D_EGL_         0x305F
+#define EGL_BACK_BUFFER_            0x3084
+#define GL_BGRA_EXT_                0x80E1
+#define GL_UNSIGNED_BYTE_           0x1401
+#define GL_TEXTURE_BINDING_2D_      0x8069
+
+static void *(*a_eglCreatePbufferFromClientBuffer)(void *, uint32_t, void *, void *,
+                                                   const int32_t *);
+static unsigned (*a_eglDestroySurface_img)(void *, void *);
+static unsigned (*a_eglBindTexImage)(void *, void *, int32_t);
+static unsigned (*a_eglReleaseTexImage)(void *, void *, int32_t);
+static int32_t  (*a_eglGetError_img)(void);
+static void     (*a_glTexParameteri_img)(uint32_t, uint32_t, int32_t);
+static void     (*a_glGetTexParameteriv_img)(uint32_t, uint32_t, int32_t *);
+
+typedef struct klfb_image {
+    uint32_t magic;
+    void    *pbuf;              // the EGLSurface over the IOSurface
+    int      w, h;
+    uint32_t bound_tex;         // the GL name it is bound to, 0 if none
+    struct klfb_image *next;
+} klfb_image;
+
+#define KLFB_IMAGE_MAGIC 0x4b4c4749u   /* 'KLGI' */
+
+// A registry rather than a bare magic check, because kl_glfb_is_image() is asked
+// about pointers the guest chose: an EGLImage from somewhere else is a valid
+// object we must forward rather than dereference for a magic word.
+static klfb_image  *g_images;
+static pthread_mutex_t g_images_lk = PTHREAD_MUTEX_INITIALIZER;
+
+static int img_resolve(void) {
+    if (a_eglCreatePbufferFromClientBuffer) return 1;
+    if (!g_ready) return 0;
+    a_eglCreatePbufferFromClientBuffer = asym("eglCreatePbufferFromClientBuffer");
+    a_eglDestroySurface_img            = asym("eglDestroySurface");
+    a_eglBindTexImage                  = asym("eglBindTexImage");
+    a_eglReleaseTexImage               = asym("eglReleaseTexImage");
+    a_eglGetError_img                  = asym("eglGetError");
+    a_glTexParameteri_img              = asym("glTexParameteri");
+    a_glGetTexParameteriv_img          = asym("glGetTexParameteriv");
+    return a_eglCreatePbufferFromClientBuffer && a_eglBindTexImage
+        && a_eglReleaseTexImage && a_eglDestroySurface_img;
+}
+
+int kl_glfb_is_image(const void *h) {
+    if (!h) return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_images_lk);
+    for (klfb_image *i = g_images; i; i = i->next)
+        if (i == h) { found = 1; break; }
+    pthread_mutex_unlock(&g_images_lk);
+    return found;
+}
+
+void *kl_glfb_image_from_pixels(void *pixels, int *out_w, int *out_h) {
+    if (!pixels) return NULL;
+    if (!kl_glfb_init() || !img_resolve()) {
+        fprintf(stderr, "  [glfb] no ANGLE IOSurface entry points — a decoded frame "
+                        "cannot be turned into a texture (is KL_GLFB=1?)\n");
+        return NULL;
+    }
+    IOSurfaceRef surf = CVPixelBufferGetIOSurface((CVPixelBufferRef)pixels);
+    if (!surf) {
+        fprintf(stderr, "  [glfb] the decoded frame is not IOSurface-backed — "
+                        "kCVPixelBufferIOSurfacePropertiesKey is what makes it so\n");
+        return NULL;
+    }
+    // The attribute list below states BGRA/UNSIGNED_BYTE to ANGLE, and ANGLE only
+    // WARNs when the IOSurface disagrees (IOSurfaceSurfaceMtl::ValidateAttributes
+    // compares bytes-per-element, which every 4-byte format passes). So check the
+    // pixel format here instead: a decoder that started handing back NV12 would
+    // otherwise sample as garbage rather than fail.
+    OSType pf = CVPixelBufferGetPixelFormatType((CVPixelBufferRef)pixels);
+    if (pf != kCVPixelFormatType_32BGRA) {
+        fprintf(stderr, "  [glfb] decoded frame is pixel format '%c%c%c%c', not BGRA — "
+                        "refusing to describe it to ANGLE as something it is not\n",
+                (char)(pf >> 24), (char)(pf >> 16), (char)(pf >> 8), (char)pf);
+        return NULL;
+    }
+    int w = (int)CVPixelBufferGetWidth((CVPixelBufferRef)pixels);
+    int h = (int)CVPixelBufferGetHeight((CVPixelBufferRef)pixels);
+    const int32_t attrs[] = {
+        EGL_WIDTH,                          w,
+        EGL_HEIGHT,                         h,
+        EGL_IOSURFACE_PLANE_ANGLE_,         0,
+        EGL_TEXTURE_TARGET_,                EGL_TEXTURE_2D_EGL_,
+        EGL_TEXTURE_FORMAT_,                EGL_TEXTURE_RGBA_,
+        EGL_TEXTURE_TYPE_ANGLE_,            GL_UNSIGNED_BYTE_,
+        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE_, GL_BGRA_EXT_,
+        EGL_NONE_,
+    };
+    // ANGLE validates all six of those as REQUIRED for EGL_IOSURFACE_ANGLE and
+    // fails the call if any is missing, so this list is a contract, not a
+    // preference.
+    void *pbuf = a_eglCreatePbufferFromClientBuffer(g_dpy, EGL_IOSURFACE_ANGLE_,
+                                                    (void *)surf, g_cfg, attrs);
+    if (!pbuf) {
+        fprintf(stderr, "  [glfb] eglCreatePbufferFromClientBuffer(EGL_IOSURFACE_ANGLE) "
+                        "failed for %dx%d — EGL error 0x%x\n",
+                w, h, a_eglGetError_img ? a_eglGetError_img() : 0);
+        return NULL;
+    }
+    klfb_image *im = calloc(1, sizeof *im);
+    if (!im) { a_eglDestroySurface_img(g_dpy, pbuf); return NULL; }
+    im->magic = KLFB_IMAGE_MAGIC;
+    im->pbuf  = pbuf;
+    im->w = w; im->h = h;
+    pthread_mutex_lock(&g_images_lk);
+    im->next = g_images;
+    g_images = im;
+    pthread_mutex_unlock(&g_images_lk);
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    static unsigned made;
+    if (made++ < 4)
+        fprintf(stderr, "  [glfb] video image %p: IOSurface %p as a %dx%d BGRA pbuffer\n",
+                (void *)im, (void *)surf, w, h);
+    return im;
+}
+
+// The other half of SL-10's detarget, and it is the difference between a picture
+// and a black rectangle.
+//
+// GL_OES_EGL_image_external specifies its OWN sampler defaults, and they are not
+// GL_TEXTURE_2D's: MIN_FILTER defaults to LINEAR (external textures have no
+// mipmaps at all) and WRAP_S/T to CLAMP_TO_EDGE. A guest targeting Android is
+// entitled to rely on them and never set any of it. Once we retarget the same
+// texture to GL_TEXTURE_2D, the defaults it inherits are NEAREST_MIPMAP_LINEAR
+// and REPEAT — and a 2D texture with a mipmap min filter and no mip levels is
+// *incomplete*, which samples as BLACK with no GL error anywhere. The frame
+// arrives, the bind succeeds, the draw succeeds, and nothing is on screen.
+//
+// So the external defaults are applied here, and only where the state is still
+// the 2D default: a guest that did set a filter deliberately keeps it. That
+// test is what stops this being a blanket override of the guest's choices.
+#define GL_TEXTURE_2D_IMG_     0x0DE1
+#define GL_TEXTURE_MIN_FILTER_ 0x2801
+#define GL_TEXTURE_MAG_FILTER_ 0x2800
+#define GL_TEXTURE_WRAP_S_     0x2802
+#define GL_TEXTURE_WRAP_T_     0x2803
+#define GL_NEAREST_MIPMAP_LINEAR_ 0x2702
+#define GL_LINEAR_             0x2601
+#define GL_REPEAT_             0x2901
+#define GL_CLAMP_TO_EDGE_      0x812F
+static void klfb_external_defaults(int32_t tex) {
+    if (!a_glTexParameteri_img || !a_glGetTexParameteriv_img) return;
+    int32_t v = 0;
+    a_glGetTexParameteriv_img(GL_TEXTURE_2D_IMG_, GL_TEXTURE_MIN_FILTER_, &v);
+    if (v == GL_NEAREST_MIPMAP_LINEAR_) {          // untouched 2D default
+        a_glTexParameteri_img(GL_TEXTURE_2D_IMG_, GL_TEXTURE_MIN_FILTER_, GL_LINEAR_);
+        static unsigned said;
+        if (said++ < 2)
+            fprintf(stderr, "  [glfb] texture %d had the GL_TEXTURE_2D mipmap min "
+                            "filter and no mip levels — incomplete, and would have "
+                            "sampled black; set to LINEAR, which is what "
+                            "GL_TEXTURE_EXTERNAL_OES defaults to\n", tex);
+    }
+    a_glGetTexParameteriv_img(GL_TEXTURE_2D_IMG_, GL_TEXTURE_WRAP_S_, &v);
+    if (v == GL_REPEAT_)
+        a_glTexParameteri_img(GL_TEXTURE_2D_IMG_, GL_TEXTURE_WRAP_S_, GL_CLAMP_TO_EDGE_);
+    a_glGetTexParameteriv_img(GL_TEXTURE_2D_IMG_, GL_TEXTURE_WRAP_T_, &v);
+    if (v == GL_REPEAT_)
+        a_glTexParameteri_img(GL_TEXTURE_2D_IMG_, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
+    (void)GL_TEXTURE_MAG_FILTER_;   // its 2D default IS external's (LINEAR)
+}
+
+// eglBindTexImage binds to whatever is bound to GL_TEXTURE_2D on the active unit
+// of the calling thread's context — which is exactly where the guest's
+// glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex) landed after klfb_detarget. So the
+// only work here is the bookkeeping ANGLE will not do for us: a surface may be
+// bound to at most one texture, and binding a second surface into a texture that
+// already has one is undefined (Texture::bindTexImageFromSurface asserts on it).
+int kl_glfb_image_bind(void *image) {
+    klfb_image *im = image;
+    if (!kl_glfb_is_image(im) || !img_resolve()) return 0;
+    int32_t tex = 0;
+    if (a_glGetIntegerv) a_glGetIntegerv(GL_TEXTURE_BINDING_2D_, &tex);
+    if (!tex) {
+        fprintf(stderr, "  [glfb] video image %p: no texture bound to GL_TEXTURE_2D — "
+                        "the guest's bind did not reach us\n", image);
+        return 0;
+    }
+    if (im->bound_tex == (uint32_t)tex) return 1;      // already there
+    pthread_mutex_lock(&g_images_lk);
+    if (im->bound_tex) {
+        a_eglReleaseTexImage(g_dpy, im->pbuf, EGL_BACK_BUFFER_);
+        im->bound_tex = 0;
+    }
+    for (klfb_image *o = g_images; o; o = o->next)
+        if (o != im && o->bound_tex == (uint32_t)tex) {
+            a_eglReleaseTexImage(g_dpy, o->pbuf, EGL_BACK_BUFFER_);
+            o->bound_tex = 0;
+        }
+    pthread_mutex_unlock(&g_images_lk);
+    while (a_glGetError && a_glGetError()) {}
+    if (!a_eglBindTexImage(g_dpy, im->pbuf, EGL_BACK_BUFFER_)) {
+        static int said;
+        if (said++ < 8)
+            fprintf(stderr, "  [glfb] eglBindTexImage(video image %p -> texture %d) "
+                            "failed, EGL error 0x%x\n", image, tex,
+                    a_eglGetError_img ? a_eglGetError_img() : 0);
+        return 0;
+    }
+    im->bound_tex = (uint32_t)tex;
+    klfb_external_defaults(tex);
+    static unsigned bound;
+    if (bound++ < 4)
+        fprintf(stderr, "  [glfb] video image %p is now texture %d (%dx%d)\n",
+                image, tex, im->w, im->h);
+    return 1;
+}
+
+void kl_glfb_image_destroy(void *image) {
+    klfb_image *im = image;
+    if (!kl_glfb_is_image(im)) return;
+    pthread_mutex_lock(&g_images_lk);
+    for (klfb_image **p = &g_images; *p; p = &(*p)->next)
+        if (*p == im) { *p = im->next; break; }
+    pthread_mutex_unlock(&g_images_lk);
+    // Release before destroy: a surface still bound to a texture keeps ANGLE's
+    // reference on the IOSurface, and the texture would go on sampling storage
+    // the decoder has recycled.
+    if (im->bound_tex && a_eglReleaseTexImage)
+        a_eglReleaseTexImage(g_dpy, im->pbuf, EGL_BACK_BUFFER_);
+    if (a_eglDestroySurface_img) a_eglDestroySurface_img(g_dpy, im->pbuf);
+    im->magic = 0;
+    free(im);
+}
+
 static void (*g_real_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t, int32_t,
                                       int32_t, int32_t, int32_t, uint32_t, uint32_t);
 
@@ -3098,6 +3362,17 @@ static uint32_t klfb_detarget(uint32_t t) {
     return t == GL_TEXTURE_EXTERNAL_OES_ ? GL_TEXTURE_2D_ : t;
 }
 
+// ...and the third piece of it. An image of OURS is not an ANGLE EGLImage at
+// all — it is a pbuffer over the decoded frame's IOSurface — so the call becomes
+// eglBindTexImage. Anything else is forwarded, detargeted, so a guest that ever
+// does have a real external image is unaffected by our presence.
+static void (*g_real_EGLImageTargetTexture2DOES)(uint32_t, void *);
+static void klfb_EGLImageTargetTexture2DOES(uint32_t target, void *image) {
+    if (kl_glfb_is_image(image)) { kl_glfb_image_bind(image); return; }
+    if (g_real_EGLImageTargetTexture2DOES)
+        g_real_EGLImageTargetTexture2DOES(klfb_detarget(target), image);
+}
+
 static void (*g_real_BindTexture)(uint32_t, uint32_t);
 static void klfb_BindTexture(uint32_t t, uint32_t n) {
     if (a_glGetError) while (a_glGetError()) {}
@@ -3151,6 +3426,8 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glActiveTexture", (void *)klfb_ActiveTexture, (void **)&g_real_ActiveTexture},
     {"glUseProgram",  (void *)klfb_UseProgram,  (void **)&g_real_UseProgram},
     {"glBindTexture", (void *)klfb_BindTexture, (void **)&g_real_BindTexture},
+    {"glEGLImageTargetTexture2DOES", (void *)klfb_EGLImageTargetTexture2DOES,
+                                     (void **)&g_real_EGLImageTargetTexture2DOES},
     {"glBindSampler", (void *)klfb_BindSampler, (void **)&g_real_BindSampler},
     {"glGetUniformLocation", (void *)klfb_GetUniformLocation, (void **)&g_real_GetUniformLocation},
     {"glUniform1i",   (void *)klfb_Uniform1i,   (void **)&g_real_Uniform1i},

@@ -430,7 +430,8 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     X(xrInitializeLoaderKHR)                                                   \
     X(xrGetOpenGLESGraphicsRequirementsKHR)                                    \
     X(xrEnumerateDisplayRefreshRatesFB) X(xrGetDisplayRefreshRateFB)           \
-    X(xrRequestDisplayRefreshRateFB)
+    X(xrRequestDisplayRefreshRateFB)                                           \
+    X(xrConvertTimespecTimeToTimeKHR) X(xrConvertTimeToTimespecTimeKHR)
 
 // ------------------------------------------------------------------ bookkeeping
 // One row per entry point: resolved counts lookups, called counts calls. The
@@ -463,21 +464,27 @@ void kl_openxr_report(FILE *f) {
         ncall += g_xr[i].called   != 0;
     }
     fprintf(f, "\n=== OpenXR surface (libklepton_openxr) ===\n");
-    fprintf(f, "  %d entry points served; %u resolved, %u called\n",
-            KLXR_COUNT, nres, ncall);
+    fprintf(f, "  %d entry points served; %u resolved by the guest, "
+               "%u refused by name\n", KLXR_COUNT, nres, ncall);
     if (ncall) {
-        fprintf(f, "  --- called (the SL-8 work list, in call count order) ---\n");
+        fprintf(f, "  --- refused (the work list, in refusal count order) ---\n");
         for (int i = 0; i < KLXR_COUNT; i++)
             if (g_xr[i].called)
                 fprintf(f, "    %-42s x%u\n", g_xr[i].name, g_xr[i].called);
     }
-    // Resolved-but-never-called is printed too, and briefly: it is what says
-    // the guest has a code path it did not take, which is a different fact from
-    // a name it has never heard of.
+    // The rest are the ones the guest looked up and we serve. `called` counts
+    // REFUSALS only — klxr_unimplemented is the sole place it is bumped, because
+    // an implemented entry point is dispatched straight through the pointer
+    // xrGetInstanceProcAddr handed out and there is no seam left to count at.
+    // This used to be headed "resolved but never called", which listed
+    // xrEndFrame under it on a run whose own log shows xrEndFrame working —
+    // a report that contradicts the trace costs more than no report (SL-13).
     int shown = 0;
     for (int i = 0; i < KLXR_COUNT; i++)
         if (g_xr[i].resolved && !g_xr[i].called) {
-            if (!shown++) fprintf(f, "  --- resolved but never called ---\n");
+            if (!shown++)
+                fprintf(f, "  --- resolved and served (no per-call count: "
+                           "dispatched by pointer) ---\n");
             fprintf(f, "    %s\n", g_xr[i].name);
         }
 }
@@ -625,6 +632,14 @@ static klxr_instance *klxr_inst(void *h) {
 static const struct { const char *name; uint32_t version; } g_extensions[] = {
     { "XR_KHR_opengl_es_enable",       10 },
     { "XR_KHR_android_create_instance", 3 },
+    // XR_KHR_convert_timespec_time is the cheapest honest claim in this table:
+    // our XrTime IS CLOCK_MONOTONIC nanoseconds (klxr_now), so the conversion is
+    // arithmetic and cannot be wrong. Without it the guest logs "not available
+    // on this runtime" on EVERY frame — a quarter of a million lines in a 40 s
+    // run, which is not just noise: it is the guest's per-frame path doing
+    // formatted I/O, and it buried the six lines of the video path that the run
+    // existed to produce.
+    { "XR_KHR_convert_timespec_time",   1 },
     // XR_FB_display_refresh_rate is the exception to the paragraph above, and
     // it is here because absence turned out NOT to be handled gracefully after
     // all (SL-11). The guest prints "XR_EXT_display_refresh_rate is not
@@ -674,12 +689,50 @@ static XrResult klxr_two_call(uint32_t capacity, uint32_t *count_out, uint32_t h
 // the ones we know and say nothing into the others — but we PRINT them, once
 // each, because a chained type is the guest naming a feature it is prepared to
 // use, which is the same kind of measurement the "not served" line above makes.
+// ONCE per (site, type). This is a capability question and the answer does not
+// change between frames, but the sites are per-frame: xrLocateSpace chains an
+// XrSpaceVelocity every frame, and at 90 Hz for 45 s that printed 95,773 lines —
+// which is not merely noise, it is formatted I/O on the guest's frame path, and
+// it buried the six lines the run existed to produce.
+#define KLXR_CHAIN_SEEN 64
 static void klxr_log_chain(const char *where, const void *next) {
+    static struct { const char *where; int32_t type; } seen[KLXR_CHAIN_SEEN];
+    static int n_seen;
     for (int depth = 0; next && depth < 16; depth++) {
         int32_t type = *(const int32_t *)next;
-        fprintf(stderr, "  [xr] %s: chained struct type %d — not filled in\n",
-                where, type);
+        int already = 0;
+        for (int i = 0; i < n_seen; i++)
+            if (seen[i].type == type && seen[i].where == where) { already = 1; break; }
+        if (!already) {
+            if (n_seen < KLXR_CHAIN_SEEN) seen[n_seen++] = (typeof(seen[0])){where, type};
+            fprintf(stderr, "  [xr] %s: chained struct type %d — not filled in\n",
+                    where, type);
+        }
         next = *(const void *const *)((const char *)next + 8);
+    }
+}
+
+// ...and the one chained struct that must NOT merely be logged. The guest asks
+// for velocity alongside every head pose, and an output struct we do not write
+// is whatever its caller's stack held — so "not filled in" was handing the
+// client a garbage head velocity, which it publishes to SteamVR as the basis
+// for pose prediction. We have no velocity source, and the struct has a field
+// that says exactly that: velocityFlags == 0 means neither component is valid.
+// Answering zero-and-VALID would be the worse lie — it asserts a stationary
+// head — so the flags carry the "we do not know" and the vectors are zeroed so
+// a guest that ignores the flags at least reads a defined value.
+//
+// Offsets are the Khronos header's, transcribed: type 0, next 8, velocityFlags
+// 16 (XrFlags64), linearVelocity 24, angularVelocity 36.
+#define KLXR_TYPE_SPACE_VELOCITY 43
+static void klxr_fill_space_velocity(void *next) {
+    for (int depth = 0; next && depth < 16; depth++) {
+        if (*(int32_t *)next == KLXR_TYPE_SPACE_VELOCITY) {
+            char *v = next;
+            *(uint64_t *)(v + 16) = 0;                 // velocityFlags: neither valid
+            memset(v + 24, 0, 2 * 3 * sizeof(float));  // linear + angular
+        }
+        next = *(void **)((char *)next + 8);
     }
 }
 
@@ -954,6 +1007,35 @@ static XrResult klxr_RequestDisplayRefreshRateFB(void *session, float rate) {
     return KLXR_SUCCESS;
 }
 
+
+// ---------------------------------------------------------- XR_KHR_convert_timespec_time
+//
+// Both directions, and they are pure arithmetic here because klxr_now() below
+// defines XrTime as CLOCK_MONOTONIC nanoseconds — the same clock a timespec
+// from clock_gettime(CLOCK_MONOTONIC) carries. On a runtime whose XrTime came
+// off some other clock this would need the offset between the two; ours does
+// not, and that is a property worth stating rather than a coincidence.
+static XrResult klxr_ConvertTimespecTimeToTimeKHR(void *instance,
+                                                  const struct timespec *ts,
+                                                  int64_t *time_out) {
+    (void)instance;
+    if (!ts || !time_out) return KLXR_ERROR_VALIDATION_FAILURE;
+    *time_out = (int64_t)ts->tv_sec * 1000000000LL + ts->tv_nsec;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_ConvertTimeToTimespecTimeKHR(void *instance, int64_t time,
+                                                  struct timespec *ts_out) {
+    (void)instance;
+    if (!ts_out) return KLXR_ERROR_VALIDATION_FAILURE;
+    // Floor division, so a negative XrTime does not land a nanosecond field
+    // outside [0, 1e9) — which is a malformed timespec, not merely an odd one.
+    int64_t sec = time / 1000000000LL, nsec = time % 1000000000LL;
+    if (nsec < 0) { nsec += 1000000000LL; sec--; }
+    ts_out->tv_sec  = (time_t)sec;
+    ts_out->tv_nsec = (long)nsec;
+    return KLXR_SUCCESS;
+}
 
 // XrTime is int64 nanoseconds on a monotonic clock the runtime chooses. It must
 // be the SAME clock the guest's own timing uses, for the reason the
@@ -1927,6 +2009,20 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     v, sc->width, sc->height, sc->tex[0], sc->tex[1], sc->tex[2]);
         }
     }
+
+    // ...and this is the VR path's swap. kl_glfb's capture and the frontend
+    // seams both hang off eglSwapBuffers, which an OpenXR guest never calls —
+    // it presents through here. So a VR run had no way to produce a picture at
+    // all: KL_GLFB_OUT was silently inert, and the only evidence a frame
+    // existed was the guest's own opinion of itself. Same call, same knobs,
+    // same thread rule as klegl_SwapBuffers (this is the guest's render thread,
+    // where the context is current and the frame was just drawn).
+    {
+        const char *out = kl_env_str("KL_GLFB_OUT", NULL);
+        if (kl_glfb_enabled() &&
+            (out || kl_glfb_has_frame_sink() || kl_glfb_has_gpu_fence()))
+            kl_glfb_present(out);
+    }
     return KLXR_SUCCESS;
 }
 
@@ -1997,6 +2093,7 @@ static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
     if (!location) return KLXR_ERROR_VALIDATION_FAILURE;
     (void)time;
     klxr_log_chain("xrLocateSpace", location->next);
+    klxr_fill_space_velocity(location->next);
 
     location->type = XR_TYPE_SPACE_LOCATION;
     location->pose.orientation = (XrQuaternionf){0, 0, 0, 1};
@@ -2102,6 +2199,10 @@ static void klxr_install(void) {
         {"xrGetDisplayRefreshRateFB", (void *)klxr_GetDisplayRefreshRateFB},
         {"xrRequestDisplayRefreshRateFB",
                                    (void *)klxr_RequestDisplayRefreshRateFB},
+        {"xrConvertTimespecTimeToTimeKHR",
+                                   (void *)klxr_ConvertTimespecTimeToTimeKHR},
+        {"xrConvertTimeToTimespecTimeKHR",
+                                   (void *)klxr_ConvertTimeToTimespecTimeKHR},
         // the session, and the state machine xrPollEvent drives
         {"xrCreateSession",        (void *)klxr_CreateSession},
         {"xrDestroySession",       (void *)klxr_DestroySession},

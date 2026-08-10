@@ -234,12 +234,24 @@ static int klm_AImage_getTimestamp(void *image, int64_t *out) {
     *out = im->pts_us * 1000;
     return AMEDIA_OK;
 }
+// The frame path is six handoffs long — submit, dequeue, release(render),
+// publish, acquire, hardware buffer — and any one of them not happening looks
+// exactly like any other from outside: no picture. So each one says so the first
+// time it happens, and the run's log then names the LAST rung reached rather
+// than leaving the whole ladder to be inferred from an end-of-run count.
+#define KLM_FIRST(flagvar, ...) do { \
+        static int flagvar; \
+        if (!flagvar++) { fprintf(stderr, "  [media] " __VA_ARGS__); } \
+    } while (0)
+
 static int klm_AImage_getHardwareBuffer(void *image, void **out) {
     klm_image *im = image;
     if (!im || im->magic != KLM_IMAGE_MAGIC || !out) return AMEDIA_ERROR_INVALID_PARAMETER;
     if (!im->hw) im->hw = klm_hwbuf_new((CVPixelBufferRef)im->pixels);
     if (!im->hw) return AMEDIA_ERROR_UNKNOWN;
     *out = im->hw;
+    KLM_FIRST(said_hw, "first AHardwareBuffer handed out (%p) — the guest can now "
+                       "ask EGL for an image of it\n", (void *)im->hw);
     return AMEDIA_OK;
 }
 
@@ -284,6 +296,10 @@ static klm_reader *g_reader;        // for the report; this guest makes one
 // to report. These outlive that. (SL-11: an empty media report read as "the
 // decoder was never fed" when it only meant "teardown got there first".)
 static unsigned g_life_in, g_life_out, g_life_rendered, g_life_published, g_life_acquired;
+// ...and the one bit that says the report is worth printing at all: a codec or a
+// reader existed at some point. Counters can legitimately all be zero, and that
+// is the single most interesting thing a report can say.
+static int g_ever_created;
 
 // Android delivers onImageAvailable on a thread that is NOT the one that
 // released the buffer, and that is load-bearing rather than incidental. This
@@ -306,7 +322,10 @@ static void *reader_dispatch(void *arg) {
         klm_listener l = r->listener;
         int have = r->have_listener;
         pthread_mutex_unlock(&r->lock);
-        if (have && l.onImageAvailable) l.onImageAvailable(l.context, r);
+        if (have && l.onImageAvailable) {
+            KLM_FIRST(said_cb, "first onImageAvailable delivered to the guest\n");
+            l.onImageAvailable(l.context, r);
+        }
         pthread_mutex_lock(&r->lock);
     }
     pthread_mutex_unlock(&r->lock);
@@ -390,6 +409,7 @@ static int klm_AImageReader_acquireLatestImage(void *reader, void **out) {
     r->count--;
     r->n_acquired++;
     pthread_mutex_unlock(&r->lock);
+    KLM_FIRST(said_acq, "first acquireLatestImage (pts %lld us)\n", (long long)pts);
 
     klm_image *im = klm_image_new((CVPixelBufferRef)pb, pts);
     CVPixelBufferRelease((CVPixelBufferRef)pb);   // the image took its own
@@ -441,6 +461,10 @@ static void klm_reader_publish(klm_reader *r, CVPixelBufferRef pb, int64_t pts_u
     // decoder's answer.
     kl_ndk_window_set_size(r->window, (int32_t)CVPixelBufferGetWidth(pb),
                            (int32_t)CVPixelBufferGetHeight(pb));
+    KLM_FIRST(said_pub, "first frame published to the reader: %zux%zu, pts %lld us "
+                        "— onImageAvailable fires next\n",
+              CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
+              (long long)pts_us);
     pthread_cond_signal(&r->cv);
     pthread_mutex_unlock(&r->lock);
 }
@@ -489,6 +513,7 @@ static void *klm_AMediaCodec_createDecoderByType(const char *mime) {
     }
     fprintf(stderr, "  [media] AMediaCodec_createDecoderByType(\"%s\")\n", mime);
     g_codec = c;
+    g_ever_created = 1;
     return c;
 }
 
@@ -616,6 +641,8 @@ static int klm_AMediaCodec_queueInputBuffer(void *codec, size_t idx, off_t offse
     c->n_in++;
     pthread_mutex_unlock(&c->lock);
     if (!p) return AMEDIA_ERROR_UNKNOWN;
+    KLM_FIRST(said_in, "first access unit queued: %zu bytes, pts %llu us, flags 0x%x\n",
+              size, (unsigned long long)time_us, flags);
     if (offset < 0 || size > KLM_IN_CAP || (size_t)offset > KLM_IN_CAP - size)
         return AMEDIA_ERROR_INVALID_PARAMETER;
     if (flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) return AMEDIA_OK;
@@ -646,6 +673,8 @@ static ssize_t klm_AMediaCodec_dequeueOutputBuffer(void *codec,
                     c->out[i].pts_us = pts;
                     c->n_out++;
                     pthread_mutex_unlock(&c->lock);
+                    KLM_FIRST(said_out, "first decoded frame dequeued (slot %d, "
+                                        "pts %lld us)\n", i, (long long)pts);
                     if (info) {
                         info->offset = 0;
                         // Zero, and deliberately: this codec renders to a
@@ -686,6 +715,9 @@ static int klm_AMediaCodec_releaseOutputBuffer(void *codec, size_t idx, bool ren
     if (render) c->n_rendered++;
     pthread_mutex_unlock(&c->lock);
 
+    if (render) KLM_FIRST(said_rel, "first releaseOutputBuffer(render=true)%s\n",
+                          r ? "" : " — but the codec has no output surface, "
+                                   "so the frame goes nowhere");
     if (render && r) klm_reader_publish(r, pb, pts);
     CVPixelBufferRelease(pb);
     return AMEDIA_OK;
@@ -705,7 +737,11 @@ void kl_mediandk_report(FILE *f) {
     unsigned rendered = g_life_rendered + (g_codec ? g_codec->n_rendered : 0);
     unsigned published = g_life_published + (g_reader ? g_reader->n_queued : 0);
     unsigned acquired = g_life_acquired + (g_reader ? g_reader->n_acquired : 0);
-    if (!in && !out && !published && !g_codec && !g_reader) return;
+    // Never silent once anything media-shaped has happened. "Did a frame reach
+    // the guest?" is the question this run exists to answer, and a report that
+    // prints nothing is indistinguishable from a report that never ran — which
+    // is exactly how it read the first time (trap 6d, in the reporting path).
+    if (!g_ever_created) return;
     fprintf(f, "\n=== media (AMediaCodec / AImageReader) ===\n");
     fprintf(f, "  codec \"%s\": %u buffers queued, %u frames dequeued, %u rendered%s\n",
             g_codec ? g_codec->mime : "video/hevc", in, out, rendered,

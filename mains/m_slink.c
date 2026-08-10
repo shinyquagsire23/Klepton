@@ -36,6 +36,8 @@
 #include "../runtime/kl_view.h"
 #include "../runtime/kl_mediandk.h"
 #include "../runtime/kl_aaudio.h"
+#include "../runtime/kl_openxr.h"
+#include "../runtime/kl_egl.h"
 
 static const char *LIBDIR = "steamlink-android/lib/arm64-v8a";
 
@@ -519,11 +521,25 @@ static void run_vr_sequence(kl_image *scene) {
     // guest gets once its callbacks can actually run.
     unsigned maxs = getenv("KL_SLINK_WAIT") ? (unsigned)atoi(getenv("KL_SLINK_WAIT")) : 10;
     int windowed = getenv("KL_VIEW") != NULL;
-    for (unsigned t = 0; windowed ? !g_view_quit : t < maxs * 10; t++) {
+    // A DEADLINE, not a pump count. kl_ndk_pump_looper(100) returns as soon as
+    // it has work, so counting maxs*10 iterations gave whatever wall time the
+    // guest's own busyness happened to produce — KL_SLINK_WAIT=40 measured
+    // 9 seconds once the stream was live, which is exactly when the knob is
+    // being used to buy the guest time. It reads as "the run stopped early" and
+    // there is nothing in the log to say otherwise.
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    double elapsed = 0;
+    for (unsigned t = 0; windowed ? !g_view_quit : elapsed < (double)maxs; t++) {
         kl_ndk_pump_looper(100);
         if ((t + 1) % 10 == 0) kl_jni_drain_ui_tasks();
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsed = (double)(now.tv_sec - t0.tv_sec)
+                + (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
     }
-    printf("  (UI thread waited %us — see above for where the guest got to)\n", maxs);
+    printf("  (UI thread waited %.1fs of %us — see above for where the guest got to)\n",
+           elapsed, maxs);
     fflush(NULL);
 }
 
@@ -695,6 +711,17 @@ static int slink_run(void) {
     if (g_vr) {
         if (!entry_img) return fail("libvrlink_scene.so not in the registry");
         run_vr_sequence(entry_img);
+        // The VR path has its own exit and had never reported the video, audio,
+        // XR or GL surfaces — which between them ARE the VR half of the app, so
+        // the run that most needs those numbers was the one that printed none
+        // of them. Every one of these is reported on the abort path through
+        // kl_fault.c, and a VR run that works does not take it. An empty report
+        // reads as "nothing happened"; no report at all reads the same way and
+        // takes longer to disbelieve (SL-13 lost a run to exactly that).
+        kl_mediandk_report(stdout);
+        kl_aaudio_report(stdout);
+        kl_openxr_report(stdout);
+        kl_egl_report(stdout);
         printf("\n=== JNI surface ===\n");
         kl_jni_report(stdout);
         return 0;
@@ -811,13 +838,17 @@ static int slink_run(void) {
     if (getenv("KL_SLINK_MAIN") || getenv("KL_VIEW"))
         run_main_sequence(sdl_img, entry_img);
 
-    printf("\n=== JNI surface ===\n");
-    kl_jni_report(stdout);
     // The video and audio paths report on the abort path through kl_fault.c,
     // which a clean exit never takes — and a clean exit is exactly the run
     // where "did anything actually decode?" is the question (SL-11).
+    //
+    // BEFORE the JNI surface, which is thousands of lines: these few are the
+    // answer the run was for, and at the bottom of that they are unfindable —
+    // and worse, indistinguishable from not having printed at all (SL-13).
     kl_mediandk_report(stdout);
     kl_aaudio_report(stdout);
+    printf("\n=== JNI surface ===\n");
+    kl_jni_report(stdout);
     return 0;
 }
 

@@ -137,7 +137,10 @@ answers GL and kl_glfb never initializes.
 - `KL_GLFB_OUT=<dir>` — request a PNG capture on each `eglSwapBuffers`. Read
   by `kl_egl.c`'s SwapBuffers; the readback is serviced from the next call the
   context-owning thread makes (or immediately when the swap arrives on that
-  thread), because the swap itself does not.
+  thread), because the swap itself does not. **Also on `xrEndFrame`** (SL-13):
+  an OpenXR guest never calls `eglSwapBuffers` at all — measured 0 across a 45 s
+  streaming run — so this knob, and both frontend seams with it, were silently
+  inert on the whole VR path.
 - `KL_GLFB_OUT_EVERY=N` — throttle the PNG capture to every Nth swap (default
   1). Applies to the file path only; a registered frame sink gets every swap.
 - `KL_GLFB_DUMP_FBOS=1` — alongside each `KL_GLFB_OUT` capture, write one PNG
@@ -853,7 +856,12 @@ See PLANNING §11.
   (`nativeSetScreenResolution`), the `ANativeWindow` and ANGLE together via
   one `slink_panel_size()` — the display is a group answer, and ANGLE is
   sized before the guest's window surface exists.
-- `KL_SLINK_WAIT=<s>` — how long to let the app run once started.
+- `KL_SLINK_WAIT=<s>` — how long to let the app run once started, in WALL-CLOCK
+  seconds. It was a pump count until SL-13 (`maxs * 10` iterations of
+  `kl_ndk_pump_looper(100)`, which returns as soon as it has work), so a busy
+  guest ended the run early — `KL_SLINK_WAIT=40` measured 9 seconds once the
+  stream was live, and nothing in the log said so. It prints what it actually
+  waited now.
 - `KL_SLINK_LIB` / `KL_SLINK_FN` — which library and entry `nativeRunMain`
   drives (default `libmain.so` / `SDL_main`).
 - `KL_SLINK_LIBDIR=<dir>` — wrapper only: which unpacked APK libdir to point

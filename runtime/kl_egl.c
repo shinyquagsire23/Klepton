@@ -31,6 +31,7 @@
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_glfb.h"
+#include "kl_mediandk.h"   // what an AHardwareBuffer is, for the image path
 #include "kl_present.h"
 
 // ---- the subset of EGL/egl.h we actually answer for ----
@@ -1177,6 +1178,77 @@ static unsigned klegl_SwapInterval(EGLDisplay dpy, int32_t interval) {
     (void)dpy; (void)interval; return EGL_TRUE;
 }
 
+// ---------------------------------------------------------------------------
+// The decoded-video image (SL-13). Three entry points, and between them they are
+// the whole path from a frame VideoToolbox produced to a texture the guest's
+// shader samples.
+//
+// This half is only the ABI: what an AHardwareBuffer is (kl_mediandk.h — a
+// CVPixelBuffer) and what an EGLImage becomes (kl_glfb.c — an IOSurface pbuffer)
+// are the other two files' business, and neither is anything EGL has a name for.
+#define EGL_NATIVE_BUFFER_ANDROID 0x3140
+#define EGL_NO_IMAGE_KHR          ((void *)0)
+
+// The identity function, with a check. Android's contract is that this hands
+// back an opaque EGLClientBuffer for a buffer we recognise, and a buffer we do
+// not recognise has no pixels we could ever find — so answer NULL rather than
+// let it reach eglCreateImageKHR as something that looks valid.
+static void *klegl_GetNativeClientBufferANDROID(void *ahb) {
+    if (!kl_mediandk_buffer_pixels(ahb)) {
+        fprintf(stderr, "  [egl] eglGetNativeClientBufferANDROID(%p): not one of our "
+                        "AHardwareBuffers — nothing else allocates them here\n", ahb);
+        g_error = EGL_BAD_PARAMETER;
+        return NULL;
+    }
+    return ahb;
+}
+
+static void *klegl_CreateImageKHR(EGLDisplay dpy, void *ctx, uint32_t target,
+                                  void *buffer, const int32_t *attrs) {
+    (void)dpy; (void)ctx;
+    if (target != EGL_NATIVE_BUFFER_ANDROID) {
+        fprintf(stderr, "  [egl] eglCreateImageKHR target 0x%x is not "
+                        "EGL_NATIVE_BUFFER_ANDROID — the only source of images here "
+                        "is the video decoder\n", target);
+        g_error = EGL_BAD_PARAMETER;
+        return EGL_NO_IMAGE_KHR;
+    }
+    void *pixels = kl_mediandk_buffer_pixels(buffer);
+    if (!pixels) {
+        fprintf(stderr, "  [egl] eglCreateImageKHR: client buffer %p is not a decoded "
+                        "frame\n", buffer);
+        g_error = EGL_BAD_PARAMETER;
+        return EGL_NO_IMAGE_KHR;
+    }
+    // Every attribute is reported once rather than ignored silently. The measured
+    // list is empty; EGL_IMAGE_PRESERVED_KHR would be the one that means
+    // something, and it is what our pbuffer does anyway (we never render into it).
+    if (attrs && attrs[0] != EGL_NONE) {
+        static int said;
+        if (!said++) {
+            fprintf(stderr, "  [egl] eglCreateImageKHR attributes (ignored):");
+            for (int i = 0; attrs[i] != EGL_NONE; i += 2)
+                fprintf(stderr, " 0x%x=0x%x", attrs[i], attrs[i + 1]);
+            fprintf(stderr, "\n");
+        }
+    }
+    int w = 0, h = 0;
+    void *img = kl_glfb_image_from_pixels(pixels, &w, &h);
+    if (!img) { g_error = EGL_BAD_PARAMETER; return EGL_NO_IMAGE_KHR; }
+    return img;
+}
+
+static unsigned klegl_DestroyImageKHR(EGLDisplay dpy, void *image) {
+    (void)dpy;
+    if (!kl_glfb_is_image(image)) {
+        fprintf(stderr, "  [egl] eglDestroyImageKHR(%p): not one of ours\n", image);
+        g_error = EGL_BAD_PARAMETER;
+        return EGL_FALSE;
+    }
+    kl_glfb_image_destroy(image);
+    return EGL_TRUE;
+}
+
 // SDL3 calls this before creating a context; Unity never did, because it only
 // ever wanted the default. EGL_OPENGL_ES_API (0x30A0) is that default and is the
 // only API this runtime serves — there is no desktop GL and no OpenVG behind us.
@@ -1257,12 +1329,22 @@ void kl_egl_report(FILE *f) {
     kl_glfb_gl_census(f);
     unsigned called = 0;
     for (unsigned i = 0; i < g_ngl; i++) if (g_gl[i].calls) called++;
-    fprintf(f, "  GL entry points resolved: %u, of which called: %u\n", g_ngl, called);
+    // `calls` counts the NULL driver's own stubs. Under KL_GLFB=1 the guest gets
+    // ANGLE's entry point directly and there is no seam left to count at, so a
+    // zero here means "the host driver served it", not "the guest never called
+    // it" — the same distinction kl_openxr_report carries, and for the same
+    // reason: the heading used to assert the second (SL-13).
+    fprintf(f, "  GL entry points resolved: %u, of which counted through the "
+               "null driver: %u\n", g_ngl, called);
     if (!g_ngl) return;
-    fprintf(f, "  --- called (the M5 work list) ---\n");
-    for (unsigned i = 0; i < g_ngl; i++)
-        if (g_gl[i].calls) fprintf(f, "    %-40s x%u\n", g_gl[i].name, g_gl[i].calls);
-    fprintf(f, "  --- resolved but never called ---\n");
+    if (called) {
+        fprintf(f, "  --- called on the null driver (the M5 work list) ---\n");
+        for (unsigned i = 0; i < g_ngl; i++)
+            if (g_gl[i].calls) fprintf(f, "    %-40s x%u\n", g_gl[i].name, g_gl[i].calls);
+    }
+    fprintf(f, "  --- resolved%s ---\n",
+            kl_glfb_enabled() ? " (served by ANGLE; no per-call count)"
+                              : " but never called");
     for (unsigned i = 0; i < g_ngl; i++)
         if (!g_gl[i].calls) fprintf(f, "    %s\n", g_gl[i].name);
 }
@@ -1292,6 +1374,13 @@ static const struct { const char *name; void *fn; } g_egl[] = {
     E("eglGetProcAddress",      klegl_GetProcAddress),
     E("eglBindAPI",             klegl_BindAPI),
     E("eglQueryAPI",            klegl_QueryAPI),
+    // SL-13 — the decoded-video image. glEGLImageTargetTexture2DOES is the
+    // fourth member of this family and is intercepted in kl_glfb.c instead,
+    // because the guest resolves it through eglGetProcAddress and it has to
+    // fall through to ANGLE for anything that is not one of our images.
+    E("eglGetNativeClientBufferANDROID", klegl_GetNativeClientBufferANDROID),
+    E("eglCreateImageKHR",      klegl_CreateImageKHR),
+    E("eglDestroyImageKHR",     klegl_DestroyImageKHR),
 };
 
 void *kl_egl_lookup(const char *name) {
