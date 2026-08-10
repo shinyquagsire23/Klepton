@@ -898,9 +898,16 @@ See PLANNING §11.
   forwards field 3 (`SteamLink.startVRLink`), so we do the same. Setting it
   overrides the derivation.
 - `KL_XR_BINDINGS=1` — print every suggested action binding, not just the
-  count per interaction profile. This guest suggests ~40 bindings for each of
-  seven controller types, so it is off by default; turn it on when the question
-  is which concrete input path an action expects to be driven from.
+  count per interaction profile, so it is off by default; turn it on when the
+  question is which concrete input path an action expects to be driven from.
+  Steam Link suggests **27–33 bindings for each of six controller profiles, 174
+  in total** (an earlier "~40 for each of seven" here was an estimate). The
+  bindings are not in its code: they are read from
+  `steamlink-vr/assets/config/controller_config.json`, which carries the six
+  profiles, one pose action on `.../input/grip/pose`, one haptic action on
+  `.../output/haptic`, and 15 input actions — so the map can be read offline
+  without a run at all. The seventh "type" in the older count is the hand
+  profile (`svl_hand_interaction_augmented`), which is not in that table.
 - `KL_SLINK_SIZE=WxH` — the panel size, published to SDL
   (`nativeSetScreenResolution`), the `ANativeWindow` and ANGLE together via
   one `slink_panel_size()` — the display is a group answer, and ANGLE is
