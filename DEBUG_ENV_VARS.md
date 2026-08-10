@@ -273,6 +273,27 @@ Built for the loading-pace investigation; all default off.
   `Oculus Quest` / `Pico ` / `HTC VIVE `. (Measured: on `steamlink-vr.apk` it
   does *not* change the 2D→VR handoff — see notes/STEAMLINK.md SL-7.)
 
+- `KL_BATTERY_CHARGING=1` / `KL_BATTERY_LEVEL=<0..100>` — what
+  `BatteryManager.isCharging()` and `getIntProperty(BATTERY_PROPERTY_CAPACITY)`
+  answer. Defaults: not charging, 95.
+
+  These are **telemetry, not control**: Steam Link reads them through
+  `IsHmdBatteryCharging()`/`GetHmdBatteryLevel()` and publishes them to the host
+  as device properties, which the Steam client shows beside the headset. Nothing
+  in the streaming path branches on them, so a wrong answer costs a wrong number
+  on someone's desktop. They are knobs because neither is measured yet — on
+  device the real values are available and wiring them is the honest fix; a
+  fixed answer at least does not fluctuate in the meantime.
+
+## Video decode (`runtime/kl_vtdec.c`, `runtime/kl_mediandk.c`)
+
+No knobs. The decoder is VideoToolbox and it is either there or it is not; what
+would otherwise be a knob is a gate instead (`make hevc`, in `make check`).
+Worth knowing rather than setting: output is **BGRA**, not the decoder's native
+NV12, because the guest samples the frame through a `samplerExternalOES` whose
+whole promise is that the YUV→RGB conversion has already happened. See
+`runtime/kl_vtdec.h`.
+
 ## Clock + condvar (bionic→Darwin translation, always on) and their diagnostics
 
 These are fixes, not knobs: bionic clock ids differ from Darwin's, and bionic
@@ -761,6 +782,17 @@ See PLANNING §11.
   shell building after the host authorized (notes/STEAMLINK.md); a synthetic
   one of the right shape is enough to get past scene setup, a real one is
   needed for an actual stream. `make slink-vr-run` carries a synthetic default.
+
+  Since SL-10 the synthetic one no longer gets as far: the decoder now comes up
+  and the run reaches `SVLDataLink::InitCrypt`, which rejects the fake token
+  ("Unknown / confusing key identifier") and `DebuggerBreak()`s — SIGTRAP, from
+  the guest, and correct behaviour rather than a shim failure. Measured so it is
+  not re-derived: the token is **URL-safe base64** (alphabet ends `...789-_`, no
+  `=` padding) decoded in place into a caller-sized vector, and the rejection
+  message prints only its **first four characters whatever its length**, so the
+  fix is not "make the token longer" — four base64 characters cannot decode to
+  the ≥ 5 bytes the check at `libvrlink_scene+0x15b5cc` demands. A real `sArgs`
+  from a live pairing run is the way past it.
 - `KL_SLINK_START_INFO` / `KL_SLINK_ORIG_PACKAGE` / `KL_SLINK_ORIG_ACTIVITY` —
   the other three extras from the same Intent. Unset means absent, and absent
   is not the same as empty: with none of the four set, `getExtras()` answers

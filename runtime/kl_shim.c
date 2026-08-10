@@ -67,6 +67,7 @@ int getentropy(void *buffer, size_t size);
 #include "kl_egl.h"
 #include "kl_opensl.h"
 #include "kl_openxr.h"
+#include "kl_mediandk.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
 #include "kl_jni.h"
@@ -1367,5 +1368,17 @@ void *kl_shim_lookup(const char *name) {
     // unresolved-import report instead of being silently swallowed.
     if (name[0] == 'x' && name[1] == 'r' && name[2] >= 'A' && name[2] <= 'Z')
         return kl_openxr_lookup(name);
+
+    // Tier 8: libmediandk (SL-10) — AMediaCodec/AMediaFormat/AImageReader/AImage
+    // and the AHardwareBuffer that joins them to the graphics side. Another
+    // DT_NEEDED that has to bind at relocation time, and another lookup that
+    // returns NULL for what it does not serve, so the unresolved report keeps
+    // working. The name prefixes are checked rather than the whole table being
+    // consulted for every miss, for the reason in the tier 6 note.
+    if (name[0] == 'A' &&
+        (!strncmp(name, "AMedia", 6) || !strncmp(name, "AImage", 6) ||
+         !strncmp(name, "AHardwareBuffer_", 16) || !strncmp(name, "ATrace_", 7) ||
+         !strncmp(name, "AMEDIAFORMAT_", 13)))
+        return kl_mediandk_lookup(name);
     return NULL;
 }

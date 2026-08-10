@@ -230,13 +230,17 @@ static int kl_ALooper_pollOnce(int timeoutMillis, int *outFd, int *outEvents, vo
 typedef struct kl_native_window {
     int     refs;
     int32_t width, height, format;
+    // Non-NULL for a window somebody else made and owns — today that is an
+    // AImageReader's output surface (kl_mediandk.c). Opaque here deliberately;
+    // see kl_ndk.h.
+    void   *owner;
 } kl_native_window;
 
 // Quest 2 per-eye geometry, which is what this title was built against. Only a
 // placeholder: in VR the eye buffers come from the XR runtime (M6), and this
 // surface exists mainly to give Unity a non-zero Screen size at startup. The
 // host overrides it via kl_ndk_set_window once a real drawable exists (M5).
-static kl_native_window g_window = {1, 1832, 1920, 1 /* RGBA_8888 */};
+static kl_native_window g_window = {1, 1832, 1920, 1 /* RGBA_8888 */, NULL};
 
 void kl_ndk_set_window(int32_t w, int32_t h, int32_t format) {
     g_window.width = w; g_window.height = h; g_window.format = format;
@@ -247,6 +251,32 @@ void kl_ndk_window_size(const void *win, int32_t *w, int32_t *h) {
     const kl_native_window *nw = win ? (const kl_native_window *)win : &g_window;
     if (w) *w = nw->width;
     if (h) *h = nw->height;
+}
+
+// Windows that are not the activity's. See kl_ndk.h for why these exist.
+void *kl_ndk_window_new(int32_t w, int32_t h, int32_t format, void *owner) {
+    kl_native_window *nw = calloc(1, sizeof *nw);
+    if (!nw) return NULL;
+    nw->refs = 1;
+    nw->width = w; nw->height = h; nw->format = format;
+    nw->owner = owner;
+    return nw;
+}
+
+void kl_ndk_window_free(void *win) {
+    // g_window is static storage and is the activity's for the life of the
+    // process; freeing it would be a wild free, and a guest that releases a
+    // surface it did not create is not doing anything unusual.
+    if (win && win != (void *)&g_window) free(win);
+}
+
+void *kl_ndk_window_owner(const void *win) {
+    return win ? ((const kl_native_window *)win)->owner : NULL;
+}
+
+void kl_ndk_window_set_size(void *win, int32_t w, int32_t h) {
+    kl_native_window *nw = win ? (kl_native_window *)win : &g_window;
+    nw->width = w; nw->height = h;
 }
 
 static void    kl_ANativeWindow_acquire(kl_native_window *w) { if (w) __atomic_fetch_add(&w->refs, 1, __ATOMIC_RELAXED); }

@@ -635,6 +635,48 @@ static char *klfb_rewrite_glsl(char *buf) {
         char *q = klfb_strip_uniform_layout(p);
         if (q) { p = q; changed = 1; } else p += 8;
     }
+
+    // SL-10: external images, which ANGLE's Metal backend does not have.
+    //
+    // Steam Link's video shader is the ordinary Android one — it declares
+    // `#extension GL_OES_EGL_image_external_essl3` and a `samplerExternalOES`,
+    // because on Android the decoded frame arrives as an external image and the
+    // sampler is what performs the YUV->RGB conversion. ANGLE hard-disables
+    // both extensions on Metal (DisplayMtl.mm sets EGLImageExternalOES and
+    // EGLImageExternalEssl3OES to false, with an upstream "NOTE(hqle): Support
+    // ..." beside them), so the shader does not compile at all and the app
+    // carries on with a broken program — measured, and it is the second half of
+    // why there is no picture.
+    //
+    // An external sampler is a 2D sampler plus three promises: the conversion
+    // has happened, there are no mipmaps, and the texture cannot be redefined
+    // by glTexImage2D. We keep all three. kl_vtdec asks VideoToolbox for BGRA
+    // rather than NV12 precisely so the conversion is already done (see
+    // kl_vtdec.h), and the other two are restrictions, so a 2D texture is a
+    // strict superset. The retarget is therefore exact HERE — it is not a
+    // general claim that external images are 2D images.
+    //
+    // The bind target has to move with it (klfb_BindTexture below): a shader
+    // that samples `sampler2D` while the guest binds GL_TEXTURE_EXTERNAL_OES
+    // reads nothing, and would be a worse failure than the compile error
+    // because it is silent.
+    //
+    // Both edits are length-preserving, which is what lets them run in place
+    // alongside the shrinking rules above.
+    p = buf;
+    while ((p = strstr(p, "#extension GL_OES_EGL_image_external"))) {
+        char *e = strchr(p, '\n');
+        if (!e) e = p + strlen(p);
+        memset(p, ' ', (size_t)(e - p));   // blank the directive, keep the line
+        changed = 1;
+    }
+    p = buf;
+    while ((p = strstr(p, "samplerExternalOES"))) {
+        memcpy(p, "sampler2D", 9);
+        memset(p + 9, ' ', strlen("samplerExternalOES") - 9);
+        p += strlen("samplerExternalOES");
+        changed = 1;
+    }
     return changed ? buf : NULL;
 }
 
@@ -1184,6 +1226,10 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     // fault). Dropping it is semantics-preserving here: the decode behaviour
     // it would select does not exist on this driver either way.
     if (pname == 0x8A48 /* TEXTURE_SRGB_DECODE_EXT */) return;
+    // The external-image retarget again — see klfb_detarget. The guest sets
+    // filtering and wrap on GL_TEXTURE_EXTERNAL_OES right after binding it, and
+    // those calls have to land on the same object the bind did.
+    if (target == 0x8D65 /* TEXTURE_EXTERNAL_OES */) target = 0x0DE1;
     if (g_real_TexParameteri) g_real_TexParameteri(target, pname, param);
     if (kl_env_on("KL_GLFB_ERRPROBE", 0) && a_glGetError) {
         uint32_t e = a_glGetError();
@@ -2988,10 +3034,21 @@ static void klfb_UseProgram(uint32_t p) {
     if (g_real_UseProgram) g_real_UseProgram(p);
     klfb_err_say("glUseProgram", p);
 }
+// The other half of the external-image retarget in klfb_rewrite_glsl. The
+// shader now declares sampler2D, so every target that names an external texture
+// has to become GL_TEXTURE_2D or the sampler reads nothing — and ANGLE would
+// reject the target anyway, since it does not advertise the extension that
+// defines it.
+#define GL_TEXTURE_EXTERNAL_OES_ 0x8D65
+#define GL_TEXTURE_2D_           0x0DE1
+static uint32_t klfb_detarget(uint32_t t) {
+    return t == GL_TEXTURE_EXTERNAL_OES_ ? GL_TEXTURE_2D_ : t;
+}
+
 static void (*g_real_BindTexture)(uint32_t, uint32_t);
 static void klfb_BindTexture(uint32_t t, uint32_t n) {
     if (a_glGetError) while (a_glGetError()) {}
-    if (g_real_BindTexture) g_real_BindTexture(t, n);
+    if (g_real_BindTexture) g_real_BindTexture(klfb_detarget(t), n);
     klfb_err_say("glBindTexture", n);
 }
 static void (*g_real_BindSampler)(uint32_t, uint32_t);

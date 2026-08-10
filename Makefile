@@ -1,6 +1,11 @@
 CC      := clang
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64
-LDLIBS  := -lz -framework AudioToolbox
+# VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
+# are in the base LDLIBS rather than on one target because kl_vtdec is in
+# RUNTIME_SHIP — everything that links the runtime needs them.
+LDLIBS  := -lz -framework AudioToolbox \
+           -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+           -framework CoreFoundation
 # The host/ship split is a source-list boundary, not a runtime getenv (§12.2).
 #
 # RUNTIME_SHIP is everything that goes into the visionOS app bundle. It is the
@@ -19,7 +24,8 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
-           runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
+           runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_vtdec.c \
+           runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_il2cpp.c runtime/kl_fault.c
 RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
@@ -133,16 +139,41 @@ slink-vr-scene: build/m_slink
 #
 # Expected: the six-step boot, "Created session successfully", the state machine
 # walking IDLE -> READY -> SYNCHRONIZED -> VISIBLE -> FOCUSED, two
-# "[xr] eye N <- swapchain" lines from xrEndFrame, and a stop by name at
-# 'AMediaCodec_createDecoderByType'. Anything earlier is a regression.
+# "[xr] eye N <- swapchain" lines from xrEndFrame, the decoder coming up
+# ("[SVLDecoder] Finished decoder init", SL-10), and then a stop inside
+# SVLDataLink::InitCrypt. Anything earlier is a regression.
 #
-# **This target exits NON-ZERO on success**, unlike the other three slink gates:
-# its stop is an abort-by-name, which is the M4 loop working, not a failure.
-# Read the last "fatal:" line, not make's exit code.
+# **This target exits NON-ZERO on success**, unlike the other three slink gates.
+# Since SL-10 the stop is not ours at all: it is the guest's own DebuggerBreak
+# (`brk #1` at libvrlink_scene+0x15b798, so SIGTRAP rather than SIGABRT) after
+# it rejects the SYNTHETIC token above — "Unknown / confusing key identifier".
+# That is the same class of correct-behaviour stop as SL-9's "No sArgs and
+# release build panic": a fabricated credential is refused, which is what a
+# credential is for. Measured, so it is not re-derived: the token is URL-safe
+# base64 (alphabet `...0123456789-_`, no padding) and InitCrypt decodes it into
+# a caller-sized vector, but the failing message prints only its FIRST FOUR
+# characters whatever its length, and four base64 characters cannot decode to
+# the >= 5 bytes the check at +0x15b5cc demands — so the shape is not simply
+# "make the token longer". A real sArgs from a live pairing run
+# (notes/STEAMLINK.md, SL-6's recipe) is the way past this, and is the standing
+# pickup item.
+#
+# Read the last "fault:"/"fatal:" line, not make's exit code.
 KL_SLINK_SARGS ?= 192.168.1.50~10400~10400~0,0,1~~~~dGVzdA==
 slink-vr-run: build/m_slink
 	KL_SLINK_VR=1 KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 KL_SLINK_WAIT=25 \
 	  KL_SLINK_SARGS='$(KL_SLINK_SARGS)' ./build/m_slink $(SLVRLIBS)
+
+# SL-10: the video decode gate. kl_vtdec is the only piece of the video path
+# that can be checked with no guest and no Steam host — an elementary stream in,
+# frames out, both ends knowable — so it is where the assertions live. See
+# tests/t_hevc.c for what each one catches. Seconds; in `make check`.
+build/t_hevc: tests/t_hevc.c $(RUNTIME) runtime/kl_vtdec.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_hevc.c $(RUNTIME) $(LDLIBS)
+
+hevc: build/t_hevc
+	./build/t_hevc
 
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 	@mkdir -p build
@@ -236,8 +267,10 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc
 	@echo "=== variadic ABI ===" && ./build/t_variadic
+	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
+	@grep -E '=== HEVC|30 access units' build/hevc.log && tail -1 build/hevc.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
 	@head -3 build/haptics.log && tail -1 build/haptics.log
 	@echo "=== opus roundtrip ===" && ./build/t_opus $(LIBS)/libunityopus.so > build/opus.log && tail -3 build/opus.log
@@ -391,11 +424,15 @@ build/xrsim/libklepton.a: $(RUNTIME_SHIP)
 build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
 	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+	   -framework CoreFoundation \
 	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
 	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+	   -framework CoreFoundation \
 	   -install_name @rpath/libklepton.dylib
 
 xros-device: build/xros/libklepton.dylib

@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include "klepton.h"
 #include "kl_jni.h"
+#include "kl_env.h"
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_jni_slots.h"
@@ -2012,6 +2013,7 @@ static klj_val klj_Context_getSystemService(void *env, void *self, const klj_val
         {"clipboard",    "android/content/ClipboardManager"},
         {"notification", "android/app/NotificationManager"},
         {"media_router", "android/media/MediaRouter"},
+        {"batterymanager", "android/os/BatteryManager"},
         {NULL, NULL},
     };
     const char *want = n > 0 ? klj_str(a[0].l) : NULL;
@@ -3016,6 +3018,33 @@ static klj_val klj_PowerManager_sustainedPerf(void *env, void *self, const klj_v
     // performance request, and claiming it would have Unity size its frame
     // budget against a guarantee we do not make.
     return (klj_val){.j = 0};
+}
+
+// BatteryManager — the headset's own battery, which Steam Link reads through
+// IsHmdBatteryCharging()/GetHmdBatteryLevel() and PUBLISHES TO THE HOST as a
+// device property; the Steam client shows it next to the headset. So it is
+// telemetry, not a control input: nothing here changes streaming behaviour, and
+// the cost of a wrong answer is a wrong number on someone's desktop.
+//
+// Answered as a headset on its battery and nearly full, which is what a Vision
+// Pro on its pack is for most of a session. Both are knobs because neither is
+// measured yet: on device the real values are available (UIDevice's battery
+// monitoring), and wiring them is the honest fix — until then a fixed answer at
+// least does not fluctuate, and a fluctuating invented number would be worse
+// than a static one.
+static klj_val klj_BatteryManager_isCharging(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = kl_env_int("KL_BATTERY_CHARGING", 0) ? 1 : 0};
+}
+
+// getIntProperty(id). BATTERY_PROPERTY_CAPACITY is 4 and is the only one this
+// guest asks for; anything else answers Integer.MIN_VALUE, which is what
+// Android returns for a property the device does not expose.
+static klj_val klj_BatteryManager_getIntProperty(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int id = n > 0 ? (int)(int32_t)a[0].j : 0;
+    if (id == 4) return (klj_val){.j = (uint32_t)kl_env_int("KL_BATTERY_LEVEL", 95)};
+    return (klj_val){.j = (uint32_t)INT32_MIN};
 }
 
 // The two Touch controllers, as Android input device ids. See
@@ -5005,6 +5034,8 @@ static const klj_binding g_bindings[] = {
     {"android/view/Window", "getDecorView", "()Landroid/view/View;", klj_Window_getDecorView},
     {"android/view/Window", "setFlags", "(II)V", klj_Window_setFlags},
     {"android/os/PowerManager", "isSustainedPerformanceModeSupported", "()Z", klj_PowerManager_sustainedPerf},
+    {"android/os/BatteryManager", "isCharging", "()Z", klj_BatteryManager_isCharging},
+    {"android/os/BatteryManager", "getIntProperty", "(I)I", klj_BatteryManager_getIntProperty},
     {"android/view/InputDevice", "getDeviceIds", "()[I", klj_InputDevice_getDeviceIds},
     {"android/view/InputDevice", "getDevice", "(I)Landroid/view/InputDevice;", klj_InputDevice_getDevice},
     {"android/view/InputDevice", "getName", "()Ljava/lang/String;", klj_InputDevice_getName},

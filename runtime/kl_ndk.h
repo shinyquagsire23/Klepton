@@ -25,6 +25,24 @@ void kl_ndk_window_size(const void *win, int32_t *w, int32_t *h);
 // Root directory for AAssetManager_open() — the unpacked APK's assets dir.
 void kl_ndk_set_assets_dir(const char *dir);
 
+// A window that is NOT the activity's. AImageReader_getWindow hands the codec
+// one of these as its output surface, and the guest may then call any
+// ANativeWindow_* entry point on it — so it has to be a real window of the same
+// kind rather than a token, or getWidth on the decoder's surface answers with
+// the activity's size.
+//
+// `owner` is opaque here on purpose: kl_ndk has no business knowing what an
+// AImageReader is, and the codec needs to get from the window it was configured
+// with back to the reader that made it. Whoever creates the window says what it
+// belongs to; kl_ndk_window_owner hands that back unexamined.
+void *kl_ndk_window_new(int32_t w, int32_t h, int32_t format, void *owner);
+void  kl_ndk_window_free(void *win);
+void *kl_ndk_window_owner(const void *win);   // NULL for the activity's window
+
+// A producer surface's size is the PRODUCER's, and it is not known until the
+// first frame arrives — AImageReader is created 1x1 and corrected here.
+void kl_ndk_window_set_size(void *win, int32_t w, int32_t h);
+
 // The AAssetManager* an ANativeActivity carries. Same object
 // AAssetManager_fromJava hands out — see the note there.
 void *kl_ndk_asset_manager(void);
