@@ -24,6 +24,19 @@
 //     path in kl_glfb.c already knows how to hand to ANGLE. The alternative —
 //     two planes and a conversion in the shader — would mean rewriting the
 //     guest's shader rather than merely retargeting its sampler. See kl_egl.c.
+//
+//     ...and there is a third option that is better than both, to take on
+//     device. Apple has private MTLPixelFormats that sample as RGB — the
+//     conversion happens in the sampler hardware — which keeps the
+//     samplerExternalOES promise EXACTLY, with no shader rewrite and no
+//     conversion pass. WebKit uses them for this. Two costs are avoided at
+//     once, because asking for a pixel format AT ALL is itself what makes
+//     VideoToolbox copy on visionOS 2 (measured by the VisionOSALVRClient
+//     author, ~2 ms a frame at high resolution; ours is 1536x6144). What
+//     stands in the way is ANGLE, whose IOSurface path knows only nine public
+//     formats. The format table and the route through
+//     EGL_METAL_TEXTURE_ANGLE are written up in notes/STEAMLINK.md, SL-13
+//     pickup 7 — this is a device-time optimisation, not a correction.
 #ifndef KL_VTDEC_H
 #define KL_VTDEC_H
 
