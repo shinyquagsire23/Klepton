@@ -104,8 +104,14 @@ slink-main: build/m_slink
 # VR APK only, and not for arbitrary reasons: the old APK ships Qt5 with the
 # stock qtforandroid QPA (a whole QtAndroid JNI surface), the VR APK ships Qt6
 # with Valve's own `qvirtual` QPA, which imports no JNI at all.
+# KL_SLINK_HANDOFF=0 because this gate measures the SHELL. Credentials persist
+# across runs, so a machine that has paired once can reach startVRLink without
+# anyone clicking anything, and the default handoff would re-exec this recipe
+# into the VR front door — which is a different measurement wearing this one's
+# name. `./build_run_slink.sh --shell --view` is where the handoff belongs.
 slink-shell: build/m_slink
-	KL_SLINK_SHELL=1 KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
+	KL_SLINK_SHELL=1 KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 KL_SLINK_HANDOFF=0 \
+	  ./build/m_slink $(SLVRLIBS)
 
 # ...and the work list for it, which is the number that matters first: map and
 # relocate all fourteen, print what is still unresolved, stop before init.

@@ -290,12 +290,27 @@ Built for the loading-pace investigation; all default off.
 
 ## Video decode (`runtime/kl_vtdec.c`, `runtime/kl_mediandk.c`)
 
-No knobs. The decoder is VideoToolbox and it is either there or it is not; what
-would otherwise be a knob is a gate instead (`make hevc`, in `make check`).
-Worth knowing rather than setting: output is **BGRA**, not the decoder's native
-NV12, because the guest samples the frame through a `samplerExternalOES` whose
-whole promise is that the YUV→RGB conversion has already happened. See
+The decoder is VideoToolbox and it is either there or it is not; what would
+otherwise be a knob is a gate instead (`make hevc`, in `make check`). Worth
+knowing rather than setting: output is **BGRA**, not the decoder's native NV12,
+because the guest samples the frame through a `samplerExternalOES` whose whole
+promise is that the YUV→RGB conversion has already happened. See
 `runtime/kl_vtdec.h`.
+
+- `KL_VTDEC_DUMP=<path>` — write the elementary stream exactly as the guest
+  queued it, as plain Annex-B that `ffprobe` reads directly, plus a sidecar
+  `<path>.idx` of `access_unit pts_us bytes` per line. Off by default.
+
+  This is the instrument for every remaining question about the picture, all of
+  which are questions about the *bitstream*: what bitrate the host chose, how
+  often it sends an IRAP, why the parameter sets change. Without it they can
+  only be asked during a live streaming run, which costs a fresh Steam pairing
+  and takes the answer with it when it ends. The `.idx` is what makes
+  instantaneous bitrate measurable without parsing anything —
+  `awk '{b+=$3} END{print b*8/1e6}'` over a window of lines.
+
+  It is also how `make hevc` grows a corpus recorded from a real host instead of
+  from ffmpeg. The stream is the guest's own bytes; nothing is re-framed.
 
 ## Clock + condvar (bionic→Darwin translation, always on) and their diagnostics
 
@@ -851,10 +866,37 @@ See PLANNING §11.
 
   A token that fails with **"XOR0 transport specified, but len too short"**
   after all that is trap 19, not a bad token — see notes/TRAPS.md.
+  **Since SL-15 you rarely set this by hand.** `KL_SLINK_HANDOFF` (below) makes
+  the shell re-exec into the VR front door with the session it just earned, so
+  `KL_SLINK_SARGS` is for replaying an old session or driving the VR half alone.
+- `KL_SLINK_HANDOFF=0` — **disable the automatic 2D→VR handoff.** On by
+  default. When the shell reaches `SteamLink.startVRLink(String)` — it has
+  paired and the host has authorized — the driver re-execs itself into the
+  OpenXR front door carrying the session as `KL_SLINK_SARGS`, which is what
+  Android does at that point too (a new activity in a fresh task, the old one
+  calling `finishAndRemoveTask()`). Re-exec rather than an in-process
+  transition because the two are different front doors with different chains,
+  and libshell's `main` is on the stack of the thread making the call.
+
+  It fills in only knobs that are **unset**, and prints each one it sets:
+  `KL_SLINK_MAIN=1`, `KL_GLFB=1`, `KL_OVRP_IPD=0.063` (the host stopgap — an
+  IPD of zero stops the host sending video at all, SL-12) and, when not
+  windowed, `KL_SLINK_WAIT=45`. `KL_VIEW_POKE` is *unset* on the way through: it
+  is a click script for the shell's UI.
+
+  `0` restores the old behaviour — print the session and abort by name.
+  `make slink-shell` sets it, because credentials persist and a machine that has
+  paired once can reach the handoff with nobody clicking anything; that gate
+  measures the shell, not the VR half.
 - `KL_SLINK_START_INFO` / `KL_SLINK_ORIG_PACKAGE` / `KL_SLINK_ORIG_ACTIVITY` —
   the other three extras from the same Intent. Unset means absent, and absent
   is not the same as empty: with none of the four set, `getExtras()` answers
   null, which is what a normally-launched activity sees.
+
+  `KL_SLINK_START_INFO` is **derived** when unset and `KL_SLINK_SARGS` is set:
+  the shell does not carry an independent value, it splits `sArgs` on `~` and
+  forwards field 3 (`SteamLink.startVRLink`), so we do the same. Setting it
+  overrides the derivation.
 - `KL_XR_BINDINGS=1` — print every suggested action binding, not just the
   count per interaction profile. This guest suggests ~40 bindings for each of
   seven controller types, so it is off by default; turn it on when the question

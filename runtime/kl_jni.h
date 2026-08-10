@@ -67,6 +67,20 @@ void *kl_jni_new_string(const char *utf8);
 // real SteamLink activity fills from the launching intent's "sArgs" extra.
 void *kl_jni_new_string_array(const char *const *items, int n);
 
+// The 2D->VR handoff: SteamLink.startVRLink(String) reached, with the session
+// the host just authorized (PLANNING §11.9).
+//
+// A callback rather than something this file does itself, because honouring the
+// handoff means starting a different FRONT DOOR — a different guest library,
+// chain and lifecycle — and which front doors exist is the driver's knowledge,
+// not the JNI layer's. Nothing installs one by default, and with none installed
+// the call aborts by name exactly as it always has. A handler that RETURNS is
+// one that could not do the handoff, and the abort still happens: this is the
+// only path by which the guest can be told its activity started, so telling it
+// that falsely would end the run silently (the shell finishes itself the
+// instant this returns).
+void kl_jni_set_vrlink_handoff(void (*fn)(const char *sargs));
+
 // Root for Context.getAssets()/AssetManager.open(). Defaults to "beatsaber/assets".
 // With no AAssetManager_* import, this JNI path is how assets reach Unity.
 void kl_jni_set_assets_dir(const char *dir);

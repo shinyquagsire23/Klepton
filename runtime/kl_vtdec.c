@@ -79,7 +79,20 @@ struct kl_vtdec {
     int ring_head, ring_count;
 
     unsigned n_submitted, n_decoded, n_dropped, n_failed;
+    // Parameter-set bookkeeping. Separated because they answer different
+    // questions: how often the host re-describes the stream (n_set_change),
+    // how often that description is genuinely new (n_fmt_built), and how often
+    // it was different enough to cost the session its reference frames
+    // (n_sess_created). A run where the last of those tracks the first is a run
+    // whose picture is being rebuilt from scratch several times a second.
+    unsigned n_set_change[KLVT_NSETS];
+    unsigned n_fmt_built, n_sess_created, n_fmt_swapped;
+    int      logged_changes;
     int width, height;
+
+    FILE    *dump;              // KL_VTDEC_DUMP — see klvt_open_dump
+    FILE    *dump_idx;
+    unsigned dump_n;
 };
 
 static kl_vtdec *g_last;        // for kl_vtdec_report; the guest makes one
@@ -174,17 +187,26 @@ static void klvt_output(void *decompressionOutputRefCon, void *sourceFrameRefCon
     pthread_mutex_unlock(&d->lock);
 }
 
-// Build the format description from whatever sets are held, then a session on
-// top of it. Called when the set changes — the first complete set, and any
-// mid-stream resolution change, which this guest does do (the host can resize
-// the stream while it runs).
+// Build the format description from whatever sets are held, and put a session
+// on top of it only if the one we have cannot carry on.
+//
+// The distinction is the whole point of this function. A parameter set whose
+// BYTES changed is not necessarily a stream whose DECODER changed: this host
+// re-describes the stream constantly (measured: 498 changes across 2453 access
+// units, i.e. every fifth frame), and tearing the VTDecompressionSession down
+// for each one throws away every reference frame it holds — so the picture is
+// rebuilt from an intra refresh several times a second and looks like a bad
+// connection. VideoToolbox answers the actual question directly:
+// VTDecompressionSessionCanAcceptFormatDescription says whether the session can
+// keep decoding against the new description. When it can, the description is
+// simply swapped — subsequent sample buffers carry the new one — and the
+// reference frames survive. Only a genuine change (a resolution change, which
+// this guest does do) costs a session.
 static int klvt_rebuild(kl_vtdec *d) {
     int n_sets = d->codec == KLVT_HEVC ? 3 : 2;
     int first  = d->codec == KLVT_HEVC ? KLVT_VPS : KLVT_SPS;
     for (int i = 0; i < n_sets; i++)
         if (!d->set[first + i]) return 0;      // not complete yet; not an error
-
-    klvt_teardown_session(d);
 
     const uint8_t *ptr[KLVT_NSETS];
     size_t         siz[KLVT_NSETS];
@@ -194,19 +216,43 @@ static int klvt_rebuild(kl_vtdec *d) {
     }
 
     OSStatus st;
+    CMVideoFormatDescriptionRef fmt = NULL;
     if (d->codec == KLVT_HEVC)
         st = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
                  kCFAllocatorDefault, (size_t)n_sets, ptr, siz,
-                 KLVT_NAL_LEN_BYTES, NULL, &d->fmt);
+                 KLVT_NAL_LEN_BYTES, NULL, &fmt);
     else
         st = CMVideoFormatDescriptionCreateFromH264ParameterSets(
                  kCFAllocatorDefault, (size_t)n_sets, ptr, siz,
-                 KLVT_NAL_LEN_BYTES, &d->fmt);
+                 KLVT_NAL_LEN_BYTES, &fmt);
     if (st != noErr) {
         fprintf(stderr, "  [vtdec] format description failed: OSStatus %d\n", (int)st);
-        d->fmt = NULL;
         return -1;
     }
+    d->n_fmt_built++;
+
+    // Identical descriptions happen whenever the changed bytes were ones the
+    // format description does not carry. Nothing to do at all, not even a swap.
+    if (d->fmt && d->sess && CMFormatDescriptionEqual(d->fmt, fmt)) {
+        CFRelease(fmt);
+        return 0;
+    }
+
+    // Safe to swap without a lock: d->fmt is read only where sample buffers are
+    // built, which is this same submitting thread. The async output callback
+    // never touches it.
+    if (d->sess && VTDecompressionSessionCanAcceptFormatDescription(d->sess, fmt)) {
+        if (d->fmt) CFRelease(d->fmt);
+        d->fmt = fmt;
+        d->n_fmt_swapped++;
+        if (d->n_fmt_swapped == 1)
+            fprintf(stderr, "  [vtdec] parameter sets changed; the session accepts "
+                            "the new description — reference frames kept\n");
+        return 0;
+    }
+
+    klvt_teardown_session(d);
+    d->fmt = fmt;
 
     CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(d->fmt);
 
@@ -238,13 +284,60 @@ static int klvt_rebuild(kl_vtdec *d) {
         return -1;
     }
 
-    fprintf(stderr, "  [vtdec] %s decoder ready: %dx%d -> BGRA\n",
-            d->codec == KLVT_HEVC ? "HEVC" : "H.264", dim.width, dim.height);
+    d->n_sess_created++;
+    fprintf(stderr, "  [vtdec] %s decoder ready: %dx%d -> BGRA%s\n",
+            d->codec == KLVT_HEVC ? "HEVC" : "H.264", dim.width, dim.height,
+            d->n_sess_created > 1 ? " (session rebuilt — reference frames lost)" : "");
     d->width = dim.width; d->height = dim.height;
     return 0;
 }
 
 // ---------------------------------------------------------------------------
+
+// KL_VTDEC_DUMP=<path> — write the elementary stream exactly as the guest
+// queued it, plus a sidecar index of one line per access unit.
+//
+// This exists because every question left about the picture (what bitrate the
+// host chose, how often it sends an IRAP, why the parameter sets change) is a
+// question about the BITSTREAM, and the only way to see the bitstream today is
+// a live streaming run — which costs a fresh Steam pairing, cannot be repeated
+// identically, and takes the answer with it when it ends. A dump turns all of
+// them into offline questions, and gives `make hevc` a corpus recorded from the
+// real host rather than from ffmpeg.
+//
+// The stream file is plain Annex-B, so ffprobe reads it directly. The index is
+// `<n> <pts_us> <bytes>` per access unit, which is what makes instantaneous
+// bitrate measurable without parsing anything.
+static void klvt_open_dump(kl_vtdec *d) {
+    const char *path = getenv("KL_VTDEC_DUMP");
+    if (!path || !*path) return;
+    d->dump = fopen(path, "wb");
+    if (!d->dump) {
+        fprintf(stderr, "  [vtdec] KL_VTDEC_DUMP: cannot write %s\n", path);
+        return;
+    }
+    char idx[1024];
+    snprintf(idx, sizeof idx, "%s.idx", path);
+    d->dump_idx = fopen(idx, "w");
+    if (d->dump_idx)
+        fprintf(d->dump_idx, "# access_unit pts_us bytes\n");
+    fprintf(stderr, "  [vtdec] dumping the elementary stream to %s\n", path);
+}
+
+static void klvt_dump_au(kl_vtdec *d, const uint8_t *annexb, size_t len,
+                         int64_t pts_us) {
+    if (!d->dump) return;
+    // A buffer that already begins with a start code is written verbatim; one
+    // that does not is a bare NAL (see next_nal) and gets the four-byte form in
+    // front of it, so the file stays a legal elementary stream either way.
+    int has_sc = len >= 3 && annexb[0] == 0 && annexb[1] == 0 &&
+                 (annexb[2] == 1 || (len >= 4 && annexb[2] == 0 && annexb[3] == 1));
+    if (!has_sc) fwrite("\0\0\0\1", 1, 4, d->dump);
+    fwrite(annexb, 1, len, d->dump);
+    if (d->dump_idx)
+        fprintf(d->dump_idx, "%u %lld %zu\n", d->dump_n, (long long)pts_us, len);
+    d->dump_n++;
+}
 
 kl_vtdec *kl_vtdec_create(const char *mime) {
     int codec;
@@ -259,6 +352,7 @@ kl_vtdec *kl_vtdec_create(const char *mime) {
     if (!d) return NULL;
     d->codec = codec;
     pthread_mutex_init(&d->lock, NULL);
+    klvt_open_dump(d);
     g_last = d;
     return d;
 }
@@ -267,19 +361,78 @@ void kl_vtdec_destroy(kl_vtdec *d) {
     if (!d) return;
     klvt_teardown_session(d);
     kl_vtdec_flush(d);
+    if (d->dump)     fclose(d->dump);
+    if (d->dump_idx) fclose(d->dump_idx);
     for (int i = 0; i < KLVT_NSETS; i++) free(d->set[i]);
     pthread_mutex_destroy(&d->lock);
     if (g_last == d) g_last = NULL;
     free(d);
 }
 
+// The leading ue(v) of a parameter set's RBSP, which for a PPS of either codec
+// is its id. Only the first few bits are read, and emulation prevention cannot
+// have touched them (it needs two preceding zero bytes), so no unescaping is
+// needed. -1 when the field does not fit or is not one we can name cheaply.
+static int klvt_leading_ue(const uint8_t *p, size_t n, size_t hdr) {
+    if (n <= hdr) return -1;
+    unsigned zeros = 0, bit = 0;
+    size_t byte = hdr;
+    while (byte < n && zeros < 16) {
+        int b = (p[byte] >> (7 - bit)) & 1;
+        if (++bit == 8) { bit = 0; byte++; }
+        if (b) break;
+        zeros++;
+    }
+    if (zeros >= 16) return -1;
+    unsigned v = 1;
+    for (unsigned i = 0; i < zeros; i++) {
+        if (byte >= n) return -1;
+        v = (v << 1) | ((p[byte] >> (7 - bit)) & 1);
+        if (++bit == 8) { bit = 0; byte++; }
+    }
+    return (int)(v - 1);
+}
+
+static const char *klvt_slot_name(int slot) {
+    return slot == KLVT_VPS ? "VPS" : slot == KLVT_SPS ? "SPS" : "PPS";
+}
+
 // Hold a parameter set, and say whether it is different from the one held.
 // Comparing rather than always rebuilding matters: this guest re-sends its
 // parameter sets in front of every IDR, which is once a second or so, and
 // tearing the session down that often would drop every frame in flight.
+//
+// When it IS different, say how — which set, whether it grew, and where the
+// first differing byte is. That last one is the diagnosis: a difference at
+// byte 0..2 is a set with a different id (the stream carries more than one and
+// we are holding a single slot per kind, so they alternate), and a difference
+// deep in the tail is one field of an otherwise identical set moving. The two
+// have completely different fixes, and the counters alone cannot tell them
+// apart. Rate-limited, because the whole problem is that this happens often.
+#define KLVT_CHANGE_LOG 8
 static int klvt_hold(kl_vtdec *d, int slot, const uint8_t *p, size_t n) {
     if (d->set[slot] && d->set_len[slot] == n && !memcmp(d->set[slot], p, n))
         return 0;
+
+    d->n_set_change[slot]++;
+    if (d->set[slot] && d->logged_changes < KLVT_CHANGE_LOG) {
+        d->logged_changes++;
+        size_t common = d->set_len[slot] < n ? d->set_len[slot] : n, at = 0;
+        while (at < common && d->set[slot][at] == p[at]) at++;
+        size_t hdr = d->codec == KLVT_HEVC ? 2 : 1;
+        int was = slot == KLVT_PPS
+                    ? klvt_leading_ue(d->set[slot], d->set_len[slot], hdr) : -1;
+        int now = slot == KLVT_PPS ? klvt_leading_ue(p, n, hdr) : -1;
+        if (was >= 0 || now >= 0)
+            fprintf(stderr, "  [vtdec] %s changed: %zu -> %zu bytes, first "
+                            "difference at byte %zu, pps_id %d -> %d\n",
+                    klvt_slot_name(slot), d->set_len[slot], n, at, was, now);
+        else
+            fprintf(stderr, "  [vtdec] %s changed: %zu -> %zu bytes, first "
+                            "difference at byte %zu\n",
+                    klvt_slot_name(slot), d->set_len[slot], n, at);
+    }
+
     uint8_t *copy = malloc(n ? n : 1);
     if (!copy) return 0;
     memcpy(copy, p, n);
@@ -292,6 +445,7 @@ static int klvt_hold(kl_vtdec *d, int slot, const uint8_t *p, size_t n) {
 int kl_vtdec_submit(kl_vtdec *d, const uint8_t *annexb, size_t len,
                     int64_t pts_us) {
     if (!d || !annexb || !len) return -1;
+    klvt_dump_au(d, annexb, len, pts_us);
 
     // Pass 1: absorb parameter sets, and measure how much length-prefixed
     // payload the rest will need. Two passes rather than one so the block
@@ -410,6 +564,16 @@ void kl_vtdec_stats(const kl_vtdec *d, unsigned *submitted, unsigned *decoded,
     pthread_mutex_unlock((pthread_mutex_t *)&d->lock);
 }
 
+void kl_vtdec_param_stats(const kl_vtdec *d, unsigned *built, unsigned *swapped,
+                          unsigned *sessions) {
+    if (!d) return;
+    pthread_mutex_lock((pthread_mutex_t *)&d->lock);
+    if (built)    *built    = d->n_fmt_built;
+    if (swapped)  *swapped  = d->n_fmt_swapped;
+    if (sessions) *sessions = d->n_sess_created;
+    pthread_mutex_unlock((pthread_mutex_t *)&d->lock);
+}
+
 void kl_vtdec_report(FILE *f) {
     kl_vtdec *d = g_last;
     if (!d) return;
@@ -420,5 +584,16 @@ void kl_vtdec_report(FILE *f) {
             d->codec == KLVT_HEVC ? "HEVC" : "H.264", d->width, d->height,
             d->n_submitted, d->n_decoded, d->n_dropped, d->n_failed,
             d->ring_count);
+    // The parameter-set line, and what to read into it: sessions is the number
+    // that costs a picture. One is the healthy answer for a stream that never
+    // changes resolution, however often the host re-describes it.
+    fprintf(f, "  parameter sets: %u VPS / %u SPS / %u PPS changes -> "
+               "%u descriptions built, %u swapped into the live session, "
+               "%u session%s created\n",
+            d->n_set_change[KLVT_VPS], d->n_set_change[KLVT_SPS],
+            d->n_set_change[KLVT_PPS], d->n_fmt_built, d->n_fmt_swapped,
+            d->n_sess_created, d->n_sess_created == 1 ? "" : "s");
+    if (d->dump)
+        fprintf(f, "  %u access units dumped to KL_VTDEC_DUMP\n", d->dump_n);
     pthread_mutex_unlock(&d->lock);
 }

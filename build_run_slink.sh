@@ -36,6 +36,13 @@
 #                                     #   Runs until you close the window: no
 #                                     #   timeout, because there is no deadline on
 #                                     #   a person looking at something
+#   ./build_run_slink.sh --shell      # the 2D configuration frontend instead of
+#                                     #   the streaming client. Once the host
+#                                     #   authorizes, this RE-EXECS itself into
+#                                     #   the OpenXR front door carrying the
+#                                     #   session — one run, pairing to stream.
+#                                     #   --no-handoff stops at the handoff and
+#                                     #   prints the session instead
 #   ./build_run_slink.sh --nofork     # run in-process (required under lldb: macOS
 #                                     #   lldb follows neither fork nor exec)
 #   ./build_run_slink.sh --trace-fs   # log every guest file op ('=fail' via env)
@@ -69,6 +76,10 @@ while [ $# -gt 0 ]; do
     # instead of the streaming client. VR APK only, so it selects that LIBDIR
     # unless one was given explicitly.
     --shell)       export KL_SLINK_SHELL=1; SHELL_MODE=1; shift ;;
+    # The shell hands off to the VR front door by re-exec once the host
+    # authorizes (see m_slink.c, slink_vrlink_handoff). This turns that off and
+    # restores the old behaviour: print the session and stop by name.
+    --no-handoff)  export KL_SLINK_HANDOFF=0; shift ;;
     --view)        export KL_VIEW=1; export KL_GLFB=1; export KL_NOFORK=1
                    VIEW=1; shift ;;
     --nofork)      export KL_NOFORK=1; shift ;;
@@ -78,7 +89,7 @@ while [ $# -gt 0 ]; do
     --timeout)     TIMEOUT="$2"; shift 2 ;;
     --libdir)      LIBDIR="$2"; LIBDIR_SET=1; shift 2 ;;
     --log)         LOG_ONLY=1; shift ;;
-    -h|--help)     sed -n '2,35p' "$0"; exit 0 ;;
+    -h|--help)     sed -n '2,49p' "$0"; exit 0 ;;
     *)             echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
   esac
 done

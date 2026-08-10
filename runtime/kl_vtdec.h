@@ -84,6 +84,17 @@ void kl_vtdec_flush(kl_vtdec *d);
 // the current frame size. For the fault reporter and for `make hevc`.
 void kl_vtdec_stats(const kl_vtdec *d, unsigned *submitted, unsigned *decoded,
                     unsigned *dropped, int *width, int *height);
+
+// How the parameter-set traffic was handled: descriptions built, descriptions
+// swapped into a session that kept running, and sessions actually created.
+//
+// The last of these is the one with a picture attached to it. Creating a
+// session throws away every reference frame VideoToolbox holds, so a stream
+// that re-describes itself often — this guest's host does, every fifth access
+// unit — decodes into visible mush if each description costs a session. A
+// stream whose resolution never changes should reach the end on ONE.
+void kl_vtdec_param_stats(const kl_vtdec *d, unsigned *built, unsigned *swapped,
+                          unsigned *sessions);
 void kl_vtdec_report(FILE *f);
 
 #endif

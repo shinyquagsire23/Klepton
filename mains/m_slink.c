@@ -20,6 +20,7 @@
 // JavaVM and registers the SDLActivity surface. Phase 3 is reconnaissance —
 // it drives what SDLActivity.onCreate drives, and stops by name wherever the
 // shim ends. As in t_boot, that stop IS the measurement.
+#include <errno.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -396,6 +397,83 @@ static void run_main_sequence(kl_image *sdl_img, kl_image *entry_img) {
     fflush(NULL);
 }
 
+// ------------------------------------------------- the 2D -> VR handoff, run --
+//
+// SteamLink.startVRLink(String) is the end of the shell's job: it has paired,
+// the host has authorized, and it now starts the VR activity with the session
+// as `sArgs` and calls finishAndRemoveTask() on itself. Both halves exist here
+// now (SL-9 onward), so there is no reason for a person to carry the string
+// between two runs by hand — but they are two front doors with different
+// chains, different libraries and different lifecycles, and the shell's `main`
+// is on the stack of the thread making this call.
+//
+// So: re-EXEC, which is what Android's own model already is — a new activity in
+// a fresh task, the old one finishing. It replaces the process image, so every
+// question about tearing the shell down (Qt, SDL, ANGLE's contexts, the audio
+// unit, the shell's threads) simply does not arise, and it is the mechanism
+// this project already uses for the recon child. The exec'd process reads the
+// session out of the environment through the same KL_SLINK_SARGS path a pasted
+// one uses, so nothing downstream can tell the difference.
+//
+// Only knobs that are UNSET are filled in, and every one is announced. Two of
+// them are not cosmetic:
+//
+//   KL_OVRP_IPD   — SL-12: on a host run nothing measures the eye offsets, so
+//                   they are 0, and this client reads an IPD of zero as
+//                   "unchanged" and never sends the host its projection. With
+//                   no picture at all as the alternative, the documented host
+//                   stopgap is the right default here — but it IS a stopgap,
+//                   and saying so out loud is the difference between a default
+//                   and a fabrication.
+//   KL_SLINK_WAIT — the VR path's deadline, 10 s by default, which is not worth
+//                   the pairing that just paid for it.
+//
+// KL_SLINK_HANDOFF=0 restores the old behaviour (print the session, abort by
+// name), which is what the `make slink-shell` gate uses: that gate measures the
+// shell, and a run that re-execs into a different front door measures something
+// else.
+static const char *g_argv0 = "./build/m_slink";
+
+static void slink_setenv_default(const char *k, const char *v, const char *why) {
+    if (getenv(k)) return;
+    setenv(k, v, 1);
+    printf("    %s=%s   (%s)\n", k, v, why);
+}
+
+static void slink_vrlink_handoff(const char *sargs) {
+    if (!kl_env_on("KL_SLINK_HANDOFF", 1)) {
+        printf("  (KL_SLINK_HANDOFF=0 — not entering the VR front door)\n");
+        return;                      // the caller aborts by name, as before
+    }
+
+    printf("\n=== 2D -> VR handoff: re-exec into the OpenXR front door ===\n");
+    printf("    %s %s\n", g_argv0, LIBDIR);
+    setenv("KL_SLINK_SARGS", sargs, 1);
+    setenv("KL_SLINK_VR", "1", 1);
+    unsetenv("KL_SLINK_SHELL");      // g_shell would otherwise win the tie
+    unsetenv("KL_VIEW_POKE");        // a click script for the SHELL's UI, and
+                                     // replaying it into the VR view would be
+                                     // synthetic input nobody asked for
+    slink_setenv_default("KL_SLINK_MAIN", "1",
+                         "drive the lifecycle on into android_main");
+    slink_setenv_default("KL_GLFB", "1",
+                         "the null GL driver cannot present a stream");
+    slink_setenv_default("KL_OVRP_IPD", "0.063",
+                         "HOST STOPGAP: an IPD of 0 stops the host sending video");
+    if (!getenv("KL_VIEW"))
+        slink_setenv_default("KL_SLINK_WAIT", "45",
+                             "the VR deadline; 10 s would waste the pairing");
+    fflush(NULL);
+
+    execl(g_argv0, g_argv0, LIBDIR, (char *)NULL);
+
+    // Only reachable if exec failed. Returning is the contract for "could not
+    // do the handoff" and the caller then aborts by name with the session
+    // printed above, so the run is no worse off than before.
+    printf("  !! exec(\"%s\") failed: %s\n", g_argv0, strerror(errno));
+    fflush(NULL);
+}
+
 // ------------------------------------------------------------- VR front door --
 // ANativeActivity, transcribed from <android/native_activity.h>. It is ABI, not
 // an interface we get to design: the guest's glue reads these fields by offset
@@ -560,6 +638,10 @@ static int slink_run(void) {
                "taking VR)\n");
         g_shell = 0;
     }
+    // Only the shell can reach startVRLink, and only it should be able to hand
+    // off — installing this unconditionally would let a client or VR run take a
+    // path neither of them has any business on.
+    if (g_shell) kl_jni_set_vrlink_handoff(slink_vrlink_handoff);
 
     // Which APK this LIBDIR came out of. It was hardcoded to the old one, which
     // was harmless while nothing read an asset and wrong the moment something
@@ -905,6 +987,7 @@ static int slink_view(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1) LIBDIR = argv[1];
+    if (argc > 0 && argv[0] && *argv[0]) g_argv0 = argv[0];
     kl_set_library_path(LIBDIR);
 
     if (getenv("KL_VIEW")) return slink_view();

@@ -28,6 +28,16 @@
 //   - the pixels are not uniform           — the strongest cheap check that a
 //                                            picture arrived rather than a
 //                                            correctly-shaped blank
+//   - ONE decompression session            — a session is created by throwing
+//                                            the previous one's reference
+//                                            frames away, so a stream that
+//                                            never changes resolution must
+//                                            reach the end on the one it
+//                                            started with, however often its
+//                                            parameter sets are re-sent. The
+//                                            live stream showed 498 sessions
+//                                            across 2453 access units before
+//                                            this was a gate
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -144,6 +154,38 @@ int main(void) {
         CVPixelBufferRelease(pb);
     }
 
+    // The parameter sets, re-sent. A real host does this in front of every
+    // IRAP — Steam Link's does it far more often than that — and each one used
+    // to cost a decompression session, i.e. every reference frame the decoder
+    // held. Bytes identical to the ones already held must change nothing at
+    // all: no description built, no session created.
+    unsigned built0 = 0, swapped0 = 0, sessions0 = 0;
+    kl_vtdec_param_stats(d, &built0, &swapped0, &sessions0);
+    unsigned char *pfx = malloc((size_t)n);
+    size_t pfx_len = 0;
+    if (pfx) {
+        long j = 0;
+        while (j + 3 < n) {
+            if (!(buf[j] == 0 && buf[j+1] == 0 && buf[j+2] == 1)) { j++; continue; }
+            long payload = j + 3, end = payload;
+            while (end + 3 < n &&
+                   !(buf[end] == 0 && buf[end+1] == 0 && buf[end+2] == 1)) end++;
+            if (end + 3 >= n) end = n;
+            int t = (buf[payload] >> 1) & 0x3f;
+            if (t >= 32 && t <= 34) {
+                pfx[pfx_len++] = 0; pfx[pfx_len++] = 0;
+                pfx[pfx_len++] = 0; pfx[pfx_len++] = 1;
+                memcpy(pfx + pfx_len, buf + payload, (size_t)(end - payload));
+                pfx_len += (size_t)(end - payload);
+            }
+            j = payload;
+        }
+        for (int rep = 0; rep < 5; rep++)
+            kl_vtdec_submit(d, pfx, pfx_len, 1000000 + rep);
+    }
+    unsigned built1 = 0, swapped1 = 0, sessions1 = 0;
+    kl_vtdec_param_stats(d, &built1, &swapped1, &sessions1);
+
     unsigned s = 0, dec = 0, drop = 0; int w = 0, h = 0;
     kl_vtdec_stats(d, &s, &dec, &drop, &w, &h);
     printf("  %d access units, %u submitted, %u decoded, %u dropped, %dx%d\n",
@@ -156,9 +198,14 @@ int main(void) {
     check(bad_pts == 0, "the guest's pts survives the round trip");
     check(uniform == 0, "the frames carry a picture, not a uniform blank");
     check(drop == 0, "nothing was dropped for want of ring space");
+    check(sessions0 == 1, "one decompression session for the whole stream");
+    check(pfx != NULL && pfx_len > 0, "the stream's parameter sets were found");
+    check(built1 == built0 && sessions1 == sessions0,
+          "re-sent parameter sets cost neither a description nor a session");
 
     kl_vtdec_report(stdout);
     kl_vtdec_destroy(d);
+    free(pfx);
     free(cuts);
     free(buf);
 

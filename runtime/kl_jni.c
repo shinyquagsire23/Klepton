@@ -1839,6 +1839,37 @@ static klj_val klj_Intent_getExtras(void *env, void *self, const klj_val *a, int
             const char *v = getenv(want[i].env);
             if (v && *v) { kv[k].key = want[i].key; kv[k].val = v; k++; }
         }
+        // sStartInfo is not an independent value: the shell derives it from
+        // sArgs and we are standing in for the shell, so deriving it here is
+        // transcription rather than invention. SteamLink.startVRLink does
+        //     String[] f = sArgs.split("~");
+        //     if (f.length > 3) intent.putExtra("sStartInfo", f[3]);
+        // and field 3 is the "0,0,1" in the middle of a real handoff string.
+        // The guest reads it back with the same GetExtrasKey call it uses for
+        // everything else, so an absent one is simply an empty string to it —
+        // which is why this went unnoticed, and why it is worth closing: the
+        // whole point of the synthesized Intent is to be the one the shell
+        // would have sent.
+        if (!getenv("KL_SLINK_START_INFO")) {
+            const char *args = getenv("KL_SLINK_SARGS");
+            if (args && *args) {
+                const char *p = args;
+                int field = 0;
+                while (field < 3 && (p = strchr(p, '~')) != NULL) { p++; field++; }
+                if (field == 3) {
+                    const char *end = strchr(p, '~');
+                    size_t len = end ? (size_t)(end - p) : strlen(p);
+                    if (len) {
+                        char *si = malloc(len + 1);
+                        if (si) {
+                            memcpy(si, p, len);
+                            si[len] = '\0';
+                            kv[k].key = "sStartInfo"; kv[k].val = si; k++;
+                        }
+                    }
+                }
+            }
+        }
         kv[k].key = kv[k].val = NULL;
         if (k) {
             extras = klj_new_object_data("android/os/Bundle", kv);
@@ -3559,17 +3590,28 @@ static klj_val klj_Context_checkSelfPermission(void *env, void *self, const klj_
 // sOriginalPackage / sOriginalActivity / sStartInfo / sArgs, a startActivity,
 // and finishAndRemoveTask on this one.
 //
-// We cannot honour that: the VR activity is a second front door that does not
-// exist here yet (no synthetic OpenXR runtime, no AMediaCodec), and launching
-// nothing while telling the shell it launched something would end the run
-// silently — the shell finishes itself immediately afterwards, so the app would
-// simply disappear with no picture and no reason given.
+// The VR activity is a second FRONT DOOR — a different guest library, chain and
+// lifecycle — so whether it can be honoured is the driver's question, not this
+// file's. `kl_jni_set_vrlink_handoff` is how a driver answers it; see the
+// header. With no handler installed, or with one that returns because it could
+// not do the handoff, this stops by name like every other unimplemented call.
 //
-// So it stops by name, like every other unimplemented call. What it does FIRST
-// is print the payload, because that string is the authorized session and it is
-// expensive to get back: reaching this line costs a pairing round trip with a
-// real Steam host and a person typing a PIN. `~` is the field separator the
-// guest itself splits on, and field 3 is what it forwards as sStartInfo.
+// What it does FIRST either way is print the payload, because that string is
+// the authorized session and it is expensive to get back: reaching this line
+// costs a pairing round trip with a real Steam host and a person typing a PIN.
+// `~` is the field separator the guest itself splits on, and field 3 is what it
+// forwards as sStartInfo.
+//
+// It must never simply RETURN. This is the only path by which the guest can be
+// told its activity started, and the shell calls finishAndRemoveTask() the
+// instant it does — so telling it that falsely ends the run with no picture and
+// no reason given.
+static void (*g_vrlink_handoff)(const char *sargs);
+
+void kl_jni_set_vrlink_handoff(void (*fn)(const char *sargs)) {
+    g_vrlink_handoff = fn;
+}
+
 static klj_val klj_SL_startVRLink(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     const char *args = n > 0 ? klj_str(a[0].l) : "";
@@ -3588,8 +3630,9 @@ static klj_val klj_SL_startVRLink(void *env, void *self, const klj_val *a, int n
             p = sep + 1; field++;
         }
     }
-    KLJ_LOG("  the VR activity (com.valvesoftware.steamlinkvr/android.app.NativeActivity) "
-            "is not stood up — this is the next arc, not a regression");
+    if (g_vrlink_handoff && args && *args) g_vrlink_handoff(args);
+    KLJ_LOG("  the VR front door was not entered (no handoff handler, or it "
+            "could not run) — the session above is what KL_SLINK_SARGS wants");
     kl_fatal_prepare(); abort();
 }
 
