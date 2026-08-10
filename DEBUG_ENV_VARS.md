@@ -495,6 +495,14 @@ puts the camera on the ground with its hands underneath it.
   `ovrp_GetNodePoseState` nodes 0/1 (PLANNING §12.17), so this is the A/B for
   "is the compositor's number wrong" — and on the host, where nothing pushes
   one, the only way to get stereo at all. Refused outside 0..0.2 m.
+  **Required for host Steam Link VR runs (SL-12).** Its VR client publishes the
+  eye-to-head transform and the raw projection params only when the half-IPD it
+  reads differs from the one it last sent, and that starts at zero — so with the
+  offsets unpushed it decides its geometry is unchanged, never tells the Steam
+  host how to project, and the host silently streams no video at all. `=0.063`
+  is what makes frames arrive. On device the compositor measures and pushes the
+  real offsets, so this stays what it has always been there: the A/B for "is the
+  compositor's number the wrong one".
 - `KL_OVRP_STAGES=<n>` — eye-swapchain depth (default 3, clamped to
   1..max). `=1` restores the single-buffered behaviour every pre-§12.19
   measurement was taken against, and its tearing; each extra stage costs a

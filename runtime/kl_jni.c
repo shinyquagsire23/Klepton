@@ -1294,6 +1294,7 @@ static klj_val klj_appinfo_sourceDir(void);
 static klj_val klj_appinfo_nativeLibraryDir(void);
 static klj_val klj_appinfo_dataDir(void);
 static klj_val klj_appinfo_splitSourceDirs(void);
+static klj_val klj_Uri_EMPTY(void);
 static klj_val klj_metaData_field(void);
 static klj_val klj_currentActivity_field(void);
 static klj_val klj_porterduff_clear(void);
@@ -1464,6 +1465,7 @@ static const klj_field g_fields[] = {
     KLJ_FSTR("android/content/Intent", "ACTION_MAIN", "android.intent.action.MAIN"),
 
     KLJ_FSTR("android/os/Environment", "MEDIA_MOUNTED", "mounted"),
+    KLJ_FFN("android/net/Uri", "EMPTY", "Landroid/net/Uri;", klj_Uri_EMPTY),
 
     // ApplicationInfo is read field-by-field, and these depend on runtime
     // configuration rather than being compile-time constants.
@@ -1505,8 +1507,20 @@ static const klj_field g_fields[] = {
     KLJ_FSTR("android/os/Build", "MANUFACTURER", "Oculus"),
     KLJ_FSTR("android/os/Build", "BRAND",        "oculus"),
     KLJ_FSTR("android/os/Build", "MODEL",        "Quest 2"),
-    KLJ_FSTR("android/os/Build", "DEVICE",       "delmar"),
-    KLJ_FSTR("android/os/Build", "PRODUCT",      "delmar"),
+    // The device codename, and it is "hollywood" rather than the "delmar" this
+    // used to say. "delmar" came from Beat Saber's own manifest
+    // (com.oculus.supportedDevices = quest|delmar), which was the only evidence
+    // available at the time — but that is the Oculus STORE's device token, a
+    // different namespace from ro.product.name/ro.product.device. Steam Link
+    // settles it from the other side: it ships a table of per-headset properties
+    // keyed by codename (assets/config/hmd_config.json — hollywood, seacliff,
+    // stinson, eureka, panther, kona) and looks its own device up in it by
+    // Build.PRODUCT. Those are ro.product.name values, and the Quest 2's is
+    // hollywood; with "delmar" the lookup missed and the client told the Steam
+    // host it was an unrecognised headset ("[DeviceHMD] Unable to find device
+    // static props for ..."). Two Quest titles agreeing beats one manifest.
+    KLJ_FSTR("android/os/Build", "DEVICE",       "hollywood"),
+    KLJ_FSTR("android/os/Build", "PRODUCT",      "hollywood"),
     KLJ_FSTR("android/os/Build", "HARDWARE",     "qcom"),
     // Build fingerprint pieces, in the shape Android defines and consistent with
     // the Quest 2 described above. Unity puts these straight into its device
@@ -1517,7 +1531,7 @@ static const klj_field g_fields[] = {
     KLJ_FSTR("android/os/Build", "TYPE",         "user"),
     KLJ_FSTR("android/os/Build", "TAGS",         "release-keys"),
     KLJ_FSTR("android/os/Build", "FINGERPRINT",
-             "oculus/delmar/delmar:10/SQ3A.220605.009.A1/1:user/release-keys"),
+             "oculus/hollywood/hollywood:10/SQ3A.220605.009.A1/1:user/release-keys"),
 
 
     KLJ_FINT("android/content/Context", "MODE_PRIVATE", 0),
@@ -1867,16 +1881,61 @@ static klj_val klj_Intent_addCategory(void *env, void *self, const klj_val *a, i
 // (SVLDecoder -> AImageReader -> EGLImage). If the UI ever becomes the thing
 // under test, this is the seam to grow — a real WKWebView drawn into the same
 // buffer would slot in here without the guest noticing.
+//
+// Loading is a different question from rendering, though, and it is one we can
+// answer honestly. Every URL this guest loads is `file:///android_asset/...`,
+// i.e. a file inside the APK we already serve through AssetManager.open(); so
+// "did the document load" is a stat() away, and getProgress() below reports it
+// rather than guessing. See that function for why the distinction is
+// load-bearing.
 static int g_webview_draws;
-static klj_val klj_WebView_init(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)a; (void)n;
-    KLJ_LOG("WebView.<init> — no browser is embedded; this panel draws nothing");
-    return (klj_val){.l = self};
+
+// Per-WebView state. There are three of them (streampreflight, streamloading,
+// streamanimation) and they load different documents, so this hangs off the
+// instance rather than the class — which is why <init> now mints a real object
+// instead of handing back the jclass. The guest NewGlobalRef's what it gets
+// (libvrlink_scene+0x149848), so it survives the local frame.
+typedef struct { char *url; char *path; int found, logged; } klj_webdoc;
+
+static klj_webdoc *klj_webdoc_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->cls || strcmp(o->cls, "android/webkit/WebView") != 0) return NULL;
+    return o->data;
 }
+
+static klj_val klj_WebView_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    void *obj = klj_new_object_data("android/webkit/WebView", calloc(1, sizeof(klj_webdoc)));
+    KLJ_LOG("WebView.<init> — no browser is embedded; this panel draws nothing");
+    return (klj_val){.l = obj};
+}
+
+// loadUrl: resolve it against the same assets root AssetManager.open() uses and
+// record whether the document is really there. Nothing is parsed and nothing is
+// rendered — this is the fetch, and only the fetch.
 static klj_val klj_WebView_loadUrl(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
+    (void)env;
     const char *u = n > 0 ? klj_str(a[0].l) : NULL;
-    KLJ_LOG("WebView.loadUrl(\"%s\") — accepted and dropped", u ? u : "(null)");
+    klj_webdoc *d = klj_webdoc_of(self);
+    if (!d || !u) {
+        KLJ_LOG("WebView.loadUrl(\"%s\") — accepted and dropped", u ? u : "(null)");
+        return (klj_val){.j = 0};
+    }
+    static const char kAsset[] = "file:///android_asset/";
+    free(d->url); free(d->path);
+    d->url = strdup(u); d->path = NULL; d->found = 0; d->logged = 0;
+    if (strncmp(u, kAsset, sizeof kAsset - 1) == 0) {
+        const char *rel = u + sizeof kAsset - 1;
+        size_t need = strlen(g_assets_dir) + strlen(rel) + 2;
+        d->path = malloc(need);
+        snprintf(d->path, need, "%s/%s", g_assets_dir, rel);
+        struct stat st;
+        d->found = (stat(d->path, &st) == 0 && S_ISREG(st.st_mode));
+    }
+    KLJ_LOG("WebView.loadUrl(\"%s\") — %s", u,
+            d->found  ? "document found; nothing renders it"
+          : d->path   ? "NOT FOUND under the assets root"
+                      : "not an asset URL; accepted and dropped");
     return (klj_val){.j = 0};
 }
 static klj_val klj_WebView_getSettings(void *env, void *self, const klj_val *a, int n) {
@@ -1891,6 +1950,16 @@ static klj_val klj_WebView_draw(void *env, void *self, const klj_val *a, int n) 
     if (!g_webview_draws++)
         KLJ_LOG("WebView.draw — nothing to draw; the panel stays transparent");
     return (klj_val){.j = 0};
+}
+// ByteBuffer.rewind() — the second half of the panel readback:
+// bitmap.copyPixelsToBuffer(buf) leaves the buffer's position at the end, and
+// the guest rewinds it before reading. A Buffer here is an address and a
+// capacity with no position (klj_direct_buffer), and everything that reads one
+// does so from its base, so rewinding is already the state it is in. Returning
+// the same buffer is what Buffer.rewind() does.
+static klj_val klj_Buffer_rewind(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = self};
 }
 // klj_void_noop is further down — it is the shared void handler, and these
 // bindings use it rather than adding a second one.
@@ -2043,6 +2112,21 @@ static klj_val klj_WifiManager_getConnectionInfo(void *env, void *self,
     (void)env; (void)self; (void)a; (void)n;
     KLJ_LOG("WifiManager.getConnectionInfo() -> null (not associated)");
     return (klj_val){.l = NULL};
+}
+
+// ConnectivityManager.getActiveNetwork() — and note what the guest does with it,
+// because the name of its caller is misleading. BIsWiFiConnected()
+// (libvrlink_scene+0x146130) is literally `return getActiveNetwork() != null`:
+// it never asks which transport, so there is no Wi-Fi claim in it to get wrong.
+// The question it really asks is "is this device on a network at all", and the
+// answer is yes — the guest is streaming from a Steam host over it as it asks.
+// Answering null would say the machine is offline while its own socket is
+// connected, and the stream scene reads that as a reason there is no video.
+static klj_val klj_ConnectivityManager_getActiveNetwork(void *env, void *self,
+                                                        const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *net;
+    return klj_singleton("android/net/Network", &net);
 }
 
 // A WifiLock is not a claim about connectivity — it is a request to the power
@@ -2441,15 +2525,83 @@ static klj_looper *klj_looper_of(void *looper_obj) {
 // HandlerThread's looper that is a real thread to shut down; for the main one
 // there is nothing to stop, because our main "loop" is the host's pump and it
 // ends when the run does.
+static void klj_mq_quit(void);
 static klj_val klj_Looper_quit(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_looper *lp = klj_looper_of(self);
-    if (!lp) { KLJ_LOG("Looper.quit() on the main looper — nothing to stop"); return (klj_val){0}; }
+    if (!lp) {
+        KLJ_LOG("Looper.quit() on the main looper — releasing anything blocked in "
+                "MessageQueue.next()");
+        klj_mq_quit();
+        return (klj_val){0};
+    }
     pthread_mutex_lock(&lp->lock);
     lp->running = 0;
     pthread_cond_broadcast(&lp->wake);
     pthread_mutex_unlock(&lp->lock);
     return (klj_val){0};
+}
+
+// ---- android.os.MessageQueue.next() ----------------------------------------
+//
+// A blocking pop off the Looper's queue, and the first thing in this shim to
+// call one. Who calls it is worth writing down, because it is not obvious and it
+// is the answer to "how does the in-headset UI talk BACK to the guest".
+//
+// libvrlink_scene cannot subclass WebMessagePort$WebMessageCallback — it is all
+// native, there is no Java of its own in the APK — so it never registers one:
+// WebView::UIThread_SetupWebView passes a NULL callback and a Handler bound to
+// the WebView thread's Looper (+0x149d1c). Then that thread runs its OWN loop
+// (WebView::WebViewThread +0x14a9b0): queue.next(), and for each Message it
+// reads the payload straight out of the Message's fields, skipping the three
+// framework target classes it knows by name. It is intercepting the framework's
+// own delivery instead of receiving it. Clever, and it means a page->native
+// message here is a Message on this queue, not a callback we can invoke.
+//
+// Nothing posts one. Java Messages in this shim go to a HandlerThread's own
+// queue (klj_looper above) and Runnables go through kl_jni_drain_ui_tasks, so
+// this queue is genuinely, correctly empty — and an empty queue is a wait, not
+// a NULL. NULL means "the looper quit", and returning it would tell the guest to
+// tear its WebView thread down. So this blocks, exactly as Android's does, and
+// says so once so that a future stall here has a name instead of being a silent
+// parked thread.
+#define KLJ_MQ_MAX 32
+static pthread_mutex_t g_mq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_mq_wake = PTHREAD_COND_INITIALIZER;
+static void     *g_mq_q[KLJ_MQ_MAX];
+static unsigned  g_mq_head, g_mq_count;   // push goes at (head + count) % KLJ_MQ_MAX
+static int       g_mq_quit, g_mq_said;
+
+static void klj_mq_quit(void) {
+    pthread_mutex_lock(&g_mq_lock);
+    g_mq_quit = 1;
+    pthread_cond_broadcast(&g_mq_wake);
+    pthread_mutex_unlock(&g_mq_lock);
+}
+
+static klj_val klj_MessageQueue_next(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    pthread_mutex_lock(&g_mq_lock);
+    for (;;) {
+        if (g_mq_count) {
+            void *msg = g_mq_q[g_mq_head];
+            g_mq_head = (g_mq_head + 1) % KLJ_MQ_MAX;
+            g_mq_count--;
+            pthread_mutex_unlock(&g_mq_lock);
+            return (klj_val){.l = msg};
+        }
+        if (g_mq_quit) {
+            pthread_mutex_unlock(&g_mq_lock);
+            return (klj_val){.l = NULL};
+        }
+        if (!g_mq_said) {
+            g_mq_said = 1;
+            KLJ_LOG("MessageQueue.next() — blocking on an empty queue; nothing "
+                    "posts Java Messages here (this is the WebView's page->native "
+                    "pump, and no page is talking)");
+        }
+        pthread_cond_wait(&g_mq_wake, &g_mq_lock);
+    }
 }
 
 
@@ -3699,37 +3851,118 @@ static klj_val klj_void_noop(void *env, void *self, const klj_val *a, int n) {
 
 // WebView's message channel — the two-way bridge between the guest's C++ and
 // the page it would have loaded. Android returns a pair of entangled ports; the
-// guest keeps port 0, posts port 1 into the document, and waits for the page to
-// talk back. Both ports are real objects here and neither ever delivers
-// anything, because there is no document (see the WebView block above). That is
-// the same answer as an unanswered channel on a page that never finished
-// loading, which is a state the guest must already tolerate.
+// guest keeps port 0 and posts port 1 into the document, which is where ipc.js
+// picks it up (`onmessage` takes e.ports[0] and calls OnConnectCallback).
+//
+// One pair per WebView, not one pair for the process: three WebViews are set up
+// (streampreflight, streamloading, streamanimation) and each opens its own
+// channel, so a shared static would cross their wires.
 static klj_val klj_WebView_createWebMessageChannel(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    static void *ports;
-    if (!ports) {
-        ports = klj_new_array('L', "android/webkit/WebMessagePort", 2);
-        klj_as_object(ports)->pinned = 1;
-        klj_array *arr = klj_arr(ports);
-        for (int i = 0; i < 2; i++) {
-            void *p = kl_jni_new_object("android/webkit/WebMessagePort");
-            klj_as_object(p)->pinned = 1;
-            ((void **)arr->data)[i] = p;
-        }
-        KLJ_LOG("WebView.createWebMessageChannel — two ports, and nothing will "
-                "ever arrive on them");
+    (void)env; (void)a; (void)n;
+    klj_webdoc *d = klj_webdoc_of(self);
+    void *ports = klj_new_array('L', "android/webkit/WebMessagePort", 2);
+    klj_as_object(ports)->pinned = 1;
+    klj_array *arr = klj_arr(ports);
+    for (int i = 0; i < 2; i++) {
+        void *p = klj_new_object_data("android/webkit/WebMessagePort", d);
+        klj_as_object(p)->pinned = 1;
+        ((void **)arr->data)[i] = p;
     }
+    KLJ_LOG("WebView.createWebMessageChannel(%s) — two ports",
+            d && d->url ? d->url : "(no document)");
     return (klj_val){.l = ports};
 }
 
-// WebView.getProgress — the page load percentage. There is no page, so nothing
-// has loaded, and 0 is the truthful answer. Answering 100 would be asserting
-// that a document we never fetched finished rendering, which is exactly the
-// kind of invented answer this shim refuses to give; if the guest ever blocks
-// waiting for it, the block is the measurement.
+// WebView.getProgress — the page load percentage, and the ONE thing gating the
+// whole in-headset UI.
+//
+// libvrlink_scene's WebViewThread spins at 5 ms posting
+// WebView::UIThread_InitializeMessageChannels to the UI thread, and that
+// function (+0x14ba5c) does exactly one test before doing its work
+// unconditionally: `if (getProgress() != 100) return`. Answering 0 forever is
+// what left SL-11 parked on "Waiting for message channels to initialize...".
+//
+// So this is not a licence to claim a document rendered. It reports the LOAD,
+// which is a fact we hold: loadUrl resolved the `file:///android_asset/` URL
+// against the same assets root AssetManager.open() serves, and stat() said
+// whether the file is there. A document that is present and fully read is at
+// 100% loaded; that it is then handed to no renderer is the separate, declared
+// gap above. A URL we cannot find stays at 0, so a wrong path still shows up as
+// a stall rather than as a lie.
 static klj_val klj_WebView_getProgress(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
+    (void)env; (void)a; (void)n;
+    klj_webdoc *d = klj_webdoc_of(self);
+    int pct = (d && d->found) ? 100 : 0;
+    if (d && !d->logged) {
+        d->logged = 1;
+        KLJ_LOG("WebView.getProgress(%s) -> %d", d->url ? d->url : "(no document)", pct);
+    }
+    return (klj_val){.j = pct};
+}
+
+// ---- the channel, once it is up --------------------------------------------
+//
+// A WebMessage is a string plus any ports being transferred with it. We keep
+// the string, because it is the entire IPC: the protocol ships in the APK
+// (assets/webui/ipc.js) and is plain text, "<mailbox> <json>", in both
+// directions. Logging what the guest sends is how the far half of this UI gets
+// measured instead of guessed at.
+static klj_val klj_WebMessage_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *s = n > 0 ? klj_str(a[0].l) : NULL;
+    return (klj_val){.l = klj_new_object_data("android/webkit/WebMessage",
+                                              strdup(s ? s : ""))};
+}
+
+static const char *klj_webmessage_data(void *msg) {
+    klj_object *o = klj_as_object(msg);
+    return (o && o->cls && strcmp(o->cls, "android/webkit/WebMessage") == 0) ? o->data : NULL;
+}
+
+// postWebMessage(msg, uri): the guest handing port 1 to the document. On
+// Android this is what fires the page's `onmessage`. There is no page, so the
+// port lands nowhere — but the guest does not wait for an acknowledgement, it
+// just marks its channel up and carries on.
+static klj_val klj_WebView_postWebMessage(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_webdoc *d = klj_webdoc_of(self);
+    const char *s = n > 0 ? klj_webmessage_data(a[0].l) : NULL;
+    KLJ_LOG("WebView.postWebMessage(\"%s\") to %s — the port reaches no document",
+            s ? s : "", d && d->url ? d->url : "(no document)");
     return (klj_val){.j = 0};
+}
+
+// WebMessagePort.postMessage: native -> page. Nothing receives it, but the text
+// is the guest telling us what its UI is being asked to show, so it is printed.
+static klj_val klj_WebMessagePort_postMessage(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *s = n > 0 ? klj_webmessage_data(a[0].l) : NULL;
+    KLJ_LOG("WebMessagePort.postMessage: %s", s ? s : "(not a WebMessage)");
+    return (klj_val){.j = 0};
+}
+
+// setWebMessageCallback(cb, handler): the page -> native direction. Worth a line
+// because of what is measured in it — libvrlink_scene passes a NULL callback
+// (+0x149d1c is `mov x3, xzr`, and the descriptor string has exactly one xref,
+// so there is no second registration anywhere). A null callback drops incoming
+// messages on Android too, so nothing we could deliver here would be read. That
+// rules out "deliver the page's Continue click" as the way past the preflight,
+// and it is the kind of thing that costs a day if it is inferred rather than
+// printed.
+static klj_val klj_WebMessagePort_setWebMessageCallback(void *env, void *self,
+                                                        const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("WebMessagePort.setWebMessageCallback(%s) — page->native is %s",
+            (n > 0 && a[0].l) ? "callback" : "null",
+            (n > 0 && a[0].l) ? "registered" : "unreadable by the guest's own choice");
+    return (klj_val){.j = 0};
+}
+
+// Uri.EMPTY — the target the guest passes to postWebMessage. An identity, and
+// the only thing it is used for is being passed straight back to us.
+static klj_val klj_Uri_EMPTY(void) {
+    static void *empty;
+    return klj_singleton("android/net/Uri", &empty);
 }
 
 // Uri.decode — percent-decoding, implemented rather than stubbed because it is a
@@ -5320,6 +5553,7 @@ static const klj_binding g_bindings[] = {
     {"android/os/Looper",  "prepare",       "()V",                    klj_Looper_prepare},
     {"android/os/Looper",  "getQueue",      "()Landroid/os/MessageQueue;", klj_Looper_getQueue},
     {"android/os/Looper",  "quit",          "()V",                    klj_Looper_quit},
+    {"android/os/MessageQueue", "next",     "()Landroid/os/Message;", klj_MessageQueue_next},
     // A HandlerThread is a thread with a Looper on it. We have one queue and one
     // drain point (kl_jni_drain_ui_tasks) for the main looper — but a
     // HandlerThread gets a real thread of its own, because the guest blocks
@@ -5373,15 +5607,21 @@ static const klj_binding g_bindings[] = {
     {"android/webkit/WebView", "createWebMessageChannel", "()[Landroid/webkit/WebMessagePort;",
      klj_WebView_createWebMessageChannel},
     {"android/webkit/WebMessagePort", "setWebMessageCallback",
-     "(Landroid/webkit/WebMessagePort$WebMessageCallback;Landroid/os/Handler;)V", klj_void_noop},
+     "(Landroid/webkit/WebMessagePort$WebMessageCallback;Landroid/os/Handler;)V",
+     klj_WebMessagePort_setWebMessageCallback},
+    {"android/webkit/WebMessage", "<init>",
+     "(Ljava/lang/String;[Landroid/webkit/WebMessagePort;)V", klj_WebMessage_init},
+    {"android/webkit/WebMessage", "<init>", "(Ljava/lang/String;)V", klj_WebMessage_init},
     {"android/webkit/WebView", "postWebMessage",
-     "(Landroid/webkit/WebMessage;Landroid/net/Uri;)V", klj_void_noop},
-    {"android/webkit/WebMessagePort", "postMessage", "(Landroid/webkit/WebMessage;)V", klj_void_noop},
+     "(Landroid/webkit/WebMessage;Landroid/net/Uri;)V", klj_WebView_postWebMessage},
+    {"android/webkit/WebMessagePort", "postMessage", "(Landroid/webkit/WebMessage;)V",
+     klj_WebMessagePort_postMessage},
     {"android/graphics/Bitmap", "createBitmap",
      "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;", klj_Bitmap_createBitmap},
     {"android/graphics/Bitmap$Config", "valueOf",
      "(Ljava/lang/String;)Landroid/graphics/Bitmap$Config;", klj_BitmapConfig_valueOf},
     {"android/graphics/Bitmap", "copyPixelsToBuffer", "(Ljava/nio/Buffer;)V", klj_void_noop},
+    {"java/nio/ByteBuffer", "rewind", "()Ljava/nio/Buffer;", klj_Buffer_rewind},
     {"android/graphics/Canvas", "<init>", "(Landroid/graphics/Bitmap;)V", klj_Canvas_init},
     {"android/graphics/Canvas", "drawColor", "(ILandroid/graphics/PorterDuff$Mode;)V", klj_void_noop},
     {"android/graphics/Canvas", "scale", "(FFFF)V", klj_void_noop},
@@ -5408,6 +5648,8 @@ static const klj_binding g_bindings[] = {
     {"android/content/Context", "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", klj_Context_getSystemService},
     {"android/net/wifi/WifiManager", "getConnectionInfo", "()Landroid/net/wifi/WifiInfo;",
      klj_WifiManager_getConnectionInfo},
+    {"android/net/ConnectivityManager", "getActiveNetwork", "()Landroid/net/Network;",
+     klj_ConnectivityManager_getActiveNetwork},
     {"android/net/wifi/WifiManager", "createWifiLock", "(ILjava/lang/String;)Landroid/net/wifi/WifiManager$WifiLock;",
      klj_WifiManager_createWifiLock},
     {"android/net/wifi/WifiManager$WifiLock", "acquire", "()V", klj_WifiLock_acquire},

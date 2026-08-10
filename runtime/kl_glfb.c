@@ -590,6 +590,19 @@ static char *klfb_strip_uniform_layout(char *p) {
     return p;
 }
 
+// A GLSL identifier character — the test that keeps a rename inside whole words.
+#define KLFB_IDENT(c) (((c) >= 'a' && (c) <= 'z') || ((c) >= 'A' && (c) <= 'Z') || \
+                       ((c) >= '0' && (c) <= '9') || (c) == '_')
+
+// GLSL built-in function names that this guest also declares as variables, with
+// the replacement each gets. The replacements are the same width as the names
+// they replace, so the rename stays an in-place edit like every other rule in
+// klfb_rewrite_glsl. Shared with klfb_GetUniformLocation, which is what keeps a
+// renamed uniform findable under the name the guest wrote.
+static const struct { const char *from, *to; } g_glsl_builtin_vars[] = {
+    {"length", "kl_len"},
+};
+
 // Returns buf rewritten in place (it only ever shrinks), or NULL if no rule
 // applied.
 static char *klfb_rewrite_glsl(char *buf) {
@@ -676,6 +689,46 @@ static char *klfb_rewrite_glsl(char *buf) {
         memset(p + 9, ' ', strlen("samplerExternalOES") - 9);
         p += strlen("samplerExternalOES");
         changed = 1;
+    }
+
+    // A variable named for a built-in function.
+    //
+    // Steam Link's pointer shader declares `uniform float length;` and also
+    // calls the built-in `length(v)` three times. ESSL keeps variables and
+    // functions in ONE namespace, so the declaration hides the function and
+    // every later call is "'length' : function name expected". The vendor GLES
+    // driver this shader shipped against evidently keeps two namespaces, C-style,
+    // and accepts it. Three compile errors, then the program fails to LINK — and
+    // that program belongs to XRConstruct, which is what draws the decoded video,
+    // so the whole stream scene comes up with "[SceneStream] Failed to initialize
+    // construct" and there is no surface for a frame to land on.
+    //
+    // The split is exact rather than a heuristic, because it is the compiler's
+    // own: an occurrence followed by `(` IS the function call it is complaining
+    // about, and every other occurrence is the variable. Renaming the second
+    // group and leaving the first restores exactly the reading the shader was
+    // written for. klfb_GetUniformLocation maps the guest's name back, so a
+    // uniform this renames is still findable by the name it was declared with.
+    for (size_t i = 0; i < sizeof g_glsl_builtin_vars / sizeof g_glsl_builtin_vars[0]; i++) {
+        const char *from = g_glsl_builtin_vars[i].from, *to = g_glsl_builtin_vars[i].to;
+        size_t n = strlen(from);
+        if (strlen(to) != n || strstr(buf, to)) continue;   // never shadow a name already here
+        int renamed = 0;
+        for (p = buf; (p = strstr(p, from)); p += n) {
+            char before = p == buf ? 0 : p[-1];
+            if (KLFB_IDENT(before) || KLFB_IDENT(p[n])) continue;   // part of a longer name
+            const char *q = p + n;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '(') continue;                                // the function call
+            memcpy(p, to, n);
+            renamed++;
+        }
+        if (renamed) {
+            fprintf(stderr, "  [glfb] shader declares `%s`, which is a built-in "
+                            "function name — renamed %d use%s to `%s`\n",
+                    from, renamed, renamed == 1 ? "" : "s", to);
+            changed = 1;
+        }
     }
     return changed ? buf : NULL;
 }
@@ -3051,6 +3104,20 @@ static void klfb_BindTexture(uint32_t t, uint32_t n) {
     if (g_real_BindTexture) g_real_BindTexture(klfb_detarget(t), n);
     klfb_err_say("glBindTexture", n);
 }
+// glGetUniformLocation, so the built-in-name rename above stays invisible to the
+// guest: it still asks for `length` and still gets the location of the uniform it
+// declared. Only a miss is retried, so a shader we did not rewrite is untouched
+// and a real -1 stays -1.
+static int32_t (*g_real_GetUniformLocation)(uint32_t, const char *);
+static int32_t klfb_GetUniformLocation(uint32_t prog, const char *name) {
+    if (!g_real_GetUniformLocation) return -1;
+    int32_t loc = g_real_GetUniformLocation(prog, name);
+    if (loc >= 0 || !name) return loc;
+    for (size_t i = 0; i < sizeof g_glsl_builtin_vars / sizeof g_glsl_builtin_vars[0]; i++)
+        if (strcmp(name, g_glsl_builtin_vars[i].from) == 0)
+            return g_real_GetUniformLocation(prog, g_glsl_builtin_vars[i].to);
+    return loc;
+}
 static void (*g_real_BindSampler)(uint32_t, uint32_t);
 static void klfb_BindSampler(uint32_t u, uint32_t s) {
     if (a_glGetError) while (a_glGetError()) {}
@@ -3085,6 +3152,7 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glUseProgram",  (void *)klfb_UseProgram,  (void **)&g_real_UseProgram},
     {"glBindTexture", (void *)klfb_BindTexture, (void **)&g_real_BindTexture},
     {"glBindSampler", (void *)klfb_BindSampler, (void **)&g_real_BindSampler},
+    {"glGetUniformLocation", (void *)klfb_GetUniformLocation, (void **)&g_real_GetUniformLocation},
     {"glUniform1i",   (void *)klfb_Uniform1i,   (void **)&g_real_Uniform1i},
     {"glGenerateMipmap", (void *)klfb_GenerateMipmap, (void **)&g_real_GenerateMipmap},
     {"glFlush",  (void *)klfb_Flush,  (void **)&g_real_Flush},
