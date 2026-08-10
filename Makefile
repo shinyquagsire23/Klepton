@@ -19,7 +19,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
-           runtime/kl_ovrplat.c runtime/kl_mediandk.c runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
+           runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_il2cpp.c runtime/kl_fault.c
 RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
@@ -104,6 +104,45 @@ slink-shell: build/m_slink
 # relocate all fourteen, print what is still unresolved, stop before init.
 slink-shell-gap: build/m_slink
 	KL_SLINK_SHELL=1 KL_GAP_ONLY=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
+
+# SL-8: the THIRD front door — libvrlink_scene.so, the OpenXR NativeActivity.
+# Not SDL3 at all, and the chain is ONE guest library: its DT_NEEDED is entirely
+# Android system libraries we shim (§11.9). libopenxr_loader.so is deliberately
+# not loaded — it is REPLACED, the same call §3.1 made for libOVRPlugin.
+#
+# The gap first, because that is the number that matters: 127 unresolved names,
+# and they are the work list for the whole VR arc.
+slink-vr-gap: build/m_slink
+	KL_SLINK_VR=1 KL_GAP_ONLY=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
+
+# ...and the run: init arrays, then ANativeActivity_onCreate. Stops by name
+# wherever the shim ends, which is the whole point.
+slink-vr-scene: build/m_slink
+	KL_SLINK_VR=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
+
+# SL-9: ...and the whole thing running — the OpenXR boot sequence, the session
+# state machine, and the frame loop, on ANGLE.
+#
+# KL_SLINK_SARGS is the SL-6 handoff arriving: without it the app prints
+# "No sArgs and release build panic" and exits before its first frame, which is
+# correct behaviour and not a failure of ours. The value below is a SYNTHETIC
+# one — the format, with no real host behind it — which is enough to carry the
+# app through scene setup and into the stream, where it stops by name at
+# AMediaCodec. Paste a real one from a pairing run (notes/STEAMLINK.md) to go
+# further.
+#
+# Expected: the six-step boot, "Created session successfully", the state machine
+# walking IDLE -> READY -> SYNCHRONIZED -> VISIBLE -> FOCUSED, two
+# "[xr] eye N <- swapchain" lines from xrEndFrame, and a stop by name at
+# 'AMediaCodec_createDecoderByType'. Anything earlier is a regression.
+#
+# **This target exits NON-ZERO on success**, unlike the other three slink gates:
+# its stop is an abort-by-name, which is the M4 loop working, not a failure.
+# Read the last "fatal:" line, not make's exit code.
+KL_SLINK_SARGS ?= 192.168.1.50~10400~10400~0,0,1~~~~dGVzdA==
+slink-vr-run: build/m_slink
+	KL_SLINK_VR=1 KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 KL_SLINK_WAIT=25 \
+	  KL_SLINK_SARGS='$(KL_SLINK_SARGS)' ./build/m_slink $(SLVRLIBS)
 
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 	@mkdir -p build

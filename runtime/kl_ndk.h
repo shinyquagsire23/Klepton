@@ -25,4 +25,25 @@ void kl_ndk_window_size(const void *win, int32_t *w, int32_t *h);
 // Root directory for AAssetManager_open() — the unpacked APK's assets dir.
 void kl_ndk_set_assets_dir(const char *dir);
 
+// The AAssetManager* an ANativeActivity carries. Same object
+// AAssetManager_fromJava hands out — see the note there.
+void *kl_ndk_asset_manager(void);
+
+// Give the CALLING thread a looper, as Android's main thread always has one
+// before any activity runs. A NativeActivity host must do this before
+// ANativeActivity_onCreate — see the note at the definition for what it costs
+// not to.
+void kl_ndk_prepare_looper(void);
+
+// Does the CALLING thread have one? The native half of Java's
+// Looper.myLooper(), which is the same question asked from the other side of
+// the JNI boundary — and the two must agree, or a guest that checks through
+// Java and then acts through ALooper gets contradictory answers.
+int kl_ndk_thread_has_looper(void);
+
+// ...and pump it, which is what Looper.loop() does on Android's main thread
+// between callbacks. Returns what ALooper_pollOnce returns. A prepared looper
+// nobody polls is a queue with no drain — see the note at the definition.
+int kl_ndk_pump_looper(int timeout_ms);
+
 #endif

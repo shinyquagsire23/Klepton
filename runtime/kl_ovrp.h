@@ -285,4 +285,42 @@ float kl_ovrp_display_frequency(void);
 void kl_ovrp_set_eye_texture_size(int w, int h);
 void kl_ovrp_eye_texture_size(int *w, int *h);
 
+// ---------------------------------------------------------------------------
+// The eye view, for a guest that is not OVRPlugin's
+//
+// Everything above is the OVRPlugin ABI's own seam. This is the same
+// information without it: where one eye is, which way it points, and the
+// frustum it should render with — the answer klovrp_GetNodePoseState and
+// klovrp_GetNodeFrustum2 compose for nodes 0 and 1, exposed so the OpenXR
+// runtime (kl_openxr.c, xrLocateViews) can give its guest the identical answer.
+//
+// Sharing it is the point. The head pose has a per-frame latch here, the eye
+// offsets carry the display's real IPD, and the tangents carry its real cant
+// and field of view — all of it pushed by one frontend. A second XR API
+// computing its own eye poses from the published pose would drift from this one
+// by a frame and would miss the cant entirely, and the symptom of that
+// (per-eye counter-rotation read as doubling) already cost a session once.
+//
+// `eye` is 0 = left, 1 = right. The pose is in the current tracking space; the
+// tangents are all positive, in cp_view_get_tangents order (left, right, top,
+// bottom). Call kl_ovrp_frame_latch() first, exactly as the ovrp path does.
+void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz,
+                      float *qx, float *qy, float *qz, float *qw,
+                      float tangents[4]);
+
+// The head pose as the GUEST sees it — pinned for the duration of its frame by
+// kl_ovrp_frame_latch, and therefore NOT the same thing as
+// kl_ovrp_get_head_pose above. That one is the frontend's question ("where is
+// the head now", which is what a composite reprojects towards); this is the
+// guest's ("where was the head when this frame started"). Answering a guest
+// with the live value is the doubling bug, and answering a compositor with the
+// pinned one makes reprojection a no-op — so the two must stay distinct.
+void kl_ovrp_get_guest_head_pose(float *px, float *py, float *pz,
+                                 float *qx, float *qy, float *qz, float *qw);
+
+// Standing eye height above the floor origin (KL_OVRP_EYE_HEIGHT), or 0 when
+// the guest asked for an eye-level tracking origin. This is the offset between
+// OpenXR's STAGE space (floor) and its LOCAL space (where the head started).
+float kl_ovrp_eye_height(void);
+
 #endif

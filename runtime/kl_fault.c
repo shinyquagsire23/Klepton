@@ -16,6 +16,7 @@
 #include "kl_opensl.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_openxr.h"
 #include "kl_il2cpp.h"
 
 static void (*g_extra[KL_FAULT_MAX_REPORTERS])(FILE *);
@@ -102,6 +103,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
         kl_opensl_report(stderr);
         kl_ovrp_report(stderr);
         kl_ovrplat_report(stderr);
+        kl_openxr_report(stderr);
     }
 
     // KL_FAULT_WAIT=1: park here instead of dying so a debugger can attach and

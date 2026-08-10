@@ -768,10 +768,54 @@ int klb_pipe2(int fds[2], int flags) {
     return 0;
 }
 
+// ---- dup2/dup3, and the guest's attempt to own our stdout ----
+//
+// libvrlink_scene pipe()s and dup2()s the write end over BOTH fd 1 and fd 2 at
+// startup (its `debug_capture_thread`), which is the ordinary Android idiom:
+// an app's stdout and stderr go nowhere useful on Android, so a capture thread
+// reads them back and re-emits each line through __android_log_write, where
+// logd is the drain.
+//
+// Here that closes a cycle, and it wedged the first VR run completely.
+// kl_android_log_write writes to *stderr* — which, after the dup2, IS the pipe
+// the capture thread is reading. Every line it forwards it hands straight back
+// to itself; 64 KB of pipe buffer later every writer blocks in write() forever.
+// The abort that followed reported nothing, because the fault reporter's own
+// output went into the same pipe. That is the whole measurement instrument
+// disconnected — an M4 abort-by-name, the gap report, the fault reporter, all
+// of it — at exactly the moment it is needed. Silence read as a hang.
+//
+// So the redirection is DECLINED, and both sides get what they were after: the
+// guest wanted its stdout in the log, and our stderr already is the log. The
+// capture thread then blocks on a read() that never returns, which is what a
+// capture thread with nothing to capture should do.
+//
+// It reports success (dup2 returns the new descriptor) rather than an error,
+// for klb_sigaction's reason — the guest believes it is installed, and a guest
+// that checks the return value does not take an error path over a diagnostic
+// convenience. Logged once by name: trap 6d, a silent refusal is worse than a
+// loud one.
+static int kl_fd_hijack_refused(int to) {
+    if (to != STDOUT_FILENO && to != STDERR_FILENO) return 0;
+    static int warned[2];
+    if (!warned[to - 1]++)
+        fprintf(stderr, "  [klepton] declining the guest's dup2() onto fd %d — "
+                        "our diagnostics live there, and its capture thread "
+                        "would be reading its own output back (see kl_libc_slink.c)\n",
+                to);
+    return 1;
+}
+
+int klb_dup2(int from, int to) {
+    if (kl_fd_hijack_refused(to)) return to;
+    return dup2(from, to);
+}
+
 int klb_dup3(int from, int to, int flags) {
     // dup3 differs from dup2 in one observable way besides the flags: it is an
     // error rather than a no-op when the two descriptors are equal.
     if (from == to) { errno = EINVAL; return -1; }
+    if (kl_fd_hijack_refused(to)) return to;
     if (dup2(from, to) < 0) return -1;
     return apply_linux_fd_flags(to, flags);
 }

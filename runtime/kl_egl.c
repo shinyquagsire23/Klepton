@@ -85,9 +85,21 @@ typedef void *EGLDisplay, *EGLSurface, *EGLContext, *EGLConfig;
 // Opaque handles the guest only ever compares and passes back. Distinct
 // addresses, so a mismatched one is a wrong pointer rather than a silent alias.
 static struct { int initialised; } g_display;
-static struct { int id, es_bits, samples; } g_configs[] = {
-    {1, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 0},   // the one Unity will pick
-    {2, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 4},   // 4x MSAA
+// The configs we admit to having. Depth is per-config and not a constant, and
+// that is not a detail: libvrlink_scene enumerates with eglGetConfigs and
+// filters the list ITSELF, insisting on RGBA8888 + ES3 + WINDOW|PBUFFER + a
+// depth of EXACTLY 16. With one depth-24 answer for every config it matched
+// nothing, took its no-config branch, and android_main returned before its
+// first GL call — no error, no log, just a thread that was there and then was
+// not. A device that offers only depth-24 configs is an unusual device; every
+// real GLES driver offers both.
+//
+// Order matters only to the extent that eglChooseConfig picks by index, so the
+// depth-16 entry goes LAST and Unity's answer is unchanged.
+static struct { int id, es_bits, samples, depth; } g_configs[] = {
+    {1, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 0, 24},   // the one Unity will pick
+    {2, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 4, 24},   // 4x MSAA
+    {3, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 0, 16},   // what libvrlink_scene requires
 };
 #define NCONFIGS ((int)(sizeof g_configs / sizeof g_configs[0]))
 
@@ -981,6 +993,25 @@ static unsigned klegl_ChooseConfig(EGLDisplay dpy, const int32_t *attribs,
     return EGL_TRUE;
 }
 
+// The other way round from eglChooseConfig: hand over the whole list and let
+// the caller filter it itself with eglGetConfigAttrib. libvrlink_scene does it
+// this way rather than describing what it wants in an attribute list, so both
+// entry points have to agree about what configs exist — they are the same
+// g_configs, which is what makes that automatic.
+//
+// Passing configs == NULL is the standard "how many are there?" query, and it
+// must not be confused with a zero-sized buffer.
+static unsigned klegl_GetConfigs(EGLDisplay dpy, EGLConfig *configs,
+                                 int32_t size, int32_t *num) {
+    (void)dpy;
+    if (!num) { g_error = EGL_BAD_PARAMETER; return EGL_FALSE; }
+    if (!configs) { *num = NCONFIGS; return EGL_TRUE; }
+    int n = size < NCONFIGS ? size : NCONFIGS;
+    for (int i = 0; i < n; i++) configs[i] = (EGLConfig)&g_configs[i];
+    *num = n;
+    return EGL_TRUE;
+}
+
 static unsigned klegl_GetConfigAttrib(EGLDisplay dpy, EGLConfig cfg,
                                       int32_t attr, int32_t *value) {
     (void)dpy;
@@ -992,7 +1023,7 @@ static unsigned klegl_GetConfigAttrib(EGLDisplay dpy, EGLConfig cfg,
     case EGL_RED_SIZE: case EGL_GREEN_SIZE: case EGL_BLUE_SIZE:
     case EGL_ALPHA_SIZE:        *value = 8; break;
     case EGL_BUFFER_SIZE:       *value = 32; break;
-    case EGL_DEPTH_SIZE:        *value = 24; break;
+    case EGL_DEPTH_SIZE:        *value = c->depth; break;
     case EGL_STENCIL_SIZE:      *value = 8; break;
     case EGL_SAMPLES:           *value = c->samples; break;
     case EGL_SAMPLE_BUFFERS:    *value = c->samples ? 1 : 0; break;
@@ -1244,6 +1275,7 @@ static const struct { const char *name; void *fn; } g_egl[] = {
     E("eglTerminate",           klegl_Terminate),
     E("eglQueryString",         klegl_QueryString),
     E("eglChooseConfig",        klegl_ChooseConfig),
+    E("eglGetConfigs",          klegl_GetConfigs),
     E("eglGetConfigAttrib",     klegl_GetConfigAttrib),
     E("eglCreateWindowSurface", klegl_CreateWindowSurface),
     E("eglCreatePbufferSurface",klegl_CreatePbufferSurface),

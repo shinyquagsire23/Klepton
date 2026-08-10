@@ -545,6 +545,8 @@ static float klovrp_eye_height(void) {
     return g_tracking_origin == 0 ? 0.0f : h;
 }
 
+float kl_ovrp_eye_height(void) { return klovrp_eye_height(); }
+
 // --- One pose per guest frame, and why the live one is wrong ---------------
 //
 // **This is what was left of the judder after the swapchain was fixed.**
@@ -698,6 +700,41 @@ static klovrp_pose klovrp_qmul(const klovrp_pose *a, const float b[4]) {
     r.qy = aw * by - ax * bz + ay * bw + az * bx;
     r.qz = aw * bz + ax * by - ay * bx + az * bw;
     return r;
+}
+
+// The eye view, for a guest that does not speak OVRPlugin — see kl_ovrp.h.
+// This is klovrp_GetNodePoseState's node-0/1 arm and klovrp_GetNodeFrustum2's
+// tangents, without the ABI: same latched head, same offsets, same cant, same
+// frustum. Deliberately NOT a reimplementation — the whole reason it lives in
+// this file is that the pieces it composes are the ones that already carry the
+// per-frame latch and the display's measured geometry.
+void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz,
+                      float *qx, float *qy, float *qz, float *qw,
+                      float tangents[4]) {
+    if ((unsigned)eye > 1) eye = 0;
+    klovrp_pose head = klovrp_head();
+
+    float dx, dy, dz, ox, oy, oz;
+    klovrp_eye_offset(eye, &dx, &dy, &dz);
+    klovrp_qrot(&head, dx, dy, dz, &ox, &oy, &oz);
+    klovrp_pose e = klovrp_eye_cant() ? klovrp_qmul(&head, g_eye_rot[eye]) : head;
+
+    if (px) *px = head.px + ox;
+    if (py) *py = head.py + oy;
+    if (pz) *pz = head.pz + oz;
+    if (qx) *qx = e.qx; if (qy) *qy = e.qy;
+    if (qz) *qz = e.qz; if (qw) *qw = e.qw;
+    if (tangents) memcpy(tangents, g_eye_tan[eye], sizeof g_eye_tan[eye]);
+}
+
+// The guest's head — the latched one. See the header for why this is a
+// different function from kl_ovrp_get_head_pose rather than a parameter on it.
+void kl_ovrp_get_guest_head_pose(float *px, float *py, float *pz,
+                                 float *qx, float *qy, float *qz, float *qw) {
+    klovrp_pose h = klovrp_head();
+    if (px) *px = h.px; if (py) *py = h.py; if (pz) *pz = h.pz;
+    if (qx) *qx = h.qx; if (qy) *qy = h.qy;
+    if (qz) *qz = h.qz; if (qw) *qw = h.qw;
 }
 
 void kl_ovrp_set_head_pose(float px, float py, float pz,

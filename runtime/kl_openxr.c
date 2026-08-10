@@ -1,0 +1,2085 @@
+// libklepton_openxr — the synthetic OpenXR runtime. See kl_openxr.h for why
+// the Khronos loader is replaced rather than translated.
+//
+// The shape is kl_ovrp.c's, deliberately, because the problem is the same one:
+// a large XR API surface where the guest calls an unknown subset, and guessing
+// at the subset is how a session gets spent implementing functions nothing ever
+// invokes. So every entry point exists and is resolvable, and the ones we have
+// not built refuse BY NAME. The list below is the measured import list of
+// libvrlink_scene.so, all forty-six of them, in the order the header explains,
+// plus the two that arrive only through xrGetInstanceProcAddr.
+//
+// The file reads in the order the guest walks it, which is also the order it
+// was written in — one abort at a time, running the guest between each:
+//
+//   the surface and the refusal          every name, and how an unbuilt one says so
+//   xrGetInstanceProcAddr                the bootstrap, and the extension door
+//   the boot sequence                    extensions, instance, system, views
+//   the session                          and the state machine xrPollEvent drives
+//   spaces                               reference and action frames
+//   actions                              bookkeeping, and the binding census
+//   swapchains                           the eye images — where this meets P5
+//   the frame loop                       wait/begin/end, locate views and spaces
+//
+// Two things about the ABI, since neither is obvious from the spec text:
+//
+//   - Every xr* function returns XrResult, an int32 where **0 is XR_SUCCESS**
+//     and negatives are failures. Trap 10 is the standing warning here: on the
+//     OVRPlugin side, answering a plain "1 for true" to a function that returns
+//     a result code produced a *failure* the engine ignored and managed code
+//     tripped over three layers away. The same mistake is available here and
+//     would look exactly as innocent.
+//   - Structures are versioned by a `type` enum in their first field and
+//     chained through `next`. We never invent a layout: anything we fill in is
+//     transcribed from the specification, and anything we have not transcribed
+//     is a refusal rather than a partly-populated struct.
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+#include "kl_openxr.h"
+#include "kl_ovrp.h"
+#include "kl_egl.h"
+#include "kl_glfb.h"
+#include "kl_env.h"
+#include "klepton.h"
+
+// ------------------------------------------------------- transcribed from the spec
+// Only what we actually read or write. Every layout below is copied field for
+// field from the Khronos openxr.h (1.0.x, and these are all core-since-1.0 so
+// the minor version does not move them) — the header is NOT vendored, because
+// what we need is a dozen structs and the alternative is 5,000 lines of enum
+// that would then have to be kept current for no benefit.
+//
+// The three rules that keep this honest, all of them learned elsewhere:
+//   - Handles are XR_DEFINE_HANDLE, i.e. pointers on LP64. Ours point at our
+//     own singletons and carry a magic, so a handle from the wrong door is a
+//     named refusal rather than a wild read (trap 3's cousin).
+//   - `type`/`next` lead every struct. We never *write* into a `next` we did
+//     not recognise, and we log the chain, because a chained struct the guest
+//     appended is a capability question it is asking us and silence is the
+//     honest answer for one we do not implement.
+//   - uint32_t before pointers means padding. Every struct here is written out
+//     in full rather than with the fields we care about, so the offsets are the
+//     compiler's problem and not ours.
+typedef uint64_t XrVersion;
+typedef int32_t  XrResult;
+typedef uint32_t XrBool32;
+typedef uint64_t XrSystemId;
+
+#define XR_MAX_EXTENSION_NAME_SIZE   128
+#define XR_MAX_APPLICATION_NAME_SIZE 128
+#define XR_MAX_ENGINE_NAME_SIZE      128
+#define XR_MAX_RUNTIME_NAME_SIZE     128
+#define XR_MAX_SYSTEM_NAME_SIZE      256
+
+#define XR_MAKE_VERSION(maj, min, pat) \
+    ((((uint64_t)(maj) & 0xffffULL) << 48) | (((uint64_t)(min) & 0xffffULL) << 32) | \
+     ((uint64_t)(pat) & 0xffffffffULL))
+
+enum {
+    XR_TYPE_EXTENSION_PROPERTIES        = 2,
+    XR_TYPE_INSTANCE_CREATE_INFO        = 3,
+    XR_TYPE_SYSTEM_GET_INFO             = 4,
+    XR_TYPE_SYSTEM_PROPERTIES           = 5,
+    XR_TYPE_INSTANCE_PROPERTIES         = 32,
+    XR_TYPE_VIEW_CONFIGURATION_VIEW     = 41,
+    XR_TYPE_SESSION_CREATE_INFO         = 8,
+    XR_TYPE_SESSION_BEGIN_INFO          = 10,
+    XR_TYPE_EVENT_DATA_BUFFER           = 16,
+    XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED = 18,
+    XR_TYPE_REFERENCE_SPACE_CREATE_INFO = 37,
+    XR_TYPE_SPACE_LOCATION              = 42,
+    XR_TYPE_ACTION_STATE_BOOLEAN        = 23,
+    XR_TYPE_ACTION_STATE_FLOAT          = 24,
+    XR_TYPE_ACTION_STATE_POSE           = 27,
+    XR_TYPE_ACTION_SET_CREATE_INFO      = 28,
+    XR_TYPE_ACTION_CREATE_INFO          = 29,
+    XR_TYPE_ACTION_SPACE_CREATE_INFO    = 38,
+    XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING = 51,
+    XR_TYPE_INTERACTION_PROFILE_STATE   = 53,
+    XR_TYPE_ACTION_STATE_GET_INFO       = 58,
+    XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO = 60,
+    XR_TYPE_ACTIONS_SYNC_INFO           = 61,
+    XR_TYPE_SWAPCHAIN_CREATE_INFO       = 9,
+    XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO = 55,
+    XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO   = 56,
+    XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO = 57,
+    XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR = 1000024002,
+    XR_TYPE_VIEW_LOCATE_INFO            = 6,
+    XR_TYPE_VIEW                        = 7,
+    XR_TYPE_VIEW_STATE                  = 11,
+    XR_TYPE_FRAME_END_INFO              = 12,
+    XR_TYPE_FRAME_WAIT_INFO             = 33,
+    XR_TYPE_COMPOSITION_LAYER_PROJECTION = 35,
+    XR_TYPE_COMPOSITION_LAYER_QUAD      = 36,
+    XR_TYPE_FRAME_STATE                 = 44,
+    XR_TYPE_FRAME_BEGIN_INFO            = 46,
+    XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW = 48,
+    XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR = 1000024001,
+    XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR = 1000024003,
+};
+
+// The session states, and the order is the state machine: a runtime walks an
+// app forward through them and the app is only allowed to call xrBeginSession
+// in READY and xrEndSession in STOPPING.
+enum {
+    KLXR_SESSION_STATE_UNKNOWN = 0, KLXR_SESSION_STATE_IDLE = 1,
+    KLXR_SESSION_STATE_READY = 2,   KLXR_SESSION_STATE_SYNCHRONIZED = 3,
+    KLXR_SESSION_STATE_VISIBLE = 4, KLXR_SESSION_STATE_FOCUSED = 5,
+    KLXR_SESSION_STATE_STOPPING = 6, KLXR_SESSION_STATE_LOSS_PENDING = 7,
+    KLXR_SESSION_STATE_EXITING = 8,
+};
+
+typedef struct { int32_t type; void *next;
+                 char extensionName[XR_MAX_EXTENSION_NAME_SIZE];
+                 uint32_t extensionVersion; } XrExtensionProperties;
+
+typedef struct { char applicationName[XR_MAX_APPLICATION_NAME_SIZE];
+                 uint32_t applicationVersion;
+                 char engineName[XR_MAX_ENGINE_NAME_SIZE];
+                 uint32_t engineVersion;
+                 XrVersion apiVersion; } XrApplicationInfo;
+
+typedef struct { int32_t type; const void *next;
+                 uint64_t createFlags;
+                 XrApplicationInfo applicationInfo;
+                 uint32_t enabledApiLayerCount;
+                 const char *const *enabledApiLayerNames;
+                 uint32_t enabledExtensionCount;
+                 const char *const *enabledExtensionNames; } XrInstanceCreateInfo;
+
+typedef struct { int32_t type; void *next;
+                 XrVersion runtimeVersion;
+                 char runtimeName[XR_MAX_RUNTIME_NAME_SIZE]; } XrInstanceProperties;
+
+typedef struct { int32_t type; const void *next;
+                 int32_t formFactor; } XrSystemGetInfo;
+
+typedef struct { uint32_t maxSwapchainImageHeight, maxSwapchainImageWidth,
+                          maxLayerCount; } XrSystemGraphicsProperties;
+typedef struct { XrBool32 orientationTracking, positionTracking;
+               } XrSystemTrackingProperties;
+
+typedef struct { int32_t type; void *next;
+                 XrSystemId systemId;
+                 uint32_t vendorId;
+                 char systemName[XR_MAX_SYSTEM_NAME_SIZE];
+                 XrSystemGraphicsProperties graphicsProperties;
+                 XrSystemTrackingProperties trackingProperties; } XrSystemProperties;
+
+typedef struct { int32_t type; void *next;
+                 XrVersion minApiVersionSupported,
+                           maxApiVersionSupported; } XrGraphicsRequirementsOpenGLESKHR;
+
+typedef struct { int32_t type; const void *next;
+                 uint64_t createFlags;
+                 XrSystemId systemId; } XrSessionCreateInfo;
+
+typedef struct { int32_t type; const void *next;
+                 void *display, *config, *context;
+               } XrGraphicsBindingOpenGLESAndroidKHR;
+
+typedef struct { int32_t type; const void *next;
+                 int32_t primaryViewConfigurationType; } XrSessionBeginInfo;
+
+typedef struct { float x, y, z, w; } XrQuaternionf;
+typedef struct { float x, y, z; } XrVector3f;
+typedef struct { XrQuaternionf orientation; XrVector3f position; } XrPosef;
+typedef struct { float width, height; } XrExtent2Df;
+
+typedef struct { int32_t type; const void *next;
+                 int32_t referenceSpaceType;
+                 XrPosef poseInReferenceSpace; } XrReferenceSpaceCreateInfo;
+
+typedef struct { int32_t type; void *next;
+                 uint64_t locationFlags;
+                 XrPosef pose; } XrSpaceLocation;
+
+// ---- actions. XrPath is an interned string, uint64, 0 = XR_NULL_PATH ----
+typedef uint64_t XrPath;
+
+#define XR_MAX_PATH_LENGTH                    256
+#define XR_MAX_ACTION_SET_NAME_SIZE           64
+#define XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE 128
+#define XR_MAX_ACTION_NAME_SIZE               64
+#define XR_MAX_LOCALIZED_ACTION_NAME_SIZE     128
+
+typedef struct { int32_t type; const void *next;
+                 char actionSetName[XR_MAX_ACTION_SET_NAME_SIZE];
+                 char localizedActionSetName[XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE];
+                 uint32_t priority; } XrActionSetCreateInfo;
+
+typedef struct { int32_t type; const void *next;
+                 char actionName[XR_MAX_ACTION_NAME_SIZE];
+                 int32_t actionType;
+                 uint32_t countSubactionPaths;
+                 const XrPath *subactionPaths;
+                 char localizedActionName[XR_MAX_LOCALIZED_ACTION_NAME_SIZE];
+               } XrActionCreateInfo;
+
+typedef struct { int32_t type; const void *next;
+                 void *action; XrPath subactionPath;
+                 XrPosef poseInActionSpace; } XrActionSpaceCreateInfo;
+
+typedef struct { void *action; XrPath binding; } XrActionSuggestedBinding;
+typedef struct { int32_t type; const void *next;
+                 XrPath interactionProfile;
+                 uint32_t countSuggestedBindings;
+                 const XrActionSuggestedBinding *suggestedBindings;
+               } XrInteractionProfileSuggestedBinding;
+
+typedef struct { int32_t type; const void *next;
+                 uint32_t countActionSets;
+                 void *const *actionSets; } XrSessionActionSetsAttachInfo;
+
+typedef struct { int32_t type; void *next;
+                 XrPath interactionProfile; } XrInteractionProfileState;
+
+typedef struct { void *actionSet; XrPath subactionPath; } XrActiveActionSet;
+typedef struct { int32_t type; const void *next;
+                 uint32_t countActiveActionSets;
+                 const XrActiveActionSet *activeActionSets; } XrActionsSyncInfo;
+
+typedef struct { int32_t type; const void *next;
+                 void *action; XrPath subactionPath; } XrActionStateGetInfo;
+
+typedef struct { int32_t type; void *next;
+                 XrBool32 currentState, changedSinceLastSync;
+                 int64_t lastChangeTime; XrBool32 isActive; } XrActionStateBoolean;
+typedef struct { int32_t type; void *next;
+                 float currentState; XrBool32 changedSinceLastSync;
+                 int64_t lastChangeTime; XrBool32 isActive; } XrActionStateFloat;
+typedef struct { int32_t type; void *next;
+                 XrBool32 isActive; } XrActionStatePose;
+
+typedef struct { int32_t type; const void *next;
+                 uint64_t createFlags, usageFlags;
+                 int64_t  format;
+                 uint32_t sampleCount, width, height,
+                          faceCount, arraySize, mipCount; } XrSwapchainCreateInfo;
+
+// The image struct is polymorphic by graphics API: the app passes an array of
+// whatever its binding's image type is, and the runtime writes into it after
+// checking `type`. For GLES that is one uint32 GL texture name per image.
+typedef struct { int32_t type; void *next; uint32_t image;
+               } XrSwapchainImageOpenGLESKHR;
+
+typedef struct { int32_t type; const void *next; } XrSwapchainImageAcquireInfo;
+typedef struct { int32_t type; const void *next;
+                 int64_t timeout; } XrSwapchainImageWaitInfo;
+typedef struct { int32_t type; const void *next; } XrSwapchainImageReleaseInfo;
+
+// ---- the frame loop ----
+typedef struct { float angleLeft, angleRight, angleUp, angleDown; } XrFovf;
+
+typedef struct { int32_t type; const void *next; } XrFrameWaitInfo;
+typedef struct { int32_t type; void *next;
+                 int64_t predictedDisplayTime, predictedDisplayPeriod;
+                 XrBool32 shouldRender; } XrFrameState;
+typedef struct { int32_t type; const void *next; } XrFrameBeginInfo;
+
+typedef struct { int32_t x, y; } XrOffset2Di;
+typedef struct { int32_t width, height; } XrExtent2Di;
+typedef struct { XrOffset2Di offset; XrExtent2Di extent; } XrRect2Di;
+typedef struct { void *swapchain; XrRect2Di imageRect;
+                 uint32_t imageArrayIndex; } XrSwapchainSubImage;
+
+// Only the header is common to every layer type. A runtime reads `type` and
+// casts, exactly as it does for the swapchain images — so a layer type we do
+// not recognise must be SKIPPED, not cast to the one we do.
+typedef struct { int32_t type; const void *next;
+                 uint64_t layerFlags; void *space; } XrCompositionLayerBaseHeader;
+
+typedef struct { int32_t type; const void *next;
+                 XrPosef pose; XrFovf fov;
+                 XrSwapchainSubImage subImage; } XrCompositionLayerProjectionView;
+typedef struct { int32_t type; const void *next;
+                 uint64_t layerFlags; void *space;
+                 uint32_t viewCount;
+                 const XrCompositionLayerProjectionView *views;
+               } XrCompositionLayerProjection;
+
+typedef struct { int32_t type; const void *next;
+                 int64_t displayTime;
+                 int32_t environmentBlendMode;
+                 uint32_t layerCount;
+                 const XrCompositionLayerBaseHeader *const *layers;
+               } XrFrameEndInfo;
+
+typedef struct { int32_t type; const void *next;
+                 int32_t viewConfigurationType;
+                 int64_t displayTime;
+                 void *space; } XrViewLocateInfo;
+typedef struct { int32_t type; void *next;
+                 uint64_t viewStateFlags; } XrViewState;
+typedef struct { int32_t type; void *next;
+                 XrPosef pose; XrFovf fov; } XrView;
+
+// XrEventDataBuffer is the app's inbox: 4,000 bytes it hands us that we write
+// the *largest* event structure into. Every event type starts type/next, so the
+// app reads `type` and casts — which means writing more than we should into one
+// is a buffer the app then reads as a different shape.
+typedef struct { int32_t type; const void *next;
+                 uint8_t varying[4000]; } XrEventDataBuffer;
+typedef struct { int32_t type; const void *next;
+                 void *session; int32_t state; int64_t time;
+               } XrEventDataSessionStateChanged;
+
+typedef struct { int32_t type; void *next;
+                 uint32_t recommendedImageRectWidth, maxImageRectWidth;
+                 uint32_t recommendedImageRectHeight, maxImageRectHeight;
+                 uint32_t recommendedSwapchainSampleCount,
+                          maxSwapchainSampleCount; } XrViewConfigurationView;
+
+// The result codes we return. Named as the spec names them so a value in a
+// guest log ("error: -7") can be read straight off this list.
+enum {
+    // successes first (OpenXR has several non-zero ones, and every one of them
+    // is >= 0 — a caller testing `== XR_SUCCESS` misreads them all)
+    KLXR_SUCCESS                        = 0,
+    KLXR_EVENT_UNAVAILABLE              = 4,
+    KLXR_SPACE_BOUNDS_UNAVAILABLE       = 7,
+    // ...then the failures, in the spec's own numeric order so a code in a
+    // guest log can be found by scanning
+    KLXR_ERROR_VALIDATION_FAILURE       = -1,
+    KLXR_ERROR_RUNTIME_FAILURE          = -2,
+    KLXR_ERROR_FUNCTION_UNSUPPORTED     = -7,
+    KLXR_ERROR_FEATURE_UNSUPPORTED      = -8,
+    KLXR_ERROR_EXTENSION_NOT_PRESENT    = -9,
+    KLXR_ERROR_LIMIT_REACHED            = -10,
+    KLXR_ERROR_SIZE_INSUFFICIENT        = -11,
+    KLXR_ERROR_HANDLE_INVALID           = -12,
+    KLXR_ERROR_SESSION_RUNNING          = -14,
+    KLXR_ERROR_SESSION_NOT_RUNNING      = -16,
+    KLXR_ERROR_SYSTEM_INVALID           = -18,
+    KLXR_ERROR_PATH_INVALID             = -19,
+    KLXR_ERROR_PATH_COUNT_EXCEEDED      = -20,
+    KLXR_ERROR_PATH_FORMAT_INVALID      = -21,
+    KLXR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED = -26,
+    KLXR_ERROR_SESSION_NOT_READY        = -28,
+    KLXR_ERROR_SESSION_NOT_STOPPING     = -29,
+    KLXR_ERROR_REFERENCE_SPACE_UNSUPPORTED = -31,
+    KLXR_ERROR_FORM_FACTOR_UNSUPPORTED  = -34,
+    KLXR_ERROR_CALL_ORDER_INVALID       = -37,
+    KLXR_ERROR_GRAPHICS_DEVICE_INVALID  = -38,
+    KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED = -41,
+    KLXR_ERROR_ACTIONSET_NOT_ATTACHED   = -46,
+    KLXR_ERROR_ACTIONSETS_ALREADY_ATTACHED = -47,
+    KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING = -50,
+};
+
+enum { KLXR_FORM_FACTOR_HMD = 1 };
+
+// The "is this real" bits on a located space or view. VALID says the value is
+// meaningful; TRACKED says it is being actively measured rather than inferred.
+// Reporting VALID without TRACKED is how a runtime says "this is my best guess
+// while tracking is lost", and an app is entitled to dim or freeze on it.
+enum { KLXR_SPACE_ORIENTATION_VALID = 0x1, KLXR_SPACE_POSITION_VALID = 0x2,
+       KLXR_SPACE_ORIENTATION_TRACKED = 0x4, KLXR_SPACE_POSITION_TRACKED = 0x8 };
+enum { KLXR_VIEW_ORIENTATION_VALID = 0x1, KLXR_VIEW_POSITION_VALID = 0x2,
+       KLXR_VIEW_ORIENTATION_TRACKED = 0x4, KLXR_VIEW_POSITION_TRACKED = 0x8 };
+enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
+
+// ---------------------------------------------------------------- the surface
+// The forty-six names libvrlink_scene.so imports, grouped the way the API is:
+// instance/system, session, spaces, swapchains, the frame loop, actions, and
+// the two haptic calls. Keeping the groups visible matters because the guest
+// works through them roughly in this order, so the group a refusal lands in
+// says how far the boot got without reading the whole log.
+#define KL_XR_ENTRY_POINTS(X)                                                  \
+    /* instance and system */                                                  \
+    X(xrGetInstanceProcAddr)                                                   \
+    X(xrEnumerateInstanceExtensionProperties)                                  \
+    X(xrCreateInstance) X(xrDestroyInstance)                                   \
+    X(xrGetInstanceProperties) X(xrResultToString)                             \
+    X(xrGetSystem) X(xrGetSystemProperties)                                    \
+    X(xrEnumerateViewConfigurationViews)                                       \
+    /* session lifecycle */                                                    \
+    X(xrCreateSession) X(xrDestroySession)                                     \
+    X(xrBeginSession) X(xrEndSession) X(xrRequestExitSession)                  \
+    X(xrPollEvent)                                                             \
+    /* spaces */                                                               \
+    X(xrCreateReferenceSpace) X(xrDestroySpace)                                \
+    X(xrGetReferenceSpaceBoundsRect) X(xrLocateSpace)                          \
+    /* swapchains */                                                           \
+    X(xrEnumerateSwapchainFormats)                                             \
+    X(xrCreateSwapchain) X(xrDestroySwapchain)                                 \
+    X(xrEnumerateSwapchainImages)                                              \
+    X(xrAcquireSwapchainImage) X(xrWaitSwapchainImage)                         \
+    X(xrReleaseSwapchainImage)                                                 \
+    /* the frame loop */                                                       \
+    X(xrWaitFrame) X(xrBeginFrame) X(xrEndFrame) X(xrLocateViews)              \
+    /* actions (input) */                                                      \
+    X(xrStringToPath) X(xrPathToString)                                        \
+    X(xrCreateActionSet) X(xrDestroyActionSet)                                 \
+    X(xrCreateAction) X(xrDestroyAction) X(xrCreateActionSpace)                \
+    X(xrSuggestInteractionProfileBindings) X(xrAttachSessionActionSets)        \
+    X(xrGetCurrentInteractionProfile) X(xrSyncActions)                         \
+    X(xrGetActionStateBoolean) X(xrGetActionStateFloat)                        \
+    X(xrGetActionStatePose)                                                    \
+    /* haptics */                                                              \
+    X(xrApplyHapticFeedback) X(xrStopHapticFeedback)                           \
+    /* extensions — NOT in any import list, reachable only through             \
+       xrGetInstanceProcAddr, which is why the "not served" line in that       \
+       function exists: it is the only way one of these ever gets named. Each  \
+       one below was added because that line named it and the guest then       \
+       called the null pointer it got back. */                                 \
+    X(xrInitializeLoaderKHR)                                                   \
+    X(xrGetOpenGLESGraphicsRequirementsKHR)
+
+// ------------------------------------------------------------------ bookkeeping
+// One row per entry point: resolved counts lookups, called counts calls. The
+// two are reported separately for the reason in the header — a name the guest
+// resolved and never called is not a work item, and conflating them is how a
+// work list doubles in size for no reason.
+typedef struct { const char *name; void *fn; unsigned resolved, called; } klxr_row;
+
+#define X(n) static int klxr_stub_##n(void);
+KL_XR_ENTRY_POINTS(X)
+#undef X
+
+static klxr_row g_xr[] = {
+#define X(n) { #n, (void *)klxr_stub_##n, 0, 0 },
+    KL_XR_ENTRY_POINTS(X)
+#undef X
+};
+#define KLXR_COUNT ((int)(sizeof g_xr / sizeof g_xr[0]))
+
+static klxr_row *klxr_row_for(const char *name) {
+    for (int i = 0; i < KLXR_COUNT; i++)
+        if (strcmp(g_xr[i].name, name) == 0) return &g_xr[i];
+    return NULL;
+}
+
+void kl_openxr_report(FILE *f) {
+    unsigned nres = 0, ncall = 0;
+    for (int i = 0; i < KLXR_COUNT; i++) {
+        nres  += g_xr[i].resolved != 0;
+        ncall += g_xr[i].called   != 0;
+    }
+    fprintf(f, "\n=== OpenXR surface (libklepton_openxr) ===\n");
+    fprintf(f, "  %d entry points served; %u resolved, %u called\n",
+            KLXR_COUNT, nres, ncall);
+    if (ncall) {
+        fprintf(f, "  --- called (the SL-8 work list, in call count order) ---\n");
+        for (int i = 0; i < KLXR_COUNT; i++)
+            if (g_xr[i].called)
+                fprintf(f, "    %-42s x%u\n", g_xr[i].name, g_xr[i].called);
+    }
+    // Resolved-but-never-called is printed too, and briefly: it is what says
+    // the guest has a code path it did not take, which is a different fact from
+    // a name it has never heard of.
+    int shown = 0;
+    for (int i = 0; i < KLXR_COUNT; i++)
+        if (g_xr[i].resolved && !g_xr[i].called) {
+            if (!shown++) fprintf(f, "  --- resolved but never called ---\n");
+            fprintf(f, "    %s\n", g_xr[i].name);
+        }
+}
+
+// ------------------------------------------------------------- the refusal
+// Everything not yet built. Named, so the guest says which of the forty-six it
+// wants — the whole point of the surface existing at all.
+//
+// This aborts rather than returning an error code, and that is deliberate. An
+// XrResult failure is a value the guest is entitled to handle, and it would:
+// XrAppManager has error paths and would take one, land somewhere plausible,
+// and the log would show a tidy shutdown with no mention of the function that
+// was missing. That is precisely the "abort read as a crash" confusion in
+// reverse, and it costs more than it saves.
+static int klxr_unimplemented(klxr_row *row) {
+    row->called++;
+    fprintf(stderr, "\n[klepton] fatal: guest called unimplemented OpenXR entry "
+                    "point '%s'\n", row->name);
+    kl_openxr_report(stderr);
+    kl_fatal_prepare();
+    abort();
+}
+
+// The stubs themselves. Declared int(void) and called through whatever pointer
+// type the guest has: AAPCS64 lets a callee ignore arguments it never reads,
+// and none of these reads any.
+#define X(n)                                                                   \
+    static int klxr_stub_##n(void) {                                           \
+        static klxr_row *row;                                                  \
+        if (!row) row = klxr_row_for(#n);                                      \
+        return klxr_unimplemented(row);                                        \
+    }
+KL_XR_ENTRY_POINTS(X)
+#undef X
+
+// --------------------------------------------------- what we do implement
+//
+// xrGetInstanceProcAddr, and it plays exactly the role the ovrp entry table
+// plays in M6: our function handing out our own pointers. It is the one entry
+// point a runtime must serve before anything else exists, because the spec has
+// it work with `instance == XR_NULL_HANDLE` for the bootstrap trio
+// (xrEnumerateInstanceExtensionProperties, xrEnumerateApiLayerProperties,
+// xrCreateInstance) — so it cannot validate the instance, and we do not.
+//
+// A name we do not know is XR_ERROR_FUNCTION_UNSUPPORTED with *function left
+// NULL, which is the specified answer and is a *measurement*, not a failure:
+// the guest is entitled to ask about an extension entry point it will then not
+// use. The assertion is still the call, and the stub it gets back is what
+// makes that assertion by name.
+static int klxr_GetInstanceProcAddr(void *instance, const char *name, void **function) {
+    (void)instance;
+    if (!function) return KLXR_ERROR_FUNCTION_UNSUPPORTED;
+    *function = NULL;
+    if (!name) return KLXR_ERROR_FUNCTION_UNSUPPORTED;
+
+    klxr_row *row = klxr_row_for(name);
+    if (!row) {
+        // Printed once per distinct name and not counted, because it is neither
+        // a resolution nor a call. This is the line that will name any
+        // extension the guest wants — xrGetDisplayRefreshRateFB and friends —
+        // and those never appear in the import list, so without it they would
+        // be invisible until something else broke.
+        fprintf(stderr, "  [xr] xrGetInstanceProcAddr(\"%s\") — not served\n", name);
+        return KLXR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+    row->resolved++;
+    *function = row->fn;
+    return KLXR_SUCCESS;
+}
+
+// xrInitializeLoaderKHR (XR_KHR_loader_init) — the first call this guest makes,
+// before xrCreateInstance and before any extension has been enabled, which is
+// what that extension is for. Its argument is an XrLoaderInitInfoAndroidKHR
+// carrying `applicationVM` and `applicationContext`, and its entire purpose is
+// to give the *Khronos loader* enough JNI to go and find a runtime through the
+// Android broker. We ARE the runtime, so there is nothing to find and nothing
+// we need from the struct — accepting is not a stub standing in for work, it is
+// the work being already done.
+//
+// It has to be served, and the reason is worth keeping: the guest checks the
+// result, LOGS the failure by name ("[CheckXR] Failed to call ... with error:
+// -7") — and then calls the null function pointer anyway. So for this guest a
+// refused proc-addr lookup is a SIGSEGV at 0x0 a moment later, with the honest
+// diagnostic already printed above it. Any name that turns up in the "not
+// served" line is therefore a crash waiting to happen, not a maybe.
+static int klxr_InitializeLoaderKHR(const void *info) {
+    (void)info;
+    return KLXR_SUCCESS;
+}
+
+// ------------------------------------------------------------ the boot sequence
+//
+// Instance, system, view configuration. The guest walks these in order and each
+// one's answer constrains the next, so they are written as one block: the
+// system a form factor resolves to is the system the properties describe, and
+// the view configuration is the one the eye textures will be sized from.
+//
+// **The eye size comes from kl_ovrp, not from a constant here.** That seam is
+// already fed by the visionOS compositor's primeDisplay (it measures the
+// drawable and pushes it), and it already carries the cap and the scale knob
+// that stop a 6888x5525 logical eye turning into hundreds of MiB of swapchain.
+// A second, parallel notion of "how big is an eye" is exactly the kind of thing
+// that would disagree with the first one on device only.
+
+// A handle is a pointer to one of these. The magic is what turns "the guest
+// passed us a session where an instance goes" into a named refusal instead of a
+// wild read — worth the four bytes, because every one of these calls takes a
+// handle and the spec's own answer for a bad one (XR_ERROR_HANDLE_INVALID) is
+// something the guest is equipped to log.
+enum { KLXR_MAGIC_INSTANCE = 0x584b4c49 /* 'XKLI' */ };
+
+typedef struct {
+    uint32_t magic;
+    XrVersion api_version;
+    char      app_name[XR_MAX_APPLICATION_NAME_SIZE];
+    char      engine_name[XR_MAX_ENGINE_NAME_SIZE];
+    int       ext_opengl_es;      // did it enable XR_KHR_opengl_es_enable?
+    int       gl_requirements_queried;   // ...and did it then ask for the range?
+} klxr_instance;
+
+static klxr_instance g_instance;
+
+// systemId is a uint64_t the runtime picks; anything but XR_NULL_SYSTEM_ID (0)
+// is legal, and a constant is right because there is exactly one HMD here.
+enum { KLXR_SYSTEM_ID = 1 };
+
+static klxr_instance *klxr_inst(void *h) {
+    klxr_instance *i = (klxr_instance *)h;
+    return (i && i->magic == KLXR_MAGIC_INSTANCE) ? i : NULL;
+}
+
+// The extensions we advertise, and the list is deliberately short.
+//
+// The guest's own log lines say what it does with the answer: it needs
+// XR_KHR_opengl_es_enable ("XRQCreateXRSession: OpenGLES OpenXR Extension is
+// not available" is a hard stop) and it *handles absence* of the rest —
+// "XR_EXT_display_refresh_rate is not available on this runtime" is a line it
+// prints and carries on from. So the honest answer to the twenty-odd FB/EXT
+// names it knows about is that we do not have them, and every one of those is
+// a feature we would otherwise have to implement to have claimed truthfully.
+//
+// XR_KHR_android_create_instance is here because this guest IS an Android
+// activity and passes its VM and activity object through
+// XrInstanceCreateInfoAndroidKHR; we already hold both.
+static const struct { const char *name; uint32_t version; } g_extensions[] = {
+    { "XR_KHR_opengl_es_enable",       10 },
+    { "XR_KHR_android_create_instance", 3 },
+};
+#define KLXR_EXT_COUNT ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
+
+// The two-call idiom, which every enumerate in OpenXR uses and which is easy to
+// get subtly wrong: capacityInput 0 means "just tell me the count" and must
+// still be XR_SUCCESS, a capacity below the count is XR_ERROR_SIZE_INSUFFICIENT,
+// and countOutput is written in ALL of those cases. Factored out so the four
+// enumerators cannot disagree about it.
+static XrResult klxr_two_call(uint32_t capacity, uint32_t *count_out, uint32_t have) {
+    if (!count_out) return KLXR_ERROR_VALIDATION_FAILURE;
+    *count_out = have;
+    if (capacity == 0) return KLXR_SUCCESS;
+    if (capacity < have) return KLXR_ERROR_SIZE_INSUFFICIENT;
+    return KLXR_SUCCESS;
+}
+
+// Anything chained onto a struct we fill is a capability question. We answer
+// the ones we know and say nothing into the others — but we PRINT them, once
+// each, because a chained type is the guest naming a feature it is prepared to
+// use, which is the same kind of measurement the "not served" line above makes.
+static void klxr_log_chain(const char *where, const void *next) {
+    for (int depth = 0; next && depth < 16; depth++) {
+        int32_t type = *(const int32_t *)next;
+        fprintf(stderr, "  [xr] %s: chained struct type %d — not filled in\n",
+                where, type);
+        next = *(const void *const *)((const char *)next + 8);
+    }
+}
+
+static XrResult klxr_EnumerateInstanceExtensionProperties(
+        const char *layer_name, uint32_t capacity, uint32_t *count_out,
+        XrExtensionProperties *props) {
+    // A layer name we do not have is XR_ERROR_API_LAYER_NOT_PRESENT, but we
+    // have no layers at all, so the only legal argument is NULL and anything
+    // else is the guest asking about something that cannot exist here.
+    if (layer_name && layer_name[0]) return KLXR_ERROR_VALIDATION_FAILURE;
+
+    XrResult r = klxr_two_call(capacity, count_out, KLXR_EXT_COUNT);
+    if (r != KLXR_SUCCESS || capacity == 0) return r;
+    if (!props) return KLXR_ERROR_VALIDATION_FAILURE;
+
+    for (uint32_t i = 0; i < KLXR_EXT_COUNT; i++) {
+        props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
+        snprintf(props[i].extensionName, sizeof props[i].extensionName,
+                 "%s", g_extensions[i].name);
+        props[i].extensionVersion = g_extensions[i].version;
+    }
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **instance) {
+    if (!info || !instance) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_INSTANCE_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+
+    // XrInstanceCreateInfoAndroidKHR rides in `next` and carries the VM and the
+    // activity. We need neither — we made both — so this is logged and not read.
+    klxr_log_chain("xrCreateInstance", info->next);
+
+    memset(&g_instance, 0, sizeof g_instance);
+    g_instance.magic = KLXR_MAGIC_INSTANCE;
+    g_instance.api_version = info->applicationInfo.apiVersion;
+    snprintf(g_instance.app_name, sizeof g_instance.app_name, "%s",
+             info->applicationInfo.applicationName);
+    snprintf(g_instance.engine_name, sizeof g_instance.engine_name, "%s",
+             info->applicationInfo.engineName);
+
+    // Every extension it asks to enable must be one we advertised — the spec
+    // requires XR_ERROR_EXTENSION_NOT_PRESENT otherwise, and accepting silently
+    // would be the worst of both: the guest would believe it had a feature and
+    // find out through a null pointer.
+    fprintf(stderr, "  [xr] xrCreateInstance: app=\"%s\" engine=\"%s\" api=%llu.%llu.%llu\n",
+            g_instance.app_name, g_instance.engine_name,
+            (unsigned long long)(g_instance.api_version >> 48) & 0xffff,
+            (unsigned long long)(g_instance.api_version >> 32) & 0xffff,
+            (unsigned long long)(g_instance.api_version & 0xffffffff));
+    for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
+        const char *name = info->enabledExtensionNames[i];
+        int known = 0;
+        for (uint32_t k = 0; k < KLXR_EXT_COUNT; k++)
+            if (strcmp(name, g_extensions[k].name) == 0) known = 1;
+        fprintf(stderr, "  [xr]   extension: %-40s %s\n", name,
+                known ? "enabled" : "NOT PRESENT");
+        if (!known) { g_instance.magic = 0; return KLXR_ERROR_EXTENSION_NOT_PRESENT; }
+        if (strcmp(name, "XR_KHR_opengl_es_enable") == 0) g_instance.ext_opengl_es = 1;
+    }
+
+    *instance = &g_instance;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_DestroyInstance(void *instance) {
+    klxr_instance *inst = klxr_inst(instance);
+    if (!inst) return KLXR_ERROR_HANDLE_INVALID;
+    inst->magic = 0;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetInstanceProperties(void *instance, XrInstanceProperties *props) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!props) return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrGetInstanceProperties", props->next);
+    props->type = XR_TYPE_INSTANCE_PROPERTIES;
+    props->runtimeVersion = XR_MAKE_VERSION(1, 0, 0);
+    snprintf(props->runtimeName, sizeof props->runtimeName, "Klepton");
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetSystem(void *instance, const XrSystemGetInfo *info,
+                               XrSystemId *system_id) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !system_id) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_SYSTEM_GET_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrGetSystem", info->next);
+    // A handheld display is a phone, and this runtime is not one. Refusing it
+    // is not a limitation we are apologising for — it is the answer that sends
+    // a guest with a 2D fallback down the 2D path, which is the correct one for
+    // a device that is not there.
+    if (info->formFactor != KLXR_FORM_FACTOR_HMD)
+        return KLXR_ERROR_FORM_FACTOR_UNSUPPORTED;
+    *system_id = KLXR_SYSTEM_ID;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
+                                         XrSystemProperties *props) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (!props) return KLXR_ERROR_VALIDATION_FAILURE;
+    // XrSystemHandTrackingPropertiesEXT and friends chain here, and leaving
+    // them untouched is how we report the feature absent: the guest zeroes the
+    // struct before the call, so an unwritten supported flag reads as false.
+    klxr_log_chain("xrGetSystemProperties", props->next);
+
+    int ew = 0, eh = 0;
+    kl_ovrp_eye_texture_size(&ew, &eh);
+
+    props->type = XR_TYPE_SYSTEM_PROPERTIES;
+    props->systemId = system_id;
+    props->vendorId = 0;
+    snprintf(props->systemName, sizeof props->systemName, "Klepton HMD");
+    // The maxima are a ceiling on what a swapchain may ask for, not a
+    // recommendation — so they are generous, and the recommendation lives in
+    // the view configuration below where the guest will actually read it.
+    props->graphicsProperties.maxSwapchainImageWidth  = (uint32_t)(ew > 0 ? ew * 2 : 8192);
+    props->graphicsProperties.maxSwapchainImageHeight = (uint32_t)(eh > 0 ? eh * 2 : 8192);
+    props->graphicsProperties.maxLayerCount = 16;
+    props->trackingProperties.orientationTracking = 1;
+    props->trackingProperties.positionTracking = 1;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_EnumerateViewConfigurationViews(
+        void *instance, XrSystemId system_id, int32_t view_config_type,
+        uint32_t capacity, uint32_t *count_out, XrViewConfigurationView *views) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    // Stereo is the only configuration we offer, and answering for mono would
+    // be answering for a device that is not this one.
+    if (view_config_type != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
+        return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+
+    XrResult r = klxr_two_call(capacity, count_out, 2);
+    if (r != KLXR_SUCCESS || capacity == 0) return r;
+    if (!views) return KLXR_ERROR_VALIDATION_FAILURE;
+
+    int ew = 0, eh = 0;
+    kl_ovrp_eye_texture_size(&ew, &eh);
+    if (ew <= 0 || eh <= 0) { ew = 2290; eh = 2400; }   // the Quest 2 default
+
+    for (uint32_t i = 0; i < 2; i++) {
+        klxr_log_chain("xrEnumerateViewConfigurationViews", views[i].next);
+        views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+        views[i].recommendedImageRectWidth  = (uint32_t)ew;
+        views[i].recommendedImageRectHeight = (uint32_t)eh;
+        views[i].maxImageRectWidth  = (uint32_t)ew * 2;
+        views[i].maxImageRectHeight = (uint32_t)eh * 2;
+        // One sample recommended: the guest resolves into the eye texture
+        // itself, and MSAA there is the shape trap 12's VRR note is about —
+        // a foveated pass whose resolve must stay physical-to-physical.
+        views[i].recommendedSwapchainSampleCount = 1;
+        views[i].maxSwapchainSampleCount = 4;
+    }
+    fprintf(stderr, "  [xr] view configuration: 2 views, recommended %dx%d each\n", ew, eh);
+    return KLXR_SUCCESS;
+}
+
+// xrGetOpenGLESGraphicsRequirementsKHR (XR_KHR_opengl_es_enable) — the gate the
+// spec puts in front of xrCreateSession: a session with a GL binding is
+// XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING unless this was called first, so
+// runtimes get to state a version range before an app commits to a context.
+//
+// The range we state is ANGLE's, because ANGLE is what is underneath: ES 3.0 as
+// the floor (that is the context kl_egl actually creates — trap 9 is the
+// standing reminder that the *description* being 3.2 does not make the context
+// 3.2) and 3.2 as the ceiling we will answer queries for. Overstating the floor
+// is the dangerous direction: an app told it needs 3.2 asks for 3.2, and gets a
+// context whose 3.2 entry points resolve and then fail on use.
+//
+// Not in the import list. It arrives through xrGetInstanceProcAddr, which is
+// exactly what that function's "not served" line was for — it named this, the
+// guest called the null pointer it got back, and the run died at 0x0.
+static XrResult klxr_GetOpenGLESGraphicsRequirementsKHR(
+        void *instance, XrSystemId system_id,
+        XrGraphicsRequirementsOpenGLESKHR *reqs) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (!reqs) return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrGetOpenGLESGraphicsRequirementsKHR", reqs->next);
+    reqs->type = XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR;
+    reqs->minApiVersionSupported = XR_MAKE_VERSION(3, 0, 0);
+    reqs->maxApiVersionSupported = XR_MAKE_VERSION(3, 2, 0);
+    g_instance.gl_requirements_queried = 1;
+    return KLXR_SUCCESS;
+}
+
+// ---------------------------------------------------------- the session, and
+// the state machine that is the actual content of this half.
+//
+// OpenXR does not let an app just start rendering. The runtime walks it forward
+// — IDLE, READY, SYNCHRONIZED, VISIBLE, FOCUSED — by *posting events the app
+// polls for*, and the app is only permitted to call xrBeginSession while it is
+// in READY. So the interesting work here is not xrCreateSession, which is
+// bookkeeping; it is that xrPollEvent has to volunteer transitions the guest is
+// waiting on, in order, and a runtime that posts none leaves a correct app
+// sitting in its event loop forever with nothing wrong anywhere.
+//
+// That is the same shape as the Choreographer in M4 and the looper in SL-8: on
+// Android something else was driving the pump, and here the runtime IS the
+// something else. Third time this class of bug has cost a session, so the
+// transitions are queued eagerly rather than waiting for a frontend to say the
+// headset is worn — we have no such signal on the host, and an idle guest looks
+// exactly like a hung one.
+enum { KLXR_MAGIC_SESSION = 0x584b4c53 /* 'XKLS' */ };
+enum { KLXR_EVENT_QUEUE = 16 };
+
+typedef struct {
+    uint32_t magic;
+    klxr_instance *instance;
+    XrSystemId systemId;
+    void *egl_display, *egl_config, *egl_context;   // the guest's own GL binding
+    int   state;                  // the last state we POSTED, not the next one
+    int   running;                // between xrBeginSession and xrEndSession
+    int   exit_requested;
+    int   action_sets_attached;   // xrAttachSessionActionSets is once, and final
+    int      frame_begun;         // between xrBeginFrame and xrEndFrame
+    int64_t  frame_predicted_time;// what the last xrWaitFrame promised
+    uint64_t frames_waited, frames_ended, layers_ignored;
+    int   queue[KLXR_EVENT_QUEUE];   // pending state transitions, in order
+    int   qhead, qcount;
+} klxr_session;
+
+static klxr_session g_session;
+
+static klxr_session *klxr_sess(void *h) {
+    klxr_session *s = (klxr_session *)h;
+    return (s && s->magic == KLXR_MAGIC_SESSION) ? s : NULL;
+}
+
+// XrTime is int64 nanoseconds on a monotonic clock the runtime chooses. It must
+// be the SAME clock the guest's own timing uses, for the reason the
+// Choreographer note in CLAUDE.md gives: two monotonic clocks differ by an
+// offset, and a frame delta computed across the pair is that offset rather than
+// a duration. CLOCK_MONOTONIC is what System.nanoTime() already answers here.
+static int64_t klxr_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static const char *klxr_state_name(int s) {
+    switch (s) {
+        case KLXR_SESSION_STATE_IDLE:         return "IDLE";
+        case KLXR_SESSION_STATE_READY:        return "READY";
+        case KLXR_SESSION_STATE_SYNCHRONIZED: return "SYNCHRONIZED";
+        case KLXR_SESSION_STATE_VISIBLE:      return "VISIBLE";
+        case KLXR_SESSION_STATE_FOCUSED:      return "FOCUSED";
+        case KLXR_SESSION_STATE_STOPPING:     return "STOPPING";
+        case KLXR_SESSION_STATE_LOSS_PENDING: return "LOSS_PENDING";
+        case KLXR_SESSION_STATE_EXITING:      return "EXITING";
+        default:                              return "UNKNOWN";
+    }
+}
+
+static void klxr_post_state(klxr_session *s, int state) {
+    if (s->qcount >= KLXR_EVENT_QUEUE) {
+        // Dropping a transition would strand the guest in whatever state it was
+        // last told about, so this is loud rather than silent. It should be
+        // unreachable: nothing here queues more than three at a time.
+        fprintf(stderr, "  [xr] event queue full, dropping state %s\n",
+                klxr_state_name(state));
+        return;
+    }
+    s->queue[(s->qhead + s->qcount) % KLXR_EVENT_QUEUE] = state;
+    s->qcount++;
+}
+
+static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *info,
+                                   void **session) {
+    klxr_instance *inst = klxr_inst(instance);
+    if (!inst) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !session) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_SESSION_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->systemId != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+
+    // The graphics binding is chained, not a parameter, and its absence is a
+    // distinct error from a bad one: a headless session (no binding at all) is
+    // legal only with XR_MND_headless, which we do not offer.
+    const XrGraphicsBindingOpenGLESAndroidKHR *gl = NULL;
+    for (const void *n = info->next; n; ) {
+        int32_t type = *(const int32_t *)n;
+        if (type == XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR)
+            gl = (const XrGraphicsBindingOpenGLESAndroidKHR *)n;
+        else
+            fprintf(stderr, "  [xr] xrCreateSession: chained struct type %d — ignored\n", type);
+        n = *(const void *const *)((const char *)n + 8);
+    }
+    if (!gl) {
+        fprintf(stderr, "  [xr] xrCreateSession: no graphics binding chained\n");
+        return KLXR_ERROR_GRAPHICS_DEVICE_INVALID;
+    }
+    if (!inst->gl_requirements_queried)
+        return KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING;
+
+    memset(&g_session, 0, sizeof g_session);
+    g_session.magic = KLXR_MAGIC_SESSION;
+    g_session.instance = inst;
+    g_session.systemId = info->systemId;
+    g_session.egl_display = gl->display;
+    g_session.egl_config  = gl->config;
+    g_session.egl_context = gl->context;
+    g_session.state = KLXR_SESSION_STATE_UNKNOWN;
+
+    fprintf(stderr, "  [xr] xrCreateSession: EGLDisplay %p config %p context %p\n",
+            gl->display, gl->config, gl->context);
+
+    // IDLE then READY, immediately. On a real headset READY waits until the
+    // thing is on someone's head; here there is nothing to wait for, and making
+    // the guest wait would only be a faithful reproduction of an idle headset.
+    klxr_post_state(&g_session, KLXR_SESSION_STATE_IDLE);
+    klxr_post_state(&g_session, KLXR_SESSION_STATE_READY);
+
+    *session = &g_session;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_DestroySession(void *session) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    s->magic = 0;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_BeginSession(void *session, const XrSessionBeginInfo *info) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (s->running) return KLXR_ERROR_SESSION_RUNNING;
+    if (s->state != KLXR_SESSION_STATE_READY) return KLXR_ERROR_SESSION_NOT_READY;
+    if (info->primaryViewConfigurationType != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
+        return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    klxr_log_chain("xrBeginSession", info->next);
+    s->running = 1;
+    // SYNCHRONIZED is "the app's frame loop is now ticking with the runtime's",
+    // VISIBLE is "and its pictures are being shown", FOCUSED is "and it is
+    // receiving input". Nothing here ever takes focus away, so all three go
+    // out together and the guest's own handler walks them in order.
+    klxr_post_state(s, KLXR_SESSION_STATE_SYNCHRONIZED);
+    klxr_post_state(s, KLXR_SESSION_STATE_VISIBLE);
+    klxr_post_state(s, KLXR_SESSION_STATE_FOCUSED);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_EndSession(void *session) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
+    if (s->state != KLXR_SESSION_STATE_STOPPING) return KLXR_ERROR_SESSION_NOT_STOPPING;
+    s->running = 0;
+    klxr_post_state(s, KLXR_SESSION_STATE_IDLE);
+    klxr_post_state(s, s->exit_requested ? KLXR_SESSION_STATE_EXITING
+                                         : KLXR_SESSION_STATE_READY);
+    return KLXR_SUCCESS;
+}
+
+// The app asking to be let go. The runtime's job is to walk it out the same way
+// it walked it in — STOPPING, so the app calls xrEndSession, and then EXITING.
+static XrResult klxr_RequestExitSession(void *session) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
+    s->exit_requested = 1;
+    klxr_post_state(s, KLXR_SESSION_STATE_STOPPING);
+    return KLXR_SUCCESS;
+}
+
+// xrPollEvent — XR_EVENT_UNAVAILABLE (a SUCCESS code, 4, not an error) when the
+// queue is empty, which is the normal answer most frames. Trap 10's warning
+// applies in an unusual direction here: a *positive* result is still success,
+// so a caller testing `result == XR_SUCCESS` rather than `>= 0` would read an
+// empty queue as an event. That is the guest's business, but it is why this
+// returns the specified code rather than an error.
+static XrResult klxr_PollEvent(void *instance, XrEventDataBuffer *data) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!data) return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_session *s = &g_session;
+    if (s->magic != KLXR_MAGIC_SESSION || s->qcount == 0) return KLXR_EVENT_UNAVAILABLE;
+
+    int state = s->queue[s->qhead];
+    s->qhead = (s->qhead + 1) % KLXR_EVENT_QUEUE;
+    s->qcount--;
+    s->state = state;
+
+    XrEventDataSessionStateChanged *ev = (XrEventDataSessionStateChanged *)data;
+    ev->type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED;
+    ev->next = NULL;
+    ev->session = s;
+    ev->state = state;
+    ev->time = klxr_now();
+    fprintf(stderr, "  [xr] session state -> %s\n", klxr_state_name(state));
+    return KLXR_SUCCESS;
+}
+
+// ------------------------------------------------------------------- spaces
+//
+// A space is a coordinate frame with a handle. There are two kinds and we serve
+// both from one pool, because from here they differ only in what they are
+// anchored to: a REFERENCE space is anchored to the world or the head, an
+// ACTION space to whatever a pose action is tracking (a controller grip, an
+// aim ray).
+//
+// **What is NOT here yet is xrLocateSpace's real answer**, and the reason is
+// the standing rule rather than an oversight: locating a space against another
+// is where the head pose enters, and the head pose has a per-frame LATCH in
+// kl_ovrp that exists because reading it live mid-frame is precisely the bug
+// behind the visionOS temporal doubling (PLANNING §12.19). Wiring a second
+// consumer to the unlatched value would reintroduce it in a new place. So
+// spaces are created and named here, and the locate lands with the frame loop
+// that latches.
+enum { KLXR_MAGIC_SPACE = 0x584b4c50 /* 'XKLP' */, KLXR_SPACE_MAX = 32 };
+
+enum { KLXR_REF_SPACE_VIEW = 1, KLXR_REF_SPACE_LOCAL = 2, KLXR_REF_SPACE_STAGE = 3 };
+
+typedef struct {
+    uint32_t magic;
+    klxr_session *session;
+    int     reference_type;       // one of the three above, 0 for an action space
+    XrPosef offset;               // poseInReferenceSpace / poseInActionSpace
+    void   *action;               // action spaces only: what this is anchored to
+    XrPath  subaction_path;       // ...and which hand of it
+} klxr_space;
+
+static klxr_space g_spaces[KLXR_SPACE_MAX];
+
+static klxr_space *klxr_space_of(void *h) {
+    klxr_space *s = (klxr_space *)h;
+    if (!s || s->magic != KLXR_MAGIC_SPACE) return NULL;
+    // A pointer with our magic that is not IN the pool is a guest bug we would
+    // rather name than follow.
+    if (s < g_spaces || s >= g_spaces + KLXR_SPACE_MAX) return NULL;
+    return s;
+}
+
+static klxr_space *klxr_space_alloc(void) {
+    for (int i = 0; i < KLXR_SPACE_MAX; i++)
+        if (!g_spaces[i].magic) return &g_spaces[i];
+    return NULL;
+}
+
+static const char *klxr_ref_space_name(int t) {
+    switch (t) {
+        case KLXR_REF_SPACE_VIEW:  return "VIEW";
+        case KLXR_REF_SPACE_LOCAL: return "LOCAL";
+        case KLXR_REF_SPACE_STAGE: return "STAGE";
+        default:                   return "?";
+    }
+}
+
+// The y of a reference space's origin in the tracking space kl_ovrp answers in.
+//
+// That space is floor-relative: y = 0 is the floor and the head stands at
+// KL_OVRP_EYE_HEIGHT above it. So STAGE is the tracking space unchanged, and
+// LOCAL — whose origin OpenXR puts where the head started, at eye level — is
+// that same space raised by the standing height. VIEW has no fixed origin at
+// all; it IS the head, so it never appears here as a base.
+//
+// Getting this wrong is not subtle in the end result and is very subtle in the
+// code: an app that places its UI in LOCAL and is answered STAGE puts every
+// panel on the floor.
+static float klxr_space_origin_y(const klxr_space *sp) {
+    if (!sp) return 0.0f;
+    if (sp->reference_type == KLXR_REF_SPACE_LOCAL) return kl_ovrp_eye_height();
+    return 0.0f;    // STAGE, and the tracking space itself
+}
+
+static XrResult klxr_CreateReferenceSpace(void *session,
+                                          const XrReferenceSpaceCreateInfo *info,
+                                          void **space) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !space) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_REFERENCE_SPACE_CREATE_INFO)
+        return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrCreateReferenceSpace", info->next);
+
+    // VIEW, LOCAL and STAGE are the three every runtime must offer. The vendor
+    // ones (UNBOUNDED_MSFT and friends) are extensions we do not advertise, and
+    // refusing by name here is what makes a guest that wanted one say so.
+    if (info->referenceSpaceType != KLXR_REF_SPACE_VIEW &&
+        info->referenceSpaceType != KLXR_REF_SPACE_LOCAL &&
+        info->referenceSpaceType != KLXR_REF_SPACE_STAGE) {
+        fprintf(stderr, "  [xr] xrCreateReferenceSpace: type %d unsupported\n",
+                info->referenceSpaceType);
+        return KLXR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+    }
+
+    klxr_space *sp = klxr_space_alloc();
+    if (!sp) return KLXR_ERROR_LIMIT_REACHED;
+    sp->magic = KLXR_MAGIC_SPACE;
+    sp->session = s;
+    sp->reference_type = info->referenceSpaceType;
+    sp->offset = info->poseInReferenceSpace;
+    fprintf(stderr, "  [xr] reference space %s at (%.3f %.3f %.3f)\n",
+            klxr_ref_space_name(sp->reference_type),
+            sp->offset.position.x, sp->offset.position.y, sp->offset.position.z);
+    *space = sp;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_DestroySpace(void *space) {
+    klxr_space *sp = klxr_space_of(space);
+    if (!sp) return KLXR_ERROR_HANDLE_INVALID;
+    memset(sp, 0, sizeof *sp);
+    return KLXR_SUCCESS;
+}
+
+// The play area, in metres. XR_SPACE_BOUNDS_UNAVAILABLE is a SUCCESS code (7),
+// and it is the honest answer: there is no guardian here, nobody has drawn a
+// boundary, and inventing one would be inventing a room. An app that gets this
+// treats the stage as unbounded, which is what a seated Vision Pro user has.
+static XrResult klxr_GetReferenceSpaceBoundsRect(void *session, int32_t ref_type,
+                                                 XrExtent2Df *bounds) {
+    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!bounds) return KLXR_ERROR_VALIDATION_FAILURE;
+    (void)ref_type;
+    bounds->width = bounds->height = 0.0f;
+    return KLXR_SPACE_BOUNDS_UNAVAILABLE;
+}
+
+// ------------------------------------------------------------------ actions
+//
+// OpenXR does not let an app read a button. It declares *actions* ("teleport",
+// "grip pose"), suggests bindings from those actions to concrete paths on named
+// controllers, and the runtime decides what is actually wired. That indirection
+// is why this block is mostly bookkeeping — and it is also why it is worth
+// building even before there is any input to report: the suggested bindings the
+// guest hands us ARE its input map, printed once, which is the measurement of
+// what a frontend would eventually have to supply.
+//
+// **Every action state below reports isActive = false**, and that is a real
+// answer rather than a stub. There is no OpenXR input frontend yet, and OpenXR
+// has a word for "this action is not bound to anything the user is holding":
+// inactive. An app reading an inactive action gets a defined, neutral value and
+// carries on, which is what a headset with no controllers paired should do.
+// Fabricating a pressed button would be the same class of mistake as trap 10 —
+// a plausible value nothing can distinguish from a real one.
+//
+// The seam to fill this in already exists on the other side: kl_ovrp's
+// controller inputs (kl_ovrp_set_hand_pose / kl_ovrp_set_controller_input) are
+// what M7's frontends drive. Joining the two is the input arc, and it wants the
+// binding list below to say which actions to join.
+enum { KLXR_MAGIC_ACTION_SET = 0x584b4c41 /* 'XKLA' */,
+       KLXR_MAGIC_ACTION     = 0x584b4c61 /* 'XKLa' */ };
+enum { KLXR_PATH_MAX = 256, KLXR_ACTION_SET_MAX = 16, KLXR_ACTION_MAX = 128 };
+
+enum { KLXR_ACTION_TYPE_BOOLEAN = 1, KLXR_ACTION_TYPE_FLOAT = 2,
+       KLXR_ACTION_TYPE_VECTOR2F = 3, KLXR_ACTION_TYPE_POSE = 4,
+       KLXR_ACTION_TYPE_VIBRATION = 100 };
+
+// The path table. Interning is the whole of xrStringToPath: a path is an
+// opaque uint64 the app compares for equality and hands back, so an index into
+// this table is exactly as good as a hash and can be turned back into the
+// string, which xrPathToString needs and a hash would not survive.
+static char     g_paths[KLXR_PATH_MAX][XR_MAX_PATH_LENGTH];
+static uint32_t g_path_count;
+
+typedef struct { uint32_t magic; char name[XR_MAX_ACTION_SET_NAME_SIZE];
+                 uint32_t priority; int attached; } klxr_action_set;
+typedef struct { uint32_t magic; char name[XR_MAX_ACTION_NAME_SIZE];
+                 int32_t type; klxr_action_set *set; } klxr_action;
+
+static klxr_action_set g_action_sets[KLXR_ACTION_SET_MAX];
+static klxr_action     g_actions[KLXR_ACTION_MAX];
+
+static XrResult klxr_StringToPath(void *instance, const char *path_string, XrPath *path) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!path_string || !path) return KLXR_ERROR_VALIDATION_FAILURE;
+    // XR_ERROR_PATH_FORMAT_INVALID is for a string that is not a well-formed
+    // path. We do not police the grammar — the guest's paths come from its own
+    // tables, not from a user — but the length IS a limit we would silently
+    // truncate past, and a truncated path would then compare equal to a
+    // different one.
+    if (strlen(path_string) >= XR_MAX_PATH_LENGTH) return KLXR_ERROR_PATH_FORMAT_INVALID;
+
+    for (uint32_t i = 0; i < g_path_count; i++)
+        if (strcmp(g_paths[i], path_string) == 0) { *path = i + 1; return KLXR_SUCCESS; }
+    if (g_path_count >= KLXR_PATH_MAX) return KLXR_ERROR_PATH_COUNT_EXCEEDED;
+    snprintf(g_paths[g_path_count], XR_MAX_PATH_LENGTH, "%s", path_string);
+    *path = ++g_path_count;         // 1-based; 0 stays XR_NULL_PATH
+    return KLXR_SUCCESS;
+}
+
+static const char *klxr_path_str(XrPath p) {
+    if (p == 0 || p > g_path_count) return "<null path>";
+    return g_paths[p - 1];
+}
+
+static XrResult klxr_PathToString(void *instance, XrPath path, uint32_t capacity,
+                                  uint32_t *count_out, char *buffer) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (path == 0 || path > g_path_count) return KLXR_ERROR_PATH_INVALID;
+    const char *s = g_paths[path - 1];
+    uint32_t need = (uint32_t)strlen(s) + 1;         // the count INCLUDES the NUL
+    XrResult r = klxr_two_call(capacity, count_out, need);
+    if (r != KLXR_SUCCESS || capacity == 0) return r;
+    if (!buffer) return KLXR_ERROR_VALIDATION_FAILURE;
+    memcpy(buffer, s, need);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_CreateActionSet(void *instance, const XrActionSetCreateInfo *info,
+                                     void **action_set) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !action_set) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_ACTION_SET_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrCreateActionSet", info->next);
+    for (int i = 0; i < KLXR_ACTION_SET_MAX; i++) {
+        if (g_action_sets[i].magic) continue;
+        g_action_sets[i].magic = KLXR_MAGIC_ACTION_SET;
+        g_action_sets[i].priority = info->priority;
+        snprintf(g_action_sets[i].name, sizeof g_action_sets[i].name, "%s",
+                 info->actionSetName);
+        fprintf(stderr, "  [xr] action set \"%s\" (priority %u)\n",
+                g_action_sets[i].name, info->priority);
+        *action_set = &g_action_sets[i];
+        return KLXR_SUCCESS;
+    }
+    return KLXR_ERROR_LIMIT_REACHED;
+}
+
+// Both pools are validated the same way, and by IDENTITY rather than by magic
+// alone: a magic word proves the guest handed back something we wrote, an
+// address in the pool proves it is still one of ours.
+static klxr_action_set *klxr_action_set_of(void *h) {
+    for (int i = 0; i < KLXR_ACTION_SET_MAX; i++)
+        if (h == &g_action_sets[i] && g_action_sets[i].magic) return &g_action_sets[i];
+    return NULL;
+}
+static klxr_action *klxr_action_of(void *h) {
+    for (int i = 0; i < KLXR_ACTION_MAX; i++)
+        if (h == &g_actions[i] && g_actions[i].magic) return &g_actions[i];
+    return NULL;
+}
+
+static XrResult klxr_DestroyActionSet(void *action_set) {
+    klxr_action_set *h = klxr_action_set_of(action_set);
+    if (!h) return KLXR_ERROR_HANDLE_INVALID;
+    memset(h, 0, sizeof *h);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_CreateAction(void *action_set, const XrActionCreateInfo *info,
+                                  void **action) {
+    klxr_action_set *set = klxr_action_set_of(action_set);
+    if (!set) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !action) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_ACTION_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrCreateAction", info->next);
+    for (int i = 0; i < KLXR_ACTION_MAX; i++) {
+        if (g_actions[i].magic) continue;
+        g_actions[i].magic = KLXR_MAGIC_ACTION;
+        g_actions[i].type = info->actionType;
+        g_actions[i].set = set;
+        snprintf(g_actions[i].name, sizeof g_actions[i].name, "%s", info->actionName);
+        *action = &g_actions[i];
+        return KLXR_SUCCESS;
+    }
+    return KLXR_ERROR_LIMIT_REACHED;
+}
+
+static XrResult klxr_DestroyAction(void *action) {
+    klxr_action *h = klxr_action_of(action);
+    if (!h) return KLXR_ERROR_HANDLE_INVALID;
+    memset(h, 0, sizeof *h);
+    return KLXR_SUCCESS;
+}
+
+// An action space is a space anchored to a pose action — the grip or the aim
+// ray of whichever controller the action bound to. It goes in the same pool as
+// the reference spaces with reference_type 0, because the only thing that
+// distinguishes them here is what xrLocateSpace will eventually ask about.
+static XrResult klxr_CreateActionSpace(void *session,
+                                       const XrActionSpaceCreateInfo *info,
+                                       void **space) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !space) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_ACTION_SPACE_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!klxr_action_of(info->action)) return KLXR_ERROR_HANDLE_INVALID;
+    klxr_log_chain("xrCreateActionSpace", info->next);
+
+    klxr_space *sp = klxr_space_alloc();
+    if (!sp) return KLXR_ERROR_LIMIT_REACHED;
+    sp->magic = KLXR_MAGIC_SPACE;
+    sp->session = s;
+    sp->reference_type = 0;
+    sp->offset = info->poseInActionSpace;
+    sp->action = info->action;
+    sp->subaction_path = info->subactionPath;
+    *space = sp;
+    return KLXR_SUCCESS;
+}
+
+// The binding suggestions, and this is the interesting one: it is the guest
+// telling us its entire input map for one controller type. We accept it and
+// print it, because the print IS the work list for wiring input later — every
+// line is an action a frontend would have to drive and the concrete path it
+// expects to be driven from.
+static XrResult klxr_SuggestInteractionProfileBindings(
+        void *instance, const XrInteractionProfileSuggestedBinding *bindings) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!bindings) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (bindings->type != XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING)
+        return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrSuggestInteractionProfileBindings", bindings->next);
+
+    fprintf(stderr, "  [xr] suggested bindings for %s (%u)\n",
+            klxr_path_str(bindings->interactionProfile),
+            bindings->countSuggestedBindings);
+    for (uint32_t i = 0; i < bindings->countSuggestedBindings; i++) {
+        const XrActionSuggestedBinding *b = &bindings->suggestedBindings[i];
+        if (!klxr_action_of(b->action)) return KLXR_ERROR_HANDLE_INVALID;
+        // One line each, and only for the profile the guest ends up using this
+        // would be too much — but it suggests bindings for every controller it
+        // knows, so KL_XR_BINDINGS gates the detail and the count above always
+        // prints.
+        if (kl_env_on("KL_XR_BINDINGS", 0))
+            fprintf(stderr, "  [xr]     %-32s <- %s\n",
+                    klxr_action_of(b->action)->name,
+                    klxr_path_str(b->binding));
+    }
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_AttachSessionActionSets(void *session,
+                                             const XrSessionActionSetsAttachInfo *info) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO)
+        return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrAttachSessionActionSets", info->next);
+    // Attaching is once per session and permanent: after it, action sets are
+    // frozen and a second attach is XR_ERROR_ACTIONSETS_ALREADY_ATTACHED.
+    if (s->action_sets_attached) return KLXR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
+    for (uint32_t i = 0; i < info->countActionSets; i++) {
+        klxr_action_set *set = klxr_action_set_of(info->actionSets[i]);
+        if (!set) return KLXR_ERROR_HANDLE_INVALID;
+        set->attached = 1;
+    }
+    s->action_sets_attached = 1;
+    fprintf(stderr, "  [xr] attached %u action set(s) to the session\n",
+            info->countActionSets);
+    return KLXR_SUCCESS;
+}
+
+// Which physical controller the runtime bound this hand's actions to.
+// XR_NULL_PATH is the specified answer for "nothing", and it is the true one:
+// no interaction profile is bound because no controller is present. An app is
+// required to handle it — the profile can change at any time as controllers
+// come and go, which is why there is an event for it.
+static XrResult klxr_GetCurrentInteractionProfile(void *session, XrPath top_level_path,
+                                                  XrInteractionProfileState *state) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s->action_sets_attached) return KLXR_ERROR_ACTIONSET_NOT_ATTACHED;
+    (void)top_level_path;
+    klxr_log_chain("xrGetCurrentInteractionProfile", state->next);
+    state->type = XR_TYPE_INTERACTION_PROFILE_STATE;
+    state->interactionProfile = 0;      // XR_NULL_PATH
+    return KLXR_SUCCESS;
+}
+
+// The per-frame input snapshot. Everything is inactive, so there is nothing to
+// snapshot — but this must still succeed, because an app that treats a failed
+// sync as fatal is an app that never renders a frame.
+static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!s->action_sets_attached) return KLXR_ERROR_ACTIONSET_NOT_ATTACHED;
+    // XR_SESSION_NOT_FOCUSED is a SUCCESS code (a positive one) meaning "synced,
+    // but you do not have focus so nothing is reported". We always have focus.
+    return KLXR_SUCCESS;
+}
+
+// The three state readers. isActive = false everywhere, and the spec then
+// requires the value fields to be zero — an app must not read a stale value out
+// of an inactive action, so leaving them alone would be the bug.
+static XrResult klxr_action_state_pre(void *session, const XrActionStateGetInfo *info,
+                                      const char *where) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_ACTION_STATE_GET_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (!klxr_action_of(info->action)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!s->action_sets_attached) return KLXR_ERROR_ACTIONSET_NOT_ATTACHED;
+    klxr_log_chain(where, info->next);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetActionStateBoolean(void *session, const XrActionStateGetInfo *info,
+                                           XrActionStateBoolean *state) {
+    XrResult r = klxr_action_state_pre(session, info, "xrGetActionStateBoolean");
+    if (r != KLXR_SUCCESS) return r;
+    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    state->type = XR_TYPE_ACTION_STATE_BOOLEAN;
+    state->currentState = 0; state->changedSinceLastSync = 0;
+    state->lastChangeTime = 0; state->isActive = 0;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetActionStateFloat(void *session, const XrActionStateGetInfo *info,
+                                         XrActionStateFloat *state) {
+    XrResult r = klxr_action_state_pre(session, info, "xrGetActionStateFloat");
+    if (r != KLXR_SUCCESS) return r;
+    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    state->type = XR_TYPE_ACTION_STATE_FLOAT;
+    state->currentState = 0.0f; state->changedSinceLastSync = 0;
+    state->lastChangeTime = 0; state->isActive = 0;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetActionStatePose(void *session, const XrActionStateGetInfo *info,
+                                        XrActionStatePose *state) {
+    XrResult r = klxr_action_state_pre(session, info, "xrGetActionStatePose");
+    if (r != KLXR_SUCCESS) return r;
+    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    state->type = XR_TYPE_ACTION_STATE_POSE;
+    state->isActive = 0;
+    return KLXR_SUCCESS;
+}
+
+// --------------------------------------------------------------- swapchains
+//
+// **This is where the VR arc meets P5.** In OpenXR the RUNTIME owns the eye
+// images and lends them to the app — the reverse of OVRPlugin, where Unity
+// generated the texture names and ovrp_SetupEyeTexture2 was handed one to put
+// storage behind. The consequence is good for us: the guest renders into
+// textures WE created, so the compositor's seam is on our side of the boundary
+// from the start rather than being recovered from a name the guest picked.
+//
+// So an image here is created exactly the way kl_ovrp's eye textures are, and
+// registered with kl_glfb the same way — kl_glfb_note_eye_texture for the
+// capture path, and the MTLTexture provider when one is present, which is what
+// makes these images the *same* MTLTextures KleptonCompositor already samples.
+// Nothing new has to be invented for the visionOS side; it is the identical
+// seam reached through a different API.
+//
+// One thing deliberately NOT done: multisampling. sampleCount > 1 would need an
+// MSAA texture and a resolve, and the VRR work (trap in notes/VISIONOS.md) is
+// specifically about keeping the eye resolve a physical-to-physical copy. We
+// recommend 1 sample in the view configuration; an app asking for more gets a
+// named refusal rather than a silent downgrade to 1, because a silent one would
+// have it believe its edges were being antialiased.
+enum { KLXR_MAGIC_SWAPCHAIN = 0x584b4c57 /* 'XKLW' */ };
+// Measured, not guessed: this guest creates a pair of eye swapchains, tears
+// them down and rebuilds them as it moves between scenes, and allocates one
+// more per UI panel and one for the stream. A pool of 8 ran out mid-run and the
+// app reported it faithfully ("Failed to create base layer swapchain for eye:
+// 1") — which is the failure working, but it was our limit, not its.
+enum { KLXR_SWAPCHAIN_MAX = 64, KLXR_SWAPCHAIN_IMAGES = 3 };
+
+typedef struct {
+    uint32_t magic;
+    klxr_session *session;
+    int64_t  format;
+    uint32_t width, height, array_size, mip_count;
+    uint64_t usage;
+    uint32_t tex[KLXR_SWAPCHAIN_IMAGES];
+    int      count;
+    int      acquired;        // index the app currently holds, -1 when none
+    int      next_index;      // round-robin, which is all "which is free" means
+                              // here: nothing else reads these images yet
+    int      eye;             // which eye this swapchain was registered as, -1 if not
+} klxr_swapchain;
+
+static klxr_swapchain g_swapchains[KLXR_SWAPCHAIN_MAX];
+
+static klxr_swapchain *klxr_swapchain_of(void *h) {
+    klxr_swapchain *sc = (klxr_swapchain *)h;
+    if (!sc || sc->magic != KLXR_MAGIC_SWAPCHAIN) return NULL;
+    if (sc < g_swapchains || sc >= g_swapchains + KLXR_SWAPCHAIN_MAX) return NULL;
+    return sc;
+}
+
+// The GL formats we will back an image with. These are GL internal formats
+// (the spec says so for the GLES binding: "the format is a GL internal
+// format"), and the order is the preference order — the spec asks runtimes to
+// list them best-first and apps do pick the first one they recognise.
+//
+// sRGB first, because that is what a compositor wants to be handed: the app
+// renders linear, the hardware converts on write, and the composite samples
+// with the conversion applied. RGBA16F second for anything doing HDR or
+// tonemapping of its own. The depth formats are last and are there because an
+// app that submits a depth layer needs somewhere to render depth into — and on
+// visionOS depth is not optional decoration, it is what the system reprojects
+// with (§12.16, and it cost a session to find).
+#define KLXR_GL_SRGB8_ALPHA8      0x8C43
+#define KLXR_GL_RGBA8             0x8058
+#define KLXR_GL_RGBA16F           0x881A
+#define KLXR_GL_DEPTH_COMPONENT24 0x81A6
+#define KLXR_GL_DEPTH_COMPONENT16 0x81A5
+#define KLXR_GL_DEPTH24_STENCIL8  0x88F0
+static const int64_t g_swapchain_formats[] = {
+    KLXR_GL_SRGB8_ALPHA8, KLXR_GL_RGBA8, KLXR_GL_RGBA16F,
+    KLXR_GL_DEPTH_COMPONENT24, KLXR_GL_DEPTH24_STENCIL8, KLXR_GL_DEPTH_COMPONENT16,
+};
+#define KLXR_FORMAT_COUNT ((uint32_t)(sizeof g_swapchain_formats / sizeof g_swapchain_formats[0]))
+
+static int klxr_format_is_depth(int64_t f) {
+    return f == KLXR_GL_DEPTH_COMPONENT24 || f == KLXR_GL_DEPTH_COMPONENT16 ||
+           f == KLXR_GL_DEPTH24_STENCIL8;
+}
+
+static XrResult klxr_EnumerateSwapchainFormats(void *session, uint32_t capacity,
+                                               uint32_t *count_out, int64_t *formats) {
+    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    XrResult r = klxr_two_call(capacity, count_out, KLXR_FORMAT_COUNT);
+    if (r != KLXR_SUCCESS || capacity == 0) return r;
+    if (!formats) return KLXR_ERROR_VALIDATION_FAILURE;
+    memcpy(formats, g_swapchain_formats, sizeof g_swapchain_formats);
+    return KLXR_SUCCESS;
+}
+
+// The GL entry points, resolved through the same gateway the guest uses
+// (kl_egl_sym) so the null driver and ANGLE are both served without this file
+// knowing which is underneath — exactly as klovrp_SetupEyeTexture2 does it.
+static void (*gl_GenTextures)(int32_t, uint32_t *);
+static void (*gl_DeleteTextures)(int32_t, const uint32_t *);
+static void (*gl_BindTexture)(uint32_t, uint32_t);
+static void (*gl_TexStorage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
+static void (*gl_TexStorage3D)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t);
+
+static void klxr_gl_init(void) {
+    if (gl_GenTextures) return;
+    gl_GenTextures    = kl_egl_sym("glGenTextures");
+    gl_DeleteTextures = kl_egl_sym("glDeleteTextures");
+    gl_BindTexture    = kl_egl_sym("glBindTexture");
+    gl_TexStorage2D   = kl_egl_sym("glTexStorage2D");
+    gl_TexStorage3D   = kl_egl_sym("glTexStorage3D");
+}
+
+#define KLXR_GL_TEXTURE_2D       0x0DE1
+#define KLXR_GL_TEXTURE_2D_ARRAY 0x8C1A
+
+static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo *info,
+                                     void **swapchain) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !swapchain) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_SWAPCHAIN_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrCreateSwapchain", info->next);
+
+    int known = 0;
+    for (uint32_t i = 0; i < KLXR_FORMAT_COUNT; i++)
+        if (g_swapchain_formats[i] == info->format) known = 1;
+    if (!known) {
+        fprintf(stderr, "  [xr] xrCreateSwapchain: format 0x%llx unsupported\n",
+                (unsigned long long)info->format);
+        return KLXR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+    }
+    if (info->sampleCount > 1) {
+        fprintf(stderr, "  [xr] xrCreateSwapchain: sampleCount %u — only 1 is served\n",
+                info->sampleCount);
+        return KLXR_ERROR_FEATURE_UNSUPPORTED;
+    }
+    // faceCount 6 is a cubemap. Nothing in the eye path wants one, and serving
+    // it wrongly would be worse than not serving it.
+    if (info->faceCount != 1) return KLXR_ERROR_FEATURE_UNSUPPORTED;
+    if (!info->width || !info->height || !info->arraySize || !info->mipCount)
+        return KLXR_ERROR_VALIDATION_FAILURE;
+
+    klxr_swapchain *sc = NULL;
+    for (int i = 0; i < KLXR_SWAPCHAIN_MAX; i++)
+        if (!g_swapchains[i].magic) { sc = &g_swapchains[i]; break; }
+    if (!sc) return KLXR_ERROR_LIMIT_REACHED;
+
+    memset(sc, 0, sizeof *sc);
+    sc->magic = KLXR_MAGIC_SWAPCHAIN;
+    sc->session = s;
+    sc->format = info->format;
+    sc->width = info->width; sc->height = info->height;
+    sc->array_size = info->arraySize; sc->mip_count = info->mipCount;
+    sc->usage = info->usageFlags;
+    sc->count = KLXR_SWAPCHAIN_IMAGES;
+    sc->acquired = -1;
+    sc->eye = -1;
+
+    klxr_gl_init();
+    if (!gl_GenTextures || !gl_BindTexture) {
+        fprintf(stderr, "  [xr] xrCreateSwapchain: no GL gateway\n");
+        sc->magic = 0;
+        return KLXR_ERROR_RUNTIME_FAILURE;
+    }
+    gl_GenTextures(sc->count, sc->tex);
+
+    uint32_t target = sc->array_size > 1 ? KLXR_GL_TEXTURE_2D_ARRAY : KLXR_GL_TEXTURE_2D;
+    for (int i = 0; i < sc->count; i++) {
+        gl_BindTexture(target, sc->tex[i]);
+        if (target == KLXR_GL_TEXTURE_2D_ARRAY) {
+            if (gl_TexStorage3D)
+                gl_TexStorage3D(target, (int32_t)sc->mip_count, (uint32_t)sc->format,
+                                (int32_t)sc->width, (int32_t)sc->height,
+                                (int32_t)sc->array_size);
+        } else if (gl_TexStorage2D) {
+            gl_TexStorage2D(target, (int32_t)sc->mip_count, (uint32_t)sc->format,
+                            (int32_t)sc->width, (int32_t)sc->height);
+        }
+    }
+
+    // **Which swapchain is an eye is NOT decided here.** The obvious guess —
+    // the first two colour swapchains, in creation order — was tried and is
+    // measurably wrong: this guest creates a pair for the eyes, tears them down
+    // and rebuilds them across scene changes, and creates more of the same
+    // shape for its UI panels and its video stream. Creation order picks the
+    // wrong two.
+    //
+    // The app does say which is which, once, in the right place: xrEndFrame
+    // submits a projection layer whose views name a swapchain each. That is the
+    // assertion, and it is where kl_glfb_note_eye_texture belongs.
+    fprintf(stderr, "  [xr] swapchain %ux%u fmt 0x%llx array %u mips %u usage 0x%llx"
+                    " -> %d images (%u %u %u)%s\n",
+            sc->width, sc->height, (unsigned long long)sc->format,
+            sc->array_size, sc->mip_count, (unsigned long long)sc->usage,
+            sc->count, sc->tex[0], sc->tex[1], sc->tex[2],
+            klxr_format_is_depth(sc->format) ? " [depth]" : "");
+    *swapchain = sc;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_DestroySwapchain(void *swapchain) {
+    klxr_swapchain *sc = klxr_swapchain_of(swapchain);
+    if (!sc) return KLXR_ERROR_HANDLE_INVALID;
+    if (sc->eye >= 0)
+        for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(sc->eye, i);
+    if (gl_DeleteTextures) gl_DeleteTextures(sc->count, sc->tex);
+    memset(sc, 0, sizeof *sc);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity,
+                                              uint32_t *count_out, void *images) {
+    klxr_swapchain *sc = klxr_swapchain_of(swapchain);
+    if (!sc) return KLXR_ERROR_HANDLE_INVALID;
+    XrResult r = klxr_two_call(capacity, count_out, (uint32_t)sc->count);
+    if (r != KLXR_SUCCESS || capacity == 0) return r;
+    if (!images) return KLXR_ERROR_VALIDATION_FAILURE;
+
+    // The array is the app's, and its element type is whatever its graphics
+    // binding says. Checking `type` on the first element is how the spec has a
+    // runtime confirm the app and the binding agree — writing GL names into an
+    // array of Vulkan images would otherwise be silent and catastrophic.
+    XrSwapchainImageOpenGLESKHR *gl = (XrSwapchainImageOpenGLESKHR *)images;
+    if (gl[0].type != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR) {
+        fprintf(stderr, "  [xr] xrEnumerateSwapchainImages: image type %d is not "
+                        "XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR\n", gl[0].type);
+        return KLXR_ERROR_VALIDATION_FAILURE;
+    }
+    for (int i = 0; i < sc->count; i++) gl[i].image = sc->tex[i];
+    return KLXR_SUCCESS;
+}
+
+// Acquire / wait / release. On a real runtime these are the actual
+// synchronisation with the compositor: acquire says which image is free, wait
+// blocks until the compositor has finished reading it, release hands it back.
+//
+// Nothing is reading these images concurrently yet — the compositor seam
+// consumes them through kl_glfb, one frame behind, and there is no second
+// consumer — so wait returns immediately. That is a correct answer for the
+// present arrangement rather than a stub for a missing one, but it is the line
+// that has to change the day the compositor samples an image the guest could
+// still be drawing into. The call ORDER is enforced, because a double-acquire
+// is a guest bug we would rather name than absorb.
+static XrResult klxr_AcquireSwapchainImage(void *swapchain,
+                                           const XrSwapchainImageAcquireInfo *info,
+                                           uint32_t *index) {
+    klxr_swapchain *sc = klxr_swapchain_of(swapchain);
+    if (!sc) return KLXR_ERROR_HANDLE_INVALID;
+    if (!index) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info) klxr_log_chain("xrAcquireSwapchainImage", info->next);
+    if (sc->acquired >= 0) return KLXR_ERROR_CALL_ORDER_INVALID;
+    sc->acquired = sc->next_index;
+    sc->next_index = (sc->next_index + 1) % sc->count;
+    *index = (uint32_t)sc->acquired;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_WaitSwapchainImage(void *swapchain,
+                                        const XrSwapchainImageWaitInfo *info) {
+    klxr_swapchain *sc = klxr_swapchain_of(swapchain);
+    if (!sc) return KLXR_ERROR_HANDLE_INVALID;
+    if (info) klxr_log_chain("xrWaitSwapchainImage", info->next);
+    if (sc->acquired < 0) return KLXR_ERROR_CALL_ORDER_INVALID;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_ReleaseSwapchainImage(void *swapchain,
+                                           const XrSwapchainImageReleaseInfo *info) {
+    klxr_swapchain *sc = klxr_swapchain_of(swapchain);
+    if (!sc) return KLXR_ERROR_HANDLE_INVALID;
+    if (info) klxr_log_chain("xrReleaseSwapchainImage", info->next);
+    if (sc->acquired < 0) return KLXR_ERROR_CALL_ORDER_INVALID;
+    sc->acquired = -1;
+    return KLXR_SUCCESS;
+}
+
+// --------------------------------------------------------- the frame loop
+//
+// xrWaitFrame / xrBeginFrame / xrEndFrame, plus the two locate calls that make
+// them mean something. This is the part that turns a booted session into a
+// running app, and it is where the pose seam finally connects: xrLocateViews
+// answers out of kl_ovrp's latched head pose and measured per-eye geometry —
+// the SAME numbers the OVRPlugin path answers Beat Saber with, on purpose. One
+// frontend feeds both, so a display whose IPD and cant have been measured is
+// described identically to whichever guest is running.
+//
+// **xrWaitFrame is the latch point**, and that is not a detail. kl_ovrp pins
+// the head pose for the duration of a guest frame because reading it live
+// mid-frame means the pose recorded for reprojection is not the pose the
+// picture was drawn from — an error that presents as the image doubling during
+// head turns and grows as the frame rate falls (§12.19). OpenXR's frame loop
+// has exactly one place that means "the guest's next frame starts here", and
+// this is it.
+static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
+                               XrFrameState *state) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info) klxr_log_chain("xrWaitFrame", info->next);
+    if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
+
+    kl_ovrp_frame_latch();
+
+    // The period is the display's, from the same seam the OVRPlugin path reads
+    // it from — so a headset that reports 120 Hz is described as 120 Hz to
+    // either guest. The predicted display time is one period out: this frame is
+    // being drawn now and shown next.
+    float hz = kl_ovrp_display_frequency();
+    if (!(hz > 0)) hz = 72.0f;
+    int64_t period = (int64_t)(1e9 / hz);
+
+    state->type = XR_TYPE_FRAME_STATE;
+    state->predictedDisplayPeriod = period;
+    state->predictedDisplayTime = klxr_now() + period;
+    // shouldRender is the runtime telling the app whether its pictures will be
+    // seen. False during SYNCHRONIZED (the app is ticking but not visible) is
+    // the specified answer and lets an app skip the work; anything from VISIBLE
+    // on is true.
+    state->shouldRender = (s->state == KLXR_SESSION_STATE_VISIBLE ||
+                           s->state == KLXR_SESSION_STATE_FOCUSED);
+    s->frame_predicted_time = state->predictedDisplayTime;
+    s->frames_waited++;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_BeginFrame(void *session, const XrFrameBeginInfo *info) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (info) klxr_log_chain("xrBeginFrame", info->next);
+    if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
+    // Calling xrBeginFrame twice without an xrEndFrame between is legal and
+    // means the app discarded a frame; the runtime says so with a success code
+    // rather than an error. We do not track it as an error either.
+    s->frame_begun = 1;
+    return KLXR_SUCCESS;
+}
+
+// xrEndFrame — the submission, and the one place the app SAYS which swapchain
+// is which eye.
+//
+// The projection layer carries one view per eye, in view order, each naming a
+// swapchain. That is the assertion the creation-order guess could not make, so
+// it is here that an image becomes an eye texture as far as kl_glfb and the
+// compositor are concerned. Registration is idempotent and only re-done when
+// the mapping changes, because the app rebuilds its swapchains across scenes.
+static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_FRAME_END_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrEndFrame", info->next);
+    if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
+    if (!s->frame_begun) return KLXR_ERROR_CALL_ORDER_INVALID;
+    s->frame_begun = 0;
+    s->frames_ended++;
+
+    for (uint32_t i = 0; i < info->layerCount; i++) {
+        const XrCompositionLayerBaseHeader *layer = info->layers[i];
+        if (!layer) continue;
+        if (layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+            // Quad layers are the UI panels; nothing composites them yet, so
+            // they are counted rather than dropped silently — a layer we ignore
+            // is content the user will not see, and the count is what says so.
+            s->layers_ignored++;
+            continue;
+        }
+        const XrCompositionLayerProjection *proj =
+            (const XrCompositionLayerProjection *)layer;
+        for (uint32_t v = 0; v < proj->viewCount && v < 2; v++) {
+            klxr_swapchain *sc = klxr_swapchain_of(proj->views[v].subImage.swapchain);
+            if (!sc) continue;
+            if (sc->eye == (int)v) continue;            // already this eye
+            sc->eye = (int)v;
+            for (int k = 0; k < sc->count; k++)
+                kl_glfb_note_eye_texture(sc->eye, k, sc->tex[k]);
+            fprintf(stderr, "  [xr] eye %u <- swapchain %ux%u images (%u %u %u)\n",
+                    v, sc->width, sc->height, sc->tex[0], sc->tex[1], sc->tex[2]);
+        }
+    }
+    return KLXR_SUCCESS;
+}
+
+// Where the head is, per eye — the answer that decides what the guest draws.
+//
+// Both halves come from kl_ovrp: the pose from kl_ovrp_eye_view (latched head,
+// plus this eye's measured offset and cant), and the frustum from the same
+// call's tangents. The conversion is the only thing done here, and it is one
+// line per edge: OpenXR states a field of view as four ANGLES from the view
+// axis, signed — left and down negative — where the seam speaks tangents, all
+// positive. atan of each, with the sign put back.
+static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
+                                 XrViewState *view_state, uint32_t capacity,
+                                 uint32_t *count_out, XrView *views) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !view_state) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_VIEW_LOCATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->viewConfigurationType != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
+        return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    klxr_space *base = klxr_space_of(info->space);
+    if (!base) return KLXR_ERROR_HANDLE_INVALID;
+
+    view_state->type = XR_TYPE_VIEW_STATE;
+    view_state->viewStateFlags = KLXR_VIEW_ORIENTATION_VALID | KLXR_VIEW_POSITION_VALID |
+                                 KLXR_VIEW_ORIENTATION_TRACKED | KLXR_VIEW_POSITION_TRACKED;
+
+    XrResult r = klxr_two_call(capacity, count_out, 2);
+    if (r != KLXR_SUCCESS || capacity == 0) return r;
+    if (!views) return KLXR_ERROR_VALIDATION_FAILURE;
+
+    // The views are wanted in `base`'s frame, and the two reference spaces
+    // differ by the standing eye height — see klxr_space_origin_y.
+    float base_y = klxr_space_origin_y(base);
+
+    for (uint32_t e = 0; e < 2; e++) {
+        float px, py, pz, qx, qy, qz, qw, tan[4];
+        kl_ovrp_eye_view((int)e, &px, &py, &pz, &qx, &qy, &qz, &qw, tan);
+        klxr_log_chain("xrLocateViews", views[e].next);
+        views[e].type = XR_TYPE_VIEW;
+        views[e].pose.position.x = px;
+        views[e].pose.position.y = py - base_y;
+        views[e].pose.position.z = pz;
+        views[e].pose.orientation.x = qx; views[e].pose.orientation.y = qy;
+        views[e].pose.orientation.z = qz; views[e].pose.orientation.w = qw;
+        views[e].fov.angleLeft  = -atanf(tan[0]);
+        views[e].fov.angleRight =  atanf(tan[1]);
+        views[e].fov.angleUp    =  atanf(tan[2]);
+        views[e].fov.angleDown  = -atanf(tan[3]);
+    }
+    return KLXR_SUCCESS;
+}
+
+// Where one space is, relative to another.
+//
+// Three cases, and the only interesting one is VIEW: the head. LOCAL and STAGE
+// are both fixed frames of the tracking space, differing by the standing eye
+// height, so locating one in the other is that offset and nothing else. An
+// action space is anchored to a controller, and we have no controllers — so it
+// is located with no valid bits, which is the specified way to say "this is not
+// being tracked right now" and is exactly what xrGetActionStatePose already
+// reports about the action behind it.
+static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
+                                 XrSpaceLocation *location) {
+    klxr_space *sp = klxr_space_of(space);
+    klxr_space *bs = klxr_space_of(base_space);
+    if (!sp || !bs) return KLXR_ERROR_HANDLE_INVALID;
+    if (!location) return KLXR_ERROR_VALIDATION_FAILURE;
+    (void)time;
+    klxr_log_chain("xrLocateSpace", location->next);
+
+    location->type = XR_TYPE_SPACE_LOCATION;
+    location->pose.orientation = (XrQuaternionf){0, 0, 0, 1};
+    location->pose.position = (XrVector3f){0, 0, 0};
+    location->locationFlags = 0;
+
+    if (sp->reference_type == 0) return KLXR_SUCCESS;   // action space: untracked
+
+    float base_y = klxr_space_origin_y(bs);
+    if (sp->reference_type == KLXR_REF_SPACE_VIEW) {
+        float px, py, pz, qx, qy, qz, qw;
+        kl_ovrp_get_guest_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
+        location->pose.position = (XrVector3f){px, py - base_y, pz};
+        location->pose.orientation = (XrQuaternionf){qx, qy, qz, qw};
+    } else {
+        location->pose.position.y = klxr_space_origin_y(sp) - base_y;
+    }
+    location->locationFlags = KLXR_SPACE_ORIENTATION_VALID | KLXR_SPACE_POSITION_VALID |
+                              KLXR_SPACE_ORIENTATION_TRACKED | KLXR_SPACE_POSITION_TRACKED;
+    return KLXR_SUCCESS;
+}
+
+// xrResultToString / xrStructureTypeToString exist so a guest can log a code it
+// did not recognise. Serving it costs nothing and turns "-41" in the guest's
+// own log into a name, which is worth more to us than to it.
+static XrResult klxr_ResultToString(void *instance, XrResult value, char *buffer) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!buffer) return KLXR_ERROR_VALIDATION_FAILURE;
+    const char *name = NULL;
+    switch (value) {
+        case KLXR_SUCCESS:                       name = "XR_SUCCESS"; break;
+        case KLXR_EVENT_UNAVAILABLE:             name = "XR_EVENT_UNAVAILABLE"; break;
+        case KLXR_ERROR_VALIDATION_FAILURE:      name = "XR_ERROR_VALIDATION_FAILURE"; break;
+        case KLXR_ERROR_RUNTIME_FAILURE:         name = "XR_ERROR_RUNTIME_FAILURE"; break;
+        case KLXR_ERROR_FUNCTION_UNSUPPORTED:    name = "XR_ERROR_FUNCTION_UNSUPPORTED"; break;
+        case KLXR_ERROR_SIZE_INSUFFICIENT:       name = "XR_ERROR_SIZE_INSUFFICIENT"; break;
+        case KLXR_ERROR_HANDLE_INVALID:          name = "XR_ERROR_HANDLE_INVALID"; break;
+        case KLXR_ERROR_SYSTEM_INVALID:          name = "XR_ERROR_SYSTEM_INVALID"; break;
+        case KLXR_ERROR_FORM_FACTOR_UNSUPPORTED: name = "XR_ERROR_FORM_FACTOR_UNSUPPORTED"; break;
+        // The rest of what we can return. Worth the lines: the guest logs this
+        // string, so an unnamed code arrives as "XR_UNKNOWN_FAILURE_-10" and
+        // costs a lookup in the middle of reading a trace — which it did.
+        case KLXR_SPACE_BOUNDS_UNAVAILABLE:      name = "XR_SPACE_BOUNDS_UNAVAILABLE"; break;
+        case KLXR_ERROR_FEATURE_UNSUPPORTED:     name = "XR_ERROR_FEATURE_UNSUPPORTED"; break;
+        case KLXR_ERROR_EXTENSION_NOT_PRESENT:   name = "XR_ERROR_EXTENSION_NOT_PRESENT"; break;
+        case KLXR_ERROR_LIMIT_REACHED:           name = "XR_ERROR_LIMIT_REACHED"; break;
+        case KLXR_ERROR_SESSION_RUNNING:         name = "XR_ERROR_SESSION_RUNNING"; break;
+        case KLXR_ERROR_SESSION_NOT_RUNNING:     name = "XR_ERROR_SESSION_NOT_RUNNING"; break;
+        case KLXR_ERROR_PATH_INVALID:            name = "XR_ERROR_PATH_INVALID"; break;
+        case KLXR_ERROR_PATH_COUNT_EXCEEDED:     name = "XR_ERROR_PATH_COUNT_EXCEEDED"; break;
+        case KLXR_ERROR_PATH_FORMAT_INVALID:     name = "XR_ERROR_PATH_FORMAT_INVALID"; break;
+        case KLXR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED:
+                                                 name = "XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED"; break;
+        case KLXR_ERROR_SESSION_NOT_READY:       name = "XR_ERROR_SESSION_NOT_READY"; break;
+        case KLXR_ERROR_SESSION_NOT_STOPPING:    name = "XR_ERROR_SESSION_NOT_STOPPING"; break;
+        case KLXR_ERROR_REFERENCE_SPACE_UNSUPPORTED:
+                                                 name = "XR_ERROR_REFERENCE_SPACE_UNSUPPORTED"; break;
+        case KLXR_ERROR_CALL_ORDER_INVALID:      name = "XR_ERROR_CALL_ORDER_INVALID"; break;
+        case KLXR_ERROR_GRAPHICS_DEVICE_INVALID: name = "XR_ERROR_GRAPHICS_DEVICE_INVALID"; break;
+        case KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED:
+                                                 name = "XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED"; break;
+        case KLXR_ERROR_ACTIONSET_NOT_ATTACHED:  name = "XR_ERROR_ACTIONSET_NOT_ATTACHED"; break;
+        case KLXR_ERROR_ACTIONSETS_ALREADY_ATTACHED:
+                                                 name = "XR_ERROR_ACTIONSETS_ALREADY_ATTACHED"; break;
+        case KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING:
+                                                 name = "XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING"; break;
+        default: break;
+    }
+    // XR_MAX_RESULT_STRING_SIZE is 64 and the buffer is the caller's, so the
+    // unknown case must still fit: "XR_UNKNOWN_" plus a signed int is 22 bytes.
+    if (name) snprintf(buffer, 64, "%s", name);
+    else      snprintf(buffer, 64, "XR_UNKNOWN_%s%d", value < 0 ? "FAILURE_" : "SUCCESS_", value);
+    return KLXR_SUCCESS;
+}
+
+// ---------------------------------------------------------------- dispatch
+// The table is built entirely out of refusals above, and everything we actually
+// implement replaces its row here. One list, so an entry point cannot be served
+// by one door and refused by the other — kl_openxr_lookup (relocation time) and
+// xrGetInstanceProcAddr (run time) both read these rows.
+static void klxr_install(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    struct { const char *name; void *fn; } impl[] = {
+        {"xrGetInstanceProcAddr",  (void *)klxr_GetInstanceProcAddr},
+        {"xrInitializeLoaderKHR",  (void *)klxr_InitializeLoaderKHR},
+        // the boot sequence, in the order the guest walks it
+        {"xrEnumerateInstanceExtensionProperties",
+                                   (void *)klxr_EnumerateInstanceExtensionProperties},
+        {"xrCreateInstance",       (void *)klxr_CreateInstance},
+        {"xrDestroyInstance",      (void *)klxr_DestroyInstance},
+        {"xrGetInstanceProperties",(void *)klxr_GetInstanceProperties},
+        {"xrResultToString",       (void *)klxr_ResultToString},
+        {"xrGetSystem",            (void *)klxr_GetSystem},
+        {"xrGetSystemProperties",  (void *)klxr_GetSystemProperties},
+        {"xrEnumerateViewConfigurationViews",
+                                   (void *)klxr_EnumerateViewConfigurationViews},
+        {"xrGetOpenGLESGraphicsRequirementsKHR",
+                                   (void *)klxr_GetOpenGLESGraphicsRequirementsKHR},
+        // the session, and the state machine xrPollEvent drives
+        {"xrCreateSession",        (void *)klxr_CreateSession},
+        {"xrDestroySession",       (void *)klxr_DestroySession},
+        {"xrBeginSession",         (void *)klxr_BeginSession},
+        {"xrEndSession",           (void *)klxr_EndSession},
+        {"xrRequestExitSession",   (void *)klxr_RequestExitSession},
+        {"xrPollEvent",            (void *)klxr_PollEvent},
+        // spaces — xrLocateSpace is deliberately still a refusal, see above
+        {"xrCreateReferenceSpace", (void *)klxr_CreateReferenceSpace},
+        {"xrDestroySpace",         (void *)klxr_DestroySpace},
+        {"xrGetReferenceSpaceBoundsRect",
+                                   (void *)klxr_GetReferenceSpaceBoundsRect},
+        // actions — bookkeeping and the binding census; every state is inactive
+        {"xrStringToPath",         (void *)klxr_StringToPath},
+        {"xrPathToString",         (void *)klxr_PathToString},
+        {"xrCreateActionSet",      (void *)klxr_CreateActionSet},
+        {"xrDestroyActionSet",     (void *)klxr_DestroyActionSet},
+        {"xrCreateAction",         (void *)klxr_CreateAction},
+        {"xrDestroyAction",        (void *)klxr_DestroyAction},
+        {"xrCreateActionSpace",    (void *)klxr_CreateActionSpace},
+        {"xrSuggestInteractionProfileBindings",
+                                   (void *)klxr_SuggestInteractionProfileBindings},
+        {"xrAttachSessionActionSets",
+                                   (void *)klxr_AttachSessionActionSets},
+        {"xrGetCurrentInteractionProfile",
+                                   (void *)klxr_GetCurrentInteractionProfile},
+        {"xrSyncActions",          (void *)klxr_SyncActions},
+        {"xrGetActionStateBoolean",(void *)klxr_GetActionStateBoolean},
+        {"xrGetActionStateFloat",  (void *)klxr_GetActionStateFloat},
+        {"xrGetActionStatePose",   (void *)klxr_GetActionStatePose},
+        // swapchains — the eye images, and the P5 seam
+        {"xrEnumerateSwapchainFormats",
+                                   (void *)klxr_EnumerateSwapchainFormats},
+        {"xrCreateSwapchain",      (void *)klxr_CreateSwapchain},
+        {"xrDestroySwapchain",     (void *)klxr_DestroySwapchain},
+        {"xrEnumerateSwapchainImages",
+                                   (void *)klxr_EnumerateSwapchainImages},
+        {"xrAcquireSwapchainImage",(void *)klxr_AcquireSwapchainImage},
+        {"xrWaitSwapchainImage",   (void *)klxr_WaitSwapchainImage},
+        {"xrReleaseSwapchainImage",(void *)klxr_ReleaseSwapchainImage},
+        // the frame loop, and the two locate calls that give it meaning
+        {"xrWaitFrame",            (void *)klxr_WaitFrame},
+        {"xrBeginFrame",           (void *)klxr_BeginFrame},
+        {"xrEndFrame",             (void *)klxr_EndFrame},
+        {"xrLocateViews",          (void *)klxr_LocateViews},
+        {"xrLocateSpace",          (void *)klxr_LocateSpace},
+    };
+    for (size_t i = 0; i < sizeof impl / sizeof impl[0]; i++) {
+        klxr_row *r = klxr_row_for(impl[i].name);
+        if (r) r->fn = impl[i].fn;
+    }
+}
+
+void *kl_openxr_lookup(const char *name) {
+    klxr_install();
+    klxr_row *row = klxr_row_for(name);
+    if (!row) return NULL;      // a lookup must still be able to say no
+    row->resolved++;
+    return row->fn;
+}

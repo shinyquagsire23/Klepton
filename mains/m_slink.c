@@ -105,11 +105,31 @@ static const char *const CHAIN_SHELL[] = {
     "libshell_arm64-v8a.so",
 };
 
-// KL_SLINK_SHELL=1 picks the frontend. Set once in slink_run() before anything
-// reads it, so the two accessors below cannot disagree.
-static int g_shell;
+// CHAIN_VR  libvrlink_scene.so — the THIRD front door, and the only one that is
+//           not SDL3 at all. §11.9 measured its DT_NEEDED as
+//           libopenxr_loader/libaaudio/libmediandk/libandroid/liblog/libEGL/
+//           libGLESv3/libm/libdl/libc: no libmain, no libSDL3, no libc++_shared,
+//           no Qt. So the "chain" is ONE guest library against system libraries
+//           we shim, which is why this array has a single entry and is not a
+//           mistake.
+//
+// libopenxr_loader.so is deliberately ABSENT. It is the Khronos loader and it
+// finds a runtime through an Android `org.khronos.openxr.runtime_broker`
+// service that does not exist here — exactly libOVRPlugin.so's situation in
+// §3.1, and settled the same way: REPLACED, not translated. The 46 xr* names
+// bind against kl_openxr.c through kl_shim_lookup instead. Putting the real
+// loader in this list would map 300 KB of code that can only fail.
+static const char *const CHAIN_VR[] = {
+    "libvrlink_scene.so",
+};
+
+// KL_SLINK_SHELL=1 picks the 2D frontend, KL_SLINK_VR=1 the OpenXR one. Set
+// once in slink_run() before anything reads them, so the accessors below cannot
+// disagree. They are mutually exclusive; VR wins if both are set, and says so.
+static int g_shell, g_vr;
 
 static const char *const *slink_chain(size_t *n) {
+    if (g_vr)    { *n = sizeof CHAIN_VR    / sizeof *CHAIN_VR;    return CHAIN_VR; }
     if (g_shell) { *n = sizeof CHAIN_SHELL / sizeof *CHAIN_SHELL; return CHAIN_SHELL; }
     *n = sizeof CHAIN_CLIENT / sizeof *CHAIN_CLIENT;
     return CHAIN_CLIENT;
@@ -208,9 +228,20 @@ static void report_gap(void) {
 #define SL_CLIENT_FN  "SDL_main"
 #define SL_SHELL_LIB  "libshell_arm64-v8a.so"
 #define SL_SHELL_FN   "main"
+// The VR half has no SDL_main-shaped entry. It is a real NativeActivity and the
+// manifest says so (`android.app.lib_name = vrlink_scene`), so the entry point
+// is the one Android's own NativeActivity.onCreate would dlsym. Checked against
+// the library's exports: ANativeActivity_onCreate is there and `android_main`
+// is NOT, so whatever glue it uses keeps that symbol internal.
+#define SL_VR_LIB     "libvrlink_scene.so"
+#define SL_VR_FN      "ANativeActivity_onCreate"
 
-static const char *slink_main_lib(void) { return g_shell ? SL_SHELL_LIB : SL_CLIENT_LIB; }
-static const char *slink_main_fn(void)  { return g_shell ? SL_SHELL_FN  : SL_CLIENT_FN;  }
+static const char *slink_main_lib(void) {
+    return g_vr ? SL_VR_LIB : g_shell ? SL_SHELL_LIB : SL_CLIENT_LIB;
+}
+static const char *slink_main_fn(void) {
+    return g_vr ? SL_VR_FN : g_shell ? SL_SHELL_FN : SL_CLIENT_FN;
+}
 
 typedef void (*v_env_cls)(void *, void *);
 
@@ -361,6 +392,139 @@ static void run_main_sequence(kl_image *sdl_img, kl_image *entry_img) {
     fflush(NULL);
 }
 
+// ------------------------------------------------------------- VR front door --
+// ANativeActivity, transcribed from <android/native_activity.h>. It is ABI, not
+// an interface we get to design: the guest's glue reads these fields by offset
+// out of the pointer we hand ANativeActivity_onCreate, and it writes the
+// callbacks table back through the first one.
+//
+// `clazz` is the NDK's own misnomer — it is the activity INSTANCE object, not a
+// jclass, and the guest calls getIntent()/getPackageName() on it. Ours is the
+// jobject kl_jni hands out for the activity, so those land on g_bindings and
+// fail by name like every other M4 gap.
+typedef struct kl_ANativeActivity kl_ANativeActivity;
+typedef struct {
+    void (*onStart)(kl_ANativeActivity *);
+    void (*onResume)(kl_ANativeActivity *);
+    void *(*onSaveInstanceState)(kl_ANativeActivity *, size_t *);
+    void (*onPause)(kl_ANativeActivity *);
+    void (*onStop)(kl_ANativeActivity *);
+    void (*onDestroy)(kl_ANativeActivity *);
+    void (*onWindowFocusChanged)(kl_ANativeActivity *, int);
+    void (*onNativeWindowCreated)(kl_ANativeActivity *, void *);
+    void (*onNativeWindowResized)(kl_ANativeActivity *, void *);
+    void (*onNativeWindowRedrawNeeded)(kl_ANativeActivity *, void *);
+    void (*onNativeWindowDestroyed)(kl_ANativeActivity *, void *);
+    void (*onInputQueueCreated)(kl_ANativeActivity *, void *);
+    void (*onInputQueueDestroyed)(kl_ANativeActivity *, void *);
+    void (*onContentRectChanged)(kl_ANativeActivity *, const void *);
+    void (*onConfigurationChanged)(kl_ANativeActivity *);
+    void (*onLowMemory)(kl_ANativeActivity *);
+} kl_ANativeActivityCallbacks;
+struct kl_ANativeActivity {
+    kl_ANativeActivityCallbacks *callbacks;
+    void       *vm;
+    void       *env;
+    void       *clazz;
+    const char *internalDataPath;
+    const char *externalDataPath;
+    int32_t     sdkVersion;
+    void       *instance;
+    void       *assetManager;
+    const char *obbPath;
+};
+
+typedef void (*anativeactivity_oncreate_fn)(kl_ANativeActivity *, void *, size_t);
+
+// One call per lifecycle hook, named, so a NULL callback is distinguishable
+// from one that ran. Android calls these from the UI thread; so do we.
+#define VR_CB(act, name, ...)                                                  \
+    do {                                                                       \
+        if ((act)->callbacks->name) {                                          \
+            printf("  [vr] %s\n", #name); fflush(NULL);                        \
+            kl_jni_local_frame_push();                                         \
+            (act)->callbacks->name((act), ##__VA_ARGS__);                      \
+            kl_jni_local_frame_pop();                                          \
+        } else printf("  [vr] %s — not registered\n", #name);                  \
+    } while (0)
+
+static void run_vr_sequence(kl_image *scene) {
+    printf("\n=== phase 2: ANativeActivity_onCreate (the VR front door) ===\n");
+    fflush(NULL);
+
+    anativeactivity_oncreate_fn onCreate =
+        (anativeactivity_oncreate_fn)kl_sym(scene, SL_VR_FN);
+    if (!onCreate) { printf("  no %s export\n", SL_VR_FN); return; }
+
+    // This thread is the app's UI thread, and on Android that means it has a
+    // looper before any activity is created. The guest takes it with
+    // ALooper_forThread() inside onCreate and does not check for NULL.
+    kl_ndk_prepare_looper();
+
+    static kl_ANativeActivityCallbacks cbs;
+    static kl_ANativeActivity act;
+    act.callbacks        = &cbs;
+    act.vm               = kl_jni_vm();
+    act.env              = kl_jni_env();
+    act.clazz            = kl_jni_activity();
+    act.internalDataPath = kl_jni_files_dir();
+    act.externalDataPath = kl_jni_files_dir();
+    // 29, the same Quest-2 answer Build.SDK_INT gives. Two numbers describing
+    // one device have to agree — this is the display-panel group answer again.
+    act.sdkVersion       = 29;
+    act.assetManager     = kl_ndk_asset_manager();
+    act.obbPath          = kl_jni_files_dir();
+
+    printf("  activity: clazz=%p env=%p assets=%p sdk=%d dataPath=%s\n",
+           act.clazz, act.env, act.assetManager, act.sdkVersion,
+           act.internalDataPath ? act.internalDataPath : "(null)");
+    fflush(NULL);
+
+    kl_jni_local_frame_push();
+    onCreate(&act, NULL, 0);
+    kl_jni_local_frame_pop();
+    // How many hooks it installed is the cheapest confirmation that onCreate
+    // did its job: a glue that returned early leaves the table empty, and that
+    // reads identically to "it worked" without this line.
+    int nhooks = 0;
+    void **slot = (void **)&cbs;
+    for (size_t i = 0; i < sizeof cbs / sizeof(void *); i++) nhooks += slot[i] != NULL;
+    printf("  onCreate returned; %d of %zu callbacks registered\n",
+           nhooks, sizeof cbs / sizeof(void *));
+    fflush(NULL);
+
+    if (!getenv("KL_SLINK_MAIN")) {
+        printf("  (KL_SLINK_MAIN unset: stopping after onCreate)\n");
+        return;
+    }
+
+    // The rest of what Android's NativeActivity does, in its order. onCreate
+    // itself only spawns the guest's thread and returns — nothing renders until
+    // the window arrives, and the glue's own loop blocks until it does.
+    printf("\n=== phase 3: the activity lifecycle ===\n");
+    VR_CB(&act, onStart);
+    VR_CB(&act, onResume);
+    VR_CB(&act, onNativeWindowCreated, kl_ndk_window());
+    VR_CB(&act, onWindowFocusChanged, 1);
+
+    // ...and then the UI thread's job, which is NOT to sleep. This guest is not
+    // native_app_glue: it does not run android_main on a thread of its own, it
+    // hangs a UIThreadCallbackHandler off *this* thread's looper and expects
+    // Looper.loop() to be turning. Sleeping here left it with exactly one live
+    // thread — its log-capture reader, blocked in read() — and no sign of a
+    // problem anywhere, because nothing was wrong except that nobody was
+    // pumping. KL_SLINK_WAIT is the deadline; what it measures is how far the
+    // guest gets once its callbacks can actually run.
+    unsigned maxs = getenv("KL_SLINK_WAIT") ? (unsigned)atoi(getenv("KL_SLINK_WAIT")) : 10;
+    int windowed = getenv("KL_VIEW") != NULL;
+    for (unsigned t = 0; windowed ? !g_view_quit : t < maxs * 10; t++) {
+        kl_ndk_pump_looper(100);
+        if ((t + 1) % 10 == 0) kl_jni_drain_ui_tasks();
+    }
+    printf("  (UI thread waited %us — see above for where the guest got to)\n", maxs);
+    fflush(NULL);
+}
+
 static int slink_run(void) {
     // Trap 1, and it bit immediately: every thread that runs guest code must
     // seed bionic's stack-guard canary into TSD slot 5 first. Without it the
@@ -372,20 +536,40 @@ static int slink_run(void) {
     kl_fault_install();
     kl_jni_set_permissive(getenv("KL_PERMISSIVE") != NULL);
     g_shell = kl_env_on("KL_SLINK_SHELL", 0);
+    g_vr    = kl_env_on("KL_SLINK_VR", 0);
+    if (g_vr && g_shell) {
+        printf("(KL_SLINK_VR and KL_SLINK_SHELL are different front doors; "
+               "taking VR)\n");
+        g_shell = 0;
+    }
 
     // Which APK this LIBDIR came out of. It was hardcoded to the old one, which
     // was harmless while nothing read an asset and wrong the moment something
     // did: the shell loads assets/config/{default,ui,hmd,controller}_config.json
     // at startup, and those exist only in the VR tree.
-    int vr = strstr(LIBDIR, "steamlink-vr") != NULL;
-    const char *apk    = vr ? "steamlink-vr.apk" : "steamlink-android.apk";
-    const char *assets = vr ? "steamlink-vr"     : "steamlink-android";
+    int vr_apk = strstr(LIBDIR, "steamlink-vr") != NULL;
+    const char *apk    = vr_apk ? "steamlink-vr.apk" : "steamlink-android.apk";
+    // The ASSETS directory, not the unpacked tree root — kl_jni_set_assets_dir
+    // wants "<tree>/assets" (that is what the Beat Saber default is), and both
+    // asset doors resolve relative paths against it. The tree root that
+    // kl_guest_path_map needs is derived from it by stripping the last
+    // component, so this stays right for both.
+    const char *assets = vr_apk ? "steamlink-vr/assets" : "steamlink-android/assets";
+    if (g_vr && !vr_apk) {
+        fprintf(stderr, "KL_SLINK_VR needs the VR apk — libvrlink_scene.so only "
+                        "exists in steamlink-vr/lib/arm64-v8a\n");
+        return 1;
+    }
 
     // The JNI surface has to describe THIS app, not Beat Saber. The activity
     // class is the load-bearing one (see above); the paths matter because
     // trap 6c applies to any guest — Android hands out absolute paths and
     // SDL3's SDL_GetBasePath/SDL_GetPrefPath propagate whatever we say.
-    kl_jni_set_activity_class(ACTIVITY);
+    // ...and the VR front door is a DIFFERENT activity in the same package.
+    // The manifest declares the two as peers (§11.9), and this is the one with
+    // `category.VR` — Android's stock NativeActivity, whose only app-specific
+    // part is the `android.app.lib_name` meta-data.
+    kl_jni_set_activity_class(g_vr ? "android/app/NativeActivity" : ACTIVITY);
     kl_jni_set_apk_path(apk);
     kl_jni_set_native_lib_dir(LIBDIR);
     kl_jni_set_files_dir("build/steamlink-files");
@@ -400,11 +584,21 @@ static int slink_run(void) {
     // button; STEAM_LINK_VR is the app's own build discriminator). The two APKs
     // differ by exactly that last entry, which is why the runtime does not carry
     // a baked-in table: it would be wrong for one of them.
-    kl_jni_add_manifest_env("SDL_JOYSTICK_HIDAPI", "1");
-    kl_jni_add_manifest_env("SDL_TV_REMOTE_AS_JOYSTICK", "0");
-    kl_jni_add_manifest_env("SDL_ANDROID_TRAP_BACK_BUTTON", "1");
-    kl_jni_add_manifest_env("SDL_ANDROID_ALLOW_RECREATE_ACTIVITY", "1");
-    if (vr) kl_jni_add_manifest_env("STEAM_LINK_VR", "1");
+    //
+    // Not in VR mode: these are the SDLActivity's <meta-data>, and the VR front
+    // door is a different activity that declares only `android.app.lib_name`.
+    // Handing them over would be inventing manifest entries the app does not
+    // have — and STEAM_LINK_VR in particular is libmain's build discriminator,
+    // so a wrong answer there is a wrong branch rather than a dead variable.
+    if (!g_vr) {
+        kl_jni_add_manifest_env("SDL_JOYSTICK_HIDAPI", "1");
+        kl_jni_add_manifest_env("SDL_TV_REMOTE_AS_JOYSTICK", "0");
+        kl_jni_add_manifest_env("SDL_ANDROID_TRAP_BACK_BUTTON", "1");
+        kl_jni_add_manifest_env("SDL_ANDROID_ALLOW_RECREATE_ACTIVITY", "1");
+        if (vr_apk) kl_jni_add_manifest_env("STEAM_LINK_VR", "1");
+    } else {
+        kl_jni_add_manifest_env("android.app.lib_name", "vrlink_scene");
+    }
 
     // Qt has to be told where its plugins live, and on Android it always is —
     // Qt's own Android bootstrap sets the library paths from the APK layout
@@ -429,7 +623,7 @@ static int slink_run(void) {
     // two chains fail in different places for different reasons, and a log that
     // does not name the mode makes the two records unmergeable.
     printf("=== Steam Link: %s front door (%s -> %s), %s ===\n",
-           g_shell ? "2D SHELL" : "streaming CLIENT",
+           g_vr ? "OpenXR VR" : g_shell ? "2D SHELL" : "streaming CLIENT",
            slink_main_lib(), slink_main_fn(), LIBDIR);
 
     // The panel, published BEFORE anything can bring ANGLE up. Doing this from
@@ -490,6 +684,20 @@ static int slink_run(void) {
     char path[1024];
     snprintf(path, sizeof path, "%s/%s", LIBDIR, slink_main_lib());
     kl_image *entry_img = kl_find_image(path);
+
+    // The VR front door diverges here and never rejoins. Everything below is
+    // SDL3's — JNI_OnLoad, RegisterNatives, SDLActivity.onCreate — and
+    // libvrlink_scene has none of it: no libSDL3 in its DT_NEEDED, no
+    // JNI_OnLoad export, no natives to register. Its whole entry is the one
+    // function Android's NativeActivity dlsyms.
+    if (g_vr) {
+        if (!entry_img) return fail("libvrlink_scene.so not in the registry");
+        run_vr_sequence(entry_img);
+        printf("\n=== JNI surface ===\n");
+        kl_jni_report(stdout);
+        return 0;
+    }
+
     snprintf(path, sizeof path, "%s/libSDL3.so", LIBDIR);
     kl_image *sdl_img = kl_find_image(path);
     if (!entry_img || !sdl_img) return fail("the entry library / libSDL3.so not in the registry");

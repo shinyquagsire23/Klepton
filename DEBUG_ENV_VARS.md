@@ -256,6 +256,23 @@ Built for the loading-pace investigation; all default off.
   file offset (`pc - image base`, e.g. the connect-NULL site at
   libunity+0x966964).
 
+## Device identity (`runtime/kl_jni.c`)
+
+- `KL_BUILD_<FIELD>=<value>` — override one `android/os/Build` (or
+  `Build$VERSION`) String constant, e.g. `KL_BUILD_MODEL="Pixel 6"`,
+  `KL_BUILD_MANUFACTURER=Google`. The default is a Quest 2 and that is a
+  settled decision (CLAUDE.md) — this is the A/B, not a new answer.
+
+  The override is applied at the single source both readers go through, so
+  `Build.MODEL` over JNI and `ro.product.model` through
+  `__system_property_get` cannot disagree; making them disagree is the bug the
+  `g_sysprops` mapping in `kl_libc.c` exists to prevent.
+
+  It matters more than "Oculus branches": libshell's `BIsVRHeadset()` is
+  literally `"<ro.product.manufacturer> <ro.product.model>"` matched against
+  `Oculus Quest` / `Pico ` / `HTC VIVE `. (Measured: on `steamlink-vr.apk` it
+  does *not* change the 2D→VR handoff — see notes/STEAMLINK.md SL-7.)
+
 ## Clock + condvar (bionic→Darwin translation, always on) and their diagnostics
 
 These are fixes, not knobs: bionic clock ids differ from Darwin's, and bionic
@@ -715,6 +732,19 @@ See PLANNING §11.
   which imports no JNI at all. `./build_run_slink.sh --shell` sets it and picks
   the tree. The shell draws its own UI with no Steam host on the network; the
   client draws nothing at all without one.
+- `KL_SLINK_VR=1` — open the THIRD front door: `libvrlink_scene.so`, the
+  **OpenXR NativeActivity** (`ANativeActivity_onCreate`), instead of either SDL3
+  half. Not a chain — its `DT_NEEDED` is entirely Android system libraries we
+  shim, so one guest library is the whole working set, and `libopenxr_loader.so`
+  is deliberately NOT loaded because it is replaced by `runtime/kl_openxr.c`.
+  VR APK only, and it says so by name if pointed at the other tree. Mutually
+  exclusive with `KL_SLINK_SHELL` (VR wins, with a line saying so).
+  `make slink-vr-gap` is the work list, `make slink-vr-scene` the run; with
+  `KL_SLINK_MAIN=1` it goes on to drive the activity lifecycle
+  (`onStart`/`onResume`/`onNativeWindowCreated`/`onWindowFocusChanged`) and then
+  **pumps the main looper**, which this guest requires — it hangs its callback
+  handler off the UI thread's looper rather than running work on a thread of its
+  own (PLANNING §11.14).
 - `KL_SLINK_ARGS="<space-separated argv>"` — `SDL_main`'s own options, which
   the real activity fills from the launching intent's `sArgs` extra. Without
   it the streaming client is being asked to stream nothing (PLANNING §11.12).
@@ -722,6 +752,23 @@ See PLANNING §11.
   connection attempt — `--transport` is load-bearing and its value is a
   protobuf enum name (`k_EStreamTransport{None,UDP,UDPRelay,SDR,UDP_SNS,
   UDPRelay_SNS}`).
+- `KL_SLINK_SARGS="<ip>~<port>~<port>~0,0,1~~~~<token>"` — the **2D→VR
+  handoff**, arriving. The VR half is not a standalone app: it reads its
+  session out of the launching Intent's `sArgs` extra, and without one it
+  prints "No sArgs and release build panic. Aborting back to SteamLink." and
+  exits before its first frame. Set it and the app runs its scene setup, its
+  frame loop and its SVL stack instead. The value is what SL-6 measured the 2D
+  shell building after the host authorized (notes/STEAMLINK.md); a synthetic
+  one of the right shape is enough to get past scene setup, a real one is
+  needed for an actual stream. `make slink-vr-run` carries a synthetic default.
+- `KL_SLINK_START_INFO` / `KL_SLINK_ORIG_PACKAGE` / `KL_SLINK_ORIG_ACTIVITY` —
+  the other three extras from the same Intent. Unset means absent, and absent
+  is not the same as empty: with none of the four set, `getExtras()` answers
+  null, which is what a normally-launched activity sees.
+- `KL_XR_BINDINGS=1` — print every suggested action binding, not just the
+  count per interaction profile. This guest suggests ~40 bindings for each of
+  seven controller types, so it is off by default; turn it on when the question
+  is which concrete input path an action expects to be driven from.
 - `KL_SLINK_SIZE=WxH` — the panel size, published to SDL
   (`nativeSetScreenResolution`), the `ANativeWindow` and ANGLE together via
   one `slink_panel_size()` — the display is a group answer, and ANGLE is

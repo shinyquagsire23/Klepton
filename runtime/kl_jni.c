@@ -17,6 +17,7 @@
 #include "klepton.h"
 #include "kl_jni.h"
 #include "kl_egl.h"
+#include "kl_ndk.h"
 #include "kl_jni_slots.h"
 #include "kl_va.h"
 
@@ -96,6 +97,11 @@ typedef struct {
     float   fval;
 } klj_pref;
 typedef struct { const char *cls, *name, *sig; int is_static; } klj_field_obj;
+
+// A Bundle's payload: a NULL-terminated key/value table. Declared up here
+// because the launch-extras Bundle is built in the Intent block, a long way
+// above the manifest <meta-data> table that was the first user of the shape.
+typedef struct { const char *key, *val; } klj_kv;
 static void *klj_class_object(const char *class_name);
 
 static const char KLJ_CLASS_CLASS[]  = "java/lang/Class";
@@ -521,6 +527,11 @@ static const struct { const char *cls, *super; } g_supers[] = {
     // the subclass, which is the duplication this table exists to avoid.
     {"com/valvesoftware/steamlink/SteamLink",  "org/libsdl/app/SDLActivity"},
     {"org/libsdl/app/SDLActivity",             "android/app/Activity"},
+    // libvrlink_scene's activity IS android.app.NativeActivity — the manifest
+    // names the framework class directly rather than a subclass — and it calls
+    // getIntent() on it. That is an Activity method, so without this edge every
+    // inherited Activity method would need re-declaring against NativeActivity.
+    {"android/app/NativeActivity",             "android/app/Activity"},
     {"android/app/Activity",                   "android/view/ContextThemeWrapper"},
     {"android/view/ContextThemeWrapper",       "android/content/ContextWrapper"},
     {"android/content/ContextWrapper",         "android/content/Context"},
@@ -1108,6 +1119,54 @@ static kl_jint klj_GetArrayLength(void *env, void *a) {
     return arr ? arr->len : 0;
 }
 
+// A direct ByteBuffer: a java.nio.ByteBuffer whose storage is guest memory the
+// guest already owns, so there is nothing to copy in either direction and no
+// lifetime for us to manage. The guest allocates, we describe.
+//
+// This is the *easiest* class of JNI object to serve honestly and the easiest
+// to get subtly wrong: the JNI contract is that the address and capacity come
+// straight back out, so anything we invent — a copy, a bounds adjustment, a
+// rounded capacity — would be a buffer the guest wrote into and something else
+// read from a different place.
+//
+// The record is calloc'd and outlives the object, which is the same
+// arrangement klj_new_method and the boxed preferences already have.
+typedef struct { void *addr; int64_t capacity; } klj_direct_buffer;
+static const char KLJ_CLASS_BYTEBUFFER[] = "java/nio/ByteBuffer";
+
+static void *klj_NewDirectByteBuffer(void *env, void *address, int64_t capacity) {
+    (void)env;
+    // A negative capacity or a NULL address is the guest describing a buffer
+    // that cannot exist; JNI says the result is undefined, so we say NULL
+    // rather than hand back something that reads as a valid empty buffer.
+    if (!address || capacity < 0) return NULL;
+    klj_direct_buffer *b = calloc(1, sizeof *b);
+    if (!b) return NULL;
+    b->addr = address; b->capacity = capacity;
+    return klj_new_object_data(KLJ_CLASS_BYTEBUFFER, b);
+}
+
+static klj_direct_buffer *klj_direct(void *buf) {
+    klj_object *o = klj_as_object(buf);
+    // strcmp, not pointer equality: o->cls is the INTERNED copy in the class
+    // table, which is a different address from the literal above.
+    return (o && strcmp(o->cls, KLJ_CLASS_BYTEBUFFER) == 0) ? o->data : NULL;
+}
+
+static void *klj_GetDirectBufferAddress(void *env, void *buf) {
+    (void)env;
+    klj_direct_buffer *b = klj_direct(buf);
+    return b ? b->addr : NULL;
+}
+
+// -1 for anything that is not a direct buffer, which is what JNI specifies and
+// is distinguishable from a legitimately empty one.
+static int64_t klj_GetDirectBufferCapacity(void *env, void *buf) {
+    (void)env;
+    klj_direct_buffer *b = klj_direct(buf);
+    return b ? b->capacity : -1;
+}
+
 static void *klj_NewObjectArray(void *env, kl_jint len, void *elemClass, void *init) {
     (void)env;
     void      *obj = klj_new_array('L', klj_class_name(elemClass), len);
@@ -1193,6 +1252,35 @@ typedef struct {
 } klj_field;
 static const klj_field g_fields[];
 
+// The device identity is single-sourced ON PURPOSE: Build.MANUFACTURER/MODEL
+// read over JNI and ro.product.* read through __system_property_get are the
+// same strings, because Steam Link asks both ways and a disagreement between
+// the two answers is visible to the guest (see the g_sysprops comment in
+// kl_libc.c, which was written after the empty-property crash).
+//
+// KL_BUILD_<FIELD> overrides one of them, and so it has to be applied HERE —
+// at the single source both readers go through — or the override would
+// re-introduce exactly the disagreement that mapping was added to remove.
+//
+// It exists because the identity is load-bearing well beyond Oculus branches.
+// libshell's BIsVRHeadset() is literally "<ro.product.manufacturer>
+// <ro.product.model>" matched against "Oculus Quest" / "Pico " / "HTC VIVE ",
+// so the model we report is what decides whether Steam Link's shell asks its
+// host for a VR session or a flat 2D one — and those two sessions are
+// different wire protocols on different ports (notes/STEAMLINK.md, SL-7).
+// Presenting a Quest 2 stays the default and the settled decision; this is the
+// A/B, not a new answer.
+static const char *klj_field_sval(const klj_field *f) {
+    if (!f->sval
+        || (strcmp(f->cls, "android/os/Build") != 0
+            && strcmp(f->cls, "android/os/Build$VERSION") != 0))
+        return f->sval;
+    char env[64];
+    snprintf(env, sizeof env, "KL_BUILD_%s", f->name);
+    const char *v = getenv(env);
+    return v ? v : f->sval;
+}
+
 // Interned jstrings for constant object fields, parallel to g_fields so the
 // table itself stays const. A static final String read twice is the same object
 // in Java, and some callers do compare identity.
@@ -1275,7 +1363,7 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
             size_t idx = (size_t)(f - g_fields);
             if (idx < KLJ_MAX_FIELDS) {
                 if (!g_field_cache[idx]) {
-                    g_field_cache[idx] = kl_jni_new_string(f->sval);
+                    g_field_cache[idx] = kl_jni_new_string(klj_field_sval(f));
                     // Pinned, because the cache outlives the read. A caller that
                     // does GetStringUTFChars/Release and then DeleteLocalRef —
                     // correct JNI, and what libshell does with ShellWifiInfo's
@@ -1287,7 +1375,7 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
                 }
                 return (klj_val){.l = g_field_cache[idx]};
             }
-            return (klj_val){.l = kl_jni_new_string(f->sval)};
+            return (klj_val){.l = kl_jni_new_string(klj_field_sval(f))};
         }
         if (want == 'F' || want == 'D') return (klj_val){.d = f->dval};
         return (klj_val){.j = (uint64_t)f->ival};
@@ -1529,7 +1617,7 @@ const char *kl_jni_build_string(const char *field) {
         if (f->sval && strcmp(f->name, field) == 0
             && (strcmp(f->cls, "android/os/Build") == 0
                 || strcmp(f->cls, "android/os/Build$VERSION") == 0))
-            return f->sval;
+            return klj_field_sval(f);
     return NULL;
 }
 
@@ -1656,7 +1744,19 @@ static const char *klj_abspath(const char *p) {
 }
 
 static const char *g_assets_dir = "beatsaber/assets";
-void kl_jni_set_assets_dir(const char *dir) { g_assets_dir = klj_abspath(dir); }
+void kl_jni_set_assets_dir(const char *dir) {
+    g_assets_dir = klj_abspath(dir);
+    // There are TWO doors onto the same directory and they have to agree:
+    // AssetManager.open() over JNI (this file) and AAssetManager_open() in the
+    // NDK (kl_ndk.c, its own g_asset_root). Beat Saber only ever uses the first
+    // and Steam Link's 2D half only ever uses the first, so the second sat at
+    // its "assets" default with NO CALLER ANYWHERE — which is fine until a
+    // guest uses the NDK door, and then it silently resolves against the
+    // working directory. libvrlink_scene is that guest: its config/*.json loads
+    // failed with "Failed to load file config/hmd_config.json" and nothing
+    // pointing at a path at all. One setter now feeds both.
+    kl_ndk_set_assets_dir(g_assets_dir);
+}
 
 static klj_val klj_singleton(const char *cls, void **slot) {
     if (!*slot) {
@@ -1671,11 +1771,55 @@ static klj_val klj_Activity_getIntent(void *env, void *self, const klj_val *a, i
     static void *intent;
     return klj_singleton("android/content/Intent", &intent);
 }
-// A normally-launched activity has no extras, so null is the truthful answer
-// here rather than a shortcut — Unity treats it as "no launch arguments".
+// The launch extras — i.e. the SL-6 handoff, arriving.
+//
+// SL-6 measured the 2D shell building an explicit Intent for
+// `com.valvesoftware.steamlinkvr/android.app.NativeActivity` carrying four
+// string extras, and refused it because the VR activity did not exist. It does
+// now, and it reads them back through exactly this call: getIntent().getExtras()
+// then Bundle.getString("sArgs"). Without them libvrlink_scene prints
+// "No sArgs and release build panic. Aborting back to SteamLink." and exits
+// before its first frame — so this is the join between the two halves of the
+// Steam Link arc, not a convenience.
+//
+// The values come from the environment rather than from a live shell, because
+// the two halves do not yet run in one process: KL_SLINK_SARGS is pasted from a
+// pairing run (notes/STEAMLINK.md has the format,
+// "<ip>~10400~10400~0,0,1~~~~<token>"). Wiring the shell's startVRLink straight
+// into this table is what removes the paste step.
+//
+// **Unset means unset.** With no sArgs the whole Bundle is absent and getExtras
+// answers null, which is what a normally-launched activity sees and what Unity
+// on the other target relies on. An empty-but-present Bundle would be a
+// different claim — "launched with arguments, none of them set" — and this
+// guest distinguishes them ("No extras bundle was present" is its own log line).
 static klj_val klj_Intent_getExtras(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.l = NULL};
+    static void *extras;
+    static int   built;
+    if (!built) {
+        built = 1;
+        static klj_kv kv[5];
+        int k = 0;
+        const struct { const char *env, *key; } want[] = {
+            {"KL_SLINK_SARGS",         "sArgs"},
+            {"KL_SLINK_START_INFO",    "sStartInfo"},
+            {"KL_SLINK_ORIG_PACKAGE",  "sOriginalPackage"},
+            {"KL_SLINK_ORIG_ACTIVITY", "sOriginalActivity"},
+        };
+        for (size_t i = 0; i < sizeof want / sizeof want[0]; i++) {
+            const char *v = getenv(want[i].env);
+            if (v && *v) { kv[k].key = want[i].key; kv[k].val = v; k++; }
+        }
+        kv[k].key = kv[k].val = NULL;
+        if (k) {
+            extras = klj_new_object_data("android/os/Bundle", kv);
+            ((klj_object *)extras)->pinned = 1;   // host-held across frames
+            for (int i = 0; i < k; i++)
+                KLJ_LOG("launch extra %s = \"%s\"", kv[i].key, kv[i].val);
+        }
+    }
+    return (klj_val){.l = extras};
 }
 // new Intent(action). The action string is the only part anything reads so far.
 static klj_val klj_Intent_init(void *env, void *clazz, const klj_val *a, int n) {
@@ -1805,6 +1949,49 @@ static klj_val klj_Context_getPackageName(void *env, void *self, const klj_val *
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.l = kl_jni_new_string("com.beatgames.beatsaber")};
 }
+// ---- WifiManager, for the VR half ----
+//
+// The 2D shell reads Wi-Fi through its own ShellWifiInfo (see the field table
+// above, and the settled answer there: we model no WifiManager, so
+// getConnectionInfo() is null, which is Android's own answer on a device not
+// associated with a network). The VR half asks the framework directly, and gets
+// the same answer for the same reason — claiming a network would be reporting a
+// signal strength we have not measured.
+static klj_val klj_WifiManager_getConnectionInfo(void *env, void *self,
+                                                 const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("WifiManager.getConnectionInfo() -> null (not associated)");
+    return (klj_val){.l = NULL};
+}
+
+// A WifiLock is not a claim about connectivity — it is a request to the power
+// manager not to put the Wi-Fi radio to sleep. There is no radio here to put to
+// sleep, so every guarantee the lock makes is already true and acquiring it is
+// the work being *already done* rather than a stub standing in for it. That is
+// why isHeld() answers true: the question is "did my acquire take effect", and
+// it did, vacuously.
+//
+// The alternative was measured: answering false makes the app print
+// "WiFi lock failed to acquire!" and carry on with a worse idea of its own
+// network conditions than the truth warrants.
+static klj_val klj_WifiManager_createWifiLock(void *env, void *self,
+                                              const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *tag = n > 1 ? klj_str(a[1].l) : NULL;
+    KLJ_LOG("WifiManager.createWifiLock(mode=%d, \"%s\")",
+            n > 0 ? (int)a[0].j : 0, tag ? tag : "");
+    static void *lock;
+    return klj_singleton("android/net/wifi/WifiManager$WifiLock", &lock);
+}
+static klj_val klj_WifiLock_acquire(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};
+}
+static klj_val klj_WifiLock_isHeld(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};
+}
+
 // getSystemService returns the manager object for a service name. Returning null
 // for an unknown one is legitimate Android — a device need not offer every
 // service — so unknowns are logged rather than fabricated.
@@ -1863,6 +2050,7 @@ static klj_val klj_String_length(void *env, void *self, const klj_val *a, int n)
 // inside the engine rather than here.
 static const char *g_files_dir = "build/android-files";
 void kl_jni_set_files_dir(const char *dir) { g_files_dir = klj_abspath(dir); }
+const char *kl_jni_files_dir(void) { return g_files_dir; }
 
 // The APK itself. Unity opens this as a zip to read streaming assets, so it has
 // to be a real file — the unpacked tree under beatsaber/ is not a substitute.
@@ -2009,6 +2197,55 @@ static klj_val klj_Looper_getMainLooper(void *env, void *self, const klj_val *a,
     static void *main_looper;
     return klj_singleton("android/os/Looper", &main_looper);
 }
+
+// Looper.myLooper() — the CALLING thread's looper, or null if it has none.
+// The distinction is the whole point of the call: a guest asks it to find out
+// whether it may post work from here, and a runtime that always answers
+// non-null tells every worker thread it is a UI thread.
+//
+// The native side already knows: ALooper_forThread() is the same question, and
+// kl_ndk_prepare_looper is what puts one on the thread that runs the activity.
+// So this defers to that rather than keeping a second idea of which threads are
+// loopered — two answers to one question is how they come to disagree.
+//
+// The looper it names is the main one, which is right for the thread we prepare
+// and would be wrong for a HandlerThread asking about itself. Nothing does that
+// yet; when something does, this needs the per-thread object, not the singleton.
+// Looper.getQueue() — the MessageQueue behind a Looper. Like the Looper itself
+// this is an identity rather than a mechanism: the queue is ours (klj_looper's
+// ring, or the native looper's), and nothing has yet called a method ON the
+// MessageQueue — the guest holds it, which is what addIdleHandler and
+// isIdle would need and neither has been reached.
+//
+// So it is a singleton per Looper object, and the moment something does call a
+// method on it, that method is where the real queue gets attached.
+static klj_val klj_Looper_getQueue(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    static void *queue;
+    (void)o;
+    return klj_singleton("android/os/MessageQueue", &queue);
+}
+
+// Looper.prepare() — give THIS thread a looper. On Android it is the first half
+// of the two-line idiom every worker thread that wants a message queue writes
+// (prepare, then loop). Both halves are ours: the native looper is the same
+// object, so this is kl_ndk_prepare_looper by another name.
+//
+// Android throws RuntimeException on a second prepare for the same thread, and
+// kl_ALooper_prepare is idempotent instead. That divergence is deliberate: the
+// throw exists to catch a programming error, and we have no exception to throw
+// that the guest would survive.
+static klj_val klj_Looper_prepare(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    kl_ndk_prepare_looper();
+    return (klj_val){0};
+}
+
+static klj_val klj_Looper_myLooper(void *env, void *self, const klj_val *a, int n) {
+    if (!kl_ndk_thread_has_looper()) return (klj_val){.l = NULL};
+    return klj_Looper_getMainLooper(env, self, a, n);
+}
 // new Handler() binds to the calling thread's Looper; new Handler(looper) to the
 // one given. We have a single queue, so the Looper is recorded and not acted on.
 // The Callback form keeps the callback: sendToTarget() has to find it again, and
@@ -2117,6 +2354,22 @@ static klj_looper *klj_looper_of(void *looper_obj) {
     klj_object *o = klj_as_object(looper_obj);
     return (o && strcmp(o->cls, "android/os/Looper") == 0) ? o->data : NULL;
 }
+
+// Looper.quit() — stop the loop on the looper this object names. For a
+// HandlerThread's looper that is a real thread to shut down; for the main one
+// there is nothing to stop, because our main "loop" is the host's pump and it
+// ends when the run does.
+static klj_val klj_Looper_quit(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_looper *lp = klj_looper_of(self);
+    if (!lp) { KLJ_LOG("Looper.quit() on the main looper — nothing to stop"); return (klj_val){0}; }
+    pthread_mutex_lock(&lp->lock);
+    lp->running = 0;
+    pthread_cond_broadcast(&lp->wake);
+    pthread_mutex_unlock(&lp->lock);
+    return (klj_val){0};
+}
+
 
 // ---- android.os.Message ----
 //
@@ -3592,6 +3845,25 @@ static klj_val klj_String_init_bytes(void *env, void *self, const klj_val *a, in
     return (klj_val){.l = s};
 }
 
+// s.getBytes(charsetName) — the inverse of the constructor above, and the same
+// deal: our jstrings ARE NUL-terminated UTF-8 byte buffers, so this is a copy
+// WITHOUT the terminator (a Java byte[] carries no NUL, and one that did would
+// show up as a trailing garbage character in whatever the guest builds from it).
+// A non-UTF-8 charset is reported for the same reason as there — silently
+// handing back the wrong encoding is trap 6d in string form.
+static klj_val klj_String_getBytes(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *s       = klj_str(self);
+    const char *charset = n > 0 ? klj_str(a[0].l) : NULL;
+    if (charset && strcasecmp(charset, "UTF-8") && strcasecmp(charset, "UTF8") &&
+        strcasecmp(charset, "US-ASCII") && strcasecmp(charset, "ISO-8859-1"))
+        KLJ_LOG("String.getBytes(\"%s\") — returning UTF-8, not transcoded", charset);
+    size_t len = s ? strlen(s) : 0;
+    void  *obj = klj_new_array('B', NULL, (int)len);
+    if (len) memcpy(klj_arr(obj)->data, s, len);
+    return (klj_val){.l = obj};
+}
+
 // Uri.encode(s): percent-encode everything outside the unreserved set. The set
 // is the Android API's, not a guess — it keeps the RFC 3986 unreserved
 // characters plus the sub-delims Uri leaves alone, and a space becomes %20
@@ -3655,7 +3927,7 @@ KLJ_ALERT_SET(Message, message)
 // settings from here and the Oculus layer reads focus-awareness and the
 // supported-device list. Returning a null Bundle would silently drop all of it,
 // so the values are transcribed from the APK's own manifest.
-static const struct { const char *key, *val; } g_metadata[] = {
+static const klj_kv g_metadata[] = {
     {"unity.splash-mode",                   "0"},
     {"unity.splash-enable",                 "false"},
     {"unity.build-id",                      "7a1e012b-c456-4b79-b3d2-b878d039f91e"},
@@ -3667,41 +3939,53 @@ static const struct { const char *key, *val; } g_metadata[] = {
     {NULL, NULL},
 };
 
-static const char *klj_meta(const char *key) {
-    for (int i = 0; g_metadata[i].key; i++)
-        if (key && strcmp(g_metadata[i].key, key) == 0) return g_metadata[i].val;
+// A Bundle is a key/value table, and there is now more than one of them: the
+// manifest's <meta-data> above, and an activity's launch extras below. So the
+// accessors dispatch on `self` — they used to read the manifest table whatever
+// object they were called on, which was fine while that was the only Bundle in
+// existence and would have silently answered manifest values to a guest asking
+// about its launch arguments.
+//
+// The payload is the table itself, NULL-terminated, borrowed and never freed:
+// every one of them is static storage that outlives the process.
+static const char *klj_bundle_get(void *self, const char *key) {
+    klj_object *o = klj_as_object(self);
+    const klj_kv *kv = o ? o->data : NULL;
+    if (!kv || !key) return NULL;
+    for (int i = 0; kv[i].key; i++)
+        if (strcmp(kv[i].key, key) == 0) return kv[i].val;
     return NULL;
 }
 
 static klj_val klj_metaData_field(void) {
     static void *bundle;
-    if (!bundle) bundle = kl_jni_new_object("android/os/Bundle");
+    if (!bundle) bundle = klj_new_object_data("android/os/Bundle", (void *)g_metadata);
     return (klj_val){.l = bundle};
 }
 
 // Bundle accessors. The two-argument forms take a default, which is what Android
 // returns for a missing key; the one-argument forms return the type's zero.
 static klj_val klj_Bundle_getString(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
-    const char *v = klj_meta(n > 0 ? klj_str(a[0].l) : NULL);
+    (void)env;
+    const char *v = klj_bundle_get(self, n > 0 ? klj_str(a[0].l) : NULL);
     if (!v && n > 1) return (klj_val){.l = a[1].l};
     return (klj_val){.l = v ? kl_jni_new_string(v) : NULL};
 }
 static klj_val klj_Bundle_getBoolean(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
-    const char *v = klj_meta(n > 0 ? klj_str(a[0].l) : NULL);
+    (void)env;
+    const char *v = klj_bundle_get(self, n > 0 ? klj_str(a[0].l) : NULL);
     if (!v) return (klj_val){.j = n > 1 ? a[1].j : 0};
     return (klj_val){.j = strcmp(v, "true") == 0};
 }
 static klj_val klj_Bundle_getInt(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
-    const char *v = klj_meta(n > 0 ? klj_str(a[0].l) : NULL);
+    (void)env;
+    const char *v = klj_bundle_get(self, n > 0 ? klj_str(a[0].l) : NULL);
     if (!v) return (klj_val){.j = n > 1 ? a[1].j : 0};
     return (klj_val){.j = (uint64_t)(int64_t)strtol(v, NULL, 10)};
 }
 static klj_val klj_Bundle_containsKey(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
-    return (klj_val){.j = klj_meta(n > 0 ? klj_str(a[0].l) : NULL) != NULL};
+    (void)env;
+    return (klj_val){.j = klj_bundle_get(self, n > 0 ? klj_str(a[0].l) : NULL) != NULL};
 }
 
 // PackageInfo, like ApplicationInfo, is read field-by-field. Values come from
@@ -4691,6 +4975,14 @@ static const klj_binding g_bindings[] = {
     // the answer is the manifest's and not a blanket yes.
     {"com/valvesoftware/steamlink/SteamLink", "checkSelfPermission", "(Ljava/lang/String;)I",
      klj_Context_checkSelfPermission},
+    // ...and again on Activity itself, because the VR half's activity IS
+    // android.app.NativeActivity and resolves the method there. Same
+    // implementation: the answer is a property of the manifest and the device we
+    // present, not of which class the guest looked it up on.
+    {"android/app/Activity", "checkSelfPermission", "(Ljava/lang/String;)I",
+     klj_Context_checkSelfPermission},
+    {"android/app/Activity", "requestPermissions", "([Ljava/lang/String;I)V",
+     klj_Activity_requestPermissions},
     {"com/valvesoftware/steamlink/SteamLink", "requestPermissions", "([Ljava/lang/String;I)V",
      klj_Activity_requestPermissions},
     // §11.9's handoff, reached: the shell has paired, the host has answered
@@ -4786,6 +5078,7 @@ static const klj_binding g_bindings[] = {
 
     {"android/net/Uri", "encode", "(Ljava/lang/String;)Ljava/lang/String;", klj_Uri_encode},
     {"java/lang/String", "<init>", "([BLjava/lang/String;)V", klj_String_init_bytes},
+    {"java/lang/String", "getBytes", "(Ljava/lang/String;)[B", klj_String_getBytes},
     {"com/unity3d/player/UnityPlayer", "loadLibrary", "(Ljava/lang/String;)Z", klj_UnityPlayer_loadLibrary},
     {"java/lang/System", "load", "(Ljava/lang/String;)V", klj_System_load},
     {"java/lang/System", "nanoTime", "()J", klj_System_nanoTime},
@@ -4834,6 +5127,10 @@ static const klj_binding g_bindings[] = {
     {"android/os/Process", "myTid",             "()I",   klj_Process_myTid},
 
     {"android/os/Looper",  "getMainLooper", "()Landroid/os/Looper;",  klj_Looper_getMainLooper},
+    {"android/os/Looper",  "myLooper",      "()Landroid/os/Looper;",  klj_Looper_myLooper},
+    {"android/os/Looper",  "prepare",       "()V",                    klj_Looper_prepare},
+    {"android/os/Looper",  "getQueue",      "()Landroid/os/MessageQueue;", klj_Looper_getQueue},
+    {"android/os/Looper",  "quit",          "()V",                    klj_Looper_quit},
     // A HandlerThread is a thread with a Looper on it. We have one queue and one
     // drain point (kl_jni_drain_ui_tasks) for the main looper — but a
     // HandlerThread gets a real thread of its own, because the guest blocks
@@ -4865,6 +5162,12 @@ static const klj_binding g_bindings[] = {
     {"android/content/Context", "getPackageManager", "()Landroid/content/pm/PackageManager;", klj_Context_getPackageManager},
     {"android/content/Context", "getPackageName", "()Ljava/lang/String;", klj_Context_getPackageName},
     {"android/content/Context", "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", klj_Context_getSystemService},
+    {"android/net/wifi/WifiManager", "getConnectionInfo", "()Landroid/net/wifi/WifiInfo;",
+     klj_WifiManager_getConnectionInfo},
+    {"android/net/wifi/WifiManager", "createWifiLock", "(ILjava/lang/String;)Landroid/net/wifi/WifiManager$WifiLock;",
+     klj_WifiManager_createWifiLock},
+    {"android/net/wifi/WifiManager$WifiLock", "acquire", "()V", klj_WifiLock_acquire},
+    {"android/net/wifi/WifiManager$WifiLock", "isHeld",  "()Z", klj_WifiLock_isHeld},
     {"android/content/Context", "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;", klj_Context_getExternalFilesDir},
     {"android/content/Context", "getFilesDir", "()Ljava/io/File;", klj_Context_getFilesDir},
     {"android/content/Context", "getCacheDir", "()Ljava/io/File;", klj_Context_getCacheDir},
@@ -5109,6 +5412,9 @@ static void klj_build_tables(void) {
     ENV(NewObjectV, klj_NewObjectV);
     ENV(NewObjectA, klj_NewObjectA);
     ENV(GetArrayLength,          klj_GetArrayLength);
+    ENV(NewDirectByteBuffer,     klj_NewDirectByteBuffer);
+    ENV(GetDirectBufferAddress,  klj_GetDirectBufferAddress);
+    ENV(GetDirectBufferCapacity, klj_GetDirectBufferCapacity);
     ENV(NewObjectArray,          klj_NewObjectArray);
     ENV(GetObjectArrayElement,   klj_GetObjectArrayElement);
     ENV(SetObjectArrayElement,   klj_SetObjectArrayElement);

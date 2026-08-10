@@ -66,6 +66,7 @@ int getentropy(void *buffer, size_t size);
 #include "kl_ndk.h"
 #include "kl_egl.h"
 #include "kl_opensl.h"
+#include "kl_openxr.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
 #include "kl_jni.h"
@@ -1101,7 +1102,7 @@ X(klb_pthread_rwlock_tryrdlock) X(klb_pthread_rwlock_trywrlock)
 X(klb___register_atfork) X(klb___gnu_strerror_r) X(klb___write_chk)
 // ...and what the 2D frontend (libshell + Qt6) adds on top of it.
 X(klb_eventfd) X(klb_eventfd_read) X(klb_eventfd_write) X(klb_ppoll)
-X(klb_accept4) X(klb_pipe2) X(klb_dup3) X(klb_memfd_create) X(klb_clone)
+X(klb_accept4) X(klb_pipe2) X(klb_dup2) X(klb_dup3) X(klb_memfd_create) X(klb_clone)
 X(klb_inotify_init) X(klb_inotify_init1)
 X(klb_inotify_add_watch) X(klb_inotify_rm_watch)
 X(klb___assert2) X(klb___FD_CLR_chk) X(klb___fgets_chk)
@@ -1220,6 +1221,7 @@ static const kl_entry g_shim[] = {
     E("eventfd_read", klb_eventfd_read), E("eventfd_write", klb_eventfd_write),
     E("ppoll", klb_ppoll),
     E("accept4", klb_accept4), E("pipe2", klb_pipe2), E("dup3", klb_dup3),
+    E("dup2", klb_dup2),
     E("memfd_create", klb_memfd_create),
     E("clone", klb_clone),
     E("inotify_init", klb_inotify_init), E("inotify_init1", klb_inotify_init1),
@@ -1356,5 +1358,14 @@ void *kl_shim_lookup(const char *name) {
         return kl_egl_sym(name);
     if (!strncmp(name, "SL_IID_", 7) || !strcmp(name, "slCreateEngine"))
         return kl_opensl_sym(name);
+
+    // Tier 7: OpenXR (SL-8). libopenxr_loader.so is REPLACED rather than
+    // translated (kl_openxr.h), so libvrlink_scene's forty-six xr* imports have
+    // to bind here at relocation time — the same door libSDL3's gl* imports use
+    // above, for the same reason. kl_openxr_lookup returns NULL for a name it
+    // does not know, so an xr* we do not serve still shows up in the
+    // unresolved-import report instead of being silently swallowed.
+    if (name[0] == 'x' && name[1] == 'r' && name[2] >= 'A' && name[2] <= 'Z')
+        return kl_openxr_lookup(name);
     return NULL;
 }

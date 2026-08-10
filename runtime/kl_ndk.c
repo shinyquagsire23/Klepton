@@ -73,6 +73,35 @@ static kl_looper *kl_ALooper_prepare(int opts) {
     return l;
 }
 
+// Android's main thread ALWAYS has a looper: ActivityThread calls
+// Looper.prepareMainLooper() long before any activity's onCreate, so
+// ALooper_forThread() on that thread never returns NULL and native code is
+// entitled to assume it. We author that side, so a host driving a
+// NativeActivity has to have done the same thing first.
+//
+// libvrlink_scene is what forced this and it fails a long way from the cause:
+// UIThreadCallbackHandler's constructor pipe()s, takes ALooper_forThread(),
+// and calls ALooper_addFd() on it — and on -1 it throws std::bad_alloc, which
+// is the *wrong* exception for "there was no looper" and sends the search
+// straight to memory. The abort is 8 frames of libc++ terminate machinery with
+// no mention of a looper anywhere.
+void kl_ndk_prepare_looper(void) { (void)kl_ALooper_prepare(0); }
+
+int kl_ndk_thread_has_looper(void) { return kl_ALooper_forThread() != NULL; }
+
+static int kl_looper_poll(int timeoutMillis, int *outFd, int *outEvents, void **outData);
+
+// ...and running it, which is the other half and is just as much ours to do.
+// Android's main thread does not merely HAVE a looper, it is sitting in
+// Looper.loop() whenever it is not inside a callback — that loop is what makes
+// a posted message run. A host that prepares a looper and then sleeps has built
+// the queue and left nothing draining it, which is the Choreographer lesson from
+// M4 in a different subsystem: the guest is not stuck, it is waiting for a pump
+// we declined to run.
+int kl_ndk_pump_looper(int timeout_ms) {
+    return kl_looper_poll(timeout_ms, NULL, NULL, NULL);
+}
+
 static void kl_ALooper_acquire(kl_looper *l) {
     if (l) __atomic_fetch_add(&l->refs, 1, __ATOMIC_RELAXED);
 }
@@ -283,11 +312,18 @@ void kl_ndk_set_assets_dir(const char *dir) {
     if (dir) snprintf(g_asset_root, sizeof g_asset_root, "%s", dir);
 }
 
+static char g_asset_manager;         // one manager; it is a directory, not state
+
 static void *kl_AAssetManager_fromJava(void *env, void *jmgr) {
     (void)env; (void)jmgr;
-    static char mgr;                 // one manager; it is a directory, not state
-    return &mgr;
+    return &g_asset_manager;
 }
+
+// ...and the same one without a JNI round trip, for ANativeActivity. Android
+// fills that struct's assetManager field itself, and it must be the pointer
+// AAssetManager_fromJava would return or the guest would hold two managers for
+// one directory.
+void *kl_ndk_asset_manager(void) { return &g_asset_manager; }
 
 static void *kl_AAssetManager_open(void *mgr, const char *fname, int mode) {
     (void)mgr; (void)mode;
@@ -448,6 +484,49 @@ static int   kl_ASensor_getType(const kl_sensor *s)         { return s ? s->type
 static float kl_ASensor_getResolution(const kl_sensor *s)   { return s ? s->resolution : 0.0f; }
 static int   kl_ASensor_getMinDelay(const kl_sensor *s)     { return s ? s->min_delay_us : 0; }
 
+// ============================================================ AConfiguration
+// An AConfiguration is Android's ResTable_config — locale, orientation, density,
+// screen size, the fields resource selection is done with. The VR guest imports
+// exactly three of the family, and none of them is a getter:
+//
+//   AConfiguration_new / _fromAssetManager / _delete
+//
+// which is native_app_glue's boilerplate verbatim. So nothing ever reads a field
+// back, and the honest answer is a zeroed block: every ACONFIGURATION_*_ANY
+// constant is 0, so "all defaults, nothing specified" is what the guest sees.
+// That is also true — we have no Android resource configuration to report.
+//
+// Sized generously and not from a transcribed struct, deliberately: the layout
+// is private to the platform, we hand out the only pointers, and the moment a
+// getter appears in an import list it becomes an unresolved name that stops the
+// run BY NAME rather than a field read off the end of a struct we guessed at.
+#define KL_ACONFIG_BYTES 128
+
+static void *kl_AConfiguration_new(void) { return calloc(1, KL_ACONFIG_BYTES); }
+static void  kl_AConfiguration_delete(void *c) { free(c); }
+static void  kl_AConfiguration_fromAssetManager(void *c, void *mgr) {
+    // Android fills the config from the asset manager's current device state.
+    // Ours has none, so this stays all-defaults; it is not a no-op standing in
+    // for something, it is the whole answer.
+    (void)mgr;
+    if (c) memset(c, 0, KL_ACONFIG_BYTES);
+}
+
+// ========================================================== ANativeActivity
+// The two calls the guest makes back INTO the activity. Both are requests to
+// the framework, not queries, so there is nothing to answer — but neither is a
+// no-op in meaning, and a silent one would be trap 6d.
+static void kl_ANativeActivity_finish(void *act) {
+    (void)act;
+    fprintf(stderr, "  [ndk] ANativeActivity_finish() — the guest is asking to "
+                    "close the activity\n");
+}
+static void kl_ANativeActivity_showSoftInput(void *act, unsigned flags) {
+    (void)act;
+    fprintf(stderr, "  [ndk] ANativeActivity_showSoftInput(0x%x) — no soft "
+                    "keyboard here\n", flags);
+}
+
 // ================================================================== dispatch
 static const struct { const char *name; void *fn; } g_ndk[] = {
 #define N(sym, fn) {sym, (void *)(fn)}
@@ -498,6 +577,13 @@ static const struct { const char *name; void *fn; } g_ndk[] = {
     N("ASensor_getType",                      kl_ASensor_getType),
     N("ASensor_getResolution",                kl_ASensor_getResolution),
     N("ASensor_getMinDelay",                  kl_ASensor_getMinDelay),
+
+    N("AConfiguration_new",              kl_AConfiguration_new),
+    N("AConfiguration_delete",           kl_AConfiguration_delete),
+    N("AConfiguration_fromAssetManager", kl_AConfiguration_fromAssetManager),
+
+    N("ANativeActivity_finish",        kl_ANativeActivity_finish),
+    N("ANativeActivity_showSoftInput", kl_ANativeActivity_showSoftInput),
 #undef N
 };
 

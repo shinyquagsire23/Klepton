@@ -73,6 +73,9 @@ void kl_jni_set_assets_dir(const char *dir);
 // Writable root behind getExternalFilesDir/getFilesDir/getCacheDir — where
 // Application.persistentDataPath lands. Created on demand. Default "build/android-files".
 void kl_jni_set_files_dir(const char *dir);
+// ...read back, absolute. ANativeActivity carries internalDataPath/obbPath as
+// plain char*, so a NativeActivity guest gets them here rather than over JNI.
+const char *kl_jni_files_dir(void);
 // The APK, which Unity opens as a zip via getPackageCodePath(). Default "beatsaber.apk".
 void kl_jni_set_apk_path(const char *path);
 // The native library directory: what ApplicationInfo.nativeLibraryDir reports and
