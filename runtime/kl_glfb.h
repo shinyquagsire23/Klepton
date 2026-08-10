@@ -244,4 +244,27 @@ void kl_glfb_eye_rate_zones(int *zones_x, int *zones_y);
 // not an ordinary image.
 void *kl_glfb_eye_rate_map(void);
 
+// The foveation POLICY — how many zones and how hard the periphery falls off —
+// held here rather than in either builder, because there are two of them
+// (t_mtl_provider.m on the host, KleptonCompositor.swift on device) and a
+// device that foveated differently from the host would make every host
+// measurement a lie about the thing being shipped. The Metal object is still
+// built where the display numbers are; only the numbers that describe it are
+// shared.
+//
+// Returns 1 when foveation is asked for (`KL_VRR`), 0 otherwise. `*zones` gets
+// the per-axis zone count (`KL_VRR_ZONES`, default 16) and `*edge` the rate at
+// the border (`KL_VRR_EDGE`, default 0.35); both are clamped to what a rate map
+// will accept. Either pointer may be NULL.
+int kl_glfb_foveation_wanted(int *zones, float *edge);
+
+// The rate layer's per-zone quality along one axis: 1.0 at the centre falling
+// linearly to `edge` at the border, `n` entries. Both axes get the same curve,
+// so this is called once per axis with the same arguments.
+void kl_glfb_foveation_quality(float *q, int n, float edge);
+
+// The largest zone count kl_glfb_foveation_wanted will report, so a caller can
+// size a stack array for the curve above without allocating.
+#define KL_FOVEATION_MAX_ZONES 64
+
 #endif

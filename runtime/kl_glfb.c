@@ -1584,6 +1584,41 @@ void kl_glfb_eye_rate_zones(int *zones_x, int *zones_y) {
     if (zones_y) *zones_y = g_eye_rate_zy;
 }
 
+// The policy, not the object. Both builders read it from here so a device run
+// foveates exactly as the host measurement did — see kl_glfb.h.
+// ON by default since 2026-08-09, once the device leg landed: every path that
+// samples an eye texture as a picture rather than as storage now unwarps it
+// (both compositors, through kl_reproject's grid). What does NOT is the
+// diagnostic readback — KL_GLFB_OUT and t_mtl_provider's lit-pixel count — and
+// those show the squeeze on purpose, as the cheapest confirmation it engaged.
+// KL_VRR=0 is the A/B.
+int kl_glfb_foveation_wanted(int *zones, float *edge) {
+    if (!kl_env_on("KL_VRR", 1)) return 0;
+    int z = kl_env_int("KL_VRR_ZONES", 16);
+    if (z < 1) z = 1;
+    if (z > KL_FOVEATION_MAX_ZONES) z = KL_FOVEATION_MAX_ZONES;
+    float e = kl_env_float("KL_VRR_EDGE", 0.35f);
+    // A rate map's quality is a fraction of full rate; 0 would ask Metal for
+    // zero-area zones, and >1 is not a thing. Out of range means the knob was
+    // fat-fingered, so fall back rather than clamp to a silently different
+    // picture.
+    if (!(e > 0.05f) || !(e <= 1.0f)) e = 0.35f;
+    if (zones) *zones = z;
+    if (edge)  *edge  = e;
+    return 1;
+}
+
+void kl_glfb_foveation_quality(float *q, int n, float edge) {
+    for (int i = 0; i < n; i++) {
+        // The zone centre in [-1, 1], so the curve is symmetric about the
+        // middle of the screen — where the fovea is, absent eye tracking we
+        // are not given.
+        float t = n > 1 ? (2.f * ((float)i + 0.5f) / (float)n - 1.f) : 0.f;
+        if (t < 0) t = -t;
+        q[i] = 1.f - (1.f - edge) * t;
+    }
+}
+
 void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate_map) {
     if (!kl_glfb_init() || !mtl_resolve()) return;
     if (!a_SetRateMapForSize || !a_SetRateMap) {

@@ -239,6 +239,26 @@ final class KleptonCompositor {
     private let eyesLock = NSLock()
     private static func key(_ eye: Int, _ stage: Int) -> Int { eye &* 64 &+ stage }
 
+    // The GUEST's foveation map (KL_VRR=1), and the eye size it was built for.
+    //
+    // Not to be confused with `drawable.rasterizationRateMaps` — that is the
+    // system foveating THIS file's composite pass, and the two are deliberately
+    // detached (see unwarpGrid). This one makes the guest rasterize its own
+    // expensive pass at a reduced peripheral rate, which leaves the eye texture
+    // warped, which `unwarpGrid` then undoes.
+    //
+    // Touched only from the guest's render thread, inside provideEyeTexture.
+    private var guestRateMap: MTLRasterizationRateMap?
+    private var guestRateW = 0, guestRateH = 0
+    private var guestRateRefused = false
+
+    // The display's own foveation curve, sampled off the drawable's rate maps
+    // in primeDisplay and re-issued at the guest's eye size. Empty when the
+    // drawable is not foveated, and then the synthetic curve in kl_glfb is used
+    // instead.
+    private var displayQualityX: [Float] = []
+    private var displayQualityY: [Float] = []
+
     // ARKit is the pose-in seam kl_ovrp.h describes: "on visionOS it is ARKit's
     // WorldTrackingProvider answering the same call" the SDL viewer answers on
     // the host. Nothing below the seam changes — kl_ovrp still reports node 9
@@ -571,6 +591,209 @@ final class KleptonCompositor {
 
     // MARK: - The provider
 
+    /// Sample one rate map's per-axis quality curve into `n` uniform screen-space
+    /// zones.
+    ///
+    /// A rate map is `screen -> physical`, and its local *rate* is that
+    /// function's slope. So walking `physicalCoordinates(screenCoordinates:)`
+    /// across uniform screen steps and differencing recovers the curve directly
+    /// — no need for the descriptor that built it, which a built map does not
+    /// report (the same reason `kl_glfb_eye_rate_zones` has to carry the zone
+    /// count for maps we *do* build).
+    ///
+    /// Metal renormalizes quality so the peak is one sample per pixel, so the
+    /// scale of what comes back does not matter, only the shape.
+    private static func sampleCurve(_ map: MTLRasterizationRateMap, layer: Int,
+                                    zonesX: Int, zonesY: Int) -> ([Float], [Float]) {
+        let scr = map.screenSize
+        func axis(_ n: Int, _ extent: Int, _ physicalAt: (Float) -> Float) -> [Float] {
+            var q = [Float](repeating: 0, count: n)
+            var prev = physicalAt(0)
+            var peak: Float = 0
+            for i in 0..<n {
+                let next = physicalAt(Float(extent) * Float(i + 1) / Float(n))
+                q[i] = max(0, next - prev)
+                peak = max(peak, q[i])
+                prev = next
+            }
+            // A degenerate map would make the descriptor invalid; flat full rate
+            // is the honest reading of "no variation along this axis".
+            guard peak > 0 else { return [Float](repeating: 1, count: n) }
+            // Metal renormalizes so the peak is one sample per pixel, so only
+            // the shape survives; the floor keeps a zero-width zone out of the
+            // descriptor.
+            for i in 0..<n { q[i] = max(q[i] / peak, 0.01) }
+            return q
+        }
+        let qx = axis(zonesX, scr.width) {
+            map.physicalCoordinates(screenCoordinates: MTLSamplePosition(x: $0, y: 0),
+                                    layer: layer).x
+        }
+        let qy = axis(zonesY, scr.height) {
+            map.physicalCoordinates(screenCoordinates: MTLSamplePosition(x: 0, y: $0),
+                                    layer: layer).y
+        }
+        return (qx, qy)
+    }
+
+    /// Take the display's own foveation curve off a drawable, so the guest
+    /// rasterizes the way the compositor already does instead of the way we
+    /// guessed.
+    ///
+    /// Called from `primeDisplay`, which is before the guest boots and therefore
+    /// before any eye texture exists — the ordering `updateGuestRateMap` needs.
+    /// Sampled once, from the first drawable, exactly as `pushEyeTextureSize`
+    /// is: `renderQuality` ramps rather than switching, so an early drawable can
+    /// still carry the old quality — but quality scales the *resolution*, and
+    /// only the normalized shape of the curve is taken from here.
+    ///
+    /// **The two eyes' maps are combined, per zone, by maximum.** visionOS gives
+    /// each view its own map and they are not the same map mirrored-and-centred:
+    /// the eyes converge, so each one's dense region sits inboard, and the pair
+    /// are mirror images of each other. The guest cannot be given two, because
+    /// both eyes render through ONE multisampled scene renderbuffer and resolve
+    /// into ONE two-slice array texture — the map is registered against those
+    /// objects, and neither of them knows which eye is in flight. Taking the
+    /// envelope makes a symmetric curve that is dense wherever *either* eye
+    /// wants density: strictly more samples than either map alone, so no eye is
+    /// ever under-rendered, at the cost of some fragments the other eye did not
+    /// need. Per-eye guest maps would mean per-eye scene storage, which is a
+    /// different change to make deliberately.
+    private func captureDisplayFoveation(_ drawable: LayerRenderer.Drawable) {
+        guard displayQualityX.isEmpty else { return }
+        let maps = drawable.rasterizationRateMaps
+        guard let first = maps.first else {
+            NSLog("[cp] drawable is not foveated — KL_VRR would use the synthetic "
+                  + "curve (KL_VRR_ZONES / KL_VRR_EDGE)")
+            return
+        }
+        // The zone count, ALVR's way (DummyMetalRenderer): a built map does not
+        // report its zones, but physicalSize / physicalGranularity is the number
+        // of cells it actually resolves to. Capped at the unwarp grid's own
+        // limit, since a grid cell per zone is what makes the unwarp exact.
+        let gran = first.physicalGranularity
+        let phys = first.physicalSize(layer: 0)
+        let cap = Int(KL_REPROJECT_GRID_MAX)
+        let nx = max(1, min(cap, gran.width  > 0 ? phys.width  / gran.width  : 16))
+        let ny = max(1, min(cap, gran.height > 0 ? phys.height / gran.height : 16))
+
+        var qx = [Float](repeating: 0, count: nx)
+        var qy = [Float](repeating: 0, count: ny)
+        var sampled = 0
+        for map in maps {
+            for layer in 0..<map.layerCount {
+                let (mx, my) = Self.sampleCurve(map, layer: layer, zonesX: nx, zonesY: ny)
+                for i in 0..<nx { qx[i] = max(qx[i], mx[i]) }
+                for i in 0..<ny { qy[i] = max(qy[i], my[i]) }
+                sampled += 1
+            }
+        }
+        guard sampled > 0 else { return }
+        displayQualityX = qx
+        displayQualityY = qy
+        // BOTH curves, and y is not decoration: the horizontal one is an
+        // envelope of two mirrored maps and is symmetric by construction, so it
+        // can never show an up/down asymmetry even when one exists. The
+        // vertical one is the only place a "the top periphery looks different
+        // from the bottom" observation can be settled — a lopsided qy is the
+        // display's own distribution being copied faithfully, a symmetric one
+        // means look at our unwarp instead. Screen y=0 here is the render
+        // target's row 0, which is the picture's BOTTOM (the guest stores it
+        // GL-side-up), so qy is printed bottom-to-top.
+        func curve(_ q: [Float]) -> String {
+            q.map { String(format: "%.2f", $0) }.joined(separator: " ")
+        }
+        NSLog("%@", "[cp] display foveation curve: \(nx)x\(ny) zones from \(sampled) "
+              + "view map(s), screen \(first.screenSize.width)x\(first.screenSize.height) "
+              + "-> physical \(phys.width)x\(phys.height), granularity "
+              + "\(gran.width)x\(gran.height)\n"
+              + "[cp]   x rate (left to right): \(curve(qx))\n"
+              + "[cp]   y rate (bottom to top): \(curve(qy))")
+    }
+
+    /// Build (or rebuild) the guest's foveation map for a `w` x `h` eye and push
+    /// it to kl_glfb.
+    ///
+    /// **The curve is the display's**, resampled to the guest's screen size —
+    /// which is why this is not simply handing the drawable's map straight
+    /// through. The guest's eye size is not the drawable's: it comes from
+    /// `kl_ovrp_set_eye_texture_size`, which caps and scales (`KL_OVRP_EYE_MAX`,
+    /// `KL_OVRP_EYE_SCALE`) because Unity allocates stages x eyes of RGBA16F at
+    /// whatever it is told. A rate map is bound to the `screenSize` it was built
+    /// for, so a map for the drawable's resolution applied to a smaller eye
+    /// texture would foveate against coordinates the guest never renders. Same
+    /// shape, our size. `KL_VRR_ZONES` / `KL_VRR_EDGE` are the fallback for an
+    /// unfoveated drawable, and are what the host stand-in
+    /// (`klmtl_update_rate_map` in tests/t_mtl_provider.m) always uses.
+    ///
+    /// **Called before the eye texture is handed back**, deliberately. kl_glfb
+    /// binds the texture as soon as this provider returns, and `FramebufferMtl`
+    /// caches its render pass descriptor — a map that arrives after the first
+    /// pass into a texture is silently ignored for that pass, and re-attaching
+    /// the texture is not enough to force the rebuild (notes/VISIONOS.md).
+    ///
+    /// Keyed on the size because Unity re-creates its eye textures mid-startup
+    /// at a different one; a map built for the old screen size would foveate
+    /// against coordinates that no longer exist.
+    private func updateGuestRateMap(w: Int, h: Int) {
+        var zones: Int32 = 0
+        var edge: Float = 0
+        guard kl_glfb_foveation_wanted(&zones, &edge) != 0 else { return }
+        if guestRateMap != nil, guestRateW == w, guestRateH == h { return }
+        guard !guestRateRefused else { return }
+        guard device.supportsRasterizationRateMap(layerCount: 1) else {
+            // Said once: this is a property of the GPU, so it will not become
+            // true later in the run.
+            guestRateRefused = true
+            NSLog("[cp] this GPU has no variable rasterization rate — KL_VRR ignored")
+            return
+        }
+        var qx = displayQualityX, qy = displayQualityY
+        var source = "the display's own"
+        if qx.isEmpty || qy.isEmpty {
+            let n = Int(zones)
+            qx = [Float](repeating: 0, count: n)
+            qy = [Float](repeating: 0, count: n)
+            qx.withUnsafeMutableBufferPointer { kl_glfb_foveation_quality($0.baseAddress, zones, edge) }
+            qy.withUnsafeMutableBufferPointer { kl_glfb_foveation_quality($0.baseAddress, zones, edge) }
+            source = "synthetic, edge rate \(String(format: "%.2f", edge))"
+        }
+        // `__sampleCount:` is the pointer-taking initializer as Swift imports
+        // it; the array-taking spelling does not exist here.
+        let layer = qx.withUnsafeBufferPointer { hp in
+            qy.withUnsafeBufferPointer { vp in
+                MTLRasterizationRateLayerDescriptor(
+                    __sampleCount: MTLSize(width: qx.count, height: qy.count, depth: 0),
+                    horizontal: hp.baseAddress!, vertical: vp.baseAddress!)
+            }
+        }
+        let desc = MTLRasterizationRateMapDescriptor()
+        desc.screenSize = MTLSize(width: w, height: h, depth: 0)
+        desc.label = "klepton guest foveation"
+        desc.setLayer(layer, at: 0)
+        guard let map = device.makeRasterizationRateMap(descriptor: desc) else {
+            guestRateRefused = true
+            NSLog("[cp] makeRasterizationRateMap \(w)x\(h) failed — KL_VRR ignored")
+            return
+        }
+        let phys = map.physicalSize(layer: 0)
+        // "%@", not the string itself: NSLog's first argument is a FORMAT
+        // string, and this one contains a literal per-cent sign — "% o" was
+        // being eaten as a conversion, so the device's first foveation line
+        // read "33.50f the fragments".
+        NSLog("%@", "[cp] guest foveation: screen \(w)x\(h) -> physical "
+              + "\(phys.width)x\(phys.height) "
+              + "(\(String(format: "%.1f", 100.0 * Double(phys.width * phys.height) / Double(w * h)))% "
+              + "of the fragments, \(qx.count)x\(qy.count) zones, \(source))")
+        // Held by this property, which is what keeps it alive: kl_glfb takes an
+        // unmanaged pointer and never retains, exactly as it does not retain the
+        // eye textures.
+        guestRateMap = map
+        guestRateW = w; guestRateH = h
+        kl_glfb_set_eye_rate_map(Int32(w), Int32(h), Int32(qx.count), Int32(qy.count),
+                                 Unmanaged.passUnretained(map).toOpaque())
+    }
+
     /// kl_glfb calls this when the guest asks for storage for one (eye, stage).
     ///
     /// Two things here are load-bearing and both were learned by running it
@@ -583,6 +806,11 @@ final class KleptonCompositor {
                                    out: UnsafeMutablePointer<kl_mtl_eye_texture>) -> Int32 {
         let k = Self.key(eye, stage)
         let partnerKey = Self.key(eye == 0 ? 1 : 0, stage)
+
+        // Before anything is handed back, including on the cached path: the
+        // size is only knowable here, and the map has to be in force before the
+        // texture is bound. A no-op once the map matches this size.
+        updateGuestRateMap(w: w, h: h)
 
         // **Nothing slow happens under eyesLock.** The render loop takes it once
         // per view per frame, so anything held across it stops frame submission
@@ -1741,6 +1969,11 @@ final class KleptonCompositor {
                 // and each of those rebuilds used to leak a whole generation
                 // (PLANNING §12.21).
                 pushEyeTextureSize(drawable)
+                // Also before the guest boots, and for a stricter reason: the
+                // eye-texture provider builds the guest's own rate map from
+                // this curve, and it must be in force before the first render
+                // pass into an eye texture (notes/VISIONOS.md).
+                captureDisplayFoveation(drawable)
             }
             // Every drawable the frame carries, not just the one measured from:
             // a frame that leaves one unpresented is a frame half-written.
