@@ -25,6 +25,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
            runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_vtdec.c \
+           runtime/kl_slink.c \
            runtime/kl_aaudio.c \
            runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_il2cpp.c runtime/kl_fault.c
@@ -317,9 +318,15 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 # mmap loader — maps the guest text. It links runtime/kl_x18.c because the S0.5
 # decoder is the authority on what an x18 site is; a bit-field guess reports
 # 2158 sites in libunityopus.so where the decoder correctly reports 0.
-build/klepton-ld: tools/klepton_ld.c runtime/kl_x18.c runtime/kl_x18.h
+# kl_env.c is here because kl_x18.c reads knobs through it. It had been missing
+# for as long as kl_env existed and nothing noticed, because the rule's only
+# prerequisites were sources it already had — so an EXISTING build/klepton-ld
+# was never remade, and the link error only appeared the first time something
+# forced a rebuild. A stale translator is not a harmless one: it bakes
+# KLX_TSD_SLOT into every veneer it emits.
+build/klepton-ld: tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c runtime/kl_x18.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tools/klepton_ld.c runtime/kl_x18.c
+	$(CC) $(CFLAGS) -o $@ tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c
 
 # P1 — the same t_opus roundtrip that M1a passes, through the translated dylib.
 # t_opus picks its loader from the file's magic, so this is one test over two
@@ -423,7 +430,13 @@ xros: xros-device xros-sim build/Klepton.xcframework
 # producing it, an edited kl_image.c left a stale libklepton.a in place, the
 # xcframework was built from it, and the app in the simulator silently ran the
 # *previous* loader — which reads as a bug in the app rather than in the build.
-build/xros/libklepton.a: $(RUNTIME_SHIP)
+# The headers are prerequisites too, and that is not pedantry: KLX_TSD_SLOT and
+# every other cross-file constant lives in one, so without them a header-only
+# change leaves a stale archive, the xcframework is built from it, and the app
+# runs the PREVIOUS constant while the source says otherwise. That is the same
+# stale-artifact trap the xcframework rule below already records; the fix there
+# stopped at the archives and left this behind it.
+build/xros/libklepton.a: $(RUNTIME_SHIP) $(wildcard runtime/*.h)
 	@mkdir -p build/xros
 	@rm -f $@
 	@for s in $(RUNTIME_SHIP); do \
@@ -432,7 +445,7 @@ build/xros/libklepton.a: $(RUNTIME_SHIP)
 	    -c $$s -o $$o || exit 1; done
 	@ar rcs $@ build/xros/*.o
 
-build/xrsim/libklepton.a: $(RUNTIME_SHIP)
+build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(wildcard runtime/*.h)
 	@mkdir -p build/xrsim
 	@rm -f $@
 	@for s in $(RUNTIME_SHIP); do \

@@ -2028,6 +2028,10 @@ static XrResult klxr_ReleaseSwapchainImage(void *swapchain,
 // head turns and grows as the frame rate falls (§12.19). OpenXR's frame loop
 // has exactly one place that means "the guest's next frame starts here", and
 // this is it.
+// See kl_openxr.h. NULL is the command line's state and the default.
+static void (*g_frame_pacer)(void);
+void kl_openxr_set_frame_pacer(void (*wait)(void)) { g_frame_pacer = wait; }
+
 static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
                                XrFrameState *state) {
     klxr_session *s = klxr_sess(session);
@@ -2035,6 +2039,13 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
     if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
     if (info) klxr_log_chain("xrWaitFrame", info->next);
     if (!s->running) return KLXR_ERROR_SESSION_NOT_RUNNING;
+
+    // Block here if the driver has a display to be paced by, BEFORE the latch:
+    // the pose this frame is pinned to must be the one the compositor just
+    // published, not the one it had published by the time the guest last asked.
+    // Getting that order wrong costs a whole frame of prediction and presents as
+    // the doubling §12.19 records, which is exactly the bug the latch exists for.
+    if (g_frame_pacer) g_frame_pacer();
 
     kl_ovrp_frame_latch();
 

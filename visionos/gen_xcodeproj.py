@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Generate Klepton.xcodeproj (the visionOS host app) with no Xcode GUI needed.
+"""Generate the visionOS host app's .xcodeproj with no Xcode GUI needed.
 
 Grown from spikes/device-probe/gen_xcodeproj.py, but data-driven: the guest
-libraries are a list, not seven hand-written object ids each. That matters
-because the set changes — a second target (Steam Link, PLANNING §11) has
-different libraries and should not need the generator edited.
+libraries are a list, not seven hand-written object ids each. That list — and
+the product name, bundle id and display name that go with it — now comes from
+visionos/targets.py, keyed on KLEPTON_TARGET. There are two guests, and two apps
+built from one tree must not collide: a bundle ID separates the INSTALLED apps
+and nothing about their build outputs, so the target carries the product name
+(hence the .xcodeproj, the .app and the derived-data directory) and the
+Frameworks/ subdirectory its translations were staged into.
 
 What the app links, and why it comes from three places:
 
@@ -26,9 +30,17 @@ What the app links, and why it comes from three places:
 """
 import os, subprocess, sys, re
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import targets as targets_mod
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-NAME = "Klepton"
-BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", "dev.klepton.app")
+KLT = targets_mod.resolve(os.environ.get("KLEPTON_TARGET") or targets_mod.DEFAULT)
+# The PRODUCT name, which is also the .xcodeproj's, the .app's and the scheme's.
+# The Swift sources are still Klepton*.swift whatever the product is called —
+# they are the app layer, shared by every target, and renaming them per build
+# would be five file copies to say one thing.
+NAME = KLT["product"]
+BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", KLT["bundle"])
 
 # Klepton.entitlements — the two memory capabilities (see that file for what
 # they buy and why this app wants them). **On by default: they fixed the
@@ -54,8 +66,14 @@ BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", "dev.klepton.app")
 ENTITLEMENTS = os.environ.get("KLEPTON_ENTITLEMENTS", "1") != "0"
 ENTITLEMENTS_SETTING = ("\t\t\t\tCODE_SIGN_ENTITLEMENTS = Klepton.entitlements;\n"
                         if ENTITLEMENTS else "")
-GUEST = ["libmain", "lib_burst_generated", "libunityopus", "libunity", "libil2cpp"]
+GUEST = KLT["libs"].split()
 ANGLE = ["ANGLE_libEGL", "ANGLE_libGLESv2"]
+# Where each set is staged on the SOURCE side. The guest's is per-target so the
+# two apps do not overwrite each other's translations in place; ANGLE's is not,
+# because it is the same renderer for every guest. Inside the built .app both
+# land flat in Frameworks/, which is why kl_app.c needs to know nothing about it.
+GUEST_DIR = f"Frameworks/{KLT['name']}"
+ANGLE_DIR = "Frameworks"
 # Both sets are embedded-not-linked, so the pbxproj treatment is identical and
 # the generator stays data-driven — the two lists differ only in what a missing
 # one means, which is why main() reports them separately.
@@ -98,8 +116,8 @@ B_C = oid("BC")
 # The Swift half of §12.6's split: the App/UI, and the Compositor Services
 # renderer P5b adds. A list rather than an id pair each, for the same reason
 # the guest libraries are one.
-SWIFT = [f"{NAME}App.swift", f"{NAME}Compositor.swift", f"{NAME}Controllers.swift",
-         f"{NAME}Template.swift", f"{NAME}Audio.swift"]
+SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
+         "KleptonTemplate.swift", "KleptonAudio.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(
@@ -113,7 +131,9 @@ swift_sources  = "\n".join(f'\t\t\t\t{s["bld"]},' for s in swift)
 F_RT    = oid("FRT");   B_RT_LNK = oid("BRTLK")
 
 # One file ref + one embed build-file per embedded framework.
-guest = [{"name": g, "ref": oid(f"FG{i}"), "emb": oid(f"BG{i}")} for i, g in enumerate(EMBED)]
+guest = [{"name": g, "ref": oid(f"FG{i}"), "emb": oid(f"BG{i}"),
+          "dir": GUEST_DIR if g in GUEST else ANGLE_DIR}
+         for i, g in enumerate(EMBED)]
 
 buildfiles = "\n".join(
     f'\t\t{g["emb"]} /* {g["name"]} in Embed */ = {{isa = PBXBuildFile; fileRef = {g["ref"]}; '
@@ -122,7 +142,7 @@ buildfiles = "\n".join(
 
 filerefs = "\n".join(
     f'\t\t{g["ref"]} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; '
-    f'name = {g["name"]}.xcframework; path = Frameworks/{g["name"]}.xcframework; sourceTree = "<group>"; }};'
+    f'name = {g["name"]}.xcframework; path = {g["dir"]}/{g["name"]}.xcframework; sourceTree = "<group>"; }};'
     for g in guest)
 
 embeds = "\n".join(f'\t\t\t\t{g["emb"]},' for g in guest)
@@ -140,7 +160,17 @@ COMMON = f"""
 					"$(inherited)",
 					"$(SRCROOT)/../runtime",
 				);
-				INFOPLIST_KEY_CFBundleDisplayName = Klepton;
+				// Two levels of escaping, and the first attempt had one. The
+				// pbxproj layer eats a backslash, and the build system then
+				// unquotes the setting VALUE the way a shell would — so a
+				// single \" here reaches clang as -DKL_TARGET_DEFAULT=beatsaber
+				// and fails with "use of undeclared identifier 'beatsaber'",
+				// which names the target and says nothing about quoting.
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"KL_TARGET_DEFAULT=\\\\\\"{KLT['name']}\\\\\\"",
+				);
+				INFOPLIST_KEY_CFBundleDisplayName = "{KLT['display']}";
 				INFOPLIST_KEY_GCSupportsControllerUserInteraction = YES;
 				// NOT UIApplicationSceneManifest_Generation. Setting it makes Xcode
 				// GENERATE the scene manifest and overwrite the one in Info.plist —
@@ -156,12 +186,19 @@ COMMON = f"""
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = "-lz -framework AudioToolbox";
+				// VideoToolbox/CoreMedia/CoreVideo are kl_vtdec's (SL-10), and
+				// they were missing here for the whole of the Steam Link arc:
+				// kl_vtdec joined RUNTIME_SHIP, `make xros` kept passing because
+				// its own link line has them, and nothing built the APP until a
+				// second target needed one. The failure is a link error naming
+				// VTDecompressionSession*, which reads as a missing SDK rather
+				// than as a build setting that was never updated.
+				OTHER_LDFLAGS = "-lz -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo";
 				PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID};
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;
 				SUPPORTED_PLATFORMS = "xros xrsimulator";
-				SWIFT_OBJC_BRIDGING_HEADER = "Sources/{NAME}-Bridging-Header.h";
+				SWIFT_OBJC_BRIDGING_HEADER = "Sources/Klepton-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 7;
 				// visionOS 26, not 2.0. The device runs 27 and the SDK is 26, and an
@@ -193,7 +230,7 @@ PBX = f"""// !$*UTF8*$!
 {swift_filerefs}
 		{F_C} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = kl_app.c; sourceTree = "<group>"; }};
 		{F_H} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = kl_app.h; sourceTree = "<group>"; }};
-		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "{NAME}-Bridging-Header.h"; sourceTree = "<group>"; }};
+		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Klepton-Bridging-Header.h"; sourceTree = "<group>"; }};
 		{F_RT} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Klepton.xcframework; path = ../build/Klepton.xcframework; sourceTree = "<group>"; }};
 {filerefs}
 /* End PBXFileReference section */
@@ -387,9 +424,9 @@ PBX = f"""// !$*UTF8*$!
 
 
 def main():
-    for g, how in [(g, "visionos/mkguest.sh") for g in GUEST] + \
-                  [(a, "visionos/mkangle.sh") for a in ANGLE]:
-        p = os.path.join(HERE, "Frameworks", f"{g}.xcframework")
+    for g, d, how in [(g, GUEST_DIR, "visionos/mkguest.sh") for g in GUEST] + \
+                     [(a, ANGLE_DIR, "visionos/mkangle.sh") for a in ANGLE]:
+        p = os.path.join(HERE, d, f"{g}.xcframework")
         if not os.path.isdir(p):
             print(f"!! missing {p} — run {how} first", file=sys.stderr)
             return 1
@@ -402,6 +439,7 @@ def main():
     with open(os.path.join(proj, "project.pbxproj"), "w") as f:
         f.write(PBX)
     print(f"wrote {proj}")
+    print(f"  KLEPTON_TARGET            = {KLT['name']}")
     print(f"  DEVELOPMENT_TEAM = {TEAM or '(NOT DETECTED - set KLEPTON_TEAM)'}")
     print(f"  CODE_SIGN_ENTITLEMENTS = "
           f"{'Klepton.entitlements' if ENTITLEMENTS else '(none - KLEPTON_ENTITLEMENTS=0)'}")

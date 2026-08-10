@@ -16,7 +16,52 @@
 #include "kl_egl.h"
 #include "kl_opensl.h"
 #include "kl_ovrp.h"      // kl_ovrp_frame_latch — one pose per guest frame
+#include "kl_openxr.h"    // kl_openxr_set_pacer — the OpenXR guest's frame clock
+#include "kl_slink.h"
+#include "kl_x18.h"       // trap 11 — claim TSD slot 300 before anything else can
 #include "kl_env.h"
+
+// --- Which guest ------------------------------------------------------------
+//
+// Everything below used to say "beatsaber" in five places, which was honest
+// while there was one guest and became a lie the moment a second app was built
+// from this tree. A target is the small set of facts that differ: what the tree
+// is called, which library the chain starts at, and which boot sequence runs.
+//
+// The default is baked in at BUILD time (KL_TARGET_DEFAULT, set by
+// gen_xcodeproj.py) rather than read from the environment, because the app has
+// to know which guest it is when it is launched by hand from the Home View with
+// no environment at all. KL_TARGET still overrides it, which is what makes an
+// A/B possible from `run.sh` without regenerating the project.
+#ifndef KL_TARGET_DEFAULT
+#define KL_TARGET_DEFAULT "beatsaber"
+#endif
+
+typedef struct {
+    const char *name;      // KL_TARGET / KL_TARGET_DEFAULT
+    const char *tree;      // the unpacked APK's directory, under the container
+    const char *apk;       // ...and the APK itself, which is load-bearing
+    const char *entry_lib; // the library whose presence proves the guest was embedded
+    int         steamlink; // which boot sequence: Unity's, or kl_slink's VR door
+} kl_target;
+
+static const kl_target TARGETS[] = {
+    { "beatsaber",    "beatsaber",    "beatsaber.apk",    "libmain",           0 },
+    // The VR front door only. The 2D shell pairs and hands off, and on visionOS
+    // that handoff has nowhere to go yet — see kl_app_boot's note.
+    { "steamlink-vr", "steamlink-vr", "steamlink-vr.apk", "libvrlink_scene",   1 },
+};
+
+static const kl_target *g_target;
+
+static const kl_target *target_lookup(const char *name) {
+    for (unsigned i = 0; i < sizeof TARGETS / sizeof *TARGETS; i++)
+        if (!strcmp(TARGETS[i].name, name)) return &TARGETS[i];
+    return NULL;
+}
+
+const char *kl_app_target_name(void) { return g_target ? g_target->name : "(unconfigured)"; }
+int kl_app_target_is_steamlink(void) { return g_target && g_target->steamlink; }
 
 static char g_libdir[1024];
 static char g_assets[1024];
@@ -32,10 +77,13 @@ const char *kl_app_status(void)   { return g_status; }
 static int have(const char *p) { struct stat st; return p && *p && stat(p, &st) == 0; }
 
 // Frameworks/ always exists (the Swift runtime lives there), so its presence
-// says nothing. What matters is whether *our* translations were embedded.
+// says nothing. What matters is whether *this target's* translations were
+// embedded — a bundle carrying the other app's guest would pass a bare
+// directory test and then fail to find a single library.
 static int have_translations(void) {
     char p[1200];
-    snprintf(p, sizeof p, "%s/libmain.framework/libmain", g_dylibs);
+    snprintf(p, sizeof p, "%s/%s.framework/%s", g_dylibs,
+             g_target->entry_lib, g_target->entry_lib);
     return have(p);
 }
 
@@ -46,6 +94,28 @@ static int missing(const char *what, const char *path) {
 
 int kl_app_configure(const char *resources, const char *container) {
     if (!resources || !container) return missing("path", "(null)");
+
+    const char *want = kl_env_str("KL_TARGET", KL_TARGET_DEFAULT);
+    g_target = target_lookup(want);
+    if (!g_target) return missing("guest target (KL_TARGET)", want);
+
+    // Trap 11, claimed HERE rather than wherever the first guest library happens
+    // to load. TSD slot 300 is a constant baked into every veneer, and Darwin
+    // hands external pthread keys out upward and never reissues a held one — so
+    // whether it is still free is a race against everything else in the process
+    // that creates keys. Beat Saber won that race by accident: kl_app_boot loads
+    // libmain before ANGLE exists. The Steam Link chain does not — something on
+    // its load path brings ANGLE up first, ANGLE takes the process past 300, and
+    // the guest then fails to load with "TSD slot 300 is unavailable", which
+    // reads as a platform limit and is a scheduling accident.
+    //
+    // This is the earliest point both targets share. It is not fatal on its own:
+    // an ELF-tree run with no veneered library is unaffected, and the load path
+    // still refuses by name for one that needs them.
+    if (kl_x18_init() != 0)
+        fprintf(stderr, "  [klepton] x18: TSD slot %d was already taken at "
+                        "configure time — a veneered guest will refuse to load\n",
+                KLX_TSD_SLOT);
 
     // The guest libraries ride in the bundle: AMFI is content about a dylib
     // inside a bundle we signed (P3/P12), and nothing has established that it
@@ -58,8 +128,8 @@ int kl_app_configure(const char *resources, const char *container) {
     // what it embeds, and a loose Mach-O elsewhere in the bundle is only
     // sealed. kl_load_auto knows both layouts.
     snprintf(g_dylibs, sizeof g_dylibs, "%s/Frameworks", resources);
-    snprintf(g_assets, sizeof g_assets, "%s/beatsaber/assets", container);
-    snprintf(g_apk,    sizeof g_apk,    "%s/beatsaber.apk", container);
+    snprintf(g_assets, sizeof g_assets, "%s/%s/assets", container, g_target->tree);
+    snprintf(g_apk,    sizeof g_apk,    "%s/%s", container, g_target->apk);
     snprintf(g_files,  sizeof g_files,  "%s/android-files", container);
     snprintf(g_log,    sizeof g_log,    "%s/klepton-boot.log", container);
 
@@ -78,21 +148,33 @@ int kl_app_configure(const char *resources, const char *container) {
     if (!have(g_apk))    return missing("staged APK (run stage_assets.sh)", g_apk);
     mkdir(g_files, 0755);
 
-    kl_set_library_path(g_libdir);
-    // Explicitly, because the default is a *relative* path that gets absolutised
-    // against the working directory — which is the repo root under t_boot and `/`
-    // inside an app bundle. Left unset on device it became
-    // "//beatsaber/lib/arm64-v8a", and that is the string Unity reads back as
-    // ApplicationInfo.nativeLibraryDir and hands to ClassLoader.findLibrary. It
-    // survived only because kl_can_load matches a translation on the basename;
-    // anything that actually used the directory would have been quietly wrong.
-    kl_jni_set_native_lib_dir(g_libdir);
-    kl_jni_set_assets_dir(g_assets);
-    kl_jni_set_apk_path(g_apk);
-    kl_jni_set_files_dir(g_files);
-    // Raw "<apk>/assets/..." opens: Unity mounts the APK into its VFS and then
-    // resolves entries by concatenating onto the mount point (trap 6c).
-    kl_guest_path_map(g_apk, g_assets);
+    if (g_target->steamlink) {
+        // Everything this guest is told about itself — the activity class, the
+        // four paths, the <meta-data>, the panel size — is kl_slink's, and
+        // shared verbatim with `build/m_slink`. Two drivers describing one guest
+        // differently is a class of bug with no error surface at all: the run
+        // works and answers the guest's questions wrongly.
+        if (kl_slink_configure(KL_SLINK_VR, g_libdir, g_assets, g_apk, g_files,
+                               NULL) != 0)
+            return missing("Steam Link front door", kl_slink_error());
+    } else {
+        kl_set_library_path(g_libdir);
+        // Explicitly, because the default is a *relative* path that gets
+        // absolutised against the working directory — which is the repo root
+        // under t_boot and `/` inside an app bundle. Left unset on device it
+        // became "//beatsaber/lib/arm64-v8a", and that is the string Unity reads
+        // back as ApplicationInfo.nativeLibraryDir and hands to
+        // ClassLoader.findLibrary. It survived only because kl_can_load matches
+        // a translation on the basename; anything that actually used the
+        // directory would have been quietly wrong.
+        kl_jni_set_native_lib_dir(g_libdir);
+        kl_jni_set_assets_dir(g_assets);
+        kl_jni_set_apk_path(g_apk);
+        kl_jni_set_files_dir(g_files);
+        // Raw "<apk>/assets/..." opens: Unity mounts the APK into its VFS and
+        // then resolves entries by concatenating onto the mount point (trap 6c).
+        kl_guest_path_map(g_apk, g_assets);
+    }
 
     // Prefer klepton-ld translations when the bundle carries them. On device
     // this is not a preference but the whole point — the mmap loader maps guest
@@ -245,6 +327,56 @@ int kl_app_open_log(void) {
     return open_log();
 }
 
+// The Steam Link half of kl_app_boot: map the chain, print the shim gap, run
+// the init arrays. It deliberately stops BEFORE ANativeActivity_onCreate, for
+// the same reason the Unity path stops at initJni — that is the part which is
+// supposed to be clean, and separating it means "the guest loaded" and "the
+// activity started" fail as two different reports rather than one.
+//
+// The chain here is the VR front door's, which is one library. The 2D shell is
+// deliberately not reachable from the app yet: on the host the shell pairs and
+// then re-execs into the VR door carrying the session (SL-15), and an app bundle
+// cannot re-exec — so the shell needs a window of its own and a handoff that
+// opens the ImmersiveSpace instead. Until that exists, the session arrives the
+// way the host's did before SL-15: KL_SLINK_SARGS, from a pairing run, which
+// visionos/run.sh already forwards.
+static int boot_steamlink(void) {
+    g_phase = "steamlink chain";
+    printf("=== Steam Link: %s front door (%s -> %s) ===\n",
+           kl_slink_door_name(), kl_slink_main_lib(), kl_slink_main_fn());
+    fflush(NULL);
+
+    // Mapping is separated from DT_INIT_ARRAY on purpose — see kl_slink.h. The
+    // gap between them is the shim work list, and printing it is the whole
+    // reason the two are not one call.
+    if (kl_slink_load_chain(stdout) != 0) return fail(kl_slink_error());
+    kl_slink_report_gap(stdout);
+
+    printf("\n=== DT_INIT_ARRAY, dependencies first ===\n");
+    fflush(NULL);
+    g_phase = "steamlink inits";
+    kl_slink_run_inits(stdout);
+
+    // Not "no sArgs, therefore stop": the guest decides that for itself and
+    // prints "No sArgs and release build panic" on its own way out, which is
+    // more informative than anything we would say here. But it exits BEFORE its
+    // first frame, and that reads exactly like a compositor failure from the
+    // outside, so it is worth naming before it happens.
+    if (!getenv("KL_SLINK_SARGS"))
+        printf("\n  NOTE: KL_SLINK_SARGS is unset. This guest reads its session out of\n"
+               "  the launching Intent and exits before its first frame without one —\n"
+               "  see notes/STEAMLINK.md for the pairing -> handoff loop.\n");
+
+    printf("\n=== EXIT CRITERION MET: the Steam Link chain is bound and "
+           "initialised on visionOS ===\n");
+    g_phase = "boot report";
+    kl_jni_report(stdout);
+    fflush(NULL);
+    g_phase = "boot done";
+    snprintf(g_status, sizeof g_status, "Steam Link chain initialised");
+    return 0;
+}
+
 int kl_app_boot(void) {
     // Once, and never concurrently. The Boot button invites a second press,
     // and the second entry is not merely redundant: the runtime's JNI tables
@@ -274,6 +406,7 @@ int kl_app_boot(void) {
     kl_egl_dump_textures(kl_env_str("KL_DUMP_TEXTURES", NULL));
 
     printf("=== Klepton on visionOS — P4 ===\n");
+    printf("  target    : %s\n", g_target->name);
     printf("  libraries : %s\n", g_libdir);
     printf("  dylibs    : %s%s\n", g_dylibs,
            have_translations() ? "" : "  (none embedded — falling back to the mmap ELF loader)");
@@ -281,6 +414,8 @@ int kl_app_boot(void) {
     printf("  apk       : %s\n", g_apk);
     printf("  files     : %s\n\n", g_files);
     fflush(NULL);
+
+    if (g_target->steamlink) return boot_steamlink();
 
     char path[1200];
     snprintf(path, sizeof path, "%s/libmain.so", g_libdir);
@@ -402,6 +537,27 @@ int kl_app_lifecycle_begin(void) {
     pthread_mutex_unlock(&once_mu);
     if (already) return fail("kl_app_lifecycle was already run in this process");
 
+    // The Steam Link guest's whole lifecycle is Android's NativeActivity one,
+    // and it MUST run on the thread that will go on to pump: onCreate takes
+    // ALooper_forThread() and the guest hangs its UIThreadCallbackHandler off
+    // exactly that looper. Splitting the two across threads leaves the guest
+    // with callbacks nobody will ever run and no error anywhere.
+    if (g_target->steamlink) {
+        g_phase = "proc";
+        report_proc();
+        g_alarm_secs = kl_env_int("KL_ALARM", 120);
+        g_phase = "ANativeActivity_onCreate";
+        printf("\n=== ANativeActivity_onCreate (the VR front door) ===\n");
+        fflush(NULL);
+        if (kl_slink_vr_create(stdout) != 0) return fail(kl_slink_error());
+        g_phase = "activity lifecycle";
+        printf("\n=== the activity lifecycle ===\n");
+        fflush(NULL);
+        kl_slink_vr_start(stdout);
+        g_phase = "looper pump";
+        return 0;
+    }
+
     void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
     if (!thiz) return fail("kl_app_boot must run first");
     g_thiz = thiz;
@@ -467,6 +623,13 @@ int kl_app_lifecycle_begin(void) {
 // Returns what nativeRender returned, or -1 if kl_app_lifecycle_begin has not
 // run (or nativeRender was never registered).
 int kl_app_frame(void) {
+    // Not a frame the caller can drive on this target, and saying so is the
+    // point. The Steam Link guest runs its own OpenXR frame loop on a thread it
+    // created inside onCreate; what our thread owes it is a turning looper, not
+    // a call per display frame. Pacing happens where OpenXR puts it — xrWaitFrame
+    // blocks on the compositor's published pose (kl_openxr_set_pacer) — so a
+    // caller that pumped here as well would be a second, disagreeing clock.
+    if (g_target && g_target->steamlink) return -1;
     if (!g_render || !g_thiz) return -1;
     alarm(g_alarm_secs);
     // Pin this frame's poses before anything in the frame can ask. The
@@ -491,6 +654,16 @@ int kl_app_frame(void) {
 }
 
 void kl_app_lifecycle_report(void) {
+    if (g_target && g_target->steamlink) {
+        // Media, audio, XR and GL — which between them ARE the VR half of this
+        // app. Every one of them otherwise reports only on kl_fault.c's abort
+        // path, which a working run never takes, so the run that most needs
+        // these numbers was the one printing none of them.
+        printf("\n=== the Steam Link VR run ===\n");
+        kl_slink_report(stdout);
+        snprintf(g_status, sizeof g_status, "Steam Link VR run ended");
+        return;
+    }
     printf("  pumped %u frames\n", g_frames_pumped);
     printf("\n=== P5.4: the lifecycle ran on device ===\n");
     kl_jni_report(stdout);
@@ -508,6 +681,24 @@ void kl_app_lifecycle_report(void) {
 int kl_app_lifecycle(unsigned frames) {
     int rc = kl_app_lifecycle_begin();
     if (rc) return rc;
+
+    // The Steam Link guest counts no frames here, because it does not take any
+    // from us: what a bounded run means for it is a bounded PUMP. That is the
+    // window-and-report shape (KL_IMMERSIVE=0) — the recon run that says how far
+    // the guest got with no compositor in the picture, which is exactly the
+    // measurement P4 is for Beat Saber and has to stay takeable for this guest
+    // too. `frames` would be a number with nothing behind it, so the deadline is
+    // KL_SLINK_WAIT's, in seconds, as it is on the command line.
+    if (g_target->steamlink) {
+        unsigned secs = kl_env_uint("KL_SLINK_WAIT", 30);
+        printf("\n=== pumping the looper for %us ===\n", secs);
+        fflush(NULL);
+        double spent = kl_slink_vr_pump((double)secs, NULL);
+        printf("  pumped for %.1fs\n", spent);
+        kl_app_lifecycle_report();
+        return 0;
+    }
+
     printf("\n=== pumping %u frames ===\n", frames);
     fflush(NULL);
     while (g_frames_pumped < frames && kl_app_frame() >= 0) { }
@@ -530,7 +721,10 @@ static struct {
     uint64_t        published;    // poses the compositor has offered
     uint64_t        consumed;     // poses the guest has started a frame for
     unsigned        limit;        // KL_FRAMES, or 0 for "until stopped"
-    int             stop;
+    // volatile because the Steam Link pump reads it WITHOUT the lock: that loop
+    // is inside kl_slink and is handed a plain flag, which is the honest shape
+    // for "somebody else will set this once". Every other reader takes the mutex.
+    volatile int    stop;
     int             state;        // kl_app_guest_state()
     int             running;      // has the thread been spawned and not joined?
     int             finished;     // has it left its loop and written the report?
@@ -560,6 +754,30 @@ static void guest_finished(void) {
     pthread_mutex_unlock(&g_guest.mu);
 }
 
+// The OpenXR guest's xrWaitFrame, waiting on the same publish the Beat Saber
+// loop above consumes. Called from a thread libvrlink_scene created, not from
+// the one guest_thread runs on, which is why it takes the lock and touches
+// nothing else.
+//
+// Timed, not indefinite: a compositor that stops publishing must make the guest
+// render against the last pose it had, not wedge it. A wedged guest is
+// indistinguishable from a crashed one in a device log, and this is exactly the
+// path a backgrounded app takes.
+static void guest_pace_wait(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 1;
+    pthread_mutex_lock(&g_guest.mu);
+    while (!g_guest.stop && g_guest.published == g_guest.consumed)
+        if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) break;
+    // Coalesce, do not queue: everything published since the last frame is one
+    // turn. A guest that is behind then skips frames — which reprojection covers
+    // — rather than being owed a backlog it can never work off.
+    g_guest.consumed = g_guest.published;
+    g_frames_pumped++;
+    pthread_mutex_unlock(&g_guest.mu);
+}
+
 static void *guest_thread(void *unused) {
     (void)unused;
     // Trap 1, before a single guest instruction runs on this thread.
@@ -573,6 +791,26 @@ static void *guest_thread(void *unused) {
         return NULL;
     }
     guest_set_state(1);
+
+    // Two shapes, because the two guests differ in who owns the frame loop.
+    //
+    // Beat Saber has none: nativeRender is a call, so this thread makes one per
+    // published pose. Steam Link brought its own — libvrlink_scene spawns a
+    // thread inside onCreate and runs OpenXR on it — so what this thread owes it
+    // is a turning looper and nothing else. Pacing is not lost by that: it moves
+    // to where OpenXR puts it, xrWaitFrame, which blocks on the same published
+    // pose through kl_openxr_set_pacer. One clock either way.
+    if (g_target->steamlink) {
+        printf("\n=== guest thread pumping the activity's looper ===\n");
+        fflush(NULL);
+        double secs = kl_slink_vr_pump(-1.0, &g_guest.stop);
+        printf("[guest] pumped for %.1fs\n", secs);
+        fflush(NULL);
+        kl_app_lifecycle_report();
+        guest_finished();
+        return NULL;
+    }
+
     printf("\n=== guest thread running, one frame per published pose ===\n");
     fflush(NULL);
 
@@ -620,6 +858,13 @@ int kl_app_guest_start(void) {
     g_guest.running = 1;
     g_guest.state = 0;
     pthread_mutex_unlock(&g_guest.mu);
+
+    // Only on this path, and before the thread exists. kl_app_lifecycle() has no
+    // publisher at all — it is the command line's shape, a plain loop — so a
+    // pacer installed there would block the guest on a pose nobody will ever
+    // publish. Installing it here also closes the window in which the guest could
+    // reach its first xrWaitFrame unpaced, because the guest does not exist yet.
+    if (g_target && g_target->steamlink) kl_openxr_set_frame_pacer(guest_pace_wait);
 
     // User-interactive, because this thread is now the one producing frames.
     // A plain pthread gets an unspecified QoS, and a guest demoted below the

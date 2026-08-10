@@ -950,6 +950,14 @@ Standalone reproducers, not part of the runtime; each reads its own knobs.
 Read on the device/simulator; `visionos/run.sh` forwards every `KL_*` it sees
 except its own control vars (next section). See PLANNING §12.
 
+- `KL_TARGET=<name>` — which guest the app boots: `beatsaber` or
+  `steamlink-vr` (`visionos/targets.py --list`). The **default is compiled in**
+  (`KL_TARGET_DEFAULT`, set by `gen_xcodeproj.py` from `KLEPTON_TARGET`), not
+  read from the environment, because an app launched by hand from the Home View
+  has no environment at all. This overrides it, which is how the two guests can
+  be A/B'd from one build without regenerating the project — but note the two
+  apps embed **different guest frameworks**, so pointing one at the other's
+  target fails at `kl_app_configure` with "missing guest libraries".
 - `KL_IMMERSIVE=0` — the immersive space is the **default**; `=0` restores
   P4's window-and-report shape, which has to stay takeable because it is the
   measurement that localises a device regression.
@@ -1072,6 +1080,18 @@ except its own control vars (next section). See PLANNING §12.
 
 Read by the scripts themselves, never forwarded to the app.
 
+- `KLEPTON_TARGET=<name>` — which guest to BUILD, read by `visionos/run.sh`,
+  `mkguest.sh`, `stage_assets.sh` and `gen_xcodeproj.py` from the one table in
+  `visionos/targets.py`. It decides the guest libraries, the APK and asset tree
+  that get staged, the bundle id, the display name and the **product name** —
+  and with that the `.xcodeproj`, the `.app`, the derived-data directory and the
+  `Frameworks/<target>/` the translations are staged into, so two apps built
+  from this tree never write to the same place. Default `beatsaber`.
+- `KLEPTON_BUNDLE_ID=...` — override the target's bundle id;
+  `KLEPTON_TEAM=<id>` — override the signing team;
+  `KLEPTON_DEVICE=<udid>` — skip device auto-detection;
+  `KLEPTON_ENTITLEMENTS=0` — build without the two memory capabilities (see
+  `gen_xcodeproj.py` for why that is the unusual build).
 - `KL_SKIP_STAGE=1` — never stage assets, even on a target that has never had
   them; `KL_STAGE=1` — always stage, whatever the stamp says. The 2.2 GB
   upload is a ~20 s loop vs a ~20 min one; a reinstall rotates the data

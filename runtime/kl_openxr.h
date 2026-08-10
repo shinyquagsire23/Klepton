@@ -60,4 +60,23 @@ void kl_openxr_report(FILE *f);
 // arc costs a fresh pairing and cannot be repeated identically.
 int kl_openxr_space_selftest(FILE *f);
 
+// The frame clock, for a host that has one.
+//
+// xrWaitFrame is where an OpenXR runtime is specified to block until the app
+// should begin its next frame — it is the runtime's one chance to say "not
+// yet". On the command line nothing is presenting, so it returns immediately
+// and the guest free-runs, which is right: there is no display to be late for.
+// Inside the visionOS app there IS one, and Compositor Services owns its
+// deadline, so this is where the two meet — the callback blocks until the
+// compositor has published another pose.
+//
+// It is installed rather than compiled in because "who is the clock" is the
+// driver's knowledge, exactly as the front-door handoff is (kl_jni.h). NULL is
+// the default and must stay so: `make slink-vr-run` has no compositor and a
+// pacer there would block forever, which is a hang with no error surface.
+//
+// The callback must return on its own if no pose arrives — a stalled display
+// should make the guest render against the last pose, not wedge it.
+void kl_openxr_set_frame_pacer(void (*wait)(void));
+
 #endif

@@ -5,14 +5,22 @@
 #   ./run.sh device       # a physical Vision Pro   (rung 3, AMFI)
 #
 # Env overrides:
+#   KLEPTON_TARGET=<name>   which guest — `python3 targets.py --list`
 #   KLEPTON_DEVICE=<udid>   skip device auto-detection
 #   KLEPTON_TEAM=<teamid>   override signing team
 #   KLEPTON_BUNDLE_ID=...   override bundle id
 #   KL_SKIP_STAGE=1         never stage, even on a target that has never had it
 #   KL_STAGE=1              always stage, whatever the stamp says
+#
+# Everything downstream of the target — the product name, and with it the
+# .xcodeproj, the scheme, the .app and the derived-data directory — comes from
+# targets.py, so two apps built from this tree never write to the same place.
 set -euo pipefail
 cd "$(dirname "$0")"
-BUNDLE_ID="${KLEPTON_BUNDLE_ID:-dev.klepton.app}"
+eval "$(python3 targets.py "${KLEPTON_TARGET:-}")"
+export KLEPTON_TARGET="$KLT_NAME"
+BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
+PRODUCT="$KLT_PRODUCT"
 MODE="${1:-sim}"
 
 # --- Staging: skip by default, but not blindly ------------------------------
@@ -29,14 +37,14 @@ MODE="${1:-sim}"
 #
 # So a stamp records that this target has been staged with this APK. No stamp
 # means stage; stamp means skip. The stamp is keyed on the APK's size and mtime,
-# so replacing beatsaber.apk re-stages on its own rather than needing to be
+# so replacing the APK re-stages on its own rather than needing to be
 # remembered. It cannot know about a data container the OS rotated underneath
 # us — KL_STAGE=1 is the answer to that, and the symptom is the same sentence.
 STAMP_DIR="build/staged"
 stage_stamp() {   # <target-key>
-  local apk="../beatsaber.apk" sig=""
+  local apk="../$KLT_APK" sig=""
   [ -f "$apk" ] && sig=$(stat -f '%z-%m' "$apk" 2>/dev/null || true)
-  echo "$STAMP_DIR/$(echo "$1-$BUNDLE_ID-$sig" | tr -c 'A-Za-z0-9._-' '_')"
+  echo "$STAMP_DIR/$(echo "$KLT_NAME-$1-$BUNDLE_ID-$sig" | tr -c 'A-Za-z0-9._-' '_')"
 }
 # stage_if_needed <target-key> <stage_assets.sh args...>
 stage_if_needed() {
@@ -76,8 +84,13 @@ for K in $(env | sed -n 's/^\(KL_[A-Za-z0-9_]*\)=.*/\1/p' | sort); do
   FORWARD="$FORWARD $K"
 done
 
-echo "[1/5] runtime + guest translations…"
-(cd .. && make -s xros)
+echo "[1/5] runtime + guest translations ($KLT_NAME)…"
+# klepton-ld as well as the runtime, and not for tidiness: the translator bakes
+# KLX_TSD_SLOT into every veneer it emits, so a stale one produces dylibs the
+# fresh runtime refuses — "translated against TSD slot 300 but this runtime uses
+# 500". The loader catches it by name, which is the right failure, but it is not
+# a failure anyone should have to have.
+(cd .. && make -s build/klepton-ld xros)
 # Keep the embedded ANGLE current, but only when the checkout is already
 # there: this must not turn `run.sh` into a surprise 12 GB clone. Without it,
 # mkangle.sh below stops and names the bootstrap command instead.
@@ -116,8 +129,8 @@ print(phys[0]["identifier"])
   echo "[3/5] building for device ${DEVID}…"
   # generic/platform, not id= : the build must not depend on the device being awake
   set +e
-  xcodebuild -project Klepton.xcodeproj -scheme Klepton -configuration Debug \
-    -destination 'generic/platform=visionOS' -derivedDataPath build/dd-device \
+  xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" -configuration Debug \
+    -destination 'generic/platform=visionOS' -derivedDataPath "build/dd-device-$KLT_NAME" \
     -allowProvisioningUpdates build 2>&1 | grep -E 'error:|Signing Identity|\*\* BUILD'
   # xcodebuild's status, through the pipe. Testing for the .app is NOT enough: a
   # failed *incremental* build leaves the previous, complete and perfectly valid
@@ -126,7 +139,7 @@ print(phys[0]["identifier"])
   # most expensive possible way to be told about a compile error.
   BUILD_RC=${PIPESTATUS[0]}
   set -e
-  APP="build/dd-device/Build/Products/Debug-xros/Klepton.app"
+  APP="build/dd-device-$KLT_NAME/Build/Products/Debug-xros/$PRODUCT.app"
   [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
   [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
 
@@ -225,13 +238,13 @@ UDID=$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1)
 
 echo "[3/5] building for the simulator…"
 set +e
-xcodebuild -project Klepton.xcodeproj -scheme Klepton \
+xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" \
   -destination "platform=visionOS Simulator,id=$UDID" \
-  -derivedDataPath build/dd-sim CODE_SIGNING_ALLOWED=NO build 2>&1 \
+  -derivedDataPath "build/dd-sim-$KLT_NAME" CODE_SIGNING_ALLOWED=NO build 2>&1 \
   | grep -E 'error:|\*\* BUILD'
 BUILD_RC=${PIPESTATUS[0]}
 set -e
-APP="build/dd-sim/Build/Products/Debug-xrsimulator/Klepton.app"
+APP="build/dd-sim-$KLT_NAME/Build/Products/Debug-xrsimulator/$PRODUCT.app"
 [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
 [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
 

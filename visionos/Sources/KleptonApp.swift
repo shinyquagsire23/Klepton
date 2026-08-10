@@ -168,7 +168,11 @@ struct BootView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("Klepton").font(.largeTitle.bold())
-                Text("P4 — guest boot on visionOS").foregroundStyle(.secondary)
+                // The guest, by name. Two apps are built from this tree and they
+                // look identical from the front; a boot log that does not say
+                // which one produced it is a log that can be read as the other's.
+                Text(String(cString: kl_app_target_name()))
+                    .foregroundStyle(.secondary)
                 Spacer()
                 if finished {
                     Label(succeeded ? "initJni completed" : status,
@@ -178,7 +182,7 @@ struct BootView: View {
             }
 
             ScrollView {
-                Text(log.isEmpty ? "Press Boot to load libmain.so and run JNI_OnLoad." : log)
+                Text(log.isEmpty ? "Press Boot to load the guest chain." : log)
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -246,6 +250,13 @@ struct BootView: View {
         Thread.detachNewThread {
             let rc = kl_app_configure(Paths.resources, Paths.container)
             if rc != 0 {
+                // To the SYSTEM log as well as the window, because this is the
+                // one failure that happens before there is a klepton-boot.log to
+                // write into — kl_app_boot opens that file, and configure runs
+                // first. A scripted run therefore saw no output at all and read
+                // as a launch that never reached our code; the reason was
+                // sitting in a SwiftUI label nobody was looking at.
+                NSLog("[app] configure failed: \(String(cString: kl_app_status()))")
                 DispatchQueue.main.async {
                     status = String(cString: kl_app_status())
                     log = "configure failed: \(status)\n\n" + stagingHelp
@@ -335,7 +346,8 @@ struct BootView: View {
         The APK assets are staged into the app's Documents container rather \
         than bundled, so they survive a reinstall and are uploaded once. Run:
 
-            visionos/stage_assets.sh <device-udid>
+            KLEPTON_TARGET=\(String(cString: kl_app_target_name())) \
+                visionos/stage_assets.sh <device-udid>
 
         from the repo root with the device paired and unlocked.
         """

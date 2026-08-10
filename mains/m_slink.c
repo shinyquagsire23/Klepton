@@ -39,13 +39,9 @@
 #include "../runtime/kl_aaudio.h"
 #include "../runtime/kl_openxr.h"
 #include "../runtime/kl_egl.h"
+#include "../runtime/kl_slink.h"
 
 static const char *LIBDIR = "steamlink-android/lib/arm64-v8a";
-
-// The activity Steam Link actually declares. SDL3 caches this class in
-// nativeSetupJNI and every callback it makes goes through it, so getting it
-// wrong is not cosmetic — it is the class every GetStaticMethodID resolves in.
-static const char *ACTIVITY = "com/valvesoftware/steamlink/SteamLink";
 
 typedef int (*jni_onload_fn)(void *vm, void *reserved);
 
@@ -55,143 +51,15 @@ static volatile int g_view_quit;
 
 static int fail(const char *msg) { fprintf(stderr, "FAIL: %s\n", msg); return 1; }
 
-// The working set, dependencies first.
-//
-// There are TWO of these, because the app has two front doors and they are not
-// a sequence (§11.9). Which one is loaded decides what the run can possibly
-// show, so it is selected once, here, and everything downstream reads
-// slink_chain()/slink_main_lib().
-//
-//   CHAIN_CLIENT  libmain.so — the streaming client. Its picture IS a decoded
-//                 video stream, so it draws nothing at all until a Steam host
-//                 is streaming to it (§11.11, measured: zero swaps ever).
-//   CHAIN_SHELL   libshell_arm64-v8a.so — the 2D configuration frontend, and
-//                 the app's own `getMainSharedObject()` answer. This one has
-//                 pixels of its OWN: Qt Widgets, drawn locally, no host needed.
-//
-// §11.2 ruled the shell out of scope on cost, and that was right while the
-// question was "which is the cheapest first window". It is the wrong answer to
-// a different question — "what can draw without a Steam host on the LAN" — and
-// that is the question now, because the client answered it with "nothing".
-static const char *const CHAIN_CLIENT[] = {
-    "libc++_shared.so",
-    "libSDL3.so",
-    "libSDL3_ttf.so",
-    "libSDL3_image.so",
-    "libh264bitstream.so",
-    "libhevcbitstream.so",
-    "libmain.so",
-};
-
-// SteamLink.getLibraries() lists fourteen, but that list is System.loadLibrary
-// order and Android resolves DT_NEEDED recursively behind each entry. We map
-// and relocate explicitly, so the order here is DEPENDENCIES FIRST — read off
-// libshell's own DT_NEEDED (SDL3 ×4, Qt6 Widgets/Svg/Gui/Network/Core, the two
-// bitstream helpers, libc++_shared) rather than off the Java.
-//
-// libSDL3_mixer and libsteamwebrtc are in getLibraries() and NOT in libshell's
-// DT_NEEDED; they are loaded anyway because the Java side loads them and the
-// shell may dlopen them later. libmain.so is deliberately absent — it is not a
-// dependency of the shell, it is what the shell launches once you pick a host.
-static const char *const CHAIN_SHELL[] = {
-    "libc++_shared.so",
-    "libSDL3.so",
-    "libSDL3_image.so",
-    "libSDL3_mixer.so",
-    "libSDL3_ttf.so",
-    "libQt6Core_arm64-v8a.so",
-    "libQt6Network_arm64-v8a.so",
-    "libQt6Gui_arm64-v8a.so",
-    "libQt6Widgets_arm64-v8a.so",
-    "libQt6Svg_arm64-v8a.so",
-    "libh264bitstream.so",
-    "libhevcbitstream.so",
-    "libsteamwebrtc.so",
-    "libshell_arm64-v8a.so",
-};
-
-// CHAIN_VR  libvrlink_scene.so — the THIRD front door, and the only one that is
-//           not SDL3 at all. §11.9 measured its DT_NEEDED as
-//           libopenxr_loader/libaaudio/libmediandk/libandroid/liblog/libEGL/
-//           libGLESv3/libm/libdl/libc: no libmain, no libSDL3, no libc++_shared,
-//           no Qt. So the "chain" is ONE guest library against system libraries
-//           we shim, which is why this array has a single entry and is not a
-//           mistake.
-//
-// libopenxr_loader.so is deliberately ABSENT. It is the Khronos loader and it
-// finds a runtime through an Android `org.khronos.openxr.runtime_broker`
-// service that does not exist here — exactly libOVRPlugin.so's situation in
-// §3.1, and settled the same way: REPLACED, not translated. The 46 xr* names
-// bind against kl_openxr.c through kl_shim_lookup instead. Putting the real
-// loader in this list would map 300 KB of code that can only fail.
-static const char *const CHAIN_VR[] = {
-    "libvrlink_scene.so",
-};
-
-// KL_SLINK_SHELL=1 picks the 2D frontend, KL_SLINK_VR=1 the OpenXR one. Set
-// once in slink_run() before anything reads them, so the accessors below cannot
-// disagree. They are mutually exclusive; VR wins if both are set, and says so.
-static int g_shell, g_vr;
-
-static const char *const *slink_chain(size_t *n) {
-    if (g_vr)    { *n = sizeof CHAIN_VR    / sizeof *CHAIN_VR;    return CHAIN_VR; }
-    if (g_shell) { *n = sizeof CHAIN_SHELL / sizeof *CHAIN_SHELL; return CHAIN_SHELL; }
-    *n = sizeof CHAIN_CLIENT / sizeof *CHAIN_CLIENT;
-    return CHAIN_CLIENT;
-}
-
-static void report_image(const char *soname, kl_image *img) {
-    const kl_stats *st = kl_get_stats(img);
-    unsigned total = st->relative + st->abs64 + st->glob_dat + st->jump_slot;
-    // The load address is printed because `sample <pid>` is the diagnostic that
-    // keeps paying off on this target and it reports guest frames as
-    // "??? (in <unknown binary>)". With the base here, one subtraction plus
-    // llvm-nm turns a wall of hex into CShellApplication::BInit. Fourteen
-    // libraries makes guessing which image an address belongs to impractical.
-    printf("  %-26s @%p %7.2f MB  reloc %-7u tls %-5u x18 %u/%u",
-           soname, kl_base(img), kl_span(img) / 1048576.0, total,
-           st->tls_rewrites, st->x18_patched, st->x18_sites);
-    if (st->x18_refused) printf(" (refused %u)", st->x18_refused);
-    // Trap 0b: words that decode as x18 sites but sit in data. Named here
-    // because the number is how the second detector is watched — silence would
-    // make a change of mind about what is code invisible.
-    if (st->x18_data_words) printf(" (data %u)", st->x18_data_words);
-    printf("  imports %u bound / %u unresolved\n",
-           st->imports_bound, st->imports_missing);
-}
-
-// Everything still unresolved once the guest libraries have satisfied each
-// other. This is the number that matters: t_load run on one library reports
-// SDL_* as missing because it loads that library alone, and reading those
-// lists as shim gaps would send the whole session chasing symbols the guest
-// already provides.
-static void report_gap(void) {
-    printf("\n=== shim gap: unresolved after cross-binding ===\n");
-    unsigned grand = 0;
-    size_t nchain;
-    const char *const *chain = slink_chain(&nchain);
-    for (size_t i = 0; i < nchain; i++) {
-        char path[1024];
-        snprintf(path, sizeof path, "%s/%s", LIBDIR, chain[i]);
-        kl_image *img = kl_find_image(path);
-        if (!img) continue;
-        unsigned nm = 0;
-        const char *const *miss = kl_missing_imports(img, &nm);
-        if (!nm) continue;
-        grand += nm;
-        printf("  %s: %u\n    ", chain[i], nm);
-        // Three per line at 36 columns, with a guaranteed space: these names run
-        // to 35 characters (AMediaCodec_releaseOutputBufferAtTime) and a %-28s
-        // silently joins two of them into one unsearchable token.
-        for (unsigned k = 0, shown = 0; k < nm; k++, shown++) {
-            if (shown && shown % 3 == 0) printf("\n    ");
-            printf("%-36s ", miss[k]);
-        }
-        printf("\n");
-    }
-    if (!grand) printf("  (none — every import bound)\n");
-    else printf("\n  %u unique unresolved names across the chain\n", grand);
-}
+// Which front door, resolved once in slink_run() before anything reads it. The
+// chains, the entry points and everything the JNI surface has to say about this
+// app moved to runtime/kl_slink.c when the visionOS app became the second
+// driver — see that file's header comment for why the split falls where it
+// does. What stays here is policy: the recon phases, KL_GAP_ONLY, the fork, the
+// viewer and the 2D->VR handoff.
+static kl_slink_door g_door;
+#define g_shell (g_door == KL_SLINK_SHELL)
+#define g_vr    (g_door == KL_SLINK_VR)
 
 // ---------------------------------------------------------------- phase 4 --
 // SDLActivity.onCreate's sequence, read out of the APK's own bytecode rather
@@ -211,54 +79,7 @@ static void report_gap(void) {
 // in M4 — the guest blocks waiting for a thread we declined to create.
 #define SL_SDLA "org/libsdl/app/SDLActivity"
 
-// The entry point, per front door. Both are what the APK's own bytecode says:
-// SteamLink.getMainSharedObject()/getMainFunction() return "libshell_<abi>.so"
-// and "main" (verified in the smali, not assumed), and SDL's inherited defaults
-// are "libmain.so" / "SDL_main".
-//
-// "a whole QtAndroid JNI surface" was the reason §11.2 priced the shell out, and
-// on the OLD apk that was true — steamlink-android/ ships Qt5 with
-// libplugins_platforms_qtforandroid, the stock Android QPA, whose whole job is
-// to talk to QtNative/QtSurface over JNI. The VR apk does NOT: it ships Qt6 with
-// **libplugins_platforms_qvirtual_arm64-v8a.so**, a QPA plugin of Valve's own
-// (`QVirtualIntegrationPlugin`), and its DT_NEEDED is Qt6Gui, Qt6Core, GLESv2,
-// EGL, log, z, m, c++_shared, dl, c — **no libandroid and no JNI at all**.
-// libshell holds the other half of it (`QVirtualPlatformDelegate`,
-// `QVirtualWindowDelegate`) and sets QT_QPA_PLATFORM itself. So Qt here renders
-// into a backing store Valve owns, and the expensive part of §11.2's estimate
-// does not exist on this build. That is what makes the shell reachable.
-//
-// KL_SLINK_LIB / _FN still override either.
-#define SL_CLIENT_LIB "libmain.so"
-#define SL_CLIENT_FN  "SDL_main"
-#define SL_SHELL_LIB  "libshell_arm64-v8a.so"
-#define SL_SHELL_FN   "main"
-// The VR half has no SDL_main-shaped entry. It is a real NativeActivity and the
-// manifest says so (`android.app.lib_name = vrlink_scene`), so the entry point
-// is the one Android's own NativeActivity.onCreate would dlsym. Checked against
-// the library's exports: ANativeActivity_onCreate is there and `android_main`
-// is NOT, so whatever glue it uses keeps that symbol internal.
-#define SL_VR_LIB     "libvrlink_scene.so"
-#define SL_VR_FN      "ANativeActivity_onCreate"
-
-static const char *slink_main_lib(void) {
-    return g_vr ? SL_VR_LIB : g_shell ? SL_SHELL_LIB : SL_CLIENT_LIB;
-}
-static const char *slink_main_fn(void) {
-    return g_vr ? SL_VR_FN : g_shell ? SL_SHELL_FN : SL_CLIENT_FN;
-}
-
 typedef void (*v_env_cls)(void *, void *);
-
-// The panel we present, in one place. Three things must agree about it or SDL
-// reads a display that contradicts itself (the "group answer" rule): the
-// resolution given to nativeSetScreenResolution, the ANativeWindow geometry
-// SDL fetches through getNativeSurface, and ANGLE's own surface size.
-static void slink_panel_size(int *w, int *h) {
-    *w = 1280; *h = 800;
-    const char *e = getenv("KL_SLINK_SIZE");
-    if (e) sscanf(e, "%dx%d", w, h);
-}
 
 static void *sdl_thread_body(void *arg) {
     void **slot = (void **)arg;
@@ -274,8 +95,8 @@ static void *sdl_thread_body(void *arg) {
         ((v_env_cls)slot[0])(env, cls);
     }
 
-    const char *lib = getenv("KL_SLINK_LIB"); if (!lib) lib = slink_main_lib();
-    const char *fn  = getenv("KL_SLINK_FN");  if (!fn)  fn  = slink_main_fn();
+    const char *lib = getenv("KL_SLINK_LIB"); if (!lib) lib = kl_slink_main_lib();
+    const char *fn  = getenv("KL_SLINK_FN");  if (!fn)  fn  = kl_slink_main_fn();
 
     // SDL dlopens this by path and dlsyms the function out of it. The path has
     // to be the one the image is REGISTERED under or kl_dl's dlopen will try to
@@ -353,7 +174,7 @@ static void run_main_sequence(kl_image *sdl_img, kl_image *entry_img) {
     // off the Display; nothing downstream has been shown to care yet, so they
     // are deliberately ordinary rather than a Quest's panel.
     int w, h;
-    slink_panel_size(&w, &h);
+    kl_slink_panel_size(&w, &h);
 
     if (setres) {
         printf("  nativeSetScreenResolution(%d,%d, %d,%d, 2.0, 60.0)\n", w, h, w, h);
@@ -475,147 +296,34 @@ static void slink_vrlink_handoff(const char *sargs) {
 }
 
 // ------------------------------------------------------------- VR front door --
-// ANativeActivity, transcribed from <android/native_activity.h>. It is ABI, not
-// an interface we get to design: the guest's glue reads these fields by offset
-// out of the pointer we hand ANativeActivity_onCreate, and it writes the
-// callbacks table back through the first one.
-//
-// `clazz` is the NDK's own misnomer — it is the activity INSTANCE object, not a
-// jclass, and the guest calls getIntent()/getPackageName() on it. Ours is the
-// jobject kl_jni hands out for the activity, so those land on g_bindings and
-// fail by name like every other M4 gap.
-typedef struct kl_ANativeActivity kl_ANativeActivity;
-typedef struct {
-    void (*onStart)(kl_ANativeActivity *);
-    void (*onResume)(kl_ANativeActivity *);
-    void *(*onSaveInstanceState)(kl_ANativeActivity *, size_t *);
-    void (*onPause)(kl_ANativeActivity *);
-    void (*onStop)(kl_ANativeActivity *);
-    void (*onDestroy)(kl_ANativeActivity *);
-    void (*onWindowFocusChanged)(kl_ANativeActivity *, int);
-    void (*onNativeWindowCreated)(kl_ANativeActivity *, void *);
-    void (*onNativeWindowResized)(kl_ANativeActivity *, void *);
-    void (*onNativeWindowRedrawNeeded)(kl_ANativeActivity *, void *);
-    void (*onNativeWindowDestroyed)(kl_ANativeActivity *, void *);
-    void (*onInputQueueCreated)(kl_ANativeActivity *, void *);
-    void (*onInputQueueDestroyed)(kl_ANativeActivity *, void *);
-    void (*onContentRectChanged)(kl_ANativeActivity *, const void *);
-    void (*onConfigurationChanged)(kl_ANativeActivity *);
-    void (*onLowMemory)(kl_ANativeActivity *);
-} kl_ANativeActivityCallbacks;
-struct kl_ANativeActivity {
-    kl_ANativeActivityCallbacks *callbacks;
-    void       *vm;
-    void       *env;
-    void       *clazz;
-    const char *internalDataPath;
-    const char *externalDataPath;
-    int32_t     sdkVersion;
-    void       *instance;
-    void       *assetManager;
-    const char *obbPath;
-};
-
-typedef void (*anativeactivity_oncreate_fn)(kl_ANativeActivity *, void *, size_t);
-
-// One call per lifecycle hook, named, so a NULL callback is distinguishable
-// from one that ran. Android calls these from the UI thread; so do we.
-#define VR_CB(act, name, ...)                                                  \
-    do {                                                                       \
-        if ((act)->callbacks->name) {                                          \
-            printf("  [vr] %s\n", #name); fflush(NULL);                        \
-            kl_jni_local_frame_push();                                         \
-            (act)->callbacks->name((act), ##__VA_ARGS__);                      \
-            kl_jni_local_frame_pop();                                          \
-        } else printf("  [vr] %s — not registered\n", #name);                  \
-    } while (0)
-
-static void run_vr_sequence(kl_image *scene) {
+// The ANativeActivity ABI, the onCreate call and the looper pump all live in
+// runtime/kl_slink.c now — they are Android's contract with this guest, not
+// this driver's. What is left here is what a *command-line* run does with them:
+// where it stops (KL_SLINK_MAIN), how long it waits (KL_SLINK_WAIT) and that a
+// windowed run waits on the window instead.
+static void run_vr_sequence(void) {
     printf("\n=== phase 2: ANativeActivity_onCreate (the VR front door) ===\n");
     fflush(NULL);
-
-    anativeactivity_oncreate_fn onCreate =
-        (anativeactivity_oncreate_fn)kl_sym(scene, SL_VR_FN);
-    if (!onCreate) { printf("  no %s export\n", SL_VR_FN); return; }
-
-    // This thread is the app's UI thread, and on Android that means it has a
-    // looper before any activity is created. The guest takes it with
-    // ALooper_forThread() inside onCreate and does not check for NULL.
-    kl_ndk_prepare_looper();
-
-    static kl_ANativeActivityCallbacks cbs;
-    static kl_ANativeActivity act;
-    act.callbacks        = &cbs;
-    act.vm               = kl_jni_vm();
-    act.env              = kl_jni_env();
-    act.clazz            = kl_jni_activity();
-    act.internalDataPath = kl_jni_files_dir();
-    act.externalDataPath = kl_jni_files_dir();
-    // 29, the same Quest-2 answer Build.SDK_INT gives. Two numbers describing
-    // one device have to agree — this is the display-panel group answer again.
-    act.sdkVersion       = 29;
-    act.assetManager     = kl_ndk_asset_manager();
-    act.obbPath          = kl_jni_files_dir();
-
-    printf("  activity: clazz=%p env=%p assets=%p sdk=%d dataPath=%s\n",
-           act.clazz, act.env, act.assetManager, act.sdkVersion,
-           act.internalDataPath ? act.internalDataPath : "(null)");
-    fflush(NULL);
-
-    kl_jni_local_frame_push();
-    onCreate(&act, NULL, 0);
-    kl_jni_local_frame_pop();
-    // How many hooks it installed is the cheapest confirmation that onCreate
-    // did its job: a glue that returned early leaves the table empty, and that
-    // reads identically to "it worked" without this line.
-    int nhooks = 0;
-    void **slot = (void **)&cbs;
-    for (size_t i = 0; i < sizeof cbs / sizeof(void *); i++) nhooks += slot[i] != NULL;
-    printf("  onCreate returned; %d of %zu callbacks registered\n",
-           nhooks, sizeof cbs / sizeof(void *));
-    fflush(NULL);
+    if (kl_slink_vr_create(stdout) != 0) {
+        printf("  %s\n", kl_slink_error());
+        return;
+    }
 
     if (!getenv("KL_SLINK_MAIN")) {
         printf("  (KL_SLINK_MAIN unset: stopping after onCreate)\n");
         return;
     }
 
-    // The rest of what Android's NativeActivity does, in its order. onCreate
-    // itself only spawns the guest's thread and returns — nothing renders until
-    // the window arrives, and the glue's own loop blocks until it does.
     printf("\n=== phase 3: the activity lifecycle ===\n");
-    VR_CB(&act, onStart);
-    VR_CB(&act, onResume);
-    VR_CB(&act, onNativeWindowCreated, kl_ndk_window());
-    VR_CB(&act, onWindowFocusChanged, 1);
+    kl_slink_vr_start(stdout);
 
-    // ...and then the UI thread's job, which is NOT to sleep. This guest is not
-    // native_app_glue: it does not run android_main on a thread of its own, it
-    // hangs a UIThreadCallbackHandler off *this* thread's looper and expects
-    // Looper.loop() to be turning. Sleeping here left it with exactly one live
-    // thread — its log-capture reader, blocked in read() — and no sign of a
-    // problem anywhere, because nothing was wrong except that nobody was
-    // pumping. KL_SLINK_WAIT is the deadline; what it measures is how far the
-    // guest gets once its callbacks can actually run.
+    // KL_SLINK_WAIT is the deadline; what it measures is how far the guest gets
+    // once its callbacks can actually run. Under the viewer there is no
+    // deadline — the window is what ends the run.
     unsigned maxs = getenv("KL_SLINK_WAIT") ? (unsigned)atoi(getenv("KL_SLINK_WAIT")) : 10;
     int windowed = getenv("KL_VIEW") != NULL;
-    // A DEADLINE, not a pump count. kl_ndk_pump_looper(100) returns as soon as
-    // it has work, so counting maxs*10 iterations gave whatever wall time the
-    // guest's own busyness happened to produce — KL_SLINK_WAIT=40 measured
-    // 9 seconds once the stream was live, which is exactly when the knob is
-    // being used to buy the guest time. It reads as "the run stopped early" and
-    // there is nothing in the log to say otherwise.
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    double elapsed = 0;
-    for (unsigned t = 0; windowed ? !g_view_quit : elapsed < (double)maxs; t++) {
-        kl_ndk_pump_looper(100);
-        if ((t + 1) % 10 == 0) kl_jni_drain_ui_tasks();
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        elapsed = (double)(now.tv_sec - t0.tv_sec)
-                + (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
-    }
+    double elapsed = kl_slink_vr_pump(windowed ? -1.0 : (double)maxs,
+                                      windowed ? &g_view_quit : NULL);
     printf("  (UI thread waited %.1fs of %us — see above for where the guest got to)\n",
            elapsed, maxs);
     fflush(NULL);
@@ -631,13 +339,10 @@ static int slink_run(void) {
     kl_thread_init();
     kl_fault_install();
     kl_jni_set_permissive(getenv("KL_PERMISSIVE") != NULL);
-    g_shell = kl_env_on("KL_SLINK_SHELL", 0);
-    g_vr    = kl_env_on("KL_SLINK_VR", 0);
-    if (g_vr && g_shell) {
+    g_door = kl_slink_door_from_env();
+    if (kl_env_on("KL_SLINK_VR", 0) && kl_env_on("KL_SLINK_SHELL", 0))
         printf("(KL_SLINK_VR and KL_SLINK_SHELL are different front doors; "
                "taking VR)\n");
-        g_shell = 0;
-    }
     // Only the shell can reach startVRLink, and only it should be able to hand
     // off — installing this unconditionally would let a client or VR run take a
     // path neither of them has any business on.
@@ -648,96 +353,29 @@ static int slink_run(void) {
     // did: the shell loads assets/config/{default,ui,hmd,controller}_config.json
     // at startup, and those exist only in the VR tree.
     int vr_apk = strstr(LIBDIR, "steamlink-vr") != NULL;
-    const char *apk    = vr_apk ? "steamlink-vr.apk" : "steamlink-android.apk";
+    const char *apk = vr_apk ? "steamlink-vr.apk" : "steamlink-android.apk";
     // The ASSETS directory, not the unpacked tree root — kl_jni_set_assets_dir
     // wants "<tree>/assets" (that is what the Beat Saber default is), and both
     // asset doors resolve relative paths against it. The tree root that
     // kl_guest_path_map needs is derived from it by stripping the last
     // component, so this stays right for both.
     const char *assets = vr_apk ? "steamlink-vr/assets" : "steamlink-android/assets";
-    if (g_vr && !vr_apk) {
-        fprintf(stderr, "KL_SLINK_VR needs the VR apk — libvrlink_scene.so only "
-                        "exists in steamlink-vr/lib/arm64-v8a\n");
+
+    // Everything the guest is told about itself: the activity class, the four
+    // paths, the <meta-data>, Qt's plugin path and the panel size. Shared with
+    // the visionOS app, which describes the same guest and must not describe it
+    // differently — runtime/kl_slink.c.
+    if (kl_slink_configure(g_door, LIBDIR, assets, apk,
+                           "build/steamlink-files", stdout) != 0) {
+        fprintf(stderr, "%s\n", kl_slink_error());
         return 1;
-    }
-
-    // The JNI surface has to describe THIS app, not Beat Saber. The activity
-    // class is the load-bearing one (see above); the paths matter because
-    // trap 6c applies to any guest — Android hands out absolute paths and
-    // SDL3's SDL_GetBasePath/SDL_GetPrefPath propagate whatever we say.
-    // ...and the VR front door is a DIFFERENT activity in the same package.
-    // The manifest declares the two as peers (§11.9), and this is the one with
-    // `category.VR` — Android's stock NativeActivity, whose only app-specific
-    // part is the `android.app.lib_name` meta-data.
-    kl_jni_set_activity_class(g_vr ? "android/app/NativeActivity" : ACTIVITY);
-    kl_jni_set_apk_path(apk);
-    kl_jni_set_native_lib_dir(LIBDIR);
-    kl_jni_set_files_dir("build/steamlink-files");
-    // The old APK has no assets/ directory at all — checked, not assumed — so
-    // for it this only keeps AAssetManager_open from being a crash, and an
-    // absent file is the honest answer. The VR APK does have one, and the shell
-    // reads it.
-    kl_jni_set_assets_dir(assets);
-
-    // The SDL_ENV.* <meta-data>, transcribed from the APK's own manifest — real
-    // behaviour, not decoration (SDL_ANDROID_TRAP_BACK_BUTTON routes the back
-    // button; STEAM_LINK_VR is the app's own build discriminator). The two APKs
-    // differ by exactly that last entry, which is why the runtime does not carry
-    // a baked-in table: it would be wrong for one of them.
-    //
-    // Not in VR mode: these are the SDLActivity's <meta-data>, and the VR front
-    // door is a different activity that declares only `android.app.lib_name`.
-    // Handing them over would be inventing manifest entries the app does not
-    // have — and STEAM_LINK_VR in particular is libmain's build discriminator,
-    // so a wrong answer there is a wrong branch rather than a dead variable.
-    if (!g_vr) {
-        kl_jni_add_manifest_env("SDL_JOYSTICK_HIDAPI", "1");
-        kl_jni_add_manifest_env("SDL_TV_REMOTE_AS_JOYSTICK", "0");
-        kl_jni_add_manifest_env("SDL_ANDROID_TRAP_BACK_BUTTON", "1");
-        kl_jni_add_manifest_env("SDL_ANDROID_ALLOW_RECREATE_ACTIVITY", "1");
-        if (vr_apk) kl_jni_add_manifest_env("STEAM_LINK_VR", "1");
-    } else {
-        kl_jni_add_manifest_env("android.app.lib_name", "vrlink_scene");
-    }
-
-    // Qt has to be told where its plugins live, and on Android it always is —
-    // Qt's own Android bootstrap sets the library paths from the APK layout
-    // before main() runs. We author that side, so this is the faithful
-    // equivalent rather than a workaround: without it libshell aborts with
-    //   Could not find the Qt platform plugin "virtual" in ""
-    // (libshell sets QT_QPA_PLATFORM=virtual itself; only the path is missing).
-    //
-    // The value is the flat native-library directory, NOT a plugins/ tree:
-    // Qt-for-Android globs each search path for `libplugins_<subdir>_*.so`
-    // (the format string is in libQt6Core), which is exactly how these are
-    // named. Absolute, per trap 6c — the guest chdir()s and a relative path
-    // would resolve somewhere else later.
-    if (g_shell) {
-        char abs[PATH_MAX];
-        if (realpath(LIBDIR, abs)) setenv("QT_PLUGIN_PATH", abs, 1);
-        else fprintf(stderr, "  [slink] realpath(%s) failed; Qt will not find "
-                             "its platform plugin\n", LIBDIR);
     }
 
     // Say which front door this run opened, before anything can go wrong. The
     // two chains fail in different places for different reasons, and a log that
     // does not name the mode makes the two records unmergeable.
     printf("=== Steam Link: %s front door (%s -> %s), %s ===\n",
-           g_vr ? "OpenXR VR" : g_shell ? "2D SHELL" : "streaming CLIENT",
-           slink_main_lib(), slink_main_fn(), LIBDIR);
-
-    // The panel, published BEFORE anything can bring ANGLE up. Doing this from
-    // eglCreateWindowSurface was too late and silently so: the guest touches EGL
-    // early enough that kl_glfb_init has already run by then, kl_glfb_set_size
-    // is a no-op once it has, and the guest ended up drawing a 1280x800 viewport
-    // into a 4000x3200 surface — which the capture then read in full, mostly
-    // empty. Nothing errored; the picture was just wrong.
-    {
-        int pw, ph;
-        slink_panel_size(&pw, &ph);
-        kl_ndk_set_window(pw, ph, 1 /* RGBA_8888 */);
-        kl_glfb_set_size(pw, ph);
-    }
+           kl_slink_door_name(), kl_slink_main_lib(), kl_slink_main_fn(), LIBDIR);
 
     // ---- phase 1: the chain ----
     // Mapping and relocation are separated from DT_INIT_ARRAY on purpose, which
@@ -748,41 +386,20 @@ static int slink_run(void) {
     // one symbol per rebuild. Relocating everything first makes the list a
     // single measurement. Same reasoning as KL_PERMISSIVE on the JNI side.
     printf("=== phase 1: mapping the working set ===\n");
-    struct timespec t0, t1;
-    size_t nchain;
-    const char *const *chain = slink_chain(&nchain);
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (size_t i = 0; i < nchain; i++) {
-        char path[1024];
-        snprintf(path, sizeof path, "%s/%s", LIBDIR, chain[i]);
-        kl_image *img = kl_load_auto(path);
-        if (!img) { fprintf(stderr, "  %s: %s\n", chain[i], kl_error()); return fail("chain load"); }
-        kl_register_image(path, img);      // dependencies first, so the next
-        report_image(chain[i], img);       // library's imports bind against it
-    }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    printf("  chain mapped and relocated in %.1f ms\n",
-           (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
-    report_gap();
+    if (kl_slink_load_chain(stdout) != 0) return fail("chain load");
+    kl_slink_report_gap(stdout);
 
     if (getenv("KL_GAP_ONLY")) { printf("\n(KL_GAP_ONLY: stopping before init)\n"); return 0; }
 
     printf("\n=== phase 1b: DT_INIT_ARRAY, dependencies first ===\n");
     fflush(NULL);
-    for (size_t i = 0; i < nchain; i++) {
-        char path[1024];
-        snprintf(path, sizeof path, "%s/%s", LIBDIR, chain[i]);
-        printf("  %s\n", chain[i]);
-        fflush(NULL);
-        kl_run_init(kl_find_image(path));
-    }
-    printf("  all init arrays returned\n");
+    kl_slink_run_inits(stdout);
 
     // The entry library, whichever front door this run opened. In shell mode
     // libmain.so is not in the chain at all — it is not a dependency of the
     // shell, it is what the shell launches once a host has been picked.
     char path[1024];
-    snprintf(path, sizeof path, "%s/%s", LIBDIR, slink_main_lib());
+    snprintf(path, sizeof path, "%s/%s", LIBDIR, kl_slink_main_lib());
     kl_image *entry_img = kl_find_image(path);
 
     // The VR front door diverges here and never rejoins. Everything below is
@@ -792,7 +409,7 @@ static int slink_run(void) {
     // function Android's NativeActivity dlsyms.
     if (g_vr) {
         if (!entry_img) return fail("libvrlink_scene.so not in the registry");
-        run_vr_sequence(entry_img);
+        run_vr_sequence();
         // The VR path has its own exit and had never reported the video, audio,
         // XR or GL surfaces — which between them ARE the VR half of the app, so
         // the run that most needs those numbers was the one that printed none
@@ -800,12 +417,7 @@ static int slink_run(void) {
         // kl_fault.c, and a VR run that works does not take it. An empty report
         // reads as "nothing happened"; no report at all reads the same way and
         // takes longer to disbelieve (SL-13 lost a run to exactly that).
-        kl_mediandk_report(stdout);
-        kl_aaudio_report(stdout);
-        kl_openxr_report(stdout);
-        kl_egl_report(stdout);
-        printf("\n=== JNI surface ===\n");
-        kl_jni_report(stdout);
+        kl_slink_report(stdout);
         return 0;
     }
 
@@ -866,8 +478,8 @@ static int slink_run(void) {
     // The entry point itself, looked up the way SDL's nativeRunMain will look it
     // up. Failing here rather than three phases later is the difference between
     // "the guest exports no such symbol" and "something went wrong in main".
-    void *entry = kl_sym(entry_img, slink_main_fn());
-    printf("  %s %s=%p\n", slink_main_lib(), slink_main_fn(), entry);
+    void *entry = kl_sym(entry_img, kl_slink_main_fn());
+    printf("  %s %s=%p\n", kl_slink_main_lib(), kl_slink_main_fn(), entry);
     if (!entry) return fail("the entry library does not export its entry point");
 
     if (!setup || !runmain)

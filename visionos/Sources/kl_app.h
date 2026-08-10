@@ -115,6 +115,18 @@ void kl_app_guest_stop(void);
 // last case kl_app_status() says why.
 int  kl_app_guest_state(void);
 
+// Which guest this app was built for, and whether it is the Steam Link one.
+//
+// Valid after kl_app_configure; before that the name is "(unconfigured)" and the
+// predicate is false. The Swift side needs both — what the boot window says, and
+// whether the compositor is driving a guest that owns its own frame loop.
+//
+// The default is compiled in (KL_TARGET_DEFAULT, from gen_xcodeproj.py) rather
+// than read from the environment, because an app launched by hand from the Home
+// View has no environment. KL_TARGET overrides it.
+const char *kl_app_target_name(void);
+int         kl_app_target_is_steamlink(void);
+
 // Absolute path of the log kl_app_boot writes, valid after kl_app_configure.
 // The Swift side displays it and offers it for export.
 const char *kl_app_log_path(void);

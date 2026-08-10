@@ -86,6 +86,19 @@ struct KleptonStageConfiguration: CompositorLayerConfiguration {
     }
     static var wantFoveation: Bool { klEnvOn("KL_CP_FOVEATION", default: true) }
 
+    /// Whether `maxRenderQuality` was actually configured on the layer.
+    ///
+    /// Not the same question as `wantFoveation`, and the difference is a crash.
+    /// The ceiling is only set when foveation is genuinely available; the
+    /// *running* quality is set later by `applyRenderQuality`, and asking for a
+    /// quality above a ceiling that was never configured is a configuration
+    /// error, which Compositor Services reports as `__BUG_IN_CLIENT__` inside
+    /// `cp_layer_renderer_set_render_quality` — an abort with no mention of
+    /// either setting. The visionOS simulator is where the two diverge: it
+    /// supports no foveation at all and reports its default render quality as
+    /// **NaN**, so every immersive run there died on the second setting.
+    nonisolated(unsafe) static var ceilingConfigured = false
+
     /// Foveation is only honourable with vertex amplification, so it is only
     /// asked for when the GPU has it.
     ///
@@ -132,6 +145,7 @@ struct KleptonStageConfiguration: CompositorLayerConfiguration {
             // point paying for resolution the rate map is not there to spend.
             configuration.maxRenderQuality = .init(quality)
         }
+        Self.ceilingConfigured = foveate
         NSLog("[cp] colour format \(want.rawValue), foveation \(foveate) "
               + "(supported \(capabilities.supportsFoveation)), "
               + "max render quality \(foveate ? String(quality) : "default") "
@@ -277,7 +291,12 @@ final class KleptonCompositor {
     // this thread, inside the submission window. That is the clock P5.4's
     // device numbers were measured against, so it stays reachable — and it is
     // the A/B for anything that looks like a pacing problem after §12.12.
+    // ...and it is not offered for the Steam Link guest, because there is no
+    // inline frame to make: that guest brought its own OpenXR loop on a thread
+    // of its own, `kl_app_frame()` returns -1 for it by design, and taking this
+    // arm would present black forever while looking like a pacing choice.
     private let syncGuest = klEnvOn("KL_SYNC_GUEST", default: false)
+                            && kl_app_target_is_steamlink() == 0
 
     // How many drawables went out before the guest had a picture to put in
     // them. Counted rather than logged per frame, because on device it is
@@ -1927,9 +1946,13 @@ final class KleptonCompositor {
     /// queryDrawables in renderFrame.
     private func applyRenderQuality() {
         let want = KleptonStageConfiguration.requestedQuality
-        guard KleptonStageConfiguration.wantFoveation else {
+        // On whether the ceiling was CONFIGURED, not on whether it was wanted.
+        // The knob can be on and the ceiling still absent — the simulator
+        // supports no foveation — and setting the running quality then aborts
+        // the process inside Compositor Services. See `ceilingConfigured`.
+        guard KleptonStageConfiguration.ceilingConfigured else {
             NSLog("[cp] render quality left at \(layerRenderer.renderQuality) "
-                  + "(KL_CP_FOVEATION=0, so no ceiling was configured)")
+                  + "(no maxRenderQuality ceiling was configured)")
             return
         }
         let before = layerRenderer.renderQuality

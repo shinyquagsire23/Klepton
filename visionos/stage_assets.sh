@@ -12,15 +12,22 @@
 #   ./stage_assets.sh                 # the booted simulator
 #   ./stage_assets.sh <device-udid>   # a physical Vision Pro
 #
-# Idempotent, but not incremental: it replaces what is there. `beatsaber.apk`
-# is load-bearing on its own, not just the unpacked tree — getPackageCodePath()
-# hands Unity the APK path and it opens it as a zip.
+# Idempotent, but not incremental: it replaces what is there. The APK is
+# load-bearing on its own, not just the unpacked tree — getPackageCodePath()
+# hands the guest the APK path and it opens it as a zip.
+#
+# Which guest, and therefore which apk and which asset tree, comes from
+# KLEPTON_TARGET (visionos/targets.py). The container layout mirrors the repo's:
+# <container>/Documents/<tree>/assets and <container>/Documents/<tree>.apk, which
+# is what kl_app_configure builds its paths from.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=".."
-BUNDLE_ID="${KLEPTON_BUNDLE_ID:-dev.klepton.app}"
-APK="$ROOT/beatsaber.apk"
-ASSETS="$ROOT/beatsaber/assets"
+eval "$(python3 targets.py "${KLEPTON_TARGET:-}")"
+BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
+APK="$ROOT/$KLT_APK"
+ASSETS="$ROOT/$KLT_ASSETS"
+TREE="$KLT_TREE"
 
 [ -d "$ASSETS" ] || { echo "!! $ASSETS missing"; exit 1; }
 [ -f "$APK" ]    || { echo "!! $APK missing"; exit 1; }
@@ -33,23 +40,26 @@ if [ -z "$TARGET" ]; then
   CONTAINER=$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data 2>/dev/null) || {
     echo "!! $BUNDLE_ID is not installed on $UDID — install the app first"; exit 1; }
   DEST="$CONTAINER/Documents"
-  echo "[stage] simulator $UDID -> $DEST"
-  mkdir -p "$DEST/beatsaber"
-  rm -rf "$DEST/beatsaber/assets"
+  echo "[stage] simulator $UDID -> $DEST ($KLT_NAME)"
+  mkdir -p "$DEST/$TREE"
+  rm -rf "$DEST/$TREE/assets"
   # A copy, not a symlink: the guest resolves paths by concatenation (trap 6c)
   # and a link would work here but hide a real failure on device.
-  cp -R "$ASSETS" "$DEST/beatsaber/assets"
-  cp "$APK" "$DEST/beatsaber.apk"
+  cp -R "$ASSETS" "$DEST/$TREE/assets"
+  cp "$APK" "$DEST/$KLT_APK"
   echo "[stage] done: $(du -sh "$DEST" | cut -f1)"
   exit 0
 fi
 
-echo "[stage] device $TARGET (this uploads ~2.2 GB and takes a while)"
+# Beat Saber's 2.2 GB is the reason any of this exists; Steam Link's is 44 MB
+# and takes seconds. Saying which is which up front is the difference between
+# waiting and wondering.
+echo "[stage] device $TARGET, $KLT_NAME ($(du -shc "$ASSETS" "$APK" | tail -1 | cut -f1))"
 copy() {   # <source> <destination-relative-to-container>
   xcrun devicectl device copy to --device "$TARGET" \
     --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
     --source "$1" --destination "$2"
 }
-copy "$ASSETS" "Documents/beatsaber/assets"
-copy "$APK"    "Documents/beatsaber.apk"
+copy "$ASSETS" "Documents/$TREE/assets"
+copy "$APK"    "Documents/$KLT_APK"
 echo "[stage] done"

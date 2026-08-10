@@ -100,7 +100,28 @@ uint32_t klx_substitute(uint32_t insn, const klx_info *info, unsigned reg);
 // that it was unowned; a slot used transiently reads as zero whenever you are
 // not looking. There is no sampling schedule that establishes ownership, which
 // is why this is now a claimed key rather than a measured-free one.
-#define KLX_TSD_SLOT 300
+//
+// WHY 500 AND NOT 300. Claiming is a RACE, and in an app bundle we do not get to
+// run first. On the visionOS 27 simulator the Steam Link app's first
+// pthread_key_create is handed **330**: SwiftUI, UIKit and their dependencies
+// burn past 300 during dyld's initialization of THEIR images, which is before a
+// constructor in ours can run — measured, not assumed, and it is why
+// klx_claim_slot_early() exists and is still not early enough for 300. The guest
+// then refuses to load with "TSD slot 300 is unavailable", which reads as a
+// platform limit and is a starting-gun problem.
+//
+// Darwin issues external keys UPWARD from 258 and the TSD array holds 512, so
+// the HIGHEST slots are the last to be taken and the most robust choice
+// available: 500 survives a process that has created ~240 keys before us, where
+// 300 survives about forty. It is not a measured-free slot either — the same
+// walk claims it, kl_x18_init still proves tsd[500] agrees with
+// pthread_setspecific before emitting anything, and a translation built against
+// a different slot is refused BY NAME at load (kl_image.c) rather than running
+// against the wrong one.
+//
+// Changing it means re-translating: `make dylibs` and visionos/mkguest.sh both
+// bake it in, and visionos/run.sh rebuilds klepton-ld for exactly this reason.
+#define KLX_TSD_SLOT 500
 
 // Longest veneer, in instructions. Public because klepton-ld sizes its pool from
 // the site count before it emits anything.

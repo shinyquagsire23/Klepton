@@ -353,6 +353,32 @@ static int g_slot = -1;
 static struct { uint32_t word; unsigned n; } g_refused[REFUSE_KINDS];
 static unsigned g_nrefused_kinds, g_refused_total;
 
+// Claim the slot before anything in this process has had a chance to take it.
+//
+// The key walk can only succeed while 300 is still unissued, and Darwin hands
+// external keys out UPWARD and never reissues a held one — so this is a race
+// against every other library in the process, and in an app bundle we do not get
+// to run first. On the visionOS 27 simulator the app's boot thread is offered
+// **330 as its very first key**: SwiftUI, UIKit and their dependencies have
+// burned past 300 before a single line of ours executes, and the guest then
+// refuses to load with "TSD slot 300 is unavailable", which reads as a platform
+// limit rather than as a starting-gun problem.
+//
+// A constructor is early enough because dyld runs image initializers before
+// main(), and the frameworks' key consumption happens during app launch rather
+// than at load. It costs one pthread key in every process that links the
+// runtime, which is what the key was going to cost anyway — `build/m_boot` and
+// `build/m_slink` already claim it in their first statement, and this simply
+// makes them not have to.
+__attribute__((constructor))
+static void klx_claim_slot_early(void) {
+    // Quietly: a process that links the runtime and never loads a guest (a unit
+    // test, a tool) has no use for the slot and no business printing about it.
+    // Everything that DOES load a guest calls kl_x18_init() again on its load
+    // path, and that call reports.
+    (void)kl_x18_init();
+}
+
 int kl_x18_init(void) {
     if (g_slot >= 0) return 0;
 
@@ -375,18 +401,28 @@ int kl_x18_init(void) {
     static pthread_key_t spare[KLX_KEY_WALK];
     unsigned nspare = 0;
     int got = 0;
+    unsigned first = 0, last = 0;
     for (unsigned i = 0; i < KLX_KEY_WALK; i++) {
         pthread_key_t k;
         if (pthread_key_create(&k, NULL) != 0) break;
+        if (!i) first = (unsigned)k;
+        last = (unsigned)k;
         if ((unsigned)k == KLX_TSD_SLOT) { got = 1; break; }
         if ((unsigned)k > KLX_TSD_SLOT) { spare[nspare++] = k; break; }
         spare[nspare++] = k;
     }
     for (unsigned i = 0; i < nspare; i++) pthread_key_delete(spare[i]);
     if (!got) {
-        fprintf(stderr, "  [klepton] x18: could not claim TSD key %d — something "
-                        "else in this process holds it. Veneers are baked against "
-                        "that key; see runtime/kl_x18.h.\n", KLX_TSD_SLOT);
+        // WHICH keys it was offered, because "something else holds it" has two
+        // very different causes and the fix differs: a process that is already
+        // PAST 300 when we ask (first > 300 — too much ran before us, and the
+        // answer is to ask earlier) versus one that runs out of keys on the way
+        // (last < 300 — the walk was refused, and the answer is elsewhere).
+        // Without the numbers those read identically.
+        fprintf(stderr, "  [klepton] x18: could not claim TSD key %d — this "
+                        "process offered keys %u..%u instead. Veneers are baked "
+                        "against %d; see runtime/kl_x18.h.\n",
+                KLX_TSD_SLOT, first, last, KLX_TSD_SLOT);
         return -1;
     }
 

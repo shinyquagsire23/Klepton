@@ -1,5 +1,5 @@
 #!/bin/bash
-# Translate the five guest libraries and wrap each as an XCFramework.
+# Translate this target's guest libraries and wrap each as an XCFramework.
 #
 # Why frameworks rather than a directory of .dylib files (PLANNING §4.0.1):
 # Xcode code-signs what it embeds under Frameworks/, and a loose Mach-O
@@ -11,21 +11,27 @@
 # Both slices are built because they are genuinely different images: the
 # platform goes into LC_BUILD_VERSION, and a visionos-stamped dylib is refused
 # by the simulator's dyld and vice versa.
+#
+# Which guest comes from KLEPTON_TARGET (visionos/targets.py). The output goes
+# into a per-target subdirectory of Frameworks/ so that building the second app
+# does not overwrite the first one's embedded guest in place — a bundle ID
+# separates the installed apps and nothing at all about their build outputs.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=".."
 LD="$ROOT/build/klepton-ld"
-SRC="$ROOT/beatsaber/lib/arm64-v8a"
-OUT="Frameworks"
-LIBS="libmain lib_burst_generated libunityopus libunity libil2cpp"
+eval "$(python3 targets.py "${KLEPTON_TARGET:-}")"
+SRC="$ROOT/$KLT_SRCDIR"
+OUT="Frameworks/$KLT_NAME"
+LIBS="$KLT_LIBS"
 
 [ -x "$LD" ] || { echo "!! $LD missing — run 'make build/klepton-ld' first"; exit 1; }
 
-# Only the guest xcframeworks are cleared, not the whole of Frameworks/ — it is
-# shared with mkangle.sh, and wiping it here made the two scripts order-dependent
-# in a way nothing would have reported except a missing ANGLE at runtime.
-rm -rf build/guest; mkdir -p build/guest "$OUT"
-for NAME in $LIBS; do rm -rf "$OUT/$NAME.xcframework"; done
+# The target's own subdirectory is cleared, not the whole of Frameworks/ — that
+# is shared with mkangle.sh, and wiping it here made the two scripts
+# order-dependent in a way nothing would have reported except a missing ANGLE at
+# runtime.
+rm -rf "build/guest/$KLT_NAME" "$OUT"; mkdir -p "build/guest/$KLT_NAME" "$OUT"
 
 for NAME in $LIBS; do
   [ -f "$SRC/$NAME.so" ] || { echo "!! $SRC/$NAME.so missing"; exit 1; }
@@ -37,7 +43,7 @@ for NAME in $LIBS; do
       xros)        KLPLAT=visionos    ;;
       xrsimulator) KLPLAT=visionossim ;;
     esac
-    FW="build/guest/$PLAT/$NAME.framework"
+    FW="build/guest/$KLT_NAME/$PLAT/$NAME.framework"
     mkdir -p "$FW"
     "$LD" "$SRC/$NAME.so" -o "$FW/$NAME" --platform "$KLPLAT" \
           --install-name "@rpath/$NAME.framework/$NAME" --quiet
@@ -57,11 +63,11 @@ EOF
   done
   rm -rf "$OUT/$NAME.xcframework"
   xcodebuild -create-xcframework \
-      -framework "build/guest/xros/$NAME.framework" \
-      -framework "build/guest/xrsimulator/$NAME.framework" \
+      -framework "build/guest/$KLT_NAME/xros/$NAME.framework" \
+      -framework "build/guest/$KLT_NAME/xrsimulator/$NAME.framework" \
       -output "$OUT/$NAME.xcframework" > /dev/null
   printf '  %-22s %s bytes\n' "$NAME.xcframework" \
-      "$(stat -f%z "build/guest/xros/$NAME.framework/$NAME")"
+      "$(stat -f%z "build/guest/$KLT_NAME/xros/$NAME.framework/$NAME")"
 done
 
-echo "[mkguest] done -> $OUT/"
+echo "[mkguest] $KLT_NAME done -> $OUT/"
