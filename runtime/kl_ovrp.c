@@ -2284,6 +2284,18 @@ static uint64_t klovrp_GetDepthCompositingSupported(int *out) {
     return 0;
 }
 
+// Mixed-reality capture — the camera composite an Oculus device does for
+// spectators. It takes no arguments and returns `ovrpBool`, not `ovrpResult`, so
+// 0 is FALSE and is the answer we want (trap 10 is the reason to say that out
+// loud: the two types disagree about which value means yes, and 0 looks like the
+// wrong one here). There is no capture camera, `ovrp_InitializeMixedReality` is
+// never answered, and the guest polls this before deciding whether to build the
+// composite path at all.
+static uint64_t klovrp_GetMixedRealityInitialized(void) {
+    ovrp_hit("ovrp_GetMixedRealityInitialized");
+    return 0;
+}
+
 // Unity calls this on every native plugin it loads, handing over its
 // IUnityInterfaces registry. The real OVRPlugin uses it to grab
 // IUnityGraphicsVulkan/GLES; we record it and do nothing, which is correct until
@@ -2366,6 +2378,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_SetControllerHaptics", (void *)klovrp_SetControllerHaptics},
     {"ovrp_SetControllerVibration", (void *)klovrp_SetControllerVibration},
     {"ovrp_GetDepthCompositingSupported", (void *)klovrp_GetDepthCompositingSupported},
+    {"ovrp_GetMixedRealityInitialized", (void *)klovrp_GetMixedRealityInitialized},
 };
 
 // Entry points answered by one of the shared handlers above. Each is reached
