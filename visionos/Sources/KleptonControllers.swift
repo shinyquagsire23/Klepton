@@ -408,9 +408,51 @@ final class KleptonControllers {
         }
         senseConnected = !accessories.isEmpty
         NSLog("[cp] spatial controllers: \(accessories.map { $0.name })")
+        for c in spatial { Self.census(c) }
         let p = AccessoryTrackingProvider(accessories: accessories)
         lock.lock(); accessoryProvider = p; lock.unlock()
         return p
+    }
+
+    /// Every element name a controller carries, once, when it attaches.
+    ///
+    /// `pollButtons` reads elements by name, and a name this hardware does not
+    /// publish is indistinguishable from a button nobody pressed — the lookup
+    /// returns nil, `?? false` makes it a release, and the control is silently
+    /// dead for the whole run. Two bugs of exactly that shape were live at once:
+    /// the thumbstick was read as two AXIS elements when `GCInput` models a
+    /// stick as a DPAD, and the PS button (`GCInputButtonHome`) may not be
+    /// delivered to an app at all on this OS. Neither can be seen from the host
+    /// and neither raises anything.
+    ///
+    /// Three collections, because which one an element lives in is exactly what
+    /// was wrong. One line per controller at attach.
+    private static func census(_ c: GCController) {
+        guard #available(visionOS 26.0, *) else { return }
+        let p = c.physicalInputProfile
+        NSLog("[cp] \(c.vendorName ?? "?") elements: "
+              + "buttons \(p.buttons.keys.sorted()) "
+              + "axes \(p.axes.keys.sorted()) "
+              + "dpads \(p.dpads.keys.sorted())")
+    }
+
+    /// Element names seen pressed at least once, across every controller.
+    nonisolated(unsafe) private static var pressSeen = Set<String>()
+
+    /// Name each button element the first time it is actually pressed.
+    ///
+    /// The census says what exists; this says what the hardware sends when a
+    /// person presses it, and only the pair settles a mapping. It is what will
+    /// answer the PS button question on the next device run — an element that
+    /// exists and never presses is the system eating it, an element that
+    /// presses under a name we do not read is a one-line fix, and neither looks
+    /// different from the other in any log we had.
+    ///
+    /// Bounded by construction: one line per distinct name, ever.
+    private static func notePress(_ name: String) {
+        if pressSeen.insert(name).inserted {
+            NSLog("[cp] button element pressed for the first time: \"\(name)\"")
+        }
     }
 
     /// Drop the pose for any hand whose controller has gone away, so a
@@ -712,7 +754,7 @@ final class KleptonControllers {
 
             c.input.inputStateQueueDepth = 1
             guard let s = c.input.nextInputState() else { continue }
-            let b = s.buttons, ax = s.axes
+            let b = s.buttons, ax = s.axes, dp = s.dpads
 
             // The PSVR2 Sense element names, per controller. Both controllers
             // use the SAME unprefixed names — the hand is the device, not the
@@ -723,11 +765,89 @@ final class KleptonControllers {
             func touched(_ n: String) -> Bool { b[n]?.touchedInput?.isTouched ?? false }
             func axis(_ n: String) -> Float { ax[n]?.absoluteInput?.value ?? 0 }
 
+            // Every element name this controller reports pressed, once each.
+            //
+            // A name this hardware does not publish is INDISTINGUISHABLE from a
+            // button nobody pressed: the lookup returns nil, `?? false` makes it
+            // a release, and the control is silently dead for the whole run.
+            // Both of this arc's input bugs are that shape — the thumbstick was
+            // being read as two axis elements that do not exist, and the PS
+            // button is being read as a name that may not either — and neither
+            // has any other symptom. `census()` says what exists; this says what
+            // the hardware actually sends when a person presses it, which is the
+            // half that settles a mapping.
+            // Every alias, not one name: the collection is a Swift Collection of
+            // ELEMENTS (it has no `.keys`), and an element is reachable under
+            // any of `aliases` — which is the whole point here, since the bug
+            // being hunted is reading one under a name it does not answer to.
+            for el in b where el.pressedInput.isPressed {
+                for n in el.aliases { Self.notePress("\(n) [\(hand == 0 ? "L" : "R")]") }
+            }
+
+            // **The Oculus layout, laid over the Sense one.**
+            //
+            //   Menu  (GCInputButtonMenu)  -> Menu `menu/click`   (RAW_START)
+            //                              -> AND Home `system/click` (RAW_BACK)
+            //   Share (GCInputButtonShare) -> Menu, if it exists
+            //   Home  (GCInputButtonHome)  -> Home, if it exists
+            //
+            // On an Oculus Touch pair the LEFT controller's Menu button is
+            // `Start` and the RIGHT controller's Oculus button is `Home`, and
+            // the Oculus button is the one that summons a dashboard. Steam Link
+            // suggests `system/click` for it (SL-20 measured 39 of 41 bindings
+            // taken, and this is one of them) — and nothing in this file set
+            // RAW_BACK at all, so that action was live, active and permanently
+            // false, which has no symptom: it decodes correctly and never fires.
+            //
+            // **`Button Menu` drives both, and that is ALVR's shape** (218ee37
+            // moved to exactly this after having each hand's button on one bit).
+            // The Sense pair reports only ONE non-game button per controller and
+            // reports it under that one name, so mapping it to `system` alone
+            // would take the menu button away to gain a dashboard button. Both
+            // costs nothing: the Touch profile splits the pair across the hands
+            // — LEFT has `menu/click` and no system, RIGHT has `system/click`
+            // and no menu — so a hand with no binding for a control has nothing
+            // to take the bit, and on the OVRPlugin path OVRInput ORs the two
+            // controllers anyway.
+            //
+            // **The real PlayStation button may not reach us at all.** It is
+            // `GCInputButtonHome`, and visionOS 26 hands it to the system the
+            // way it hands over the Digital Crown; taking it needs
+            // `GCControllerHomeButtonSetting.inAppAction`, which does not exist
+            // in the XROS 26.0 SDK this tree builds against. Read anyway, so a
+            // visionOS 27 build gets it the moment the system stops eating it —
+            // and `notePresses` above is what will say when that happens,
+            // which is worth more than a guessed selector.
+            let menuish = pressed("Button Menu") || pressed("Button Share")
+                       || pressed("Button Options")
+            let homeish = pressed("Button Menu") || pressed("Button Home")
+
             var st = KleptonHandState()
             st.fromController = true
             st.indexTrigger = value("Trigger")
             st.handTrigger  = pressed("Grip") ? 1 : 0
-            st.stick = SIMD2<Float>(axis("Thumbstick X Axis"), axis("Thumbstick Y Axis"))
+            // **The thumbstick is a DPAD element, not two axes.** `GCInput`
+            // models a stick as one `GCDirectionPadElement` carrying `xAxis` and
+            // `yAxis` — `input.dpads[GCInputLeftThumbstick]`, and the header
+            // says in as many words that looking a dpad up in `axes` fails. The
+            // two names read here before ("Thumbstick X Axis" / "Thumbstick Y
+            // Axis") are not element names on this hardware, so both lookups
+            // returned nil, `?? 0` made that a centred stick, and the guest saw
+            // a controller whose stick never moved — with the Up/Down/Left/Right
+            // BUTTON bits working the whole time, which is why it read as an
+            // analog problem rather than a naming one.
+            //
+            // The axis fallback is kept for anything that does publish them.
+            // ALVR reads `dpads["Thumbstick"]` for the Sense pair; the prefixed
+            // names are what a conventional gamepad uses.
+            func stick2() -> SIMD2<Float> {
+                for n in ["Thumbstick",
+                          hand == 0 ? "Left Thumbstick" : "Right Thumbstick"] {
+                    if let d = dp[n] { return SIMD2(d.xAxis.value, d.yAxis.value) }
+                }
+                return SIMD2(axis("Thumbstick X Axis"), axis("Thumbstick Y Axis"))
+            }
+            st.stick = stick2()
 
             var bits: UInt32 = 0, touch: UInt32 = 0
             if hand == 0 {
@@ -740,7 +860,8 @@ final class KleptonControllers {
                 if pressed("Thumbstick Button") { bits |= OVRPRawButton.lThumbstick }
                 if st.indexTrigger > 0 { bits |= OVRPRawButton.lIndexTrigger }
                 if st.handTrigger  > 0 { bits |= OVRPRawButton.lHandTrigger }
-                if pressed("Button Menu") { bits |= OVRPRawButton.start }
+                if menuish { bits |= OVRPRawButton.start }
+                if homeish { bits |= OVRPRawButton.back }
             } else {
                 if pressed("Button A") { bits |= OVRPRawButton.a }
                 if pressed("Button B") { bits |= OVRPRawButton.b }
@@ -749,7 +870,17 @@ final class KleptonControllers {
                 if pressed("Thumbstick Button") { bits |= OVRPRawButton.rThumbstick }
                 if st.indexTrigger > 0 { bits |= OVRPRawButton.rIndexTrigger }
                 if st.handTrigger  > 0 { bits |= OVRPRawButton.rHandTrigger }
-                if pressed("Button Menu") { bits |= OVRPRawButton.start }
+                // Both bits on both hands. The Oculus Touch interaction profile
+                // splits the pair — the LEFT carries `menu/click` and no
+                // system, the RIGHT carries `system/click` and no menu — so a
+                // hand whose profile does not have the control simply has no
+                // binding to take the bit and cannot cross-fire; and on the
+                // OVRPlugin path OVRInput ORs the two controllers anyway, so
+                // which hand carried it was never observable there either.
+                // Publishing both is what makes the mapping independent of
+                // which Sense controller a given physical button sits on.
+                if menuish { bits |= OVRPRawButton.start }
+                if homeish { bits |= OVRPRawButton.back }
                 // The guest reads stick *direction* bits as well as the axes,
                 // and only the right hand has them in the raw enum.
                 if pressed("Thumbstick Up")    { bits |= OVRPRawButton.rThumbstickUp }

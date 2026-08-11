@@ -534,6 +534,15 @@ int kl_view_main(const char *libdir, int hw) {
             if (keys[SDL_SCANCODE_X]) rb |= 0x00000002; // B
             if (keys[SDL_SCANCODE_C]) lb |= 0x00000100; // X
             if (keys[SDL_SCANCODE_V]) lb |= 0x00000200; // Y
+            // Q = Menu (Start, 0x00100000), E = System (Back, 0x00200000) —
+            // two DIFFERENT physical buttons on a Sense controller (Create /
+            // Options, and the PlayStation button), so two keys. On the OpenXR
+            // path Back is `/user/hand/right/input/system/click`, which is how
+            // a SteamVR guest is asked for its dashboard; nothing set it until
+            // SL-21, and it is driven from here as well so the path can be
+            // exercised with no headset and no controller paired.
+            if (keys[SDL_SCANCODE_Q]) { lb |= 0x00100000; rb |= 0x00100000; }
+            if (keys[SDL_SCANCODE_E]) { lb |= 0x00200000; rb |= 0x00200000; }
             if (keys[SDL_SCANCODE_UP])    { rb |= 0x00001000; sy2 =  1.0f; }  // RThumbstickUp
             if (keys[SDL_SCANCODE_DOWN])  { rb |= 0x00002000; sy2 = -1.0f; }  // RThumbstickDown
             if (keys[SDL_SCANCODE_LEFT])  { rb |= 0x00004000; sx  = -1.0f; }  // RThumbstickLeft

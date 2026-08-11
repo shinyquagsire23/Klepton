@@ -2295,9 +2295,16 @@ static void klxr_note_active(klxr_action *a, int hand, float v) {
     a->nonzero_reads++;
     if (a->said) return;
     a->said = 1;
-    fprintf(stderr, "  [xr] action \"%s\" fired on the %s hand (%s = %.2f)\n",
+    // The BINDING PATH as well as the source. An action name is the guest's
+    // ("press-2"), and on its own it cannot answer the question a run like this
+    // is actually asking — did the button I pressed arrive as `menu/click` or
+    // as `system/click`? The path is what the guest suggested, so this line is
+    // the join between a physical press and the control the app thinks it is.
+    XrPath p = a->bind[hand];
+    fprintf(stderr, "  [xr] action \"%s\" fired on the %s hand (%s = %.2f) <- %s\n",
             a->name, hand ? "right" : "left", klxr_src_name(a->kind[hand]),
-            (double)v);
+            (double)v,
+            (p && p <= g_path_count) ? g_paths[p - 1] : "(no path recorded)");
 }
 
 static XrResult klxr_GetActionStateBoolean(void *session, const XrActionStateGetInfo *info,
@@ -3545,6 +3552,7 @@ int kl_openxr_input_selftest(FILE *f) {
     void *press0  = klxr_st_action(set, "press-0",  KLXR_ACTION_TYPE_BOOLEAN);
     void *press2  = klxr_st_action(set, "press-2",  KLXR_ACTION_TYPE_BOOLEAN);
     void *press4  = klxr_st_action(set, "press-4",  KLXR_ACTION_TYPE_BOOLEAN);
+    void *press6  = klxr_st_action(set, "press-6",  KLXR_ACTION_TYPE_BOOLEAN);
     void *touch4  = klxr_st_action(set, "touch-4",  KLXR_ACTION_TYPE_BOOLEAN);
     void *analog0 = klxr_st_action(set, "analog-0", KLXR_ACTION_TYPE_FLOAT);
     void *analog1 = klxr_st_action(set, "analog-1", KLXR_ACTION_TYPE_FLOAT);
@@ -3557,6 +3565,10 @@ int kl_openxr_input_selftest(FILE *f) {
         klxr_st_sb(press0,  "/user/hand/left/input/x/click"),
         klxr_st_sb(press0,  "/user/hand/right/input/a/click"),
         klxr_st_sb(press2,  "/user/hand/left/input/menu/click"),
+        // The Touch profile's other side of that pair — system on the RIGHT
+        // only. This is the dashboard button, and it was decoding correctly and
+        // reading false forever because no frontend set the BACK bit.
+        klxr_st_sb(press6,  "/user/hand/right/input/system/click"),
         klxr_st_sb(touch4,  "/user/hand/left/input/thumbrest/touch"),
         klxr_st_sb(touch4,  "/user/hand/right/input/thumbrest/touch"),
         klxr_st_sb(analog0, "/user/hand/left/input/trigger/value"),
@@ -3586,6 +3598,10 @@ int kl_openxr_input_selftest(FILE *f) {
     ok &= klxr_st_ok(f, "menu/click leaves the right hand unbound",
                      ((klxr_action *)press2)->kind[0] == KLXR_SRC_BUTTON &&
                      ((klxr_action *)press2)->kind[1] == KLXR_SRC_NONE);
+    ok &= klxr_st_ok(f, "system/click is the RIGHT hand's, and it is the BACK bit",
+                     ((klxr_action *)press6)->kind[0] == KLXR_SRC_NONE &&
+                     ((klxr_action *)press6)->kind[1] == KLXR_SRC_BUTTON &&
+                     ((klxr_action *)press6)->bit[1] == KL_OVRP_RAW_BACK);
     // The rule that keeps a Touch controller from reporting a Vive's controls.
     ok &= klxr_st_ok(f, "a binding from an INACTIVE profile is not taken",
                      ((klxr_action *)press4)->kind[0] == KLXR_SRC_NONE &&
@@ -3629,7 +3645,12 @@ int kl_openxr_input_selftest(FILE *f) {
     kl_ovrp_set_hand_pose(0, -0.2f, 1.0f, -0.3f, 0, 0, 0, 1);
     kl_ovrp_set_hand_pose(1,  0.2f, 1.0f, -0.3f, 0, 0, 0, 1);
     kl_ovrp_set_controller_input(0, KL_OVRP_RAW_X, 0, 0.25f, 0, -1.0f, 0);
-    kl_ovrp_set_controller_input(1, 0, 0, 0.75f, 0, 0.5f, 0);
+    // The right hand holds its system button — the one physical control that a
+    // Sense controller reports as `Button Menu` and that the frontend publishes
+    // as START|BACK (KleptonControllers.pollButtons). Nothing else in this
+    // gate's map reads BACK, so a runtime that decoded system/click and then
+    // dropped the bit on the way through is separated from one that carries it.
+    kl_ovrp_set_controller_input(1, KL_OVRP_RAW_BACK, 0, 0.75f, 0, 0.5f, 0);
     kl_ovrp_frame_latch();
     klxr_st_sync();
 
@@ -3653,6 +3674,16 @@ int kl_openxr_input_selftest(FILE *f) {
                      fabsf(fl.currentState + 1.0f) < 1e-4f);
     ok &= klxr_st_ok(f, "an unbound action stays inactive with hands present",
                      klxr_st_bool(touch4, NULL, &b) && !b.isActive);
+    // The dashboard button, end to end: the frontend's BACK bit on the right
+    // hand reaching `/user/hand/right/input/system/click`. Read without a
+    // subaction path as well, because that is how a guest that does not care
+    // which hand summoned the dashboard asks — and the left hand has no
+    // binding for it, so the OR must not turn "one hand cannot" into inactive.
+    ok &= klxr_st_ok(f, "system/click reads the RIGHT hand's press",
+                     klxr_st_bool(press6, "/user/hand/right", &b) &&
+                     b.isActive && b.currentState);
+    ok &= klxr_st_ok(f, "...and with no subaction path, over one bound hand",
+                     klxr_st_bool(press6, NULL, &b) && b.isActive && b.currentState);
 
     // changedSinceLastSync is a property of the SYNC, not of the read.
     klxr_st_bool(press0, "/user/hand/left", &b);
