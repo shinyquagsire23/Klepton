@@ -35,6 +35,12 @@ static int          g_open;           // a unit exists and is initialised
 static int          g_running;        // ...and AudioOutputUnitStart succeeded
 static int          g_playing;        // the guest wants sound
 static int          g_interrupted;    // the OS took the stream
+static uint64_t     g_interrupt_ns;   // ...when, so a lost `.ended` is escapable
+static unsigned     g_interrupt_max_ms = 3000;
+// The recovery machinery lives at the bottom of the file, beside the producer
+// it used to be part of; kl_audio_open and kl_audio_interrupted are above it.
+static unsigned     g_wd_streak;      // consecutive restarts, for the backoff
+static void         watchdog_start(void);
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;   // unit lifecycle only
 
 static unsigned g_in_rate, g_in_ch, g_in_bits;   // the guest's format
@@ -337,11 +343,14 @@ int kl_audio_open(unsigned rate, unsigned channels, unsigned bits) {
     static int dump_tried;
     if (!dump_tried++) dump_open();
 
+    g_interrupt_ns = now_ns();
+    g_interrupt_max_ms = kl_env_int("KL_AUDIO_INTERRUPT_MAX_MS", 3000);
     // Start the unit immediately, even with nothing queued. A stopped unit is
     // one the OS is free to tear down harder than a running silent one, and the
     // render callback's timestamp is the watchdog's only heartbeat.
     unit_start();
     pthread_mutex_unlock(&g_lock);
+    watchdog_start();
 
     fprintf(stderr, "  [au] CoreAudio out: guest %u Hz/%u ch -> device %.0f Hz/%u ch, "
                     "%u ms target%s\n",
@@ -397,6 +406,7 @@ void kl_audio_flush(void) {
 // ---- the OS taking the stream away ----
 void kl_audio_interrupted(int began) {
     fprintf(stderr, "  [au] session interruption %s\n", began ? "began" : "ended");
+    g_interrupt_ns = now_ns();
     if (began) {
         g_interrupted = 1;
         pthread_mutex_lock(&g_lock);
@@ -404,6 +414,7 @@ void kl_audio_interrupted(int began) {
         pthread_mutex_unlock(&g_lock);
     } else {
         g_interrupted = 0;
+        g_wd_streak = 0;
         kl_audio_restart();
     }
 }
@@ -510,16 +521,113 @@ static size_t convert(const int16_t *src, size_t n, float **out) {
 // The watchdog. A render callback that has stopped arriving while we believe we
 // are running is the visionOS failure mode this file was written expecting:
 // the OS reclaims the stream on a route change or a scene transition and the
-// unit stays nominally started. Cheap to check here — the producer is already
-// awake — and it means a missed notification costs a gap, not the session.
+// unit stays nominally started.
+//
+// **The heartbeat is the only honest signal.** visionOS silently stops calling
+// the render callback when the immersive space is dismissed — a Digital Crown
+// press, the app's window being closed — with no error, no interruption
+// notification and a unit that still reports itself running. ALVR carries the
+// same check for the same reason and against the same OS bug; there it lives in
+// the receive loop, here it has a thread of its own (below).
+//
+// Consecutive restarts back off. A restart that cannot work — the app really is
+// off screen, or the session really is inactive — would otherwise print twice a
+// second for as long as that lasts, which buries the one line that says what
+// actually happened.
 static void watchdog(void) {
     if (!g_open || g_interrupted) return;
     uint64_t last = atomic_load_explicit(&g_last_render_ns, memory_order_relaxed);
-    if (!g_running || now_ns() - last > 500ull * 1000000ull) {
-        fprintf(stderr, "  [au] no render callback for %.2f s — restarting\n",
-                (double)(now_ns() - last) / 1e9);
-        kl_audio_restart();
+    uint64_t idle = now_ns() - last;
+    uint64_t limit = 500ull * 1000000ull;
+    if (g_wd_streak > 3) limit = 3000ull * 1000000ull;    // backed off
+    if (g_running && idle <= limit) { g_wd_streak = 0; return; }
+    if (g_wd_streak < 4 || (g_wd_streak % 20) == 0)
+        fprintf(stderr, "  [au] no render callback for %.2f s — restarting%s\n",
+                (double)idle / 1e9,
+                g_wd_streak >= 4 ? " (still; further attempts are quiet)" : "");
+    g_wd_streak++;
+    kl_audio_restart();
+}
+
+// ...and the thread that runs it, because the producer cannot.
+//
+// `watchdog()` used to be reachable from exactly one place: the spin inside
+// kl_audio_write that waits for the ring to drain. That covers the case the
+// file was written for — the render callback dies while the guest keeps
+// producing — and misses every other one. Two that matter here:
+//
+//   * The guest stops producing too. Steam Link's audio is a pull path
+//     (kl_aaudio.c calls the guest's data callback), and a guest whose own
+//     clock has stalled writes nothing, so nothing checks.
+//   * An interruption that never ends. `kl_audio_interrupted(1)` latches
+//     g_interrupted, and the write loop breaks out of the spin *before* the
+//     watchdog on that flag — so a `.began` with no matching `.ended` (which is
+//     a documented hazard on this OS family, and is what a scene transition
+//     looks like when the notification is dropped) is silence for the rest of
+//     the run with nothing left running to notice.
+//
+// A detached thread at 4 Hz costs nothing and depends on neither side.
+static void *watchdog_thread(void *unused) {
+    (void)unused;
+    pthread_setname_np("klepton-audio-watchdog");
+    for (;;) {
+        nap_ms(250);
+        if (!g_open) continue;
+        // The stuck-interruption escape. The OS deactivated the session on the
+        // way in and is supposed to tell us on the way out; when it does not,
+        // the only thing that distinguishes "still interrupted" from "the
+        // notification was lost" is trying. Bounded, so a real interruption (a
+        // call, another app taking the route) is not fought over.
+        if (g_interrupted && g_playing) {
+            uint64_t since = now_ns() - g_interrupt_ns;
+            if (since > (uint64_t)g_interrupt_max_ms * 1000000ull) {
+                fprintf(stderr, "  [au] interrupted for %.1f s with no resume — "
+                                "assuming the notification was lost\n",
+                        (double)since / 1e9);
+                g_interrupted = 0;
+                g_interrupt_ns = now_ns();
+                kl_audio_restart();
+            }
+            continue;
+        }
+        watchdog();
     }
+    return NULL;
+}
+
+static void watchdog_start(void) {
+    static int started;
+    if (started) return;
+    if (!kl_env_on("KL_AUDIO_WATCHDOG", 1)) {
+        fprintf(stderr, "  [au] KL_AUDIO_WATCHDOG=0 — no independent watchdog\n");
+        started = 1;
+        return;
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, watchdog_thread, NULL) != 0) {
+        fprintf(stderr, "  [au] could not start the audio watchdog thread\n");
+        return;
+    }
+    pthread_detach(t);
+    started = 1;
+}
+
+// The app is back on screen. Whatever this file believes about its own state,
+// rebuild — and this is deliberately NOT conditional on the heartbeat.
+//
+// The heartbeat costs up to a second to notice, and it notices by finding
+// silence that has already been heard. A compositor coming out of `.paused`
+// knows the transition exactly, at the moment it happens, so the gap it leaves
+// is the rebuild itself. The two overlap on purpose: this is precise and can be
+// missed, the heartbeat is late and cannot.
+void kl_audio_resume(void) {
+    if (!g_open) return;
+    int was = g_interrupted;
+    g_interrupted = 0;
+    g_interrupt_ns = now_ns();
+    g_wd_streak = 0;
+    fprintf(stderr, "  [au] resume%s\n", was ? " (was interrupted)" : "");
+    kl_audio_restart();
 }
 
 size_t kl_audio_write(const void *pcm, size_t bytes) {

@@ -820,6 +820,23 @@ reads no knobs). See PLANNING §12.18.
   for a head-mounted listener, and visionOS otherwise pans it a second time
   into a sound stage anchored to the app's scene — which is the sound following
   the window. Turn this on only to A/B that.
+- `KL_AUDIO_WATCHDOG=0` — stop the independent watchdog thread from running.
+  **On by default, and it is the thing that keeps audio alive on visionOS.**
+  This OS silently stops calling CoreAudio's render callback across a scene
+  transition — the Digital Crown pressed to passthrough, the boot window closed
+  while the immersive space runs — with no error, no interruption notification,
+  and an output unit that still reports itself started. ALVR carries the same
+  heartbeat against the same bug. The check used to be reachable only from the
+  spin inside `kl_audio_write`, which covers "the callback died while the guest
+  kept producing" and misses "the guest stopped too" and "an interruption that
+  never ended"; it has a 4 Hz thread of its own now. Turn it off only to see
+  the failure it hides.
+- `KL_AUDIO_INTERRUPT_MAX_MS=<n>` — how long an interruption may last with no
+  matching "ended" before the watchdog assumes the notification was lost and
+  restarts anyway (default 3000). `.began` without `.ended` is a documented
+  hazard on this OS family and used to be silence for the rest of the run,
+  because the write loop breaks out of its spin *before* the watchdog on that
+  flag. Raise it if a real interruption is being fought over.
 
 ## x18 (`runtime/kl_x18.c`)
 

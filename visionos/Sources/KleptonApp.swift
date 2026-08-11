@@ -87,6 +87,19 @@ enum Immersive {
 enum Lifecycle {
     static func scenePhaseChanged(to phase: ScenePhase) {
         NSLog("[app] scene phase -> \(phase)")
+        // Coming back is the audio's cue, and it needs one: this OS silently
+        // stops calling CoreAudio's render callback across a scene transition —
+        // the boot window being closed while the immersive space runs is one,
+        // a Digital Crown press to passthrough is another — with no error and
+        // no interruption notification. See kl_audio_resume; the compositor
+        // hooks the immersive half of the same transition, and kl_audio's
+        // heartbeat catches whatever neither of them sees.
+        //
+        // Unconditional rather than "only if we were away". A rebuild of a
+        // healthy unit costs a few milliseconds of silence and cannot go wrong;
+        // the state that would let us skip it is precisely the state this
+        // platform lies about.
+        if phase == .active { kl_audio_resume() }
         guard phase == .background else { return }
         guard klEnvOn("KL_EXIT_ON_BACKGROUND", default: true) else {
             NSLog("[app] backgrounded; KL_EXIT_ON_BACKGROUND=0, staying alive")

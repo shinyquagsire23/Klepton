@@ -1078,6 +1078,19 @@ final class KleptonCompositor {
                 NSLog("[cp] layer paused at iteration \(iterations) — waiting")
                 layerRenderer.waitUntilRunning()
                 NSLog("[cp] layer running again")
+                // ...and the audio, which does NOT come back on its own.
+                //
+                // This transition is the immersive space being temporarily
+                // dismissed and restored — a Digital Crown press to passthrough,
+                // the app's window being closed out from under it — and visionOS
+                // silently stops calling CoreAudio's render callback across it:
+                // no error, no interruption notification, and an output unit
+                // that still reports itself started. It is the same OS bug ALVR
+                // works around, and the same workaround (rebuild, do not
+                // restart). kl_audio's own heartbeat finds it too, about a
+                // second later; this is the half that knows the exact moment,
+                // and a second of dropped music is the difference.
+                kl_audio_resume()
                 continue loop
             default:
                 autoreleasepool { presented += renderFrame() }

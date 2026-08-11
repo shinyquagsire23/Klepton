@@ -53,6 +53,16 @@ int  kl_audio_active(void);
 // a missed notification degrades to a ~0.5 s gap rather than to silence.
 void kl_audio_interrupted(int began);
 int  kl_audio_restart(void);
+// The app is back on screen — call it on any transition that can only mean
+// that, whatever this side believes its own state to be.
+//
+// The case it exists for has no notification at all: a Digital Crown press
+// temporarily dismisses the immersive space, CoreAudio stops calling the render
+// callback, and the unit still reports itself started. ALVR hit the same bug
+// and works around it the same way. The heartbeat above finds it too, but a
+// second later and by finding silence that has already been heard; a compositor
+// leaving `.paused` knows the moment exactly. The two overlap on purpose.
+void kl_audio_resume(void);
 // Swift calls this once the AVAudioSession is configured and active. Before it
 // the hardware sample rate reads as a default rather than the real one, and an
 // output unit initialised against the wrong rate fails at AudioUnitInitialize.
