@@ -85,8 +85,16 @@ void kl_jni_set_vrlink_handoff(void (*fn)(const char *sargs));
 // With no AAssetManager_* import, this JNI path is how assets reach Unity.
 void kl_jni_set_assets_dir(const char *dir);
 // Writable root behind getExternalFilesDir/getFilesDir/getCacheDir — where
-// Application.persistentDataPath lands. Created on demand. Default "build/android-files".
+// Application.persistentDataPath lands. Created on demand. Defaults to
+// kl_userdata_dir("beatsaber") if nothing sets it.
 void kl_jni_set_files_dir(const char *dir);
+// The per-guest userdata root: ~/Library/Application Support/Klepton/userdata/<guest>,
+// or KL_FILES_DIR if set. Keyed on the guest rather than the APK so that swapping
+// Beat Saber versions keeps one save/pairing profile instead of repeating first
+// setup — and deliberately OUTSIDE build/, which `make clean` deletes. Drivers
+// pass the result to kl_jni_set_files_dir; visionOS overrides it with the app
+// container. Returns an absolute path.
+const char *kl_userdata_dir(const char *guest);
 // ...read back, absolute. ANativeActivity carries internalDataPath/obbPath as
 // plain char*, so a NativeActivity guest gets them here rather than over JNI.
 const char *kl_jni_files_dir(void);

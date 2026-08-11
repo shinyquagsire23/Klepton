@@ -294,6 +294,25 @@ Built for the loading-pace investigation; all default off.
   file offset (`pc - image base`, e.g. the connect-NULL site at
   libunity+0x966964).
 
+## Guest storage (`runtime/kl_jni.c`)
+
+- `KL_FILES_DIR=<dir>` — the writable root behind `getFilesDir` /
+  `getExternalFilesDir` / `getCacheDir` / `shared_prefs`, i.e. where the guest's
+  saves, PlayerPrefs and Steam Link's pairing credentials live.
+
+  Default is **`~/Library/Application Support/Klepton/userdata/<guest>`**, where
+  `<guest>` is `beatsaber` or `steamlink`. Two properties are deliberate. It is
+  **outside `build/`** — it used to be `build/android-files`, so `make clean`
+  cost a Beat Saber first-run setup and a Steam Link re-pairing every time it
+  ran. And it is keyed on the **guest, not the APK**, so swapping Beat Saber
+  1.28 for 1.6.0 keeps one profile instead of repeating first setup, which is
+  the case the move exists to survive.
+
+  Set this when two versions must *not* share — a save format that changed
+  under them — or to give a run a scratch profile without disturbing the real
+  one. visionOS ignores it: the app container is the only writable location
+  there and `kl_app.c` passes it in explicitly.
+
 ## Device identity (`runtime/kl_jni.c`)
 
 - `KL_BUILD_<FIELD>=<value>` — override one `android/os/Build` (or

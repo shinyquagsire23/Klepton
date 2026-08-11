@@ -276,8 +276,11 @@ static int slink_run(void) {
     // paths, the <meta-data>, Qt's plugin path and the panel size. Shared with
     // the visionOS app, which describes the same guest and must not describe it
     // differently — runtime/kl_slink.c.
+    // Both front doors share one profile: the pairing credential the shell
+    // stores is exactly what the VR door is handed at SL-15's re-exec, so
+    // splitting them would make the app re-pair against itself.
     if (kl_slink_configure(g_door, LIBDIR, assets, apk,
-                           "build/steamlink-files", stdout) != 0) {
+                           kl_userdata_dir("steamlink"), stdout) != 0) {
         fprintf(stderr, "%s\n", kl_slink_error());
         return 1;
     }

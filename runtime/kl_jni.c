@@ -2246,9 +2246,48 @@ static klj_val klj_String_length(void *env, void *self, const klj_val *a, int n)
 // from getExternalFilesDir, and saves and player prefs land there. These must be
 // real, writable directories — a stub path would make the first write fail deep
 // inside the engine rather than here.
-static const char *g_files_dir = "build/android-files";
+
+// Where the GUEST's own persistent state lives: saves, PlayerPrefs, Steam Link's
+// pairing credentials. It used to be build/android-files, i.e. inside the
+// directory `make clean` deletes — so clearing build artifacts silently cost a
+// Beat Saber first-run setup and a Steam Link re-pairing. Guest state is not a
+// build output and does not belong among them; ~/Library/Application Support is
+// where macOS puts exactly this.
+//
+// Keyed on the GUEST, not on the APK, and that is the point rather than an
+// approximation: swapping Beat Saber 1.28 for 1.6.0 is the case this exists to
+// survive, so the two versions share one folder and neither run repeats first
+// setup. Where two versions must NOT share — a save format that changed under
+// them — KL_FILES_DIR overrides the path outright, which is also how a run gets
+// a scratch profile without disturbing the real one.
+//
+// visionOS is unaffected: the app container is the only writable location there
+// and kl_app.c passes it in explicitly, so this default is the host's.
+const char *kl_userdata_dir(const char *guest) {
+    char *env = kl_env_str("KL_FILES_DIR", NULL);
+    if (env && *env) return klj_abspath(env);
+    const char *home = getenv("HOME");
+    size_t n = (home ? strlen(home) : 0) + strlen(guest) + 64;
+    char *out = malloc(n);
+    if (!out) return klj_abspath("userdata");
+    // No HOME is not a case worth inventing a policy for, but it must not
+    // produce a path at the filesystem root: fall back beside the build tree.
+    if (home && *home)
+        snprintf(out, n, "%s/Library/Application Support/Klepton/userdata/%s",
+                 home, guest);
+    else
+        snprintf(out, n, "userdata/%s", guest);
+    return klj_abspath(out);
+}
+
+// NULL until something asks or something sets it. Resolved lazily because
+// kl_userdata_dir reads the environment, and a static initialiser cannot.
+static const char *g_files_dir;
 void kl_jni_set_files_dir(const char *dir) { g_files_dir = klj_abspath(dir); }
-const char *kl_jni_files_dir(void) { return g_files_dir; }
+const char *kl_jni_files_dir(void) {
+    if (!g_files_dir) g_files_dir = kl_userdata_dir("beatsaber");
+    return g_files_dir;
+}
 
 // The APK itself. Unity opens this as a zip to read streaming assets, so it has
 // to be a real file — the unpacked tree under beatsaber/ is not a substitute.
@@ -2270,7 +2309,7 @@ void kl_jni_set_native_lib_dir(const char *dir) { g_native_lib_dir = klj_abspath
 // rather than calling accessors, so these are field getters, not methods.
 static klj_val klj_appinfo_sourceDir(void)     { return (klj_val){.l = kl_jni_new_string(g_apk_path)}; }
 static klj_val klj_appinfo_nativeLibraryDir(void) { return (klj_val){.l = kl_jni_new_string(g_native_lib_dir)}; }
-static klj_val klj_appinfo_dataDir(void)       { return (klj_val){.l = kl_jni_new_string(g_files_dir)}; }
+static klj_val klj_appinfo_dataDir(void)       { return (klj_val){.l = kl_jni_new_string(kl_jni_files_dir())}; }
 // This APK is not a split install, so there are no additional source dirs. An
 // empty array says that unambiguously; Android would say null, and both read as
 // "no splits" to a caller that checks length.
@@ -2332,7 +2371,7 @@ static klj_val klj_Context_getObbDirs(void *env, void *self, const klj_val *a, i
 static klj_val klj_Context_getObbDir(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     char path[1024];
-    snprintf(path, sizeof path, "%s/obb", g_files_dir);
+    snprintf(path, sizeof path, "%s/obb", kl_jni_files_dir());
     return (klj_val){.l = klj_new_file(path)};
 }
 
@@ -4582,21 +4621,21 @@ static klj_val klj_Context_getExternalFilesDir(void *env, void *self, const klj_
     (void)env; (void)self;
     const char *type = n > 0 && a[0].l ? klj_str(a[0].l) : NULL;
     char path[1024];
-    if (type && *type) snprintf(path, sizeof path, "%s/files/%s", g_files_dir, type);
-    else               snprintf(path, sizeof path, "%s/files", g_files_dir);
+    if (type && *type) snprintf(path, sizeof path, "%s/files/%s", kl_jni_files_dir(), type);
+    else               snprintf(path, sizeof path, "%s/files", kl_jni_files_dir());
     KLJ_LOG("getExternalFilesDir(%s) -> %s", type ? type : "null", path);
     return (klj_val){.l = klj_new_file(path)};
 }
 static klj_val klj_Context_getFilesDir(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     char path[1024];
-    snprintf(path, sizeof path, "%s/files", g_files_dir);
+    snprintf(path, sizeof path, "%s/files", kl_jni_files_dir());
     return (klj_val){.l = klj_new_file(path)};
 }
 static klj_val klj_Context_getCacheDir(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     char path[1024];
-    snprintf(path, sizeof path, "%s/cache", g_files_dir);
+    snprintf(path, sizeof path, "%s/cache", kl_jni_files_dir());
     return (klj_val){.l = klj_new_file(path)};
 }
 
@@ -4608,7 +4647,7 @@ static klj_val klj_Environment_getExternalStorageState(void *env, void *self, co
 }
 static klj_val klj_Environment_getExternalStorageDirectory(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.l = klj_new_file(g_files_dir)};
+    return (klj_val){.l = klj_new_file(kl_jni_files_dir())};
 }
 
 // There is no ARCore here and there never will be — Vision Pro's world sensing
@@ -4914,7 +4953,7 @@ static klj_val klj_Context_getSharedPreferences(void *env, void *self, const klj
     klj_prefs *p = &g_prefs_files[g_nprefs_files];
     snprintf(p->name, sizeof p->name, "%s", name);
     char dir[1024];
-    snprintf(dir, sizeof dir, "%s/shared_prefs", g_files_dir);
+    snprintf(dir, sizeof dir, "%s/shared_prefs", kl_jni_files_dir());
     klj_mkdir_p(dir);
     snprintf(p->path, sizeof p->path, "%s/%s.xml", dir, name);
     klj_prefs_load(p);
@@ -5901,7 +5940,7 @@ static void klj_init(void) {
     // The defaults are relative literals; the setters resolve what they are
     // given, so this covers the case where nothing set them.
     g_assets_dir     = klj_abspath(g_assets_dir);
-    g_files_dir      = klj_abspath(g_files_dir);
+    (void)kl_jni_files_dir();   // resolve now, so the report below prints it
     g_apk_path       = klj_abspath(g_apk_path);
     g_native_lib_dir = klj_abspath(g_native_lib_dir);
     // Raw opens of "<apk>/assets/..." (Unity's split assets) are served from

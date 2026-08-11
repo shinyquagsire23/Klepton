@@ -43,8 +43,43 @@ build/t_opus: tests/t_opus.c $(RUNTIME) runtime/klepton.h
 test: build/t_opus
 	./build/t_opus $(LIBS)/libunityopus.so
 
+# Safe to run: the guest's saves, PlayerPrefs and Steam Link pairing live in
+# ~/Library/Application Support/Klepton/userdata/<guest>, NOT in build/. They
+# used to be build/android-files and build/steamlink-files, so this target cost
+# a Beat Saber first-run setup and a Steam Link re-pairing every time it ran.
 clean:
 	rm -rf build
+
+# What a GUEST swap actually requires — the answer is "much less than `clean`",
+# and `clean` is the expensive way to get it.
+#
+# Nothing caches a translated guest on the ELF path: kl_image maps, relocates,
+# rewrites TLS and veneers x18 at LOAD time, every run, so a new APK is picked
+# up with no step at all. Two things do persist across a swap:
+#
+#   build/dylibs/  klepton-ld output, and the ONE genuinely stale artefact —
+#                  Mach-O translations of the PREVIOUS guest, which the dylib
+#                  gates (make dylibs / loaddylib / bootdylib / bootdylib-life)
+#                  and the visionOS app would otherwise keep using. Nothing
+#                  names the guest version in them, so a stale one is silently
+#                  the wrong library rather than a missing one.
+#
+#   kl_libc_table.h  generated from the guests' undefined symbols. Now a UNION
+#                  over every unpacked tree, so a swap only ever ADDS to it —
+#                  but a genuinely new title brings imports nothing forwards yet.
+#
+# Not here on purpose: visionos/run.sh's staging stamp is keyed on the APK's
+# size and mtime, so it re-stages on its own; and the userdata above must
+# survive, which is the whole reason it moved out of build/.
+.PHONY: guestswap
+guestswap:
+	@rm -rf build/dylibs
+	@echo "  removed build/dylibs (previous guest's Mach-O translations)"
+	@python3 tools/gen_libc_table.py
+	@$(MAKE) --no-print-directory guestlibs
+	@echo "  userdata untouched: $$HOME/Library/Application Support/Klepton/userdata"
+	@echo "  next: 'make check' (rebuilds what the table changed), then 'make dylibs'"
+	@echo "        if you use the dylib or visionOS paths."
 
 build/t_load: tests/t_load.c $(RUNTIME) runtime/klepton.h
 	@mkdir -p build

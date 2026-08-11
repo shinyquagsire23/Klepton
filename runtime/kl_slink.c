@@ -187,6 +187,10 @@ int kl_slink_configure(kl_slink_door door, const char *libdir, const char *asset
     kl_jni_set_apk_path(apk);
     kl_jni_set_native_lib_dir(g_libdir);
     kl_jni_set_files_dir(files);
+    // Printed because this is where the PAIRING CREDENTIAL lives, and a run that
+    // silently looks in the wrong place is indistinguishable from a host that
+    // deauthorized us — one costs a re-pair to diagnose (SL-15).
+    if (out) fprintf(out, "  [slink] userdata: %s\n", kl_jni_files_dir());
     // The old APK has no assets/ directory at all — checked, not assumed — so
     // for it this only keeps AAssetManager_open from being a crash, and an
     // absent file is the honest answer. The VR APK does have one, and the shell
