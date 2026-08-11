@@ -703,13 +703,42 @@ static const struct { const char *from, *to; } g_glsl_builtin_vars[] = {
 // Built at glLinkProgram, because that is the first moment a name has a
 // location at all, and read by every glUniform* thunk. A program the guest
 // pinned nothing in gets no entry, and g_prog_pins_n == 0 is the fast out for
-// every guest that resolves uniforms by name (Beat Saber does; this costs it
-// one predictable compare per uniform call).
+// a guest that pins nothing anywhere.
+//
+// `byname` is the half this shipped without, and it cost Beat Saber's menu UI.
+// The remap is only ever correct for a guest that WRITES TO THE NUMBER IT
+// PINNED; a guest that asks the driver where a uniform went is being told our
+// linker's answer, and putting that answer back through the pin table is the
+// same bug in the mirror. Unity does both — it emits UNITY_LOCATION(n) pins AND
+// resolves every uniform by name — so on Beat Saber the remap re-pointed the
+// locations the driver itself had just handed out. The reason it was not caught:
+// the by-name door was assumed to be glGetUniformLocation, and UNITY 2019.4 DOES
+// NOT USE IT. It goes through the ES 3.1 program-interface family
+// (glGetProgramResourceLocation), which is emulated further down this file and
+// resolves to exactly the same driver call. Both doors set the flag now.
 #define KLFB_PIN_PROGS 64
-static struct { uint32_t prog; unsigned n;
+static struct { uint32_t prog; unsigned n; int byname;
                 struct { int32_t pinned, actual; } m[KLFB_PINS * 2]; }
     g_prog_pins[KLFB_PIN_PROGS];
 static unsigned g_prog_pins_n;
+
+// Counted so the choice is visible in the end-of-run report rather than
+// inferred from a picture: a pin table that never fires and one that re-points
+// half the guest's uniforms look identical from outside.
+static unsigned g_pin_byname_progs, g_pin_remap_hits, g_pin_remap_changed;
+
+// The guest asked the driver where `program`'s uniforms are. Its pins are a
+// statement about the shader text, not about what it is going to write to.
+static void klfb_pins_byname(uint32_t program) {
+    for (unsigned i = 0; i < g_prog_pins_n; i++)
+        if (g_prog_pins[i].prog == program) {
+            if (!g_prog_pins[i].byname) {
+                g_prog_pins[i].byname = 1;
+                g_pin_byname_progs++;
+            }
+            return;
+        }
+}
 
 static int32_t (*g_real_GetUniformLocation)(uint32_t, const char *);
 
@@ -799,9 +828,13 @@ static int32_t klfb_remap_loc(int32_t loc) {
     if (!g_prog_pins_n || loc < 0 || !g_cur_prog) return loc;
     for (unsigned i = 0; i < g_prog_pins_n; i++) {
         if (g_prog_pins[i].prog != g_cur_prog) continue;
+        if (g_prog_pins[i].byname) return loc;   // it is quoting our own answer
         for (unsigned j = 0; j < g_prog_pins[i].n; j++)
-            if (g_prog_pins[i].m[j].pinned == loc)
+            if (g_prog_pins[i].m[j].pinned == loc) {
+                g_pin_remap_hits++;
+                if (g_prog_pins[i].m[j].actual != loc) g_pin_remap_changed++;
                 return g_prog_pins[i].m[j].actual;
+            }
         return loc;
     }
     return loc;
@@ -3001,7 +3034,20 @@ static void klfb_DrawArraysInstanced(uint32_t mode, int32_t first, int32_t count
     klfb_draw_probe(count * instances);
 }
 
+// The pin table, out loud. A table that never fires and one that re-points half
+// the guest's uniforms are indistinguishable from the picture, and the second
+// one cost Beat Saber its menu UI for nine commits.
+static void klfb_report_pins(void) {
+    if (!g_prog_pins_n) return;
+    fprintf(stderr, "  [glfb] uniform pins: %u program(s) pinned, %u of them resolve "
+                    "by name (pins not honoured there); %u remap%s fired, %u changed "
+                    "a location\n",
+            g_prog_pins_n, g_pin_byname_progs, g_pin_remap_hits,
+            g_pin_remap_hits == 1 ? "" : "s", g_pin_remap_changed);
+}
+
 static void klfb_report_draws(void) {
+    klfb_report_pins();
     if (!g_ndraw_fbs) { fprintf(stderr, "  [glfb] no draws seen at all\n"); return; }
     fprintf(stderr, "  [glfb] draws by target framebuffer:");
     for (unsigned i = 0; i < g_ndraw_fbs; i++)
@@ -3354,11 +3400,17 @@ static uint32_t klfb_GetProgramResourceIndex(uint32_t program, uint32_t iface,
     return KLFB_INVALID_INDEX;
 }
 
+static int32_t klfb_GetUniformLocation(uint32_t prog, const char *name);
 static int32_t klfb_GetProgramResourceLocation(uint32_t program, uint32_t iface,
                                                const char *name) {
     klfb_res_resolve();
+    // THE door Unity 2019.4 uses — it never calls glGetUniformLocation. Routed
+    // through the same thunk rather than to the driver, so the two entry points
+    // cannot answer differently about the same program; a raw driver location
+    // here and a pin remap on the glUniform* side is what broke Beat Saber's
+    // menu UI (see klfb_pins_byname).
     if (name && iface == KLFB_IF_UNIFORM && r_GetUniformLocation)
-        return r_GetUniformLocation(program, name);
+        return klfb_GetUniformLocation(program, name);
     if (name && iface == KLFB_IF_PROGRAM_INPUT) {
         // Attrib "location" is queried by name too.
         static int32_t (*r_GetAttribLocation)(uint32_t, const char *);
@@ -3613,16 +3665,21 @@ static struct { uint32_t prog; int32_t loc; char name[48]; } g_uloc[KLFB_LOCS];
 static unsigned g_uloc_n;
 
 static int32_t klfb_GetUniformLocation(uint32_t prog, const char *name) {
+    // Resolved here as well as in the thunk table: the ES 3.1 door below calls
+    // this for a guest that never resolves glGetUniformLocation itself, so the
+    // thunk's real slot can still be empty.
+    if (!g_real_GetUniformLocation)
+        g_real_GetUniformLocation = (void *)asym("glGetUniformLocation");
     if (!g_real_GetUniformLocation || !name) return -1;
+    // Asking is the whole decision: from here on this program is described to
+    // the guest in the LINKER's numbering and glUniform* leaves it alone. The
+    // alternative — answer in the guest's pinned numbering and remap on the way
+    // back — was what shipped, and it cannot be made right: the two numberings
+    // share one integer space, so an unpinned uniform whose linker location
+    // happens to equal some other uniform's pinned one is redirected into it,
+    // silently. There is no such ambiguity once only one numbering is in use.
+    klfb_pins_byname(prog);
     int32_t loc = klfb_actual_loc(prog, name);
-    // A program with pins answers in the guest's own numbering, or the two
-    // halves of a guest that both pins and asks would disagree with each other.
-    if (loc >= 0)
-        for (unsigned i = 0; i < g_prog_pins_n; i++)
-            if (g_prog_pins[i].prog == prog)
-                for (unsigned j = 0; j < g_prog_pins[i].n; j++)
-                    if (g_prog_pins[i].m[j].actual == loc)
-                        return g_prog_pins[i].m[j].pinned;
     if (loc >= 0) {
         pthread_mutex_lock(&g_compile_lock);
         unsigned i = 0;
