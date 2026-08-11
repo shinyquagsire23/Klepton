@@ -988,27 +988,55 @@ See PLANNING §11.
   `.../output/haptic`, and 15 input actions — so the map can be read offline
   without a run at all. The seventh "type" in the older count is the hand
   profile (`svl_hand_interaction_augmented`), which is not in that table.
-- `KL_XR_AIM_PITCH=<degrees>` — the AIM pose as a rotation off the GRIP pose,
-  about the grip's X axis, positive tilting the ray up. **Default -35 (the ray
-  tilts DOWN off the hilt), confirmed on hardware.**
+- `KL_XR_PROFILE=0` — answer `xrGetCurrentInteractionProfile` with
+  `XR_NULL_PATH` again, i.e. "no controller is bound". Default on
+  (`/interaction_profiles/oculus/touch_controller`, SL-20).
+
+  **This is the A/B for anything that got worse when the controllers
+  appeared.** Answering the profile is not a local change: the guest keys its
+  whole controller description off it, so with it on it publishes
+  `VTE_PROPS_STATIC_L`/`_R`, streams controller state to the host every frame,
+  and SteamVR then renders and encodes controller models and laser pointers
+  that were not in the picture before. That is real extra work on both ends and
+  more motion in the encoded frame at a fixed bitrate. Measured, so the knob is
+  known to bite: `VTE_PROPS_STATIC_{L,R} was updated` appears **4 times** with
+  it on and **0** with it off, same run otherwise.
+- `KL_XR_GRIP_PITCH=<degrees>` — rotate the CONTROLLER pose about its X axis,
+  positive tilting forward up. **Default -35 (tilts down), measured on
+  hardware.** This is the one that visibly rotates the controller.
 
   OpenXR gives a controller two poses and Steam Link binds both: the stream's
-  `pamir-stream-pose` reads `.../input/grip/pose` (the hilt) and the in-headset
-  UI's `ui_pointer_pose` reads `.../input/aim/pose` (the ray). Collapse them and
-  the laser leaves the hand at the hilt's angle instead of the pointing angle.
+  `pamir-stream-pose` reads `.../input/grip/pose` — the hilt SteamVR renders
+  and streams back — and the in-headset UI's `ui_pointer_pose` reads
+  `.../input/aim/pose`, the ray. **The controller you are looking at is the
+  GRIP pose**, so this knob applies to every action-space pose, aim included:
+  an aim ray built on a mis-pitched hilt is mis-pitched with it.
 
-  SL-20 first shipped this at 0, arguing that `KleptonControllers.swift` already
-  builds a hilt frame whose -Z points along the direction the hilt points, so
-  aim and grip nearly coincide for this input source. **That was wrong on
-  hardware** — the same 35 degrees a Touch controller needs is needed here.
+  SL-20 first shipped the correction at 0 on the aim pose ONLY, arguing that
+  `KleptonControllers.swift` already builds a hilt frame pointing where the hilt
+  points. Both halves were wrong, and the second one is the instructive one:
+  with the rotation on the aim pose alone, `KL_XR_AIM_PITCH` moved nothing a
+  person could see, so the knob read as *"the rotation is not the problem"*
+  while the rotation was never being applied to the pose in question. `make
+  xrinput` asserts the correction reaches the grip pose now, because that
+  failure has no other symptom — the position is right, the space is tracked,
+  and every call returns `XR_SUCCESS`.
 
-  The sign is negative and two independent sources agree on it: the headset,
-  and the sign of every hilt correction in the guest's own
-  `controller_config.json` (-20.6 Touch, -10 Pico, -5 Vive, all about X). A ray
-  that is off by TWICE the angle rather than merely still wrong means the sign;
-  `KL_XR_AIM_PITCH=35` is the flip. The runtime prints what it took
-  (`[xr] aim pose is the grip pitched -35.0 deg`), so a run says which value was
-  in force rather than leaving it to be inferred from the picture.
+  Two independent sources agree on the sign: the headset, and the sign of every
+  hilt correction in the guest's own `controller_config.json` (-20.6 Touch, -10
+  Pico, -5 Vive, all about X). A controller off by TWICE the angle rather than
+  merely still wrong means the sign; `KL_XR_GRIP_PITCH=35` is the flip.
+- `KL_XR_AIM_PITCH=<degrees>` — the EXTRA offset between the aim ray and the
+  grip, applied only to `.../input/aim/pose`. **Default 0**: the real aim-vs-grip
+  angle of this input source has not been measured, and the frontend's hilt
+  frame already points roughly where a hand points. Separate from the knob above
+  because they answer different questions, and conflating them is the bug that
+  produced a knob which did nothing.
+
+  Both are read once and printed together at the first `xrCreateActionSpace`
+  (`[xr] controller pose: grip pitched -35.0 deg …`) — **not** lazily when a
+  pose is first corrected, which never runs on a host with no frontend and so
+  never said which value was in force.
 - `KL_SLINK_SIZE=WxH` — the panel size, published to SDL
   (`nativeSetScreenResolution`), the `ANativeWindow` and ANGLE together via
   one `slink_panel_size()` — the display is a group answer, and ANGLE is

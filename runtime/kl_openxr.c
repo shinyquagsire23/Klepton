@@ -1466,34 +1466,81 @@ static int klxr_action_space_hand(const klxr_space *sp, int *is_aim);
 // no amount of reading the basis conversion would have.
 //
 // Sign convention: R_x(θ) takes the forward vector (0,0,-1) to (0, sinθ,
-// -cosθ), so positive pitches the ray up and NEGATIVE pitches it down. It is
-// negative — the ray tilts down off the hilt.
+// -cosθ), so positive pitches forward UP and negative pitches it down.
 //
-// Two independent things agree on that, which is why it is worth writing down:
-// it was settled on hardware, and it matches the sign of every hilt correction
-// in the guest's own controller_config.json (-20.6 for Touch, -10 for Pico, -5
-// for Vive, all about X). The agreement is the reassuring part — a magnitude
-// from a headset and a sign from the guest's own table are different sources.
+// -35 on the grip is measured on hardware, and it matches the sign of every
+// hilt correction in the guest's own controller_config.json (-20.6 for Touch,
+// -10 for Pico, -5 for Vive, all about X) — a magnitude from a headset and a
+// sign from the guest's own table are different sources, so the agreement is
+// worth recording.
 //
-// KL_XR_AIM_PITCH overrides it. A ray that is off by TWICE the angle rather
-// than merely still wrong means the sign, and `KL_XR_AIM_PITCH=35` is the flip.
-#define KLXR_AIM_PITCH_DEFAULT (-35.0f)
-static void klxr_aim_from_grip(XrPosef *p) {
-    // A separate `init` flag rather than a sentinel value: the knob's whole
-    // range is meaningful here, negative included, so -1 cannot mean "not read
-    // yet" without silently swallowing a legitimate setting.
-    static int init;
-    static float pitch;
-    if (!init) {
-        init = 1;
-        pitch = kl_env_float("KL_XR_AIM_PITCH", KLXR_AIM_PITCH_DEFAULT);
-        fprintf(stderr, "  [xr] aim pose is the grip pitched %.1f deg "
-                        "(KL_XR_AIM_PITCH)\n", (double)pitch);
-    }
-    if (pitch == 0.0f) return;
-    float half = pitch * 0.5f * 3.14159265358979f / 180.0f;
+// A controller off by TWICE the angle rather than merely still wrong means the
+// sign, and `KL_XR_GRIP_PITCH=35` is the flip.
+#define KLXR_GRIP_PITCH_DEFAULT (-35.0f)
+#define KLXR_AIM_PITCH_DEFAULT  (0.0f)
+static void klxr_pitch_about_x(XrPosef *p, float degrees) {
+    if (degrees == 0.0f) return;
+    float half = degrees * 0.5f * 3.14159265358979f / 180.0f;
     XrQuaternionf rx = { sinf(half), 0, 0, cosf(half) };
     p->orientation = klxr_qmul(p->orientation, rx);
+}
+
+// The two corrections, applied to every action-space pose. They are separate
+// because they answer different questions, and collapsing them into one knob is
+// exactly the mistake this code made first time round.
+//
+//   KL_XR_GRIP_PITCH  corrects the CONTROLLER — the pose bound to
+//                     .../input/grip/pose, which for Steam Link is
+//                     `pamir-stream-pose`, i.e. the hilt SteamVR renders and
+//                     streams back. This is the one that visibly rotates the
+//                     controller. It applies to aim spaces too, because an aim
+//                     ray built on a mis-pitched hilt is mis-pitched with it.
+//
+//   KL_XR_AIM_PITCH   is the EXTRA offset between the aim ray and the grip,
+//                     applied only to .../input/aim/pose (`ui_pointer_pose`,
+//                     the in-headset UI pointer). Zero by default: the real
+//                     aim-vs-grip angle of this input source has not been
+//                     measured, and the frontend's hilt frame already points
+//                     roughly where a hand points.
+//
+// **The first version applied the whole thing to the aim pose only**, which is
+// why setting KL_XR_AIM_PITCH appeared to do nothing at all: the controller a
+// user is looking at is the GRIP pose, and nothing touched it. A knob whose
+// name matched the symptom but not the pose is worse than no knob — it reads as
+// "the rotation is not the problem" when the rotation was never applied.
+// Read once and SAY so, and the saying is why this is split out rather than
+// being a lazy init inside the corrector: the corrector only runs when a hand
+// is actually being tracked, so on any run without a frontend — every host run
+// — it never executes and the log never said which pitch was in force. A knob
+// whose value cannot be confirmed from the log is half a knob, and this pair is
+// specifically the one a person A/Bs against a picture.
+//
+// Called from xrCreateActionSpace, which happens whenever a guest uses
+// controllers at all, tracked or not.
+static void klxr_pitches(float *grip, float *aim) {
+    // A separate `init` flag rather than a sentinel value: the whole range of
+    // both knobs is meaningful, negative included, so -1 cannot mean "not read
+    // yet" without silently swallowing a legitimate setting.
+    static int init;
+    static float grip_pitch, aim_pitch;
+    if (!init) {
+        init = 1;
+        grip_pitch = kl_env_float("KL_XR_GRIP_PITCH", KLXR_GRIP_PITCH_DEFAULT);
+        aim_pitch  = kl_env_float("KL_XR_AIM_PITCH", KLXR_AIM_PITCH_DEFAULT);
+        fprintf(stderr, "  [xr] controller pose: grip pitched %.1f deg "
+                        "(KL_XR_GRIP_PITCH), aim a further %.1f deg "
+                        "(KL_XR_AIM_PITCH)\n",
+                (double)grip_pitch, (double)aim_pitch);
+    }
+    if (grip) *grip = grip_pitch;
+    if (aim)  *aim  = aim_pitch;
+}
+
+static void klxr_pose_corrections(XrPosef *p, int is_aim) {
+    float grip_pitch, aim_pitch;
+    klxr_pitches(&grip_pitch, &aim_pitch);
+    klxr_pitch_about_x(p, grip_pitch);
+    if (is_aim) klxr_pitch_about_x(p, aim_pitch);
 }
 
 static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
@@ -1521,7 +1568,7 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
         if (!present) return base;
         base.position    = (XrVector3f){ pos[0], pos[1], pos[2] };
         base.orientation = (XrQuaternionf){ quat[0], quat[1], quat[2], quat[3] };
-        if (is_aim) klxr_aim_from_grip(&base);
+        klxr_pose_corrections(&base, is_aim);
         if (lin) memcpy(lin, v, sizeof v);
         if (ang) memcpy(ang, a, sizeof a);
     }
@@ -1922,6 +1969,7 @@ static XrResult klxr_CreateActionSpace(void *session,
     // hands it over as poseInActionSpace. It is composed in klxr_space_pose_ex
     // like any other; printing it is how a wrong hilt angle gets traced to the
     // guest's own table rather than to our basis.
+    klxr_pitches(NULL, NULL);        // so the log always says which pitch is in force
     fprintf(stderr, "  [xr] action space for \"%s\" on %s at "
                     "(%.3f %.3f %.3f)\n",
             klxr_action_of(info->action)->name,
@@ -2090,7 +2138,17 @@ static XrResult klxr_GetCurrentInteractionProfile(void *session, XrPath top_leve
     klxr_log_chain("xrGetCurrentInteractionProfile", state->next);
     state->type = XR_TYPE_INTERACTION_PROFILE_STATE;
     state->interactionProfile = 0;      // XR_NULL_PATH
-    if (klxr_path_hand(klxr_path_str(top_level_path), NULL) >= 0) {
+    // KL_XR_PROFILE=0 restores the old XR_NULL_PATH answer. It is the A/B for
+    // everything that follows from a guest believing it has controllers — it
+    // publishes VTE_PROPS_STATIC_L/_R, streams controller state to the host
+    // every frame, and SteamVR then renders and encodes controller models and
+    // laser pointers that were not there before. That is real extra work on
+    // both ends, so "the stream got worse when the controllers appeared" is a
+    // hypothesis this knob settles in one run rather than one that has to be
+    // argued about.
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_XR_PROFILE", 1);
+    if (on && klxr_path_hand(klxr_path_str(top_level_path), NULL) >= 0) {
         // Interning rather than looking up: the guest suggested bindings under
         // this profile, so the string is already in the table — but going
         // through xrStringToPath's own interner is what guarantees the XrPath
@@ -3637,6 +3695,44 @@ int kl_openxr_input_selftest(FILE *f) {
                 good ? "ok  " : "FAIL", h ? "right" : "left",
                 loc.pose.position.x, want);
         ok &= good;
+
+        // ...and the correction actually REACHES the grip pose. This assertion
+        // exists because the first version applied the pitch to aim spaces
+        // only, so KL_XR_GRIP_PITCH moved nothing a user could see — the
+        // controller is the grip pose — and the knob read as "the rotation is
+        // not the problem" while the rotation was never applied. A pitch that
+        // silently misses its pose has no other symptom: the position is right,
+        // the space is tracked, and every call returns XR_SUCCESS.
+        //
+        // The hand was published at the identity, so the whole orientation here
+        // IS the correction: q.x = sin(pitch/2).
+        float want_x = sinf(KLXR_GRIP_PITCH_DEFAULT * 0.5f * 3.14159265358979f / 180.0f);
+        int pitched = fabsf(loc.pose.orientation.x - want_x) < 1e-3f;
+        fprintf(f, "  %s ...and is pitched by KL_XR_GRIP_PITCH (q.x=%.4f, "
+                   "want %.4f)\n", pitched ? "ok  " : "FAIL",
+                loc.pose.orientation.x, want_x);
+        ok &= pitched;
+    }
+
+    // The aim delta is SEPARATE from the grip correction and defaults to 0, so
+    // an aim space must land exactly where the grip one does. If these ever
+    // differ with KL_XR_AIM_PITCH unset, the two knobs have been conflated
+    // again — which is the same bug in the other direction.
+    {
+        XrActionSpaceCreateInfo ai;
+        memset(&ai, 0, sizeof ai);
+        ai.type = XR_TYPE_ACTION_SPACE_CREATE_INFO;
+        ai.action = aim;
+        ai.poseInActionSpace.orientation = (XrQuaternionf){0, 0, 0, 1};
+        klxr_StringToPath(&g_instance, "/user/hand/left", &ai.subactionPath);
+        void *aim_space = NULL;
+        klxr_CreateActionSpace(&g_session, &ai, &aim_space);
+        XrSpaceLocation a, g;
+        memset(&a, 0, sizeof a); memset(&g, 0, sizeof g);
+        klxr_LocateSpace(aim_space, stage_sp, 0, &a);
+        klxr_LocateSpace(sp[0], stage_sp, 0, &g);
+        ok &= klxr_st_ok(f, "the aim delta is separate and defaults to none",
+                         fabsf(a.pose.orientation.x - g.pose.orientation.x) < 1e-4f);
     }
 
     // Haptics: the two entry points that used to abort. What is checked is that
