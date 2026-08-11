@@ -41,7 +41,7 @@ build/t_opus: tests/t_opus.c $(RUNTIME) runtime/klepton.h
 	$(CC) $(CFLAGS) -o $@ tests/t_opus.c $(RUNTIME) $(LDLIBS)
 
 test: build/t_opus
-	./build/t_opus beatsaber/lib/arm64-v8a/libunityopus.so
+	./build/t_opus $(LIBS)/libunityopus.so
 
 clean:
 	rm -rf build
@@ -50,10 +50,43 @@ build/t_load: tests/t_load.c $(RUNTIME) runtime/klepton.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_load.c $(RUNTIME) $(LDLIBS)
 
-LIBS := beatsaber/lib/arm64-v8a
+LIBS ?= beatsaber/lib/arm64-v8a
+
+# The guest library set is DISCOVERED, not listed. It is a property of the APK,
+# and pinning it means every version swap silently degrades: the 2019.4 Beat
+# Saber build had lib_burst_generated and libunityopus, 1.6.0 (Unity 2018.4) has
+# neither and adds libvrintegrationloader, and the stale list took the gates
+# down with it while also starving tools/gen_libc_table.py of the twelve imports
+# the new libraries actually need. Globbing costs nothing and means pointing
+# LIBS at another Unity title just works.
+#
+# The exclusions are the libraries we REPLACE rather than translate (PLANNING
+# §3.1): libOVRPlugin depends on Quest system libraries absent from any APK,
+# libovrplatformloader is a forwarder to com.oculus.horizon, and libvrapi is
+# never loaded because the chain terminates before it. Translating any of them
+# is not merely wasted work, it is the wrong answer.
+GUEST_REPLACED := libOVRPlugin libovrplatformloader libvrapi
+GUEST_LIBS = $(filter-out $(GUEST_REPLACED),\
+               $(basename $(notdir $(wildcard $(LIBS)/*.so))))
+
+# The dyld / AMFI acceptance probes (P2, P3) do not care WHICH guest library
+# they carry — they ask whether a hand-emitted Mach-O is accepted at all. P1
+# does care, because it runs opus through the translated dylib and so proves
+# guest CODE executes, not just that it maps. Prefer libunityopus where the
+# title has one and fall back to libmain, which every Unity APK ships.
+DYLIB_PROBE_LIB = $(if $(wildcard $(LIBS)/libunityopus.so),libunityopus,libmain)
+
 load: build/t_load
-	@for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
+	@for f in $(GUEST_LIBS); do \
 	  ./build/t_load $(LIBS)/$$f.so || true; echo; done
+
+# What the discovery above actually resolved to, for when a gate's numbers move
+# after a version swap and the first question is "against which libraries?".
+guestlibs:
+	@echo "LIBS = $(LIBS)"
+	@echo "translated: $(GUEST_LIBS)"
+	@echo "replaced:   $(filter $(GUEST_REPLACED),\
+	         $(basename $(notdir $(wildcard $(LIBS)/*.so))))"
 
 # SL-1 — the second target's boot harness (PLANNING §11). Links the same
 # runtime as m_boot, minus the host-only diagnostics: this target has no
@@ -274,8 +307,7 @@ build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 	$(CC) $(CFLAGS) -o $@ tests/t_x18.c runtime/kl_x18.c runtime/kl_env.c
 
 x18: build/t_x18
-	python3 tools/check_x18.py build/t_x18 $(LIBS)/libunity.so $(LIBS)/libil2cpp.so \
-	  $(LIBS)/libunityopus.so $(LIBS)/libmain.so $(LIBS)/lib_burst_generated.so
+	python3 tools/check_x18.py build/t_x18 $(foreach f,$(GUEST_LIBS),$(LIBS)/$(f).so)
 
 # Trap 26 — the CTR_EL0 veneer, EXECUTED. Same shape as t_x18: linked against
 # the decoder alone, so a veneer bug cannot hide behind a working loader. It
@@ -359,20 +391,30 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@head -1 build/bcast.log && tail -1 build/bcast.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
 	@head -3 build/haptics.log && tail -1 build/haptics.log
-	@echo "=== opus roundtrip ===" && ./build/t_opus $(LIBS)/libunityopus.so > build/opus.log && tail -3 build/opus.log
-	@echo "=== all guest libraries ===" && for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
+# The opus roundtrip is the one gate here that RUNS guest code rather than
+# inspecting it, so it is worth keeping wherever it exists — but libunityopus.so
+# is a Unity 2019.x artifact (2018.4 has opus inside libunity and exports none of
+# its API), so on an older title there is nothing to point it at. Skip loudly
+# rather than fail: a missing library is a property of the guest, not a
+# regression, and a silent skip is how a gate quietly stops covering anything.
+	@echo "=== opus roundtrip ===" && if [ -f $(LIBS)/libunityopus.so ]; then \
+	  ./build/t_opus $(LIBS)/libunityopus.so > build/opus.log && tail -3 build/opus.log; \
+	else echo "  SKIPPED: $(LIBS) has no libunityopus.so (pre-2019 Unity keeps"; \
+	     echo "  opus inside libunity). Guest code still executes under 'make boot'."; fi
+	@echo "=== all guest libraries ===" && for f in $(GUEST_LIBS); do \
 	  printf '%-24s' $$f; ./build/t_load $(LIBS)/$$f.so 2>/dev/null | grep -E '^  imports:'; done
-	@echo "=== S0.5 x18 veneers ===" && for f in libunity libil2cpp; do \
+	@echo "=== S0.5 x18 veneers ===" && for f in $(GUEST_LIBS); do \
 	  printf '%-24s' $$f; ./build/t_load $(LIBS)/$$f.so 2>/dev/null | grep -E '^  x18 sites:'; done
-	@echo "  (the 2 refused sites are libunity's br x18 jump tables — see PLANNING S0.5;"
-	@echo "   'make x18' is the exhaustive decoder check against objdump, run it after"
-	@echo "   any change to runtime/kl_x18.c)"
+	@echo "  (refused sites are br x18 jump tables and trap-0d data words — see PLANNING"
+	@echo "   S0.5. The count is guest-specific, so it moves with the APK; what must not"
+	@echo "   move is the count for a GIVEN guest. 'make x18' is the exhaustive decoder"
+	@echo "   check against objdump, run it after any change to runtime/kl_x18.c)"
 # S0.1's counts, watched for the same reason the veneer totals are. They were
 # not, and a single site the trap-0d data test refused re-opened trap 1 in
 # libunity for sixteen commits: `make check` stops at initJni and stayed green
 # while the lifecycle faulted on it. A REFUSED TLS site is a hard failure here,
 # not a statistic — unlike the x18 side, refusing one is never free.
-	@echo "=== S0.1 TLS rewrites (trap 1) ===" && for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
+	@echo "=== S0.1 TLS rewrites (trap 1) ===" && for f in $(GUEST_LIBS); do \
 	  printf '%-24s' $$f; ./build/t_load $(LIBS)/$$f.so 2>/dev/null > build/tls-$$f.log; \
 	  grep -E '^  TLS rewrites:' build/tls-$$f.log; \
 	  if grep -q 'TLS sites REFUSED' build/tls-$$f.log; then \
@@ -409,6 +451,12 @@ build/klepton-ld: tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c runtime/k
 # signature before dyld will map anything.
 .PHONY: p1
 p1: build/klepton-ld build/t_opus
+	@test -f $(LIBS)/libunityopus.so || { \
+	  echo "P1 SKIPPED: $(LIBS) has no libunityopus.so — this title keeps opus"; \
+	  echo "  inside libunity and exports none of its API, so there is no pure"; \
+	  echo "  guest function to round-trip. 'make bootdylib-life' is the"; \
+	  echo "  equivalent proof for such a title: the whole guest runs from dylibs."; \
+	  exit 0; }
 	@./build/klepton-ld $(LIBS)/libunityopus.so -o build/libunityopus.dylib
 	@codesign -s - -f build/libunityopus.dylib 2>/dev/null
 	@./build/t_opus $(PWD)/build/libunityopus.dylib | tail -4
@@ -420,13 +468,13 @@ XRSIM ?= $(shell xcrun simctl list devices booted 2>/dev/null | grep -o '[0-9A-F
 .PHONY: p2
 p2: build/klepton-ld
 	@test -n "$(XRSIM)" || { echo "no booted simulator — 'xcrun simctl boot <udid>' first"; exit 1; }
-	@./build/klepton-ld $(LIBS)/libunityopus.so -o build/libunityopus-xrsim.dylib \
+	@./build/klepton-ld $(LIBS)/$(DYLIB_PROBE_LIB).so -o build/$(DYLIB_PROBE_LIB)-xrsim.dylib \
 	   --platform visionossim --quiet
-	@codesign -s - -f build/libunityopus-xrsim.dylib 2>/dev/null
+	@codesign -s - -f build/$(DYLIB_PROBE_LIB)-xrsim.dylib 2>/dev/null
 	@clang -target arm64-apple-xros1.0-simulator \
 	   -isysroot $$(xcrun --sdk xrsimulator --show-sdk-path) -arch arm64 \
 	   -o build/dl_xrsim tools/dlprobe.c
-	@xcrun simctl spawn $(XRSIM) $(PWD)/build/dl_xrsim $(PWD)/build/libunityopus-xrsim.dylib
+	@xcrun simctl spawn $(XRSIM) $(PWD)/build/dl_xrsim $(PWD)/build/$(DYLIB_PROBE_LIB)-xrsim.dylib
 
 # Translate every guest library. All five go through now that the x18 veneer
 # pass runs offline; a library klepton-ld cannot take is reported rather than
@@ -434,7 +482,7 @@ p2: build/klepton-ld
 .PHONY: dylibs
 dylibs: build/klepton-ld
 	@mkdir -p build/dylibs
-	@for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
+	@for f in $(GUEST_LIBS); do \
 	  if ./build/klepton-ld $(LIBS)/$$f.so -o build/dylibs/$$f.dylib \
 	       --platform $(KL_PLATFORM) --quiet 2>build/dylibs/$$f.err; then \
 	    codesign -s - -f build/dylibs/$$f.dylib 2>/dev/null; \
@@ -474,7 +522,7 @@ bootdylib-life: dylibs build/m_boot
 # chain does not reach all of them. Import counts must match `make check`'s.
 .PHONY: loaddylib
 loaddylib: dylibs build/t_load
-	@for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
+	@for f in $(GUEST_LIBS); do \
 	  test -f build/dylibs/$$f.dylib || continue; \
 	  printf '  %-22s' $$f; \
 	  KL_DYLIB_DIR=$(PWD)/build/dylibs ./build/t_load $(LIBS)/$$f.so 2>&1 \

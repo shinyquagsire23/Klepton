@@ -5,16 +5,41 @@ A symbol qualifies for a direct forward only if its signature AND every struct i
 touches are identical on both platforms. Everything else is hand-written in
 kl_libc.c / kl_pthread.c / kl_dl.c, or thunked in kl_va_thunks.S.
 """
-import struct, re, sys, os
+import struct, re, sys, os, glob
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# The Unity target is discovered twice over — which LIBRARIES (unity_libs below)
+# and which TREES (here) — and both were a hardcoded list that went stale across
+# a guest version swap.
+#
+# Libraries: a property of the APK. The 2019.4 build (Beat Saber 1.28) has
+# lib_burst_generated and libunityopus; 1.6.0 (Unity 2018.4) has neither and
+# adds libvrintegrationloader. The stale list simply stopped scanning the
+# libraries the guest actually loads, so the twelve imports they need were never
+# forwarded — surfacing as a batch of abort-by-name stops that read like guest
+# changes rather than like a tooling list nobody updated.
+#
+# Trees: scanning only whichever version currently occupies beatsaber/ makes
+# this table PING-PONG. Regenerating with 1.6.0 unpacked dropped fifteen names
+# 1.28 imports (isgraph, iswdigit, frexpf, ldexpf, lldiv, logb, sigaltstack, …),
+# which took `make check` down with 14 unresolved imports in libunity and 9 in
+# libil2cpp — and regenerating it back would drop 1.6.0's seven in turn. Neither
+# version is wrong, so the table is the UNION over every unpacked tree present:
+# a forward costs one table entry, and a forward for a name this guest never
+# imports costs nothing at all. Beat Saber alone spans Unity 2018.4 and 2019.4,
+# so this is a standing property of the project, not a one-off.
+#
+# A machine holding fewer trees regenerates a SUBSET, which is the one way this
+# can still lose a name. It is visible rather than silent — the scan prints
+# every tree and library it found, and `make check` fails loudly on any
+# unresolved import for whichever guest is installed.
+UNITY_TREES = sorted(glob.glob(os.path.join(ROOT, 'beatsaber*', 'lib', 'arm64-v8a')))
+
 # Both targets, and for Steam Link BOTH front doors — the streaming client and
-# the 2D configuration frontend. See the fourth entry for why the frontend is no
-# longer excluded.
-TARGETS = [
-    (os.path.join(ROOT, 'beatsaber/lib/arm64-v8a'),
-     ['libmain', 'lib_burst_generated', 'libunityopus', 'libunity', 'libil2cpp']),
+# the 2D configuration frontend. See the third Steam Link entry for why the
+# frontend is no longer excluded.
+TARGETS = [(d, None) for d in UNITY_TREES] + [
     (os.path.join(ROOT, 'steamlink-android/lib/arm64-v8a'),
      ['libmain', 'libSDL3', 'libSDL3_ttf', 'libSDL3_image',
       'libh264bitstream', 'libhevcbitstream', 'libc++_shared']),
@@ -43,6 +68,28 @@ TARGETS = [
       'libQt6Widgets_arm64-v8a', 'libQt6Svg_arm64-v8a',
       'libplugins_platforms_qvirtual_arm64-v8a']),
 ]
+
+# Libraries we REPLACE rather than translate (PLANNING §3.1), so their imports
+# are not ours to satisfy: libOVRPlugin needs Quest system libraries absent from
+# any APK, libovrplatformloader is a forwarder to com.oculus.horizon, and
+# libvrapi is never loaded because the chain terminates before it. Keep this in
+# step with GUEST_REPLACED in the Makefile.
+GUEST_REPLACED = {'libOVRPlugin', 'libovrplatformloader', 'libvrapi'}
+
+
+def unity_libs(d):
+    """Every translated guest library in an unpacked APK's lib dir.
+
+    A TARGETS entry whose name list is None is resolved this way. Used for the
+    Unity target because its library set is a Unity-version artifact rather
+    than a property of this project -- pointing LIBS at another old-Unity title
+    should not require editing a list here.
+    """
+    if not os.path.isdir(d):
+        return []
+    return sorted(f[:-3] for f in os.listdir(d)
+                  if f.endswith('.so') and f[:-3] not in GUEST_REPLACED)
+
 
 def undefined_symbols(path):
     d = open(path, 'rb').read()
@@ -106,6 +153,30 @@ fileno fgetc ungetc getwc fgetwc ungetwc fputwc putwc fwide
 stat64 lstat64 fstat64
 stdout stderr stdin __register_atfork __gnu_strerror_r __write_chk _ctype_
 dup2 mprotect
+vsprintf
+__google_potentially_blocking_region_begin __google_potentially_blocking_region_end
+""".split())
+
+# Excluded from the table but NOT hand-written anywhere: names we deliberately
+# leave unresolved, so the loader's per-import trampoline aborts BY NAME if the
+# guest ever calls one. That is the project's own rule — a lookup is a
+# measurement, a call is an assertion — and an unresolved import already
+# implements it for free.
+#
+# Kept separate from SPECIAL because SPECIAL is a PROMISE that kl_shim.c has an
+# E(...) entry, and ptrace sat in it for a session with no implementation behind
+# it. The next reader's obvious repair is to drop it back into the generated
+# table, which is the one genuinely wrong answer available here: Linux's
+# ptrace(enum __ptrace_request, ...) and Darwin's ptrace(int, pid_t, caddr_t,
+# int) share a name and share almost no request numbers, so a direct forward
+# would execute a DIFFERENT operation and report success (trap 6b's class).
+#
+# ptrace is Beat Saber 1.6.0's libunity only — an anti-debug probe, on no path
+# 1.28 takes. Left unresolved rather than answered because nothing has yet
+# forced a decision about what it should say, and inventing one is how trap 6d
+# happens.
+UNRESOLVED_BY_DESIGN = set("""
+ptrace
 """.split())
 
 # Subsystem gateways with their own files, like gl*/SL_* below: AAudio is the
@@ -130,11 +201,59 @@ PREFIX_SKIP = ('pthread_', 'sem_', '__android_log', 'egl')
 RE_SKIP = re.compile(r'^(A[A-Z]|AMEDIA|SL_|sl[A-Z]|SDL_|IMG_|TTF_|Mix_|gl[A-Z])')
 
 def main():
+    # No Unity tree at all would generate a Steam-Link-only table without
+    # complaint — the same silent-drop failure the union above exists to stop,
+    # in its largest possible form. beatsaber/ is the reference target.
+    if not UNITY_TREES:
+        sys.exit("gen_libc_table: no unpacked Unity guest found — expected at "
+                 "least %s. Unpack the reference APK (BUILDING.md) before "
+                 "regenerating, or this table loses every Unity import."
+                 % os.path.relpath(os.path.join(ROOT, 'beatsaber/lib/arm64-v8a'), ROOT))
+    print("Unity trees (the table is their UNION): %s" %
+          ' '.join(os.path.relpath(d, ROOT).split(os.sep)[0] for d in UNITY_TREES))
+
     allu, exported = set(), set()
+    missing = []
     for libs, names in TARGETS:
+        if names is None:
+            names = unity_libs(libs)
+            if not names:
+                sys.exit("gen_libc_table: no guest libraries under %s" % libs)
+            print("discovered %d guest librar%s in %s: %s" %
+                  (len(names), 'y' if len(names) == 1 else 'ies',
+                   os.path.relpath(libs, ROOT), ' '.join(names)))
         for f in names:
-            allu |= undefined_symbols(os.path.join(libs, f + '.so'))
-            exported |= defined_symbols(os.path.join(libs, f + '.so'))
+            p = os.path.join(libs, f + '.so')
+            if not os.path.exists(p):
+                missing.append(p)
+                continue
+            allu |= undefined_symbols(p)
+            exported |= defined_symbols(p)
+    # A named library that is not there means this list no longer describes the
+    # unpacked APK — a guest version swap. Silence here regenerates a table
+    # against the libraries that DO exist and drops every import unique to the
+    # ones that do not, which surfaces much later as a batch of unrelated-looking
+    # abort-by-name stops. Refuse instead: the list is a deliberate statement
+    # about which libraries we translate, so it has to be edited, not inferred.
+    if missing:
+        sys.exit("gen_libc_table: %d target librar%s missing -- TARGETS is stale "
+                 "for the unpacked APK:\n  %s" %
+                 (len(missing), 'y is' if len(missing) == 1 else 'ies are',
+                  '\n  '.join(missing)))
+    # Nor is a name a library we REPLACE exports. libvrintegrationloader (1.6.0)
+    # and libOVRMrcLib (1.11.1) link DIRECTLY against libvrapi, where 1.28's
+    # chain only ever dlsym'd it — so scanning those trees put vrapi_* into this
+    # set for the first time, and a generated forward would name a symbol that
+    # does not exist on Darwin. The linker catches that, but only after the
+    # question has been made confusing; these belong to kl_ovrp.c / kl_ovrplat.c,
+    # or to nothing at all, since the chain terminates before libvrapi loads
+    # (PLANNING §3.1). Read off the replaced libraries themselves rather than
+    # listed, so a new Oculus family arriving with a future title is handled.
+    for d in UNITY_TREES:
+        for name in sorted(GUEST_REPLACED):
+            p = os.path.join(d, name + '.so')
+            if os.path.exists(p):
+                exported |= defined_symbols(p)
     # A name one guest library exports is not a shim gap — libmain.so's 1418
     # unresolved import sites are overwhelmingly SDL3's, and they bind against
     # the guest libSDL3 at relocation time (kl_guest_sym_global). Generating a
@@ -148,6 +267,7 @@ def main():
                  and not s.startswith(PREFIX_SUBSYSTEM)
                  and not RE_SKIP.match(s)
                  and s not in SPECIAL
+                 and s not in UNRESOLVED_BY_DESIGN
                  and s not in listed)
 
     out = os.path.join(ROOT, 'runtime/kl_libc_table.h')
