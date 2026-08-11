@@ -57,6 +57,15 @@ typedef struct {
     unsigned tls_refused;
     unsigned svc_sites;                              // inline syscalls found
     unsigned imports_bound, imports_missing;
+    // ...and the undefined imports that are WEAK, which is a different answer
+    // rather than a subset of imports_missing. A weak undefined is how a guest
+    // asks "does this platform have X?": the call site null-tests the slot, so
+    // resolving one to a non-null abort trampoline answers YES and then aborts
+    // when the guest takes the branch it was offered. Left NULL and counted
+    // here. Nonzero is normal (memfd_create, getentropy, __cxa_thread_atexit_impl,
+    // jemalloc's mallctl, TSAN's __google_potentially_blocking_region_*), but a
+    // NULL-pointer fault with no name in the log starts by reading this list.
+    unsigned imports_weak_null;
     // S0.5: guest instructions naming x18, and how many were redirected to a
     // veneer. Anything refused is still exposed to trap 0.
     unsigned x18_sites, x18_patched, x18_refused;
@@ -74,6 +83,9 @@ const kl_stats *kl_get_stats(kl_image *img);
 
 // Unique names of imports the shim could not resolve. Valid until kl_unload().
 const char *const *kl_missing_imports(kl_image *img, unsigned *count);
+// ...and the WEAK undefined ones, which are left NULL rather than stubbed.
+// See stats.imports_weak_null: a different answer, not a subset of the above.
+const char *const *kl_weak_imports(kl_image *img, unsigned *count);
 
 // ---- shim ----
 // Resolve a bionic/NDK import by name. Returns NULL if unimplemented.

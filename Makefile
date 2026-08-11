@@ -95,21 +95,26 @@ LIBS ?= beatsaber/lib/arm64-v8a
 # the new libraries actually need. Globbing costs nothing and means pointing
 # LIBS at another Unity title just works.
 #
-# The exclusions are the libraries we REPLACE rather than translate (PLANNING
-# §3.1): libOVRPlugin depends on Quest system libraries absent from any APK,
-# libovrplatformloader is a forwarder to com.oculus.horizon, and libvrapi is
-# never loaded because the chain terminates before it. Translating any of them
-# is not merely wasted work, it is the wrong answer.
+# A `.so` IS NOT NECESSARILY AN ELF, and the discovery has to say so.
+# Some code injections ship config files this way.
+guest_elf_libs = $(shell for f in $(1)/*.so; do \
+                   head -c4 "$$f" 2>/dev/null | grep -q ELF && echo "$$f"; done)
+GUEST_SOS = $(basename $(notdir $(call guest_elf_libs,$(LIBS))))
+
+# The exclusions are the libraries we REPLACE rather than translate
 GUEST_REPLACED := libOVRPlugin libovrplatformloader libvrapi
-GUEST_LIBS = $(filter-out $(GUEST_REPLACED),\
-               $(basename $(notdir $(wildcard $(LIBS)/*.so))))
+
+# ...and these are not part of the APPLICATION at all.
+GUEST_EXCLUDED := libfrda libscript
+
+GUEST_LIBS = $(filter-out $(GUEST_REPLACED) $(GUEST_EXCLUDED),$(GUEST_SOS))
 
 # The dyld / AMFI acceptance probes (P2, P3) do not care WHICH guest library
 # they carry — they ask whether a hand-emitted Mach-O is accepted at all. P1
 # does care, because it runs opus through the translated dylib and so proves
 # guest CODE executes, not just that it maps. Prefer libunityopus where the
 # title has one and fall back to libmain, which every Unity APK ships.
-DYLIB_PROBE_LIB = $(if $(wildcard $(LIBS)/libunityopus.so),libunityopus,libmain)
+DYLIB_PROBE_LIB = $(if $(filter libunityopus,$(GUEST_LIBS)),libunityopus,libmain)
 
 load: build/t_load
 	@for f in $(GUEST_LIBS); do \
@@ -120,7 +125,9 @@ load: build/t_load
 guestlibs:
 	@echo "LIBS = $(LIBS)"
 	@echo "translated: $(GUEST_LIBS)"
-	@echo "replaced:   $(filter $(GUEST_REPLACED),\
+	@echo "replaced:   $(filter $(GUEST_REPLACED),$(GUEST_SOS))"
+	@echo "excluded:   $(filter $(GUEST_EXCLUDED),$(GUEST_SOS))"
+	@echo "not ELF:    $(filter-out $(GUEST_SOS),\
 	         $(basename $(notdir $(wildcard $(LIBS)/*.so))))"
 
 # SL-1 — the second target's boot harness (PLANNING §11). Links the same
@@ -376,7 +383,8 @@ bcast: build/t_bcast
 # a crash. Reads ELF files; no guest runs, seconds.
 .PHONY: sysregs
 sysregs:
-	python3 tools/sysreg_scan.py $(LIBS)/*.so $(SLVRLIBS)/*.so $(SLLIBS)/*.so
+	python3 tools/sysreg_scan.py $(call guest_elf_libs,$(LIBS)) \
+	  $(SLVRLIBS)/*.so $(SLLIBS)/*.so
 
 # The same decoder check against the second target. Kept separate from `x18`
 # because it proves a different thing: Steam Link is a different toolchain

@@ -58,6 +58,21 @@ int main(int argc, char **argv) {
         printf("  CTR_EL0 reads: %u    veneered: %u    refused: %u\n",
                st->ctr_sites, st->ctr_patched, st->ctr_refused);
     printf("  imports: %u bound, %u unresolved sites\n", st->imports_bound, st->imports_missing);
+    // Weak undefineds, left NULL on purpose. Printed only when the library has
+    // any, and printed in FULL rather than categorised: the list is short, and
+    // the reason it exists at all is that a NULL call names nothing, so this is
+    // the only place the name is ever written down.
+    if (st->imports_weak_null) {
+        unsigned nw = 0;
+        const char *const *weak = kl_weak_imports(img, &nw);
+        printf("  weak undefined, left NULL: %u sites, %u unique\n",
+               st->imports_weak_null, nw);
+        for (unsigned i = 0; i < nw; i++) {
+            if (i % 4 == 0) printf("      ");
+            printf("%-26s", weak[i]);
+            if (i % 4 == 3 || i + 1 == nw) printf("\n");
+        }
+    }
 
     unsigned nm = 0;
     const char *const *miss = kl_missing_imports(img, &nm);

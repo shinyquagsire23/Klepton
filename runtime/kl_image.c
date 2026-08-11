@@ -41,8 +41,10 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define SHT_PROGBITS  1
 #define SHT_DYNSYM    11
 #define SHF_EXECINSTR 0x4
+#define SHT_NOBITS 8
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
+#define PT_GNU_RELRO 0x6474e552
 #define PF_X 1
 #define PF_W 2
 #define PF_R 4
@@ -65,6 +67,7 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define R_AARCH64_GLOB_DAT  1025
 #define R_AARCH64_JUMP_SLOT 1026
 #define R_AARCH64_RELATIVE  1027
+#define STB_WEAK 2
 
 struct kl_image {
     uint8_t   *base;        // mapping base; ELF vaddr V lives at base + V
@@ -78,6 +81,8 @@ struct kl_image {
     char       path[512];
     const char **missing;      // unique unresolved import names
     unsigned    missing_n, missing_cap;
+    const char **weak;         // ...and the weak ones, deliberately left NULL
+    unsigned    weak_n, weak_cap;
     void       *dl_handle;     // set when the image arrived as a translated
                                // Mach-O dylib (M1b); then dyld owns the mapping
 };
@@ -93,9 +98,25 @@ static void record_missing(kl_image *img, const char *nm) {
     img->missing[img->missing_n++] = nm;
 }
 
+static void record_weak(kl_image *img, const char *nm) {
+    if (!nm) return;
+    for (unsigned i = 0; i < img->weak_n; i++)
+        if (strcmp(img->weak[i], nm) == 0) return;
+    if (img->weak_n == img->weak_cap) {
+        img->weak_cap = img->weak_cap ? img->weak_cap * 2 : 32;
+        img->weak = realloc(img->weak, img->weak_cap * sizeof *img->weak);
+    }
+    img->weak[img->weak_n++] = nm;
+}
+
 const char *const *kl_missing_imports(kl_image *img, unsigned *count) {
     if (count) *count = img->missing_n;
     return img->missing;
+}
+
+const char *const *kl_weak_imports(kl_image *img, unsigned *count) {
+    if (count) *count = img->weak_n;
+    return img->weak;
 }
 
 // ---------- unresolved-import stubs ----------
@@ -335,7 +356,22 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
         case R_AARCH64_GLOB_DAT:
         case R_AARCH64_JUMP_SLOT: {
             uint64_t v = sym_value(img, sidx, &nm);
-            if (!v) {
+            if (!v && (img->symtab[sidx].st_info >> 4) == STB_WEAK
+                   && img->symtab[sidx].st_shndx == 0) {
+                // A WEAK undefined must stay NULL — that is the whole mechanism
+                // by which a guest asks whether an optional symbol exists. The
+                // call site null-tests the slot, so an abort trampoline here
+                // answers "present" and the guest then calls it. Beat Saber 1.40
+                // is where this stopped being theoretical: libunity weak-imports
+                // the entire AMediaCodec / AImageReader / AHardwareBuffer family
+                // to probe for NDK video decode, and every name kl_mediandk.c
+                // does not implement would have read as supported.
+                //
+                // Reported, not silent: this trades an abort naming the symbol
+                // for a NULL call naming nothing, so record_weak keeps the list.
+                img->stats.imports_weak_null++;
+                record_weak(img, nm);
+            } else if (!v) {
                 // Dedupe: libil2cpp has 711k relocations; per-site logging would flood.
                 img->stats.imports_missing++;
                 record_missing(img, nm);
@@ -594,6 +630,121 @@ int kl_can_load(const char *path) {
     return access(path, R_OK) == 0;
 }
 
+// ---------- segment protection, when the HOST page is coarser than p_align ----------
+//
+// Apply PT_LOAD permissions at HOST page granularity, as the union of every
+// segment sharing a page — and then resolve the one union that cannot be
+// applied.
+//
+// This used to be a per-segment mprotect() rounded out to the page, which is
+// correct only while no two segments share one. CLAUDE.md recorded that as a
+// measured property of the corpus ("p_align is never smaller than Apple's 16 KB
+// page"): Beat Saber shipped 64 KB, Steam Link 16 KB. Beat Saber 1.40 ships
+// **4 KB** — eleven of its thirteen libraries — so segments now share pages,
+// the last one written wins, and libmain's r-x segment was left RW because the
+// RW segment 0x14e4 bytes above it is processed after it. JNI_OnLoad then took
+// an instruction fetch from a non-executable page: SIGBUS with the fault
+// address equal to the pc, which reads like a wild jump rather than a
+// permission. Nothing about it named the loader.
+//
+// The union is W|X on exactly one page per library (where the r-x segment's
+// tail meets the RW segment's head), and macOS refuses mprotect(RWX) on
+// ordinary anonymous memory with EACCES, so "just OR them" does not survive
+// contact. Two rules settle every case in the corpus, and both are readings of
+// what the file already says rather than heuristics:
+//
+//   1. Drop X if no SHF_EXECINSTR SECTION lands on the page. The r-x LOAD
+//      segment spans .rodata, .dynsym, .rela.dyn and .eh_frame as well as
+//      .text — the same distinction the rewrite passes above rely on — so the
+//      X on such a page was never for code. 8 of 11 libraries, libunity,
+//      libil2cpp and libenet among them.
+//   2. Otherwise drop W if every writable byte on the page is inside
+//      PT_GNU_RELRO. RELRO is by definition read-only once relocation is done,
+//      and relocation IS done here, so this is the ELF's own instruction rather
+//      than a concession. The remaining 3 — libmain, lib_burst_generated,
+//      libhaptics_sdk.
+//
+// Anything left is a page that genuinely needs both, which no permission can
+// express. It fails by name rather than silently mis-protecting, because the
+// symptom on either side is a fault a long way from here.
+static int protect_pages(kl_image *img, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
+                         const Elf64_Shdr *sh, uint64_t lo) {
+    const uintptr_t pg = (uintptr_t)getpagesize();
+    const size_t npages = (img->span + pg - 1) / pg;
+    uint8_t *want = calloc(npages, 1);          // ELF PF_* bits, per host page
+    if (!want) { err("out of memory for %zu page protections", npages); return -1; }
+
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD || !ph[i].p_memsz) continue;
+        size_t s = (size_t)((ph[i].p_vaddr - lo) / pg);
+        size_t e = (size_t)((ph[i].p_vaddr - lo + ph[i].p_memsz + pg - 1) / pg);
+        for (size_t p = s; p < e && p < npages; p++) want[p] |= (uint8_t)ph[i].p_flags;
+    }
+
+    for (size_t p = 0; p < npages; p++) {
+        if ((want[p] & (PF_W | PF_X)) != (PF_W | PF_X)) continue;
+        uint64_t ps = lo + (uint64_t)p * pg, pe = ps + pg;
+
+        int has_code = 0;
+        for (int i = 0; sh && i < eh->e_shnum; i++)
+            if ((sh[i].sh_flags & SHF_EXECINSTR) && sh[i].sh_type != SHT_NOBITS
+                && sh[i].sh_addr < pe && sh[i].sh_addr + sh[i].sh_size > ps)
+                has_code = 1;
+        if (!has_code) { want[p] &= (uint8_t)~PF_X; continue; }
+
+        // Every writable byte on this page must be inside a PT_GNU_RELRO range.
+        int relro_covers = 1;
+        for (int i = 0; i < eh->e_phnum && relro_covers; i++) {
+            if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_W)) continue;
+            uint64_t ws = ph[i].p_vaddr, we = ws + ph[i].p_memsz;
+            if (ws >= pe || we <= ps) continue;
+            if (ws < ps) ws = ps;
+            if (we > pe) we = pe;
+            int covered = 0;
+            for (int j = 0; j < eh->e_phnum; j++)
+                if (ph[j].p_type == PT_GNU_RELRO && ph[j].p_vaddr <= ws
+                    && ph[j].p_vaddr + ph[j].p_memsz >= we)
+                    covered = 1;
+            if (!covered) relro_covers = 0;
+        }
+        if (relro_covers) { want[p] &= (uint8_t)~PF_W; continue; }
+
+        uint64_t minalign = 0;
+        for (int i = 0; i < eh->e_phnum; i++)
+            if (ph[i].p_type == PT_LOAD && (!minalign || ph[i].p_align < minalign))
+                minalign = ph[i].p_align;
+        // Nameable, because the fix is not in this function: the only general
+        // way out is to place the image so that a host page boundary falls in
+        // the GAP between the executable segment and the writable bytes (here
+        // 0x11250..0x13910, wide enough that some offset works), which is a
+        // property of the mapping rather than of the protections.
+        err("%s: page %#llx needs W and X together and neither rule applies — "
+            "executable sections are present AND writable bytes outside "
+            "PT_GNU_RELRO share it (LOAD p_align %#llx < host page %#lx)",
+            img->path, (unsigned long long)ps,
+            (unsigned long long)minalign, (unsigned long)pg);
+        free(want);
+        return -1;
+    }
+
+    // Coalesce equal-protection runs: libil2cpp is 5380 pages and would
+    // otherwise cost 5380 syscalls and as many VM map entries.
+    for (size_t p = 0; p < npages; ) {
+        if (!want[p]) { p++; continue; }        // a gap between segments; leave RW
+        size_t q = p;
+        while (q < npages && want[q] == want[p]) q++;
+        int prot = ((want[p] & PF_R) ? PROT_READ  : 0) |
+                   ((want[p] & PF_W) ? PROT_WRITE : 0) |
+                   ((want[p] & PF_X) ? PROT_EXEC  : 0);
+        if (mprotect(img->base + p * pg, (q - p) * pg, prot) != 0)
+            fprintf(stderr, "  [klepton] mprotect(%p,%#zx,%d) failed: %s\n",
+                    (void *)(img->base + p * pg), (q - p) * pg, prot, strerror(errno));
+        p = q;
+    }
+    free(want);
+    return 0;
+}
+
 kl_image *kl_load(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { err("open %s: %s", path, strerror(errno)); return NULL; }
@@ -721,17 +872,8 @@ kl_image *kl_load(const char *path) {
     }
     sys_icache_invalidate(img->base, img->span);
 
-    uintptr_t pg = (uintptr_t)getpagesize();
-    for (int i = 0; i < eh->e_phnum; i++) {
-        if (ph[i].p_type != PT_LOAD) continue;
-        uintptr_t s = (uintptr_t)(img->base + ph[i].p_vaddr - lo) & ~(pg - 1);
-        uintptr_t e = ((uintptr_t)(img->base + ph[i].p_vaddr - lo + ph[i].p_memsz) + pg - 1) & ~(pg - 1);
-        int prot = ((ph[i].p_flags & PF_R) ? PROT_READ : 0) |
-                   ((ph[i].p_flags & PF_W) ? PROT_WRITE : 0) |
-                   ((ph[i].p_flags & PF_X) ? PROT_EXEC : 0);
-        if (mprotect((void *)s, (size_t)(e - s), prot) != 0)
-            fprintf(stderr, "  [klepton] mprotect(%#lx,%#lx,%d) failed: %s\n",
-                    (unsigned long)s, (unsigned long)(e - s), prot, strerror(errno));
+    if (protect_pages(img, eh, ph, sh, lo) != 0) {
+        munmap(file, (size_t)sb.st_size); return NULL;
     }
 
     if (kl_env_on("KL_TRACE_IMAGES", 0))

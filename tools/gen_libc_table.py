@@ -76,6 +76,26 @@ TARGETS = [(d, None) for d in UNITY_TREES] + [
 # step with GUEST_REPLACED in the Makefile.
 GUEST_REPLACED = {'libOVRPlugin', 'libovrplatformloader', 'libvrapi'}
 
+# Not part of the APPLICATION at all, so its imports are not the guest's.
+# Beat Saber 1.40 as unpacked here is a modified build whose
+# UnityPlayerActivity.<clinit> was patched to System.loadLibrary("frda") -- a
+# Frida-based injector, configured by libfrda.config.so to patch
+# libovrplatformloader / libvrapi / libc and hijack entitlement RESPONSES for a
+# table of 249 DLC asset IDs and ~270 SKUs. That is the circumvention this
+# project refuses in code (kl_ovrplat.c, "The DRM line" in CLAUDE.md), and
+# nothing in the game depends on it: no DT_NEEDED anywhere names either
+# library. Keep in step with GUEST_EXCLUDED in the Makefile.
+GUEST_EXCLUDED = {'libfrda', 'libscript'}
+
+
+def is_elf(path):
+    """A `.so` is not necessarily an ELF -- see unity_libs."""
+    try:
+        with open(path, 'rb') as f:
+            return f.read(4) == b'\x7fELF'
+    except OSError:
+        return False
+
 
 def unity_libs(d):
     """Every translated guest library in an unpacked APK's lib dir.
@@ -84,15 +104,27 @@ def unity_libs(d):
     Unity target because its library set is a Unity-version artifact rather
     than a property of this project -- pointing LIBS at another old-Unity title
     should not require editing a list here.
+
+    Selected on the ELF MAGIC, not on the extension. Beat Saber 1.40 ships
+    `libfrda.config.so`, which is JSON: naming a data file `.so` is how you get
+    Android's installer to extract it into the app's lib dir beside the real
+    libraries. Globbing on `.so` handed that file to undefined_symbols() below,
+    which read its text as a section-header offset (8100131176265705836) and
+    died inside struct.unpack -- an error naming neither the file nor the cause.
     """
     if not os.path.isdir(d):
         return []
     return sorted(f[:-3] for f in os.listdir(d)
-                  if f.endswith('.so') and f[:-3] not in GUEST_REPLACED)
+                  if f.endswith('.so') and f[:-3] not in GUEST_REPLACED
+                  and f[:-3] not in GUEST_EXCLUDED and is_elf(os.path.join(d, f)))
 
 
 def undefined_symbols(path):
     d = open(path, 'rb').read()
+    if d[:4] != b'\x7fELF':
+        sys.exit("gen_libc_table: %s is named .so but is not an ELF (%r...). A "
+                 "TARGETS entry names it explicitly, so this is a stale list "
+                 "rather than a discovery bug." % (os.path.relpath(path, ROOT), d[:8]))
     shoff = struct.unpack_from('<Q', d, 0x28)[0]
     ses, sn, _ = struct.unpack_from('<HHH', d, 0x3a)
     sh = [struct.unpack_from('<IIQQQQIIQQ', d, shoff + i * ses) for i in range(sn)]
@@ -112,6 +144,10 @@ def undefined_symbols(path):
 def defined_symbols(path):
     """Dynamic symbols this library DEFINES — i.e. what its siblings bind to."""
     d = open(path, 'rb').read()
+    if d[:4] != b'\x7fELF':
+        sys.exit("gen_libc_table: %s is named .so but is not an ELF (%r...). A "
+                 "TARGETS entry names it explicitly, so this is a stale list "
+                 "rather than a discovery bug." % (os.path.relpath(path, ROOT), d[:8]))
     shoff = struct.unpack_from('<Q', d, 0x28)[0]
     ses, sn, _ = struct.unpack_from('<HHH', d, 0x3a)
     sh = [struct.unpack_from('<IIQQQQIIQQ', d, shoff + i * ses) for i in range(sn)]
@@ -155,6 +191,7 @@ stdout stderr stdin __register_atfork __gnu_strerror_r __write_chk _ctype_
 dup2 mprotect
 vsprintf
 __google_potentially_blocking_region_begin __google_potentially_blocking_region_end
+getrandom isnan
 """.split())
 
 # Excluded from the table but NOT hand-written anywhere: names we deliberately
@@ -186,7 +223,12 @@ ptrace
 # here, exactly as libOVRPlugin.so did (PLANNING §3.1).
 PREFIX_SUBSYSTEM = ('AAudio', 'xr')
 
-PREFIX_SKIP = ('pthread_', 'sem_', '__android_log', 'egl')
+# `_Z` is Itanium C++ mangling: never a libc forward, and never OURS to
+# provide. Beat Saber 1.40's libunity weak-imports `_ZTH15gDeferredAction`, a
+# clang TLS-init wrapper for a variable whose dynamic initializer was optimized
+# away — a weak undefined that is CORRECT at NULL (kl_image.c honours that), and
+# a generated forward for which names a symbol no Darwin library defines.
+PREFIX_SKIP = ('pthread_', 'sem_', '__android_log', 'egl', '_Z')
 # Same reason gl* is excluded: these are subsystem gateways with their own
 # files, not libc. SL_/sl (OpenSL ES) -> kl_opensl.c, AMedia*/AMEDIA* ->
 # kl_mediandk.c, SDL_/IMG_/TTF_ are the guest's own cross-library imports and

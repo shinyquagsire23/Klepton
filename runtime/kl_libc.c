@@ -21,6 +21,7 @@
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <sys/utsname.h>
+#include <sys/random.h>   // getentropy — behind klb_getrandom
 #include <wchar.h>
 #include <ctype.h>
 #include "klepton.h"
@@ -287,6 +288,46 @@ int klb_statfs(const char *path, void *out) {
     b->f_namelen = 255;
     return 0;
 }
+
+// ---------- getrandom ----------
+// Linux-only; Darwin's equivalent is getentropy(), which differs in three ways
+// that all matter. It has no flags argument, it caps a single call at 256
+// bytes, and it returns 0/-1 rather than a byte COUNT — so a direct forward
+// would hand the caller 0 where it expects "n bytes filled" and the caller
+// would read an uninitialised buffer as random. libhaptics_sdk (Beat Saber
+// 1.40) weak-imports it, so it also has to answer honestly rather than abort:
+// a weak probe that finds the symbol will call it.
+//
+// GRND_NONBLOCK/GRND_RANDOM are both satisfiable here — Darwin's entropy pool
+// is always ready, so neither flag can block and neither changes the answer.
+#define GUEST_GRND_NONBLOCK 0x0001
+#define GUEST_GRND_RANDOM   0x0002
+
+ssize_t klb_getrandom(void *buf, size_t len, unsigned int flags) {
+    if (flags & ~(unsigned)(GUEST_GRND_NONBLOCK | GUEST_GRND_RANDOM)) {
+        errno = kl_errno_to_linux(EINVAL);
+        return -1;
+    }
+    uint8_t *p = buf;
+    for (size_t off = 0; off < len; ) {
+        size_t n = len - off < 256 ? len - off : 256;   // getentropy's hard cap
+        if (getentropy(p + off, n) != 0) {
+            errno = kl_errno_to_linux(errno);
+            return off ? (ssize_t)off : -1;
+        }
+        off += n;
+    }
+    return (ssize_t)len;
+}
+
+// ---------- isnan ----------
+// bionic EXPORTS isnan as a real function; Darwin's <math.h> defines it as a
+// type-generic macro over __builtin_isnan, so there is no symbol to forward and
+// KL_FWD(isnan) does not compile. libOculusXRPlugin (1.40) imports it.
+//
+// bionic's is the C89 double form — the guest's call site has already narrowed
+// to double, so this is not the generic macro's job.
+int klb_isnan(double x) { return __builtin_isnan(x); }
 
 // ---------- sysconf ----------
 // Trap 4 again, and it stayed hidden for a while because it fails quietly:

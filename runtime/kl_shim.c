@@ -24,6 +24,7 @@
 #include <locale.h>
 #include <xlocale.h>
 #include <libgen.h>
+#include <fnmatch.h>    // libunity (1.40) — every FNM_* number matches Linux's
 #include <pthread.h>
 #include <sched.h>
 #include <poll.h>
@@ -1437,6 +1438,7 @@ X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_renam
 X(klh_android_log_print)
 X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_system) X(klb_syscall) X(klb_swprintf)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
+X(klb_getrandom) X(klb_isnan)
 X(klb_mmap) X(klb_mprotect) X(klb_madvise)
 X(klb_pthread_mutex_init) X(klb_pthread_mutex_lock) X(klb_pthread_mutex_unlock)
 X(klb_pthread_mutex_trylock) X(klb_pthread_mutex_destroy)
@@ -1548,6 +1550,10 @@ static const kl_entry g_shim[] = {
     E("getpwuid", klb_getpwuid), E("getpwuid_r", klb_getpwuid_r),
     E("prctl", klb_prctl),
     E("memrchr", klb_memrchr), E("memalign", klb_memalign),
+    // Beat Saber 1.40: getrandom is Linux-only and getentropy is NOT a drop-in
+    // (no flags, 256-byte cap, 0/-1 rather than a count); isnan is a macro on
+    // Darwin, so there is no symbol to forward. Both in kl_libc.c.
+    E("getrandom", klb_getrandom), E("isnan", klb_isnan),
     E("mmap", klb_mmap), E("mprotect", klb_mprotect), E("madvise", klb_madvise),
     E("sched_getaffinity", klb_sched_getaffinity), E("sched_setaffinity", klb_sched_setaffinity),
     E("__system_property_find", klb_sysprop_find),
