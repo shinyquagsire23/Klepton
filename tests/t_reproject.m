@@ -321,6 +321,50 @@ static void check_pixels(void) {
     [dst getBytes:out1 bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
     ok(memcmp(out1, s1, 16) == 0, "slice 1 samples the other eye's picture");
 
+    // The sRGB decode (kl_reproject.h). Checked on a MID grey, because the
+    // source above is nothing but 0 and 255 — both fixed points of the curve —
+    // so it would pass identically with the decode wired to nothing at all.
+    // That is the failure this assertion exists for: an extra transfer function
+    // in a composite has no error surface, produces a perfectly well-formed
+    // frame, and is only visible to someone comparing brightness against the
+    // machine that sent it.
+    uint8_t grey[16];
+    memset(grey, 128, sizeof grey);
+    for (int i = 3; i < 16; i += 4) grey[i] = 255;
+    [src replaceRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0 slice:1
+             withBytes:grey bytesPerRow:8 bytesPerImage:16];
+    // 128/255 = 0.5020 as an sRGB code value is 0.2159 in linear light, and the
+    // render target here is a plain unorm, so the byte must land near 55.
+    const int want_lin = (int)lroundf(255.0f *
+        powf((128.0f / 255.0f + 0.055f) / 1.055f, 2.4f));
+    for (int decode = 0; decode < 2; decode++) {
+        u.srgb_decode = (uint32_t)decode;
+        cmd = [q commandBuffer];
+        enc = [cmd renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:ps];
+        [enc setFragmentTexture:src atIndex:0];
+        [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
+        [enc setVertexBytes:&u length:sizeof u atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+        klr_draw(enc);
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        uint8_t g[16] = {0};
+        [dst getBytes:g bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
+        int want = decode ? want_lin : 128;
+        int good = 1;
+        for (int i = 0; i < 16; i += 4)
+            if (abs((int)g[i] - want) > 1 || abs((int)g[i+1] - want) > 1 ||
+                abs((int)g[i+2] - want) > 1) good = 0;
+        printf("    srgb_decode=%d: 128 -> %u (want %d)\n", decode, g[0], want);
+        ok(good, decode ? "srgb_decode = 1 takes the sample from sRGB to linear"
+                        : "srgb_decode = 0 leaves the sample exactly alone");
+    }
+    u.srgb_decode = 0;
+    [src replaceRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0 slice:1
+             withBytes:s1 bytesPerRow:8 bytesPerImage:16];
+
     // visible = 0 must draw NOTHING. This is how the visionOS pass expresses
     // "this eye has no picture yet" now that both eyes share one encoder and
     // one draw call — it can no longer just skip the draw. A collapse that

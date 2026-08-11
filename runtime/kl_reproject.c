@@ -62,6 +62,43 @@ static int klr_nocant(void) {
     return on;
 }
 
+// Whether the composite decodes its sample from sRGB. See kl_reproject.h for
+// the full argument; the short version is that ANGLE forces an sRGB encode the
+// guest explicitly asked to be without, and the extra decode undoes it.
+//
+// A plain int, written from the GL thread the first time the guest says so and
+// read from the render thread every frame. Not atomic on purpose: it is one
+// word, it only ever moves 0 -> 1, and the worst a torn read could do is
+// composite one more frame with the old value.
+//
+// `KL_SRGB_DECODE` overrides it in both directions and is the A/B — the whole
+// question is a judgement about brightness and the only instrument is a person
+// looking at it, so being able to flip it inside a single session (rather than
+// across two pairings) is the difference between settling it and arguing.
+static int g_srgb_decode;
+
+static int klr_srgb_forced(int *out) {
+    const char *e = getenv("KL_SRGB_DECODE");
+    if (!e || !*e) return 0;
+    *out = kl_env_on("KL_SRGB_DECODE", 0);
+    return 1;
+}
+
+void kl_reproject_set_srgb_decode(int on) {
+    on = on ? 1 : 0;
+    if (g_srgb_decode == on) return;
+    g_srgb_decode = on;
+    int forced;
+    fprintf(stderr, "  [reproject] sRGB decode %s%s\n", on ? "ON" : "off",
+            klr_srgb_forced(&forced) ? " (overridden by KL_SRGB_DECODE)" : "");
+}
+
+int kl_reproject_srgb_decode(void) {
+    int forced;
+    if (klr_srgb_forced(&forced)) return forced;
+    return g_srgb_decode;
+}
+
 // The shader. Compiled from source at runtime by whichever compositor is
 // running rather than shipped as a .metal, so it lives beside the math that
 // feeds it — the uniforms below and the struct in this string are one
@@ -79,12 +116,36 @@ static const char kl_msl_reproject[] =
 "    uint     slice;\n"
 "    float    depth;      // metres — see kl_reproject.h\n"
 "    uint     visible;    // 0 = collapse the quad, this eye has no picture\n"
+"    uint     srgbDecode; // 1 = the sample is an sRGB code value, not linear\n"
 "};\n"
+"\n"
+// The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
+// difference is confined to the bottom of the range, which is precisely where a
+// wrong curve is most visible — a near-black that lifts is the artefact this
+// whole path exists to remove, and approximating it would leave a smaller
+// version of the same complaint.
+"static float3 kl_srgb_to_linear(float3 c)\n"
+"{\n"
+"    float3 lo = c * (1.0 / 12.92);\n"
+"    float3 hi = pow(max(c + 0.055, 0.0) * (1.0 / 1.055), 2.4);\n"
+"    return select(lo, hi, c > 0.04045);\n"
+"}\n"
+"\n"
+"static float4 kl_eye_sample(texture2d_array<float> tex, sampler samp,\n"
+"                            float2 uv, uint slice, uint srgbDecode)\n"
+"{\n"
+"    float3 c = tex.sample(samp, uv, slice).rgb;\n"
+"    return float4(srgbDecode != 0u ? kl_srgb_to_linear(c) : c, 1.0);\n"
+"}\n"
 "\n"
 // `slice` travels as a flat varying because the fragment stage has no
 // amplification_id: with both eyes drawn in one amplified pass, the uniform the
 // fragment shader would have to read is not the one it can index to.
-"struct VOut { float4 pos [[position]]; float2 uv; uint slice [[flat]]; };\n"
+// `srgbDecode` rides along for the same reason `slice` does: it comes out of
+// the per-view uniform, and with both eyes in one amplified pass the fragment
+// stage cannot index the array it would have to read.
+"struct VOut { float4 pos [[position]]; float2 uv; uint slice [[flat]];\n"
+"              uint srgb [[flat]]; };\n"
 "\n"
 // Off-screen on every axis (x, y and z all exceed w), so the clipper drops the
 // primitive whole. This is how an eye with no texture yet is expressed now that
@@ -127,6 +188,7 @@ static const char kl_msl_reproject[] =
 "    float y = mix(-u.tangents.w, u.tangents.z, c.y) * d;\n"
 "    VOut o;\n"
 "    o.slice = u.slice;\n"
+"    o.srgb = u.srgbDecode;\n"
 "    o.pos = u.visible == 0u ? kl_offscreen\n"
 "                            : u.projection * u.modelView * float4(x, y, -d, 1.0);\n"
 "    // Same mapping as the plain blit below, and for the same reason. Derived\n"
@@ -152,7 +214,7 @@ static const char kl_msl_reproject[] =
 "                               texture2d_array<float> tex [[texture(0)]],\n"
 "                               sampler samp [[sampler(0)]])\n"
 "{\n"
-"    return float4(tex.sample(samp, in.uv, in.slice).rgb, 1.0);\n"
+"    return kl_eye_sample(tex, samp, in.uv, in.slice, in.srgb);\n"
 "}\n"
 "\n"
 // The probe ladder (KL_CP_PROBE). Same library, same vertex function, so each
@@ -169,7 +231,7 @@ static const char kl_msl_reproject[] =
 "                                  texture2d_array<float> tex [[texture(0)]],\n"
 "                                  sampler samp [[sampler(0)]])\n"
 "{\n"
-"    return float4(tex.sample(samp, in.uv, in.slice).rgb, 1.0);\n"
+"    return kl_eye_sample(tex, samp, in.uv, in.slice, in.srgb);\n"
 "}\n"
 "\n"
 // The eye texture over the whole viewport, ignoring the quad, the poses and the
@@ -183,6 +245,7 @@ static const char kl_msl_reproject[] =
 "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
 "    VOut o;\n"
 "    o.slice = ua[amp].slice;\n"
+"    o.srgb = ua[amp].srgbDecode;\n"
 "    o.pos = ua[amp].visible == 0u ? kl_offscreen\n"
 "                                  : float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
 "    o.uv  = float2(p.x, p.y);\n"
@@ -193,7 +256,7 @@ static const char kl_msl_reproject[] =
 "                                texture2d_array<float> tex [[texture(0)]],\n"
 "                                sampler samp [[sampler(0)]])\n"
 "{\n"
-"    return float4(tex.sample(samp, in.uv, in.slice).rgb, 1.0);\n"
+"    return kl_eye_sample(tex, samp, in.uv, in.slice, in.srgb);\n"
 "}\n";
 
 // The pass that existed before reprojection: a full-screen triangle, three
@@ -295,7 +358,10 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     // Visible unless the caller says otherwise: only the visionOS compositor
     // has an eye it may have no picture for, and it clears the flag itself.
     u.visible = 1;
-    u.pad = 0;
+    // Not a caller's decision: it is a property of how the guest wrote the
+    // texture, and both compositors must reach the same answer. See
+    // kl_reproject_set_srgb_decode.
+    u.srgb_decode = (uint32_t)kl_reproject_srgb_decode();
     // **500 m, and the 2 m that sat here was a misattribution.**
     //
     // The quad is eye-centred (device_from_view loses its translation below), so

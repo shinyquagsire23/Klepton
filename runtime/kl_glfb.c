@@ -63,6 +63,7 @@
 #include "kl_glfb.h"
 #include "kl_present.h"
 #include "kl_egl.h"        // kl_gl_cap_* — the capability tables
+#include "kl_reproject.h"  // kl_reproject_set_srgb_decode — see klfb_srgb_settle
 #include "klepton.h"       // kl_trace_stub, for the per-name GL call trace
 
 // ---- the EGL/GLES constants used here, so there is nothing to include ----
@@ -2078,6 +2079,47 @@ void kl_glfb_release_eye_texture(int eye, int stage) {
             eye, stage, gl_tex, img);
 }
 
+// ---------------------------------------------------------------------------
+// GL_FRAMEBUFFER_SRGB, and why a cap we do not have is worth intercepting.
+//
+// `EXT_sRGB_write_control` lets an app turn the linear->sRGB encode off for a
+// framebuffer whose attachment is an sRGB format — i.e. say "the values I am
+// writing are ALREADY sRGB code values, store them as they are". Steam Link
+// uses it exactly that way: it disables the encode, renders its decoded video
+// into an SRGB8_ALPHA8 swapchain, and re-enables it after
+// (`XRConstruct::RenderFrame`, `QSVLRendererXR::FlipFrame` — 883 of each per
+// run). A Quest has the extension. ANGLE does not expose it, so both calls
+// raised INVALID_ENUM and ES applied the encode anyway.
+//
+// **The error was never the problem; the encode was.** The stored byte becomes
+// `encode(V)` where the guest wrote `V`, and sampling an sRGB texture decodes
+// once — so the composite receives `V`, an sRGB code value, and treats it as
+// linear. That is the picture reading too bright, and it has no error surface
+// at all: every call after the two INVALID_ENUMs succeeds and the frame is
+// perfectly well-formed. The note that stood here through SL-15..SL-20 — "an
+// encode on write and a decode on sample cancel, so this is precision rather
+// than gamma" — is true about the pair and wrong about the conclusion: what
+// they cancel back to is the guest's sRGB code value, and the composite needs
+// linear.
+//
+// So the state is RECORDED rather than forwarded. Swallowing it also removes
+// 1766 GL errors a run from a log where an unexplained error is a lead.
+//
+// Sticky, and deliberately: this asks "does this guest render sRGB code values
+// into its eye texture", which is a property of the guest, not of the instant.
+// The composite runs on another thread entirely and sampling a live GL enable
+// from it would be a race with no right answer.
+#define KLFB_GL_FRAMEBUFFER_SRGB 0x8DB9
+static int g_srgb_write_off;        // the guest asked for the encode OFF
+static int g_eye_fmt_is_srgb;       // ...and an eye texture is an sRGB format
+
+// Both halves have to hold, and neither is knowable without the other: an eye
+// texture that is not sRGB takes no encode to undo (Beat Saber's is RGBA16F),
+// and a guest that never disables the encode meant the one it got.
+static void klfb_srgb_settle(void) {
+    kl_reproject_set_srgb_decode(g_srgb_write_off && g_eye_fmt_is_srgb);
+}
+
 int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
                                  int w, int h, uint32_t internal_fmt) {
     if (!g_mtl_provider || eye < 0 || eye > 1 || !gl_tex) return 0;
@@ -2164,6 +2206,12 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
     // and only rebuilds it on a GL state sync, so a map bound afterwards misses
     // the first pass with nothing reporting it (notes/VISIONOS.md).
     if (g_eye_rate_map && a_SetRateMap) a_SetRateMap(t.texture, g_eye_rate_map);
+    // The other half of the sRGB question (klfb_srgb_settle). The format is not
+    // ours to choose — it is whatever the guest asked its swapchain for — so
+    // this is where it becomes known, and it can arrive either side of the
+    // guest's first glDisable.
+    if (internal_fmt == GL_SRGB8_ALPHA8) g_eye_fmt_is_srgb = 1;
+    klfb_srgb_settle();
     fprintf(stderr, "  [glfb] eye=%d stage=%d tex=%u is now backed by MTLTexture %p "
                     "slice %d (%dx%d fmt 0x%x)\n",
             eye, stage, gl_tex, t.texture, t.slice, w, h, internal_fmt);
@@ -3825,6 +3873,31 @@ static void klfb_Uniform1f(int32_t loc, float v) {
             loc, (double)v, e, who);
 }
 
+static void (*g_real_Enable)(uint32_t);
+static void (*g_real_Disable)(uint32_t);
+
+static void klfb_srgb_note(int enabled) {
+    static int said;
+    if (g_srgb_write_off == !enabled) return;
+    if (!enabled) g_srgb_write_off = 1;      // sticky — see above
+    if (!said++)
+        fprintf(stderr, "  [glfb] the guest %s GL_FRAMEBUFFER_SRGB — ANGLE has no "
+                        "EXT_sRGB_write_control, so the encode is applied "
+                        "regardless and the composite undoes it\n",
+                enabled ? "enabled" : "disabled");
+    klfb_srgb_settle();
+}
+
+static void klfb_Enable(uint32_t cap) {
+    if (cap == KLFB_GL_FRAMEBUFFER_SRGB) { klfb_srgb_note(1); return; }
+    if (g_real_Enable) g_real_Enable(cap);
+}
+
+static void klfb_Disable(uint32_t cap) {
+    if (cap == KLFB_GL_FRAMEBUFFER_SRGB) { klfb_srgb_note(0); return; }
+    if (g_real_Disable) g_real_Disable(cap);
+}
+
 static void (*g_real_GenerateMipmap)(uint32_t);
 static void klfb_GenerateMipmap(uint32_t t) {
     if (a_glGetError) while (a_glGetError()) {}
@@ -3857,6 +3930,9 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     KLFB_UT(UniformMatrix3x4fv), KLFB_UT(UniformMatrix4x3fv),
 #undef KLFB_UT
     {"glGenerateMipmap", (void *)klfb_GenerateMipmap, (void **)&g_real_GenerateMipmap},
+    // GL_FRAMEBUFFER_SRGB only — every other cap falls straight through
+    {"glEnable",  (void *)klfb_Enable,  (void **)&g_real_Enable},
+    {"glDisable", (void *)klfb_Disable, (void **)&g_real_Disable},
     {"glFlush",  (void *)klfb_Flush,  (void **)&g_real_Flush},
     {"glDrawElements", (void *)klfb_DrawElements, (void **)&g_real_DrawElements},
     {"glDrawArrays",   (void *)klfb_DrawArrays,   (void **)&g_real_DrawArrays},

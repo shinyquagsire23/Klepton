@@ -85,8 +85,33 @@ typedef struct {
     // stage has no texture yet has to be expressed in the uniforms rather than
     // by not issuing a draw. kl_reproject_build always sets it.
     uint32_t      visible;
-    uint32_t      pad;
+    // 1 = decode the sample from sRGB to linear before it is composited.
+    //
+    // **This undoes an encode we could not prevent, and it is not a colour
+    // preference.** An OpenXR guest that renders into an `SRGB8_ALPHA8`
+    // swapchain and brackets that rendering with
+    // `glDisable(GL_FRAMEBUFFER_SRGB)` is saying "the values I am writing are
+    // ALREADY sRGB code values, store them as they are". A Quest honours that
+    // (`EXT_sRGB_write_control`); ANGLE does not expose the extension and ES
+    // applies the encode unconditionally to an sRGB attachment, so the stored
+    // byte is `encode(V)` where the guest meant `V`. Sampling an sRGB texture
+    // decodes once, which hands the composite `V` — the sRGB code value,
+    // treated as if it were linear. That is brighter than intended everywhere
+    // except pure black and pure white, which is exactly how it looks.
+    //
+    // One more decode puts it right. Set by kl_reproject_set_srgb_decode(),
+    // which kl_glfb drives from what the guest actually asked for — it is off
+    // for Beat Saber, whose eye textures are RGBA16F and already linear, and
+    // off for any guest that leaves the encode alone.
+    uint32_t      srgb_decode;
 } kl_reproject_uniforms;
+
+// Whether the composite should decode its sample from sRGB (above). Pushed
+// rather than queried so this file stays linkable on its own — `make reproject`
+// builds it against nothing but kl_env — and so both compositors get the same
+// answer from one place instead of each deciding.
+void kl_reproject_set_srgb_decode(int on);
+int  kl_reproject_srgb_decode(void);
 
 // The reprojection pass. Draw as a 4-vertex triangle strip, no vertex buffer.
 //

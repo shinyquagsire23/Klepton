@@ -706,6 +706,19 @@ The composite/timewarp pass — one file, compiled by both compositors
   pictures by construction; diagnostic only.
 - `KL_REPROJECT_NOCANT=1` — treat `device_from_view` as having no rotation;
   the A/B for the eye-cant handling.
+- `KL_SRGB_DECODE=0|1` — force the composite's sRGB→linear decode on or off,
+  overriding what was measured. **The default is measured, not fixed**:
+  `kl_glfb` sets it when the guest disables `GL_FRAMEBUFFER_SRGB` *and* its eye
+  texture is an sRGB format, which is Steam Link (Beat Saber's is RGBA16F, so
+  it stays off there and nothing about that path changes).
+  The reason it exists at all: `EXT_sRGB_write_control` lets a guest say "the
+  values I am writing are already sRGB code values"; ANGLE does not expose it,
+  ES applies the encode anyway, and the composite then samples that back and
+  treats an sRGB code value as linear — which is **the picture reading too
+  bright**. One more decode undoes it. The whole question is a judgement about
+  brightness with a person as the only instrument, so being able to flip it
+  inside one session is the difference between settling it and arguing about
+  it. `make reproject` gates the shader half (128 → 55).
 
 ## Viewer (`runtime/kl_view.c`, `mains/m_boot.c`)
 
