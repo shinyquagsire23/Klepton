@@ -1355,6 +1355,25 @@ static int kl_vasprintf(char **o, const char *fmt, void *gva) {
     if (kl_va_marshal(fmt, (kl_va *)gva, m, sizeof m, KL_VA_PRINTF) == (size_t)-1) return -1;
     return vasprintf(o, fmt, (va_list)m);
 }
+// Unity 2018.4 (Beat Saber 1.6.0) imports the unbounded form as well; 2019.4
+// did not. Same trap 2 marshalling as its bounded sibling -- the guest's
+// va_list is an AAPCS64 descriptor and cannot be handed to Darwin's vsprintf.
+static int kl_vsprintf(char *b, const char *fmt, void *gva) {
+    char m[512] __attribute__((aligned(16)));
+    if (kl_va_marshal(fmt, (kl_va *)gva, m, sizeof m, KL_VA_PRINTF) == (size_t)-1) return -1;
+    return vsprintf(b, fmt, (va_list)m);
+}
+
+// ---------- Android-only libc instrumentation ----------
+// bionic exports these as a pair of no-op hooks that Google's internal build
+// interposes to account for time spent in blocking calls; the stock
+// implementation does nothing at all. Unity 2018.4's libunity and libil2cpp
+// both call them, so they are on the ordinary path rather than a diagnostic
+// one, and refusing them would abort a run that has nothing wrong with it.
+// Nothing here can observe the accounting, so a no-op IS the behaviour --
+// unlike the silent-zero cases in trap 6d, there is no answer being invented.
+static void kl_blocking_region_begin(void) { }
+static void kl_blocking_region_end(void) { }
 
 // ---------- fortify (_chk) variants ----------
 static void *kl_memcpy_chk(void *d, const void *s, size_t n, size_t dl) {
@@ -1504,7 +1523,11 @@ static const kl_entry g_shim[] = {
 
     // guest va_list consumers
     E("vfprintf", kl_vfprintf), E("vsnprintf", kl_vsnprintf), E("vasprintf", kl_vasprintf),
-    E("vprintf", klb_vprintf), E("vsscanf", klb_vsscanf),
+    E("vprintf", klb_vprintf), E("vsscanf", klb_vsscanf), E("vsprintf", kl_vsprintf),
+
+    // Android-only libc instrumentation (no-ops in stock bionic)
+    E("__google_potentially_blocking_region_begin", kl_blocking_region_begin),
+    E("__google_potentially_blocking_region_end", kl_blocking_region_end),
 
     // fortify
     E("__memcpy_chk", kl_memcpy_chk), E("__memset_chk", kl_memset_chk),

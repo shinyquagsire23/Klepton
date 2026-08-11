@@ -730,6 +730,18 @@ The composite/timewarp pass — one file, compiled by both compositors
   sampler bindings reach unit 35 on the post passes. `KL_POKE_CAP_OFF=1`
   leaves the field alone.
 
+  **Both offsets were measured against Unity 2019.4 and apply to no other
+  build**, so the poke is now GATED on the version stamp `m_boot` reads out of
+  the mapped libunity (`unity_version()`). On anything else it skips and says
+  so by name. Setting `KL_POKE_CAP=<n>` explicitly ALSO forces it past that
+  gate — do that only with re-measured offsets, since the write is a 4-byte
+  store through whatever the stale offset happens to point at. Beat Saber
+  1.6.0 (Unity 2018.4.4f1) found this the expensive way: the unguarded read
+  took the lifecycle down with a SIGSEGV inside `recon_run`, which reads like a
+  shim bug rather than an expired constant. **Marked for deletion** — see the
+  TODO on `poke_texture_unit_cap()` in `mains/m_boot.c` for the two fixes that
+  would retire it, neither of which needs an offset into anything.
+
 - `KL_VIEW=1` — interactive one-eye viewer on SDL3; WASD+mouse-look drives
   the head pose ovrp reports. Requires `KL_GLFB=1`, runs the guest in-process
   on a spawned thread (no guard test, no re-exec), and pumps frames until the

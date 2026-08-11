@@ -97,6 +97,7 @@
 #define GL_FLOAT         0x1406
 #define GL_RENDERER      0x1F01
 #define GL_VERSION       0x1F02
+#define GL_EXTENSIONS    0x1F03
 
 // We use the VENDORED ANGLE, always — `make angle-debug` (which pulls and
 // patches the checkout first). It is not interchangeable with a stock build:
@@ -306,6 +307,22 @@ int kl_glfb_init(void) {
             a_glGetString ? (const char *)a_glGetString(GL_RENDERER) : "?");
     fprintf(stderr, "  [glfb] %s\n",
             a_glGetString ? (const char *)a_glGetString(GL_VERSION) : "?");
+    // Whether a half-float eye texture can be RENDERED to, which on an ES 3.0
+    // context is an extension question and not a version one: RGBA16F is
+    // texture-filterable in core ES 3.0 but only colour-renderable with
+    // EXT_color_buffer_(half_)float. Printed because the failure mode is a
+    // single engine-side line ("RenderTexture.Create failed: format
+    // unsupported - RGBA16 SFloat") a long way from anything GL, and the
+    // engine's own answer depends on which of the two it looks for -- Unity
+    // 2019.4 infers it from the version it is told, 2018.4 asks for the string.
+    if (a_glGetString) {
+        const char *ext = (const char *)a_glGetString(GL_EXTENSIONS);
+        if (!ext) ext = "";
+        fprintf(stderr, "  [glfb] renderable float: EXT_color_buffer_float=%s "
+                        "EXT_color_buffer_half_float=%s\n",
+                strstr(ext, "GL_EXT_color_buffer_float") ? "yes" : "NO",
+                strstr(ext, "GL_EXT_color_buffer_half_float") ? "yes" : "NO");
+    }
 
     // Release it. EGL binds a context to one thread at a time and *refuses* to
     // migrate it — unlike CGL, which silently allows it. Leaving it current on

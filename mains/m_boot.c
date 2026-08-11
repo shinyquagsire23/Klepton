@@ -10,12 +10,14 @@
 // Phase 1 is the assertion. Phase 2 is reconnaissance: it drives the registered
 // NativeLoader.load() to find out what the *next* milestone has to answer for,
 // and runs in a forked child because an unimplemented JNI slot aborts by design.
+#include <ctype.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -123,6 +125,154 @@ static int check_drm_guard(void) {
 // RETURNS instead of _exit(0) — the guest is a spawned thread in that mode and
 // the reports belong to the main thread after the join.
 static volatile int g_view_quit;
+// ---------------------------------------------------------------------------
+// Guest-shape probes.
+//
+// Anything derived by reverse engineering ONE libunity build has to say which
+// build it was derived from, or it silently becomes a wild pointer against the
+// next one. Beat Saber 1.6.0 (Unity 2018.4.4f1) is 15.7 MB where the 2019.4
+// build is 17 MB, so every measured offset in this file moved -- the
+// texture-unit cap poke below read a garbage pointer and took the whole
+// lifecycle down with SIGSEGV in OUR code, which reads like a shim bug rather
+// than like a constant that expired.
+
+// Unity stamps its own version into libunity as a plain NUL-terminated string
+// ("2018.4.4f1"). libunity is stripped of everything useful -- 292 dynamic
+// symbols and not one GfxDevice among them -- so scanning for the stamp is the
+// only version signal available without a symbol table. One linear pass over
+// the mapped image, once, at pump start.
+static const char *unity_version(void) {
+    static char ver[32];
+    static int done;
+    if (done) return ver[0] ? ver : NULL;
+    done = 1;
+    kl_image *u = kl_find_image("libunity.so");
+    if (!u) return NULL;
+    const char *b = (const char *)kl_base(u);
+    size_t n = kl_span(u);
+    for (size_t i = 0; i + 10 < n; i++) {
+        // 20NN.N[N].N[N]<a|b|f|p>N... — the shape of every Unity version stamp.
+        if (b[i] != '2' || b[i + 1] != '0') continue;
+        size_t j = i + 2;
+        if (!isdigit((unsigned char)b[j]) || !isdigit((unsigned char)b[j + 1])) continue;
+        j += 2;
+        if (b[j] != '.') continue;
+        j++;
+        size_t d0 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
+        if (j == d0 || b[j] != '.') continue;
+        j++;
+        size_t d1 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
+        if (j == d1) continue;
+        if (b[j] != 'f' && b[j] != 'p' && b[j] != 'a' && b[j] != 'b') continue;
+        j++;
+        size_t d2 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
+        if (j == d2 || b[j] != '\0') continue;
+        if (j - i >= sizeof ver) continue;
+        memcpy(ver, b + i, j - i);
+        ver[j - i] = 0;
+        return ver;
+    }
+    return NULL;
+}
+
+// Is [p, p+len) actually mapped? mincore reports ENOMEM for a range that is
+// not, which is the cheapest honest test that does not need Mach. Used to stop
+// a stale measured offset from being dereferenced rather than to prove it is
+// the RIGHT object -- that is what the version gate is for.
+static int addr_mapped(const void *p, size_t len) {
+    if (!p) return 0;
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) return 0;
+    uintptr_t a   = (uintptr_t)p & ~((uintptr_t)pg - 1);
+    uintptr_t end = ((uintptr_t)p + len + (uintptr_t)pg - 1) & ~((uintptr_t)pg - 1);
+    size_t pages  = (size_t)((end - a) / (uintptr_t)pg);
+    char vec[16];
+    if (pages == 0 || pages > sizeof vec) return 0;
+    return mincore((void *)a, (size_t)(end - a), vec) == 0;
+}
+
+// libunity's texture-unit cap, direct from the horse's mouth: the singleton
+// getter at vaddr 0x313710 returns *(base + 0x122e340), and GfxDeviceGLES's
+// SetTexture rejects units >= *(singleton + 0xe8) with "Invalid texture unit!".
+// Unity defaults it to 32 without ever querying GL, while its HLSLCC-baked
+// sampler bindings reach unit 35 on the post passes -- so the reject preempted
+// the binds and the samplers read stale unit-0 textures.
+//
+// BOTH offsets were measured against the Unity 2019.4 build and are meaningless
+// against any other, so the version is a GATE and not a comment. A title whose
+// version is not listed is left alone and told so by name: skipping costs at
+// worst the stale-texture artifact this works around, while poking costs a
+// 4-byte store through a garbage pointer, which is unrecoverable and lands
+// nowhere near the cause.
+//
+// TODO: DELETE THIS. It is a store into a reverse-engineered field of a private
+// engine object, and it cannot be made to generalise -- there is no symbol to
+// find it by (libunity is stripped) and the offset moves with every Unity
+// build, so the version table can only ever grow one painful measurement at a
+// time. It exists to work around Unity capping texture units at 32 without
+// asking GL, while its own baked sampler bindings reach unit 35. The real fixes
+// are upstream of it and either one retires this outright:
+//   - have the guest ask, and answer honestly: find why libunity never queries
+//     GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS here and make the query happen, or
+//   - handle it where the reject is observed: GfxDeviceGLES refuses the bind
+//     and logs "Invalid texture unit!", which kl_glfb can see -- remapping the
+//     out-of-range unit at bind time needs no offset into anything.
+// Until then it is OFF for every guest but the one it was measured on, which is
+// the only honest state for a constant nobody can verify.
+#define POKE_VER_2019   "2019.4"
+#define POKE_SINGLETON  0x122e340
+#define POKE_FIELD      0xe8
+
+static void poke_texture_unit_cap(void) {
+    const char *pv = getenv("KL_POKE_CAP");
+    int poke_n = pv ? atoi(pv) : 64;        // matches the vendored ANGLE rebuild
+    if (poke_n <= 1) return;
+
+    const char *ver = unity_version();
+    // KL_POKE_CAP is also the override for an unlisted version: asking for it
+    // explicitly is a statement that the offsets have been re-measured.
+    if (!pv && (!ver || strncmp(ver, POKE_VER_2019, strlen(POKE_VER_2019)) != 0)) {
+        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — measured against Unity "
+                        "%s.x, this guest is %s.\n"
+                        "         Re-measure libunity+%#x/+%#x for it, or set "
+                        "KL_POKE_CAP=<n> to force.\n",
+                POKE_VER_2019, ver ? ver : "an unknown version",
+                POKE_SINGLETON, POKE_FIELD);
+        return;
+    }
+
+    kl_image *u = kl_find_image("libunity.so");
+    if (!u) return;
+    uint8_t *ub = (uint8_t *)kl_base(u);
+    if ((size_t)POKE_SINGLETON + sizeof(void *) > kl_span(u)) {
+        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — libunity is %zu bytes, "
+                        "shorter than the %#x offset.\n", kl_span(u), POKE_SINGLETON);
+        return;
+    }
+    uint8_t *singleton = *(uint8_t **)(ub + POKE_SINGLETON);
+    // Cheap shape checks behind the version gate: an aligned, mapped pointer
+    // whose field reads as a plausible unit count. Any of these failing means
+    // the offset no longer names what it used to, whatever the version says.
+    if (!singleton || ((uintptr_t)singleton & 7) ||
+        !addr_mapped(singleton + POKE_FIELD, sizeof(int32_t))) {
+        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — libunity+%#x holds %p, "
+                        "which is not a mapped aligned object.\n",
+                POKE_SINGLETON, (void *)singleton);
+        return;
+    }
+    int32_t cur = *(int32_t *)(singleton + POKE_FIELD);
+    if (cur <= 0 || cur > 4096) {
+        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — +%#x reads %d, which is "
+                        "not a texture-unit count.\n", POKE_FIELD, cur);
+        return;
+    }
+    if (cur < poke_n) {
+        fprintf(stderr, "  [poke] texture-unit cap@+%#x %d -> %d\n",
+                POKE_FIELD, cur, poke_n);
+        *(int32_t *)(singleton + POKE_FIELD) = poke_n;
+    }
+}
+
 static int recon_run(int view_pump) {
     install_fault_reporter();
     // Strict: an unimplemented *call* is fatal. Lookups are not, so this
@@ -253,31 +403,12 @@ static int recon_run(int view_pump) {
         unsigned frames = fenv ? (unsigned)strtoul(fenv, NULL, 10) : 0;
         if (frames || view_pump) {
             void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
-            if (getenv("KL_POKE_CAP") || !getenv("KL_POKE_CAP_OFF")) {
-                // libunity's texture-unit cap, direct from the horse's mouth:
-                // the singleton getter at vaddr 0x313710 returns *(base +
-                // 0x122e340), and GfxDeviceGLES's SetTexture rejects units >=
-                // *(singleton + 0xe8) with "Invalid texture unit!". Unity
-                // defaults it to 32 without ever querying GL, while its
-                // HLSLCC-baked sampler bindings reach unit 35 on the post
-                // passes — so the reject preempted the binds and the samplers
-                // read stale unit-0 textures. Default is poke 64, matching the
-                // vendored ANGLE rebuild (kMaxShaderSamplers=32, combined 64);
-                // KL_POKE_CAP=<n> overrides, KL_POKE_CAP_OFF=1 leaves it alone.
-                kl_image *u = kl_find_image("libunity.so");
-                if (u) {
-                    uint8_t *ub = (uint8_t *)kl_base(u);
-                    uint8_t *singleton = *(uint8_t **)(ub + 0x122e340);
-                    const char *pv = getenv("KL_POKE_CAP");
-                    int poke_n = pv ? atoi(pv) : 64;
-                    if (poke_n > 1 && singleton &&
-                        *(int32_t *)(singleton + 0xe8) < poke_n) {
-                        fprintf(stderr, "  [poke] texture-unit cap@+0xe8 %d -> %d\n",
-                                *(int32_t *)(singleton + 0xe8), poke_n);
-                        *(int32_t *)(singleton + 0xe8) = poke_n;
-                    }
-                }
-            }
+            // Default is poke 64, matching the vendored ANGLE rebuild
+            // (kMaxShaderSamplers=32, combined 64); KL_POKE_CAP=<n> overrides
+            // and forces it on an unlisted Unity version, KL_POKE_CAP_OFF=1
+            // leaves it alone entirely.
+            if (getenv("KL_POKE_CAP") || !getenv("KL_POKE_CAP_OFF"))
+                poke_texture_unit_cap();
             if (view_pump)
                 printf("\n=== recon: pumping frames until the viewer closes ===\n");
             else

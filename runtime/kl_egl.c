@@ -208,8 +208,40 @@ void kl_egl_set_gles_version(int major, int minor) {
     g_es_major = major; g_es_minor = minor;
 }
 
+// The extensions we advertise. The list stayed EMPTY for a long time and the
+// reason was sound -- naming one is a promise, and a broken promise fails far
+// from its cause -- but empty turned out to be its own broken promise for a
+// guest that reads capabilities from the string instead of from the version.
+//
+// The rule for adding here is narrow: an extension may be named only if the
+// GLES level we already claim in GL_VERSION makes it CORE, so naming it states
+// nothing new. Both entries below qualify -- colour-renderable float and
+// half-float are core in ES 3.2, which is what we tell Beat Saber we are -- and
+// the backend really does provide them (kl_glfb prints "renderable float:" at
+// context creation, and the vendored ANGLE answers yes to both).
+//
+// It cost a version swap to find. Unity 2019.4 infers RGBA16F renderability
+// from the ES level it is told and never looks at the string; Unity 2018.4
+// (Beat Saber 1.6.0) asks for the string, found nothing, and refused to create
+// the eye textures -- "RenderTexture.Create failed: format unsupported - RGBA16
+// SFloat (2)", then "Failure creating VR textures of size (4580, 2400)", then
+// it tore the distortion window down. Nothing in that chain mentions an
+// extension, and the ES 3.2 claim made the capability look already granted.
+static const char *const g_gl_extensions[] = {
+    "GL_EXT_color_buffer_float",
+    "GL_EXT_color_buffer_half_float",
+};
+
+// ...and none of it is offered below ES 3. Steam Link is told GLES 2.0
+// (kl_egl_set_gles_version) and has always run against an empty list; the
+// argument above is an ES 3.2 argument and does not carry over, so that target
+// stays exactly as it was rather than being changed by a fix it did not need.
+static int klgl_ext_count(void) {
+    return g_es_major >= 3 ? (int)(sizeof g_gl_extensions / sizeof g_gl_extensions[0]) : 0;
+}
+
 static const char *klgl_GetString(uint32_t name) {
-    static char ver[64], glsl[64];
+    static char ver[64], glsl[64], exts[256];
     switch (name) {
     case GL_VENDOR:     return "Klepton";
     case GL_RENDERER:   return "Klepton GLES";
@@ -222,18 +254,26 @@ static const char *klgl_GetString(uint32_t name) {
         snprintf(glsl, sizeof glsl, "OpenGL ES GLSL ES %d.%d0",
                  g_es_major, g_es_minor);
         return glsl;
-    // Empty for the same reason as the EGL extension string: naming one is a
-    // promise, and a broken promise fails far from its cause. ES3 asks for these
-    // through glGetStringi anyway.
-    case GL_EXTENSIONS: return "";
+    // ES3 guests are supposed to ask through glGetStringi, and Unity 2018.4
+    // asks BOTH ways. Built from the same list so the two doors cannot drift.
+    case GL_EXTENSIONS: {
+        int n = klgl_ext_count();
+        exts[0] = 0;
+        for (int i = 0; i < n; i++) {
+            if (i) strlcat(exts, " ", sizeof exts);
+            strlcat(exts, g_gl_extensions[i], sizeof exts);
+        }
+        return exts;
+    }
     }
     fprintf(stderr, "  [gl] glGetString: unhandled name 0x%x\n", name);
     return "";
 }
 
 static const char *klgl_GetStringi(uint32_t name, uint32_t index) {
-    (void)name; (void)index;
-    return "";           // consistent with GL_NUM_EXTENSIONS = 0
+    if (name == GL_EXTENSIONS && (int)index < klgl_ext_count())
+        return g_gl_extensions[index];
+    return "";           // consistent with GL_NUM_EXTENSIONS
 }
 
 static uint32_t klgl_GetError(void) { return GL_NO_ERROR; }
@@ -243,7 +283,8 @@ static uint32_t klgl_GetError(void) { return GL_NO_ERROR; }
 // it is talking to; nothing here is measured from a real driver yet because
 // there is no real driver yet.
 static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
-    {GL_NUM_EXTENSIONS,   0},
+    // GL_NUM_EXTENSIONS is NOT here — it is answered from g_gl_extensions in
+    // kl_gl_cap_integerv so the count and the strings cannot disagree.
     {GL_MAJOR_VERSION,    3},
     {GL_MINOR_VERSION,    2},
     {0x0D33 /* MAX_TEXTURE_SIZE            */, 16384},
@@ -299,6 +340,11 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     if (!params) return 1;
     if (pname == GL_MAJOR_VERSION) { params[0] = g_es_major; return 1; }
     if (pname == GL_MINOR_VERSION) { params[0] = g_es_minor; return 1; }
+    // Answered from the list rather than from the table below, for the same
+    // reason the two glGetString doors are: a count that disagrees with what
+    // glGetStringi will hand out makes the guest read past the end or stop
+    // short, and either one is silent.
+    if (pname == GL_NUM_EXTENSIONS) { params[0] = klgl_ext_count(); return 1; }
     for (size_t i = 0; i < sizeof g_gl_int / sizeof g_gl_int[0]; i++)
         if (g_gl_int[i].pname == pname) {
             params[0] = g_gl_int[i].value;

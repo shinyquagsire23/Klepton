@@ -1535,6 +1535,7 @@ static const klj_field g_fields[] = {
 
 
     KLJ_FINT("android/content/Context", "MODE_PRIVATE", 0),
+    KLJ_FINT("android/content/Context", "BIND_AUTO_CREATE", 0),
 
     KLJ_CTX_SVC("LOCATION_SERVICE",     "location"),
     KLJ_CTX_SVC("AUDIO_SERVICE",        "audio"),
@@ -3485,6 +3486,89 @@ static klj_val klj_AudioManager_getProperty(void *env, void *self, const klj_val
     }
     // Android returns null for an unknown property, and FMOD handles that.
     KLJ_LOG("AudioManager.getProperty(\"%s\") -> null (unknown property)", k);
+    return (klj_val){.l = NULL};
+}
+
+// android.media.AudioSystem is the hidden framework class behind AudioManager,
+// and Unity 2018.4's FMOD build reaches for it directly where 2019.4 went
+// through getProperty(). Same device, so it MUST answer the same two numbers --
+// this is the group-answer rule and the whole reason those live in one macro
+// each: FMOD sizes its mixer from the rate and its buffer from the frame count,
+// and a run where the two doors disagree is a mixer configured for a device
+// that does not exist.
+static klj_val klj_AudioSystem_getPrimaryOutputSamplingRate(void *env, void *self,
+                                                            const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AudioSystem.getPrimaryOutputSamplingRate() -> %d", KLJ_AUDIO_RATE);
+    return (klj_val){.j = KLJ_AUDIO_RATE};
+}
+static klj_val klj_AudioSystem_getPrimaryOutputFrameCount(void *env, void *self,
+                                                          const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AudioSystem.getPrimaryOutputFrameCount() -> %d", KLJ_AUDIO_FRAMES);
+    return (klj_val){.j = KLJ_AUDIO_FRAMES};
+}
+
+// No Bluetooth audio is routed here: kl_audio opens a CoreAudio output unit on
+// whatever the host has selected, and nothing in this shim can present an A2DP
+// device. False is the truthful answer rather than a convenient one -- Unity
+// uses it to pick a higher output latency, which would be wrong for the device
+// we actually play through.
+static klj_val klj_AudioManager_isBluetoothA2dpOn(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AudioManager.isBluetoothA2dpOn() -> false");
+    return (klj_val){.j = 0};
+}
+
+// ---------------------------------------------------------- window insets
+//
+// Unity 2018.4 asks the decor view for its insets to compute a safe area; the
+// 2019.4 build in this project never did. Answered as one description of one
+// window, like the display and audio groups above: a headset draws into an
+// immersive surface with no status bar, no navigation bar and no display
+// cutout, so every inset is genuinely zero. The object carries no payload
+// because its accessors are constant fields (see g_fields) -- there is one
+// window and every WindowInsets describes it.
+//
+// A real Android view returns null here when it is not attached to a window,
+// and answering null would also "work"; it is the wrong answer because our view
+// IS attached, and it would send Unity down its no-information path instead of
+// telling it the insets are zero.
+#define KLJ_CLASS_WINDOWINSETS "android/view/WindowInsets"
+
+static klj_val klj_View_getRootWindowInsets(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("View.getRootWindowInsets() -> WindowInsets (all zero — immersive surface)");
+    return (klj_val){.l = kl_jni_new_object(KLJ_CLASS_WINDOWINSETS)};
+}
+
+// The listener contract: return the insets the view did NOT consume. We consume
+// nothing, so the argument comes straight back. Returning a fresh object would
+// be equivalent today and would stop being so the moment insets are non-zero.
+static klj_val klj_View_onApplyWindowInsets(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("View.onApplyWindowInsets() -> the insets unchanged (nothing consumed)");
+    return (klj_val){.l = n > 0 ? a[0].l : kl_jni_new_object(KLJ_CLASS_WINDOWINSETS)};
+}
+
+// Recorded and dropped. The listener fires when the insets CHANGE, and ours are
+// constant for the life of the process, so a registration that is never called
+// back is the accurate behaviour rather than an unimplemented one.
+static klj_val klj_View_setOnApplyWindowInsetsListener(void *env, void *self,
+                                                       const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("View.setOnApplyWindowInsetsListener() — recorded; insets never change, "
+            "so it is never called back");
+    return (klj_val){.l = NULL};
+}
+
+// Null is what Android itself returns when the display has no cutout, and this
+// display has none -- there is no notch in a headset. It is the same answer a
+// Quest gives, so Unity takes the branch it takes on the real device.
+static klj_val klj_WindowInsets_getDisplayCutout(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("WindowInsets.getDisplayCutout() -> null (no cutout on this display)");
     return (klj_val){.l = NULL};
 }
 
@@ -5481,6 +5565,16 @@ static const klj_binding g_bindings[] = {
     {"com/unity3d/player/UnityPlayer", "getLaunchURL", "()Ljava/lang/String;", klj_UnityPlayer_getLaunchURL},
     {"java/lang/Integer", "parseInt", "(Ljava/lang/String;)I", klj_Integer_parseInt},
     {"android/media/AudioManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", klj_AudioManager_getProperty},
+    {"android/media/AudioManager", "isBluetoothA2dpOn", "()Z", klj_AudioManager_isBluetoothA2dpOn},
+    // Unity 2018.4 reads the device's audio configuration off the hidden
+    // AudioSystem class instead of AudioManager.getProperty(). Same numbers.
+    {"android/media/AudioSystem", "getPrimaryOutputSamplingRate", "()I", klj_AudioSystem_getPrimaryOutputSamplingRate},
+    {"android/media/AudioSystem", "getPrimaryOutputFrameCount", "()I", klj_AudioSystem_getPrimaryOutputFrameCount},
+    // ...and asks the decor view for its insets to compute a safe area.
+    {"android/view/View", "getRootWindowInsets", "()Landroid/view/WindowInsets;", klj_View_getRootWindowInsets},
+    {"android/view/View", "onApplyWindowInsets", "(Landroid/view/WindowInsets;)Landroid/view/WindowInsets;", klj_View_onApplyWindowInsets},
+    {"android/view/View", "setOnApplyWindowInsetsListener", "(Landroid/view/View$OnApplyWindowInsetsListener;)V", klj_View_setOnApplyWindowInsetsListener},
+    {"android/view/WindowInsets", "getDisplayCutout", "()Landroid/view/DisplayCutout;", klj_WindowInsets_getDisplayCutout},
     {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
     {"android/content/Context", "checkCallingOrSelfPermission", "(Ljava/lang/String;)I", klj_Context_checkPermission},
 

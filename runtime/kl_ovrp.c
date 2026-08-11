@@ -2465,7 +2465,13 @@ static const char *const g_ovrp_bool_yes[] = {
     "ovrp_Media_GetInitialized",
     // Setup calls whose return the guest ignores (0x9bba0c, 0x9bcd5c); 1 for
     // consistency with the other "it worked" answers.
-    "ovrp_SetupDistortionWindow3", "ovrp_SetupDisplayObjects",
+    // The un-suffixed form is the OVRP_0_1_x shape that Unity 2018.4 (Beat
+    // Saber 1.6.0) calls where 2019.4 calls ...3 -- same call, same answer.
+    // Both are listed rather than matched by prefix: OVRPlugin's numbered
+    // suffixes mark ABI revisions, and trap 10's whole shape is a numbered
+    // variant that returns something DIFFERENT under a familiar name.
+    "ovrp_SetupDistortionWindow", "ovrp_SetupDistortionWindow3",
+    "ovrp_SetupDisplayObjects",
 };
 
 static const char *const g_ovrp_bool_no[] = {
