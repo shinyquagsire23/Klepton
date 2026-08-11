@@ -607,11 +607,47 @@ puts the camera on the ground with its hands underneath it.
     eyes converge, and the guest has only one scene renderbuffer to foveate.
     `KL_VRR_ZONES` / `KL_VRR_EDGE` below are the fallback for an unfoveated
     drawable, and are what the host always uses.
+  - **Only two targets are foveated: the eye textures, and the guest's
+    multisampled scene renderbuffer. INTERMEDIATES ARE NOT**, deliberately.
+    The registry has a size-keyed rule for the scene target (which ANGLE
+    allocates itself in response to `glRenderbufferStorageMultisample`, so
+    nothing outside can name its `MTLTexture`), and the guest allocates *other*
+    render targets at exactly the same eye size — a post-processing chain
+    reading and writing full-resolution intermediates. Foveating one of those
+    would be a wrong picture, because the guest samples it with screen-space
+    coordinates that know nothing about the warp. The scene target is
+    distinguishable from all of them by being MULTISAMPLED, so the rule carries
+    `minSamples` (`KL_RATE_MIN_SAMPLES` = 2 in `kl_glfb.c`) and hits it and
+    nothing else. If a post chain ever needs foveating, it needs its own unwarp
+    at every point the guest samples it — not a widened rule here.
+  - **A rate map is built for ONE screen size**, so a guest that re-creates its
+    eye textures at a different size needs the map rebuilt. Both frontends do
+    that, keyed on size, from inside the provider so it lands before the texture
+    is bound. `kl_glfb` enforces it as well rather than trusting the ordering: a
+    texture whose size does not match the registered map is left unfoveated and
+    says so by name. Beat Saber **1.6.0** is what makes this reachable — it
+    goes 2400x2290 -> 2880x2748 -> back mid-run, where the 2019.4 build picks
+    one size and keeps it.
   - The eye texture is left in a WARPED layout. `kl_view_mtl`'s composite and
     `KleptonCompositor`'s undo it (the unwarp grid, `kl_reproject.h`); every
     other reader — the `KL_GLFB_OUT` capture, `t_mtl_provider`'s readback — does
     not, so those show the squeeze directly. That is the cheapest confirmation
     it engaged.
+  - **Foveation needs eye textures we own, so it follows the Metal PROVIDER, not
+    the viewer.** `tests/t_mtl_provider.m` is compiled into `m_boot` and
+    `m_slink` (it is a host stand-in for Compositor Services, not a test-only
+    file), and `kl_mtl_provider_install()` registers it **unconditionally under
+    `KL_VIEW`** — so the macOS viewer does foveate, and `KL_VRR` is live there.
+    `KL_VIEW_CPU=1` opts out and takes the readback path instead.
+  - **`KL_GLFB_MTL=1` installs the same provider with no window**, which is the
+    way to A/B foveation on the host without a headset or a viewer:
+    `KL_GLFB=1 KL_GLFB_MTL=1 KL_VRR=0|1`. The provider builds the map from
+    inside itself (`klmtl_update_rate_map`), because the eye size is only known
+    there. Measured on Beat Saber 1.6.0: `screen 2290x2400 -> physical
+    1648x1724 (51.7%)`, rebuilt **four times a run** as the guest resizes.
+    Without a provider there are no eye MTLTextures, no map, and
+    `klvm_grid_buffer` builds the 1x1 identity grid — foveation is simply absent
+    rather than off.
   - `KL_ANGLE_VRR_TRACE=1` alongside it shows the ANGLE half: which render
     passes found the map, and whether each eye resolve took the
     physical-passthrough path (`passthrough=1`) rather than warping twice.

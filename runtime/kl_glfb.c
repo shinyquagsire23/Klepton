@@ -1900,7 +1900,11 @@ static void *g_mtl_provider_ctx;
 // §12.1(3)'s "key the pose to the stage" warning bite, so the array is indexed
 // by stage from the start rather than retrofitted later.
 #define KL_MTL_MAX_STAGES 4
-static struct { void *tex; int slice; void *image; uint32_t gl_tex; }
+// w/h are carried so a rate map can be matched against the texture it would be
+// attached to. A map is built for one screen size; attaching it to a texture of
+// another is a warp against coordinates that do not exist, and nothing in Metal
+// or ANGLE reports it.
+static struct { void *tex; int slice; void *image; uint32_t gl_tex; int w, h; }
     g_eye_mtl[2][KL_MTL_MAX_STAGES];
 
 void kl_glfb_set_mtl_provider(kl_glfb_mtl_provider fn, void *ctx) {
@@ -2016,11 +2020,22 @@ void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate
         a_SetRateMapForSize((uint32_t)w, (uint32_t)h, KL_RATE_MIN_SAMPLES, rate_map);
 
     // Eye textures already bound do not come back through the bind path, so
-    // re-register (or clear) each of them here.
+    // re-register (or clear) each of them here — but only those the map was
+    // actually built for. A frontend that re-drives this on a size change (both
+    // of ours do, keyed on size) can still be holding textures of the OLD size
+    // at this moment, and handing them the new map would foveate them against a
+    // screen size they do not have. Clearing is always safe, so a mismatch
+    // clears rather than skips.
     for (int e = 0; e < 2; e++)
-        for (int s = 0; s < KL_MTL_MAX_STAGES; s++)
-            if (g_eye_mtl[e][s].tex)
-                a_SetRateMap(g_eye_mtl[e][s].tex, rate_map);
+        for (int s = 0; s < KL_MTL_MAX_STAGES; s++) {
+            if (!g_eye_mtl[e][s].tex) continue;
+            int fits = rate_map && g_eye_mtl[e][s].w == w && g_eye_mtl[e][s].h == h;
+            a_SetRateMap(g_eye_mtl[e][s].tex, fits ? rate_map : NULL);
+            if (rate_map && !fits)
+                fprintf(stderr, "  [glfb] eye=%d stage=%d is %dx%d, not the %dx%d this "
+                                "rate map was built for — left unfoveated\n",
+                        e, s, g_eye_mtl[e][s].w, g_eye_mtl[e][s].h, w, h);
+        }
 
     fprintf(stderr, "  [glfb] eye rate map %p for %dx%d, %dx%d zones (multisampled "
                     "targets of that size, plus every bound eye texture)\n",
@@ -2218,11 +2233,31 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
     g_eye_mtl[eye][stage].slice  = t.slice;
     g_eye_mtl[eye][stage].image  = img;
     g_eye_mtl[eye][stage].gl_tex = gl_tex;
-    // Foveation, if a map is in force. Before the guest renders into this
-    // texture, not after: ANGLE caches a framebuffer's render pass descriptor
-    // and only rebuilds it on a GL state sync, so a map bound afterwards misses
-    // the first pass with nothing reporting it (notes/VISIONOS.md).
-    if (g_eye_rate_map && a_SetRateMap) a_SetRateMap(t.texture, g_eye_rate_map);
+    g_eye_mtl[eye][stage].w      = w;
+    g_eye_mtl[eye][stage].h      = h;
+    // Foveation, if a map is in force AND it was built for this size. Before the
+    // guest renders into this texture, not after: ANGLE caches a framebuffer's
+    // render pass descriptor and only rebuilds it on a GL state sync, so a map
+    // bound afterwards misses the first pass with nothing reporting it
+    // (notes/VISIONOS.md).
+    //
+    // The size test is the invariant, held HERE rather than trusted to the
+    // frontend. Both of ours re-drive kl_glfb_set_eye_rate_map from the provider
+    // before this runs, so in practice the map is already the right one — but
+    // the ordering is a convention, and the failure if it is ever broken is a
+    // wrong picture with no error anywhere. Beat Saber 1.6.0 is what makes this
+    // reachable: it re-creates its eye textures mid-run at a different size
+    // (2400x2290 -> 2880x2748 -> back), where 2019.4 picks one and keeps it.
+    if (g_eye_rate_map && a_SetRateMap) {
+        if (w == g_eye_rate_w && h == g_eye_rate_h) {
+            a_SetRateMap(t.texture, g_eye_rate_map);
+        } else {
+            fprintf(stderr, "  [glfb] eye=%d stage=%d is %dx%d but the rate map is for "
+                            "%dx%d — left unfoveated (the frontend has not re-driven "
+                            "kl_glfb_set_eye_rate_map for the new size)\n",
+                    eye, stage, w, h, g_eye_rate_w, g_eye_rate_h);
+        }
+    }
     // The other half of the sRGB question (klfb_srgb_settle). The format is not
     // ours to choose — it is whatever the guest asked its swapchain for — so
     // this is where it becomes known, and it can arrive either side of the
