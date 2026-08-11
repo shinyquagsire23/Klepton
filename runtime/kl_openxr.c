@@ -1468,15 +1468,25 @@ static int klxr_action_space_hand(const klxr_space *sp, int *is_aim);
 // Sign convention: R_x(θ) takes the forward vector (0,0,-1) to (0, sinθ,
 // -cosθ), so positive pitches forward UP and negative pitches it down.
 //
-// -35 on the grip is measured on hardware, and it matches the sign of every
-// hilt correction in the guest's own controller_config.json (-20.6 for Touch,
-// -10 for Pico, -5 for Vive, all about X) — a magnitude from a headset and a
-// sign from the guest's own table are different sources, so the agreement is
-// worth recording.
+// +35 on the grip, confirmed by eye on a headset streaming from SteamVR.
 //
-// A controller off by TWICE the angle rather than merely still wrong means the
-// sign, and `KL_XR_GRIP_PITCH=35` is the flip.
-#define KLXR_GRIP_PITCH_DEFAULT (-35.0f)
+// **The guest's own controller_config.json does NOT predict this sign, and it
+// looks like it should.** Its per-profile hilt rotations are all negative about
+// the same axis (-20.6 Touch, -10 Pico, -5 Vive), which is why -35 was tried
+// first and was wrong by twice the angle. Those are the guest's
+// grip-to-*device* offsets, applied on its side to a pose it already has; this
+// is the correction from the frontend's hilt frame INTO the grip pose the guest
+// expects, and the two run opposite ways. Do not re-derive the sign from that
+// table — it is a plausible source that gives the wrong answer.
+//
+// **This is the OpenXR path only, so it does not touch Beat Saber**, which
+// speaks OVRPlugin and never resolves a single xr* entry point (its own
+// end-of-run report reads `0 resolved by the guest`). The rotation is applied
+// to kl_openxr's local copy of the pose, not written back into kl_ovrp, so the
+// two guests cannot be made to disagree by this knob. If this ever needs to
+// move into kl_ovrp, it needs a per-guest split at that moment — the shared
+// seam is the reason, not the knob.
+#define KLXR_GRIP_PITCH_DEFAULT (35.0f)
 #define KLXR_AIM_PITCH_DEFAULT  (0.0f)
 static void klxr_pitch_about_x(XrPosef *p, float degrees) {
     if (degrees == 0.0f) return;

@@ -1002,8 +1002,17 @@ See PLANNING §11.
   known to bite: `VTE_PROPS_STATIC_{L,R} was updated` appears **4 times** with
   it on and **0** with it off, same run otherwise.
 - `KL_XR_GRIP_PITCH=<degrees>` — rotate the CONTROLLER pose about its X axis,
-  positive tilting forward up. **Default -35 (tilts down), measured on
-  hardware.** This is the one that visibly rotates the controller.
+  positive tilting forward up. **Default +35, confirmed by eye on a headset
+  streaming from SteamVR.** This is the one that visibly rotates the controller.
+
+  **It affects the OpenXR guest only, so Beat Saber is untouched** — no
+  per-guest split is needed and none exists. Beat Saber speaks OVRPlugin and
+  resolves *zero* of the 53 xr\* entry points (its own end-of-run report says
+  `0 resolved by the guest`), and the rotation is applied to `kl_openxr`'s local
+  copy of the pose rather than written back into `kl_ovrp`, so the two guests
+  cannot be made to disagree by this knob. The pitch line does not even print on
+  a Beat Saber run. If this ever moves into `kl_ovrp`, it needs a per-guest
+  split *at that moment* — the shared seam would be the reason, not the knob.
 
   OpenXR gives a controller two poses and Steam Link binds both: the stream's
   `pamir-stream-pose` reads `.../input/grip/pose` — the hilt SteamVR renders
@@ -1022,10 +1031,15 @@ See PLANNING §11.
   failure has no other symptom — the position is right, the space is tracked,
   and every call returns `XR_SUCCESS`.
 
-  Two independent sources agree on the sign: the headset, and the sign of every
-  hilt correction in the guest's own `controller_config.json` (-20.6 Touch, -10
-  Pico, -5 Vive, all about X). A controller off by TWICE the angle rather than
-  merely still wrong means the sign; `KL_XR_GRIP_PITCH=35` is the flip.
+  **The guest's own `controller_config.json` does not predict the sign, and it
+  looks like it should.** Its per-profile hilt rotations are all *negative*
+  about the same axis (-20.6 Touch, -10 Pico, -5 Vive), which is why -35 was
+  tried first and was wrong by twice the angle. Those are the guest's
+  grip-to-*device* offsets, applied on its side to a pose it already has; this
+  is the correction from the frontend's hilt frame *into* the grip pose the
+  guest expects, and the two run opposite ways. A plausible source that gives
+  the wrong answer — do not re-derive from it. A controller off by twice the
+  angle rather than merely still wrong is the tell for a sign error.
 - `KL_XR_AIM_PITCH=<degrees>` — the EXTRA offset between the aim ray and the
   grip, applied only to `.../input/aim/pose`. **Default 0**: the real aim-vs-grip
   angle of this input source has not been measured, and the frontend's hilt
