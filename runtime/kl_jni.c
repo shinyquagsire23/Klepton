@@ -3623,6 +3623,46 @@ static klj_val klj_PackageManager_hasSystemFeature(void *env, void *self, const 
     return (klj_val){.j = (uint64_t)has};
 }
 
+// Context.bindService(Intent, ServiceConnection, int) — "connect me to that
+// service". Answered FALSE, which is exactly what Android returns when nothing
+// installed can service the Intent, and nothing here can: the caller is Unity
+// 2018.4's analytics reaching for
+// com.google.android.gms.ads.identifier.service.START, i.e. Play Services'
+// advertising ID, and there is no Play Services on this host. Reporting its
+// absence is the same story kl_ovrplat tells about the Oculus platform.
+//
+// False is also the only answer that does not HANG, which is why this is not a
+// place to be permissive. bindService is asynchronous and `true` is a PROMISE
+// that ServiceConnection.onServiceConnected will be called later; we have no
+// service to call it from, so a fabricated true leaves the guest waiting on a
+// callback that cannot come — trap 6e's shape, a wait that never ends, rather
+// than an error it can handle. False is a state its own code already handles,
+// and it leaves the connection with nothing queued against it, so the matching
+// unbindService has nothing to undo either.
+static klj_val klj_Context_bindService(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_object *intent = n > 0 ? klj_as_object(a[0].l) : NULL;
+    const char *action = intent ? (const char *)intent->data : NULL;
+    KLJ_LOG("Context.bindService(\"%s\") -> false (no such service on this host; "
+            "the connection is never called back)", action ? action : "(no action)");
+    return (klj_val){.j = 0};
+}
+
+// ...and its partner, which the guest calls on the way out whether or not the
+// bind succeeded. Nothing was ever bound, so there is nothing to undo and a
+// no-op IS the behaviour rather than a stub standing in for one.
+//
+// Real Android throws IllegalArgumentException for a ServiceConnection that was
+// never bound, and we deliberately do not: this project's exception state is
+// always clear (CLAUDE.md), so throwing would mean building machinery for a
+// path whose only purpose is to be caught and ignored. Returning quietly is
+// what the caller's catch block would have produced anyway.
+static klj_val klj_Context_unbindService(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("Context.unbindService() — nothing was bound, so nothing to undo");
+    return (klj_val){.l = NULL};
+}
+
 static klj_val klj_Context_checkPermission(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     KLJ_LOG("Context.checkCallingOrSelfPermission(\"%s\") -> GRANTED",
@@ -5616,6 +5656,8 @@ static const klj_binding g_bindings[] = {
     {"android/view/WindowInsets", "getDisplayCutout", "()Landroid/view/DisplayCutout;", klj_WindowInsets_getDisplayCutout},
     {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
     {"android/content/Context", "checkCallingOrSelfPermission", "(Ljava/lang/String;)I", klj_Context_checkPermission},
+    {"android/content/Context", "bindService", "(Landroid/content/Intent;Landroid/content/ServiceConnection;I)Z", klj_Context_bindService},
+    {"android/content/Context", "unbindService", "(Landroid/content/ServiceConnection;)V", klj_Context_unbindService},
 
     {"javax/net/ssl/TrustManagerFactory", "getDefaultAlgorithm", "()Ljava/lang/String;", klj_TMF_getDefaultAlgorithm},
     {"javax/net/ssl/TrustManagerFactory", "getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;", klj_TMF_getInstance},
