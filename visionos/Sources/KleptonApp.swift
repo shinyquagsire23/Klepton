@@ -307,9 +307,20 @@ struct BootView: View {
             // clock and drives kl_app_lifecycle_begin/_frame itself, and both
             // entries are once-per-process, so running the pump here as well
             // would take the lifecycle's only turn.
-            if result == 0, !Immersive.wanted,
-               let f = ProcessInfo.processInfo.environment["KL_FRAMES"] {
-                result = kl_app_lifecycle(UInt32(f) ?? 1)
+            //
+            // Which knob asks for it depends on the guest, because a frame
+            // budget is meaningless to one that owns its own frame loop. Beat
+            // Saber's is KL_FRAMES — nativeRender calls, counted. Steam Link's
+            // is KL_SLINK_WAIT — seconds of looper pump, exactly as it is on the
+            // command line. Gating both on KL_FRAMES was the first version and
+            // it made the window path on that target load the chain, report, and
+            // then never call ANativeActivity_onCreate at all: a run that looks
+            // finished and never started the activity.
+            let env = ProcessInfo.processInfo.environment
+            let asked = kl_app_target_is_steamlink() != 0
+                        ? env["KL_SLINK_WAIT"] : env["KL_FRAMES"]
+            if result == 0, !Immersive.wanted, asked != nil {
+                result = kl_app_lifecycle(UInt32(env["KL_FRAMES"] ?? "") ?? 1)
             }
             poll.invalidate()
 

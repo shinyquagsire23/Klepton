@@ -164,8 +164,13 @@ print(phys[0]["identifier"])
   # opens the immersive space by default, and an immersive run has no frame
   # budget to exhaust, so `./run.sh device` with no KL_FRAMES would have sat on
   # a blocking --console forever waiting for an app that never exits.
+  # ...and KL_SLINK_WAIT is the third: it is the Steam Link target's KL_FRAMES,
+  # a bounded pump on the window path, and a run doing one still never exits on
+  # its own — so --console would sit there until the app was quit by hand while
+  # the log it should be pulling sat in the container.
   OPEN_ENDED=""
-  [ -z "${KL_FRAMES:-}" ] || OPEN_ENDED=1
+  [ -z "${KL_FRAMES:-}" ]     || OPEN_ENDED=1
+  [ -z "${KL_SLINK_WAIT:-}" ] || OPEN_ENDED=1
   case "${KL_IMMERSIVE:-1}" in 0|no|off|false|"") ;; *) OPEN_ENDED=1 ;; esac
   if [ -z "$OPEN_ENDED" ]; then
     # P4's shape: --console blocks until the app terminates, which for a UI app
