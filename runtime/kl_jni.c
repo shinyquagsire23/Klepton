@@ -1290,6 +1290,8 @@ static void *g_field_cache[KLJ_MAX_FIELDS];
 
 // Defined further down with the rest of the Java implementations.
 static void   *klj_new_file(const char *path);
+static klj_val klj_PackageInfo_versionCode(void);
+static klj_val klj_PackageInfo_versionName(void);
 static klj_val klj_appinfo_sourceDir(void);
 static klj_val klj_appinfo_nativeLibraryDir(void);
 static klj_val klj_appinfo_dataDir(void);
@@ -1477,13 +1479,27 @@ static const klj_field g_fields[] = {
     KLJ_FFN("android/content/pm/ApplicationInfo", "splitPublicSourceDirs", "[Ljava/lang/String;", klj_appinfo_splitSourceDirs),
     KLJ_FINT("android/content/pm/ApplicationInfo", "flags", 0),
 
-    KLJ_FSTR("android/content/pm/PackageInfo", "versionName", "1.28.0_4124311467"),
-    KLJ_FINT("android/content/pm/PackageInfo", "versionCode", 545),
+    // Both read from the unpacked tree's apktool.yml — see klj_guest_version.
+    // A split-binary guest builds its OBB FILENAME from the version code, so a
+    // constant here goes stale into a missing-game-data error on every swap.
+    KLJ_FFN("android/content/pm/PackageInfo", "versionName", "Ljava/lang/String;",
+            klj_PackageInfo_versionName),
+    KLJ_FFN("android/content/pm/PackageInfo", "versionCode", "I",
+            klj_PackageInfo_versionCode),
     KLJ_FSTR("android/content/pm/PackageInfo", "packageName", "com.beatgames.beatsaber"),
 
     // Unity's own static handle on the Activity. Must be the *same* object the
     // Context was, not another instance of the class — Unity passes one to native
     // code and reads the other back, then compares them.
+    //
+    // Both spellings of ONE field, because a binding is matched on the full
+    // (class, name, signature) and two callers ask with different types. The
+    // declared type is Landroid/app/Activity; (UnityPlayer.smali:35) and that is
+    // what libOculusXRPlugin's JNI_OnLoad asks for in Beat Saber 1.40; libunity
+    // asks with the erased Ljava/lang/Object;, which is what this table carried
+    // alone until 1.40 stopped at "no host value for field". Same function, so
+    // they cannot become two different activities.
+    KLJ_FFN("com/unity3d/player/UnityPlayer", "currentActivity", "Landroid/app/Activity;", klj_currentActivity_field),
     KLJ_FFN("com/unity3d/player/UnityPlayer", "currentActivity", "Ljava/lang/Object;", klj_currentActivity_field),
     KLJ_FFN("android/graphics/PorterDuff$Mode", "CLEAR", "Landroid/graphics/PorterDuff$Mode;", klj_porterduff_clear),
 
@@ -2357,22 +2373,42 @@ static klj_val klj_ClassLoader_findLibrary(void *env, void *self, const klj_val 
     return (klj_val){.l = found ? kl_jni_new_string(path) : NULL};
 }
 
-// No OBB expansion files: this APK carries its assets inline, and there is no
-// /Android/obb to point at. An empty array is the real answer for such an app.
+// getObbDir() and getObbDirs() are ONE answer asked two ways — Android's plural
+// form is the singular one followed by any adopted external volumes, and there
+// are none here. They used to disagree: the plural returned an empty array
+// under a comment asserting "this APK carries its assets inline", which was
+// true of Beat Saber 1.28 and is FALSE of 1.40. 1.40 is a split application
+// binary (assets/unity_obb_guid marks it), its data ships in
+// main.<versionCode>.<package>.obb, and Unity looks for it through the PLURAL
+// form — so an empty list reads as "this device has no OBB storage" and the
+// asset pack is never found whatever getObbDir() says.
+//
+// The directory is created rather than merely named. Both callers are asking
+// where to LOOK, and a path that does not exist is indistinguishable from one
+// with no OBB in it, so creating it turns "somebody still has to make this
+// directory" into "the file goes here".
+static void klj_mkdir_p(const char *path);          // defined further down
+
+static const char *klj_obb_dir(void) {
+    static char path[1024];
+    if (!*path) {
+        snprintf(path, sizeof path, "%s/obb", kl_jni_files_dir());
+        klj_mkdir_p(path);
+    }
+    return path;
+}
 static klj_val klj_Context_getObbDirs(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    static void *empty;
-    if (!empty) empty = klj_new_array('L', "java/io/File", 0);
-    return (klj_val){.l = empty};
+    static void *dirs;
+    if (!dirs) {
+        dirs = klj_new_array('L', "java/io/File", 1);
+        ((void **)klj_arr(dirs)->data)[0] = klj_new_file(klj_obb_dir());
+    }
+    return (klj_val){.l = dirs};
 }
-
-// Android returns a File here whether or not the directory exists; ours is
-// created, which is harmless and keeps any later write working.
 static klj_val klj_Context_getObbDir(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    char path[1024];
-    snprintf(path, sizeof path, "%s/obb", kl_jni_files_dir());
-    return (klj_val){.l = klj_new_file(path)};
+    return (klj_val){.l = klj_new_file(klj_obb_dir())};
 }
 
 // ---- UI thread queue ----
@@ -2961,6 +2997,91 @@ static klj_val klj_Display_isWideColorGamut(void *env, void *self, const klj_val
     return (klj_val){.j = 0};
 }
 
+// Beat Saber 1.40 asks these two; 1.28 did not. Both belong to the DISPLAY
+// PANEL — the group of answers Unity cross-checks against each other — so they
+// are derived from the same KLJ_DISPLAY_* constants as getWidth/getHeight/
+// getRefreshRate rather than answered on their own terms.
+static klj_val klj_Display_isHdr(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // False, and consistent with isWideColorGamut above. The eye textures are
+    // RGBA16F, which is a precision choice inside our own pipeline and says
+    // nothing about the Android display this panel describes; a Quest reports
+    // false here too. Answering true asks Unity to pick an HDR swapchain
+    // format against a surface that is not one.
+    return (klj_val){.j = 0};
+}
+
+// getSupportedModes() -> exactly ONE mode, the one the rest of the panel
+// already describes. A Quest really does report several (60/72/90/120) and it
+// would be easy to list them, but every extra entry is a mode Unity may SELECT,
+// and nothing downstream of here would then agree: getRefreshRate() is a
+// constant, the frame clock is the Choreographer's, and on device the real
+// number is pushed from the compositor's primeDisplay. One mode makes the panel
+// self-consistent by construction, which is the rule that got Bloom and the
+// GLES 3.2 capability set right (trap 9).
+static klj_val klj_Display_getSupportedModes(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *modes;
+    if (!modes) {
+        modes = klj_new_array('L', "android/view/Display$Mode", 1);
+        void **slot = klj_arr(modes)->data;
+        slot[0] = klj_new_object_data("android/view/Display$Mode", NULL);
+    }
+    return (klj_val){.l = modes};
+}
+static klj_val klj_Mode_getModeId(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};        // Android numbers modes from 1, not 0
+}
+static klj_val klj_Mode_getPhysicalWidth(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = KLJ_DISPLAY_W};
+}
+static klj_val klj_Mode_getPhysicalHeight(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = KLJ_DISPLAY_H};
+}
+static klj_val klj_Mode_getRefreshRate(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.d = KLJ_DISPLAY_REFRESH};
+}
+
+// UnityPermissions.skipPermissionsDialog() reads the manifest's
+// `unityplayer.SkipPermissionsDialog` metadata off the activity, falling back
+// to the application. This manifest declares it **false**, so false is the
+// transcription, not a choice — and the branch it opens is already served:
+// Activity.checkSelfPermission answers granted, so Unity finds nothing to ask
+// for and no dialog is ever constructed.
+static klj_val klj_UnityPlayer_skipPermissionsDialog(void *env, void *self,
+                                                     const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// The manifest permission model; defined with the other permission entry
+// points further down, and read by three callers rather than two now.
+static int klj_permission_state(const char *p, const char **why);
+
+// UnityPlayer.requestUserAuthorization(String) — ask the user for one runtime
+// permission and BLOCK until they answer (its body builds a
+// UnityPermissions$ModalWaitForPermissionResponse and calls waitForResponse()).
+//
+// Returning is the answer, and returning IMMEDIATELY is the point. There is no
+// user to ask, and the permission's state is already settled by the manifest
+// model that checkSelfPermission reads — so there is nothing to wait for and
+// nothing this call could change. The one thing it must not do is model the
+// wait: this is the caller's thread, and a wait for a response no one can send
+// is trap 6e, a hang rather than an error.
+static klj_val klj_UnityPlayer_requestUserAuthorization(void *env, void *self,
+                                                        const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *p = n > 0 ? klj_str(a[0].l) : "", *why = "";
+    int granted = klj_permission_state(p, &why);
+    KLJ_LOG("UnityPlayer.requestUserAuthorization(\"%s\") — no user to ask; "
+            "it stays %s%s", p, granted ? "GRANTED" : "DENIED", why);
+    return (klj_val){.l = NULL};
+}
+
 // Resources.getIdentifier looks a name up in the APK's resource table. We have
 // no resource table, and 0 is Android's own "no such resource" — the caller must
 // already handle it, since a name that is not in the APK returns the same thing.
@@ -3453,6 +3574,27 @@ static klj_val klj_InputManager_registerListener(void *env, void *self, const kl
     // Same shape as registerDisplayListener: recorded, and nothing is owed a
     // callback because our device set never changes.
     KLJ_LOG("InputManager.registerInputDeviceListener — recorded; the device set never changes");
+    return (klj_val){.l = NULL};
+}
+
+// ...and the set itself, which Beat Saber 1.40 asks for through InputManager
+// where 1.28 asked through InputDevice. Two doors, ONE answer: this delegates
+// to klj_InputDevice_getDeviceIds rather than deciding again, so the two can
+// never disagree about which controllers exist. An empty answer here is the
+// bug that comment describes — Unity builds its joystick list from this
+// enumeration, and with no devices in it the trigger axes read zero however
+// faithfully ovrp_GetControllerState is filled in.
+static klj_val klj_InputDevice_getDeviceIds(void *env, void *self, const klj_val *a, int n);
+static klj_val klj_InputDevice_getDevice(void *env, void *self, const klj_val *a, int n);
+
+// ...and the same for the lookup: InputManager.getInputDevice(id) is
+// InputDevice.getDevice(id) asked through the instance rather than the static.
+static klj_val klj_InputManager_getInputDevice(void *env, void *self, const klj_val *a, int n) {
+    return klj_InputDevice_getDevice(env, self, a, n);
+}
+
+static klj_val klj_InputManager_getInputDeviceIds(void *env, void *self, const klj_val *a, int n) {
+    return klj_InputDevice_getDeviceIds(env, self, a, n);
     return (klj_val){.j = 0};
 }
 
@@ -3665,9 +3807,19 @@ static klj_val klj_Context_unbindService(void *env, void *self, const klj_val *a
 
 static klj_val klj_Context_checkPermission(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
-    KLJ_LOG("Context.checkCallingOrSelfPermission(\"%s\") -> GRANTED",
-            n > 0 ? klj_str(a[0].l) : "");
-    return (klj_val){.j = 0};      // PackageManager.PERMISSION_GRANTED
+    // Answered from the SAME manifest model as checkSelfPermission below. It
+    // used to grant everything unconditionally, which is the group-answer
+    // mistake in its purest form: two entry points asking one question and
+    // disagreeing. Beat Saber 1.40 is where that stopped being theoretical —
+    // it asks for android.permission.BLUETOOTH, which this manifest does not
+    // declare, took the GRANTED at its word, and then called GetObjectClass on
+    // the null adapter that followed. A permission we grant is a capability we
+    // have promised to have.
+    const char *p = n > 0 ? klj_str(a[0].l) : "", *why = "";
+    int granted = klj_permission_state(p, &why);
+    KLJ_LOG("Context.checkCallingOrSelfPermission(\"%s\") -> %s%s", p,
+            granted ? "GRANTED" : "DENIED", why);
+    return (klj_val){.j = granted ? 0 : (uint64_t)(int64_t)-1};
 }
 
 // Activity.checkSelfPermission(String) — "may I use this, right now". Two
@@ -3690,14 +3842,23 @@ static klj_val klj_Context_checkPermission(void *env, void *self, const klj_val 
 // this app by the time someone is pairing: the dangerous ones (RECORD_AUDIO for
 // stream microphone input, the ACCESS_*_LOCATION that reading an SSID needs)
 // were requested at first run, and there is no user here to ask.
+// This is the UNION over the manifests of every guest in the tree, the same
+// shape and for the same reason as kl_libc_table.h: one table, and a name that
+// belongs to the other target costs nothing here. It is not free in principle —
+// granting a permission this guest never declared is the very bug the caller
+// above documents — but no guest asks about another's, and the alternative is
+// parsing binary AXML at runtime to answer a question two entry points ask.
+// The first four are Beat Saber's whole manifest; the rest are Steam Link's.
 static const char *const g_manifest_permissions[] = {
+    "android.permission.ACCESS_NETWORK_STATE",
+    "android.permission.INTERNET",
+    "android.permission.READ_EXTERNAL_STORAGE",
+    "android.permission.WRITE_EXTERNAL_STORAGE",
     "android.permission.ACCESS_COARSE_LOCATION",
     "android.permission.ACCESS_FINE_LOCATION",
-    "android.permission.ACCESS_NETWORK_STATE",
     "android.permission.ACCESS_WIFI_STATE",
     "android.permission.BLUETOOTH_CONNECT",
     "android.permission.CHANGE_NETWORK_STATE",
-    "android.permission.INTERNET",
     "android.permission.MODIFY_AUDIO_SETTINGS",
     "android.permission.RECORD_AUDIO",
     "android.permission.VIBRATE",
@@ -3722,6 +3883,59 @@ static const char *const g_absent_hardware_permissions[] = {
     "com.picovr.permission.FACE_TRACKING",
 };
 
+// ...and, like the <meta-data> Bundle, the declared set is read from the
+// guest's OWN manifest where one is unpacked, falling back to the union above.
+// The union is only ever approximately right: it is every guest's permissions
+// at once, so it grants this guest things it never declared and — the way it
+// actually bit — misses what a guest declares that no other one does. Beat
+// Saber 1.28 declares com.oculus.permission.DEVICE_CONFIG_PUSH_TO_CLIENT, which
+// appears in no other manifest here and so was absent from the list, and 1.40
+// declares READ_/WRITE_EXTERNAL_STORAGE. Android answers this question by
+// looking at the manifest; so do we.
+// The <meta-data> parser's attribute helper; both readers of AndroidManifest.xml
+// share it so they cannot disagree about how an attribute is spelled.
+static const char *klj_xml_attr(const char *el, const char *end, const char *attr);
+
+static const char *const *klj_declared_permissions(size_t *count) {
+    static const char **list;
+    static size_t n;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        char path[1024];
+        snprintf(path, sizeof path, "%s/../AndroidManifest.xml", g_assets_dir);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            long size = (fseek(f, 0, SEEK_END), ftell(f));
+            char *xml = size > 0 ? malloc((size_t)size + 1) : NULL;
+            if (xml) {
+                rewind(f);
+                xml[fread(xml, 1, (size_t)size, f)] = '\0';
+                size_t cap = 16;
+                list = calloc(cap, sizeof *list);
+                for (const char *p = xml; (p = strstr(p, "<uses-permission")) != NULL; ) {
+                    const char *end = strchr(p, '>');
+                    if (!end) break;
+                    const char *k = klj_xml_attr(p, end, "android:name=\"");
+                    p = end;
+                    const char *ke = k ? strchr(k, '"') : NULL;
+                    if (!ke) continue;
+                    if (n == cap) { cap *= 2; list = realloc(list, cap * sizeof *list); }
+                    list[n++] = strndup(k, (size_t)(ke - k));
+                }
+                free(xml);
+            }
+            fclose(f);
+        }
+        if (n) KLJ_LOG("manifest <uses-permission>: %zu declared", n);
+        else   KLJ_LOG("no readable <uses-permission> beside %s — using the union "
+                       "list, which is every guest's permissions at once", g_assets_dir);
+    }
+    if (n) { *count = n; return list; }
+    *count = sizeof g_manifest_permissions / sizeof *g_manifest_permissions;
+    return g_manifest_permissions;
+}
+
 static int klj_permission_state(const char *p, const char **why) {
     for (size_t i = 0; i < sizeof g_absent_hardware_permissions /
                            sizeof *g_absent_hardware_permissions; i++)
@@ -3729,9 +3943,10 @@ static int klj_permission_state(const char *p, const char **why) {
             *why = " (the Quest 2 we present has no such sensor)";
             return 0;
         }
-    for (size_t i = 0; i < sizeof g_manifest_permissions /
-                           sizeof *g_manifest_permissions; i++)
-        if (strcmp(p, g_manifest_permissions[i]) == 0) { *why = ""; return 1; }
+    size_t n = 0;
+    const char *const *declared = klj_declared_permissions(&n);
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(p, declared[i]) == 0) { *why = ""; return 1; }
     *why = " (not declared in the guest's manifest)";
     return 0;
 }
@@ -3923,6 +4138,38 @@ static klj_val klj_Activity_setRequestedOrientation(void *env, void *self, const
 
 // ---- odds and ends the same batch reached for ----
 void *klb_dlopen(const char *path, int flags);   // kl_dl.c — the guest's own dlopen
+void *klb_dlsym(void *handle, const char *name); // ...and its dlsym
+
+// System.loadLibrary()/System.load() must call JNI_OnLoad if the library
+// exports one. That is Android's contract and not an optimisation: a plugin's
+// entire JNI setup lives there, and skipping it leaves the library loaded,
+// resolvable, and UNINITIALISED — every cached class, method id and flag still
+// at its static initial value.
+//
+// Nothing needed it until Beat Saber 1.40. libmain and libunity are driven
+// explicitly by the driver (m_boot), and 1.28's only runtime plugin was
+// libOVRPlugin, which we replace outright. 1.40 loads libOculusXRPlugin.so from
+// managed code, and that library caches the answer to
+// `OculusUnity.getIsOnOculusHardware()` into a static byte during JNI_OnLoad —
+// GetIsOnOculusHardware() is three instructions that read it back. With
+// JNI_OnLoad never called the byte stays zero, the Oculus XR Plugin loader
+// reads "this is not an Oculus device" and calls Application.Quit(), printing
+// a message about how the .apk was built. Nothing in it points at a load step.
+//
+// Once per image: klb_dlopen returns the existing handle for an already-open
+// library (libil2cpp arrives twice over), and JNI_OnLoad is not idempotent.
+static void klj_run_jni_onload(void *handle, const char *what) {
+    if (!handle) return;
+    static void *done[32];
+    static unsigned done_n;
+    for (unsigned i = 0; i < done_n; i++) if (done[i] == handle) return;
+    typedef int (*onload_fn)(void *vm, void *reserved);
+    onload_fn onload = (onload_fn)klb_dlsym(handle, "JNI_OnLoad");
+    if (!onload) return;             // most libraries have none; that is normal
+    if (done_n < sizeof done / sizeof *done) done[done_n++] = handle;
+    int v = onload(kl_jni_vm(), NULL);
+    KLJ_LOG("%s: JNI_OnLoad -> 0x%08x", what, (unsigned)v);
+}
 
 // UnityPlayer.loadLibrary(name) is Unity's System.loadLibrary wrapper. Routing it
 // through the guest dlopen rather than kl_load keeps one image registry: the
@@ -3940,6 +4187,7 @@ static klj_val klj_UnityPlayer_loadLibrary(void *env, void *self, const klj_val 
         snprintf(path, sizeof path, "%s/lib%s.so", g_native_lib_dir, name);
     void *h = klb_dlopen(path, 0x00002 /* RTLD_NOW */);
     KLJ_LOG("UnityPlayer.loadLibrary(\"%s\") -> %s", name, h ? "loaded" : "failed");
+    klj_run_jni_onload(h, name);
     return (klj_val){.j = h != NULL};
 }
 
@@ -3958,6 +4206,7 @@ static klj_val klj_System_load(void *env, void *self, const klj_val *a, int n) {
     if (!path || !*path) return (klj_val){.j = 0};
     void *h = klb_dlopen(path, 0x00002 /* RTLD_NOW */);
     KLJ_LOG("System.load(\"%s\") -> %s", path, h ? "loaded" : "failed");
+    klj_run_jni_onload(h, path);
     return (klj_val){.j = 0};
 }
 
@@ -4434,6 +4683,21 @@ static klj_val klj_Locale_getCountry(void *env, void *self, const klj_val *a, in
     return (klj_val){.l = kl_jni_new_string(country)};
 }
 
+// BCP 47, which is what Beat Saber 1.40 asks for where 1.28 read getLanguage()
+// and getCountry() separately. Built from the same two parts so the three
+// cannot disagree — a language tag is a rendering of this Locale, not a second
+// opinion about it. Java omits the region subtag entirely when there is none,
+// rather than leaving a trailing hyphen.
+static klj_val klj_Locale_toLanguageTag(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    char lang[16], country[16], tag[40];
+    klj_locale_parts(lang, sizeof lang, country, sizeof country);
+    if (*country) snprintf(tag, sizeof tag, "%s-%s", lang, country);
+    else          snprintf(tag, sizeof tag, "%s", lang);
+    KLJ_LOG("Locale.toLanguageTag() -> %s", tag);
+    return (klj_val){.l = kl_jni_new_string(tag)};
+}
+
 // null means "this route is not presenting to a secondary display", which is the
 // ordinary case and the one Unity is checking for. Documented as nullable, so this
 // is the API's own answer rather than a stub standing in for one.
@@ -4574,9 +4838,74 @@ static const char *klj_bundle_get(void *self, const char *key) {
     return NULL;
 }
 
+// ...and the table above is a TRANSCRIPTION, which goes stale on a guest swap
+// exactly as the version code did. Beat Saber 1.40 is where that stopped being
+// cosmetic: the Oculus XR Plugin reads its own configuration from here through
+// OculusUnity.getManifestSetting(), and 1.40 declares three keys
+// (com.unity.xr.oculus.LowOverheadMode / LateLatching / LateLatchingDebug) that
+// no earlier manifest had, so a stale table answers false to all three — a
+// setting silently disabled rather than an error.
+//
+// apktool has already decoded AndroidManifest.xml to text beside the assets and
+// libraries, so read the guest's own <meta-data> instead of describing it here.
+// The parse is deliberately narrow: this is apktool's output, not arbitrary XML,
+// and every element in it has the shape
+// `<meta-data android:name="K" android:value="V"/>`. Anything it cannot read
+// falls back to the transcription, and says which it used.
+static const char *klj_xml_attr(const char *el, const char *end, const char *attr) {
+    const char *p = strstr(el, attr);
+    return (p && p < end) ? p + strlen(attr) : NULL;
+}
+
+static const klj_kv *klj_manifest_metadata(void) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/../AndroidManifest.xml", g_assets_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    long size = (fseek(f, 0, SEEK_END), ftell(f));
+    char *xml = size > 0 ? malloc((size_t)size + 1) : NULL;
+    if (!xml) { fclose(f); return NULL; }
+    rewind(f);
+    size_t got = fread(xml, 1, (size_t)size, f);
+    fclose(f);
+    xml[got] = '\0';
+
+    size_t cap = 32, n = 0;
+    klj_kv *kv = calloc(cap, sizeof *kv);
+    for (const char *p = xml; (p = strstr(p, "<meta-data")) != NULL; ) {
+        const char *end = strchr(p, '>');
+        if (!end) break;
+        const char *k = klj_xml_attr(p, end, "android:name=\"");
+        const char *v = klj_xml_attr(p, end, "android:value=\"");
+        p = end;
+        if (!k || !v) continue;
+        const char *ke = strchr(k, '"'), *ve = strchr(v, '"');
+        if (!ke || !ve) continue;
+        if (n + 1 >= cap) { cap *= 2; kv = realloc(kv, cap * sizeof *kv);
+                            memset(kv + n, 0, (cap - n) * sizeof *kv); }
+        kv[n].key = strndup(k, (size_t)(ke - k));
+        kv[n].val = strndup(v, (size_t)(ve - v));
+        n++;
+    }
+    free(xml);
+    if (!n) { free(kv); return NULL; }
+    kv[n].key = kv[n].val = NULL;
+    KLJ_LOG("manifest <meta-data>: %zu entries from %s", n, path);
+    return kv;
+}
+
 static klj_val klj_metaData_field(void) {
     static void *bundle;
-    if (!bundle) bundle = klj_new_object_data("android/os/Bundle", (void *)g_metadata);
+    if (!bundle) {
+        const klj_kv *kv = klj_manifest_metadata();
+        if (!kv) {
+            kv = g_metadata;
+            KLJ_LOG("no readable AndroidManifest.xml beside %s — using the "
+                    "transcribed <meta-data>, which may not be this guest's",
+                    g_assets_dir);
+        }
+        bundle = klj_new_object_data("android/os/Bundle", (void *)kv);
+    }
     return (klj_val){.l = bundle};
 }
 
@@ -4605,8 +4934,66 @@ static klj_val klj_Bundle_containsKey(void *env, void *self, const klj_val *a, i
     return (klj_val){.j = klj_bundle_get(self, n > 0 ? klj_str(a[0].l) : NULL) != NULL};
 }
 
-// PackageInfo, like ApplicationInfo, is read field-by-field. Values come from
-// the APK's own manifest (apktool.yml: versionCode 545, versionName 1.28.0_...).
+// ---------- the guest's version, which NAMES A FILE ----------
+//
+// versionCode and versionName used to be transcribed constants (545 /
+// "1.28.0_4124311467"). That is stale the moment a guest is swapped, and it is
+// not a cosmetic staleness: for a SPLIT APPLICATION BINARY build — which Beat
+// Saber 1.40 is, marked by assets/unity_obb_guid — Unity builds the asset pack
+// path out of the version code, so a wrong number sends it looking for
+// `main.545.com.beatgames.beatsaber.obb` when the file it was shipped with is
+// `main.1716...`. A missing OBB reads as missing game data, several layers
+// from the constant that caused it.
+//
+// Read from the unpacked tree instead, so a swap describes itself. apktool.yml
+// is where the unpacker records both, in plain text, beside the assets and
+// libraries this run is already pointed at. Falling back to the constants keeps
+// a tree without one working, and says so rather than answering quietly.
+static void klj_guest_version(long *code, const char **name) {
+    static long  cached_code = -1;
+    static char  cached_name[64];
+    if (cached_code < 0) {
+        cached_code = 545;                       // 1.28's, the historical default
+        snprintf(cached_name, sizeof cached_name, "1.28.0_4124311467");
+        char path[1024];
+        // apktool.yml sits beside assets/, one level up from the assets dir.
+        snprintf(path, sizeof path, "%s/../apktool.yml", g_assets_dir);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char line[256];
+            long  got_code = -1;
+            char  got_name[64] = {0};
+            while (fgets(line, sizeof line, f)) {
+                char buf[64];
+                if (sscanf(line, " versionCode: '%ld'", &got_code) == 1) continue;
+                if (sscanf(line, " versionCode: %ld", &got_code) == 1) continue;
+                if (sscanf(line, " versionName: %63s", buf) == 1)
+                    snprintf(got_name, sizeof got_name, "%s", buf);
+            }
+            fclose(f);
+            if (got_code > 0) cached_code = got_code;
+            if (*got_name) snprintf(cached_name, sizeof cached_name, "%s", got_name);
+            KLJ_LOG("guest version %ld / %s (from %s)", cached_code, cached_name, path);
+        } else {
+            KLJ_LOG("no apktool.yml beside %s — falling back to versionCode %ld / %s. "
+                    "A split-binary guest builds its OBB NAME from this number.",
+                    g_assets_dir, cached_code, cached_name);
+        }
+    }
+    if (code) *code = cached_code;
+    if (name) *name = cached_name;
+}
+
+static klj_val klj_PackageInfo_versionCode(void) {
+    long code; klj_guest_version(&code, NULL);
+    return (klj_val){.j = (uint64_t)(int64_t)code};
+}
+static klj_val klj_PackageInfo_versionName(void) {
+    const char *name; klj_guest_version(NULL, &name);
+    return (klj_val){.l = kl_jni_new_string(name)};
+}
+
+// PackageInfo, like ApplicationInfo, is read field-by-field.
 static klj_val klj_PM_getPackageInfo(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *pi;
@@ -4693,9 +5080,122 @@ static klj_val klj_Environment_getExternalStorageDirectory(void *env, void *self
 // There is no ARCore here and there never will be — Vision Pro's world sensing
 // arrives through ARKit under our own ovrp_* layer (M6), not through Google AR.
 // False is the truthful answer, and Unity has a supported no-AR path.
+// libOculusXRPlugin's GetIsSupportedDevice() upcall, and the gate Beat Saber
+// 1.40 fails without: the Oculus XR Plugin loader refuses to initialize on
+// what it decides is "a non-Oculus device" and calls Application.Quit().
+//
+// Not invented — this is the guest's own OculusUnity.getIsOnOculusHardware(),
+// transcribed: `Build.MANUFACTURER.toLowerCase(Locale.ENGLISH).contains("oculus")`.
+// We present Build.MANUFACTURER = "Oculus" (the settled decision in CLAUDE.md),
+// so running the guest's test against our own answer gives true, and answering
+// true here is the same statement made directly rather than through three
+// String methods. Read back through kl_jni_build_string for exactly that
+// reason: that is the single source Build.MANUFACTURER and
+// ro.product.manufacturer already answer from, so this cannot drift away from
+// the field it is supposed to be reading — and if the presented manufacturer is
+// ever changed, this answers false, which is then correct rather than stale.
+static klj_val klj_OculusUnity_isOnOculusHardware(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    const char *mfr = kl_jni_build_string("MANUFACTURER");
+    int oculus = mfr && strcasestr(mfr, "oculus") != NULL;
+    KLJ_LOG("OculusUnity.getIsOnOculusHardware() -> %s (Build.MANUFACTURER = \"%s\")",
+            oculus ? "true" : "false", mfr ? mfr : "(unset)");
+    return (klj_val){.j = (uint64_t)oculus};
+}
+
+// OculusUnity.loadLibrary(name) — a logged wrapper around System.loadLibrary
+// (OculusUnity.smali:69: Log.d then System.loadLibrary). Delegated to
+// UnityPlayer.loadLibrary, which is the same wrapper for the other plugin, so
+// every library the guest loads through Java goes through one path and gets its
+// JNI_OnLoad called. Its own return is void; the boolean is discarded here
+// exactly as the guest's `invoke-static` discards it.
+static klj_val klj_UnityPlayer_loadLibrary(void *env, void *self, const klj_val *a, int n);
+
+static klj_val klj_OculusUnity_loadLibrary(void *env, void *self, const klj_val *a, int n) {
+    klj_UnityPlayer_loadLibrary(env, self, a, n);
+    return (klj_val){.l = NULL};
+}
+
+// OculusUnity.getManifestSetting(key) and the three named wrappers over it.
+// Transcribed from OculusUnity.smali:78-85 — it reads
+// ApplicationInfo.metaData.getBoolean(key), which is the same Bundle
+// klj_metaData_field serves, now parsed from the guest's own manifest. So these
+// answer whatever the APK declares rather than a policy of ours, and the four
+// entry points cannot disagree because there is one lookup behind them.
+//
+// Android's Bundle.getBoolean returns false for a missing key, which is also
+// what the guest's own catch block returns, so an absent key needs no special
+// case.
+static const char *klj_bundle_get(void *self, const char *key);
+static klj_val klj_metaData_field(void);
+
+static int klj_oculus_manifest_flag(const char *key) {
+    const char *v = klj_bundle_get(klj_metaData_field().l, key);
+    int on = v && (strcasecmp(v, "true") == 0 || strcmp(v, "1") == 0);
+    KLJ_LOG("OculusUnity.getManifestSetting(\"%s\") -> %s%s", key,
+            on ? "true" : "false", v ? "" : " (not declared)");
+    return on;
+}
+
+static klj_val klj_OculusUnity_manifestSetting(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return (klj_val){.j = (uint64_t)klj_oculus_manifest_flag(n > 0 ? klj_str(a[0].l) : "")};
+}
+
+#define KLJ_OCULUS_FLAG(fn, key)                                                  \
+    static klj_val fn(void *env, void *self, const klj_val *a, int n) {           \
+        (void)env; (void)self; (void)a; (void)n;                                  \
+        return (klj_val){.j = (uint64_t)klj_oculus_manifest_flag(key)};           \
+    }
+KLJ_OCULUS_FLAG(klj_OculusUnity_lowOverhead,      "com.unity.xr.oculus.LowOverheadMode")
+KLJ_OCULUS_FLAG(klj_OculusUnity_lateLatching,     "com.unity.xr.oculus.LateLatching")
+KLJ_OCULUS_FLAG(klj_OculusUnity_lateLatchingDebug,"com.unity.xr.oculus.LateLatchingDebug")
+#undef KLJ_OCULUS_FLAG
+
 static klj_val klj_UnityPlayer_initializeGoogleAr(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 0};
+}
+
+// Google Play Asset Delivery — Beat Saber 1.40's first stop after initJni, and
+// the reason its assets load differently from 1.28's. Unity 2021+ always
+// compiles the wrapper in and asks for it at startup.
+//
+// The absence is reported through playCoreApiMissing(), NOT by returning NULL
+// from init(), and this is read off the guest's own smali rather than guessed:
+// init() constructs the singleton unconditionally and its only other exit is a
+// RuntimeException for being called twice, so NULL is not in its range at all.
+// Answering NULL got exactly the failure that implies — Unity does not test it,
+// and called GetObjectClass on 0 one line later.
+//
+// playCoreApiMissing() is the real question, and it is `this.a == null`, i.e.
+// "the Play Core AssetPackManager did not construct". True is the truthful
+// answer: Play Asset Delivery is the Play Store's delivery channel, this is a
+// Meta Store build, and there is no Play Store on a Quest OR on a Vision Pro.
+// The same "the platform is genuinely absent" story kl_ovrplat.c tells for the
+// Oculus Platform and bindService tells for Play Services — and every Quest
+// takes this branch on real hardware, so it is a path Unity supports.
+//
+// What it falls through to is the split application binary: assets/unity_obb_guid
+// in the APK marks the build as one, so Unity looks for the OBB instead.
+static klj_val klj_PlayAssetDelivery_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *singleton;      // init() is a singleton factory; getInstance()
+    if (!singleton)              // hands back the same object, so identity matters
+        singleton = klj_new_object_data("com/unity3d/player/PlayAssetDeliveryUnityWrapper", NULL);
+    KLJ_LOG("PlayAssetDeliveryUnityWrapper.init() -> wrapper "
+            "(playCoreApiMissing will answer true: no Play Store here)");
+    return (klj_val){.l = singleton};
+}
+
+static klj_val klj_PlayAssetDelivery_getInstance(void *env, void *self, const klj_val *a, int n) {
+    return klj_PlayAssetDelivery_init(env, self, a, n);
+}
+
+static klj_val klj_PlayAssetDelivery_missing(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};        // Play Core is absent — see above
 }
 
 static klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {
@@ -5633,6 +6133,10 @@ static const klj_binding g_bindings[] = {
     {"android/hardware/input/InputManager", "registerInputDeviceListener",
      "(Landroid/hardware/input/InputManager$InputDeviceListener;Landroid/os/Handler;)V",
      klj_InputManager_registerListener},
+    {"android/hardware/input/InputManager", "getInputDeviceIds", "()[I",
+     klj_InputManager_getInputDeviceIds},
+    {"android/hardware/input/InputManager", "getInputDevice",
+     "(I)Landroid/view/InputDevice;", klj_InputManager_getInputDevice},
     {"android/media/AudioManager", "getStreamVolume", "(I)I", klj_AudioManager_getStreamVolume},
     {"android/media/AudioManager", "getStreamMinVolume", "(I)I", klj_AudioManager_getStreamMinVolume},
     {"android/media/AudioManager", "getStreamMaxVolume", "(I)I", klj_AudioManager_getStreamMaxVolume},
@@ -5705,6 +6209,17 @@ static const klj_binding g_bindings[] = {
     {"android/view/Display", "getAppVsyncOffsetNanos",        "()J", klj_Display_getAppVsyncOffsetNanos},
     {"android/view/Display", "getPresentationDeadlineNanos",  "()J", klj_Display_getPresentationDeadlineNanos},
     {"android/view/Display", "isWideColorGamut",              "()Z", klj_Display_isWideColorGamut},
+    {"android/view/Display", "isHdr",                         "()Z", klj_Display_isHdr},
+    {"android/view/Display", "getSupportedModes",
+     "()[Landroid/view/Display$Mode;", klj_Display_getSupportedModes},
+    {"android/view/Display$Mode", "getModeId",         "()I", klj_Mode_getModeId},
+    {"android/view/Display$Mode", "getPhysicalWidth",  "()I", klj_Mode_getPhysicalWidth},
+    {"android/view/Display$Mode", "getPhysicalHeight", "()I", klj_Mode_getPhysicalHeight},
+    {"android/view/Display$Mode", "getRefreshRate",    "()F", klj_Mode_getRefreshRate},
+    {"com/unity3d/player/UnityPlayer", "skipPermissionsDialog", "()Z",
+     klj_UnityPlayer_skipPermissionsDialog},
+    {"com/unity3d/player/UnityPlayer", "requestUserAuthorization",
+     "(Ljava/lang/String;)V", klj_UnityPlayer_requestUserAuthorization},
     {"android/view/Window",  "getAttributes",
      "()Landroid/view/WindowManager$LayoutParams;", klj_Window_getAttributes},
     {"android/content/res/Resources", "getIdentifier",
@@ -5750,6 +6265,7 @@ static const klj_binding g_bindings[] = {
     {"java/util/Locale", "getDefault",  "()Ljava/util/Locale;",   klj_Locale_getDefault},
     {"java/util/Locale", "getLanguage", "()Ljava/lang/String;",   klj_Locale_getLanguage},
     {"java/util/Locale", "getCountry",  "()Ljava/lang/String;",   klj_Locale_getCountry},
+    {"java/util/Locale", "toLanguageTag", "()Ljava/lang/String;", klj_Locale_toLanguageTag},
     {"android/media/AudioManager", "getDevices", "(I)[Landroid/media/AudioDeviceInfo;", klj_AudioManager_getDevices},
     {"android/media/MediaRouter", "getSelectedRoute", "(I)Landroid/media/MediaRouter$RouteInfo;", klj_MediaRouter_getSelectedRoute},
     {"android/media/MediaRouter$RouteInfo", "getPresentationDisplay", "()Landroid/view/Display;", klj_RouteInfo_getPresentationDisplay},
@@ -5944,6 +6460,26 @@ static const klj_binding g_bindings[] = {
     {"java/lang/String", "equals", "(Ljava/lang/Object;)Z", klj_String_equals},
     {"java/lang/String", "length", "()I",                   klj_String_length},
     {"com/unity3d/player/UnityPlayer", "initializeGoogleAr", "()Z", klj_UnityPlayer_initializeGoogleAr},
+    {"com/unity/oculus/OculusUnity", "getIsOnOculusHardware", "()Z",
+     klj_OculusUnity_isOnOculusHardware},
+    {"com/unity/oculus/OculusUnity", "loadLibrary", "(Ljava/lang/String;)V",
+     klj_OculusUnity_loadLibrary},
+    {"com/unity/oculus/OculusUnity", "getManifestSetting", "(Ljava/lang/String;)Z",
+     klj_OculusUnity_manifestSetting},
+    {"com/unity/oculus/OculusUnity", "getLowOverheadMode", "()Z",
+     klj_OculusUnity_lowOverhead},
+    {"com/unity/oculus/OculusUnity", "getLateLatching", "()Z",
+     klj_OculusUnity_lateLatching},
+    {"com/unity/oculus/OculusUnity", "getLateLatchingDebug", "()Z",
+     klj_OculusUnity_lateLatchingDebug},
+    {"com/unity3d/player/PlayAssetDeliveryUnityWrapper", "init",
+     "(Landroid/content/Context;)Lcom/unity3d/player/PlayAssetDeliveryUnityWrapper;",
+     klj_PlayAssetDelivery_init},
+    {"com/unity3d/player/PlayAssetDeliveryUnityWrapper", "getInstance",
+     "()Lcom/unity3d/player/PlayAssetDeliveryUnityWrapper;",
+     klj_PlayAssetDelivery_getInstance},
+    {"com/unity3d/player/PlayAssetDeliveryUnityWrapper", "playCoreApiMissing", "()Z",
+     klj_PlayAssetDelivery_missing},
 
     {"bitter/jnibridge/JNIBridge", "newInterfaceProxy",
      "(J[Ljava/lang/Class;)Ljava/lang/Object;", klj_JNIBridge_newInterfaceProxy},

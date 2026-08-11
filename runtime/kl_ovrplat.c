@@ -339,7 +339,27 @@ static int plat_is_request(const char *name) {
     return 0;
 }
 
+// The real libovrplatformloader exports JNI_OnLoad and caches the JavaVM out of
+// it. Ours has no JNI surface to set up, so the whole body is the version
+// number Android checks for.
+//
+// Reached only because System.load() now honours the Android contract and calls
+// JNI_OnLoad on what it loaded (kl_jni.c). Before that, this library was
+// dlopen'd and never initialized, and nothing noticed — which is exactly the
+// bug that change fixes, so this is the cost of fixing it rather than a
+// workaround. Answering the version is not a stub: a library that returns an
+// unrecognised version is one that REFUSED to initialize, and Android unloads it.
+//
+// Below plat_is_drm in kl_ovrplat_sym, like everything in this table, so the
+// entitlement classifier still runs first and this cannot be a way around it.
+static uint64_t klplat_JNI_OnLoad(void *vm, void *reserved) {
+    (void)vm; (void)reserved;
+    plat_hit("JNI_OnLoad");
+    return 0x00010006;                 // JNI_VERSION_1_6
+}
+
 static const struct { const char *name; void *fn; } g_plat_impl[] = {
+    {"JNI_OnLoad",                (void *)klplat_JNI_OnLoad},
     {"ovr_IsPlatformInitialized", (void *)klplat_IsPlatformInitialized},
     {"ovr_PopMessage",            (void *)klplat_PopMessage},
     {"ovr_Entitlement_GetIsViewerEntitled", (void *)klplat_Entitlement_GetIsViewerEntitled}

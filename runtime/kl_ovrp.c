@@ -164,6 +164,11 @@ static const char *klovrp_GetVersion(void) {
     return "1.60.0";
 }
 
+static const char *klovrp_GetVersion2(void) {
+    ovrp_hit("ovrp_GetVersion2");
+    return "1.60.0";
+}
+
 // ovrpSystemHeadset. The value is read out of the guest's own IL2CPP metadata
 // rather than from an OVRPlugin header we do not have: global-metadata.dat lists
 // the enum as Oculus_Quest, Oculus_Quest_2, Placeholder_10 .. Placeholder_14,
@@ -2306,6 +2311,20 @@ static void klovrp_UnityPluginLoad(void *unity_interfaces) {
 }
 static void klovrp_UnityPluginUnload(void) {}
 
+// The real OVRPlugin exports JNI_OnLoad and caches the JavaVM out of it. Ours
+// has no JNI surface to set up — every entry point here is answered from
+// kl_ovrp's own state, and the VM is reachable through kl_jni_vm() anywhere it
+// were ever needed — so the whole body is the version number Android checks.
+//
+// It is reached at all only because System.load() now honours the Android
+// contract and calls JNI_OnLoad on what it loaded (kl_jni.c). Answering the
+// version is not a stub: returning nothing, or a version Android does not
+// recognise, is how a real library reports that it refused to initialize.
+static int klovrp_JNI_OnLoad(void *vm, void *reserved) {
+    (void)vm; (void)reserved;
+    return 0x00010006;                 // JNI_VERSION_1_6, as the real one returns
+}
+
 static const char g_ovrp_handle[] = "klepton-ovrplugin";
 
 // Assembly entry thunks that capture the x8 sret pointer before any call can
@@ -2338,7 +2357,9 @@ int kl_ovrp_is_handle(const void *h) { return h == (const void *)g_ovrp_handle; 
 static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"UnityPluginLoad",   (void *)klovrp_UnityPluginLoad},
     {"UnityPluginUnload", (void *)klovrp_UnityPluginUnload},
+    {"JNI_OnLoad",        (void *)klovrp_JNI_OnLoad},
     {"ovrp_GetVersion",   (void *)klovrp_GetVersion},
+    {"ovrp_GetVersion2",   (void *)klovrp_GetVersion2},
     {"ovrp_GetSystemHeadsetType", (void *)klovrp_GetSystemHeadsetType},
     {"ovrp_GetSystemProductName", (void *)klovrp_GetSystemProductName},
     {"ovrp_GetSystemDisplayFrequency", (void *)klovrp_GetSystemDisplayFrequency},
