@@ -958,9 +958,17 @@ except its own control vars (next section). See PLANNING §12.
   be A/B'd from one build without regenerating the project — but note the two
   apps embed **different guest frameworks**, so pointing one at the other's
   target fails at `kl_app_configure` with "missing guest libraries".
-- `KL_IMMERSIVE=0` — the immersive space is the **default**; `=0` restores
-  P4's window-and-report shape, which has to stay takeable because it is the
-  measurement that localises a device regression.
+- `KL_IMMERSIVE=0` — the immersive space is the default **for Beat Saber**;
+  `=0` restores P4's window-and-report shape, which has to stay takeable because
+  it is the measurement that localises a device regression. **For
+  `steamlink-vr` the default is the other way round** — that guest cannot draw
+  without an authorized session, so the default launch would open a space that
+  is black by construction and hide the one surface with information on it.
+  `KL_IMMERSIVE=1` turns it on for a run that HAS a session. Note the window
+  path never opens a `LayerRenderer.Drawable`, so nothing measures the display:
+  the guest gets Quest 2 defaults and a **zero IPD**, and `KL_OVRP_IPD=0.063` is
+  required there for the reason SL-12 records (see `notes/VISIONOS.md`, "The eye
+  geometry has ONE source").
 - `KL_AUTOBOOT=0` — autoboot is the default too; `=0` restores the
   Boot-button-only shape, for attaching a debugger or starting a GPU capture
   before the guest runs.

@@ -33,12 +33,28 @@ func klEnvFloat(_ name: String, _ dflt: Float) -> Float {
 
 enum Immersive {
     static let id = "KleptonImmersive"
-    // Default ON. Klepton runs a VR title, so the immersive space is the app —
-    // launching from the Home View and getting a window with a Boot button is
-    // not a sensible product, it is a test harness. P4's window-and-report
-    // shape is still exactly one knob away (KL_IMMERSIVE=0) and has to stay so,
-    // because it is the measurement that localises a device regression.
-    static var wanted: Bool { klEnvOn("KL_IMMERSIVE", default: true) }
+    // Default ON for Beat Saber, OFF for Steam Link, and the difference is not a
+    // preference — it is what each app can currently put on screen.
+    //
+    // Klepton runs a VR title, so the immersive space IS the app: launching from
+    // the Home View and getting a window with a Boot button is a test harness,
+    // not a product. P4's window-and-report shape stays exactly one knob away
+    // (KL_IMMERSIVE=0) because it is the measurement that localises a device
+    // regression.
+    //
+    // Steam Link is the other way round until its 2D shell has a window. Its VR
+    // half cannot draw anything without an authorized session, and a session
+    // arrives by hand (KL_SLINK_SARGS) — so the default launch opens an
+    // immersive space that is black by construction and hides the one surface
+    // with information on it. KL_IMMERSIVE=1 turns it on for a run that HAS a
+    // session, which is the run that wants it.
+    //
+    // Reads kl_app_target_is_steamlink(), so it is only meaningful after
+    // kl_app_configure. Both call sites are inside boot(), after configure has
+    // returned; the scene body reads `mixed`, not this.
+    static var wanted: Bool {
+        klEnvOn("KL_IMMERSIVE", default: kl_app_target_is_steamlink() == 0)
+    }
 
     // .mixed by default now that the picture works. The guest renders an opaque
     // world so passthrough shows through nowhere it matters, and being able to
@@ -316,10 +332,21 @@ struct BootView: View {
             // it made the window path on that target load the chain, report, and
             // then never call ANativeActivity_onCreate at all: a run that looks
             // finished and never started the activity.
+            // ...and whether it is asked for AT ALL differs too. Beat Saber's
+            // window path stops at initJni unless KL_FRAMES says otherwise,
+            // because continuing is what P4's gate must not do. Steam Link's has
+            // no such reason: its chain report is printed and complete BEFORE
+            // the activity starts, so that measurement stays takeable from any
+            // run, and stopping there instead would mean the default launch
+            // loads the guest and then does nothing at all. So it always runs,
+            // bounded by KL_SLINK_WAIT (30 s by default) — bounded rather than
+            // open-ended because the media/audio/XR/GL report is written at the
+            // END of the pump, and that is the report a working run has no other
+            // way of producing.
             let env = ProcessInfo.processInfo.environment
-            let asked = kl_app_target_is_steamlink() != 0
-                        ? env["KL_SLINK_WAIT"] : env["KL_FRAMES"]
-            if result == 0, !Immersive.wanted, asked != nil {
+            let steamlink = kl_app_target_is_steamlink() != 0
+            if result == 0, !Immersive.wanted,
+               steamlink || env["KL_FRAMES"] != nil {
                 result = kl_app_lifecycle(UInt32(env["KL_FRAMES"] ?? "") ?? 1)
             }
             poll.invalidate()
