@@ -63,9 +63,14 @@ static void install_fault_reporter(void) {
 // what was looked up, and the surface report separates entitlement lookups out
 // specifically so a real one is visible — probing from the parent would leave our
 // own test sitting in that list, indistinguishable from the guest asking.
-// Does calling `name` abort? Runs it in a child, because passing means dying.
-// Returns 1 = aborted, 0 = returned a value, -1 = the name resolved to nothing.
-static int drm_call_aborts(const char *name) {
+// What does calling `name` actually do? Run it in a child, because for most of
+// this surface the PASSING outcome is death. The value matters as well as the
+// refusal now — the line below distinguishes the application's own entitlement
+// (answered, and answered yes) from DLC (refused), and "it returned something"
+// cannot tell those apart.
+enum { KLDRM_UNRESOLVED = -1, KLDRM_ABORTED, KLDRM_ZERO, KLDRM_NONZERO };
+
+static int drm_call(const char *name) {
     fflush(NULL);
     pid_t p = fork();
     if (p == 0) {
@@ -73,29 +78,61 @@ static int drm_call_aborts(const char *name) {
         freopen("/dev/null", "w", stderr);
         void *fn = kl_ovrplat_sym(name);
         if (!fn) _exit(2);              // resolved to nothing at all
-        ((uint64_t (*)(void))fn)();
-        _exit(3);                       // returned a value
+        uint64_t v = ((uint64_t (*)(void))fn)();
+        _exit(v ? 4 : 3);
     }
     int st = 0;
     waitpid(p, &st, 0);
-    if (WIFEXITED(st) && WEXITSTATUS(st) == 2) return -1;
-    return WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT;
+    if (WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT) return KLDRM_ABORTED;
+    if (!WIFEXITED(st)) return KLDRM_UNRESOLVED;
+    switch (WEXITSTATUS(st)) {
+    case 3: return KLDRM_ZERO;
+    case 4: return KLDRM_NONZERO;
+    default: return KLDRM_UNRESOLVED;
+    }
 }
 
+// The line this asserts, in both directions. It moved once, deliberately, and
+// the move is the reason the value is now checked rather than just the refusal:
+//
+//   The APPLICATION's own entitlement is answered, and answered yes. Klepton
+//   runs an APK unpacked from a device the user owns, so ownership of the
+//   application itself is the one thing in this family we can actually assert
+//   — and it is asserted about a title the user already bought. It is not a
+//   fabricated answer in the sense the refusals below are about; it is the
+//   true state of affairs for the only way this project is used.
+//
+//   DLC is a different question and stays refused, because it is one we
+//   genuinely cannot answer: paid content here is out-of-band asset data plus
+//   a licence held by a platform that is absent, and neither half is on this
+//   host to check. Claiming ownership of content we cannot see IS the
+//   circumvention, so it keeps aborting by name.
+//
+// The two are separable because the API separates them — the viewer-entitled
+// call is about the app, the AssetFile and IAP families are about content.
 static int check_drm_guard(void) {
-    // 1. The licence check itself must die rather than answer.
-    int r = drm_call_aborts("ovr_Entitlement_GetIsViewerEntitled");
-    if (r < 0) return fail("entitlement guard: the name resolved to nothing");
-    if (!r)
-        return fail("entitlement guard did NOT abort — an ownership query would be "
-                    "answered, which is exactly what must not happen");
+    // 1. The application's own entitlement: answered, and non-zero. Checked for
+    //    its VALUE, since a 0 here reads to the guest as "not entitled" and
+    //    sends a legitimately-owned title down its licence-failure path.
+    int r = drm_call("ovr_Entitlement_GetIsViewerEntitled");
+    if (r == KLDRM_UNRESOLVED)
+        return fail("entitlement guard: the name resolved to nothing");
+    if (r == KLDRM_ABORTED)
+        return fail("entitlement guard ABORTED — the application's own entitlement "
+                    "is the one we can assert, and refusing it stops a title the "
+                    "user owns");
+    if (r != KLDRM_NONZERO)
+        return fail("entitlement guard answered 0 — that reads as 'not entitled' "
+                    "and is the licence-failure path, not a neutral answer");
 
-    // 2. So must anything that would DELIVER paid content. This is also what
-    //    proves the ovr_AssetFile_GetList carve-out below is an exact name and
-    //    not a widening of the "AssetFile" marker to the whole family.
-    r = drm_call_aborts("ovr_AssetFile_DownloadById");
-    if (r < 0) return fail("DRM guard: ovr_AssetFile_DownloadById resolved to nothing");
-    if (!r)
+    // 2. Anything that would DELIVER paid content must still die rather than
+    //    answer. This is also what proves the ovr_AssetFile_GetList carve-out
+    //    below is an exact name and not a widening of the "AssetFile" marker to
+    //    the whole family.
+    r = drm_call("ovr_AssetFile_DownloadById");
+    if (r == KLDRM_UNRESOLVED)
+        return fail("DRM guard: ovr_AssetFile_DownloadById resolved to nothing");
+    if (r != KLDRM_ABORTED)
         return fail("DRM guard did NOT abort on ovr_AssetFile_DownloadById — a "
                     "content-delivery call must never be answered");
 
@@ -103,14 +140,15 @@ static int check_drm_guard(void) {
     //    answered with "none", because that grants nothing (kl_ovrplat.c,
     //    g_plat_absent). If this ever starts aborting the game stops at the
     //    language select again.
-    r = drm_call_aborts("ovr_AssetFile_GetList");
-    if (r < 0) return fail("ovr_AssetFile_GetList resolved to nothing");
-    if (r)
+    r = drm_call("ovr_AssetFile_GetList");
+    if (r == KLDRM_UNRESOLVED) return fail("ovr_AssetFile_GetList resolved to nothing");
+    if (r == KLDRM_ABORTED)
         return fail("ovr_AssetFile_GetList aborted — enumerating DLC we do not have "
                     "is a fact about this host, not a licence decision");
 
-    printf("  entitlement/ownership queries refuse and abort (guard verified);\n"
-           "  DLC enumeration answers \"none\" without granting anything\n");
+    printf("  the app's own entitlement answers yes, DLC delivery refuses and\n"
+           "  aborts (guard verified); DLC enumeration answers \"none\" without\n"
+           "  granting anything\n");
     return 0;
 }
 

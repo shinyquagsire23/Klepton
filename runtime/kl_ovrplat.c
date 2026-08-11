@@ -36,7 +36,9 @@ static void plat_hit(const char *name) {
 // lands on the refusal by default, which is the direction an error should fall.
 //
 // What is covered and why:
-//   Entitle*  — "is this user allowed to run this", the app-level licence check.
+//   Entitle*  — "is this user allowed to run this", the licence check. Note the
+//               g_plat_absent carve-out below: the APP's own entitlement is
+//               answered, everything else in the family still refuses.
 //   IAP       — purchases and their ownership records.
 //   AssetFile — download and unlock of purchasable DLC; the delivery half of the
 //               same question. ovr_AssetFile_* is how paid content arrives.
@@ -47,34 +49,41 @@ static const char *const g_drm_markers[] = {
     "Entitle", "Entitlement", "IAP", "Purchase", "AssetFile", "AssetDetails",
 };
 
-// The carve-out: ownership-ADJACENT calls we answer, because the honest answer
-// grants nothing.
-//
-// The line PLANNING 8 draws is against fabricating a POSITIVE entitlement —
-// telling the app the user owns something they do not. Reporting that no DLC is
-// present is the opposite of that. It unlocks nothing, it is strictly more
-// restrictive than the truth, and it is the same "the platform is absent" story
-// ovr_IsPlatformInitialized and ovr_PopMessage already tell. No content is
-// reachable through a run that answers this which was not reachable through a
-// run that aborted on it.
-//
-// Exact names, not substrings, and checked BEFORE the markers below — so the
+// The carve-outs: names in the ownership families that we ANSWER rather than
+// refuse. There are exactly two, they earn it for two DIFFERENT reasons, and
+// neither reason generalises to the rest of the family — which is why these are
+// exact names, not substrings, and are checked BEFORE the markers below, so the
 // marker list keeps its fail-closed default and anything new still lands on the
-// refusal. Each entry has to earn its place on the "enumerates, never grants"
-// test:
+// refusal.
 //
 //   ovr_AssetFile_GetList — enumerates the DLC asset files present on this
 //     device. There are none, and saying so is a fact about this host rather
-//     than a licence decision. It carries no entitlement flag: the ownership
-//     question is asked by the Entitlement/IAP families, which stay refused,
-//     as does everything that could DELIVER content (ovr_AssetFile_Download*).
+//     than a licence decision. It unlocks nothing and is strictly MORE
+//     restrictive than the truth: no content is reachable through a run that
+//     answers it which was not reachable through a run that aborted on it. It
+//     carries no entitlement flag — the ownership question is asked by the
+//     Entitlement/IAP families, and everything that could DELIVER content
+//     (ovr_AssetFile_Download*) stays refused.
 //
-// Answered through klplat_init_fails, i.e. request id 0: the platform request
-// APIs are asynchronous and ovr_PopMessage never produces a message, so a
-// plausible id would leave the caller polling forever for a completion that
-// cannot come. 0 puts it on the error path it already has.
+//   ovr_Entitlement_GetIsViewerEntitled — the APPLICATION's own licence check,
+//     and the one question in this family we can actually answer. Klepton runs
+//     an APK the user unpacked from a device they own, i.e. from a copy of the
+//     app they already bought; answering yes describes that, it does not
+//     manufacture it. This is a deliberate move of the line and it is confined
+//     to the app: DLC ownership stays refused because it is genuinely
+//     unanswerable here — paid content is out-of-band asset data plus a licence
+//     held by a platform that is absent from this host, so neither half is
+//     present to check, and claiming it IS the circumvention. It is answered
+//     for real (klplat_Entitlement_GetIsViewerEntitled) rather than through the
+//     request path below, because it returns its answer directly.
+//
+// The remaining entries are answered through klplat_init_fails, i.e. request id
+// 0: the platform request APIs are asynchronous and ovr_PopMessage never
+// produces a message, so a plausible id would leave the caller polling forever
+// for a completion that cannot come. 0 puts it on the error path it already has.
 static const char *const g_plat_absent[] = {
     "ovr_AssetFile_GetList",
+    "ovr_Entitlement_GetIsViewerEntitled",
 };
 
 static int plat_is_absent_ok(const char *name) {
@@ -90,11 +99,13 @@ static int plat_is_drm(const char *name) {
     return 0;
 }
 
-// Ownership and licence queries. This aborts unconditionally — KL_PERMISSIVE is a
-// scouting knob for things we intend to implement, and this is not one of them.
-// Answering 0 would be worse than useless here: for a call shaped like
-// ovr_Entitlement_GetIsViewerEntitled a fabricated answer is the circumvention
-// itself, and a permissive run would produce it silently.
+// Ownership and licence queries — everything the carve-out above does NOT name,
+// which after it is the CONTENT half: IAP, purchase records, asset details, and
+// the delivery calls. This aborts unconditionally — KL_PERMISSIVE is a scouting
+// knob for things we intend to implement, and this is not one of them. Answering
+// 0 would be worse than useless here: for a call shaped like ovr_IAP_GetProducts
+// or ovr_AssetFile_DownloadById a fabricated answer is the circumvention itself,
+// and a permissive run would produce it silently.
 static uint64_t klplat_drm(const char *name) {
     int s = plat_slot(name);
     if (s >= 0) { g_plat[s].calls++; g_plat[s].drm = 1; }
@@ -140,6 +151,19 @@ static uint64_t klplat_called(const char *name) {
 static uint64_t klplat_IsPlatformInitialized(void) {
     plat_hit("ovr_IsPlatformInitialized");
     return 0;
+}
+
+// The app's own licence check — see the g_plat_absent carve-out above for why
+// this one is answered and the rest of the family is not: the user unpacked
+// their own APK, so a licence to the application itself is something we can
+// assert, while DLC needs out-of-band asset data and a licence we genuinely
+// cannot verify. Non-zero is load-bearing rather than incidental — 0 here is
+// the guest's licence-FAILURE path, not a neutral answer — so m_boot's
+// check_drm_guard asserts the value, in both directions along with the
+// refusals it sits beside.
+static uint64_t klplat_Entitlement_GetIsViewerEntitled(void) {
+    plat_hit("ovr_Entitlement_GetIsViewerEntitled");
+    return 1;
 }
 
 // The message pump. Returning NULL means "no messages queued", which is true and
@@ -318,6 +342,7 @@ static int plat_is_request(const char *name) {
 static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_IsPlatformInitialized", (void *)klplat_IsPlatformInitialized},
     {"ovr_PopMessage",            (void *)klplat_PopMessage},
+    {"ovr_Entitlement_GetIsViewerEntitled", (void *)klplat_Entitlement_GetIsViewerEntitled}
 };
 
 static const char g_plat_handle[] = "klepton-ovrplatformloader";
