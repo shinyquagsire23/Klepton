@@ -123,9 +123,15 @@ static int branch_sys(uint32_t w, klx_info *o) {
         // afterwards — there is no memory-indirect branch on A64. blr would in
         // fact fall through (it returns to just after itself), but that leaves
         // x30 pointing into the veneer, which an unwinder would not recognise.
-        // Two sites exist in the whole corpus, both jump tables in libunity's
-        // UTF-8 decoder, and x16/x17 are provably live across them. Refused.
-        o->hazard = KLX_HZ_NOFALL;
+        //
+        // `br` alone is separable, and the emitter serves it: because control
+        // never comes back, the register it branches through does not have to be
+        // restored — it only has to be one the destination does not need. That
+        // is exactly x18 and nothing else, which is why this is a special case
+        // rather than the general shape. See the KLX_HZ_TERMBR arm of the
+        // emitter for the argument and for the window it cannot close.
+        o->hazard = ((w & 0xFFFFFC1Fu) == 0xD61F0000u) ? KLX_HZ_TERMBR
+                                                       : KLX_HZ_NOFALL;
         addfld(o, w, KLX_RN, KLX_R);
         return 1;
     }
@@ -749,6 +755,55 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
             out += k;
             w[i] = patch;
             st->ctr_patched++;
+            continue;
+        }
+
+        // `br x18` — trap 0's one terminal case, and the only site shape served
+        // without a spill or a scratch register:
+        //
+        //      mrs  x18, tpidrro_el0
+        //      ldr  x18, [x18, #slot*8]
+        //      br   x18
+        //
+        // Why x18 and only x18. An indirect branch needs a register still holding
+        // the target when it branches, and control never returns, so that
+        // register is never restored — the destination gets it clobbered. Every
+        // ordinary register is therefore unusable unless it is provably dead at
+        // the destination, and at a jump-table dispatch nothing is: all six sites
+        // in libunity are `ldrsw x18,[table,idx]` / `add x18,x18,base` / `br x18`
+        // with x16 AND x17 live across them (libunity+0xab1d70, itself a table
+        // target, reads the x17 set before the branch). x18 is the one register
+        // guest code cannot observe — every guest access to it is veneered to the
+        // TSD slot, so the architectural register carries nothing, which is the
+        // whole premise of this file. Clobbering it costs nothing.
+        //
+        // What this does NOT close: the kernel zeroes x18 on any exception
+        // return, so a timer interrupt landing between the `ldr` and the `br`
+        // branches to 0. That window is one instruction and cannot be made
+        // smaller — a64 has no memory-indirect branch, so the target must sit in
+        // a register across at least one boundary. It is a real race, not a
+        // theoretical one (trap 0), and it is left standing deliberately: the
+        // alternative is refusing the site, which is not a smaller risk but a
+        // CERTAIN branch through a zeroed x18 every time it executes. Beat Saber
+        // 1.6.0 reaches one of these during scene load and dies on it every run.
+        //
+        // It is also self-identifying if it ever fires: a fault at address 0 with
+        // pc 0 and a guest frame above it is this and essentially nothing else,
+        // because a jump-table target is never address 0.
+        if (in.hazard == KLX_HZ_TERMBR) {
+            if (out + VEN_MAX_INSN > pool_end) {
+                note_refusal(word); st->refused++; continue;
+            }
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            body[k++] = enc_mrs_tpidrro(18);
+            body[k++] = enc_ldr(18, 18, (unsigned)KLX_TSD_SLOT * 8);
+            body[k++] = word;                  // br x18, against the loaded value
+            if (!enc_b(spc, vpc, &patch)) { note_refusal(word); st->refused++; continue; }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            st->patched++;
             continue;
         }
 
