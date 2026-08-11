@@ -505,19 +505,43 @@ index 0710ffe..ad3916b 100644
      {
          const ColorBlitParams *colorParams = static_cast<const ColorBlitParams *>(&params);
 diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.h b/src/libANGLE/renderer/metal/mtl_state_cache.h
-index 329402d..aea9ec5 100644
+index 329402d..f010383 100644
 --- a/src/libANGLE/renderer/metal/mtl_state_cache.h
 +++ b/src/libANGLE/renderer/metal/mtl_state_cache.h
-@@ -743,6 +743,12 @@ struct RenderPassDesc
+@@ -15,6 +15,7 @@
+ 
+ #include <unordered_map>
+ 
++#include "common/apple/ObjCPtr.h"   // Klepton: owning rasterizationRateMap
+ #include "common/hash_utils.h"
+ #include "common/unsafe_buffers.h"
+ #include "libANGLE/State.h"
+@@ -743,6 +744,28 @@ struct RenderPassDesc
      uint32_t rasterSampleCount   = 1;
      uint32_t defaultWidth        = 0;
      uint32_t defaultHeight       = 0;
 +
-+    // Klepton: variable rasterization rate. Non-owning — the registry in
-+    // mtl_common.mm holds the reference, and FramebufferMtl::prepareRenderPass
-+    // is the only thing that fills this in. nil on every unfoveated pass, which
-+    // is all of them upstream.
-+    __unsafe_unretained id<MTLRasterizationRateMap> rasterizationRateMap = nil;
++    // Klepton: variable rasterization rate. OWNING, and it has to be.
++    //
++    // This was __unsafe_unretained, on the premise that "the registry in
++    // mtl_common.mm holds the reference". That premise is true only while the
++    // map stays REGISTERED, and a descriptor outlives its registration: ANGLE
++    // caches a framebuffer's RenderPassDesc and rebuilds it only on a GL state
++    // sync, so retiring a map leaves every cached descriptor pointing at it.
++    //
++    // A guest that re-creates its eye textures at a new size does exactly that —
++    // Beat Saber 1.6.0 goes 2290x2400 -> 2748x2880 -> back, retiring a map each
++    // time. The map deallocates, the address is recycled, and the next pass
++    // validated through a stale descriptor dies in Metal's validator:
++    //
++    //   -[OS_dispatch_group screenSize]: unrecognized selector sent to instance
++    //
++    // i.e. a use-after-free wearing whatever the allocator reused the address
++    // for. Owning it here is the fix rather than holding maps alive forever in
++    // the frontend, because THIS is the reference that outlives the registry.
++    // ObjCPtr converts implicitly to the raw pointer, so the comparison in
++    // operator== and the assignment in convertToMetalDesc are unchanged.
++    angle::ObjCPtr<id<MTLRasterizationRateMap>> rasterizationRateMap;
  };
  
  }  // namespace mtl
