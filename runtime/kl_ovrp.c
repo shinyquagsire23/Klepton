@@ -1351,6 +1351,39 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
     g_input[hand].stick_y = stick_y;
 }
 
+// --- ...and the read side, for kl_openxr.c (kl_ovrp.h documents the contract)
+//
+// The pose comes from klovrp_hand(), which is the PINNED one — the same value
+// ovrp_GetNodePoseState hands the other guest in the same frame. Reading
+// g_hand_pose directly here would have been the shorter line and would have
+// reintroduced §12.19's unlatched read in a new API.
+int kl_ovrp_hand_motion(int hand, float *pos, float *quat, float *vel, float *ang) {
+    if ((unsigned)hand > 1) return 0;
+    klovrp_pose p = klovrp_hand(hand);
+    if (pos)  { pos[0] = p.px; pos[1] = p.py; pos[2] = p.pz; }
+    if (quat) { quat[0] = p.qx; quat[1] = p.qy; quat[2] = p.qz; quat[3] = p.qw; }
+    if (vel)  { vel[0] = p.vx; vel[1] = p.vy; vel[2] = p.vz; }
+    if (ang)  { ang[0] = p.avx; ang[1] = p.avy; ang[2] = p.avz; }
+    return __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE) ? 1 : 0;
+}
+
+int kl_ovrp_controller_input(int hand, uint32_t *buttons, uint32_t *touches,
+                             float *index_trigger, float *hand_trigger,
+                             float *stick_x, float *stick_y) {
+    if ((unsigned)hand > 1) return 0;
+    if (buttons)       *buttons = g_input[hand].buttons;
+    if (touches)       *touches = g_input[hand].touches;
+    if (index_trigger) *index_trigger = g_input[hand].index_trigger;
+    if (hand_trigger)  *hand_trigger = g_input[hand].hand_trigger;
+    if (stick_x)       *stick_x = g_input[hand].stick_x;
+    if (stick_y)       *stick_y = g_input[hand].stick_y;
+    // Presence is the pose seam's, not this one's: a frontend that publishes a
+    // hand publishes both in the same breath, and there is no separate "the
+    // buttons are meaningful" signal here. A hand-tracked hand therefore reads
+    // present with every button released, which is the truth about it.
+    return __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE) ? 1 : 0;
+}
+
 // KL_OVRP_HANDS_SWEEP=1: collapse both hands onto the head and sweep their
 // pitch from -70 to +70 degrees in 5-degree steps, holding each step long
 // enough for the KL_OVRP_FAKE_TRIGGER duty cycle to complete two presses.
@@ -1792,6 +1825,14 @@ static struct klovrp_haptics {
     // symptom would be haptics that are merely intermittent rather than absent.
     float    vib_amp;       // 0 = not vibrating
     double   vib_until;     // when this vibration lapses if not refreshed
+    // ...and the OpenXR path (xrApplyHapticFeedback), kept separate from BOTH
+    // of the above for the same reason they are separate from each other. It is
+    // the same shape as the vibration pair — a level with a lapse — but a
+    // different owner, and a shared slot is how one owner's stop erases the
+    // other's buzz with no error anywhere. A run only ever has one of the three
+    // live; the cost of keeping them apart is two floats.
+    float    xr_amp;
+    double   xr_until;
     uint64_t pushes, samples, pulses;
     float    peak;
 } g_hap[2] = {
@@ -1992,6 +2033,48 @@ static float klovrp_hap_min_on(void) {
     return s;
 }
 
+// The OpenXR guest's order, in. See kl_ovrp.h for why this is a third source
+// rather than a reuse of the vibration slot.
+//
+// The clamp on the duration is a real limit, not defensiveness: OpenXR lets an
+// app ask for a vibration lasting minutes, and nothing here can be told to stop
+// once a frontend has been handed a level — so an unbounded one is a controller
+// that buzzes until the process ends. KL_HAPTICS_XR_MAX caps it.
+void kl_ovrp_haptics_apply(int hand, float amplitude, float seconds) {
+    if ((unsigned)hand > 1) return;
+    static float cap = -1.0f;
+    if (cap < 0.0f) cap = kl_env_float("KL_HAPTICS_XR_MAX", 5.0f);
+    float a = amplitude < 0.0f ? 0.0f : amplitude > 1.0f ? 1.0f : amplitude;
+    float s = seconds;
+    if (!(s > 0.0f)) s = klovrp_hap_min_on();   // XR_MIN_HAPTIC_DURATION: a click
+    if (s < klovrp_hap_min_on()) s = klovrp_hap_min_on();
+    if (s > cap) s = cap;
+
+    struct klovrp_haptics *h = &g_hap[hand];
+    double now = klovrp_mono();
+    pthread_mutex_lock(&h->mu);
+    float was = h->xr_amp;
+    h->xr_amp = a;
+    h->xr_until = a > 0.0f ? now + (double)s : 0.0;
+    pthread_mutex_unlock(&h->mu);
+    if (klovrp_hap_trace() && (was > 0.0f) != (a > 0.0f))
+        fprintf(stderr, "  [ovrp] haptics: hand %d xrApplyHapticFeedback %s "
+                        "(amp=%.2f, %.0f ms)\n",
+                hand, a > 0.0f ? "on" : "off", (double)a, (double)s * 1000.0);
+}
+
+void kl_ovrp_haptics_stop(int hand) {
+    if ((unsigned)hand > 1) return;
+    struct klovrp_haptics *h = &g_hap[hand];
+    pthread_mutex_lock(&h->mu);
+    int was = h->xr_amp > 0.0f;
+    h->xr_amp = 0.0f;
+    h->xr_until = 0.0;
+    pthread_mutex_unlock(&h->mu);
+    if (was && klovrp_hap_trace())
+        fprintf(stderr, "  [ovrp] haptics: hand %d xrStopHapticFeedback\n", hand);
+}
+
 int kl_ovrp_haptics_pull(int hand, float *amplitude, float *seconds) {
     if ((unsigned)hand > 1) return 0;
     struct klovrp_haptics *h = &g_hap[hand];
@@ -2008,6 +2091,13 @@ int kl_ovrp_haptics_pull(int hand, float *amplitude, float *seconds) {
     if (h->vib_amp > 0.0f) {
         if (now >= h->vib_until) h->vib_amp = 0.0f;      // lapsed, unrefreshed
         else if (h->vib_amp > amp) amp = h->vib_amp;
+    }
+    // The OpenXR path, merged the same way. Its lapse is the duration the guest
+    // asked for rather than a ceiling on an un-refreshed level, so an
+    // xrApplyHapticFeedback that is never stopped still ends on time.
+    if (h->xr_amp > 0.0f) {
+        if (now >= h->xr_until) h->xr_amp = 0.0f;
+        else if (h->xr_amp > amp) amp = h->xr_amp;
     }
 
     // ALVR's floor: an actuator cannot act on a burst shorter than about 32 ms,

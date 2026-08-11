@@ -65,40 +65,50 @@ BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", KLT["bundle"])
 # them, at the cost of the memory headroom.
 ENTITLEMENTS = os.environ.get("KLEPTON_ENTITLEMENTS", "1") != "0"
 
-# ...and one of those keys is on a different footing from the rest.
+# ...and the keys that are NOT self-service, each with its own escape hatch.
 #
-# com.apple.developer.networking.multicast is granted by REQUEST rather than by
-# enabling a capability (see Klepton.entitlements), so on an account that has
-# not been granted it the build fails with
+# The two memory keys above are safe to attach unconditionally: Xcode's own
+# capability database knows them, they are enabled by ticking a box, and
+# automatic signing adds them to the App ID on the next build. A key that is
+# granted by REQUEST — or that the toolchain does not recognise at all — is on a
+# completely different footing, because attaching one does not degrade. It fails
+# the whole signing step, which takes the memory keys down with it, and those
+# are what stopped the loading-transition kills. That is why
+# `com.apple.developer.networking.multicast` was removed outright once the
+# broadcast fan-out in kl_shim.c made it unnecessary.
 #
-#   error: Provisioning profile "iOS Team Provisioning Profile: dev.klepton.
-#          steamlink" doesn't include the com.apple.developer.networking.
-#          multicast entitlement.
+# So a risky key gets a knob rather than a second authored file — two entitlement
+# files that have to agree is exactly how they stop agreeing. The authored file
+# is the union; the knob FILTERS a generated copy.
 #
-# (Measured, SL-19 — note it says "doesn't INCLUDE the entitlement", not
-# "doesn't support the capability" as the memory pair does. That wording is the
-# tell: a capability you may enable yourself reads one way, a grant you must be
-# given reads the other.)
-#
-# and takes the two memory entitlements down with it — which is a much worse
-# day than not having discovery, because those are what stopped the
-# loading-transition kills. KLEPTON_MULTICAST=0 writes a filtered copy without
-# that one key and points the project at it, so the failure is a missing
-# computer list rather than a build that will not sign.
-#
-# The filtered file is GENERATED, not a second authored one: two entitlement
-# files that have to agree is exactly how they stop agreeing.
-MULTICAST = os.environ.get("KLEPTON_MULTICAST", "1") != "0"
+#   com.apple.developer.low-latency-streaming (KLEPTON_LOW_LATENCY=0 drops it)
+#       Added at the user's request while chasing a streaming regression. Note
+#       honestly what is and is not known about it: this key does not appear in
+#       the XROS SDK or in Xcode's Library tree — but neither do the two memory
+#       keys, which certainly do work, so that search is INCONCLUSIVE and not
+#       evidence the key is wrong. If the build starts failing with "doesn't
+#       include the com.apple.developer.low-latency-streaming entitlement" (a
+#       grant you must be given) or with an unknown-entitlement error (a key the
+#       platform does not know), set KLEPTON_LOW_LATENCY=0 and the memory keys
+#       survive. Do not diagnose a stream problem from its presence alone —
+#       runtime/kl_openxr.c's KL_XR_PROFILE is the A/B for the change that
+#       actually altered what the client publishes.
+OPTIONAL_ENTITLEMENTS = {
+    "com.apple.developer.low-latency-streaming": "KLEPTON_LOW_LATENCY",
+}
 ENTITLEMENTS_FILE = "Klepton.entitlements"
-if ENTITLEMENTS and not MULTICAST:
+_dropped = [k for k, env in OPTIONAL_ENTITLEMENTS.items()
+            if os.environ.get(env, "1") == "0"]
+if ENTITLEMENTS and _dropped:
     import plistlib
     src = pathlib.Path(__file__).with_name("Klepton.entitlements")
     d = plistlib.loads(src.read_bytes())
-    d.pop("com.apple.developer.networking.multicast", None)
-    out = pathlib.Path(__file__).with_name("build") / "Klepton-nomulticast.entitlements"
+    for k in _dropped:
+        d.pop(k, None)
+    out = pathlib.Path(__file__).with_name("build") / "Klepton-filtered.entitlements"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(plistlib.dumps(d))
-    ENTITLEMENTS_FILE = "build/Klepton-nomulticast.entitlements"
+    ENTITLEMENTS_FILE = "build/Klepton-filtered.entitlements"
 
 ENTITLEMENTS_SETTING = (f"\t\t\t\tCODE_SIGN_ENTITLEMENTS = {ENTITLEMENTS_FILE};\n"
                         if ENTITLEMENTS else "")

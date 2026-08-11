@@ -364,4 +364,84 @@ void kl_ovrp_get_guest_head_pose(float *px, float *py, float *pz,
 // OpenXR's STAGE space (floor) and its LOCAL space (where the head started).
 float kl_ovrp_eye_height(void);
 
+// ---------------------------------------------------------------------------
+// The read side of the M7 seam, for the OTHER XR API
+//
+// Everything above this line is the OVRPlugin ABI answering the OVRPlugin
+// guest. These three are the same measurements handed to `kl_openxr.c`, which
+// serves an OpenXR guest that never calls a single ovrp_ entry point — and
+// they are HERE rather than in a third place for the reason `kl_ovrp_eye_view`
+// is: one frontend publishes one sample of one instant, and a second XR API
+// deriving its own would drift from the first by a frame.
+//
+// Read them exactly as the ovrp path does — after `kl_ovrp_frame_latch()`,
+// because these return the pose PINNED for the guest's frame and not the live
+// one (see `kl_ovrp_get_guest_head_pose` above for why those must stay
+// distinct).
+//
+// Both return 1 when a frontend has actually published for that hand and 0
+// when the answer is the head-relative default the ovrp path parks controllers
+// at. That distinction is what OpenXR calls `isActive`, and it is the whole
+// reason these report it rather than just filling the buffers: an action bound
+// to a controller nobody is holding must read inactive, not zero.
+//
+// Any output pointer may be NULL. `pos`/`vel`/`ang` take 3 floats, `quat` 4
+// (x, y, z, w), all in the current tracking space.
+int kl_ovrp_hand_motion(int hand, float *pos, float *quat, float *vel, float *ang);
+int kl_ovrp_controller_input(int hand, uint32_t *buttons, uint32_t *touches,
+                             float *index_trigger, float *hand_trigger,
+                             float *stick_x, float *stick_y);
+
+// `ovrpButton` / `ovrpTouch` RAW bits, as they arrive in the two words above.
+//
+// Raw, not virtual — the distinction that cost a session once: 0x2000 is
+// `PrimaryIndexTrigger` in virtual space and `RThumbstickDown` in raw, so a
+// frontend emitting virtual values turned every trigger press into a stick
+// flick. The frontends compose these (`kl_view.c`, `KleptonControllers.swift`)
+// and `kl_openxr.c` decodes them back into per-path booleans, which is why the
+// numbers finally live in a header instead of three times over in comments.
+//
+// A/B/X/Y are hand-specific in this enum, not per-hand aliases: A and B are the
+// RIGHT controller's face buttons and X and Y the LEFT's, and both arrive in
+// their own hand's `buttons` word.
+enum {
+    KL_OVRP_RAW_A                = 0x00000001,
+    KL_OVRP_RAW_B                = 0x00000002,
+    KL_OVRP_RAW_RTHUMBSTICK      = 0x00000004,
+    KL_OVRP_RAW_X                = 0x00000100,
+    KL_OVRP_RAW_Y                = 0x00000200,
+    KL_OVRP_RAW_LTHUMBSTICK      = 0x00000400,
+    KL_OVRP_RAW_RTHUMBSTICK_UP   = 0x00001000,
+    KL_OVRP_RAW_RTHUMBSTICK_DOWN = 0x00002000,
+    KL_OVRP_RAW_RTHUMBSTICK_LEFT = 0x00004000,
+    KL_OVRP_RAW_RTHUMBSTICK_RIGHT= 0x00008000,
+    KL_OVRP_RAW_START            = 0x00100000,
+    KL_OVRP_RAW_BACK             = 0x00200000,
+    KL_OVRP_RAW_RINDEX_TRIGGER   = 0x04000000,
+    KL_OVRP_RAW_RHAND_TRIGGER    = 0x08000000,
+    KL_OVRP_RAW_LINDEX_TRIGGER   = 0x10000000,
+    KL_OVRP_RAW_LHAND_TRIGGER    = 0x20000000,
+};
+
+// ...and the OTHER direction, for a guest whose haptics API is not OVRPlugin's.
+//
+// OpenXR does not have a sample stream. `xrApplyHapticFeedback` carries an
+// amplitude and a DURATION and means "buzz at this level until it lapses";
+// `xrStopHapticFeedback` ends it early. That is the shape of the legacy
+// `ovrp_SetControllerVibration` path rather than the buffered one, so it feeds
+// a third source beside those two — deliberately a third, and not a reuse of
+// the vibration slot, for the same reason the vibration slot is not folded into
+// the ring: two owners of one level erase each other silently, and the symptom
+// is haptics that are merely intermittent (kl_ovrp.c documents the day that
+// cost). `kl_ovrp_haptics_pull` merges all three by maximum.
+//
+// `seconds <= 0` is a click of the minimum useful length — OpenXR's
+// XR_MIN_HAPTIC_DURATION, which means "as short as the hardware can do" and
+// here means the same 32 ms floor the pull already holds every level for.
+//
+// Frequency is not a parameter, the same decision and for the same reason as
+// the rest of this seam: see the note above `kl_ovrp_haptics_pull`.
+void kl_ovrp_haptics_apply(int hand, float amplitude, float seconds);
+void kl_ovrp_haptics_stop(int hand);
+
 #endif

@@ -210,7 +210,8 @@ answers GL and kl_glfb never initializes.
   on the subnet. Default ON. **This is what makes Steam Link's host discovery
   work on visionOS**, where an app may not broadcast without
   `com.apple.developer.networking.multicast` — an entitlement Apple grants by
-  REQUEST, not by enabling a capability. Measured shape of the thing being
+  REQUEST, not by enabling a capability, and one this project deliberately does
+  **not** ship (`visionos/Klepton.entitlements` says why). Measured shape of the thing being
   worked around (SL-19): the guest opens an **IPv6** socket, binds
   `[::]:27036`, and sends its 31-byte probe to `[::ffff:255.255.255.255]` and
   `[ff02::1]`, both of which return *No route to host*. The fan-out replays it
@@ -656,6 +657,14 @@ that reports what came due since the frontend last asked. Platform-independent
   `ovrp_SetControllerVibration` level runs before it lapses, default 2 (the
   real API's own ceiling is about that). It matters more here than there: a
   frontend that has already been handed a pulse cannot be told to stop.
+- `KL_HAPTICS_XR_MAX=<seconds>` — the ceiling on one `xrApplyHapticFeedback`
+  order, default 5. Not defensiveness: OpenXR lets an app ask for a vibration
+  lasting minutes, and for the same reason as the lapse above, nothing here can
+  recall a level a frontend has already been handed — so an unbounded duration
+  is a controller that buzzes until the process ends. The OpenXR path is a
+  **third** haptics source beside the buffered ring and the legacy vibration
+  level, kept separate from both because two owners of one slot erase each
+  other silently; `kl_ovrp_haptics_pull` merges all three by maximum.
 
 - `KL_DISPLAY_HZ=<hz>` — force the display frequency the guest is told the
   headset runs at, 30..240. It defaults to the Quest 2's 72, which is the
@@ -957,17 +966,45 @@ See PLANNING §11.
   the shell does not carry an independent value, it splits `sArgs` on `~` and
   forwards field 3 (`SteamLink.startVRLink`), so we do the same. Setting it
   overrides the derivation.
-- `KL_XR_BINDINGS=1` — print every suggested action binding, not just the
-  count per interaction profile, so it is off by default; turn it on when the
-  question is which concrete input path an action expects to be driven from.
-  Steam Link suggests **27–33 bindings for each of six controller profiles, 174
-  in total** (an earlier "~40 for each of seven" here was an estimate). The
-  bindings are not in its code: they are read from
+- `KL_XR_BINDINGS=1` — print every suggested action binding **and what it
+  decoded to**, not just the count per interaction profile, so it is off by
+  default; turn it on when the question is which concrete input path an action
+  expects to be driven from. It reports the decode rather than only the path
+  because a binding we take and one we silently fail to recognise look
+  identical otherwise.
+
+  **Measured (SL-20, the first run of this knob in the repo):** six profiles,
+  39–45 bindings each, and for the active one
+  (`/interaction_profiles/oculus/touch_controller`) **41 suggested, 39 taken**.
+  The two not taken are `/input/thumbrest/touch` on each hand, which has no
+  input source on this platform and is therefore left unbound — an action that
+  reports `isActive = false` rather than a permanently-not-touched sensor we
+  cannot measure. Earlier notes here said "27–33 per profile, 174 total" and
+  before that "~40 for each of seven"; both were estimates off the JSON.
+
+  The bindings are not in its code: they are read from
   `steamlink-vr/assets/config/controller_config.json`, which carries the six
   profiles, one pose action on `.../input/grip/pose`, one haptic action on
   `.../output/haptic`, and 15 input actions — so the map can be read offline
   without a run at all. The seventh "type" in the older count is the hand
   profile (`svl_hand_interaction_augmented`), which is not in that table.
+- `KL_XR_AIM_PITCH=<degrees>` — the AIM pose as a rotation off the GRIP pose,
+  about the grip's X axis, positive tilting the ray up. **Default 0, and that
+  is a decision rather than a placeholder.**
+
+  OpenXR gives a controller two poses and Steam Link binds both: the stream's
+  `pamir-stream-pose` reads `.../input/grip/pose` (the hilt) and the in-headset
+  UI's `ui_pointer_pose` reads `.../input/aim/pose` (the ray). On a real Touch
+  controller those differ by a large device-specific angle, because the OpenXR
+  grip's -Z runs through the fist from little finger to thumb rather than
+  forwards. That is **not** the pose this project's frontend publishes:
+  `KleptonControllers.swift` converts ARKit's wrist frame into a hilt frame
+  whose -Z already points along the direction the hilt points, so here the two
+  nearly coincide and a fabricated 35-degree offset would make a correct pose
+  wrong. The seam exists because they *are* different poses; the knob is so a
+  headset settles it in one A/B instead of a rebuild. Symptom to watch for: the
+  UI laser leaving the hand at the wrong angle while the streamed controller
+  model sits correctly.
 - `KL_SLINK_SIZE=WxH` — the panel size, published to SDL
   (`nativeSetScreenResolution`), the `ANativeWindow` and ANGLE together via
   one `slink_panel_size()` — the display is a group answer, and ANGLE is

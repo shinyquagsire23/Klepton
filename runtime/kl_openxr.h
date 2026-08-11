@@ -60,6 +60,20 @@ void kl_openxr_report(FILE *f);
 // arc costs a fresh pairing and cannot be repeated identically.
 int kl_openxr_space_selftest(FILE *f);
 
+// SL-20 — the action surface, checked the same way and for the same reason.
+//
+// The input path's failures are all SILENT: a binding decoded to the wrong bit,
+// a hand combined the wrong way, an inactive action reporting a stale press, an
+// action space following the other hand. Every one of those returns XR_SUCCESS,
+// draws a correct picture, and is visible only to a person holding a controller
+// in a live stream — which on this arc costs a fresh pairing and cannot be
+// repeated identically. So it is asserted here instead: no guest, no headset,
+// no Steam host. `make xrinput`.
+//
+// It drives the REAL entry points through xrGetInstanceProcAddr, so what it
+// checks is the surface the guest calls rather than a copy of it.
+int kl_openxr_input_selftest(FILE *f);
+
 // The frame clock, for a host that has one.
 //
 // xrWaitFrame is where an OpenXR runtime is specified to block until the app

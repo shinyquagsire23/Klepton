@@ -198,6 +198,20 @@ build/t_xrspace: tests/t_xrspace.c $(RUNTIME) runtime/kl_openxr.h
 xrspace: build/t_xrspace
 	./build/t_xrspace
 
+# SL-20: the OpenXR action-surface gate — the same argument as xrspace above,
+# one API family across. A binding decoded to the wrong bit, two hands combined
+# the wrong way, a stale press surviving a controller being put down, an action
+# space following the other hand: every one of those returns XR_SUCCESS and
+# draws a correct picture, and the only instrument that could see one is a
+# person holding a controller inside a live stream. No guest, no headset, no
+# Steam host; seconds, in `make check`.
+build/t_xrinput: tests/t_xrinput.c $(RUNTIME) runtime/kl_openxr.h runtime/kl_ovrp.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_xrinput.c $(RUNTIME) $(LDLIBS)
+
+xrinput: build/t_xrinput
+	./build/t_xrinput
+
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(LDLIBS)
@@ -331,12 +345,14 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_ctr build/t_bcast
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_ctr build/t_bcast
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
 	@grep -E '=== HEVC|30 access units' build/hevc.log && tail -1 build/hevc.log
 	@./build/t_xrspace > build/xrspace.log 2>&1 || { cat build/xrspace.log; exit 1; }
 	@head -2 build/xrspace.log && tail -1 build/xrspace.log
+	@./build/t_xrinput > build/xrinput.log 2>&1 || { cat build/xrinput.log; exit 1; }
+	@grep -E '=== OpenXR actions' build/xrinput.log && tail -1 build/xrinput.log
 	@./build/t_ctr > build/ctr.log 2>&1 || { cat build/ctr.log; exit 1; }
 	@head -2 build/ctr.log && tail -1 build/ctr.log
 	@./build/t_bcast > build/bcast.log 2>&1 || { cat build/bcast.log; exit 1; }

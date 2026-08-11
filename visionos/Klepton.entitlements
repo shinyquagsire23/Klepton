@@ -28,29 +28,49 @@
   provisioning failure rather than a no-op.
 
   ===========================================================================
-  networking.multicast, and this one is NOT like the two above.
+  And NOT com.apple.developer.networking.multicast, which was here and is gone.
 
-  Steam Link discovers hosts by UDP BROADCAST to port 27036 (SL-5 measured it).
-  On this platform broadcast and multicast are gated behind an entitlement that
-  Apple grants by REQUEST, not by ticking a capability box:
+  Steam Link discovers hosts by UDP BROADCAST to port 27036 (SL-5 measured it),
+  and visionOS gates broadcast behind that entitlement — which Apple grants by
+  REQUEST rather than by ticking a capability box. That makes it categorically
+  different from the two above: they are self-service, it is a wait, and until
+  it is granted attaching it fails the BUILD and takes the memory pair with it.
 
-      https://developer.apple.com/contact/request/networking-multicast
+  It is not needed. kl_shim.c delivers the guest's broadcast as unicast to each
+  host on the subnet instead (`make bcast`), which needs only the free
+  local-network permission — Info.plist's NSLocalNetworkUsageDescription — and
+  that is what found the PC on a physical Vision Pro. Do not put it back
+  without a measurement saying the fan-out is insufficient; the entitlement is
+  also genuinely broad, since it lets the app send to and receive from every
+  device on the network, and the fan-out's reach is one subnet sweep.
 
-  So it differs from the memory pair in the one way that matters operationally:
-  they are self-service, this is not. Until the request is granted, attaching it
-  fails the BUILD — the profile cannot carry an entitlement the App ID has not
-  been granted — which is why KLEPTON_MULTICAST=0 exists and why the failure is
-  named in gen_xcodeproj.py rather than left to be read off a signing error.
+  ===========================================================================
+  low-latency-streaming, which is in the third category: WANTED, and NOT
+  self-service.
 
-  It is also genuinely broad, and worth being honest about: it lets the app send
-  to and receive from every device on the network. We want it for exactly one
-  thing — the discovery sweep that populates the computer list — and the rest of
-  the session is ordinary unicast to the one host that was paired with.
+  This app is a real-time video client — HEVC off the wire, decoded on
+  VideoToolbox, presented at display rate in an immersive space — which is the
+  workload the key names. Added at the user's request.
 
-  NSLocalNetworkUsageDescription is the OTHER half and is free; see Info.plist.
-  Neither substitutes for the other: without the usage string there is no
-  permission at all, and without this entitlement the permission does not extend
-  to broadcast.
+  What is known and what is not, stated plainly so the next session does not
+  re-derive it: the key does not appear anywhere in the XROS SDK or Xcode's
+  Library tree. That is NOT evidence against it — neither of the two memory
+  keys above appears there either, and those demonstrably work, so Xcode's
+  capability database simply is not a greppable file. It is listed here as
+  unverified rather than as confirmed.
+
+  Because it is unverified it is FILTERABLE: gen_xcodeproj.py drops it when
+  KLEPTON_LOW_LATENCY=0, writing a generated copy. That exists for exactly the
+  failure the multicast section above describes — attaching a key the App ID
+  has not been granted, or that the platform does not recognise, fails the
+  whole signing step and takes the two memory keys with it. One knob, and the
+  memory keys survive.
+
+  It is also not a diagnosis. It was added while chasing a streaming
+  regression, and the change that actually altered what the client publishes to
+  the host is the interaction profile now being answered — KL_XR_PROFILE=0 in
+  runtime/kl_openxr.c is that A/B. Settle the cause there before concluding
+  anything about this key.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -59,7 +79,7 @@
 	<true/>
 	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
 	<true/>
-	<key>com.apple.developer.networking.multicast</key>
+	<key>com.apple.developer.low-latency-streaming</key>
 	<true/>
 </dict>
 </plist>
