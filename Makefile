@@ -367,6 +367,19 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@echo "  (the 2 refused sites are libunity's br x18 jump tables — see PLANNING S0.5;"
 	@echo "   'make x18' is the exhaustive decoder check against objdump, run it after"
 	@echo "   any change to runtime/kl_x18.c)"
+# S0.1's counts, watched for the same reason the veneer totals are. They were
+# not, and a single site the trap-0d data test refused re-opened trap 1 in
+# libunity for sixteen commits: `make check` stops at initJni and stayed green
+# while the lifecycle faulted on it. A REFUSED TLS site is a hard failure here,
+# not a statistic — unlike the x18 side, refusing one is never free.
+	@echo "=== S0.1 TLS rewrites (trap 1) ===" && for f in libmain lib_burst_generated libunityopus libunity libil2cpp; do \
+	  printf '%-24s' $$f; ./build/t_load $(LIBS)/$$f.so 2>/dev/null > build/tls-$$f.log; \
+	  grep -E '^  TLS rewrites:' build/tls-$$f.log; \
+	  if grep -q 'TLS sites REFUSED' build/tls-$$f.log; then \
+	    echo "  FAIL: $$f has a TLS site the data test refused — that thread pointer"; \
+	    echo "        is garbage on every thread (trap 1). The loader named the address."; \
+	    exit 1; fi; \
+	done
 	@if [ -x "$(NDK_CC)" ]; then echo "=== guest differential (S0.5) ===" && \
 	   $(MAKE) -s guest | grep -E 'x18 sites|identical to the host|lost '; \
 	 else echo "=== guest differential: SKIPPED (set ANDROID_NDK_HOME) ==="; fi

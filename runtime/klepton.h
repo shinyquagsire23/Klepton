@@ -50,6 +50,11 @@ size_t     kl_span(kl_image *img);
 typedef struct {
     unsigned relative, abs64, glob_dat, jump_slot;   // relocations applied
     unsigned tls_rewrites;                           // mrs tpidr_el0 -> tpidrro_el0
+    // ...and TLS sites the trap-0d data test refused. Counted apart from
+    // x18_data_words because the two mean opposite things: a refused x18 site
+    // costs nothing, a refused TLS site is trap 1 live in the guest. Nonzero
+    // here is a finding, not a statistic — rewrite_tls names each one.
+    unsigned tls_refused;
     unsigned svc_sites;                              // inline syscalls found
     unsigned imports_bound, imports_missing;
     // S0.5: guest instructions naming x18, and how many were redirected to a

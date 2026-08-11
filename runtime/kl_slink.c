@@ -292,6 +292,9 @@ static void report_image(FILE *out, const char *soname, kl_image *img) {
     // because the number is how the second detector is watched — silence would
     // make a change of mind about what is code invisible.
     if (st->x18_data_words) fprintf(out, " (data %u)", st->x18_data_words);
+    // ...and the same test refusing a TLS site, which is the opposite of free:
+    // that thread pointer is garbage on every thread (trap 1).
+    if (st->tls_refused) fprintf(out, " (TLS REFUSED %u)", st->tls_refused);
     fprintf(out, "  imports %u bound / %u unresolved\n",
             st->imports_bound, st->imports_missing);
 }

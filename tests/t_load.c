@@ -43,6 +43,12 @@ int main(int argc, char **argv) {
     printf("  relocations: %u  (RELATIVE=%u ABS64=%u GLOB_DAT=%u JUMP_SLOT=%u)\n",
            total, st->relative, st->abs64, st->glob_dat, st->jump_slot);
     printf("  TLS rewrites: %u    inline svc #0: %u\n", st->tls_rewrites, st->svc_sites);
+    // Trap 1: a TLS site the data test refused is a thread pointer the guest
+    // reads as garbage. Printed only when there is one, so a clean library
+    // reads exactly as it always has.
+    if (st->tls_refused)
+        printf("  TLS sites REFUSED: %u  — trap 1 is live at those addresses\n",
+               st->tls_refused);
     printf("  x18 sites: %u    veneered: %u    refused: %u\n",
            st->x18_sites, st->x18_patched, st->x18_refused);
     // Trap 26. Printed only when the library has any, so `make check`'s output

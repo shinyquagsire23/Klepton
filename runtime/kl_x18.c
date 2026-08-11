@@ -475,10 +475,27 @@ int kl_x18_init(void) {
 // A missed real site is the other half of trap 0 and must not be silent, so
 // every refusal is counted and `make check`'s veneer totals are the gate: they
 // are exact numbers, and this rule must not move them.
+//
+// A WORD OF ZERO IS NOT EVIDENCE. It is what a linker leaves in the GAP between
+// functions, and a gap is adjacent to code by definition — so counting it makes
+// the window vote on the wrong side of a boundary it cannot see. It cost the
+// arc that found it: libunity.so+0x3f2118 is a `-fstack-protector` prologue
+// three words past thirteen zero words of padding, the window refused it, and a
+// REFUSED TLS SITE IS TRAP 1 BACK (see rewrite_tls in kl_image.c). It presented
+// as a SIGSEGV in the guest 40 minutes of bisect away, on the lifecycle path
+// only, with `make check` green throughout.
+//
+// The margin for dropping it is measured, not assumed: across every trap-0d
+// refusal in both guests' entire library sets, the NON-ZERO evidence alone is 3
+// to 12 words against a threshold of 2 — the crypto tables this exists to
+// protect are dense pseudorandom data and do not need zeros to be recognised.
+// Zero-only windows, meanwhile, are exactly one site in either guest, and it is
+// the one above.
 #define KLX_WIN_HALF   16
 #define KLX_WIN_LIMIT  2
 
 static int klx_unallocated(uint32_t w) {
+    if (!w) return 0;                      // padding, not a constant table
     unsigned op0 = (w >> 25) & 0xf;
     return op0 <= 3;                       // 0/1/3 unallocated, 2 = SVE
 }

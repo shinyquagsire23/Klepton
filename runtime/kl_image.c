@@ -275,12 +275,29 @@ const void *kl_phdrs(kl_image *i, unsigned *count) {
 // exists now, and having one of the two rewriters checked and the other not is
 // how a class comes back. The order matters too: this must consult the
 // unmodified buffer, which it does, since it is the first pass over a chunk.
-static void rewrite_tls(uint8_t *p, size_t n, kl_stats *st) {
+//
+// A refusal here is NOT the free outcome it is on the x18 side, and it must
+// never again be silent: a `mrs xN, tpidr_el0` left alone reads a register the
+// kernel clobbers, so the site returns garbage on every thread and the guest
+// faults dereferencing it somewhere else entirely. That is trap 1, and one
+// zero-padding false positive re-opened it for a whole arc (see
+// klx_looks_like_data). Each one is counted apart from the x18 population and
+// named by address, because the address is what makes it a five-minute
+// disassembly instead of a bisect.
+static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
+                        kl_stats *st) {
     uint32_t *w = (uint32_t *)p;
     size_t words = n / 4;
     for (size_t i = 0; i < words; i++) {
         if ((w[i] & 0xffffffe0u) == 0xd53bd040u) {
-            if (kl_x18_is_data(w, n, i)) { st->x18_data_words++; continue; }
+            if (kl_x18_is_data(w, n, i)) {
+                st->tls_refused++;
+                fprintf(stderr, "  [klepton] %s: TLS site at +0x%llx left alone — its "
+                                "neighbourhood reads as data (trap 0d). If it IS code, "
+                                "that thread pointer is garbage (trap 1)\n",
+                        path, (unsigned long long)(va + i * 4));
+                continue;
+            }
             w[i] |= 0x20u;
             st->tls_rewrites++;
         } else if (w[i] == 0xd4000001u) { st->svc_sites++; }    // svc #0 — report only
@@ -659,7 +676,8 @@ kl_image *kl_load(const char *path) {
         // than it should be is not an option for TLS — an unrewritten
         // tpidr_el0 read is a wrong answer on every thread.
         if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
-        rewrite_tls(img->base + ph[i].p_vaddr - lo, (size_t)ph[i].p_filesz, &img->stats);
+        rewrite_tls(img->base + ph[i].p_vaddr - lo, (size_t)ph[i].p_filesz,
+                    ph[i].p_vaddr, path, &img->stats);
     }
     // ...and code inside those sections, not whole sections. An executable
     // section can itself contain data: Steam Link's libmain.so carries
@@ -684,7 +702,7 @@ kl_image *kl_load(const char *path) {
         while (kl_x18_next_code(sh[i].sh_addr, (size_t)sh[i].sh_size,
                                 skip, nskip, &cursor, &cva, &csz)) {
             uint8_t *p = img->base + cva - lo;
-            rewrite_tls(p, csz, &img->stats);
+            rewrite_tls(p, csz, cva, path, &img->stats);
             if (!veneer) continue;
             kl_x18_stats xs;
             if (kl_x18_patch(p, csz, &xs) != 0) {

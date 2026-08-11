@@ -69,11 +69,30 @@ static void die(const char *fmt, ...) {
 // kernel on preemption, so a guest read of it is a wrong answer on every
 // thread. The two encodings differ by exactly one bit. Instruction count is
 // preserved, so nothing in the image moves.
-static unsigned rewrite_tls(uint8_t *p, size_t n) {
+// It consults kl_x18_is_data for the same reason the runtime loader does — a
+// word of a constant table that happens to match this pattern would get a bit
+// flipped — and, more importantly, so that the two passes AGREE. They did not:
+// this one rewrote libunity.so+0x3f2118 and the loader refused it, so the same
+// guest crashed as an ELF on the host and ran as a dylib on device, which reads
+// like a platform difference and is not one. A refusal is named, because a TLS
+// site left alone is trap 1 in whatever runs the output (see kl_image.c).
+static unsigned rewrite_tls(uint8_t *p, size_t n, uint64_t va, unsigned *refused) {
     unsigned hits = 0;
     uint32_t *w = (uint32_t *)p;
-    for (size_t i = 0; i + 4 <= n; i += 4, w++)
-        if ((*w & 0xffffffe0u) == 0xd53bd040u) { *w |= 0x20u; hits++; }
+    size_t words = n / 4;
+    for (size_t i = 0; i < words; i++) {
+        if ((w[i] & 0xffffffe0u) != 0xd53bd040u) continue;
+        if (kl_x18_is_data(w, n, i)) {
+            (*refused)++;
+            fprintf(stderr, "klepton-ld: TLS site at +0x%llx left alone — its "
+                            "neighbourhood reads as data (trap 0d). If it IS code, "
+                            "that thread pointer is garbage (trap 1)\n",
+                    (unsigned long long)(va + i * 4));
+            continue;
+        }
+        w[i] |= 0x20u;
+        hits++;
+    }
     return hits;
 }
 
@@ -174,7 +193,7 @@ int main(int argc, char **argv) {
     if (!img) die("out of memory");
     memcpy(img, f, (size_t)sb.st_size);
 
-    unsigned tls_rewrites = 0, x18_sites = 0;
+    unsigned tls_rewrites = 0, tls_refused = 0, x18_sites = 0;
     const Elf64_Shdr *sh = (eh->e_shoff && eh->e_shnum)
                          ? (const Elf64_Shdr *)(f + eh->e_shoff) : NULL;
     if (!sh) die("%s has no section headers — cannot separate code from rodata "
@@ -200,7 +219,7 @@ int main(int argc, char **argv) {
         while (kl_x18_next_code(sh[i].sh_addr, (size_t)sh[i].sh_size,
                                 skip, nskip, &cursor, &cva, &csz)) {
             uint8_t *p = img + sh[i].sh_offset + (cva - sh[i].sh_addr);
-            tls_rewrites += rewrite_tls(p, csz);
+            tls_rewrites += rewrite_tls(p, csz, cva, &tls_refused);
             x18_sites    += kl_x18_count(p, csz);
         }
     }
@@ -525,7 +544,7 @@ int main(int argc, char **argv) {
             printf("  text->data delta preserved: ELF %#llx, macho %#llx (same)\n",
                    (unsigned long long)(grp[1].vlo - grp[0].vlo),
                    (unsigned long long)((image_shift + grp[1].vlo) - (image_shift + grp[0].vlo)));
-        printf("  TLS rewrites  %u\n", tls_rewrites);
+        printf("  TLS rewrites  %u   refused %u\n", tls_rewrites, tls_refused);
         printf("  x18 sites     %u   veneered %u   refused %u   (pool %#llx bytes at %#llx)\n",
                x18st.sites, x18st.patched, x18st.refused,
                (unsigned long long)pool_off, (unsigned long long)pool_va);
