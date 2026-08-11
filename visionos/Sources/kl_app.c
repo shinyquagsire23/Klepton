@@ -18,6 +18,8 @@
 #include "kl_ovrp.h"      // kl_ovrp_frame_latch — one pose per guest frame
 #include "kl_openxr.h"    // kl_openxr_set_pacer — the OpenXR guest's frame clock
 #include "kl_slink.h"
+#include "kl_mono.h"      // the flat guest's window seam — frame out, pointer in
+#include "kl_glfb.h"      // kl_glfb_release_current — the handoff hands the context on
 #include "kl_x18.h"       // trap 11 — claim TSD slot 300 before anything else can
 #include "kl_env.h"
 
@@ -47,12 +49,33 @@ typedef struct {
 
 static const kl_target TARGETS[] = {
     { "beatsaber",    "beatsaber",    "beatsaber.apk",    "libmain",           0 },
-    // The VR front door only. The 2D shell pairs and hands off, and on visionOS
-    // that handoff has nowhere to go yet — see kl_app_boot's note.
+    // Both front doors, in one app. The shell pairs in a WindowGroup and hands
+    // off to the OpenXR half in an ImmersiveSpace — see boot_steamlink and
+    // app_vrlink_handoff.
     { "steamlink-vr", "steamlink-vr", "steamlink-vr.apk", "libvrlink_scene",   1 },
 };
 
 static const kl_target *g_target;
+
+// Which of Steam Link's front doors this run opened, and whether the VR one's
+// chain has been mapped yet.
+//
+// **Both doors can be opened by one process here, and that is the difference
+// between this driver and `build/m_slink`.** On the host the shell pairs and
+// then re-EXECs into the VR door carrying the session (SL-15), which makes
+// every question about tearing the shell down go away. An app bundle cannot
+// re-exec, so the two chains coexist: the shell's fourteen libraries stay
+// mapped and its main thread parks inside startVRLink, exactly as an Android
+// activity that called finishAndRemoveTask() would stop running.
+static kl_slink_door g_door;
+static int           g_vr_loaded;
+
+// "Stop pumping." Set by kl_app_guest_stop (the immersive space going away) and
+// by the 2D->VR handoff, which is the shell's own end. Plain and volatile
+// because it is written once by somebody else and read by a loop inside
+// kl_slink, which is handed a flag rather than a lock — the honest shape for
+// exactly that.
+static volatile int  g_guest_quit;
 
 static const kl_target *target_lookup(const char *name) {
     for (unsigned i = 0; i < sizeof TARGETS / sizeof *TARGETS; i++)
@@ -149,14 +172,51 @@ int kl_app_configure(const char *resources, const char *container) {
     mkdir(g_files, 0755);
 
     if (g_target->steamlink) {
+        // Which front door this launch opens. The SHELL is the default because
+        // it is the only one that can produce a session: the VR half reads its
+        // own out of the launching Intent and leaves before its first frame
+        // without one (SL-9). A run that was HANDED a session by hand — the
+        // SL-17 shape, KL_SLINK_SARGS from a host pairing — wants the VR door
+        // directly, and says so by carrying one.
+        g_door = KL_SLINK_SHELL;
+        if (kl_env_on("KL_SLINK_VR", 0) || kl_env_str("KL_SLINK_SARGS", NULL))
+            g_door = KL_SLINK_VR;
+        if (kl_env_on("KL_SLINK_SHELL", 0)) g_door = KL_SLINK_SHELL;
+
         // Everything this guest is told about itself — the activity class, the
         // four paths, the <meta-data>, the panel size — is kl_slink's, and
         // shared verbatim with `build/m_slink`. Two drivers describing one guest
         // differently is a class of bug with no error surface at all: the run
         // works and answers the guest's questions wrongly.
-        if (kl_slink_configure(KL_SLINK_VR, g_libdir, g_assets, g_apk, g_files,
+        if (kl_slink_configure(g_door, g_libdir, g_assets, g_apk, g_files,
                                NULL) != 0)
             return missing("Steam Link front door", kl_slink_error());
+
+        // ...and then Qt's plugin path, overriding what kl_slink_configure
+        // derived, because on this platform the two are not the same directory.
+        //
+        // **Qt reads a plugin as a FILE before it will load it.** libQt6Core's
+        // search is a glob (`libplugins_%1_*.so`), so it lists the path and
+        // then parses each candidate's ELF metadata for the IID and the Qt
+        // version. Everywhere else in this project a guest library is a NAME
+        // the loader resolves — on device the ELF tree is deliberately not in
+        // the bundle at all — and that is not enough here: with no real files
+        // nothing is ever a candidate, and libshell aborts with `Could not find
+        // the Qt platform plugin "virtual"`.
+        //
+        // So the six plugin .so files are staged into the container as data
+        // (visionos/targets.py, `qtplugins`), and the dlopen Qt then does is
+        // unaffected: kl_load_auto matches a translation on the BASENAME
+        // whatever the path says, so it still gets the signed framework out of
+        // Frameworks/. A missing directory is left alone rather than pointed at
+        // — an empty QT_PLUGIN_PATH and a wrong one fail the same way, and the
+        // staging error belongs in stage_assets.sh's report.
+        char qtdir[1200];
+        snprintf(qtdir, sizeof qtdir, "%s/%s/qtplugins", container, g_target->tree);
+        if (have(qtdir)) setenv("QT_PLUGIN_PATH", qtdir, 1);
+        else if (g_door == KL_SLINK_SHELL)
+            fprintf(stderr, "  [klepton] %s is not staged — Qt will not find its "
+                            "platform plugin (run visionos/stage_assets.sh)\n", qtdir);
     } else {
         kl_set_library_path(g_libdir);
         // Explicitly, because the default is a *relative* path that gets
@@ -327,45 +387,161 @@ int kl_app_open_log(void) {
     return open_log();
 }
 
-// The Steam Link half of kl_app_boot: map the chain, print the shim gap, run
-// the init arrays. It deliberately stops BEFORE ANativeActivity_onCreate, for
-// the same reason the Unity path stops at initJni — that is the part which is
-// supposed to be clean, and separating it means "the guest loaded" and "the
-// activity started" fail as two different reports rather than one.
+// --- Steam Link, both front doors -------------------------------------------
 //
-// The chain here is the VR front door's, which is one library. The 2D shell is
-// deliberately not reachable from the app yet: on the host the shell pairs and
-// then re-execs into the VR door carrying the session (SL-15), and an app bundle
-// cannot re-exec — so the shell needs a window of its own and a handoff that
-// opens the ImmersiveSpace instead. Until that exists, the session arrives the
-// way the host's did before SL-15: KL_SLINK_SARGS, from a pairing run, which
-// visionos/run.sh already forwards.
-static int boot_steamlink(void) {
-    g_phase = "steamlink chain";
-    printf("=== Steam Link: %s front door (%s -> %s) ===\n",
+// The Steam Link half of kl_app_boot: map a chain, print the shim gap, run the
+// init arrays. It deliberately stops BEFORE the guest is started, for the same
+// reason the Unity path stops at initJni — that is the part which is supposed
+// to be clean, and separating it means "the guest loaded" and "the guest ran"
+// fail as two different reports rather than one.
+
+// Map, report and initialise the VR chain. Idempotent, because two paths reach
+// it: a launch that was handed a session (the door is VR from the start) and a
+// handoff out of the shell (the door was SHELL and the VR chain is loaded on
+// top of it). One function so those two cannot diverge.
+static int steamlink_load_vr(void) {
+    if (g_vr_loaded) return 0;
+    // Re-describing the app, because the VR half is a DIFFERENT ACTIVITY in the
+    // same package (§11.9) — android/app/NativeActivity with `android.app.
+    // lib_name`, not SteamLink with the SDL <meta-data>. On the host the
+    // re-exec did this by starting over; here it is a second call.
+    if (kl_slink_configure(KL_SLINK_VR, g_libdir, g_assets, g_apk, g_files,
+                           stdout) != 0)
+        return fail(kl_slink_error());
+    printf("\n=== Steam Link: %s front door (%s -> %s) ===\n",
            kl_slink_door_name(), kl_slink_main_lib(), kl_slink_main_fn());
     fflush(NULL);
-
-    // Mapping is separated from DT_INIT_ARRAY on purpose — see kl_slink.h. The
-    // gap between them is the shim work list, and printing it is the whole
-    // reason the two are not one call.
     if (kl_slink_load_chain(stdout) != 0) return fail(kl_slink_error());
     kl_slink_report_gap(stdout);
-
     printf("\n=== DT_INIT_ARRAY, dependencies first ===\n");
     fflush(NULL);
-    g_phase = "steamlink inits";
     kl_slink_run_inits(stdout);
+    g_vr_loaded = 1;
+    return 0;
+}
 
-    // Not "no sArgs, therefore stop": the guest decides that for itself and
-    // prints "No sArgs and release build panic" on its own way out, which is
-    // more informative than anything we would say here. But it exits BEFORE its
-    // first frame, and that reads exactly like a compositor failure from the
-    // outside, so it is worth naming before it happens.
-    if (!getenv("KL_SLINK_SARGS"))
-        printf("\n  NOTE: KL_SLINK_SARGS is unset. This guest reads its session out of\n"
-               "  the launching Intent and exits before its first frame without one —\n"
-               "  see notes/STEAMLINK.md for the pairing -> handoff loop.\n");
+// The 2D -> VR handoff, PLANNING §11.9 — and the one thing about it that is
+// this driver's rather than the host driver's is that **there is no re-exec**.
+//
+// `build/m_slink` replaces its process image, which makes every question about
+// tearing the shell down (Qt, SDL, ANGLE's contexts, the audio unit, the
+// shell's threads) simply not arise. An app bundle cannot do that. So the two
+// front doors coexist: this records the session, hands the ImmersiveSpace its
+// cue, and then **parks this thread forever**.
+//
+// Parking is the honest shape and not a workaround. This is the guest's own
+// main thread, inside startVRLink, and on Android the very next thing that
+// method does is finishAndRemoveTask() on itself — an activity that stops
+// running. kl_jni.h's contract says the same thing from the other end: a
+// handler that RETURNS still aborts, because returning tells the guest its
+// activity started when nothing did, and the shell then finishes itself with no
+// picture and no reason given.
+//
+// The GL context is released first, and that one is load-bearing rather than
+// tidy: kl_glfb hands the root context to one thread at a time, and a parked
+// thread still holding it is a VR guest that can never make one current.
+static char           g_sargs[4096];
+static volatile int   g_handoff;
+
+static void app_vrlink_handoff(const char *sargs) {
+    snprintf(g_sargs, sizeof g_sargs, "%s", sargs ? sargs : "");
+    // Through the environment as well as the variable, because that is the path
+    // a hand-carried session already takes (KL_SLINK_SARGS) and the guest must
+    // not be able to tell the two apart — SL-17's device runs are the same code.
+    setenv("KL_SLINK_SARGS", g_sargs, 1);
+
+    printf("\n=== 2D -> VR handoff: the shell paired and the host authorized ===\n");
+    printf("    the OpenXR front door opens in the ImmersiveSpace; this thread "
+           "parks (no re-exec inside an app bundle)\n");
+    // SL-12's stopgap, and it is announced rather than assumed. On the window
+    // path nothing ever holds a drawable, so no eye offsets are measured and the
+    // IPD is 0 — which this client reads as "unchanged" and never publishes its
+    // projection, so the host sends no video. See notes/VISIONOS.md.
+    if (!getenv("KL_OVRP_IPD")) {
+        setenv("KL_OVRP_IPD", "0.063", 1);
+        printf("    KL_OVRP_IPD=0.063   (STOPGAP: an IPD of 0 stops the host "
+               "sending video)\n");
+    }
+    fflush(NULL);
+
+    kl_glfb_release_current();
+    // The shell's pump has nothing left to drain — its main thread is about to
+    // stop existing for all practical purposes — so let whoever is pumping it
+    // finish and write its report.
+    g_guest_quit = 1;
+    __atomic_store_n(&g_handoff, 1, __ATOMIC_RELEASE);
+
+    for (;;) {
+        struct timespec iv = { 3600, 0 };
+        nanosleep(&iv, NULL);
+    }
+}
+
+int kl_app_vrlink_pending(void) { return __atomic_load_n(&g_handoff, __ATOMIC_ACQUIRE); }
+const char *kl_app_vrlink_sargs(void) { return g_sargs; }
+
+// Android's NativeActivity sequence for the VR door, from wherever it is
+// reached: a launch that was handed a session, or a handoff out of the shell.
+// It MUST run on the thread that will go on to pump — onCreate takes
+// ALooper_forThread() and the guest hangs its UIThreadCallbackHandler off
+// exactly that looper, so splitting the two across threads leaves it with
+// callbacks nobody will ever run and no error anywhere.
+static int steamlink_vr_begin(void) {
+    g_door = KL_SLINK_VR;
+    // The handoff set this to end the SHELL's pump; a new front door is a new
+    // run and the VR pump must not inherit it. Cleared here rather than in the
+    // handoff because the handoff's own meaning is "stop pumping the shell" and
+    // clearing it there would be a race with the loop it is trying to stop.
+    g_guest_quit = 0;
+    if (steamlink_load_vr()) return 1;
+    g_phase = "ANativeActivity_onCreate";
+    printf("\n=== ANativeActivity_onCreate (the VR front door) ===\n");
+    fflush(NULL);
+    if (kl_slink_vr_create(stdout) != 0) return fail(kl_slink_error());
+    g_phase = "activity lifecycle";
+    printf("\n=== the activity lifecycle ===\n");
+    fflush(NULL);
+    kl_slink_vr_start(stdout);
+    g_phase = "looper pump";
+    return 0;
+}
+
+static int boot_steamlink(void) {
+    g_phase = "steamlink chain";
+
+    if (g_door == KL_SLINK_VR) {
+        if (steamlink_load_vr()) return 1;
+        // Not "no sArgs, therefore stop": the guest decides that for itself and
+        // prints "No sArgs and release build panic" on its own way out, which is
+        // more informative than anything we would say here. But it exits BEFORE
+        // its first frame, and that reads exactly like a compositor failure from
+        // the outside, so it is worth naming before it happens.
+        if (!getenv("KL_SLINK_SARGS"))
+            printf("\n  NOTE: KL_SLINK_SARGS is unset. This guest reads its session out of\n"
+                   "  the launching Intent and exits before its first frame without one —\n"
+                   "  see notes/STEAMLINK.md for the pairing -> handoff loop.\n");
+    } else {
+        printf("=== Steam Link: %s front door (%s -> %s) ===\n",
+               kl_slink_door_name(), kl_slink_main_lib(), kl_slink_main_fn());
+        fflush(NULL);
+        if (kl_slink_load_chain(stdout) != 0) return fail(kl_slink_error());
+        kl_slink_report_gap(stdout);
+        printf("\n=== DT_INIT_ARRAY, dependencies first ===\n");
+        fflush(NULL);
+        g_phase = "steamlink inits";
+        kl_slink_run_inits(stdout);
+
+        // libSDL3's JNI_OnLoad and SDL.setupJNI() — the shell is an SDLActivity
+        // app and this is SDL3's contract with Android, shared with m_slink.
+        g_phase = "SDL3 JNI_OnLoad";
+        printf("\n=== libSDL3.so JNI_OnLoad ===\n");
+        fflush(NULL);
+        if (kl_slink_sdl_onload(stdout) != 0) return fail(kl_slink_error());
+        g_phase = "SDL.setupJNI";
+        printf("\n=== SDL.setupJNI() ===\n");
+        fflush(NULL);
+        kl_slink_sdl_setup(stdout);
+    }
 
     printf("\n=== EXIT CRITERION MET: the Steam Link chain is bound and "
            "initialised on visionOS ===\n");
@@ -373,7 +549,8 @@ static int boot_steamlink(void) {
     kl_jni_report(stdout);
     fflush(NULL);
     g_phase = "boot done";
-    snprintf(g_status, sizeof g_status, "Steam Link chain initialised");
+    snprintf(g_status, sizeof g_status, "Steam Link %s chain initialised",
+             kl_slink_door_name());
     return 0;
 }
 
@@ -397,6 +574,18 @@ int kl_app_boot(void) {
     if (!*g_libdir) return fail("kl_app_configure was not called");
     if (open_log()) return fail("could not open the log file");
 
+    // Trap 1, and it had been missing from this driver since P4 — a gap that
+    // one guest happened not to expose. Every thread that runs guest code must
+    // seed bionic's stack-guard canary into TSD slot 5 first, and this is the
+    // thread the whole boot runs on. Beat Saber's chain never noticed: nothing
+    // on the path to initJni has a stack protector on it. libSDL3's JNI_OnLoad
+    // does, so the first Steam Link shell run inside the app died with
+    // `stack smashing detected in libSDL3.so+0xa6f9c` — a real canary mismatch
+    // with no buffer overflow anywhere near it, which is exactly how this trap
+    // presents. Idempotent, so calling it on a thread that already has one is
+    // free.
+    kl_thread_init();
+
     heartbeat_start();
     kl_fault_install();
     // Strict: an unimplemented *call* is fatal, so the run stops exactly where
@@ -407,6 +596,19 @@ int kl_app_boot(void) {
 
     printf("=== Klepton on visionOS — P4 ===\n");
     printf("  target    : %s\n", g_target->name);
+    // The front door, with the reason. It is chosen from the ENVIRONMENT in
+    // kl_app_configure — which runs before the log file is open, so it cannot
+    // announce itself there — and an app launched from the Home View has no
+    // environment at all. A run that was meant to carry a session and silently
+    // took the shell instead is indistinguishable from a broken handoff, and
+    // the first thing it does is open a screen that looks like it is working.
+    if (g_target->steamlink)
+        printf("  front door: %s   (KL_SLINK_SARGS %s, KL_SLINK_VR %s, "
+               "KL_SLINK_SHELL %s)\n",
+               g_door == KL_SLINK_VR ? "VR (libvrlink_scene)" : "SHELL (libshell + Qt)",
+               kl_env_str("KL_SLINK_SARGS", NULL) ? "carried" : "UNSET",
+               kl_env_on("KL_SLINK_VR", 0) ? "on" : "off",
+               kl_env_on("KL_SLINK_SHELL", 0) ? "ON, which overrides the others" : "off");
     printf("  libraries : %s\n", g_libdir);
     printf("  dylibs    : %s%s\n", g_dylibs,
            have_translations() ? "" : "  (none embedded — falling back to the mmap ELF loader)");
@@ -546,16 +748,27 @@ int kl_app_lifecycle_begin(void) {
         g_phase = "proc";
         report_proc();
         g_alarm_secs = kl_env_int("KL_ALARM", 120);
-        g_phase = "ANativeActivity_onCreate";
-        printf("\n=== ANativeActivity_onCreate (the VR front door) ===\n");
-        fflush(NULL);
-        if (kl_slink_vr_create(stdout) != 0) return fail(kl_slink_error());
-        g_phase = "activity lifecycle";
-        printf("\n=== the activity lifecycle ===\n");
-        fflush(NULL);
-        kl_slink_vr_start(stdout);
-        g_phase = "looper pump";
-        return 0;
+
+        if (g_door == KL_SLINK_SHELL) {
+            // The capture BEFORE the guest's first swap: kl_glfb captures only
+            // when a sink or a dump directory is set, so a late registration is
+            // a window that stays black with nothing saying why.
+            kl_mono_capture_start();
+            // ...and the handoff, which only the shell can reach. Installing it
+            // on any other door would let a run take a path it has no business
+            // on. Read app_vrlink_handoff before changing this: it never
+            // returns.
+            kl_jni_set_vrlink_handoff(app_vrlink_handoff);
+
+            g_phase = "SDL onCreate -> main";
+            printf("\n=== onCreate -> the shell's main() ===\n");
+            fflush(NULL);
+            if (kl_slink_sdl_start_main(stdout) != 0) return fail(kl_slink_error());
+            g_phase = "shell running";
+            return 0;
+        }
+
+        return steamlink_vr_begin();
     }
 
     void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
@@ -659,9 +872,10 @@ void kl_app_lifecycle_report(void) {
         // app. Every one of them otherwise reports only on kl_fault.c's abort
         // path, which a working run never takes, so the run that most needs
         // these numbers was the one printing none of them.
-        printf("\n=== the Steam Link VR run ===\n");
+        printf("\n=== the Steam Link %s run ===\n", kl_slink_door_name());
         kl_slink_report(stdout);
-        snprintf(g_status, sizeof g_status, "Steam Link VR run ended");
+        snprintf(g_status, sizeof g_status, "Steam Link %s run ended",
+                 kl_slink_door_name());
         return;
     }
     printf("  pumped %u frames\n", g_frames_pumped);
@@ -690,10 +904,24 @@ int kl_app_lifecycle(unsigned frames) {
     // too. `frames` would be a number with nothing behind it, so the deadline is
     // KL_SLINK_WAIT's, in seconds, as it is on the command line.
     if (g_target->steamlink) {
-        unsigned secs = kl_env_uint("KL_SLINK_WAIT", 30);
-        printf("\n=== pumping the looper for %us ===\n", secs);
+        // ...and the shell has no deadline at all by default, which is the one
+        // place the two doors differ here. A bounded pump measures how far a
+        // guest got by itself; the shell is not measuring, it is being USED —
+        // a person is reading it, typing a PIN into it and waiting on a host,
+        // and pairing alone took ~35 s the first time (SL-6). An explicit
+        // KL_SLINK_WAIT still bounds it, for a scripted run that wants that.
+        double secs = 30;
+        if (g_door == KL_SLINK_SHELL)
+            secs = kl_env_str("KL_SLINK_WAIT", NULL) ? kl_env_uint("KL_SLINK_WAIT", 30) : -1.0;
+        else
+            secs = kl_env_uint("KL_SLINK_WAIT", 30);
+
+        if (secs < 0) printf("\n=== the shell is running; pumping until the window closes ===\n");
+        else          printf("\n=== pumping for %.0fs ===\n", secs);
         fflush(NULL);
-        double spent = kl_slink_vr_pump((double)secs, NULL);
+        double spent = g_door == KL_SLINK_SHELL
+                     ? kl_slink_sdl_pump(secs, &g_guest_quit)
+                     : kl_slink_vr_pump(secs, &g_guest_quit);
         printf("  pumped for %.1fs\n", spent);
         kl_app_lifecycle_report();
         return 0;
@@ -784,8 +1012,16 @@ static void *guest_thread(void *unused) {
     kl_thread_init();
     pthread_setname_np("Klepton Guest");
 
-    if (kl_app_lifecycle_begin() != 0) {
-        printf("[guest] lifecycle_begin failed: %s\n", g_status);
+    // Two ways in, and which one this is depends on what the WINDOW already
+    // did. On a plain launch this thread is the first thing to run a guest, and
+    // kl_app_lifecycle_begin is that. After a 2D->VR handoff the window path has
+    // already spent that entry on the shell — so the immersive space is opening
+    // on top of a process that is mid-run, and what it starts is the OTHER front
+    // door. Both are once-per-process; they are just not the same once.
+    int rc = kl_app_vrlink_pending() ? steamlink_vr_begin() : kl_app_lifecycle_begin();
+    if (rc != 0) {
+        printf("[guest] %s failed: %s\n",
+               kl_app_vrlink_pending() ? "the VR front door" : "lifecycle_begin", g_status);
         fflush(NULL);
         guest_finished();
         return NULL;
@@ -803,7 +1039,7 @@ static void *guest_thread(void *unused) {
     if (g_target->steamlink) {
         printf("\n=== guest thread pumping the activity's looper ===\n");
         fflush(NULL);
-        double secs = kl_slink_vr_pump(-1.0, &g_guest.stop);
+        double secs = kl_slink_vr_pump(-1.0, &g_guest_quit);
         printf("[guest] pumped for %.1fs\n", secs);
         fflush(NULL);
         kl_app_lifecycle_report();
@@ -896,6 +1132,7 @@ void kl_app_guest_stop(void) {
     pthread_mutex_lock(&g_guest.mu);
     if (!g_guest.running) { pthread_mutex_unlock(&g_guest.mu); return; }
     g_guest.stop = 1;
+    g_guest_quit = 1;      // the kl_slink pumps watch this one
     g_guest.running = 0;
     pthread_t t = g_guest.thread;
     pthread_cond_broadcast(&g_guest.cv);

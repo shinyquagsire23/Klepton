@@ -40,10 +40,10 @@
 #include "../runtime/kl_openxr.h"
 #include "../runtime/kl_egl.h"
 #include "../runtime/kl_slink.h"
+#include "../runtime/kl_ovrp.h"
+#include "../tests/t_mtl_provider.h"
 
 static const char *LIBDIR = "steamlink-android/lib/arm64-v8a";
-
-typedef int (*jni_onload_fn)(void *vm, void *reserved);
 
 // Set when the viewer's window closes; the phase-4 wait loop watches it so the
 // guest is not torn down while a window is still showing its output.
@@ -62,162 +62,38 @@ static kl_slink_door g_door;
 #define g_vr    (g_door == KL_SLINK_VR)
 
 // ---------------------------------------------------------------- phase 4 --
-// SDLActivity.onCreate's sequence, read out of the APK's own bytecode rather
-// than from SDL's upstream source, because Steam Link overrides three of the
-// hooks that decide it (see SL_MAIN_LIB below).
+// SDLActivity.onCreate's sequence — nativeSetScreenResolution, onNativeResize,
+// onNativeSurfaceCreated, and then mSDLThread, where the guest's main() runs.
 //
-//   SDLSurface.surfaceChanged -> nativeSetScreenResolution(IIIIFF)
-//                             -> onNativeResize()
-//   SDLSurface.surfaceCreated -> onNativeSurfaceCreated()
-//   SDLMain.run [on mSDLThread] -> nativeInitMainThread()
-//                               -> SDLActivity.main() -> nativeRunMain(lib, fn, args)
-//                               -> nativeCleanupMainThread()
-//
-// The thread split is not incidental and folding it away would hang: SDL runs
-// the guest's main on mSDLThread and pumps events on the UI thread, and
-// SDL_main blocks on the event queue. Same shape as the HandlerThread lesson
-// in M4 — the guest blocks waiting for a thread we declined to create.
-#define SL_SDLA "org/libsdl/app/SDLActivity"
-
-typedef void (*v_env_cls)(void *, void *);
-
-static void *sdl_thread_body(void *arg) {
-    void **slot = (void **)arg;
-    // Trap 1: any thread that runs guest code seeds bionic's stack-guard canary
-    // into TSD slot 5 first. This thread runs the whole of SDL_main.
-    kl_thread_init();
-
-    void *env = kl_jni_env(), *cls = kl_jni_class(SL_SDLA);
-
-    if (slot[0]) {
-        printf("  [sdl] nativeInitMainThread()\n");
-        fflush(NULL);
-        ((v_env_cls)slot[0])(env, cls);
-    }
-
-    const char *lib = getenv("KL_SLINK_LIB"); if (!lib) lib = kl_slink_main_lib();
-    const char *fn  = getenv("KL_SLINK_FN");  if (!fn)  fn  = kl_slink_main_fn();
-
-    // SDL dlopens this by path and dlsyms the function out of it. The path has
-    // to be the one the image is REGISTERED under or kl_dl's dlopen will try to
-    // map a second copy: kl_jni_set_native_lib_dir() and the chain loader above
-    // both use LIBDIR, so build it the same way. (Trap 6c: absolute would be
-    // more Android-like, but the registry key is what must match.)
-    char libpath[1024];
-    snprintf(libpath, sizeof libpath, "%s/%s", LIBDIR, lib);
-
-    // argv. SDL3's nativeRunMain takes a String[] and prepends argv[0] itself,
-    // so this array is argv[1..]. The real activity fills it from the launching
-    // intent's "sArgs" extra (§11.9) and libmain PARSES IT — --server, --appid,
-    // --steamid, --transport and ~40 more. Passing NULL is not "no options
-    // chosen", it is the streaming client being asked to stream nothing, which
-    // is why it reaches OnStreamError before opening a single socket.
-    char  argbuf[2048];
-    const char *argv[64];
-    int   argc = 0;
-    const char *a = getenv("KL_SLINK_ARGS");
-    if (a && *a) {
-        snprintf(argbuf, sizeof argbuf, "%s", a);
-        for (char *tok = strtok(argbuf, " \t");
-             tok && argc < (int)(sizeof argv / sizeof argv[0]);
-             tok = strtok(NULL, " \t"))
-            argv[argc++] = tok;
-    }
-    void *jargs = argc ? kl_jni_new_string_array(argv, argc) : NULL;
-
-    printf("  [sdl] nativeRunMain(\"%s\", \"%s\", %s", libpath, fn,
-           argc ? "[" : "NULL");
-    for (int i = 0; i < argc; i++) printf("%s\"%s\"", i ? ", " : "", argv[i]);
-    printf("%s)\n", argc ? "])" : ")");
-    fflush(NULL);
-
-    kl_jni_local_frame_push();
-    int rc = ((int (*)(void *, void *, void *, void *, void *))slot[1])(
-        env, cls, kl_jni_new_string(libpath), kl_jni_new_string(fn), jargs);
-    kl_jni_local_frame_pop();
-
-    printf("  [sdl] nativeRunMain returned %d\n", rc);
-    fflush(NULL);
-
-    if (slot[2]) {
-        printf("  [sdl] nativeCleanupMainThread()\n");
-        fflush(NULL);
-        ((v_env_cls)slot[2])(kl_jni_env(), kl_jni_class(SL_SDLA));
-    }
-    return NULL;
-}
-
-// Look one up and say so. A native SDL3 did not register is a different failure
-// from one that aborts when called, and conflating them wastes a run.
-static void *want(const char *name) {
-    void *p = kl_jni_native(SL_SDLA, name, NULL);
-    printf("  %-28s %s\n", name, p ? "ok" : "NOT REGISTERED");
-    return p;
-}
-
-static void run_main_sequence(kl_image *sdl_img, kl_image *entry_img) {
-    (void)sdl_img; (void)entry_img;
+// All of it lives in runtime/kl_slink.c now: it is SDL3's contract with
+// Android and therefore a property of *this guest*, and the visionOS app is a
+// second driver that must not be able to describe it differently. What stays
+// here is policy — when to run it, and how long the UI thread waits afterwards.
+static void run_main_sequence(void) {
     printf("\n=== phase 4: onCreate -> SDL_main (KL_SLINK_MAIN) ===\n");
     fflush(NULL);
-
-    void *setres  = want("nativeSetScreenResolution");
-    void *surfcr  = want("onNativeSurfaceCreated");
-    void *resize  = want("onNativeResize");
-    void *initmt  = want("nativeInitMainThread");
-    void *runmain = want("nativeRunMain");
-    void *cleanmt = want("nativeCleanupMainThread");
-    if (!runmain) { printf("  no nativeRunMain — cannot reach SDL_main\n"); return; }
-
-    void *env = kl_jni_env(), *cls = kl_jni_class(SL_SDLA);
-
-    // A plausible flat window. These are the numbers SDLSurface would have read
-    // off the Display; nothing downstream has been shown to care yet, so they
-    // are deliberately ordinary rather than a Quest's panel.
-    int w, h;
-    kl_slink_panel_size(&w, &h);
-
-    if (setres) {
-        printf("  nativeSetScreenResolution(%d,%d, %d,%d, 2.0, 60.0)\n", w, h, w, h);
-        fflush(NULL);
-        kl_jni_local_frame_push();
-        ((void (*)(void *, void *, int, int, int, int, float, float))setres)(
-            env, cls, w, h, w, h, 2.0f, 60.0f);
-        kl_jni_local_frame_pop();
-    }
-    if (resize) { printf("  onNativeResize()\n"); fflush(NULL);
-                  kl_jni_local_frame_push(); ((v_env_cls)resize)(env, cls); kl_jni_local_frame_pop(); }
-    if (surfcr) { printf("  onNativeSurfaceCreated()\n"); fflush(NULL);
-                  kl_jni_local_frame_push(); ((v_env_cls)surfcr)(env, cls); kl_jni_local_frame_pop(); }
-
-    // ...and now the SDL thread, which is where SDL_main lives.
-    void *slot[3] = { initmt, runmain, cleanmt };
-    pthread_t th;
-    if (pthread_create(&th, NULL, sdl_thread_body, slot) != 0) {
-        printf("  pthread_create for the SDL thread failed\n");
+    if (kl_slink_sdl_start_main(stdout) != 0) {
+        printf("  %s\n", kl_slink_error());
         return;
     }
 
-    // The UI thread's job while SDL_main runs. There is no looper to pump yet —
-    // this is the recon shape, and what it measures is how far SDL_main gets
-    // before it blocks on something we have not built. KL_ALARM is the backstop.
+    // The UI thread's job while the guest's main runs. There is no looper to
+    // pump on this door — what the guest needs is the posted-task queue being
+    // drained — and KL_SLINK_WAIT is the backstop.
     //
-    // Under the viewer there is no deadline: SDL_main runs for as long as the
+    // Under the viewer there is no deadline: main() runs for as long as the
     // window is open, and the loop ends when the user closes it. A fixed wait
     // there would tear the guest down mid-frame a few seconds after it started.
-    unsigned secs = 0;
     const char *lim = getenv("KL_SLINK_WAIT");
     unsigned maxs = lim ? (unsigned)atoi(lim) : 10;
     int windowed = getenv("KL_VIEW") != NULL;
-    struct timespec ts = { 0, 100 * 1000 * 1000 };
-    for (unsigned t = 0; windowed ? !g_view_quit : t < maxs * 10; t++) {
-        nanosleep(&ts, NULL);
-        if (++secs % 10 == 0) { kl_jni_drain_ui_tasks(); }
-    }
-    if (windowed) { printf("  (window closed)\n"); fflush(NULL); return; }
-    printf("  (UI thread waited %us; SDL thread not joined — see above for where it got to)\n", maxs);
+    double spent = kl_slink_sdl_pump(windowed ? -1.0 : (double)maxs,
+                                     windowed ? &g_view_quit : NULL);
+    if (windowed) { printf("  (window closed after %.1fs)\n", spent); fflush(NULL); return; }
+    printf("  (UI thread waited %.1fs of %us; SDL thread not joined — see above "
+           "for where it got to)\n", spent, maxs);
     fflush(NULL);
 }
-
 // ------------------------------------------------- the 2D -> VR handoff, run --
 //
 // SteamLink.startVRLink(String) is the end of the shell's job: it has paired,
@@ -302,6 +178,15 @@ static void slink_vrlink_handoff(const char *sargs) {
 // where it stops (KL_SLINK_MAIN), how long it waits (KL_SLINK_WAIT) and that a
 // windowed run waits on the window instead.
 static void run_vr_sequence(void) {
+    // KL_GLFB_MTL=1: the eye swapchain images this guest is about to create get
+    // MTLTexture storage from the same provider Compositor Services supplies on
+    // device, so the P5 seam has a host arm at all for this guest. Registered
+    // before onCreate because the backing happens at the first xrEndFrame, and
+    // an unregistered provider there is simply "no eye textures" with nothing
+    // saying so. Explicitly on KL_GLFB_MTL and not on KL_VIEW: the 2D shell's
+    // window has no eye textures and must not acquire a provider by accident.
+    if (getenv("KL_GLFB_MTL")) kl_mtl_provider_install();
+
     printf("\n=== phase 2: ANativeActivity_onCreate (the VR front door) ===\n");
     fflush(NULL);
     if (kl_slink_vr_create(stdout) != 0) {
@@ -326,6 +211,32 @@ static void run_vr_sequence(void) {
                                       windowed ? &g_view_quit : NULL);
     printf("  (UI thread waited %.1fs of %us — see above for where the guest got to)\n",
            elapsed, maxs);
+
+    // The P5 seam, measured, on the host — which is the whole point of doing it
+    // here. On device this question ("is there a picture in the eye textures?")
+    // costs a fresh Steam pairing to ask and answers only as a black immersive
+    // space, which indicts everything from the decoder to the compositor
+    // equally. These three numbers separate the halves:
+    //
+    //   stage  -1 means no frame record was ever filed, so a compositor has
+    //          nothing to sample whatever the guest drew — the seam, not the
+    //          picture (SL-18's `0 with a picture` was exactly this).
+    //   lit    per eye, out of the eye texture the compositor WOULD sample.
+    //          0 with a stage means the guest drew black or drew somewhere
+    //          else; non-zero means the picture is there and anything still
+    //          missing is downstream of this file.
+    if (getenv("KL_GLFB_MTL")) {
+        int stage = kl_ovrp_last_complete_stage();
+        printf("\n=== the eye textures (P5) ===\n");
+        printf("  last complete stage: %d%s\n", stage,
+               stage < 0 ? "   <-- NO FRAME RECORD; a compositor shows black" : "");
+        for (int eye = 0; eye < 2 && stage >= 0; eye++) {
+            int w = 0, h = 0;
+            unsigned long lit = kl_mtl_count_lit(eye, stage, &w, &h);
+            printf("  eye %d stage %d: %dx%d, %lu lit%s\n", eye, stage, w, h, lit,
+                   lit ? "" : "   <-- BLACK");
+        }
+    }
     fflush(NULL);
 }
 
@@ -421,43 +332,22 @@ static int slink_run(void) {
         return 0;
     }
 
-    snprintf(path, sizeof path, "%s/libSDL3.so", LIBDIR);
-    kl_image *sdl_img = kl_find_image(path);
-    if (!entry_img || !sdl_img) return fail("the entry library / libSDL3.so not in the registry");
-
     // ---- phase 2: the JNI gate ----
-    // JNI_OnLoad is libSDL3's, and it is a versioned symbol (JNI_OnLoad@@SDL3_0.0.0).
-    // The version lives in a separate table; the .dynstr name is plain, so an
-    // ordinary lookup finds it.
+    // libSDL3's JNI_OnLoad, the natives SDLActivity.onCreate calls first, and
+    // the entry point looked up the way nativeRunMain will look it up. All of
+    // it is SDL3's contract with Android, so it lives in runtime/kl_slink.c
+    // where the visionOS app reads the same description.
     printf("\n=== phase 2: libSDL3.so JNI_OnLoad ===\n");
     fflush(NULL);
-    jni_onload_fn onload = (jni_onload_fn)kl_sym(sdl_img, "JNI_OnLoad");
-    if (!onload) return fail("libSDL3.so exports no JNI_OnLoad");
-
-    kl_jni_local_frame_push();
-    int version = onload(kl_jni_vm(), NULL);
-    kl_jni_local_frame_pop();
-    printf("  JNI_OnLoad returned 0x%08x\n", version);
-    // SDL3 asks for JNI_VERSION_1_4, not Unity's 1_6 — read off its own
-    // epilogue (`mov w0,#4; movk w0,#1,lsl#16`), not assumed. Both are versions
-    // we satisfy; what matters is that it did not return a negative error.
-    if (version != 0x00010004 && version != KL_JNI_VERSION_1_6)
-        return fail("JNI_OnLoad did not return a JNI version we serve");
-
-    // SDL3 registers its natives from JNI_OnLoad the way Unity does. These
-    // three are the ones SDLActivity.onCreate calls first, through
-    // SDL.setupJNI(), so their absence would stop phase 3 immediately.
-    const char *SDLA = "org/libsdl/app/SDLActivity";
-    void *setup = kl_jni_native(SDLA, "nativeSetupJNI", NULL);
-    void *runmain = kl_jni_native(SDLA, "nativeRunMain", NULL);
-    printf("  %s.nativeSetupJNI=%p nativeRunMain=%p\n", SDLA, setup, runmain);
+    if (kl_slink_sdl_onload(stdout) != 0) return fail(kl_slink_error());
 
     // ...and Steam Link's own seven are STATIC exports, so they resolve by
     // name off libmain rather than through RegisterNatives. Checking both
     // halves here is what makes "the natives are a mix" an assertion instead
     // of a note. They live in the streaming client only; the shell has no
     // video surface to hand anyone, so this half of the assertion is the
-    // client chain's.
+    // client chain's — which is also why it stays with the driver: it is a
+    // recon measurement, not something the guest needs done to it.
     static const char *const STATIC_NATIVES[] = {
         "Java_com_valvesoftware_steamlink_SteamLink_useVideoSurface",
         "Java_com_valvesoftware_steamlink_SteamLink_videoSurfaceCreated",
@@ -475,16 +365,6 @@ static int slink_run(void) {
                nstatic, sizeof STATIC_NATIVES / sizeof *STATIC_NATIVES);
     }
 
-    // The entry point itself, looked up the way SDL's nativeRunMain will look it
-    // up. Failing here rather than three phases later is the difference between
-    // "the guest exports no such symbol" and "something went wrong in main".
-    void *entry = kl_sym(entry_img, kl_slink_main_fn());
-    printf("  %s %s=%p\n", kl_slink_main_lib(), kl_slink_main_fn(), entry);
-    if (!entry) return fail("the entry library does not export its entry point");
-
-    if (!setup || !runmain)
-        return fail("SDL3 did not register the SDLActivity natives");
-
     printf("\n=== SL-1 EXIT CRITERION MET: chain bound, SDL3 JNI_OnLoad ran ===\n");
 
     // ---- phase 3: reconnaissance ----
@@ -494,33 +374,7 @@ static int slink_run(void) {
     // place for the surface to start failing by name.
     printf("\n=== recon: SDL.setupJNI() ===\n");
     fflush(NULL);
-    // SDL.setupJNI() calls THREE natives, not one — SDLActivity's, then
-    // SDLAudioManager's, then SDLControllerManager's — and each caches its own
-    // jclass and its own method ids in file-static globals on the C side.
-    // Calling only the first leaves the other two sets NULL, and the failure
-    // surfaces much later and somewhere else: the audio backend calls a cached
-    // (class, methodID) pair that is still {NULL, NULL} and it presents as
-    // "Call*Method with a jmethodID we never issued", with no hint that a setup
-    // call was skipped. Cost one debugging round; do not trim this list.
-    static const char *const SETUP_CLASSES[] = {
-        "org/libsdl/app/SDLActivity",
-        "org/libsdl/app/SDLAudioManager",
-        "org/libsdl/app/SDLControllerManager",
-    };
-    for (size_t i = 0; i < sizeof SETUP_CLASSES / sizeof *SETUP_CLASSES; i++) {
-        void *fn = kl_jni_native(SETUP_CLASSES[i], "nativeSetupJNI", NULL);
-        printf("  %s.nativeSetupJNI %s\n", SETUP_CLASSES[i], fn ? "" : "NOT REGISTERED");
-        if (!fn) continue;
-        fflush(NULL);
-        kl_jni_local_frame_push();
-        // The jclass is the second argument, and this one is load-bearing: SDL3
-        // takes a global ref to it and resolves every static method it will ever
-        // call against it. NULL here reads as "GetStaticMethodID on
-        // <unknown-jclass>" in the report and would be a dangling class later.
-        ((void (*)(void *, void *))fn)(kl_jni_env(), kl_jni_class(SETUP_CLASSES[i]));
-        kl_jni_local_frame_pop();
-    }
-    printf("  setupJNI returned\n");
+    kl_slink_sdl_setup(stdout);
 
     // ---- phase 4: the rest of onCreate, to SDL_main ----
     // Behind a knob for the same reason KL_LIFECYCLE gates t_boot: SL-1 is a
@@ -530,7 +384,8 @@ static int slink_run(void) {
     // KL_VIEW implies it: opening a window for a guest whose main never runs
     // would show a permanently black rectangle and read as a rendering bug.
     if (getenv("KL_SLINK_MAIN") || getenv("KL_VIEW"))
-        run_main_sequence(sdl_img, entry_img);
+        run_main_sequence();
+
 
     // The video and audio paths report on the abort path through kl_fault.c,
     // which a clean exit never takes — and a clean exit is exactly the run

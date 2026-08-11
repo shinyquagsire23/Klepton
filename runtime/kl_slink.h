@@ -103,6 +103,37 @@ int  kl_slink_load_chain(FILE *out);
 void kl_slink_report_gap(FILE *out);
 void kl_slink_run_inits(FILE *out);
 
+// --- the SDL3 front doors (CLIENT and SHELL) --------------------------------
+//
+// Both of these are SDLActivity apps, so what starts them is SDL3's contract
+// with Android and not ours: libSDL3's JNI_OnLoad, SDL.setupJNI()'s three
+// natives, and then the surface/resolution calls SDLSurface would have made
+// before SDLMain.run spawns mSDLThread. It lives here for the same reason the
+// VR door's onCreate does — it is a property of *this guest*, and the visionOS
+// app must not describe it differently from `build/m_slink`.
+//
+// _onload runs libSDL3's JNI_OnLoad and checks the two natives SDLActivity's
+// own onCreate calls first, so a chain that bound but registered nothing fails
+// here rather than three phases later.
+int  kl_slink_sdl_onload(FILE *out);
+// SDL.setupJNI() — and it is THREE natives, not one (SDLActivity,
+// SDLAudioManager, SDLControllerManager). Each caches its own jclass and method
+// ids in file-static C globals, and skipping one surfaces much later as a call
+// through a {NULL, NULL} pair with nothing pointing back here.
+void kl_slink_sdl_setup(FILE *out);
+// The rest of onCreate: the panel geometry, the surface, and mSDLThread — which
+// is where the guest's main() runs. Returns 0 if the thread was spawned.
+//
+// The thread split is not incidental and folding it away would hang: SDL runs
+// the guest's main on mSDLThread and pumps events on the UI thread, and
+// SDL_main blocks on the event queue. What the caller owes it afterwards is a
+// UI thread that keeps draining posted tasks — see kl_slink_sdl_pump.
+int  kl_slink_sdl_start_main(FILE *out);
+// The UI thread's job while main() runs: drain the posted-task queue on a
+// cadence. `seconds` is a DEADLINE in wall time; negative means "until *quit",
+// which is the app-bundle shape. `quit` may be NULL. Returns seconds spent.
+double kl_slink_sdl_pump(double seconds, const volatile int *quit);
+
 // --- the VR front door ------------------------------------------------------
 //
 // libvrlink_scene.so is a real NativeActivity: no JNI_OnLoad, no natives to

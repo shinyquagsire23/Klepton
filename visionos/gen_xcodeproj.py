@@ -28,7 +28,7 @@ What the app links, and why it comes from three places:
                         driver.
   Sources/              the Swift app layer and kl_app.c (PLANNING §12.6).
 """
-import os, subprocess, sys, re
+import os, pathlib, subprocess, sys, re
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import targets as targets_mod
@@ -64,7 +64,43 @@ BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", KLT["bundle"])
 # developer portal) — or build with KLEPTON_ENTITLEMENTS=0 to get moving without
 # them, at the cost of the memory headroom.
 ENTITLEMENTS = os.environ.get("KLEPTON_ENTITLEMENTS", "1") != "0"
-ENTITLEMENTS_SETTING = ("\t\t\t\tCODE_SIGN_ENTITLEMENTS = Klepton.entitlements;\n"
+
+# ...and one of those keys is on a different footing from the rest.
+#
+# com.apple.developer.networking.multicast is granted by REQUEST rather than by
+# enabling a capability (see Klepton.entitlements), so on an account that has
+# not been granted it the build fails with
+#
+#   error: Provisioning profile "iOS Team Provisioning Profile: dev.klepton.
+#          steamlink" doesn't include the com.apple.developer.networking.
+#          multicast entitlement.
+#
+# (Measured, SL-19 — note it says "doesn't INCLUDE the entitlement", not
+# "doesn't support the capability" as the memory pair does. That wording is the
+# tell: a capability you may enable yourself reads one way, a grant you must be
+# given reads the other.)
+#
+# and takes the two memory entitlements down with it — which is a much worse
+# day than not having discovery, because those are what stopped the
+# loading-transition kills. KLEPTON_MULTICAST=0 writes a filtered copy without
+# that one key and points the project at it, so the failure is a missing
+# computer list rather than a build that will not sign.
+#
+# The filtered file is GENERATED, not a second authored one: two entitlement
+# files that have to agree is exactly how they stop agreeing.
+MULTICAST = os.environ.get("KLEPTON_MULTICAST", "1") != "0"
+ENTITLEMENTS_FILE = "Klepton.entitlements"
+if ENTITLEMENTS and not MULTICAST:
+    import plistlib
+    src = pathlib.Path(__file__).with_name("Klepton.entitlements")
+    d = plistlib.loads(src.read_bytes())
+    d.pop("com.apple.developer.networking.multicast", None)
+    out = pathlib.Path(__file__).with_name("build") / "Klepton-nomulticast.entitlements"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(plistlib.dumps(d))
+    ENTITLEMENTS_FILE = "build/Klepton-nomulticast.entitlements"
+
+ENTITLEMENTS_SETTING = (f"\t\t\t\tCODE_SIGN_ENTITLEMENTS = {ENTITLEMENTS_FILE};\n"
                         if ENTITLEMENTS else "")
 GUEST = KLT["libs"].split()
 ANGLE = ["ANGLE_libEGL", "ANGLE_libGLESv2"]
@@ -117,7 +153,7 @@ B_C = oid("BC")
 # renderer P5b adds. A list rather than an id pair each, for the same reason
 # the guest libraries are one.
 SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
-         "KleptonTemplate.swift", "KleptonAudio.swift"]
+         "KleptonTemplate.swift", "KleptonAudio.swift", "KleptonShell.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(
@@ -140,9 +176,13 @@ buildfiles = "\n".join(
     f'settings = {{ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }}; }};'
     for g in guest)
 
+# Quoted, and it is not decoration: a pbxproj value may go unquoted only if it
+# is alphanumerics, `_`, `.`, `/` and `-`. `libc++_shared` has a `+` in it, and
+# the failure is not a bad reference — the whole project becomes unreadable,
+# `xcodebuild` says "damaged ... due to a parse error" and names no file.
 filerefs = "\n".join(
     f'\t\t{g["ref"]} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; '
-    f'name = {g["name"]}.xcframework; path = {g["dir"]}/{g["name"]}.xcframework; sourceTree = "<group>"; }};'
+    f'name = "{g["name"]}.xcframework"; path = "{g["dir"]}/{g["name"]}.xcframework"; sourceTree = "<group>"; }};'
     for g in guest)
 
 embeds = "\n".join(f'\t\t\t\t{g["emb"]},' for g in guest)

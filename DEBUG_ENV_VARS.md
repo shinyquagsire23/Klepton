@@ -169,6 +169,12 @@ answers GL and kl_glfb never initializes.
   Compositor Services (`tests/t_mtl_provider.m`). With `KL_GLFB_OUT` set it
   also writes `mtl_eye0.png`/`mtl_eye1.png` from the textures, tone-mapped like
   the reference frames so the two are directly comparable.
+  On `build/m_slink`'s **VR** front door it does the same for the OpenXR
+  swapchains (SL-19) and prints, at the end of the run, the last complete frame
+  record's stage and how many texels of each eye are lit. That is the host arm
+  of "the immersive space is black": a stage of -1 means no frame record, `0
+  lit` means the guest drew nothing there, and anything else means the picture
+  reached the texture the compositor samples.
 - `KL_ANGLE_VRR_TRACE=1` — read by **our patched ANGLE**, not by the runtime
   (`angle-patches/klepton.patch`, `vendor/src/libANGLE/renderer/metal/`). Logs
   the variable-rasterization-rate seam: every rate map bound or unbound through
@@ -199,6 +205,34 @@ answers GL and kl_glfb never initializes.
   unit!" neighbourhood — see `KL_POKE_CAP` under Viewer).
 
 ## Networking (`runtime/kl_shim.c`)
+
+- `KL_NET_BCAST_FANOUT=0` — stop delivering a broadcast as unicast to every host
+  on the subnet. Default ON. **This is what makes Steam Link's host discovery
+  work on visionOS**, where an app may not broadcast without
+  `com.apple.developer.networking.multicast` — an entitlement Apple grants by
+  REQUEST, not by enabling a capability. Measured shape of the thing being
+  worked around (SL-19): the guest opens an **IPv6** socket, binds
+  `[::]:27036`, and sends its 31-byte probe to `[::ffff:255.255.255.255]` and
+  `[ff02::1]`, both of which return *No route to host*. The fan-out replays it
+  as unicast — as IPv4-mapped addresses, since the socket is IPv6 — and the
+  host answers: `recvfrom -> 213 from [::ffff:192.168.4.28]:27036`. It covers
+  both `sendto` and `sendmsg`, because this guest imports both. `make bcast` is
+  the gate.
+- `KL_SLINK_HOST=<ip>[,<ip>…]` — replace the subnet sweep with an explicit
+  list, one packet per address. The direct-connect case, and the answer when
+  the subnet is too wide to sweep (anything past a /22 is refused by name, and
+  a truncated sweep says how many addresses it dropped — a sweep that quietly
+  covers half a /22 finds the machines at the bottom of the range and not the
+  ones above them).
+- `KL_GUEST_JIT=1` — allow the guest to map anonymous `PROT_EXEC` memory.
+  Default REFUSED, loudly: AMFI will not execute an unsigned page, so a mapping
+  that succeeds is a SIGKILL on the first branch into it, with no signal and no
+  log line (trap 27). A JIT that is told no takes its interpreter. On a host run
+  there is no AMFI and this is safe to set.
+- `KL_TRACE_NET=1` — every socket call the guest makes, with addresses and
+  errors. Note the name: it is `KL_TRACE_NET`, not `KL_NET_TRACE`, and the
+  wrong one costs a device round trip that looks like "the guest does no
+  networking".
 
 The socket layer translates bionic→Darwin: `SOL_SOCKET` level + option numbers
 in setsockopt/getsockopt, the `sa_len` byte and `AF_INET6` (10 vs 30) in every
@@ -689,12 +723,19 @@ The composite/timewarp pass — one file, compiled by both compositors
   offset is the honest emulation and is what puts the in-game controller
   models where a body would hold them.
 - `KL_VIEW_POKE="fx,fy@secs[;fx,fy@secs]..."` — mono guests only. A sequence of
-  synthetic clicks (up to 12) at fractional window coordinates, delivered
-  through the same `SDLActivity.onNativeMouse` a real click uses. Hover, press
-  and release land on three separate frames, which is load-bearing: pressed and
-  released inside one iteration takes a button's highlight and produces no
-  click. Exists so the input path can be proved without posting a CGEvent at
-  the desktop, which clicks whatever window is really under that point.
+  synthetic clicks (up to 12) at fractional **guest surface** coordinates,
+  delivered through the same `SDLActivity.onNativeMouse` a real click uses.
+  Hover, press and release land on three separate ticks, which is load-bearing:
+  pressed and released inside one iteration takes a button's highlight and
+  produces no click. Exists so the input path can be proved without posting a
+  CGEvent at the desktop, which clicks whatever window is really under that
+  point.
+  Not a viewer knob any more despite the name (SL-18): it lives in
+  `runtime/kl_mono.c` and is driven from `kl_slink_sdl_pump`, i.e. the Android
+  UI thread — where a real MotionEvent would be delivered, and the one thread
+  guaranteed to keep turning. So it needs **no window at all**, which is what
+  makes it usable inside the visionOS simulator, where `simctl` runs the app
+  headless and there is nothing to click.
   Every `secs` is measured from the SAME zero — the mono transition — not from
   the click before it, so a run is described by when each screen is expected
   rather than by gaps that have to be re-derived when an earlier screen gets
@@ -765,6 +806,20 @@ reads no knobs). See PLANNING §12.18.
   with like. Default on. This is the A/B that identified the veneer pass as
   the cause of Steam Link's failing TLS handshake: with it off the handshake
   completed, with it on the guest answered `bad_record_mac`.
+- `KL_CTR=0` — disable trap 26's `mrs Xt, CTR_EL0` veneer. Deliberately its own
+  knob rather than part of `KL_X18`: the two rewrites fix different registers,
+  and an A/B on one must not silently move the other. Default on. **The control
+  arm crashes**: an un-veneered `mrs Xt, CTR_EL0` is SIGILL from EL0 on every
+  Darwin kernel, so this is how you reproduce that on purpose, not a fallback.
+- `KL_CTR_EL0=<hex>` — what the veneer answers, default `0x8444c004` (Apple
+  silicon's own value: 64-byte lines, IDC=0, DIC=0, so `__clear_cache` really
+  does its `dc cvau` / `ic ivau` maintenance, both of which ARE legal from EL0).
+  `0xb444c004` sets IDC and DIC, which makes `__clear_cache` a pair of barriers
+  and skips both maintenance loops — the fallback if a kernel ever traps those
+  too. See `KLX_CTR_EL0_VALUE` in `runtime/kl_x18.h`.
+  **Baked in at translation time**, so changing it means re-translating
+  (`make dylibs`, `visionos/mkguest.sh`); `make ctr` prints the value in force
+  and `klepton-ld` prints it per library that has a site.
 - `KL_HWCAP=<hex>` — override the measured `getauxval(AT_HWCAP)` outright
   (`kl_libc_slink.c`). An A/B, not a tuning knob: the bits select whole
   hand-written assembly implementations, so `KL_HWCAP=0x3` (FP|ASIMD only)
@@ -817,6 +872,11 @@ See PLANNING §11.
   is deliberately NOT loaded because it is replaced by `runtime/kl_openxr.c`.
   VR APK only, and it says so by name if pointed at the other tree. Mutually
   exclusive with `KL_SLINK_SHELL` (VR wins, with a line saying so).
+  **Both knobs reach the visionOS app too, and the DEFAULT there is different**
+  (SL-18): the app opens the SHELL unless it is handed a session — either
+  `KL_SLINK_VR=1` or a `KL_SLINK_SARGS` — because the shell is the only door
+  that can produce one, and the VR half leaves before its first frame without
+  it. `KL_SLINK_SHELL=1` forces the shell back even with a session present.
   `make slink-vr-gap` is the work list, `make slink-vr-scene` the run; with
   `KL_SLINK_MAIN=1` it goes on to drive the activity lifecycle
   (`onStart`/`onResume`/`onNativeWindowCreated`/`onWindowFocusChanged`) and then

@@ -41,10 +41,18 @@ MODE="${1:-sim}"
 # remembered. It cannot know about a data container the OS rotated underneath
 # us — KL_STAGE=1 is the answer to that, and the symptom is the same sentence.
 STAMP_DIR="build/staged"
+# ...and the stamp is keyed on the LAYOUT as well as the APK, because what gets
+# staged is not fixed. SL-18 added the Qt plugin .so files, and a stamp that
+# knew only about the APK would have skipped staging them on every machine that
+# had ever staged this target — a shell that aborts with `Could not find the Qt
+# platform plugin "virtual"` and a run.sh that says the assets are already
+# there. Bump this whenever stage_assets.sh stages something new.
+STAGE_SCHEMA=2
 stage_stamp() {   # <target-key>
   local apk="../$KLT_APK" sig=""
   [ -f "$apk" ] && sig=$(stat -f '%z-%m' "$apk" 2>/dev/null || true)
-  echo "$STAMP_DIR/$(echo "$KLT_NAME-$1-$BUNDLE_ID-$sig" | tr -c 'A-Za-z0-9._-' '_')"
+  echo "$STAMP_DIR/$(echo "$KLT_NAME-$1-$BUNDLE_ID-$sig-v$STAGE_SCHEMA" \
+       | tr -c 'A-Za-z0-9._-' '_')"
 }
 # stage_if_needed <target-key> <stage_assets.sh args...>
 stage_if_needed() {

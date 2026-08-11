@@ -34,20 +34,61 @@ TARGETS = {
         "tree":    "beatsaber",
         "apk":     "beatsaber.apk",
         "assets":  "beatsaber/assets",
+        # Nothing in this guest reads a library as a FILE, so no ELF goes into
+        # the container at all. See steamlink-vr's `qtplugins`.
+        "qtplugins": "",
         "product": "Klepton",
         "display": "Klepton",
         "bundle":  "dev.klepton.app",
     },
     "steamlink-vr": {
-        # The OpenXR front door, and ONE library: libvrlink_scene's DT_NEEDED is
-        # entirely Android system libraries we shim (PLANNING §11.9). The 2D
-        # shell's fourteen are deliberately absent — see kl_app.c's boot_steamlink
-        # for why the shell is not reachable from the app yet.
-        "libs":    "libvrlink_scene",
+        # BOTH front doors, because the app runs both: the 2D shell pairs in a
+        # WindowGroup and hands off to the OpenXR half in an ImmersiveSpace, in
+        # one process (PLANNING §11.9 — an app bundle cannot re-exec the way
+        # `build/m_slink` does).
+        #
+        # Three groups, and the third is the one that is easy to leave out:
+        #   libvrlink_scene   the VR door. ONE library — its DT_NEEDED is
+        #                     entirely Android system libraries we shim.
+        #   the shell chain   fourteen, dependencies first, off libshell's own
+        #                     DT_NEEDED (runtime/kl_slink.c's CHAIN_SHELL).
+        #   the Qt plugins    six, in NOBODY's DT_NEEDED. Qt dlopens them by
+        #                     path at runtime — the platform QPA first, and
+        #                     libshell aborts without it. A dlopen that finds no
+        #                     translation falls through to the mmap ELF loader,
+        #                     which is exactly the RWX-from-an-unsigned-file
+        #                     shape AMFI exists to refuse.
+        "libs":    "libvrlink_scene "
+                   "libc++_shared libSDL3 libSDL3_image libSDL3_mixer libSDL3_ttf "
+                   "libQt6Core_arm64-v8a libQt6Network_arm64-v8a libQt6Gui_arm64-v8a "
+                   "libQt6Widgets_arm64-v8a libQt6Svg_arm64-v8a "
+                   "libh264bitstream libhevcbitstream libsteamwebrtc "
+                   "libshell_arm64-v8a "
+                   "libplugins_platforms_qvirtual_arm64-v8a "
+                   "libplugins_iconengines_qsvgicon_arm64-v8a "
+                   "libplugins_imageformats_qgif_arm64-v8a "
+                   "libplugins_imageformats_qico_arm64-v8a "
+                   "libplugins_imageformats_qjpeg_arm64-v8a "
+                   "libplugins_imageformats_qsvg_arm64-v8a",
         "srcdir":  "steamlink-vr/lib/arm64-v8a",
         "tree":    "steamlink-vr",
         "apk":     "steamlink-vr.apk",
         "assets":  "steamlink-vr/assets",
+        # The six plugin .so files ALSO go into the container, as ELF, and not
+        # as a loader path — kl_load_auto still resolves each of them to its
+        # signed framework by basename, so nothing maps guest text from here.
+        #
+        # **Qt reads a plugin as a FILE before it will load it.** libQt6Core's
+        # search is a glob (`libplugins_%1_*.so`), so it lists the directory and
+        # then parses each candidate's ELF metadata for the IID and the Qt
+        # version. A directory of names the loader resolves is enough for
+        # everything else in this project and is not enough for that: with no
+        # real files nothing is ever a candidate, and libshell aborts with
+        # `Could not find the Qt platform plugin "virtual"`.
+        #
+        # Six files, 544 KB — not the whole 75 MB tree, because these are the
+        # only libraries anything reads rather than loads.
+        "qtplugins": "steamlink-vr/lib/arm64-v8a",
         "product": "KleptonSteamLink",
         "display": "Klepton Steam Link",
         "bundle":  "dev.klepton.steamlink",

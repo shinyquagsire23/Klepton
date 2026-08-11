@@ -45,6 +45,12 @@ int main(int argc, char **argv) {
     printf("  TLS rewrites: %u    inline svc #0: %u\n", st->tls_rewrites, st->svc_sites);
     printf("  x18 sites: %u    veneered: %u    refused: %u\n",
            st->x18_sites, st->x18_patched, st->x18_refused);
+    // Trap 26. Printed only when the library has any, so `make check`'s output
+    // for Beat Saber (which has none anywhere) is unchanged — the whole point
+    // of counting these apart from the x18 numbers.
+    if (st->ctr_sites)
+        printf("  CTR_EL0 reads: %u    veneered: %u    refused: %u\n",
+               st->ctr_sites, st->ctr_patched, st->ctr_refused);
     printf("  imports: %u bound, %u unresolved sites\n", st->imports_bound, st->imports_missing);
 
     unsigned nm = 0;

@@ -105,7 +105,7 @@ sincosf sincos putchar getchar fdatasync __cmsg_nxthdr __cxa_thread_atexit_impl
 fileno fgetc ungetc getwc fgetwc ungetwc fputwc putwc fwide
 stat64 lstat64 fstat64
 stdout stderr stdin __register_atfork __gnu_strerror_r __write_chk _ctype_
-dup2
+dup2 mprotect
 """.split())
 
 # Subsystem gateways with their own files, like gl*/SL_* below: AAudio is the

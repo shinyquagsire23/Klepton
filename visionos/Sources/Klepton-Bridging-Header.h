@@ -21,3 +21,11 @@
 // Swift (KleptonAudio.swift). Three calls cross: the session's measured rate
 // going in, and the two ways the OS takes the stream away coming back.
 #import "kl_audio.h"
+// ...and by two for the flat guest's window (SL-18). kl_present says WHAT SHAPE
+// of picture the guest is producing — one flat image wants a WindowGroup, an
+// eye pair wants the ImmersiveSpace — and kl_mono is what a window then talks
+// to: the newest presented frame out, the pointer and the keyboard in. Both are
+// shared with kl_view.c, so the host viewer and this app cannot disagree about
+// what a click is.
+#import "kl_present.h"
+#import "kl_mono.h"

@@ -60,6 +60,10 @@ typedef struct {
     // separately because a number moving here means the second detector
     // changed its mind about what is code.
     unsigned x18_data_words;
+    // Trap 26: `mrs Xt, CTR_EL0`, which EL0 may not execute on Darwin. Same
+    // veneer machinery, counted apart because the x18 numbers above are exact
+    // and `make check` gates on them.
+    unsigned ctr_sites, ctr_patched, ctr_refused;
 } kl_stats;
 const kl_stats *kl_get_stats(kl_image *img);
 

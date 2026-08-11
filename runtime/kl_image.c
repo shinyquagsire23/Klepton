@@ -451,11 +451,25 @@ kl_image *kl_load_dylib(const char *path) {
     unsigned long statsz = 0;
     const klx_stat_section *rec =
         (const klx_stat_section *)getsectiondata(mh, "__TEXT", "__klstat", &statsz);
-    if (rec && statsz >= sizeof *rec && rec->magic == KLX_STAT_MAGIC) {
+    if (rec && (statsz < sizeof *rec || rec->magic != KLX_STAT_MAGIC)) {
+        // A record we cannot read is not a record we may ignore: the TSD-slot
+        // check below is the only thing standing between a stale translation
+        // and seventeen thousand veneers indexing somebody else's per-thread
+        // state. An older klepton-ld wrote a shorter record with a different
+        // magic, and both would have failed the test above silently.
+        err("%s carries a __klstat record this runtime does not recognise "
+            "(magic %#x, %lu bytes; expected %#x, %zu) — re-translate it with "
+            "this tree's klepton-ld", real, rec->magic, statsz,
+            KLX_STAT_MAGIC, sizeof *rec);
+        free(img); dlclose(h); return NULL;
+    }
+    if (rec) {
         img->stats.tls_rewrites = rec->tls_rewrites;
         img->stats.x18_sites    = rec->sites;
         img->stats.x18_patched  = rec->patched;
         img->stats.x18_refused  = rec->refused;
+        img->stats.ctr_sites    = rec->ctr_sites;
+        img->stats.ctr_patched  = rec->ctr_patched;
 
         // The veneers carry a TSD slot chosen at translation time. If this
         // process cannot have that slot, every one of them reads and writes
@@ -475,6 +489,15 @@ kl_image *kl_load_dylib(const char *path) {
                 free(img); dlclose(h); return NULL;
             }
         }
+        // Trap 26's constant is self-contained — the veneer answers it and
+        // nothing here has to agree — so a difference is reported rather than
+        // refused. It is reported at all because "the CTR_EL0 value in this
+        // dylib is not the one this tree defaults to" is otherwise invisible,
+        // and the A/B for it (KL_CTR_EL0) is baked at translation time.
+        if (rec->ctr_patched && rec->ctr_value != KLX_CTR_EL0_VALUE)
+            fprintf(stderr, "  [klepton] %s: %u CTR_EL0 veneer(s) answer %#x, not "
+                            "this tree's default %#x\n",
+                    real, rec->ctr_patched, rec->ctr_value, KLX_CTR_EL0_VALUE);
     }
 
     if (kl_env_on("KL_TRACE_IMAGES", 0))
@@ -673,6 +696,9 @@ kl_image *kl_load(const char *path) {
             img->stats.x18_patched += xs.patched;
             img->stats.x18_refused += xs.refused;
             img->stats.x18_data_words += xs.data_words;
+            img->stats.ctr_sites   += xs.ctr_sites;
+            img->stats.ctr_patched += xs.ctr_patched;
+            img->stats.ctr_refused += xs.ctr_refused;
         }
     }
     sys_icache_invalidate(img->base, img->span);

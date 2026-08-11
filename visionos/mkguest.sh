@@ -35,9 +35,11 @@ rm -rf "build/guest/$KLT_NAME" "$OUT"; mkdir -p "build/guest/$KLT_NAME" "$OUT"
 
 for NAME in $LIBS; do
   [ -f "$SRC/$NAME.so" ] || { echo "!! $SRC/$NAME.so missing"; exit 1; }
-  # Bundle identifiers admit only alphanumerics, '-' and '.'; three of these
-  # names contain '_'.
-  ID_NAME="${NAME//_/-}"
+  # Bundle identifiers admit only alphanumerics, '-' and '.'. Several of these
+  # names contain '_', and libc++_shared contains '+' — which the previous
+  # underscores-only rewrite let through, and Xcode rejects at the EMBED step
+  # rather than at build: "had an invalid CFBundleIdentifier in its Info.plist".
+  ID_NAME=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9.-' '-')
   for PLAT in xros xrsimulator; do
     case "$PLAT" in
       xros)        KLPLAT=visionos    ;;

@@ -96,6 +96,7 @@ static const char *angle_dir(void) {
 #define GL_FLOAT                 0x1406
 #define GL_HALF_FLOAT            0x140B
 #define GL_RGBA16F               0x881A
+#define GL_SRGB8_ALPHA8          0x8C43
 #define GL_COLOR_BUFFER_BIT      0x00004000
 #define GL_IMPLEMENTATION_COLOR_READ_FORMAT 0x8B9B
 #define GL_IMPLEMENTATION_COLOR_READ_TYPE   0x8B9A
@@ -231,9 +232,11 @@ static int resolve_all(void) {
 }
 
 // A GL texture whose storage is `mtl`'s slice `slice`. Returns the texture name,
-// or 0 with the reason printed.
-static uint32_t bind_mtl_slice(void *dpy, id<MTLTexture> mtl, int slice,
-                               uint32_t internal_fmt, void **out_image) {
+// or 0 with the reason printed. `tex` names an EXISTING texture to re-point, or
+// 0 to make a fresh one — see Q5 for why re-pointing matters.
+static uint32_t bind_mtl_slice_to(void *dpy, id<MTLTexture> mtl, int slice,
+                                  uint32_t internal_fmt, uint32_t tex,
+                                  void **out_image) {
     const int32_t img_attrs[] = {
         EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE, slice,
         EGL_TEXTURE_INTERNAL_FORMAT_ANGLE,   (int32_t)internal_fmt,
@@ -246,8 +249,7 @@ static uint32_t bind_mtl_slice(void *dpy, id<MTLTexture> mtl, int slice,
                slice, eglGetError ? eglGetError() : 0);
         return 0;
     }
-    uint32_t tex = 0;
-    glGenTextures(1, &tex);
+    if (!tex) glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     while (glGetError() != GL_NO_ERROR) {}
     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
@@ -260,6 +262,11 @@ static uint32_t bind_mtl_slice(void *dpy, id<MTLTexture> mtl, int slice,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     *out_image = img;
     return tex;
+}
+
+static uint32_t bind_mtl_slice(void *dpy, id<MTLTexture> mtl, int slice,
+                               uint32_t internal_fmt, void **out_image) {
+    return bind_mtl_slice_to(dpy, mtl, slice, internal_fmt, 0, out_image);
 }
 
 // Draw a full-viewport-ish triangle in `rgb`, to prove the path carries real
@@ -505,6 +512,78 @@ int main(void) {
             float rr = half_to_float(h4[0]), gg = half_to_float(h4[1]);
             snprintf(label, sizeof label, "eye slice 1: MTLTexture half = %.3f, %.3f", rr, gg);
             check(rr > 1.9f && rr < 2.1f && gg > 0.45f && gg < 0.55f, label);
+            if (img) eglDestroyImageKHR(dpy, img);
+        }
+    }
+
+    // ---- Q5: the OTHER guest's eye texture — the OpenXR swapchain's shape.
+    //
+    // Two assumptions the Steam Link eye path rests on, neither of which the
+    // OVRPlugin path could ever have exercised, and both of which fail
+    // *silently* in the direction that matters (a declined bind leaves the
+    // guest rendering happily into GL storage nothing composites):
+    //
+    //   a. the format is the guest's, not ours. Steam Link's swapchains are
+    //      SRGB8_ALPHA8, and ANGLE compares the internal format we claim
+    //      against the MTLTexture's pixel format and refuses a mismatch
+    //      ("Incompatible format"). So a provider hardwired to RGBA16F cannot
+    //      back this guest at all.
+    //   b. the texture ALREADY HAS STORAGE. An OpenXR runtime creates the
+    //      swapchain images before anything knows which of them is an eye —
+    //      that is only asserted at xrEndFrame — so the eye textures are given
+    //      glTexStorage2D storage first and re-pointed at an MTLTexture
+    //      afterwards. glTexStorage2D makes a texture IMMUTABLE, and whether
+    //      glEGLImageTargetTexture2DOES may respecify one is a question about
+    //      ANGLE rather than about the spec.
+    printf("\n[Q5] the OpenXR guest's eye swapchain: SRGB8_ALPHA8, re-pointed "
+           "after glTexStorage2D\n");
+    const int SW = 2290, SH = 2400;         // measured, steamlink-vr
+    MTLTextureDescriptor *sd = [MTLTextureDescriptor new];
+    sd.textureType = MTLTextureType2DArray;
+    sd.pixelFormat = MTLPixelFormatRGBA8Unorm_sRGB;
+    sd.width = SW; sd.height = SH; sd.arrayLength = 2;
+    sd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    sd.storageMode = MTLStorageModeShared;
+    id<MTLTexture> sw = [mtl newTextureWithDescriptor:sd];
+    check(sw != nil, "newTextureWithDescriptor (RGBA8Unorm_sRGB 2290x2400 x2)");
+    if (sw) {
+        // The image as the swapchain first made it: an ordinary immutable GL
+        // texture, which the guest may already have rendered a frame into.
+        uint32_t tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        while (glGetError() != GL_NO_ERROR) {}
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_SRGB8_ALPHA8, SW, SH);
+        check(glGetError() == GL_NO_ERROR, "glTexStorage2D SRGB8_ALPHA8 (immutable)");
+
+        void *img = NULL;
+        uint32_t re = bind_mtl_slice_to(dpy, sw, 0, GL_SRGB8_ALPHA8, tex, &img);
+        check(re == tex, "the SAME texture name re-pointed at an MTLTexture slice");
+        if (re == tex) {
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+            uint32_t st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            char label[96];
+            snprintf(label, sizeof label, "re-pointed: FBO complete (status 0x%x)", st);
+            check(st == GL_FRAMEBUFFER_COMPLETE, label);
+            glViewport(0, 0, SW, SH);
+            glClearColor(0.f, 0.f, 0.f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            check(draw_triangle(0.5f, 0.25f, 0.75f), "re-pointed: draw");
+            glFinish();
+            // Read the METAL side. The point is not that GL is consistent with
+            // itself — it is that the pixels landed in the texture the
+            // compositor will sample, through a name that had other storage a
+            // moment ago. sRGB encodes on write, so 0.5 linear comes back as
+            // ~188, not 128; the window is wide enough not to depend on the
+            // exact transfer function and narrow enough to fail on black.
+            uint8_t px[4] = { 0 };
+            [sw getBytes:px bytesPerRow:4 bytesPerImage:4
+              fromRegion:MTLRegionMake2D((NSUInteger)SW / 2, (NSUInteger)SH / 2, 1, 1)
+             mipmapLevel:0 slice:0];
+            snprintf(label, sizeof label,
+                     "re-pointed: MTLTexture sRGB bytes = %u, %u, %u", px[0], px[1], px[2]);
+            check(px[0] > 150 && px[0] < 220 && px[2] > px[0], label);
             if (img) eglDestroyImageKHR(dpy, img);
         }
     }

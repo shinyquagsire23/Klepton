@@ -26,6 +26,31 @@
   NOT increased-debugging-memory-limit: iOS only, no VISION_OS in its
   supportedSDKs, and an entitlement the platform does not know is a
   provisioning failure rather than a no-op.
+
+  ===========================================================================
+  networking.multicast, and this one is NOT like the two above.
+
+  Steam Link discovers hosts by UDP BROADCAST to port 27036 (SL-5 measured it).
+  On this platform broadcast and multicast are gated behind an entitlement that
+  Apple grants by REQUEST, not by ticking a capability box:
+
+      https://developer.apple.com/contact/request/networking-multicast
+
+  So it differs from the memory pair in the one way that matters operationally:
+  they are self-service, this is not. Until the request is granted, attaching it
+  fails the BUILD — the profile cannot carry an entitlement the App ID has not
+  been granted — which is why KLEPTON_MULTICAST=0 exists and why the failure is
+  named in gen_xcodeproj.py rather than left to be read off a signing error.
+
+  It is also genuinely broad, and worth being honest about: it lets the app send
+  to and receive from every device on the network. We want it for exactly one
+  thing — the discovery sweep that populates the computer list — and the rest of
+  the session is ordinary unicast to the one host that was paired with.
+
+  NSLocalNetworkUsageDescription is the OTHER half and is free; see Info.plist.
+  Neither substitutes for the other: without the usage string there is no
+  permission at all, and without this entitlement the permission does not extend
+  to broadcast.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -33,6 +58,8 @@
 	<key>com.apple.developer.kernel.increased-memory-limit</key>
 	<true/>
 	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>com.apple.developer.networking.multicast</key>
 	<true/>
 </dict>
 </plist>

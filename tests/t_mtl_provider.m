@@ -33,6 +33,7 @@
 static id<MTLTexture> g_held[2][4];
 static int g_slice[2][4];
 static int g_dim[4][2];          // the size each stage's texture actually is
+static uint32_t g_fmt[4];        // ...and the GL internalformat it was made for
 
 // ---------------------------------------------------------------------------
 // Foveation on the host (KL_VRR, on by default; KL_VRR=0 is the A/B).
@@ -101,9 +102,34 @@ static void klmtl_update_rate_map(id<MTLDevice> dev, int w, int h) {
     kl_glfb_set_eye_rate_map(w, h, zones, zones, (__bridge void *)m);
 }
 
-static int provide(int eye, int stage, int w, int h, kl_mtl_eye_texture *out, void *ctx) {
+// GL internal format -> MTLPixelFormat. ANGLE refuses the pair outright when
+// they disagree ("Incompatible format"), so this is a requirement, not a
+// preference: Unity asks for RGBA16F and Steam Link's OpenXR swapchains ask for
+// SRGB8_ALPHA8, and one provider serves both guests.
+static MTLPixelFormat klmtl_pixel_format(uint32_t gl_internal) {
+    switch (gl_internal) {
+    case 0x881A: return MTLPixelFormatRGBA16Float;   // GL_RGBA16F
+    case 0x8C43: return MTLPixelFormatRGBA8Unorm_sRGB;  // GL_SRGB8_ALPHA8
+    case 0x8058: return MTLPixelFormatRGBA8Unorm;    // GL_RGBA8
+    default:     return MTLPixelFormatInvalid;
+    }
+}
+
+static int provide(int eye, int stage, int w, int h, uint32_t internal_fmt,
+                   kl_mtl_eye_texture *out, void *ctx) {
     (void)ctx;
     if (eye < 0 || eye > 1 || stage < 0 || stage > 3) return 0;
+    MTLPixelFormat pf = klmtl_pixel_format(internal_fmt);
+    if (pf == MTLPixelFormatInvalid) {
+        // Declining is the right answer, not a substitute format: the guest
+        // then gets ordinary GL storage of the format it asked for, which is
+        // wrong in a way that shows up as a black eye rather than as colour
+        // that is subtly off.
+        fprintf(stderr, "  [mtl] eye %d stage %d asks for GL internalformat 0x%x, "
+                        "which this provider has no MTLPixelFormat for — declining\n",
+                eye, stage, internal_fmt);
+        return 0;
+    }
     void *devp = kl_glfb_mtl_device();
     if (!devp) {
         fprintf(stderr, "  [mtl] no MTLDevice from ANGLE — cannot provide eye textures\n");
@@ -120,29 +146,33 @@ static int provide(int eye, int stage, int w, int h, kl_mtl_eye_texture *out, vo
     // smaller than it thinks it has (kl_glfb refuses that now, so this is what
     // makes it work rather than merely be caught). The old texture is released
     // by ARC on overwrite; kl_glfb releases the EGLImage that referenced it.
-    if (!g_held[0][stage] || g_dim[stage][0] != w || g_dim[stage][1] != h) {
+    if (!g_held[0][stage] || g_dim[stage][0] != w || g_dim[stage][1] != h ||
+        g_fmt[stage] != internal_fmt) {
         if (g_held[0][stage])
-            fprintf(stderr, "  [mtl] stage %d: eye size changed %dx%d -> %dx%d, "
-                            "reallocating\n", stage, g_dim[stage][0], g_dim[stage][1], w, h);
+            fprintf(stderr, "  [mtl] stage %d: eye changed %dx%d fmt 0x%x -> %dx%d "
+                            "fmt 0x%x, reallocating\n", stage, g_dim[stage][0],
+                    g_dim[stage][1], g_fmt[stage], w, h, internal_fmt);
         // One 2-slice array texture per stage, shared between the eyes — the
         // shape a layered cp_drawable has, so the slice plumbing is exercised
         // here rather than discovered on device.
         MTLTextureDescriptor *d = [MTLTextureDescriptor new];
         d.textureType = MTLTextureType2DArray;
-        d.pixelFormat = MTLPixelFormatRGBA16Float;   // KL_OVRP_TEXFMT_EYE
+        d.pixelFormat = pf;                          // the guest's own format
         d.width = (NSUInteger)w; d.height = (NSUInteger)h; d.arrayLength = 2;
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         d.storageMode = MTLStorageModeShared;        // so the readback below works
         id<MTLTexture> t = [dev newTextureWithDescriptor:d];
         if (!t) {
-            fprintf(stderr, "  [mtl] newTextureWithDescriptor RGBA16F %dx%d x2 FAILED\n", w, h);
+            fprintf(stderr, "  [mtl] newTextureWithDescriptor 0x%x %dx%d x2 FAILED\n",
+                    internal_fmt, w, h);
             return 0;
         }
         g_held[0][stage] = t; g_held[1][stage] = t;
         g_slice[0][stage] = 0; g_slice[1][stage] = 1;
         g_dim[stage][0] = w;  g_dim[stage][1] = h;
-        fprintf(stderr, "  [mtl] stage %d: RGBA16F %dx%d array, 2 slices (%.1f MB)\n",
-                stage, w, h, (double)w * h * 8 * 2 / (1024 * 1024));
+        g_fmt[stage] = internal_fmt;
+        fprintf(stderr, "  [mtl] stage %d: GL 0x%x %dx%d array, 2 slices (%.1f MB)\n",
+                stage, internal_fmt, w, h, (double)w * h * 8 * 2 / (1024 * 1024));
         // KL_VRR: the eye size is only known here, so the map is built here too.
         klmtl_update_rate_map(dev, w, h);
     }

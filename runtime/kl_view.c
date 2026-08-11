@@ -33,6 +33,7 @@
 
 #include "kl_view.h"
 #include "kl_glfb.h"     // kl_glfb_last_frame_lit — the HUD's liveness signal
+#include "kl_mono.h"     // the flat guest's input path, shared with the app
 #include "kl_view_mtl.h" // the hardware composite path
 #include "kl_ovrp.h"     // kl_ovrp_set_head_pose — the pose-in seam
 #include "kl_present.h"  // mono vs stereo — which shape of picture the guest makes
@@ -104,59 +105,26 @@ int kl_view_available(void) {
 // ---- mono input: the window's pointer and keys, into the guest ---------------
 //
 // A flat guest has no pose to drive, so the mouse means what it means on a
-// desktop: it is the pointer. The route is the guest's OWN Android input path
-// — `SDLActivity.onNativeMouse` / `onNativeKeyDown` / `onNativeKeyUp`, which
-// SDL3 registered with us at JNI_OnLoad — rather than anything invented. That
-// keeps this honest in the way the rest of the shim is: we synthesize the Java
-// side, so the events arrive exactly as SDLSurface.onTouch would have sent
-// them, and SDL's own Android backend does the translating.
+// desktop: it is the pointer. The route into the guest is runtime/kl_mono.c —
+// its OWN Android input path, `SDLActivity.onNativeMouse` / `onNativeKeyDown` /
+// `onNativeKeyUp`, which SDL3 registered with us at JNI_OnLoad. That moved out
+// of this file when the visionOS app became a second window frontend for the
+// same guest: two frontends inventing the same Android events separately is two
+// chances to invent them differently.
 //
-// It also means this costs nothing for a guest that is not SDL: the lookups
-// return NULL for Unity (which registers no such natives) and every call below
-// is a no-op. The natives are resolved once, lazily, because RegisterNatives
-// runs long after this file's first line.
+// What stays here is the part that is genuinely SDL's — the window-to-surface
+// scaling and the scancode table.
 //
-// android.view.MotionEvent's constants, spelled rather than guessed — SDL3's
-// Android_OnMouse switches on the action and derives WHICH button changed by
-// diffing the button-state mask against the last one, so the state passed here
-// must be the state AFTER the transition, not the button that caused it.
-#define KL_AMOTION_DOWN        0
-#define KL_AMOTION_UP          1
-#define KL_AMOTION_MOVE        2
-#define KL_AMOTION_HOVER_MOVE  7
-#define KL_AMOTION_SCROLL      8
-#define KL_ABUTTON_PRIMARY     1
-#define KL_ABUTTON_SECONDARY   2
-#define KL_ABUTTON_TERTIARY    4
-
-#define KL_VIEW_SDLA "org/libsdl/app/SDLActivity"
-
-typedef void (*kl_fn_mouse)(void *env, void *cls, int32_t state, int32_t action,
-                            float x, float y, uint8_t relative);
-typedef void (*kl_fn_key)(void *env, void *cls, int32_t keycode);
-
-static struct {
-    int         resolved;
-    kl_fn_mouse mouse;
-    kl_fn_key   key_down, key_up;
-    void       *env, *cls;
-} g_mono_in;
-
-static void view_mono_input_resolve(void) {
-    if (g_mono_in.resolved) return;
-    g_mono_in.resolved = 1;
-    g_mono_in.mouse    = (kl_fn_mouse)kl_jni_native(KL_VIEW_SDLA, "onNativeMouse", NULL);
-    g_mono_in.key_down = (kl_fn_key)kl_jni_native(KL_VIEW_SDLA, "onNativeKeyDown", NULL);
-    g_mono_in.key_up   = (kl_fn_key)kl_jni_native(KL_VIEW_SDLA, "onNativeKeyUp", NULL);
-    if (!g_mono_in.mouse) {
-        fprintf(stderr, "view: [mono] the guest registered no %s.onNativeMouse — "
-                        "the window is display-only\n", KL_VIEW_SDLA);
-        return;
-    }
-    g_mono_in.env = kl_jni_env();
-    g_mono_in.cls = kl_jni_class(KL_VIEW_SDLA);
-    fprintf(stderr, "view: [mono] pointer and keys go to the guest\n");
-}
+// The MotionEvent constants are kl_mono.h's (KL_MONO_*); these aliases keep the
+// call sites in this file reading the way they always have.
+#define KL_AMOTION_DOWN        KL_MONO_DOWN
+#define KL_AMOTION_UP          KL_MONO_UP
+#define KL_AMOTION_MOVE        KL_MONO_MOVE
+#define KL_AMOTION_HOVER_MOVE  KL_MONO_HOVER_MOVE
+#define KL_AMOTION_SCROLL      KL_MONO_SCROLL
+#define KL_ABUTTON_PRIMARY     KL_MONO_BTN_PRIMARY
+#define KL_ABUTTON_SECONDARY   KL_MONO_BTN_SECONDARY
+#define KL_ABUTTON_TERTIARY    KL_MONO_BTN_TERTIARY
 
 // Window points -> the guest's surface pixels. The window is resized to the
 // guest's panel on the mode transition, so this is usually 1:1 — but only
@@ -173,12 +141,9 @@ static void view_mono_scale(SDL_Window *win, float *x, float *y) {
 
 static void view_mono_mouse(SDL_Window *win, int32_t state, int32_t action,
                             float x, float y) {
-    view_mono_input_resolve();
-    if (!g_mono_in.mouse) return;
+    if (!kl_mono_input_available()) return;
     view_mono_scale(win, &x, &y);
-    kl_jni_local_frame_push();
-    g_mono_in.mouse(g_mono_in.env, g_mono_in.cls, state, action, x, y, 0);
-    kl_jni_local_frame_pop();
+    kl_mono_pointer(state, action, x, y);
 }
 
 // SDL scancode -> Android keycode. Only what a configuration UI is driven with:
@@ -212,88 +177,13 @@ static int32_t view_mono_keycode(SDL_Scancode sc) {
     }
 }
 
-// KL_VIEW_POKE="fx,fy@secs[;fx,fy@secs]..." — a SEQUENCE of synthetic clicks at
-// fractional window coordinates, each `secs` after the guest goes mono. It
-// exists because the alternative for proving this path is posting a CGEvent at
-// the real desktop, which clicks whatever window is actually under that point —
-// it found an editor the first time it was tried. This drives the same three
-// calls a real click drives, so it proves the path and not just the plumbing.
-//
-// A sequence rather than a single click because the interesting screens are not
-// the first one: the shell's host list is two clicks in, and pairing is three.
-// Every `secs` is measured from the SAME zero (the mono transition), not from
-// the previous click, so a run is described by when each screen is expected
-// rather than by durations that have to be re-derived when an earlier one gets
-// slower. A poke whose deadline has already passed fires as soon as the one
-// before it finishes, so the order is always the written one.
-#define KL_VIEW_POKE_MAX 12
-
-static void view_mono_poke(SDL_Window *win, uint64_t t_mono, uint64_t t_now) {
-    static int      parsed;
-    static struct { float fx, fy; unsigned delay_ms; } poke[KL_VIEW_POKE_MAX];
-    static int      npoke, cur;
-
-    if (parsed && cur >= npoke) return;
-    if (!parsed) {
-        parsed = 1;
-        const char *s = kl_env_str("KL_VIEW_POKE", NULL);
-        while (s && *s && npoke < KL_VIEW_POKE_MAX) {
-            float fx, fy; unsigned secs = 0;
-            if (sscanf(s, "%f,%f@%u", &fx, &fy, &secs) < 2) break;
-            poke[npoke].fx = fx; poke[npoke].fy = fy;
-            poke[npoke].delay_ms = secs * 1000;
-            npoke++;
-            const char *next = strchr(s, ';');
-            s = next ? next + 1 : NULL;
-        }
-        if (npoke)
-            fprintf(stderr, "view: [mono] KL_VIEW_POKE: %d click%s queued\n",
-                    npoke, npoke == 1 ? "" : "s");
-        if (cur >= npoke) return;
-    }
-    if (!t_mono || t_now - t_mono < poke[cur].delay_ms) return;
-
-    // Three steps on three different frames, not three calls in a row. A real
-    // click hovers, holds for ~100 ms and releases, and the guest's event loop
-    // has to RUN in between: pressed and released within one of our iterations
-    // is a click Qt can sample as never having happened (measured — the button
-    // took its highlight and nothing else). The hover step is separate for the
-    // same reason: Qt decides what a press lands on from where the pointer
-    // already is.
-    static int step;
-    static uint64_t t_step;
-    if (step && t_now - t_step < 150) return;
-    t_step = t_now;
-
-    int ww = 0, wh = 0;
-    SDL_GetWindowSize(win, &ww, &wh);
-    float x = poke[cur].fx * (float)ww, y = poke[cur].fy * (float)wh;
-    switch (step++) {
-    case 0:
-        fprintf(stderr, "view: [mono] poke %d/%d click at %.0f,%.0f of %dx%d "
-                        "(t+%.1fs)\n", cur + 1, npoke, (double)x, (double)y,
-                ww, wh, (double)(t_now - t_mono) / 1000.0);
-        view_mono_mouse(win, 0, KL_AMOTION_HOVER_MOVE, x, y);
-        break;
-    case 1:
-        view_mono_mouse(win, KL_ABUTTON_PRIMARY, KL_AMOTION_DOWN, x, y);
-        break;
-    default:
-        view_mono_mouse(win, 0, KL_AMOTION_UP, x, y);
-        step = 0;
-        cur++;
-        break;
-    }
-}
+// KL_VIEW_POKE lives in runtime/kl_mono.c now — the fractions are of the
+// guest's own surface, which both frontends scale into, so one implementation
+// serves the SDL window and the visionOS one and a click means the same thing
+// on each. See kl_mono.h for what it is for.
 
 static void view_mono_key(int down, SDL_Scancode sc) {
-    view_mono_input_resolve();
-    kl_fn_key fn = down ? g_mono_in.key_down : g_mono_in.key_up;
-    int32_t code = view_mono_keycode(sc);
-    if (!fn || !code) return;
-    kl_jni_local_frame_push();
-    fn(g_mono_in.env, g_mono_in.cls, code);
-    kl_jni_local_frame_pop();
+    kl_mono_key(down, view_mono_keycode(sc));
 }
 
 // ---- the readback path's display (KL_VIEW_CPU=1) ----------------------------
@@ -469,7 +359,7 @@ int kl_view_main(const char *libdir, int hw) {
                 // succeed, and reporting it now means every run says whether
                 // the window is interactive instead of only the runs someone
                 // moved the mouse in.
-                view_mono_input_resolve();
+                (void)kl_mono_input_available();
                 t_mono = t_now;
             } else if (m == KL_PRESENT_STEREO) {
                 SDL_SetWindowTitle(win, "Klepton — VR guest (one eye)");
@@ -555,8 +445,6 @@ int kl_view_main(const char *libdir, int hw) {
                 break;
             }
         }
-
-        if (mono) view_mono_poke(win, t_mono, t_now);
 
         // Movement, in the yaw plane: forward is (−sin yaw, 0, −cos yaw) and
         // right is (cos yaw, 0, −sin yaw) under the convention above. R/Space

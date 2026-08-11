@@ -237,10 +237,13 @@ int main(int argc, char **argv) {
                             pool + pool_off, (size_t)(pool_cap - pool_off),
                             pool_va + pool_off, &st, &used) != 0)
                 die("x18 veneer emission failed for section %d", i);
-            x18st.sites   += st.sites;
-            x18st.patched += st.patched;
-            x18st.refused += st.refused;
-            pool_off      += used;
+            x18st.sites       += st.sites;
+            x18st.patched     += st.patched;
+            x18st.refused     += st.refused;
+            x18st.ctr_sites   += st.ctr_sites;
+            x18st.ctr_patched += st.ctr_patched;
+            x18st.ctr_refused += st.ctr_refused;
+            pool_off          += used;
         }
     }
     if (x18st.refused) {
@@ -251,6 +254,16 @@ int main(int argc, char **argv) {
                         "exposed to trap 0:\n", in, x18st.refused, x18st.sites);
         kl_x18_report(stderr);
     }
+    // Trap 26 is louder than trap 0 because the failure is immediate: a
+    // `mrs Xt, CTR_EL0` left alone is SIGILL the first time it executes, not a
+    // wrong value some time later. Announced even when it worked, because one
+    // instruction in one library is exactly the kind of thing that goes missing
+    // when the guest is re-translated by a different build.
+    if (x18st.ctr_sites)
+        fprintf(stderr, "klepton-ld: %s: %u CTR_EL0 read(s), %u veneered to "
+                        "answer %#llx%s (trap 26)\n", in, x18st.ctr_sites,
+                x18st.ctr_patched, (unsigned long long)kl_x18_ctr_value(),
+                x18st.ctr_refused ? " — SOME REFUSED, they will SIGILL" : "");
 
     uint64_t seg_vm[10], seg_vmend[10], seg_foff[10], seg_fsize[10];
     for (int g = 0; g < ngrp; g++) {
@@ -463,8 +476,15 @@ int main(int argc, char **argv) {
     // offset (segment 0 starts at vmaddr 0 and fileoff 0).
     if (pool_off) memcpy(o + seg_foff[0] + pool_va, pool, (size_t)pool_off);
     {
+        // The reserve the record is parked in (see stat_va) is 64 bytes and the
+        // record has grown once already; a silent overrun here would write into
+        // the veneer pool.
+        _Static_assert(sizeof(klx_stat_section) <= 64,
+                       "__klstat no longer fits its reserve — move stat_va");
         klx_stat_section rec = { KLX_STAT_MAGIC, x18st.sites, x18st.patched,
-                                 x18st.refused, tls_rewrites, KLX_TSD_SLOT };
+                                 x18st.refused, tls_rewrites, KLX_TSD_SLOT,
+                                 x18st.ctr_sites, x18st.ctr_patched,
+                                 kl_x18_ctr_value() };
         memcpy(o + seg_foff[0] + stat_va, &rec, sizeof rec);
     }
 
@@ -509,6 +529,9 @@ int main(int argc, char **argv) {
         printf("  x18 sites     %u   veneered %u   refused %u   (pool %#llx bytes at %#llx)\n",
                x18st.sites, x18st.patched, x18st.refused,
                (unsigned long long)pool_off, (unsigned long long)pool_va);
+        printf("  CTR_EL0 reads %u   veneered %u   refused %u   (answering %#llx)\n",
+               x18st.ctr_sites, x18st.ctr_patched, x18st.ctr_refused,
+               (unsigned long long)kl_x18_ctr_value());
         printf("  total         %llu bytes\n", (unsigned long long)total);
     }
     return 0;

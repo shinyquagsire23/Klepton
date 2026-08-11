@@ -2059,7 +2059,7 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
         return 0;
     }
     kl_mtl_eye_texture t = { NULL, 0, 0, 0 };
-    if (!g_mtl_provider(eye, stage, w, h, &t, g_mtl_provider_ctx) || !t.texture) {
+    if (!g_mtl_provider(eye, stage, w, h, internal_fmt, &t, g_mtl_provider_ctx) || !t.texture) {
         fprintf(stderr, "  [glfb] provider declined eye=%d stage=%d %dx%d\n",
                 eye, stage, w, h);
         return 0;

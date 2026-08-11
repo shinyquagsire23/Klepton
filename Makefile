@@ -28,6 +28,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_slink.c \
            runtime/kl_aaudio.c \
            runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
+           runtime/kl_mono.c \
            runtime/kl_il2cpp.c runtime/kl_fault.c
 RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
@@ -262,6 +263,40 @@ x18: build/t_x18
 	python3 tools/check_x18.py build/t_x18 $(LIBS)/libunity.so $(LIBS)/libil2cpp.so \
 	  $(LIBS)/libunityopus.so $(LIBS)/libmain.so $(LIBS)/lib_burst_generated.so
 
+# Trap 26 — the CTR_EL0 veneer, EXECUTED. Same shape as t_x18: linked against
+# the decoder alone, so a veneer bug cannot hide behind a working loader. It
+# runs the real illegal instruction in a child as its control, which is why the
+# host can gate a crash that only ever happened on a headset.
+build/t_ctr: tests/t_ctr.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_ctr.c runtime/kl_x18.c runtime/kl_env.c
+
+ctr: build/t_ctr
+	./build/t_ctr
+
+# SL-19 — the broadcast fan-out, driven through the shim's own sendto and aimed
+# at loopback, so it exercises the discovery path without putting 254 datagrams
+# on anyone's network. The path is otherwise reachable only from a live Qt
+# frontend with a Steam host on the LAN.
+build/t_bcast: tests/t_bcast.c $(RUNTIME) runtime/klepton.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_bcast.c $(RUNTIME) $(LDLIBS)
+
+bcast: build/t_bcast
+	./build/t_bcast
+
+# ...and the preemptive version of the same question: what OTHER system
+# registers do these guests touch, and which of them may EL0 not execute?
+#
+# Trap 26 cost a device run because ONE instruction in ONE library is illegal
+# from EL0 and nothing below the device took that path. This decodes every
+# `mrs`/`msr`/`sys` in every guest library, names the register, and sorts by
+# whether Darwin permits it — so a new target's answer is a command rather than
+# a crash. Reads ELF files; no guest runs, seconds.
+.PHONY: sysregs
+sysregs:
+	python3 tools/sysreg_scan.py $(LIBS)/*.so $(SLVRLIBS)/*.so $(SLLIBS)/*.so
+
 # The same decoder check against the second target. Kept separate from `x18`
 # because it proves a different thing: Steam Link is a different toolchain
 # (Valve's clang, BoringSSL, SDL3) and it is what found the data-in-.text class
@@ -272,6 +307,13 @@ x18-slink: build/t_x18
 	  $(SLLIBS)/libSDL3_ttf.so $(SLLIBS)/libSDL3_image.so $(SLLIBS)/libc++_shared.so
 	python3 tools/check_x18.py build/t_x18 $(SLVRLIBS)/libmain.so $(SLVRLIBS)/libSDL3.so \
 	  $(SLVRLIBS)/libvrlink_scene.so $(SLVRLIBS)/libopenxr_loader.so
+	# The 2D shell's chain, which SL-18 loads on the device too — and which is
+	# where trap 26 lives (libQt6Core carries the project's only `mrs CTR_EL0`).
+	# libshell is trap 0d's own library: 12 of its 14 apparent x18 sites are
+	# CRYPTOGAMS constants with no symbol over them.
+	python3 tools/check_x18.py build/t_x18 $(SLVRLIBS)/libshell_arm64-v8a.so \
+	  $(SLVRLIBS)/libQt6Core_arm64-v8a.so $(SLVRLIBS)/libQt6Gui_arm64-v8a.so \
+	  $(SLVRLIBS)/libQt6Widgets_arm64-v8a.so $(SLVRLIBS)/libQt6Network_arm64-v8a.so
 
 # kl_jni_slots.h is checked in; regenerate only when bumping the NDK.
 jnislots:
@@ -289,12 +331,16 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_ctr build/t_bcast
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
 	@grep -E '=== HEVC|30 access units' build/hevc.log && tail -1 build/hevc.log
 	@./build/t_xrspace > build/xrspace.log 2>&1 || { cat build/xrspace.log; exit 1; }
 	@head -2 build/xrspace.log && tail -1 build/xrspace.log
+	@./build/t_ctr > build/ctr.log 2>&1 || { cat build/ctr.log; exit 1; }
+	@head -2 build/ctr.log && tail -1 build/ctr.log
+	@./build/t_bcast > build/bcast.log 2>&1 || { cat build/bcast.log; exit 1; }
+	@head -1 build/bcast.log && tail -1 build/bcast.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
 	@head -3 build/haptics.log && tail -1 build/haptics.log
 	@echo "=== opus roundtrip ===" && ./build/t_opus $(LIBS)/libunityopus.so > build/opus.log && tail -3 build/opus.log
@@ -421,9 +467,30 @@ XROS_SDK  := $(shell xcrun --sdk xros --show-sdk-path)
 XRSIM_SDK := $(shell xcrun --sdk xrsimulator --show-sdk-path)
 XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64
 
-.PHONY: xros xros-device xros-sim
-xros: xros-device xros-sim build/Klepton.xcframework
+.PHONY: xros xros-device xros-sim swiftcheck
+xros: xros-device xros-sim build/Klepton.xcframework swiftcheck
 	@echo "  P4 gate: the shipping runtime compiles and links for both visionOS platforms."
+
+# ...and the OTHER half of that seam, which had no gate at all: the Swift app
+# against the C headers it imports through the bridging header.
+#
+# `xros` proves the runtime compiles and links. It says nothing about whether
+# the app still calls it correctly — and every C signature the app touches is a
+# signature Swift binds by shape, so widening one (the eye-texture provider
+# gaining its GL internalformat, SL-19) breaks KleptonCompositor.swift with
+# nothing on the host reporting it. The next time anyone found out was a
+# `visionos/run.sh` that needs a booted simulator or a headset.
+#
+# -typecheck only: no objects, no linking, a few seconds, and it needs neither
+# a simulator nor a device. The deployment target has to match
+# gen_xcodeproj.py's XROS_DEPLOYMENT_TARGET or availability answers differ
+# between this and the real build, which is the one thing that would make it
+# lie.
+swiftcheck:
+	@xcrun -sdk xros swiftc -typecheck -target arm64-apple-xros26.0 \
+	  -import-objc-header visionos/Sources/Klepton-Bridging-Header.h \
+	  -I runtime visionos/Sources/*.swift 2>&1 | grep -E '^[^ ].*error:' && exit 1; \
+	  echo "  swiftcheck: the visionOS app typechecks against runtime/*.h"
 
 # The archives are real targets with real prerequisites, not side effects of a
 # .PHONY rule. That distinction cost a debugging pass: with only a phony rule

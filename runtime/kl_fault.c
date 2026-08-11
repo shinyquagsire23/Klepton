@@ -98,7 +98,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // *expected* end of a scouting run — the guest carries on with answers we
     // invented and eventually walks into one.
     if (sig == SIGABRT || sig == SIGALRM || sig == SIGSEGV || sig == SIGBUS ||
-        sig == SIGTRAP) {
+        sig == SIGTRAP || sig == SIGILL || sig == SIGFPE) {
         for (unsigned i = 0; i < g_extra_n; i++) g_extra[i](stderr);
         kl_pthread_report(stderr);
         kl_egl_report(stderr);
@@ -143,4 +143,15 @@ void kl_fault_install(void) {
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGALRM, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);   // guest __builtin_trap / brk assertions
+    // SIGILL was missing here for the whole project, and `kl_fatal_prepare()`
+    // has always known about it — its restore list is
+    // {ABRT, SEGV, BUS, ILL, FPE, TRAP} — so the asymmetry was visible and
+    // nothing had ever raised one. The first Steam Link shell run on a physical
+    // Vision Pro did: it died with `App terminated due to signal 4` and a log
+    // that simply stopped, which reads as a hang or an OS kill rather than as a
+    // crash with a pc. An undefined instruction is exactly the failure a guest
+    // executing DATA produces (trap 0b/0d's shape), so it is the last signal
+    // that should be silent here.
+    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGFPE,  &sa, NULL);
 }

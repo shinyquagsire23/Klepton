@@ -54,6 +54,7 @@ typedef struct {
     uint8_t  roles;     // union of the roles above: does this site read x18, write it, or both
     uint8_t  pcrel;     // KLX_PC_*
     uint8_t  hazard;    // KLX_HZ_*: the veneer shape does not hold for this site
+    uint8_t  sysreg;    // KLX_SYS_*: reads a system register EL0 may not read
 } klx_info;
 
 // A veneer spills scratch below sp, runs the instruction, then restores and
@@ -62,6 +63,14 @@ typedef struct {
 #define KLX_HZ_NONE     0
 #define KLX_HZ_NOFALL   1   // br/ret: control leaves before the restore runs
 #define KLX_HZ_SPWRITE  2   // modifies sp, so the restore would read elsewhere
+
+// System registers that need translating, which is a different job from x18 but
+// the same machinery: the site is rewritten in place to a branch into a stub
+// that answers, because one instruction cannot materialise a 64-bit constant.
+//
+// TPIDR_EL0 is not here — it is a one-bit rewrite (trap 1) and needs no stub.
+#define KLX_SYS_NONE    0
+#define KLX_SYS_CTR_EL0 1   // trap 26: SIGILL from EL0 on Darwin
 
 // Decode one instruction word. Returns out->ok. Sites where x18 does not appear
 // come back ok with nfields == 0.
@@ -123,6 +132,43 @@ uint32_t klx_substitute(uint32_t insn, const klx_info *info, unsigned reg);
 // bake it in, and visionos/run.sh rebuilds klepton-ld for exactly this reason.
 #define KLX_TSD_SLOT 500
 
+// ---------------------------------------------------- trap 26: CTR_EL0
+//
+// What a veneered `mrs Xt, CTR_EL0` answers. Baked into the veneer as a
+// movz/movk pair, so — like KLX_TSD_SLOT — it must be a constant at translation
+// time; KL_CTR_EL0=<hex> overrides it for an A/B, at the cost of re-translating.
+//
+// **This is Apple silicon's own CTR_EL0, not a convenient invention.** The
+// register cannot be read from EL0 on any Darwin kernel (measured: `mrs x0,
+// ctr_el0` SIGILLs on macOS 26 as well as on visionOS — trap 26's claim that
+// macOS permits it is wrong, and the simulator does not catch the crash only
+// because Qt's `__clear_cache` is never reached there), so the value is
+// transcribed rather than sampled:
+//
+//     IminLine 4, DminLine 4   64-byte lines, the minimum across all levels
+//     L1Ip 0b11 (PIPT), ERG 4, CWG 4, bit 31 RES1
+//     IDC 0, DIC 0             cache maintenance IS required for coherency
+//
+// **IDC/DIC are deliberately 0, which is the opposite of what the trap-26
+// record designed**, and the difference matters. That design assumed `dc cvau`
+// and `ic ivau` were as likely to trap as the `mrs`, so it answered IDC=1/DIC=1
+// to make `__clear_cache` skip both maintenance loops. Measured on Darwin, both
+// instructions are LEGAL from EL0 (only the `mrs` is trapped, which is
+// SCTLR_EL1.UCT rather than UCI), and Darwin's own `sys_icache_invalidate` is
+// built on them. So claiming coherency we do not have would silently skip the
+// maintenance a JIT needs — a wrong answer with no error surface, where letting
+// the loops run is simply correct. If a future kernel does trap them, the crash
+// moves a few instructions along and kl_fault.c now names it; KL_CTR_EL0
+// =0xb444c004 sets IDC and DIC and is the way back.
+//
+// Under-stating the line size is the safe direction (more maintenance ops, each
+// covering its own line), so 64 stands even where the coherency line is 128.
+#define KLX_CTR_EL0_VALUE 0x8444c004u
+
+// ...the value actually in force, KL_CTR_EL0 applied. Exposed so klepton-ld can
+// record what it baked into the veneers it emitted.
+uint64_t kl_x18_ctr_value(void);
+
 // Longest veneer, in instructions. Public because klepton-ld sizes its pool from
 // the site count before it emits anything.
 #define KLX_VEN_MAX_INSN 8
@@ -135,6 +181,10 @@ typedef struct {
                          // (trap 0b's second detector — NOT refusals: these
                          // were never instructions, and patching them is the
                          // corruption the detector exists to prevent)
+    // trap 26, counted APART from the x18 numbers on purpose: those are exact
+    // and `make check` gates on them, so a second population sharing the same
+    // counters would move a number that is supposed to be stable.
+    unsigned ctr_sites, ctr_patched, ctr_refused;
 } kl_x18_stats;
 
 // Check the assumptions the emitted code depends on: thread-pointer alignment
@@ -168,7 +218,9 @@ int  kl_x18_patch(void *code, size_t size, kl_x18_stats *st);
 // clamped to the buffer, so pass the same chunk the scanner is walking.
 int kl_x18_is_data(const void *code, size_t size, size_t index);
 
-// Count x18 sites without emitting anything — klepton-ld sizes its pool with it.
+// Count sites that will need a VENEER — x18 sites plus trap 26's CTR_EL0 reads
+// — without emitting anything. klepton-ld sizes its pool with it, so it has to
+// be the total rather than the x18 half; the stats keep the two apart.
 unsigned kl_x18_count(const void *code, size_t size);
 
 // What an offline translation did, recorded in the emitted image's
@@ -177,12 +229,18 @@ unsigned kl_x18_count(const void *code, size_t size);
 // would report "x18 sites: 0", which reads as "this library never needed any"
 // rather than "this was handled at translation time". Silent zeros are worse
 // than errors (CLAUDE.md trap 6d).
-#define KLX_STAT_MAGIC 0x38315838u   /* "8X18" */
+// The magic carries a VERSION, and the loader refuses a record it does not
+// recognise BY NAME rather than ignoring it. A record that merely got longer
+// would fail the `statsz >= sizeof` test and be skipped silently — which also
+// skips the TSD-slot check that is the whole reason it is read.
+#define KLX_STAT_MAGIC 0x39315838u   /* "8X19" — was "8X18" before trap 26 */
 typedef struct {
     uint32_t magic;
     uint32_t sites, patched, refused;
     uint32_t tls_rewrites;
     uint32_t slot;          // KLX_TSD_SLOT the veneers were built against
+    uint32_t ctr_sites, ctr_patched;   // trap 26
+    uint32_t ctr_value;     // ...and what they were built to answer
 } klx_stat_section;
 
 // Encodings that were refused, with counts — the work list for extending the

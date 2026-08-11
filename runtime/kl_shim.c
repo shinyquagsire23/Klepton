@@ -355,6 +355,18 @@ static int kl_setsockopt(int fd, int level, int opt, const void *val, socklen_t 
     int r = setsockopt(fd, level, ropt, val, len);
     if (r) fprintf(stderr, "  [sock] setsockopt(fd=%d level=%d opt=%d->%d) FAILED: %s\n",
                    fd, level, opt, ropt, strerror(errno));
+    // SO_BROADCAST is the guest DECLARING that it is about to broadcast, and it
+    // is the only signal that survives whichever send call it then uses. Said
+    // out loud because "no fan-out line in the log" has two completely
+    // different causes — the sweep missed the send, or discovery never ran —
+    // and without this they are the same silence. (0x20 on both platforms.)
+    if (glevel == SOL_SOCKET && opt == SO_BROADCAST) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [sock] the guest enabled SO_BROADCAST on fd %d (%s) — "
+                            "discovery is starting, so a fan-out line must follow\n",
+                    fd, r ? strerror(errno) : "ok");
+    }
     return r;
 }
 static int kl_getsockopt(int fd, int level, int opt, void *val, socklen_t *len) {
@@ -751,6 +763,267 @@ static ssize_t kl_sendto_connected(int fd, const void *buf, size_t n, int dflags
     return send(fd, buf, n, dflags);
 }
 
+// ---- broadcast, on a platform that will not let an app broadcast ----------
+//
+// Steam Link finds hosts by UDP broadcast to 255.255.255.255:27036 (SL-5). On
+// visionOS that needs `com.apple.developer.networking.multicast`, which Apple
+// grants by REQUEST rather than by enabling a capability — so it is not a build
+// setting, it is a wait. Without it the computer list stays empty.
+//
+// It does not have to be. A broadcast is a destination address and nothing
+// else: the same datagram sent to each host on the subnet reaches the same
+// listeners, and unicast to a LAN address needs only the local-network
+// permission (Info.plist's NSLocalNetworkUsageDescription), which is free. The
+// replies come back unicast to the port the guest already bound, so nothing
+// downstream of this changes at all.
+//
+// **Both are sent, and that is deliberate.** The real broadcast is attempted
+// first because on a host run it simply works and is one packet instead of 254.
+// Its result is NOT used to decide whether to fan out, because the failure mode
+// we are working around is a send that *succeeds* and is dropped — Apple's
+// filtering is not required to surface as an errno, and "silent zeros are worse
+// than errors" (trap 6d) cuts both ways: we must not read a successful send as
+// evidence the packet arrived. Duplicate probes are harmless here; a discovery
+// reply is idempotent and the guest already merges hosts by id.
+//
+// KL_NET_BCAST_FANOUT=0 turns it off (the A/B, and what a host run wants once
+// this is understood). KL_SLINK_HOST=<ip>[,<ip>…] replaces the sweep with an
+// explicit list, which is the direct-connect case and costs one packet.
+// 1022 hosts, which is a /22 — measured, because that is what this network
+// turned out to be and a 512 cap swept exactly half of it. The PC happened to
+// be in the half that was covered, which is the kind of luck that makes a bug
+// look like a feature working.
+#define KLNET_FANOUT_MAX 1024
+
+static int kl_fanout_enabled(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_NET_BCAST_FANOUT", 1);
+    return on;
+}
+
+// Every IPv4 address this datagram would have reached, resolved once.
+//
+// Sized rather than unbounded: a /16 is 65,534 sends per discovery tick, which
+// is a denial of service against our own network rather than a sweep. Anything
+// wider than /22 is refused BY NAME — the answer there is KL_SLINK_HOST, not a
+// bigger buffer.
+static unsigned kl_fanout_targets(uint32_t *out, unsigned max) {
+    static uint32_t cache[KLNET_FANOUT_MAX];
+    static unsigned cached = 0;
+    static int done = 0;
+    if (done) {
+        unsigned k = cached < max ? cached : max;
+        memcpy(out, cache, k * sizeof *out);
+        return k;
+    }
+    done = 1;
+
+    // An explicit list wins outright: this is the direct-connect path and the
+    // point of it is not to sweep.
+    const char *only = kl_env_str("KL_SLINK_HOST", NULL);
+    if (only && *only) {
+        char tmp[256];
+        snprintf(tmp, sizeof tmp, "%s", only);
+        for (char *p = strtok(tmp, ","); p && cached < KLNET_FANOUT_MAX; p = strtok(NULL, ",")) {
+            struct in_addr a;
+            while (*p == ' ') p++;
+            if (inet_pton(AF_INET, p, &a) == 1) cache[cached++] = a.s_addr;
+            else fprintf(stderr, "  [net] KL_SLINK_HOST: '%s' is not an IPv4 address\n", p);
+        }
+        fprintf(stderr, "  [net] broadcast fan-out: %u host(s) from KL_SLINK_HOST\n", cached);
+        unsigned k = cached < max ? cached : max;
+        memcpy(out, cache, k * sizeof *out);
+        return k;
+    }
+
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) {
+        fprintf(stderr, "  [net] broadcast fan-out: getifaddrs failed (%s)\n", strerror(errno));
+        return 0;
+    }
+    for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        if (!(p->ifa_flags & IFF_UP) || (p->ifa_flags & IFF_LOOPBACK)) continue;
+        if (!p->ifa_netmask) continue;
+        uint32_t addr = ntohl(((struct sockaddr_in *)p->ifa_addr)->sin_addr.s_addr);
+        uint32_t mask = ntohl(((struct sockaddr_in *)p->ifa_netmask)->sin_addr.s_addr);
+        if (!mask || mask == 0xFFFFFFFFu) continue;          // /32: nothing to sweep
+        uint32_t hosts = ~mask;
+        if (hosts > KLNET_FANOUT_MAX - 1) {
+            fprintf(stderr, "  [net] broadcast fan-out: %s is a /%d — %u hosts is too "
+                            "many to sweep; set KL_SLINK_HOST=<ip> instead\n",
+                    p->ifa_name, 32 - __builtin_popcount(hosts), hosts - 1);
+            continue;
+        }
+        uint32_t net = addr & mask;
+        uint32_t want = 0;
+        for (uint32_t h = 1; h < hosts; h++) {
+            uint32_t t = net | h;
+            if (t == addr) continue;                          // ourselves
+            want++;
+            if (cached < KLNET_FANOUT_MAX) cache[cached++] = htonl(t);
+        }
+        // Never silently. A truncated sweep finds the hosts at the bottom of
+        // the range and not the ones above it, which presents as "discovery
+        // works, except for that one machine" — and the first version of this
+        // capped a /22 at 512 without a word.
+        if (want > cached)
+            fprintf(stderr, "  [net] broadcast fan-out: %s has %u hosts and the cap "
+                            "is %u — %u address(es) NOT swept; use KL_SLINK_HOST=<ip> "
+                            "if the machine you want is above %u in the range\n",
+                    p->ifa_name, want, (unsigned)KLNET_FANOUT_MAX, want - cached, cached);
+        fprintf(stderr, "  [net] broadcast fan-out: %s %u.%u.%u.%u/%d -> %u unicast "
+                        "target(s)\n", p->ifa_name,
+                (addr >> 24) & 0xff, (addr >> 16) & 0xff, (addr >> 8) & 0xff, addr & 0xff,
+                32 - __builtin_popcount(hosts), cached);
+    }
+    freeifaddrs(ifa);
+    if (!cached)
+        fprintf(stderr, "  [net] broadcast fan-out: no usable IPv4 interface — "
+                        "discovery will only see what the real broadcast reaches\n");
+    unsigned k = cached < max ? cached : max;
+    memcpy(out, cache, k * sizeof *out);
+    return k;
+}
+
+// Is this destination one the platform may refuse?
+//
+// **Measured on device, and it is not what the IPv4 shape suggested.** Steam
+// Link's discovery opens an IPv6 socket, binds `[::]:27036` dual-stack, and
+// sends its 31-byte probe twice:
+//
+//     sendto(fd, 31 B, [::ffff:255.255.255.255]:27036) -> No route to host
+//     sendto(fd, 31 B, [ff02::1]:27036)                -> No route to host
+//
+// So the IPv4 broadcast arrives as an IPv4-MAPPED IPv6 address, and there is a
+// second probe to the IPv6 all-nodes link-local multicast group. A family test
+// of `AF_INET` matches neither, which is why the first fan-out fired on nothing
+// and why SO_BROADCAST never appeared in the log: the guest never sets it,
+// because it is not using an IPv4 broadcast socket at all.
+//
+// Both are treated as broadcast-like. The reply that matters is IPv4 — Steam's
+// discovery protocol is — so both fan out over the same IPv4 host list, sent
+// back through whichever family the socket is.
+#define KL_V4MAPPED(a) (!memcmp((a), "\0\0\0\0\0\0\0\0\0\0\xff\xff", 12))
+
+static int kl_is_broadcast(const struct sockaddr *sa) {
+    if (!sa) return 0;
+    if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)sa;
+        const uint8_t *a = s6->sin6_addr.s6_addr;
+        // ff02::1 — all nodes on this link. The v6 counterpart of a broadcast,
+        // and refused here for the same reason.
+        if (a[0] == 0xff && a[1] == 0x02 &&
+            !memcmp(a + 2, "\0\0\0\0\0\0\0\0\0\0\0\0\0", 13) && a[15] == 1) return 1;
+        if (!KL_V4MAPPED(a)) return 0;
+        struct sockaddr_in v4 = { .sin_family = AF_INET };
+        memcpy(&v4.sin_addr, a + 12, 4);
+        return kl_is_broadcast((const struct sockaddr *)&v4);
+    }
+    if (sa->sa_family != AF_INET) return 0;
+    uint32_t d = ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr);
+    if (d == 0xFFFFFFFFu) return 1;
+    struct ifaddrs *ifa = NULL;
+    int hit = 0;
+    if (getifaddrs(&ifa) != 0) return 0;
+    for (struct ifaddrs *p = ifa; p && !hit; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET || !p->ifa_netmask) continue;
+        if (!(p->ifa_flags & IFF_UP) || (p->ifa_flags & IFF_LOOPBACK)) continue;
+        uint32_t a = ntohl(((struct sockaddr_in *)p->ifa_addr)->sin_addr.s_addr);
+        uint32_t m = ntohl(((struct sockaddr_in *)p->ifa_netmask)->sin_addr.s_addr);
+        if (m && d == (a | ~m)) hit = 1;
+    }
+    freeifaddrs(ifa);
+    return hit;
+}
+
+// One destination, in the family the guest's socket actually is.
+//
+// The socket that broadcasts here is IPv6 (measured), so sending a plain
+// sockaddr_in on it fails with EAFNOSUPPORT and the whole fan-out is a no-op
+// that logs success. The IPv4 host goes back as an IPv4-mapped address, which
+// a dual-stack socket routes to the real IPv4 host.
+static socklen_t kl_fanout_addr(int family, uint16_t port_net, uint32_t v4,
+                                struct sockaddr_storage *out) {
+    memset(out, 0, sizeof *out);
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)out;
+        s6->sin6_family = AF_INET6;
+        s6->sin6_len = sizeof *s6;
+        s6->sin6_port = port_net;
+        s6->sin6_addr.s6_addr[10] = 0xff;
+        s6->sin6_addr.s6_addr[11] = 0xff;
+        memcpy(s6->sin6_addr.s6_addr + 12, &v4, 4);
+        return sizeof *s6;
+    }
+    struct sockaddr_in *s4 = (struct sockaddr_in *)out;
+    s4->sin_family = AF_INET;
+    s4->sin_len = sizeof *s4;
+    s4->sin_port = port_net;
+    s4->sin_addr.s_addr = v4;
+    return sizeof *s4;
+}
+
+static uint16_t kl_sa_port(const struct sockaddr *sa) {
+    return sa->sa_family == AF_INET6 ? ((const struct sockaddr_in6 *)sa)->sin6_port
+                                     : ((const struct sockaddr_in *)sa)->sin_port;
+}
+
+static void kl_sendto_fanout(int fd, const void *buf, size_t n, int dflags,
+                             const struct sockaddr *sa) {
+    static uint32_t tgt[KLNET_FANOUT_MAX];
+    static unsigned ntgt;
+    static int init;
+    if (!init) { init = 1; ntgt = kl_fanout_targets(tgt, KLNET_FANOUT_MAX); }
+    if (!ntgt) return;
+
+    uint16_t port = kl_sa_port(sa);
+    unsigned ok = 0;
+    int last = 0;
+    for (unsigned i = 0; i < ntgt; i++) {
+        struct sockaddr_storage to;
+        socklen_t tl = kl_fanout_addr(sa->sa_family, port, tgt[i], &to);
+        if (sendto(fd, buf, n, dflags, (struct sockaddr *)&to, tl) >= 0) ok++;
+        else last = errno;
+    }
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [net] broadcast fan-out: %zu B to port %u delivered as %u "
+                        "unicast of %u%s%s (KL_NET_BCAST_FANOUT=0 to stop, "
+                        "KL_SLINK_HOST to aim it)\n", n, ntohs(port), ok, ntgt,
+                ok < ntgt ? ", last error " : "", ok < ntgt ? strerror(last) : "");
+}
+
+// The msghdr form of the same thing. Shares the target list, so a run that
+// discovers through one call and one that discovers through the other reach
+// exactly the same hosts.
+static void kl_sendmsg_fanout(int fd, struct msghdr *h, int dflags) {
+    static uint32_t tgt[KLNET_FANOUT_MAX];
+    static unsigned ntgt;
+    static int init;
+    if (!init) { init = 1; ntgt = kl_fanout_targets(tgt, KLNET_FANOUT_MAX); }
+    if (!ntgt) return;
+
+    uint16_t port = kl_sa_port(h->msg_name);
+    void *saved = h->msg_name;
+    socklen_t savedlen = h->msg_namelen;
+    struct sockaddr_storage to;
+    unsigned ok = 0;
+    for (unsigned i = 0; i < ntgt; i++) {
+        socklen_t tl = kl_fanout_addr(((struct sockaddr *)saved)->sa_family,
+                                      port, tgt[i], &to);
+        h->msg_name = &to;
+        h->msg_namelen = tl;
+        if (sendmsg(fd, h, dflags) >= 0) ok++;
+    }
+    h->msg_name = saved;
+    h->msg_namelen = savedlen;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [net] broadcast fan-out (sendmsg): port %u delivered as "
+                        "%u unicast of %u\n", ntohs(port), ok, ntgt);
+}
+
 static ssize_t kl_sendto(int fd, const void *buf, size_t n, int flags,
                          const struct sockaddr *sa, socklen_t len) {
     struct sockaddr_storage hs;
@@ -764,6 +1037,14 @@ static ssize_t kl_sendto(int fd, const void *buf, size_t n, int flags,
     ssize_t r = sendto(fd, buf, n, dflags, sa, len);
     if (r < 0 && errno == EISCONN && sa)
         r = kl_sendto_connected(fd, buf, n, dflags, sa);
+    // ...and again, one host at a time, where the platform may have dropped it.
+    // Deliberately not conditional on `r` — see kl_sendto_fanout above.
+    if (sa && kl_fanout_enabled() && kl_is_broadcast(sa)) {
+        int e = errno;                          // the fan-out must not rewrite it
+        kl_sendto_fanout(fd, buf, n, dflags, sa);
+        errno = e;
+        if (r < 0) r = (ssize_t)n;              // the datagram did go out
+    }
     if (kl_net_trace())
         fprintf(stderr, "  [net] sendto(fd=%d, %zu B, flags=0x%x->0x%x, %s) -> %zd%s\n",
                 fd, n, flags, dflags, host, r, r < 0 ? strerror(errno) : "");
@@ -929,6 +1210,20 @@ static ssize_t kl_sendmsg(int fd, const void *gmsg, int flags) {
         // Retry with the name dropped, which is what Linux effectively did.
         h.msg_name = NULL; h.msg_namelen = 0;
         r = sendmsg(fd, &h, dflags);
+    }
+    // ...and the fan-out, for the same reason and on the same terms as
+    // kl_sendto's. libshell imports BOTH sendto and sendmsg, so covering one
+    // and not the other is a fan-out that works or does not depending on which
+    // call the guest happened to use — which is indistinguishable, from the
+    // log, from a fan-out that is broken.
+    if (h.msg_name && kl_fanout_enabled() && kl_is_broadcast(h.msg_name)) {
+        int e = errno;
+        kl_sendmsg_fanout(fd, &h, dflags);
+        errno = e;
+        if (r < 0) {
+            r = 0;
+            for (int i = 0; i < (int)h.msg_iovlen; i++) r += (ssize_t)h.msg_iov[i].iov_len;
+        }
     }
     if (kl_net_trace())
         fprintf(stderr, "  [net] sendmsg(fd=%d, %d iov, %u B ctl, flags=0x%x->0x%x, %s) -> %zd%s\n",
@@ -1123,7 +1418,7 @@ X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_renam
 X(klh_android_log_print)
 X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_system) X(klb_syscall) X(klb_swprintf)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
-X(klb_mmap) X(klb_madvise)
+X(klb_mmap) X(klb_mprotect) X(klb_madvise)
 X(klb_pthread_mutex_init) X(klb_pthread_mutex_lock) X(klb_pthread_mutex_unlock)
 X(klb_pthread_mutex_trylock) X(klb_pthread_mutex_destroy)
 X(klb_pthread_mutexattr_init) X(klb_pthread_mutexattr_destroy) X(klb_pthread_mutexattr_settype)
@@ -1230,7 +1525,7 @@ static const kl_entry g_shim[] = {
     E("getpwuid", klb_getpwuid), E("getpwuid_r", klb_getpwuid_r),
     E("prctl", klb_prctl),
     E("memrchr", klb_memrchr), E("memalign", klb_memalign),
-    E("mmap", klb_mmap), E("madvise", klb_madvise),
+    E("mmap", klb_mmap), E("mprotect", klb_mprotect), E("madvise", klb_madvise),
     E("sched_getaffinity", klb_sched_getaffinity), E("sched_setaffinity", klb_sched_setaffinity),
     E("__system_property_find", klb_sysprop_find),
     E("__system_property_get", klb_sysprop_get),

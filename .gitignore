@@ -45,3 +45,4 @@ visionos/*.xcodeproj/
 
 # Python bytecode from visionos/targets.py, imported by gen_xcodeproj.py
 visionos/__pycache__/
+tools/__pycache__/

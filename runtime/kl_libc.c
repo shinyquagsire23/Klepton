@@ -1099,10 +1099,68 @@ int kl_mmap_flags(int lx) {
     if (lx & LX_MAP_NORESERVE)  d |= MAP_NORESERVE;
     return d;
 }
+// ---- executable anonymous memory: a guest JIT, and why it must fail LOUDLY --
+//
+// Trap 12 says AMFI kills any pc not backed by a signed file. What that means
+// for a guest that generates code is worse than "the JIT does not work": the
+// mapping succeeds, the writes succeed, `__clear_cache` succeeds, and the
+// process is killed on the first BRANCH into it — `EXC_BAD_ACCESS /
+// KERN_PROTECTION_FAILURE`, termination namespace CODESIGNING, "Invalid Page".
+// That is a SIGKILL, so no handler of ours reports it and the log simply stops.
+// SL-19 spent a device run and two crash reports to find one of these
+// (PCRE2's JIT inside libQt6Core, reached through QRegularExpression).
+//
+// Refusing the request is strictly better, because a JIT that cannot get
+// executable memory is a case its authors already handle — PCRE2 falls back to
+// its interpreter, and so do most others. So an anonymous PROT_EXEC mapping
+// fails with EPERM and says so ONCE, by name, which is the difference between a
+// fallback and a corpse.
+//
+// File-backed PROT_EXEC is untouched: that is a real signed image and it is how
+// dlopen works. KL_GUEST_JIT=1 restores the old behaviour for a host run, where
+// there is no AMFI and a JIT works fine — and where this would otherwise make
+// the host quietly slower than the device is honest about.
+static int guest_jit_allowed(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GUEST_JIT", 0);
+    return on;
+}
+
+static int klb_refuse_exec(const char *what, int anon, int prot) {
+    if (!anon || !(prot & PROT_EXEC) || guest_jit_allowed()) return 0;
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [klepton] refusing the guest's %s of anonymous "
+                        "PROT_EXEC memory — this platform will not execute an "
+                        "unsigned page (trap 12), and a mapping that succeeds "
+                        "here is a SIGKILL on the first branch into it. A JIT "
+                        "that is told no takes its interpreter; one that is not "
+                        "takes the process down. KL_GUEST_JIT=1 to allow it.\n",
+                what);
+    }
+    errno = EPERM;
+    return 1;
+}
+
 void *klb_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     int df = kl_mmap_flags(flags);
     if (df & MAP_ANON) fd = -1;                  // Darwin insists on -1 for anonymous
+    if (klb_refuse_exec("mmap", (df & MAP_ANON) != 0, prot)) return MAP_FAILED;
     return mmap(addr, len, prot, df, fd, off);   // PROT_* values match on both sides
+}
+
+// ...and the other half, which is how a JIT usually asks: map RW, write, then
+// mprotect to RX. Refusing only mmap would let that one through.
+//
+// Unconditional on PROT_EXEC, and that is narrower than it looks: this entry
+// point serves the GUEST only. Our own loader makes guest text executable by
+// calling mprotect() directly (kl_image.c), and dlopen is dyld's business, so
+// nothing that legitimately maps a signed image comes through here. A guest
+// asking to make memory executable is a guest generating code.
+int klb_mprotect(void *addr, size_t len, int prot) {
+    if (klb_refuse_exec("mprotect", 1, prot)) return -1;
+    return mprotect(addr, len, prot);
 }
 
 #define LX_O_CREAT 0x40

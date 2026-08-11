@@ -175,6 +175,27 @@ private struct EyeAllocation {
     var slice: Int
 }
 
+/// GL internal format -> MTLPixelFormat, for the eye textures the guest asks
+/// for storage for.
+///
+/// **This is a requirement, not a preference.** ANGLE compares the GL internal
+/// format we claim against the MTLTexture's own pixel format and refuses the
+/// pair — `TextureImageSiblingMtl::ValidateClientBuffer`, "Incompatible format"
+/// — so a provider hardwired to RGBA16F cannot back a guest that asked for
+/// anything else. Unity asks for RGBA16F through OVRPlugin; Steam Link's OpenXR
+/// swapchains ask for SRGB8_ALPHA8, which is what put this here. `nil` means
+/// decline, and the guest then gets ordinary GL storage of the right format —
+/// black in the headset, which is visible, rather than colour that is subtly
+/// wrong, which is not.
+private func klEyePixelFormat(_ glInternal: UInt32) -> MTLPixelFormat? {
+    switch glInternal {
+    case 0x881A: return .rgba16Float        // GL_RGBA16F
+    case 0x8C43: return .rgba8Unorm_srgb    // GL_SRGB8_ALPHA8
+    case 0x8058: return .rgba8Unorm         // GL_RGBA8
+    default:     return nil
+    }
+}
+
 final class KleptonCompositor {
     private let layerRenderer: LayerRenderer
     private var device: MTLDevice!
@@ -519,11 +540,11 @@ final class KleptonCompositor {
         }
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
-        kl_glfb_set_mtl_provider({ (eye, stage, w, h, out, ctx) -> Int32 in
+        kl_glfb_set_mtl_provider({ (eye, stage, w, h, fmt, out, ctx) -> Int32 in
             guard let ctx, let out else { return 0 }
             let me = Unmanaged<KleptonCompositor>.fromOpaque(ctx).takeUnretainedValue()
             return me.provideEyeTexture(eye: Int(eye), stage: Int(stage),
-                                        w: Int(w), h: Int(h), out: out)
+                                        w: Int(w), h: Int(h), format: fmt, out: out)
         }, ctx)
         NSLog("[cp] MTL provider installed on \(device.name) "
               + "(vertex amplification \(amplification))")
@@ -822,9 +843,18 @@ final class KleptonCompositor {
     /// texture binds **successfully** and the guest renders into storage it does
     /// not have. kl_glfb refuses a mismatch rather than accept that.
     private func provideEyeTexture(eye: Int, stage: Int, w: Int, h: Int,
+                                   format: UInt32,
                                    out: UnsafeMutablePointer<kl_mtl_eye_texture>) -> Int32 {
         let k = Self.key(eye, stage)
         let partnerKey = Self.key(eye == 0 ? 1 : 0, stage)
+
+        guard let pixelFormat = klEyePixelFormat(format) else {
+            NSLog("[cp] eye \(eye) stage \(stage) asks for GL internalformat "
+                  + String(format: "0x%x", format)
+                  + ", which has no MTLPixelFormat here — declining, so this eye "
+                  + "renders into GL storage nothing composites")
+            return 0
+        }
 
         // Before anything is handed back, including on the cached path: the
         // size is only knowable here, and the map has to be in force before the
@@ -852,7 +882,16 @@ final class KleptonCompositor {
         var partner = eyes[partnerKey]
         eyesLock.unlock()
 
-        if let a = cached, a.texture.width == w, a.texture.height == h {
+        // The format is part of the identity for the same reason the size is:
+        // handing back a texture whose pixel format is not the one the guest
+        // asked for gets the pair refused by ANGLE, and the eye then quietly
+        // falls back to GL storage nothing samples.
+        func fits(_ a: EyeAllocation) -> Bool {
+            a.texture.width == w && a.texture.height == h
+                && a.texture.pixelFormat == pixelFormat
+        }
+
+        if let a = cached, fits(a) {
             out.pointee = kl_mtl_eye_texture(texture: Unmanaged.passUnretained(a.texture).toOpaque(),
                                              slice: Int32(a.slice),
                                              w: Int32(a.texture.width),
@@ -863,12 +902,12 @@ final class KleptonCompositor {
         // Both eyes share one array texture, so the second eye must find the
         // first eye's allocation rather than make its own.
         var tex: MTLTexture? = nil
-        if let p = partner, p.texture.width == w, p.texture.height == h { tex = p.texture }
+        if let p = partner, fits(p) { tex = p.texture }
 
         if tex == nil {
             let desc = MTLTextureDescriptor()
             desc.textureType = .type2DArray
-            desc.pixelFormat = .rgba16Float
+            desc.pixelFormat = pixelFormat
             desc.width = w; desc.height = h
             desc.arrayLength = 2                 // one slice per eye
             desc.mipmapLevelCount = 1
@@ -887,7 +926,8 @@ final class KleptonCompositor {
             // actually reserved, so this is the only honest input to "is the
             // eye swapchain why we are at 3.5 GB".
             let naive = w * h * 8 * 2
-            NSLog("[cp] stage \(stage): RGBA16F \(w)x\(h) array, 2 slices — "
+            NSLog("[cp] stage \(stage): GL "
+                  + String(format: "0x%x", format) + " \(w)x\(h) array, 2 slices — "
                   + "\(t.allocatedSize / (1024 * 1024)) MiB allocated "
                   + "(uncompressed would be \(naive / (1024 * 1024)) MiB), "
                   + "compression=\(t.compressionType == .lossy ? "lossy" : "lossless")")
@@ -901,7 +941,7 @@ final class KleptonCompositor {
         // ovrp_SetupEyeTexture2 arrives serially on the guest's render thread,
         // so this costs nothing and exists so that assumption is not load-bearing.
         partner = eyes[partnerKey]
-        if let p = partner, p.texture.width == w, p.texture.height == h { tex = p.texture }
+        if let p = partner, fits(p) { tex = p.texture }
         let final = tex!
         eyes[k] = EyeAllocation(texture: final, slice: eye)
         eyesLock.unlock()

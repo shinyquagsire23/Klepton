@@ -107,6 +107,12 @@ static int branch_sys(uint32_t w, klx_info *o) {
     if (((w >> 25) & 0x7f) == 0x2a) return 1;  // b.cond
     if (((w >> 24) & 0xff) == 0xd4) return 1;  // svc / brk / hlt
     if (((w >> 22) & 0x3ff) == 0x354) {        // system: mrs / msr / hints / barriers
+        // Trap 26. `mrs Xt, CTR_EL0` is S3_3_C0_C0_1, i.e. 0xD53B0020 | Rt, and
+        // reading it from EL0 is an ILLEGAL INSTRUCTION on Darwin — measured on
+        // macOS as well as visionOS. It is flagged here rather than refused
+        // because the veneer answers it; note the flag is orthogonal to the x18
+        // fields, so `mrs x18, CTR_EL0` is both and the emitter serves both.
+        if ((w & 0xFFFFFFE0u) == 0xD53B0020u) o->sysreg = KLX_SYS_CTR_EL0;
         // Hints and barriers encode Rt as 31, so they fall out via addfld.
         addfld(o, w, KLX_RD, ((w >> 21) & 1) ? KLX_W : KLX_R);
         return 1;
@@ -309,7 +315,7 @@ int klx_decode(uint32_t w, klx_info *o) {
     else if ((op0 & 0x7) == 0x5) o->ok = dp_reg(w, o);      // x101
     else if ((op0 & 0x7) == 0x7) o->ok = simd_fp(w, o);     // x111
     else                         o->ok = 0;                 // reserved / SVE / SME
-    if (!o->ok) { o->nfields = 0; o->roles = 0; o->gp_used = 0; }
+    if (!o->ok) { o->nfields = 0; o->roles = 0; o->gp_used = 0; o->sysreg = KLX_SYS_NONE; }
     return o->ok;
 }
 
@@ -498,23 +504,33 @@ int kl_x18_is_data(const void *code, size_t size, size_t index) {
 // sites still reports its data words. The emitter returns early in that case —
 // correctly, there is nothing to veneer — and counting there alone silently
 // undercounted, which is the one thing this number must not do.
-static unsigned klx_survey(const void *code, size_t size, unsigned *data) {
+//
+// `ctr` is trap 26's population and is counted APART: the x18 totals are exact
+// numbers `make check` gates on, and a second population sharing them would
+// move a number that is meant to be stable. The data-word test applies to both,
+// for the same reason — 0xd53b0029 is a perfectly ordinary word to find in a
+// constant table.
+static unsigned klx_survey(const void *code, size_t size, unsigned *data,
+                           unsigned *ctr) {
     const uint32_t *w = (const uint32_t *)code;
     size_t n = size / 4;
     unsigned c = 0;
     if (data) *data = 0;
+    if (ctr) *ctr = 0;
     for (size_t i = 0; i < n; i++) {
         klx_info in;
         klx_decode(w[i], &in);
-        if (!in.nfields) continue;
-        if (klx_looks_like_data(w, n, i)) { if (data) (*data)++; continue; }
-        c++;
+        if (!in.nfields && !in.sysreg) continue;
+        if (klx_looks_like_data(w, n, i)) { if (data && in.nfields) (*data)++; continue; }
+        if (in.nfields) c++;
+        if (in.sysreg && ctr) (*ctr)++;
     }
     return c;
 }
 
 unsigned kl_x18_count(const void *code, size_t size) {
-    return klx_survey(code, size, NULL);
+    unsigned ctr = 0;
+    return klx_survey(code, size, NULL, &ctr) + ctr;
 }
 
 // ---------- instruction encoders ----------
@@ -531,6 +547,26 @@ static uint32_t enc_str(unsigned t, unsigned n, unsigned off) {
     return 0xF9000000u | ((off / 8) << 10) | (n << 5) | t;
 }
 static uint32_t enc_mrs_tpidrro(unsigned t) { return 0xD53BD060u | t; }
+static uint32_t enc_movz(unsigned t, uint16_t imm, unsigned shift16) {  // movz xT, #imm, lsl #(16*s)
+    return 0xD2800000u | ((uint32_t)shift16 << 21) | ((uint32_t)imm << 5) | t;
+}
+static uint32_t enc_movk(unsigned t, uint16_t imm, unsigned shift16) {
+    return 0xF2800000u | ((uint32_t)shift16 << 21) | ((uint32_t)imm << 5) | t;
+}
+
+// Materialise a 64-bit constant into xT with as few movz/movk as it needs.
+// Always at least one instruction, so a zero constant is `movz xT, #0`.
+static unsigned enc_mov_imm64(unsigned t, uint64_t v, uint32_t *out) {
+    unsigned k = 0;
+    for (unsigned s = 0; s < 4; s++) {
+        uint16_t part = (uint16_t)(v >> (16 * s));
+        if (!part) continue;
+        uint32_t insn = k ? enc_movk(t, part, s) : enc_movz(t, part, s);
+        out[k++] = insn;
+    }
+    if (!k) out[k++] = enc_movz(t, 0, 0);
+    return k;
+}
 
 static int enc_b(uint64_t from, uint64_t to, uint32_t *out) {
     int64_t d = (int64_t)to - (int64_t)from;
@@ -596,6 +632,30 @@ static int veneer_enabled(void) {
     return cached;
 }
 
+// Trap 26's own knob, deliberately independent of KL_X18: the two rewrites fix
+// different registers and an A/B on one must not silently move the other.
+// KL_CTR=0 leaves `mrs Xt, CTR_EL0` alone, which is a SIGILL wherever it runs.
+static int ctr_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = kl_env_on("KL_CTR", 1);
+    return cached;
+}
+
+// ...and what the veneer answers. See KLX_CTR_EL0_VALUE in kl_x18.h for why
+// this value and not the IDC=1/DIC=1 one trap 26 designed.
+uint64_t kl_x18_ctr_value(void) {
+    static uint64_t cached;
+    static int init;
+    if (!init) {
+        init = 1;
+        cached = KLX_CTR_EL0_VALUE;
+        const char *s = kl_env_str("KL_CTR_EL0", NULL);
+        if (s && *s) cached = strtoull(s, NULL, 0);
+    }
+    return cached;
+}
+#define ctr_value() kl_x18_ctr_value()
+
 // The emitter proper. `code_va`/`pool_va` are the addresses the two buffers will
 // have when the code executes, which is what every `b` and `adrp` is computed
 // against; the buffers themselves may live anywhere (a file image being laid out
@@ -608,25 +668,72 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
     uint32_t *w = (uint32_t *)code;
     size_t    n = size / 4;
 
-    unsigned want = klx_survey(code, size, &st->data_words);
+    unsigned want = klx_survey(code, size, &st->data_words, &st->ctr_sites);
     st->sites = want;
     if (pool_used) *pool_used = 0;
-    if (!want || !veneer_enabled()) return 0;
+    int do_x18 = want && veneer_enabled();
+    int do_ctr = st->ctr_sites && ctr_enabled();
+    if (!do_x18 && !do_ctr) return 0;
 
     uint32_t *out = (uint32_t *)pool, *pool_end = (uint32_t *)((uint8_t *)pool + poolcap);
 
     for (size_t i = 0; i < n; i++) {
         klx_info in;
         klx_decode(w[i], &in);
-        if (!in.nfields) continue;
-        // Not a refusal: a refusal is an x18 site we could not veneer, and this
-        // is a word that was never an instruction. Already tallied by the
-        // survey above, so only skipped here.
+        if (!in.nfields && !in.sysreg) continue;
+        // Not a refusal: a refusal is a site we could not veneer, and this is a
+        // word that was never an instruction. Already tallied by the survey
+        // above, so only skipped here.
         if (klx_looks_like_data(w, n, i)) continue;
+
+        // Which rewrite this word wants. A word can want both — `mrs x18,
+        // CTR_EL0` — and then the CTR veneer is the one that serves it, because
+        // it can put the constant into the shadow slot but the x18 veneer
+        // cannot avoid executing the `mrs`.
+        int ctr_site = in.sysreg == KLX_SYS_CTR_EL0 && do_ctr;
+        int x18_site = in.nfields && do_x18 && !ctr_site;
+        if (!ctr_site && !x18_site) continue;
 
         uint64_t spc = code_va + (uint64_t)i * 4;
         uint64_t vpc = pool_va + (uint64_t)((uint8_t *)out - (uint8_t *)pool);
         uint32_t word = w[i];
+
+        // Trap 26: `mrs Xt, CTR_EL0`. No spill, no TSD and no scratch — the
+        // veneer materialises a constant into the destination the instruction
+        // already names and branches back. The only case that needs the x18
+        // machinery is `mrs x18, CTR_EL0`, where the destination is the shadow
+        // slot rather than a register; it does not occur in either guest, and
+        // it is served rather than refused because a refusal here is a SIGILL.
+        if (ctr_site) {
+            uint32_t body[VEN_MAX_INSN];
+            unsigned k = 0;
+            int ok = 1;
+            unsigned rt = word & 31u;
+            if (out + VEN_MAX_INSN > pool_end) {
+                note_refusal(word); st->ctr_refused++; continue;
+            }
+            if (in.nfields) {                       // destination is x18 itself
+                unsigned a, b;
+                pick_scratch(in.gp_used, &a, &b);
+                body[k++] = enc_stp(a, b, -16);
+                body[k++] = enc_mrs_tpidrro(a);
+                k += enc_mov_imm64(b, ctr_value(), body + k);
+                body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
+                body[k++] = enc_ldp(a, b, -16);
+            } else {
+                k += enc_mov_imm64(rt, ctr_value(), body + k);
+            }
+            ok &= (k < VEN_MAX_INSN);
+            if (ok) { ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++; }
+            uint32_t patch;
+            if (ok) ok &= enc_b(spc, vpc, &patch);
+            if (!ok) { note_refusal(word); st->ctr_refused++; continue; }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            st->ctr_patched++;
+            continue;
+        }
 
         if (in.hazard || in.pcrel == KLX_PC_ADR || in.pcrel == KLX_PC_LITERAL ||
             out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
@@ -699,15 +806,20 @@ int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
 
     // Same reason as in kl_x18_emit: the data-word tally has to survive the
     // "nothing to veneer here" path, or a chunk of pure data reports nothing.
-    unsigned want = klx_survey(code, size, &st->data_words);
+    unsigned want = klx_survey(code, size, &st->data_words, &st->ctr_sites);
     st->sites = want;
-    if (!want || !veneer_enabled()) return 0;
-    if (g_slot < 0 && kl_x18_init() != 0) return -1;
+    unsigned veneers = (veneer_enabled() ? want : 0) +
+                       (ctr_enabled() ? st->ctr_sites : 0);
+    if (!veneers) return 0;
+    // The TSD slot is only needed by the x18 half; a chunk whose only veneer is
+    // trap 26's does not touch it. Checking it anyway would refuse to fix a
+    // SIGILL because of a register the code in question never names.
+    if (want && veneer_enabled() && g_slot < 0 && kl_x18_init() != 0) return -1;
 
     // The pool goes immediately after the code so that `b` reaches it from
     // anywhere in the range. mmap treats the address as a hint, so the result
     // is range-checked per site rather than assumed.
-    size_t   cap  = ((size_t)want * VEN_MAX_INSN * 4 + 0xFFFF) & ~(size_t)0xFFFF;
+    size_t   cap  = ((size_t)veneers * VEN_MAX_INSN * 4 + 0xFFFF) & ~(size_t)0xFFFF;
     uint8_t *hint = (uint8_t *)(((uintptr_t)code + size + 0xFFFF) & ~(uintptr_t)0xFFFF);
     uint8_t *base = mmap(hint, cap, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANON, -1, 0);

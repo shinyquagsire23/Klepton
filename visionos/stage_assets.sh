@@ -47,6 +47,11 @@ if [ -z "$TARGET" ]; then
   # and a link would work here but hide a real failure on device.
   cp -R "$ASSETS" "$DEST/$TREE/assets"
   cp "$APK" "$DEST/$KLT_APK"
+  if [ -n "$KLT_QTPLUGINS" ]; then
+    rm -rf "$DEST/$TREE/qtplugins"
+    mkdir -p "$DEST/$TREE/qtplugins"
+    cp "$ROOT/$KLT_QTPLUGINS"/libplugins_*.so "$DEST/$TREE/qtplugins/"
+  fi
   echo "[stage] done: $(du -sh "$DEST" | cut -f1)"
   exit 0
 fi
@@ -62,4 +67,16 @@ copy() {   # <source> <destination-relative-to-container>
 }
 copy "$ASSETS" "Documents/$TREE/assets"
 copy "$APK"    "Documents/$KLT_APK"
+# The Qt plugin .so files, when the target asks for them. They are DATA, not a
+# loader path — see the `qtplugins` note in targets.py: Qt globs this directory
+# and parses each candidate's ELF metadata before it will dlopen it, and the
+# dlopen itself still resolves to the signed framework in the bundle.
+# devicectl copies a directory, so they are staged through one locally first.
+if [ -n "$KLT_QTPLUGINS" ]; then
+  STAGE=$(mktemp -d)/qtplugins
+  mkdir -p "$STAGE"
+  cp "$ROOT/$KLT_QTPLUGINS"/libplugins_*.so "$STAGE/"
+  copy "$STAGE" "Documents/$TREE/qtplugins"
+  rm -rf "$(dirname "$STAGE")"
+fi
 echo "[stage] done"

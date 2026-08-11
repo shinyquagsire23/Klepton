@@ -179,11 +179,20 @@ uint64_t kl_glfb_stage_draw_count(int stage);
 // mismatch rather than trusting the caller.
 typedef struct { void *texture; int slice; int w, h; } kl_mtl_eye_texture;
 
-// Called from ovrp_SetupEyeTexture2 when Unity asks for eye storage. Return
-// non-zero having filled `out`, or 0 to let the guest get ordinary GL storage.
-// w/h are the dimensions the texture must have — note they arrive already
-// transposed relative to ovrp's arguments; see kl_ovrp.c's SetupEyeTexture2.
+// Called when a guest asks for eye storage — ovrp_SetupEyeTexture2 for Unity,
+// xrEndFrame's eye assertion for an OpenXR guest. Return non-zero having filled
+// `out`, or 0 to let the guest get ordinary GL storage. w/h are the dimensions
+// the texture must have — note they arrive already transposed relative to
+// ovrp's arguments; see kl_ovrp.c's SetupEyeTexture2.
+//
+// **`internal_fmt` is not advisory.** ANGLE compares the GL internal format we
+// claim against the MTLTexture's own pixel format and refuses the pair outright
+// — `TextureImageSiblingMtl::ValidateClientBuffer`, "Incompatible format" — so
+// a provider that always allocates RGBA16F simply cannot back a guest that
+// asked for anything else. Unity asks for RGBA16F and Steam Link asks for
+// SRGB8_ALPHA8, which is why this is a parameter rather than a constant.
 typedef int (*kl_glfb_mtl_provider)(int eye, int stage, int w, int h,
+                                    uint32_t internal_fmt,
                                     kl_mtl_eye_texture *out, void *ctx);
 void kl_glfb_set_mtl_provider(kl_glfb_mtl_provider fn, void *ctx);
 int  kl_glfb_has_mtl_provider(void);

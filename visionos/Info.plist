@@ -89,6 +89,27 @@
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Klepton connects to spatial controllers that are not visible to the system as standard game controllers.</string>
 
+	<!-- The LOCAL network, which on this platform is a separate permission from
+	     "the network" and fails in the worst available way without it.
+	     (SL-19.)
+
+	     Steam Link finds hosts by UDP broadcast on port 27036 — SL-5 measured
+	     that, and measured it colliding with a Mac running Steam. On iOS 14 and
+	     later, and on visionOS, an app that has not declared this key gets no
+	     prompt and its local-network traffic is DISCARDED: no errno, no error
+	     on the socket, nothing in any log. That is why the device run shows
+	     `Connected to Remote Client service` — the Steam backend is on the
+	     internet and needs none of this — while the computer list stays empty.
+
+	     Same class as trap 13, one step quieter: there a missing usage string
+	     is a process kill on the request, here it is silence. So the failure to
+	     look for is "the feature does nothing", not "the feature errors".
+
+	     No NSBonjourServices: this guest does not browse mDNS, it broadcasts.
+	     A service type we invented would be a declaration we cannot back up. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Steam Link finds the PCs on your network by broadcasting to them, and streams from the one you pair with.</string>
+
 	<!-- Array-valued, so it cannot be an INFOPLIST_KEY_ build setting — which
 	     is the reason this file exists rather than four more settings. Without
 	     it the Sense controllers are not offered to the app as spatial

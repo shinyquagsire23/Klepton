@@ -127,6 +127,23 @@ int  kl_app_guest_state(void);
 const char *kl_app_target_name(void);
 int         kl_app_target_is_steamlink(void);
 
+// The 2D -> VR handoff (PLANNING §11.9), from the Swift side's point of view.
+//
+// Steam Link's 2D shell pairs with a host, and when the host authorizes it
+// calls SteamLink.startVRLink(sArgs) and finishes itself. On the host that is a
+// re-exec into the OpenXR front door (SL-15); an app bundle cannot re-exec, so
+// here the window's job is to notice this has happened and open the
+// ImmersiveSpace. The guest thread the compositor then starts opens the other
+// front door in the same process.
+//
+// _pending is 0 until the shell hands off and 1 after, and never goes back —
+// the shell's main thread is parked inside startVRLink by then and there is
+// nothing to return to. _sargs is the authorized session, for the log: the
+// runtime already has it (it is in the environment as KL_SLINK_SARGS, which is
+// the same path a hand-carried one takes), so nothing has to pass it along.
+int         kl_app_vrlink_pending(void);
+const char *kl_app_vrlink_sargs(void);
+
 // Absolute path of the log kl_app_boot writes, valid after kl_app_configure.
 // The Swift side displays it and offers it for export.
 const char *kl_app_log_path(void);

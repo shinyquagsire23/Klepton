@@ -188,6 +188,47 @@ int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out);
 // a caller has any business passing to the call above.
 int kl_ovrp_last_complete_stage(void);
 
+// ...and the two calls that FILE those records for a guest that does not speak
+// OVRPlugin at all.
+//
+// Both compositors — KleptonCompositor.swift and the macOS viewer — read the
+// frame record above and nothing else: with no record, `last_complete` is -1
+// forever and every frame composites black however good the picture is. Beat
+// Saber files it from ovrp_BeginFrame/ovrp_EndFrame; an OpenXR guest never
+// calls either, which is why the Steam Link immersive space was black with a
+// perfectly healthy compositor (SL-18).
+//
+// The pair is the same two moments, and the OpenXR half is the easier one:
+//
+//   begin   at xrWaitFrame, the frame latch point. Pins the pose this frame
+//           will be drawn with, exactly as ovrp_BeginFrame does.
+//   end     at xrEndFrame, with the swapchain image the guest presented.
+//
+// **The stage is passed in rather than observed**, and that is the difference
+// between the two guests. Unity picks its stage privately, so kl_glfb has to
+// watch which eye texture it bound as a draw target and klovrp_EndFrame files
+// the frame under whatever was seen (PLANNING §12.19). An OpenXR guest names
+// the image it drew — xrReleaseSwapchainImage, then the projection layer at
+// xrEndFrame — so there is nothing to infer and none of that machinery's
+// failure modes (`drew into NO eye stage`, `drew into N stages`) can arise.
+//
+// **...and so is the POSE, which is the other thing OpenXR states outright.**
+// `pose7` is {px,py,pz,qx,qy,qz,qw} in the tracking space and `tan8` is the two
+// eyes' {left,right,top,bottom} tangents; NULL for either keeps what `begin`
+// latched. An OpenXR guest submits both in the projection layer, and taking
+// them from there rather than from our latch is what stops a compositor
+// timewarping a picture the guest has ALREADY timewarped: a streaming client
+// warps the host's frame to the predicted display pose before submitting it,
+// says so in the layer, and our correction then correctly comes out near zero.
+// Against the latched pose it comes out as the whole frame's head motion,
+// applied a second time — which reads as the scene moving further than the head
+// did, and as an arc on any rotation, because a head turn translates the eyes.
+// A guest that does NOT pre-warp submits the pose it was given, and this is
+// then identical to the latch. Strictly better in both cases, so it is not a
+// knob; KL_REPROJECT_MODE=off remains the blunt A/B.
+void kl_ovrp_frame_begin_external(void);
+void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8);
+
 // How many swapchain stages we tell the guest it has (KL_OVRP_STAGES). The
 // answer to ovrp_GetEyeTextureStageCount, so it bounds every (eye, stage) key
 // in the system — a compositor iterating stages must use this rather than its

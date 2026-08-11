@@ -1274,14 +1274,25 @@ static const char *klxr_ref_space_name(int t) {
 // prints the line, in one fprintf, once it also has the answer it gave. Split
 // across the computation it would be split in the log too — the guest logs from
 // several threads and one landed in the middle of the first version of this.
+// ...once per (call, space, base), AND THEN RARELY AGAIN.
+//
+// Once was enough while the only question was WHICH spaces the guest asks
+// about (SL-16 answered a whole arc with that census). It is not enough for the
+// question that follows — whether the ANSWERS are right — because the first
+// call happens before the head has moved, so every position in the census is
+// 0 and a leak of the head's own position is indistinguishable from no leak.
+// The repeat costs one line per pair per ~600 calls and is the difference
+// between a census and a measurement. KL_XR_LOCATE_EVERY=0 turns it off.
 static int klxr_locate_seen(const char *call, int sp_type, int base_type) {
-    static struct { const char *call; int sp, base; } seen[16];
+    static struct { const char *call; int sp, base; unsigned n; } seen[16];
     static int n;
+    static int every = -1;
+    if (every < 0) every = kl_env_int("KL_XR_LOCATE_EVERY", 600);
     for (int i = 0; i < n; i++)
         if (seen[i].call == call && seen[i].sp == sp_type && seen[i].base == base_type)
-            return 0;
+            return every > 0 && ++seen[i].n % (unsigned)every == 0;
     if (n == (int)(sizeof seen / sizeof seen[0])) return 0;
-    seen[n].call = call; seen[n].sp = sp_type; seen[n].base = base_type; n++;
+    seen[n].call = call; seen[n].sp = sp_type; seen[n].base = base_type; seen[n].n = 0; n++;
     return 1;
 }
 
@@ -1323,6 +1334,19 @@ static XrPosef klxr_pose_rel(XrPosef a, XrPosef b) {
     XrPosef out;
     out.position = klxr_qrot(inv, d);
     out.orientation = klxr_qmul(inv, b.orientation);
+    return out;
+}
+
+// ...and the other direction: a pose stated IN `base`, expressed in base's
+// parent. klxr_pose_rel's inverse, and the composition klxr_space_pose already
+// does for a space's own offset.
+static XrPosef klxr_pose_apply(XrPosef base, XrPosef p) {
+    XrVector3f r = klxr_qrot(base.orientation, p.position);
+    XrPosef out;
+    out.position = (XrVector3f){ base.position.x + r.x,
+                                 base.position.y + r.y,
+                                 base.position.z + r.z };
+    out.orientation = klxr_qmul(base.orientation, p.orientation);
     return out;
 }
 
@@ -1777,6 +1801,10 @@ typedef struct {
     int      next_index;      // round-robin, which is all "which is free" means
                               // here: nothing else reads these images yet
     int      eye;             // which eye this swapchain was registered as, -1 if not
+    int      mtl_eye;         // ...and which eye its images were BACKED as, -1 if
+                              // none. Separate from `eye` because every
+                              // projection layer's views claim an eye and only
+                              // the composited layer's storage is provided.
 } klxr_swapchain;
 
 static klxr_swapchain g_swapchains[KLXR_SWAPCHAIN_MAX];
@@ -1891,6 +1919,7 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
     sc->acquired = -1;
     sc->last_released = -1;
     sc->eye = -1;
+    sc->mtl_eye = -1;
 
     klxr_gl_init();
     if (!gl_GenTextures || !gl_BindTexture) {
@@ -1934,12 +1963,99 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
     return KLXR_SUCCESS;
 }
 
+// ---- P5: giving an eye swapchain's images MTLTexture storage -------------
+//
+// **The ordering problem, and why this is here and not in xrCreateSwapchain.**
+// The provider is asked for storage for a texture the guest has already told us
+// is an eye. An OpenXR guest cannot tell us that at allocation time:
+// xrCreateSwapchain knows a size and a format, nothing more, and *which*
+// swapchain is an eye is only asserted at xrEndFrame, from the projection
+// layer. Creation order does not say it either — measured, and wrong (SL-9):
+// this guest makes a pair per projection layer, more for its UI panels and its
+// video stream, and rebuilds all of them across scene changes.
+//
+// So the backing is retroactive: the guest renders into ordinary GL storage
+// until it presents a frame that names the swapchain as an eye, and from that
+// frame on the same GL texture names are re-pointed at MTLTextures the
+// compositor owns. **One frame per swapchain generation is lost** — it was
+// drawn into storage nothing samples — and that is the whole price. The
+// alternative, backing every swapchain image at creation, costs the memory of
+// every UI panel and stream buffer as well; this guest submits four projection
+// layers a frame plus 1536x1536 panels, so it is not a small difference.
+//
+// Re-pointing a texture that already has immutable glTexStorage2D storage is
+// legal: glEGLImageTargetTexture2DOES respecifies the texture, ANGLE's
+// validation has no immutability test and Texture::setEGLImageTargetImpl
+// orphans the previous storage. `make mtltex` checks it against real ANGLE
+// rather than against that reading.
+static void klxr_back_eye_images(klxr_swapchain *sc, int eye) {
+    if (!kl_glfb_has_mtl_provider() || sc->mtl_eye == eye) return;
+    if (klxr_format_is_depth(sc->format)) return;
+    // The provider hands back a slice of a 2-slice array, one per eye, and the
+    // compositor's amplified pass depends on both eyes sharing that texture. A
+    // swapchain that is itself an array is a different shape — the guest would
+    // be rendering both eyes into one of ours — so it is named and left alone
+    // rather than half-served.
+    if (sc->array_size != 1 || sc->mip_count != 1) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [xr] eye %d swapchain is %u array slice(s) x %u mip(s) "
+                            "— not backed by an MTLTexture; the compositor has "
+                            "nothing to sample for it\n",
+                    eye, sc->array_size, sc->mip_count);
+        }
+        return;
+    }
+    int done = 0;
+    for (int k = 0; k < sc->count; k++)
+        done += kl_glfb_bind_eye_mtl_texture(eye, k, sc->tex[k],
+                                             (int)sc->width, (int)sc->height,
+                                             (uint32_t)sc->format);
+    if (done == sc->count) {
+        // Exactly one swapchain owns an eye's provider slots at a time, and it
+        // is this one from here on: the guest rebuilds its eye swapchains
+        // across scenes, and the OLD one is destroyed AFTER the new one has
+        // been asserted. Without this, that teardown releases the slots the new
+        // swapchain has just taken — the storage the guest is now rendering
+        // into — which is a black eye some frames later and nothing saying why.
+        for (int i = 0; i < KLXR_SWAPCHAIN_MAX; i++)
+            if (&g_swapchains[i] != sc && g_swapchains[i].mtl_eye == eye)
+                g_swapchains[i].mtl_eye = -1;
+        sc->mtl_eye = eye;
+        fprintf(stderr, "  [xr] eye %d: %d swapchain image(s) %ux%u fmt 0x%llx now "
+                        "MTLTexture-backed — the compositor can sample them\n",
+                eye, done, sc->width, sc->height, (unsigned long long)sc->format);
+    } else {
+        // Not silent and not fatal: the guest keeps its GL storage and keeps
+        // rendering, and the display stays black. Which of those two it is, is
+        // exactly what the compositor's `e0=nil e1=nil` could not say.
+        fprintf(stderr, "  [xr] eye %d: only %d of %d swapchain images could be "
+                        "backed (%ux%u fmt 0x%llx) — the compositor will show "
+                        "black for this eye\n",
+                eye, done, sc->count, sc->width, sc->height,
+                (unsigned long long)sc->format);
+    }
+}
+
 static XrResult klxr_DestroySwapchain(void *swapchain) {
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
     if (!sc) return KLXR_ERROR_HANDLE_INVALID;
-    if (sc->eye >= 0)
-        for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(sc->eye, i);
-    if (gl_DeleteTextures) gl_DeleteTextures(sc->count, sc->tex);
+    // `mtl_eye`, not `eye`: every projection layer's views claim an eye, so
+    // releasing on `eye` would have one layer's swapchain tear down the storage
+    // another layer's is still rendering into — and mtl_eye is cleared when a
+    // newer swapchain takes the slot, so only the current owner releases.
+    //
+    // The release deletes the GL names as well (it holds the only other
+    // reference keeping the MTLTexture alive), so this is a choice of one path
+    // or the other rather than both: deleting twice is a silent GL no-op but
+    // double-counts in the object census, which is what that census exists to
+    // be trusted for.
+    if (sc->mtl_eye >= 0) {
+        for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(sc->mtl_eye, i);
+    } else if (gl_DeleteTextures) {
+        gl_DeleteTextures(sc->count, sc->tex);
+    }
     memset(sc, 0, sizeof *sc);
     return KLXR_SUCCESS;
 }
@@ -2048,6 +2164,13 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
     if (g_frame_pacer) g_frame_pacer();
 
     kl_ovrp_frame_latch();
+    // ...and open this frame's record against the pose just latched, which is
+    // what a compositor reprojects against. The OVRPlugin path does this from
+    // ovrp_BeginFrame; here it belongs beside the latch rather than in
+    // xrBeginFrame, because xrBeginFrame may be called twice for one wait (a
+    // discarded frame) and the record must describe the pose the guest was
+    // given, once.
+    kl_ovrp_frame_begin_external();
 
     // The period is the display's, from the same seam the OVRPlugin path reads
     // it from — so a headset that reports 120 Hz is described as 120 Hz to
@@ -2108,9 +2231,23 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // the capture takes the first (the base layer, composited furthest back)
     // and KL_XR_CAPTURE_LAYER moves it without a rebuild, because a run that
     // reads the wrong one costs a fresh Steam pairing to repeat.
+    //
+    // It is now also which layer the COMPOSITOR shows, which makes it more than
+    // a capture knob: the compositor draws one quad per eye out of one array
+    // texture, so it can show exactly one projection layer, and layering the
+    // rest is real work (their own quads, their own depths, in submission
+    // order) rather than a parameter. Until then this is the one that reaches
+    // the display, and the name says only half of what it does.
     static int cap_layer = -1;
     if (cap_layer < 0) cap_layer = kl_env_int("KL_XR_CAPTURE_LAYER", 0);
     uint32_t proj_layers = 0;
+    int drawn_stage = -1;
+    // What the composited layer SAYS it was drawn with. See kl_ovrp.h's
+    // kl_ovrp_frame_end_external: taking these from the submission rather than
+    // from our latch is what stops the compositor correcting a delta the guest
+    // has already corrected.
+    int   have_layer_pose = 0;
+    float layer_pose[7], layer_tan[8];
 
     for (uint32_t i = 0; i < info->layerCount; i++) {
         const XrCompositionLayerBaseHeader *layer = info->layers[i];
@@ -2133,8 +2270,58 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             // next acquire has not happened yet. Named every frame, because the
             // rotation moves every frame; the registration below is once.
             if ((int)li == cap_layer && sc->last_released >= 0 &&
-                sc->last_released < sc->count)
+                sc->last_released < sc->count) {
                 kl_glfb_set_live_eye_texture((int)v, sc->tex[sc->last_released]);
+                // The stage the frame record is filed under. Taken from eye 0,
+                // because both eyes' swapchains are acquired and released once
+                // per frame and therefore rotate together — and taken from the
+                // guest's own release rather than observed, which is the whole
+                // reason this path has none of the OVRPlugin path's ambiguity.
+                if (v == 0) drawn_stage = sc->last_released;
+                // The layer states its pose in ITS space, which need not be the
+                // tracking space — so it is composed out of that space rather
+                // than used raw. The frustum comes with it: a picture rendered
+                // with one field of view must keep being placed with that one.
+                klxr_space *lsp = klxr_space_of(layer->space);
+                XrPosef in_tracking = klxr_pose_apply(
+                    lsp ? klxr_space_pose(lsp) : (XrPosef){{0,0,0,1},{0,0,0}},
+                    proj->views[v].pose);
+                // The record wants the HEAD, and a projection layer states the
+                // EYES — measured: eye 0's position differs from the latched
+                // head by 0.0315 m, which is exactly half the IPD and not a
+                // reprojection. The head is the midpoint, so the first view
+                // seeds it and the second averages it in; the orientation is
+                // the same for both (measured at 0.000 deg apart) and is taken
+                // from view 0.
+                if (v == 0) {
+                    layer_pose[0] = in_tracking.position.x;
+                    layer_pose[1] = in_tracking.position.y;
+                    layer_pose[2] = in_tracking.position.z;
+                    layer_pose[3] = in_tracking.orientation.x;
+                    layer_pose[4] = in_tracking.orientation.y;
+                    layer_pose[5] = in_tracking.orientation.z;
+                    layer_pose[6] = in_tracking.orientation.w;
+                    have_layer_pose = 1;
+                } else if (have_layer_pose) {
+                    layer_pose[0] = 0.5f * (layer_pose[0] + in_tracking.position.x);
+                    layer_pose[1] = 0.5f * (layer_pose[1] + in_tracking.position.y);
+                    layer_pose[2] = 0.5f * (layer_pose[2] + in_tracking.position.z);
+                }
+                // OpenXR states the field of view as four signed ANGLES from
+                // the view axis; the record speaks tangents, all positive, in
+                // cp_view_get_tangents order.
+                const XrFovf *f = &proj->views[v].fov;
+                float *t = layer_tan + v * 4;
+                t[0] = fabsf(tanf(f->angleLeft));
+                t[1] = fabsf(tanf(f->angleRight));
+                t[2] = fabsf(tanf(f->angleUp));
+                t[3] = fabsf(tanf(f->angleDown));
+            }
+            // The eye textures the compositor samples, provided retroactively:
+            // this call is the first moment anything knows which swapchain is
+            // an eye. Only the composited layer's, and only once per (swapchain,
+            // eye) — klxr_back_eye_images returns immediately after that.
+            if ((int)li == cap_layer) klxr_back_eye_images(sc, (int)v);
             if (sc->eye == (int)v) continue;            // already this eye
             sc->eye = (int)v;
             for (int k = 0; k < sc->count; k++)
@@ -2148,6 +2335,16 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     (int)li == cap_layer ? " [captured]" : "");
         }
     }
+
+    // Close this frame's record, under the image the guest actually presented.
+    // A frame that submitted no projection layer for the composited layer drew
+    // no new picture, so nothing is filed and the compositor shows the previous
+    // one again — the same rule, and for the same reason, as klovrp_EndFrame's
+    // "a frame that drew into no eye stage must not file anything".
+    if (drawn_stage >= 0)
+        kl_ovrp_frame_end_external(drawn_stage,
+                                   have_layer_pose ? layer_pose : NULL,
+                                   have_layer_pose ? layer_tan : NULL);
 
     // ...and this is the VR path's swap. kl_glfb's capture and the frontend
     // seams both hang off eglSwapBuffers, which an OpenXR guest never calls —

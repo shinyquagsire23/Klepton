@@ -1193,6 +1193,113 @@ int kl_ovrp_last_complete_stage(void) {
     return s;
 }
 
+// --- the same two moments, for a guest that never speaks OVRPlugin ----------
+//
+// See kl_ovrp.h for why these exist. They write the same records the pair above
+// writes and share every static with them, deliberately: the compositor reads
+// one ring, and a second one filled by a second guest is how the two answers
+// drift. No process runs both — a run is Beat Saber or it is Steam Link.
+void kl_ovrp_frame_begin_external(void) {
+    // klovrp_head() rather than klovrp_step_head(): the step ring is libunity's
+    // Update/Render split, which has no counterpart here. The latch is the same
+    // one, taken by kl_ovrp_frame_latch() at xrWaitFrame just before this.
+    klovrp_pose h = klovrp_head();
+    pthread_mutex_lock(&g_frames.mu);
+    uint64_t s = ++g_frames.serial;
+    kl_ovrp_render_pose *r = &g_frames.pending;
+    r->px = h.px; r->py = h.py; r->pz = h.pz;
+    r->qx = h.qx; r->qy = h.qy; r->qz = h.qz; r->qw = h.qw;
+    memcpy(r->tangents, g_eye_tan, sizeof r->tangents);
+    r->serial = s;
+    r->stage = -1;
+    r->complete = 0;
+    g_frames.pending_index = (int)s;
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
+void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8) {
+    if ((unsigned)stage >= KLOVRP_MAX_STAGES) {
+        // Not clamped. A stage outside the ring means the swapchain has more
+        // images than the record ring has slots, and folding it onto a slot
+        // that already describes a different picture is the exact pose/picture
+        // mismatch this ring exists to prevent — better to file nothing and say
+        // so than to file the wrong thing.
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [ovrp] external frame stage %d is beyond the %d-slot "
+                            "record ring — this frame's pose is NOT filed\n",
+                    stage, KLOVRP_MAX_STAGES);
+        }
+        return;
+    }
+    // Louder than a comment, once: the compositor's own per-stage report walks
+    // 0..kl_ovrp_stage_count(), so a stage past that is composited correctly
+    // and reported as if it did not exist.
+    if (stage >= kl_ovrp_stage_count()) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [ovrp] external frame stage %d is beyond "
+                            "KL_OVRP_STAGES (%d) — it composites, but the "
+                            "per-stage report will not show it\n",
+                    stage, kl_ovrp_stage_count());
+        }
+    }
+    pthread_mutex_lock(&g_frames.mu);
+    if (g_frames.serial) {
+        // The guest's own statement of what it drew, where it has one. See the
+        // header: this is what keeps a compositor from correcting a delta the
+        // guest has already corrected.
+        // ...and by how much, which is the measurement the whole change rests
+        // on rather than an assertion about it. A guest that renders at the
+        // pose it was handed submits that same pose and this is 0; a streaming
+        // client that warps the host's frame to the predicted display pose
+        // before submitting it reports the frame's own head motion, and THAT is
+        // the delta a compositor must not apply a second time. Printed on the
+        // first frame and then rarely, because the number only has to settle
+        // which of the two guests this is.
+        if (pose7) {
+            klovrp_pose a = { .qx = g_frames.pending.qx, .qy = g_frames.pending.qy,
+                              .qz = g_frames.pending.qz, .qw = g_frames.pending.qw };
+            klovrp_pose b = { .qx = pose7[3], .qy = pose7[4],
+                              .qz = pose7[5], .qw = pose7[6] };
+            float deg = klovrp_quat_degrees(&a, &b);
+            float dx = pose7[0] - g_frames.pending.px;
+            float dy = pose7[1] - g_frames.pending.py;
+            float dz = pose7[2] - g_frames.pending.pz;
+            static unsigned n;
+            static float worst_deg, worst_m;
+            float m = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (deg > worst_deg) worst_deg = deg;
+            if (m > worst_m) worst_m = m;
+            if (n == 0 || ++n % 600 == 0)
+                fprintf(stderr, "  [ovrp] the guest submitted a pose %.3f deg / "
+                                "%.4f m from the one it was handed (worst %.3f deg "
+                                "/ %.4f m) — it %s\n", (double)deg, (double)m,
+                        (double)worst_deg, (double)worst_m,
+                        worst_deg > 0.05f || worst_m > 0.002f
+                            ? "REPROJECTS ITS OWN FRAMES, so ours must not repeat it"
+                            : "renders at the pose it is given");
+            if (n == 0) n = 1;
+            g_frames.pending.px = pose7[0];
+            g_frames.pending.py = pose7[1];
+            g_frames.pending.pz = pose7[2];
+            g_frames.pending.qx = pose7[3];
+            g_frames.pending.qy = pose7[4];
+            g_frames.pending.qz = pose7[5];
+            g_frames.pending.qw = pose7[6];
+        }
+        if (tan8) memcpy(g_frames.pending.tangents, tan8, sizeof g_frames.pending.tangents);
+        g_frames.pending.stage = stage;
+        g_frames.pending.complete = 1;
+        g_frames.r[stage] = g_frames.pending;
+        g_frames.last_complete = stage;
+        g_frames.filed[stage]++;
+    }
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
 // --- M7: the two hands ------------------------------------------------------
 // Node ids and enum values are not invented: they are read out of the guest's
 // own global-metadata.dat (the OVRPlugin C# it was compiled against):

@@ -110,7 +110,7 @@ struct KleptonApp: App {
 
     var body: some Scene {
         WindowGroup { BootView() }
-            .defaultSize(width: 1100, height: 900)
+            .defaultSize(width: 1280, height: 800)
             // On the app's phase, not this window's: closing the boot window
             // while the immersive space is up is not backgrounding, and must
             // not be treated as it. The log line above every decision is what
@@ -178,9 +178,52 @@ struct BootView: View {
     @State private var finished = false
     @State private var succeeded = false
     @State private var openedSpace = false
+    // The flat guest's picture, and the handoff that ends it. Polled rather
+    // than pushed: both are C state written by a guest thread, and a callback
+    // out of one into SwiftUI would be a main-actor hop from a thread that is
+    // mid-frame. A timer at 5 Hz costs nothing and cannot deadlock.
+    @State private var showShell = false
+    @State private var handedOff = false
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
 
     var body: some View {
+        Group {
+            if showShell { ShellWindow() } else { bootReport }
+        }
+        .task { await watchPresentation() }
+    }
+
+    /// Which of the two things the window can be showing, decided by what the
+    /// guest is actually producing rather than by a knob.
+    ///
+    /// kl_present observes the mode — a window surface was created, or an eye
+    /// texture was set up — so a guest that surprises us is described correctly
+    /// rather than according to a flag someone remembered to set. The 2D->VR
+    /// handoff is the transition kl_present.h was written for.
+    private func watchPresentation() async {
+        while !Task.isCancelled {
+            let mono = kl_present_mode_now() == KL_PRESENT_MONO
+            if mono != showShell { showShell = mono }
+
+            if kl_app_vrlink_pending() != 0, !handedOff {
+                handedOff = true
+                NSLog("[app] 2D -> VR handoff: \(String(cString: kl_app_vrlink_sargs()))")
+                // Unconditionally, not behind Immersive.wanted: that default
+                // says what a LAUNCH should open, and this is a run that has
+                // just been handed the one thing the VR half cannot start
+                // without. openedSpace is shared with boot() so the two paths
+                // cannot both open it.
+                if !openedSpace {
+                    openedSpace = true
+                    let r = await openImmersiveSpace(id: Immersive.id)
+                    NSLog("[cp] openImmersiveSpace (after handoff) -> \(r)")
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+    }
+
+    private var bootReport: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("Klepton").font(.largeTitle.bold())
