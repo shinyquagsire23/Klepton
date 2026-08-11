@@ -1465,14 +1465,18 @@ static int klxr_action_space_hand(const klxr_space *sp, int *is_aim);
 // real property of the frontend, and the headset settled it in one A/B where
 // no amount of reading the basis conversion would have.
 //
-// Sign convention, since it is the half that cannot be checked from here:
-// R_x(θ) takes the forward vector (0,0,-1) to (0, sinθ, -cosθ), so POSITIVE
-// pitches the ray UP and negative pitches it down. Negative matches the sign of
-// every hilt correction in the guest's own controller_config.json — -20.6 for
-// Touch, -10 for Pico, -5 for Vive, all about X.
+// Sign convention: R_x(θ) takes the forward vector (0,0,-1) to (0, sinθ,
+// -cosθ), so positive pitches the ray up and NEGATIVE pitches it down. It is
+// negative — the ray tilts down off the hilt.
 //
-// KL_XR_AIM_PITCH overrides it; `KL_XR_AIM_PITCH=35` is the one-variable flip
-// if the ray turns out to be off by twice the angle rather than fixed.
+// Two independent things agree on that, which is why it is worth writing down:
+// it was settled on hardware, and it matches the sign of every hilt correction
+// in the guest's own controller_config.json (-20.6 for Touch, -10 for Pico, -5
+// for Vive, all about X). The agreement is the reassuring part — a magnitude
+// from a headset and a sign from the guest's own table are different sources.
+//
+// KL_XR_AIM_PITCH overrides it. A ray that is off by TWICE the angle rather
+// than merely still wrong means the sign, and `KL_XR_AIM_PITCH=35` is the flip.
 #define KLXR_AIM_PITCH_DEFAULT (-35.0f)
 static void klxr_aim_from_grip(XrPosef *p) {
     // A separate `init` flag rather than a sentinel value: the knob's whole

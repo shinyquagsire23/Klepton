@@ -491,8 +491,14 @@ def main():
     print(f"wrote {proj}")
     print(f"  KLEPTON_TARGET            = {KLT['name']}")
     print(f"  DEVELOPMENT_TEAM = {TEAM or '(NOT DETECTED - set KLEPTON_TEAM)'}")
+    # ENTITLEMENTS_FILE, not the literal name: this used to print
+    # "Klepton.entitlements" unconditionally, so a build that was actually
+    # signing against a FILTERED copy said it was signing against the authored
+    # one. A summary that contradicts what went into the pbxproj is worse than
+    # no summary — it is the line you would check to rule the filter out.
     print(f"  CODE_SIGN_ENTITLEMENTS = "
-          f"{'Klepton.entitlements' if ENTITLEMENTS else '(none - KLEPTON_ENTITLEMENTS=0)'}")
+          f"{ENTITLEMENTS_FILE if ENTITLEMENTS else '(none - KLEPTON_ENTITLEMENTS=0)'}"
+          + (f"  (dropped: {', '.join(_dropped)})" if ENTITLEMENTS and _dropped else ""))
     print(f"  PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID}")
     print(f"  embedded guest frameworks: {', '.join(GUEST)}")
     print(f"  embedded ANGLE:            {', '.join(ANGLE)}")

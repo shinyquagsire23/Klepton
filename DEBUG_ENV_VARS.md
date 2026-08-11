@@ -989,22 +989,26 @@ See PLANNING §11.
   without a run at all. The seventh "type" in the older count is the hand
   profile (`svl_hand_interaction_augmented`), which is not in that table.
 - `KL_XR_AIM_PITCH=<degrees>` — the AIM pose as a rotation off the GRIP pose,
-  about the grip's X axis, positive tilting the ray up. **Default 0, and that
-  is a decision rather than a placeholder.**
+  about the grip's X axis, positive tilting the ray up. **Default -35 (the ray
+  tilts DOWN off the hilt), confirmed on hardware.**
 
   OpenXR gives a controller two poses and Steam Link binds both: the stream's
   `pamir-stream-pose` reads `.../input/grip/pose` (the hilt) and the in-headset
-  UI's `ui_pointer_pose` reads `.../input/aim/pose` (the ray). On a real Touch
-  controller those differ by a large device-specific angle, because the OpenXR
-  grip's -Z runs through the fist from little finger to thumb rather than
-  forwards. That is **not** the pose this project's frontend publishes:
-  `KleptonControllers.swift` converts ARKit's wrist frame into a hilt frame
-  whose -Z already points along the direction the hilt points, so here the two
-  nearly coincide and a fabricated 35-degree offset would make a correct pose
-  wrong. The seam exists because they *are* different poses; the knob is so a
-  headset settles it in one A/B instead of a rebuild. Symptom to watch for: the
-  UI laser leaving the hand at the wrong angle while the streamed controller
-  model sits correctly.
+  UI's `ui_pointer_pose` reads `.../input/aim/pose` (the ray). Collapse them and
+  the laser leaves the hand at the hilt's angle instead of the pointing angle.
+
+  SL-20 first shipped this at 0, arguing that `KleptonControllers.swift` already
+  builds a hilt frame whose -Z points along the direction the hilt points, so
+  aim and grip nearly coincide for this input source. **That was wrong on
+  hardware** — the same 35 degrees a Touch controller needs is needed here.
+
+  The sign is negative and two independent sources agree on it: the headset,
+  and the sign of every hilt correction in the guest's own
+  `controller_config.json` (-20.6 Touch, -10 Pico, -5 Vive, all about X). A ray
+  that is off by TWICE the angle rather than merely still wrong means the sign;
+  `KL_XR_AIM_PITCH=35` is the flip. The runtime prints what it took
+  (`[xr] aim pose is the grip pitched -35.0 deg`), so a run says which value was
+  in force rather than leaving it to be inferred from the picture.
 - `KL_SLINK_SIZE=WxH` — the panel size, published to SDL
   (`nativeSetScreenResolution`), the `ANativeWindow` and ANGLE together via
   one `slink_panel_size()` — the display is a group answer, and ANGLE is
