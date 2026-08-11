@@ -1161,6 +1161,15 @@ except its own control vars (next section). See PLANNING §12.
   is opaque so passthrough shows through nowhere it matters, and seeing the
   room makes scale and IPD easier to judge. The scene manifest declares
   `UIImmersionStyleMixed` to match; keep the two in step.
+- `KL_OVERLAYS=1` — put the system's persistent overlays back. Both immersive
+  spaces pass `.persistentSystemOverlays(.hidden)` by default: the Home
+  indicator and the hand-gesture affordance beneath it are drawn by the system
+  *over* the guest, and both guests put interactive content exactly where it
+  lands — Beat Saber's lower menu row, Steam Link's dashboard toolbar. It also
+  reappears on every hand raise, which for a hand-driven title is continuous.
+  `.hidden` is a request rather than a guarantee (the system still shows the
+  indicator when it considers it mandatory), so turn this on when the question
+  is whether the system still thinks our space is on screen at all.
 - `KL_TEMPLATE=1` — the **floor test**: Apple's `MetalImmersiveTemplate` with a
   blue fragment shader in its own immersive space, sharing nothing with the
   compositor (`KleptonTemplate.swift`). Runs INSTEAD of booting the guest —

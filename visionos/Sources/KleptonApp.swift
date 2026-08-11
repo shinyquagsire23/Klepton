@@ -69,6 +69,28 @@ enum Immersive {
     // describes is not the one on screen.
     nonisolated(unsafe) private static var closures = 0
     static func bump() -> Int { closures += 1; return closures }
+
+    /// Whether the system's persistent overlays — the Home indicator, and the
+    /// hand-gesture affordance that fades in beneath it — stay on top of the
+    /// guest's picture.
+    ///
+    /// Hidden by default. The overlay is drawn by the system *over* the
+    /// immersive scene, and both guests here put their own interactive content
+    /// exactly where it lands: Beat Saber's lower menu row and Steam Link's
+    /// dashboard toolbar are both near the bottom of the field, so the overlay
+    /// sits on the controls rather than beside them. It also reappears on every
+    /// hand raise, which for a title driven entirely by raised hands is
+    /// continuous.
+    ///
+    /// `.hidden` is a request, not a guarantee — the system still shows the
+    /// indicator at moments it considers mandatory (the first seconds of a
+    /// space, a pending system alert), which is why this is the same `Visibility`
+    /// ALVR passes rather than a claim that it is gone. `KL_OVERLAYS=1` puts it
+    /// back, which is what a run wants when the question is whether the system
+    /// still thinks our space is on screen at all.
+    static var systemOverlays: Visibility {
+        klEnvOn("KL_OVERLAYS", default: false) ? .automatic : .hidden
+    }
 }
 
 /// What backgrounding means for this process: the end of it.
@@ -148,6 +170,10 @@ struct KleptonApp: App {
         }
         .immersionStyle(selection: .constant(Template.mixed ? .mixed : .full),
                         in: .mixed, .full)
+        // The floor test gets it too, and deliberately: it is the control for
+        // the space below, and a control that differs in what the system draws
+        // over it is not one.
+        .persistentSystemOverlays(Immersive.systemOverlays)
 
         ImmersiveSpace(id: Immersive.id) {
             CompositorLayer(configuration: KleptonStageConfiguration()) { layerRenderer in
@@ -166,6 +192,10 @@ struct KleptonApp: App {
         // how the scene sits. KL_FULL=1 goes back.
         .immersionStyle(selection: .constant(Immersive.mixed ? .mixed : .full),
                         in: .mixed, .full)
+        // See Immersive.systemOverlays. On the scene, not on a view inside it:
+        // a CompositorLayer has no view hierarchy for the View-level modifier to
+        // attach to, so the Scene-level one is the only one that applies here.
+        .persistentSystemOverlays(Immersive.systemOverlays)
     }
 }
 
