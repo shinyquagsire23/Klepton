@@ -12,6 +12,9 @@ CLAUDE.md
 /planning/
 PLANNING.md
 
+# pi coding agent — local session/mesh state
+.pi/
+
 # binaries
 *.dSYM/
 *.dylib

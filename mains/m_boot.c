@@ -495,7 +495,11 @@ static int recon_run(int view_pump) {
                 // doFrame is what wakes the engine for a frame, and
                 // nativeRender then draws what it decided. Ticking after
                 // rendering would hand every frame the previous one's time.
-                kl_jni_tick_choreographer();
+                // The frame clock is now a free-running host thread started at
+                // the first Choreographer postFrameCallback — it is NOT driven
+                // from here. Doing it inline is how the pump blocked forever: a
+                // doFrame could only be delivered before nativeRender, and
+                // nativeRender waits on the refresh counter a doFrame advances.
                 // One local frame per pumped frame, as the JVM gives each
                 // nativeRender on Android — the guest's per-frame locals are
                 // meant to die here (see kl_jni.h).

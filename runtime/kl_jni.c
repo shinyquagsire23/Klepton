@@ -17,6 +17,7 @@
 #include "klepton.h"
 #include "kl_jni.h"
 #include "kl_env.h"
+#include "kl_ovrp.h"
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_jni_slots.h"
@@ -2850,17 +2851,70 @@ static klj_val klj_Choreographer_getInstance(void *env, void *self, const klj_va
 // delta time from the gap between calls.
 static void *g_frame_callback;
 
+// Forward — kl_jni_tick_choreographer() is defined later, beside the message
+// delivery machinery; the frame-clock thread needs this and no other hook.
+void kl_jni_tick_choreographer(void);
+
+// ---- the frame clock -----------------------------------------------
+//
+// On Android the Choreographer's doFrame fires CONTINUOUSLY, once per display
+// refresh, from the system — wholly independent of the render thread. Unity
+// 1.40 (via the Android Game SDK's Swappy) waits on a refresh COUNTER that
+// each doFrame advances by one, and the pump calling nativeRender directly
+// blocked forever because it could deliver a doFrame only BEFORE the call and
+// could not deliver more while inside it. The fixes are exactly as device
+// reality is structured: the frame clock is a free-running source of its own,
+// not a side effect of the render pump. Its cadence is read from the same
+// display-frequency seam the compositor pushes (kl_ovrp_display_frequency),
+// so it moves with the stated device — 72 Hz Quest-2 fiction on the host, the
+// real drawable rate once a visionOS frontend pushes it.
+//
+// The thread calls guest code (JNIBridge.invoke -> doFrame -> the engine's own
+// nOnChoreographer) while the main thread may be inside nativeRender. That is
+// exactly Android: the vsync thread and the render thread are different
+// threads, and the engine's own bookkeeping around these counters is locked
+// (the wait side and the counter read hold the same mutex).
+static int         g_frame_clock_running;
+static void *klj_frame_clock_main(void *arg) {
+    (void)arg;
+    kl_jni_env();                     // per-thread env + kl_thread_init
+    while (g_frame_clock_running) {
+        double hz = kl_ovrp_display_frequency();
+        if (!(hz >= 30.0 && hz <= 240.0)) hz = 72.0;
+        struct timespec d = { 0, (long)(1e9 / hz) };
+        nanosleep(&d, NULL);
+        if (g_frame_callback)
+            kl_jni_tick_choreographer();
+    }
+    return NULL;
+}
+static void klj_frame_clock_start(void) {
+    static int started;
+    if (started) return;
+    started = 1;
+    g_frame_clock_running = 1;
+    pthread_t th;
+    if (pthread_create(&th, NULL, klj_frame_clock_main, NULL) == 0)
+        pthread_detach(th);
+}
+
 static klj_val klj_Choreographer_postFrameCallback(void *env, void *self,
                                                    const klj_val *a, int n) {
     (void)env; (void)self;
     g_frame_callback = n > 0 ? a[0].l : NULL;
+    // The moment a callback exists the frame clock must be LIVE on its own
+    // thread — the render pump may block inside nativeRender waiting on the
+    // refresh counter at any moment, and only an independent source can keep
+    // advancing it then. See the frame-clock block above.
+    klj_frame_clock_start();
     if (g_frame_callback) {
         static int announced;
         if (!announced) {
             announced = 1;
             klj_object *o = klj_as_object(g_frame_callback);
-            KLJ_LOG("Choreographer.postFrameCallback(%s) — the frame clock is now "
-                    "driven from the host's pump", o ? o->cls : "(untagged)");
+            KLJ_LOG("Choreographer.postFrameCallback(%s) — the frame clock now runs "
+                    "on its own host thread at the seam's display frequency",
+                    o ? o->cls : "(untagged)");
         }
     }
     return (klj_val){.j = 0};
@@ -3458,7 +3512,11 @@ static klj_val klj_PowerManager_sustainedPerf(void *env, void *self, const klj_v
 // than a static one.
 static klj_val klj_BatteryManager_isCharging(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.j = kl_env_int("KL_BATTERY_CHARGING", 0) ? 1 : 0};
+    // The charging flag lives in the kl_ovrp battery seam — the single source
+    // both this Java answer and ovrp_GetSystemBatteryLevel2 read, so a visionOS
+    // frontend pushing the real UIDevice state updates every consumer at once.
+    // KL_BATTERY_CHARGING still overrides via the seam's own env read.
+    return (klj_val){.j = (uint64_t)kl_ovrp_battery_charging()};
 }
 
 // getIntProperty(id). BATTERY_PROPERTY_CAPACITY is 4 and is the only one this
@@ -3467,7 +3525,7 @@ static klj_val klj_BatteryManager_isCharging(void *env, void *self, const klj_va
 static klj_val klj_BatteryManager_getIntProperty(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     int id = n > 0 ? (int)(int32_t)a[0].j : 0;
-    if (id == 4) return (klj_val){.j = (uint32_t)kl_env_int("KL_BATTERY_LEVEL", 95)};
+    if (id == 4) return (klj_val){.j = (uint32_t)kl_ovrp_battery_level()};
     return (klj_val){.j = (uint32_t)INT32_MIN};
 }
 
@@ -3567,6 +3625,46 @@ static klj_val klj_InputDevice_getDescriptor(void *env, void *self, const klj_va
     (void)env; (void)a; (void)n;
     klj_inputdev *d = klj_inputdev_of(self);
     return (klj_val){.l = kl_jni_new_string(d ? d->descriptor : "")};
+}
+
+// USB product/vendor ids. libunity calls these from its joystick-descriptor
+// builder (guest libunity 0xf4dea8/0xf4dfe0) purely to name the device — the
+// controllers are already enumerated via getDeviceIds and the real input never
+// flows down this path (it goes through OVRPlugin's GetControllerState4). The
+// controllers are not USB devices here, so 0 is the honest answer; anything
+// more specific would be invented for a string nobody acts on.
+static klj_val klj_InputDevice_getProductId(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+static klj_val klj_InputDevice_getVendorId(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// The controllers are physical devices, not a synthetic mouse/keyboard vdev, so
+// isVirtual() is false — same informational-class query as getProductId above.
+static klj_val klj_InputDevice_isVirtual(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// Unity reads the joystick axis table from getMotionRanges(). The honest answer
+// for THIS device is an EMPTY list: every axis is served through OVRPlugin's
+// GetControllerState4, not through Android InputDevice motion ranges — the game
+// reads controller input over OVRPlugin, and a device reporting "no axes on the
+// InputDevice path" cannot disagree with what OVRPlugin reports. Building a
+// fake axis table here would be guessing at conventions nothing reads, and an
+// empty set is the configuration Unity already handles for axis-less devices.
+static klj_val klj_InputDevice_getMotionRanges(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = klj_new_list(NULL, 0)};
+}
+
+static klj_val klj_InputDevice_getMotionRange(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = NULL};   // no InputDevice-backed axis exists
 }
 
 static klj_val klj_InputManager_registerListener(void *env, void *self, const klj_val *a, int n) {
@@ -4301,6 +4399,23 @@ static klj_val klj_Thread_start(void *env, void *self, const klj_val *a, int n) 
 // wrong shape).
 static klj_val klj_void_noop(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// The engine calls the JAVA wrapper UnityPlayer.hidePreservedContent()V; on
+// Android it is a one-line forward to the registered native
+// nativeHidePreservedContent, which the guest DID register (RegisterNatives
+// list, UnityPlayer.nativeHidePreservedContent()V). So the faithful dispatch
+// is to call that native, not silence — hiding the preserved frame is the
+// guest's decision and it has an implementation for exactly this. If the guest
+// never registered it, silence (nothing is preserved to hide anyway).
+static klj_val klj_UnityPlayer_hidePreservedContent(void *env, void *self,
+                                                    const klj_val *a, int n) {
+    (void)a; (void)n;
+    void *fn = kl_jni_native("com/unity3d/player/UnityPlayer",
+                             "nativeHidePreservedContent", NULL);
+    if (fn)
+        ((void (*)(void *, void *))fn)(env, self);
     return (klj_val){.j = 0};
 }
 
@@ -5153,6 +5268,61 @@ KLJ_OCULUS_FLAG(klj_OculusUnity_lateLatching,     "com.unity.xr.oculus.LateLatch
 KLJ_OCULUS_FLAG(klj_OculusUnity_lateLatchingDebug,"com.unity.xr.oculus.LateLatchingDebug")
 #undef KLJ_OCULUS_FLAG
 
+// The private native OculusUnity.surfaceCreated(Surface). OculusUnity.smali
+// declares it `private native` but libOculusXRPlugin's JNI_OnLoad never calls
+// RegisterNatives for it — it is reached by Java_ symbol resolution on real
+// Android (the library exports Java_com_unity_oculus_OculusUnity_surfaceCreated,
+// 0x10b7c). We run the REAL libOculusXRPlugin, so the implementation exists and
+// is the honest thing to call: it takes a global ref to the Surface and hands it
+// to the plugin's internal surface-notify, which is the one effect the whole
+// UnitySurfaceView dance exists to produce. Resolved by symbol rather than bound
+// in jni land, because no guest ever registered it and the JVM's Java_ name
+// resolution is exactly the mechanism Android would use.
+static void *klj_oculus_surface_created_native(void) {
+    static void *fn;
+    if (!fn) {
+        kl_image *img = kl_find_image("libOculusXRPlugin.so");
+        if (img)
+            fn = kl_sym(img, "Java_com_unity_oculus_OculusUnity_surfaceCreated");
+        if (!fn)
+            fprintf(stderr, "  [jni] no Java_com_unity_oculus_OculusUnity_surfaceCreated "
+                            "export in libOculusXRPlugin.so — surface setup skipped\n");
+    }
+    return fn;
+}
+
+// OculusUnity.initOculus() — transcribed from OculusUnity.smali:22-39. The real
+// body logs, stashes the Activity, then posts a lambda to the UI thread that
+// finds the unitySurfaceView (res id 0x7f020000, present in this APK's
+// res/values/ids.xml) and calls the private native surfaceCreated(Surface).
+//
+// Executed INLINE rather than through the posted Runnable: nothing downstream
+// reads glView/activity back, and the only observable effect is the native
+// surfaceCreated running, so deferring it to a UI-thread drain would add a
+// dependency on the host pump draining at the right moment for zero observable
+// difference. If a later abort names SurfaceView/SurfaceHolder methods, THAT is
+// the signal the singular surface fidelity matters and the object model exists
+// then. The Surface handed over is a valid jobject; the native only NewGlobalRefs
+// it and never dereferences it.
+static klj_val klj_OculusUnity_initOculus(void *env, void *self, const klj_val *a, int n) {
+    (void)a; (void)n;
+    KLJ_LOG("OculusUnity.initOculus() — activity %s, surface dance inline",
+            (klj_as_object(kl_jni_activity())->cls));
+    void *surface = kl_jni_new_object("android/view/Surface");
+    void *fn = klj_oculus_surface_created_native();
+    if (fn)
+        ((void (*)(void *, void *, void *))fn)(env, self, surface);
+    return (klj_val){.j = 0};
+}
+
+// pauseOculus/resumeOculus are empty bodies and destroyOculus only removes a
+// SurfaceHolder callback that our inline dance never installed (smali:62-66) —
+// the recorded-not-fitted shape, exactly like every other lifecycle no-op here.
+static klj_val klj_OculusUnity_lifecycle(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
 static klj_val klj_UnityPlayer_initializeGoogleAr(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 0};
@@ -5676,7 +5846,9 @@ static klj_val klj_ED_apply(void *env, void *self, const klj_val *a, int n) {
 // so the whole chain follows from getAll() rather than being speculative. It is
 // read-only throughout: nothing mutates one of our snapshots, so there is no
 // remove() or setValue() here.
-typedef struct { klj_pref_set *set; unsigned pos; } klj_iter;
+// `coll` is one of { klj_pref_set, klj_list } selected by is_set; both expose
+// the same { count, void** } shape the two walkers below read.
+typedef struct { int is_set; void *coll; unsigned pos; } klj_iter;
 
 static klj_pref_set *klj_pset(void *self) {
     klj_object *o = klj_as_object(self);
@@ -5700,24 +5872,46 @@ static klj_val klj_Coll_isEmpty(void *env, void *self, const klj_val *a, int n) 
 static klj_val klj_Set_iterator(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_iter *it = calloc(1, sizeof *it);
-    it->set = klj_pset(self);
+    it->is_set = 1;
+    it->coll = klj_pset(self);
     void *obj = kl_jni_new_object("java/util/Iterator");
     klj_as_object(obj)->data = it;
     return (klj_val){.l = obj};
+}
+static klj_val klj_List_iterator(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_list *l = NULL;
+    klj_object *o = klj_as_object(self);
+    if (o) l = o->data;
+    klj_iter *it = calloc(1, sizeof *it);
+    it->is_set = 0;
+    it->coll = l;
+    void *obj = kl_jni_new_object("java/util/Iterator");
+    klj_as_object(obj)->data = it;
+    return (klj_val){.l = obj};
+}
+static unsigned klj_iter_len(const klj_iter *it) {
+    if (!it || !it->coll) return 0;
+    return it->is_set ? ((klj_pref_set *)it->coll)->n : ((klj_list *)it->coll)->count;
+}
+static void *klj_iter_at(const klj_iter *it, unsigned pos) {
+    if (!it || !it->coll) return NULL;
+    if (it->is_set) return &((klj_pref_set *)it->coll)->v[pos];
+    return ((klj_list *)it->coll)->items[pos];
 }
 static klj_val klj_Iterator_hasNext(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_object *o  = klj_as_object(self);
     klj_iter   *it = o ? o->data : NULL;
-    return (klj_val){.j = it && it->set && it->pos < it->set->n};
+    return (klj_val){.j = it && it->pos < klj_iter_len(it)};
 }
 static klj_val klj_Iterator_next(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_object *o  = klj_as_object(self);
     klj_iter   *it = o ? o->data : NULL;
-    if (!it || !it->set || it->pos >= it->set->n) return (klj_val){.l = NULL};
+    if (!it || it->pos >= klj_iter_len(it)) return (klj_val){.l = NULL};
     void *obj = kl_jni_new_object("java/util/Map$Entry");
-    klj_as_object(obj)->data = &it->set->v[it->pos++];
+    klj_as_object(obj)->data = klj_iter_at(it, it->pos++);
     return (klj_val){.l = obj};
 }
 
@@ -6130,6 +6324,11 @@ static const klj_binding g_bindings[] = {
     {"android/view/InputDevice", "getId", "()I", klj_InputDevice_getId},
     {"android/view/InputDevice", "getSources", "()I", klj_InputDevice_getSources},
     {"android/view/InputDevice", "getDescriptor", "()Ljava/lang/String;", klj_InputDevice_getDescriptor},
+    {"android/view/InputDevice", "getProductId", "()I", klj_InputDevice_getProductId},
+    {"android/view/InputDevice", "getVendorId", "()I", klj_InputDevice_getVendorId},
+    {"android/view/InputDevice", "isVirtual", "()Z", klj_InputDevice_isVirtual},
+    {"android/view/InputDevice", "getMotionRanges", "()Ljava/util/List;", klj_InputDevice_getMotionRanges},
+    {"android/view/InputDevice", "getMotionRange", "(I)Landroid/view/InputDevice$MotionRange;", klj_InputDevice_getMotionRange},
     {"android/hardware/input/InputManager", "registerInputDeviceListener",
      "(Landroid/hardware/input/InputManager$InputDeviceListener;Landroid/os/Handler;)V",
      klj_InputManager_registerListener},
@@ -6241,6 +6440,7 @@ static const klj_binding g_bindings[] = {
     // There is no soft keyboard here; Unity calls hide unconditionally while
     // tearing down text input, so silence is correct rather than a stub.
     {"com/unity3d/player/UnityPlayer", "hideSoftInput", "()V", klj_void_noop},
+    {"com/unity3d/player/UnityPlayer", "hidePreservedContent", "()V", klj_UnityPlayer_hidePreservedContent},
     {"com/unity3d/player/UnityPlayer", "getNetworkProxySettings", "(Ljava/lang/String;)Ljava/lang/String;", klj_UnityPlayer_getNetworkProxySettings},
     {"com/unity3d/player/UnityPlayer", "addPhoneCallListener", "()V", klj_UnityPlayer_addPhoneCallListener},
     {"android/content/Context", "getContentResolver", "()Landroid/content/ContentResolver;", klj_Context_getContentResolver},
@@ -6460,6 +6660,10 @@ static const klj_binding g_bindings[] = {
     {"java/lang/String", "equals", "(Ljava/lang/Object;)Z", klj_String_equals},
     {"java/lang/String", "length", "()I",                   klj_String_length},
     {"com/unity3d/player/UnityPlayer", "initializeGoogleAr", "()Z", klj_UnityPlayer_initializeGoogleAr},
+    // Standalone-launched (UnityPlayerActivity is the LAUNCHER in this
+    // manifest), not embedded in a host app — so the Unity-as-a-Library
+    // predicate is false, which is what the real Android would compute.
+    {"com/unity3d/player/UnityPlayer", "isUaaLUseCase", "()Z", klj_false},
     {"com/unity/oculus/OculusUnity", "getIsOnOculusHardware", "()Z",
      klj_OculusUnity_isOnOculusHardware},
     {"com/unity/oculus/OculusUnity", "loadLibrary", "(Ljava/lang/String;)V",
@@ -6472,6 +6676,10 @@ static const klj_binding g_bindings[] = {
      klj_OculusUnity_lateLatching},
     {"com/unity/oculus/OculusUnity", "getLateLatchingDebug", "()Z",
      klj_OculusUnity_lateLatchingDebug},
+    {"com/unity/oculus/OculusUnity", "initOculus", "()V", klj_OculusUnity_initOculus},
+    {"com/unity/oculus/OculusUnity", "pauseOculus",   "()V", klj_OculusUnity_lifecycle},
+    {"com/unity/oculus/OculusUnity", "resumeOculus",  "()V", klj_OculusUnity_lifecycle},
+    {"com/unity/oculus/OculusUnity", "destroyOculus", "()V", klj_OculusUnity_lifecycle},
     {"com/unity3d/player/PlayAssetDeliveryUnityWrapper", "init",
      "(Landroid/content/Context;)Lcom/unity3d/player/PlayAssetDeliveryUnityWrapper;",
      klj_PlayAssetDelivery_init},
@@ -6495,6 +6703,7 @@ static const klj_binding g_bindings[] = {
     {"java/util/List", "size",    "()I",                 klj_List_size},
     {"java/util/List", "isEmpty", "()Z",                 klj_List_isEmpty},
     {"java/util/List", "get",  "(I)Ljava/lang/Object;",  klj_List_get},
+    {"java/util/List", "iterator", "()Ljava/util/Iterator;", klj_List_iterator},
 
     {"java/util/Scanner", "<init>",        "(Ljava/io/InputStream;Ljava/lang/String;)V", klj_Scanner_init},
     {"java/util/Scanner", "useDelimiter",  "(Ljava/lang/String;)Ljava/util/Scanner;",    klj_Scanner_useDelimiter},

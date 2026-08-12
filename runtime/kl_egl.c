@@ -1203,6 +1203,13 @@ static unsigned klegl_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
 }
 
 static EGLContext klegl_GetCurrentContext(void) { return g_current; }
+static EGLDisplay klegl_GetCurrentDisplay(void) {
+    // The EGL 1.5 companion to the two above: the display for the current
+    // context, or EGL_NO_DISPLAY when nothing is current — that is the spec's
+    // answer for a thread with no context, and it is what 1.40's
+    // libOculusXRPlugin asks for as it spins up its own EGL context.
+    return g_current ? DISPLAY : (EGLDisplay)0;   /* EGL_NO_DISPLAY */
+}
 static EGLSurface klegl_GetCurrentSurface(int32_t which) {
     return which == EGL_READ ? g_read : g_draw;
 }
@@ -1424,6 +1431,7 @@ static const struct { const char *name; void *fn; } g_egl[] = {
     E("eglDestroyContext",      klegl_DestroyContext),
     E("eglMakeCurrent",         klegl_MakeCurrent),
     E("eglGetCurrentContext",   klegl_GetCurrentContext),
+    E("eglGetCurrentDisplay",   klegl_GetCurrentDisplay),
     E("eglGetCurrentSurface",   klegl_GetCurrentSurface),
     E("eglSwapBuffers",         klegl_SwapBuffers),
     E("eglSwapInterval",        klegl_SwapInterval),

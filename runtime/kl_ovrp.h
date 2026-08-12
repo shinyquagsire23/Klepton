@@ -297,6 +297,35 @@ void kl_ovrp_set_eye_rotation(int eye, float qx, float qy, float qz, float qw);
 // nothing will ever ask for again. Values outside 30..240 are refused as a
 // failed measurement rather than passed on, because this one is a divisor.
 void kl_ovrp_set_display_frequency(float hz);
+
+// Battery telemetry, as one source of truth. The defaults are the Quest-2
+// fiction (95% / not charging) — on the host there is no battery. A visionOS
+// frontend that reads the real level off UIDevice pushes it through
+// kl_ovrp_set_battery_level, the same seam shape as
+// kl_ovrp_set_display_frequency, and BOTH the OVRPlugin query
+// (ovrp_GetSystemBatteryLevel2) and the Java BatteryManager answer
+// (kl_jni.c) read through the getters, so the two presentations cannot
+// disagree. KL_BATTERY_LEVEL / KL_BATTERY_CHARGING still override on the
+// host, exactly as they do today.
+void kl_ovrp_set_battery_level(int level);     // 0..100, clamped
+int  kl_ovrp_battery_level(void);
+void kl_ovrp_set_battery_charging(int charging);
+int  kl_ovrp_battery_charging(void);
+
+// The predicted display time (seconds) the guest is told the next frame will
+// be shown. It drives timewarp — the guest predicts the head pose at the time
+// WE name — so a value that does not match when the frame actually presents
+// produces a reprojection nobody asked for. There is no display on the host to
+// measure, so the default answers the monotonic PRESENT, which is the least-
+// wrong no-data value: prediction with zero advance is conservative, whereas 0
+// reads as a timestamp far in the past. A visionOS frontend that knows the
+// real drawable presentation time pushes it through
+// kl_ovrp_set_predicted_display_time (per frame), same seam shape as the
+// display frequency and eye texture size. Monotonic, never wall-clock — every
+// consumer compares it against other monotonic times, and the XR side already
+// defines its clock as CLOCK_MONOTONIC.
+void   kl_ovrp_set_predicted_display_time(double t);
+double kl_ovrp_predicted_display_time(void);
 float kl_ovrp_display_frequency(void);
 
 // The per-eye render target size the guest is told to use

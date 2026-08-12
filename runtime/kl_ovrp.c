@@ -183,6 +183,150 @@ static uint64_t klovrp_GetSystemHeadsetType(void) {
     return OVRP_HEADSET_OCULUS_QUEST_2;
 }
 
+static uint64_t klovrp_GetSystemHeadsetType2(int *out) {
+    ovrp_hit("ovrp_GetSystemHeadsetType2");
+    // The 1.40 ABI for the headset-type query: ovrpResult + int* out-param,
+    // NOT the scalar-returning OVRP_0_1_x form — the real plugin writes the
+    // enum through the pointer (0x16dd00) and returns -1001 for a NULL one.
+    // Same value as the unsuffixed form: Quest 2 is what we claim everywhere
+    // else, and our PreInitialize3/Initialize7 answers mean the preinit gate
+    // the real plugin checks first is already satisfied, so only the NULL
+    // guard is reachable.
+    if (!out) return -1001;
+    *out = OVRP_HEADSET_OCULUS_QUEST_2;
+    return OVRP_SUCCESS;
+}
+
+// Real plugin is ovrpResult + int* out-param (0x172530), NOT a scalar return;
+// it NULL-checks x0 and writes the count. Nothing has ever been recentered on
+// this host, so the honest answer is 0.
+static uint64_t klovrp_GetLocalTrackingSpaceRecenterCount(int *out) {
+    ovrp_hit("ovrp_GetLocalTrackingSpaceRecenterCount");
+    if (!out) return -1001;
+    *out = 0;
+    return OVRP_SUCCESS;
+}
+
+// Eye-tracked foveation is a Quest Pro feature; we present a Quest 2, and our
+// foveation is the fixed/VRR kind (ovrp_SetTiledMultiResDynamic family), not
+// one that follows the gaze — so "not supported" is the honest answer, and the
+// guest then uses the fixed foveation path. Real plugin is ovrpResult + int*
+// out (0x1719a0).
+static uint64_t klovrp_GetFoveationEyeTrackedSupported(int *out) {
+    ovrp_hit("ovrp_GetFoveationEyeTrackedSupported");
+    if (out) *out = 0;
+    return OVRP_SUCCESS;
+}
+
+// The 2-form of the multiview capability is ovrpResult + int* out (real
+// 0x171090), unlike the scalar-bool un-suffixed form already refused in
+// g_ovrp_bool_no. Same answer as that form: no multiview in our GL gateway.
+static uint64_t klovrp_GetSystemMultiViewSupported2(int *out) {
+    ovrp_hit("ovrp_GetSystemMultiViewSupported2");
+    if (out) *out = 0;
+    return OVRP_SUCCESS;
+}
+
+// Guardian boundary: there is no boundary system on this host, so the
+// configured flag is false — same stance as the Geometry2/Visible forms. Real
+// plugin is ovrpResult + int* out (0x171170).
+static uint64_t klovrp_GetBoundaryConfigured2(int *out) {
+    ovrp_hit("ovrp_GetBoundaryConfigured2");
+    if (out) *out = 0;
+    return OVRP_SUCCESS;
+}
+
+// Gate predicates whose 2-forms are ovrpResult + int* out (the un-suffixed
+// forms are the OVRP_0_1_x scalar/mask shapes already answered in
+// g_ovrp_bool_yes). Each writes TRUE because the un-suffixed sibling already
+// says yes and the two must not disagree: VR focus (which gates whether Unity
+// renders at all), the head present, and the node present.
+static uint64_t klovrp_GetAppHasVrFocus2(int *out) {
+    ovrp_hit("ovrp_GetAppHasVrFocus2");
+    if (out) *out = 1;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_GetUserPresent2(int *out) {
+    ovrp_hit("ovrp_GetUserPresent2");
+    if (out) *out = 1;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_GetNodePresent2(int node, int *out) {
+    ovrp_hit("ovrp_GetNodePresent2");
+    // node comes FIRST (real 0x16f450: w0 = ovrpNode, x1 = int* out) — the
+    // last "write a bool" shape this guest has that is NOT a single
+    // pointer. Any node a caller names is one we report; the value is written
+    // for the callers that read it, since at least one (OculusSystem::
+    // GetNodePresent, libOculusXRPlugin+0xf264) only checks the return.
+    (void)node;
+    if (out) *out = 1;
+    return OVRP_SUCCESS;
+}
+
+// Another node-first predicate, real 0x16f4b0 is the same (int node, int *out)
+// shape as GetNodePresent2 — w0=node, x1=out. Orientation IS tracked for
+// every node we report poses for.
+static uint64_t klovrp_GetNodeOrientationTracked2(int node, int *out) {
+    ovrp_hit("ovrp_GetNodeOrientationTracked2");
+    (void)node;
+    if (out) *out = 1;
+    return OVRP_SUCCESS;
+}
+
+// The real plugin never fills this one at all — 0x1706d0 NULL-checks its out,
+// then returns -1004 (unsupported) with *out untouched. We answer SUCCESS with
+// a nominal 20 C instead: there is no temperature reading here, but an error
+// return is only safely handled if the guest happens to tolerate it, and a
+// plausible static nominal is harmless telemetry either way (leaving *out
+// untouched would read as 0 C, a value nobody sent).
+static uint64_t klovrp_GetSystemBatteryTemperature2(int *out) {
+    ovrp_hit("ovrp_GetSystemBatteryTemperature2");
+    if (!out) return -1001;
+    *out = 20;   // nominal °C — no temperature sensor is presented
+    return OVRP_SUCCESS;
+}
+
+// Battery level, through the kl_ovrp_battery_level seam so this cannot drift
+// from what the Java BatteryManager answers or from what a visionOS frontend
+// pushes off UIDevice. The real plugin's 2-form is another never-writing stub
+// (0x1706a0 returns -1004); we answer success with the shared level instead.
+static uint64_t klovrp_GetSystemBatteryLevel2(int *out) {
+    ovrp_hit("ovrp_GetSystemBatteryLevel2");
+    if (!out) return -1001;
+    *out = kl_ovrp_battery_level();
+    return OVRP_SUCCESS;
+}
+
+// No power-saving mode is active. Real plugin is ovrpResult + int* out
+// (0x1703f0).
+static uint64_t klovrp_GetSystemPowerSavingMode2(int *out) {
+    ovrp_hit("ovrp_GetSystemPowerSavingMode2");
+    if (out) *out = 0;
+    return OVRP_SUCCESS;
+}
+
+// Recenter is an event that must never fire on a healthy run, and no frontend
+// has asked for one — the un-suffixed form answers 0 and this 2-form is the
+// ovrpResult + int* out version of the same refusal (real 0x1708e0).
+static uint64_t klovrp_GetAppShouldRecenter2(int *out) {
+    ovrp_hit("ovrp_GetAppShouldRecenter2");
+    if (out) *out = 0;
+    return OVRP_SUCCESS;
+}
+
+// The time (seconds, monotonic) the guest is told the next frame will be shown,
+// for its timewarp pose prediction. Real signature (0x171fd0) is
+// ovrpResult + double* out — s0 is NOT the return, the value goes through the
+// pointer. Answered through the predicted-display-time seam, which a visionOS
+// frontend keeps in sync with the drawable presentation time.
+static uint64_t klovrp_GetPredictedDisplayTime(int node, double *out) {
+    ovrp_hit("ovrp_GetPredictedDisplayTime");
+    (void)node;
+    if (!out) return -1001;
+    *out = kl_ovrp_predicted_display_time();
+    return OVRP_SUCCESS;
+}
+
 // libunity's OculusVRDevice::Initialize calls this for the product name and,
 // if the return is non-NULL, strlens and hashes it (guest code at 0x9bb538 —
 // NULL is explicitly tolerated). A static string is therefore both safe and
@@ -191,6 +335,17 @@ static uint64_t klovrp_GetSystemHeadsetType(void) {
 static const char *klovrp_GetSystemProductName(void) {
     ovrp_hit("ovrp_GetSystemProductName");
     return "Oculus Quest 2";
+}
+
+// The 2-form of the same answer: ovrpResult + const char** out — real
+// 0x170700 writes the string POINTER through [out], it is not a scalar
+// return. Same "Oculus Quest 2" as the un-suffixed form; the two product-
+// name surfaces must never disagree, and a static literal is never freed.
+static uint64_t klovrp_GetSystemProductName2(const char **out) {
+    ovrp_hit("ovrp_GetSystemProductName2");
+    if (!out) return -1001;
+    *out = "Oculus Quest 2";
+    return OVRP_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +398,55 @@ float kl_ovrp_display_frequency(void) {
         }
     }
     return g_display_hz;
+}
+
+// ---- battery telemetry seam ----
+// One source of truth for the battery, routed through by the OVRPlugin query
+// (GetSystemBatteryLevel2), the Java BatteryManager answer (kl_jni.c), and —
+// on device — a frontend pushing UIDevice's real reading. Sanity checks mirror
+// the display-frequency setter: a level outside 0..100 is a bad measurement,
+// and passing it on would make every consumer answer nonsense.
+static int g_battery_level = 95;       // Quest-2 fiction, like the display: 72 Hz
+static int g_battery_charging;
+
+void kl_ovrp_set_battery_level(int level) {
+    g_battery_level = level < 0 ? 0 : (level > 100 ? 100 : level);
+}
+int kl_ovrp_battery_level(void) {
+    static int checked;
+    if (!checked) {
+        checked = 1;
+        const char *e = getenv("KL_BATTERY_LEVEL");
+        if (e && *e) kl_ovrp_set_battery_level(atoi(e));
+    }
+    return g_battery_level;
+}
+void kl_ovrp_set_battery_charging(int charging) { g_battery_charging = !!charging; }
+int kl_ovrp_battery_charging(void) {
+    static int checked;
+    if (!checked) {
+        checked = 1;
+        const char *e = getenv("KL_BATTERY_CHARGING");
+        if (e && *e) g_battery_charging = atoi(e) != 0;
+    }
+    return g_battery_charging;
+}
+
+// ---- predicted display time seam ----
+// 0 means "nothing pushed; answer the monotonic present". A visionOS frontend
+// overwrites it with the real drawable presentation time, and the guest's
+// timewarp then predicts the pose using a timestamp that matches when the
+// frame actually scans out. Sanity window: a presentation time within 0..1e9 s
+// is a plausible timestamp, anything else is a bad measurement and discarded.
+static double g_predicted_display;
+void kl_ovrp_set_predicted_display_time(double t) {
+    if (t > 0.0 && t < 1e9) g_predicted_display = t;
+}
+double kl_ovrp_predicted_display_time(void) {
+    if (g_predicted_display > 0.0) return g_predicted_display;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
 static float klovrp_GetSystemDisplayFrequency(void) {
@@ -987,8 +1191,7 @@ int kl_ovrp_stage_count(void) {
 // our own counter is what the ring is indexed by, so a guest that numbers
 // frames differently — or restarts them — cannot desynchronise the ring from
 // the records in it.
-static uint64_t klovrp_BeginFrame(int guest_frame_index) {
-    ovrp_hit("ovrp_BeginFrame");
+static uint64_t klovrp_begin_frame_impl(int guest_frame_index) {
     // The RENDER step's sample — the pose the guest was handed for this frame
     // and rendered every eye from. Not a fresh read: a fresh read at this
     // moment is a pose the picture was never drawn with, and reprojection
@@ -1021,6 +1224,27 @@ static uint64_t klovrp_BeginFrame(int guest_frame_index) {
     // one drew nothing, and that answer is indistinguishable from a right one.
     kl_glfb_begin_render_window();
     return OVRP_SUCCESS;
+}
+
+// The two named entry points over the core above. They exist separately only
+// because the work-list report counts by the name a call actually hit — a
+// single shared pointer would label every ovrp_BeginFrame4 as the un-numbered
+// form. The work is identical either way and neither carries an out-param.
+static uint64_t klovrp_BeginFrame(int guest_frame_index) {
+    ovrp_hit("ovrp_BeginFrame");
+    return klovrp_begin_frame_impl(guest_frame_index);
+}
+
+// The 1.40 wrapper's frame-begin (real 0x16ec80). Same job, plus a second
+// argument the real plugin only forwards to the runtime (x1 -> internal x3);
+// nothing about the frame record depends on it, so it is named and dropped.
+// On success the real one also pokes a global "a frame is in flight" byte;
+// our record rings already express that, and answering ovrpSuccess is all any
+// caller reads.
+static uint64_t klovrp_BeginFrame4(int guest_frame_index, uint64_t extra) {
+    ovrp_hit("ovrp_BeginFrame4");
+    (void)extra;
+    return klovrp_begin_frame_impl(guest_frame_index);
 }
 
 // The guest has finished submitting this frame's eyes. Only now is the stage
@@ -1554,6 +1778,47 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     f[7]  = p->vx;  f[8]  = p->vy;  f[9]  = p->vz;
     f[13] = p->avx; f[14] = p->avy; f[15] = p->avz;
     return OVRP_SUCCESS;
+}
+
+// The 1.40 wrapper's pose query — ovrp_GetNodePoseState3. This is NOT a
+// renamed alias of the un-numbered form: the real plugin (0x16f680) reads its
+// out pointer from x3, and the wrapper (OculusSystem::GetNodePoseState, a
+// MEMBER function, this in x0) hard-codes w0 = -1 before the call — its own
+// args land in w1/w2/x3 and its body never forwards them. So the entry has
+// four arguments and cannot share the sret x8 capture of the un-numbered
+// shape. The 0x58-byte struct it copies is the SAME layout
+// klovrp_GetNodePoseState_impl writes; w0=-1 is "the most recent step",
+// which klovrp_step_ix maps to the non-render buffer and falls back to the
+// live pose { klovrp_head } if never sampled, so -1 is safe. w2 is the NODE
+// under the member-fn layout (w1=step, w2=node, x3=out) and the first-call
+// log prints all three data args so a run settles that mapping.
+static uint64_t klovrp_GetNodePoseState3(int a, int b, int c, void *out) {
+    ovrp_hit("ovrp_GetNodePoseState3");
+    if (!out) return -1001;
+    {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "  [ovrp] GetNodePoseState3 first call: "
+                            "w0(step)=-1 compiled in, w1=%d, w2=%d (candidate node)\n",
+                    b, c);
+        }
+    }
+    return klovrp_GetNodePoseState_impl(a, c, out);
+}
+
+// The wait for a frame to be beginable. Real 0x16ec30 is a scalar INT return
+// (the frame index), not ovrpResult + out*: not-init answers -1002, and on
+// success it clamps any negative internal result to 0. Each call issues the
+// NEXT frame id, which the guest feeds to klovrp_BeginFrame, where it is
+// threaded to g_frames.pending_index — the guest's own frame counter, which
+// the record ring is sized to multiplex (see KLOVRP_STAGES_DEFAULT). Nobody
+// actually waits here: with one swapchain there is nothing to block on, and a
+// real wait would only be this call delaying the caller.
+static uint64_t klovrp_WaitToBeginFrame(void) {
+    ovrp_hit("ovrp_WaitToBeginFrame");
+    static uint64_t next;   // first issued id is 1 — the caller's 0 is identity
+    return next++;
 }
 
 // ovrpVector3f by value — a 12-byte HFA, so the floats go home in s0..s2,
@@ -2361,12 +2626,30 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetVersion",   (void *)klovrp_GetVersion},
     {"ovrp_GetVersion2",   (void *)klovrp_GetVersion2},
     {"ovrp_GetSystemHeadsetType", (void *)klovrp_GetSystemHeadsetType},
+    {"ovrp_GetSystemHeadsetType2", (void *)klovrp_GetSystemHeadsetType2},
+    {"ovrp_GetLocalTrackingSpaceRecenterCount",
+     (void *)klovrp_GetLocalTrackingSpaceRecenterCount},
+    {"ovrp_GetFoveationEyeTrackedSupported",
+     (void *)klovrp_GetFoveationEyeTrackedSupported},
+    {"ovrp_GetSystemMultiViewSupported2", (void *)klovrp_GetSystemMultiViewSupported2},
+    {"ovrp_GetBoundaryConfigured2", (void *)klovrp_GetBoundaryConfigured2},
+    {"ovrp_GetAppHasVrFocus2", (void *)klovrp_GetAppHasVrFocus2},
+    {"ovrp_GetUserPresent2", (void *)klovrp_GetUserPresent2},
+    {"ovrp_GetNodePresent2", (void *)klovrp_GetNodePresent2},
+    {"ovrp_GetNodeOrientationTracked2", (void *)klovrp_GetNodeOrientationTracked2},
+    {"ovrp_GetSystemBatteryTemperature2", (void *)klovrp_GetSystemBatteryTemperature2},
+    {"ovrp_GetSystemBatteryLevel2", (void *)klovrp_GetSystemBatteryLevel2},
+    {"ovrp_GetSystemPowerSavingMode2", (void *)klovrp_GetSystemPowerSavingMode2},
+    {"ovrp_GetAppShouldRecenter2", (void *)klovrp_GetAppShouldRecenter2},
+    {"ovrp_GetPredictedDisplayTime", (void *)klovrp_GetPredictedDisplayTime},
     {"ovrp_GetSystemProductName", (void *)klovrp_GetSystemProductName},
+    {"ovrp_GetSystemProductName2", (void *)klovrp_GetSystemProductName2},
     {"ovrp_GetSystemDisplayFrequency", (void *)klovrp_GetSystemDisplayFrequency},
     {"ovrp_GetEyeTextureSize", (void *)klovrp_GetEyeTextureSize},
     {"ovrp_GetEyeTextureStageCount", (void *)klovrp_GetEyeTextureStageCount},
     {"ovrp_GetDesiredEyeTextureFormat", (void *)klovrp_GetDesiredEyeTextureFormat},
     {"ovrp_SetTrackingOriginType", (void *)klovrp_SetTrackingOriginType},
+    {"ovrp_SetTrackingOriginType2", (void *)klovrp_SetTrackingOriginType},
     {"ovrp_GetTrackingOriginType", (void *)klovrp_GetTrackingOriginType},
     {"ovrp_GetNodeFrustum2", (void *)klovrp_GetNodeFrustum2},
     // Real implementations only so that the frame boundary can be *observed* —
@@ -2374,11 +2657,14 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     // timewarp bookkeeping (kl_ovrp.h): the pose the guest is about to render
     // with, latched against the stage that frame draws into.
     {"ovrp_BeginFrame", (void *)klovrp_BeginFrame},
+    {"ovrp_BeginFrame4", (void *)klovrp_BeginFrame4},
     {"ovrp_EndFrame", (void *)klovrp_EndFrame},
     {"ovrp_GetNodePositionTracked2", (void *)klovrp_GetNodePositionTracked2},
     {"ovrp_GetNodePositionValid", (void *)klovrp_GetNodePositionValid},
     {"ovrp_GetNodeOrientationValid", (void *)klovrp_GetNodeOrientationValid},
     {"ovrp_GetNodePoseState", (void *)klovrp_GetNodePoseState_entry},
+    {"ovrp_GetNodePoseState3", (void *)klovrp_GetNodePoseState3},
+    {"ovrp_WaitToBeginFrame", (void *)klovrp_WaitToBeginFrame},
     {"ovrp_GetAppPerfStats", (void *)klovrp_GetAppPerfStats},
     {"ovrp_GetBoundaryDimensions", (void *)klovrp_GetBoundaryDimensions},
     {"ovrp_GetControllerState2", (void *)klovrp_GetControllerState2_entry},
@@ -2419,7 +2705,18 @@ static const char *const g_ovrp_result_ok[] = {
     // Bring-up. This is the decision recorded in PLANNING M6: we answer success
     // and stand behind it, rather than reporting a failure Unity would be right
     // to believe.
-    "ovrp_PreInitialize", "ovrp_Initialize5",
+    // ovrp_PreInitialize3 is the numbered sibling 1.40's libOculusXRPlugin
+    // dlsyms (its own real implementation is a relay to ovrp_PreInitialize5 that
+    // zeroes the three input args and returns ovrpResult 0 on first call, and on
+    // THIS host this is always the first call). Numbered variants are listed
+    // rather than matched by prefix — trap 10's whole shape is a numbered
+    // variant that returns something DIFFERENT under a familiar name.
+    "ovrp_PreInitialize", "ovrp_PreInitialize3", "ovrp_Initialize5",
+    // ovrp_Initialize7 is the ABI revision 1.40's libOculusXRPlugin actually
+    // calls (it resolves 5, 6 and 7 and uses the highest by construction — its
+    // own real library is a relay that stacks more args onto a common impl).
+    // Same answer as Initialize5: success, standing behind it.
+    "ovrp_Initialize7",
     // Configuration the guest sets and never reads back.
     "ovrp_SetAppAsymmetricFov",
     // Called with an out-pointer (void**) it may write; libunity pre-zeroes
@@ -2449,9 +2746,19 @@ static const char *const g_ovrp_result_ok[] = {
     "ovrp_SetSystemCpuLevel", "ovrp_SetSystemGpuLevel",
     // Color-space hints from the C# side; recorded state, like the setters.
     "ovrp_SetClientColorDesc",
+    // Layer teardown the guest issues on reconfigure/shutdown (likely paired
+    // with a layer it never explicitly created on this path — nothing in the
+    // guest aborted on a setup call, so no layer state is tracked here to
+    // contradict). Real 0x16e400 takes the layer id in w0 and clamps any
+    // negative result to 0. Scalar, no out-param.
+    "ovrp_DestroyLayer",
     // Audio device ids — PC-legacy queries; NULL until the guest proves it
-    // dereferences the answer.
+    // dereferences the answer. The ...2 forms are scalar int returns (the real
+    // 0x16db20 NULL-checks its first arg and clamps a negative getter result
+    // to 0), so answering 0 is exactly what they do when no Android audio
+    // device exists — and our output is CoreAudio, not an Android device.
     "ovrp_GetAudioOutId", "ovrp_GetAudioInId", "ovrp_GetDisplayAdapterId",
+    "ovrp_GetAudioOutId2", "ovrp_GetAudioInId2", "ovrp_GetDisplayAdapterId2",
     // Managed-side Media facade init + MRC configuration; ovrpResult/void.
     "ovrp_Media_Initialize", "ovrp_Media_SetMrcAudioSampleRate",
     "ovrp_Media_SetMrcInputVideoBufferType", "ovrp_Media_GetMrcInputVideoBufferType",
@@ -2492,7 +2799,9 @@ static const char *const g_ovrp_bool_yes[] = {
     // suffixes mark ABI revisions, and trap 10's whole shape is a numbered
     // variant that returns something DIFFERENT under a familiar name.
     "ovrp_SetupDistortionWindow", "ovrp_SetupDistortionWindow3",
-    "ovrp_SetupDisplayObjects",
+    "ovrp_SetupDisplayObjects", "ovrp_SetupDisplayObjects2",
+    // ...and the teardown mirror, same lifecycle, same ignored return.
+    "ovrp_DestroyDistortionWindow", "ovrp_DestroyDistortionWindow2",
 };
 
 static const char *const g_ovrp_bool_no[] = {
