@@ -212,8 +212,22 @@ int kl_viewmtl_start(void *metal_layer) {
     g_queue = [g_dev newCommandQueue];
     g_event = [g_dev newSharedEvent];
     if (!g_queue || !g_event) {
-        fprintf(stderr, "  [vmtl] no command queue / shared event on %s\n",
-                g_dev.name.UTF8String);
+        // WHICH of the two, and only once: this is retried every frame until it
+        // takes, so an unnamed failure is a thousand identical lines that say
+        // the compositor is down and not what is down about it.
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [vmtl] %s on %s — the hardware compositor cannot "
+                            "start, so the window stays black\n",
+                    !g_queue && !g_event ? "no command queue and no shared event"
+                    : !g_queue          ? "newCommandQueue returned nil"
+                                        : "newSharedEvent returned nil",
+                    g_dev.name.UTF8String);
+        }
+        // Not half-started: a queue kept across a failed retry is a queue
+        // leaked per frame.
+        g_queue = nil; g_event = nil;
         return 0;
     }
 

@@ -274,11 +274,18 @@ static const char kl_msl_blit[] =
 "    o.uv  = float2(p.x, p.y);\n"
 "    return o;\n"
 "}\n"
+// Opaque, exactly as kl_eye_sample is, and not for tidiness: an eye layer is
+// composited opaque by the runtime, so a guest has no reason to author alpha —
+// Beat Saber 1.40 leaves 0 across the whole eye texture. Sampling that straight
+// into a drawable hands the window server a fully transparent frame over a
+// correct picture, which is the same failure as a black one and looks identical
+// from inside. The A/B for "is the alpha the problem" is the reprojection path,
+// which has forced 1.0 since it was written.
 "fragment float4 kl_blit_f(VOut in [[stage_in]],\n"
 "                          texture2d_array<float> tex [[texture(0)]],\n"
 "                          sampler samp [[sampler(0)]],\n"
 "                          constant uint &slice [[buffer(0)]]) {\n"
-"    return tex.sample(samp, in.uv, slice);\n"
+"    return float4(tex.sample(samp, in.uv, slice).rgb, 1.0);\n"
 "}\n";
 
 const char *kl_reproject_msl(void)      { return kl_msl_reproject; }

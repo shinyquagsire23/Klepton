@@ -216,6 +216,43 @@ static uint8_t tone8(float c) {
     return (uint8_t)(powf(c, 1.0f / 2.2f) * 255.0f + 0.5f);
 }
 
+// ...and the format has to be the TEXTURE's, for the same reason. SL-19 taught
+// the provider to allocate whatever internalformat the guest asked for; both
+// readbacks below went on decoding every eye as RGBA16F. A 1.40 eye is
+// R8G8B8A8_sRGB, so eight bytes were read where four exist: the picture landed
+// in the left third of the image, magenta, with the rest of the row read out of
+// the next one — indistinguishable from a broken interop, and it WAS the
+// instrument. An instrument that cannot say which format it is looking at can
+// only agree with itself.
+//
+// The rule matches kl_glfb's capture exactly, which is the whole point of these
+// numbers: a float target is tone-mapped to 8 bits (klfb_dbg_tone), an 8-bit
+// target is read as-is, and "lit" is the sum of three channels above 12.
+static int klmtl_read_format(MTLPixelFormat pf, size_t *bpp, int *is_half) {
+    switch (pf) {
+    case MTLPixelFormatRGBA16Float:     *bpp = 8; *is_half = 1; return 1;
+    case MTLPixelFormatRGBA8Unorm_sRGB:
+    case MTLPixelFormatRGBA8Unorm:      *bpp = 4; *is_half = 0; return 1;
+    default:                            return 0;
+    }
+}
+
+// One channel of pixel x, in the capture's 8-bit domain.
+static uint8_t klmtl_chan8(const void *row, size_t x, int k, int is_half) {
+    if (!is_half) return ((const uint8_t *)row)[x * 4 + k];
+    uint16_t hb = ((const uint16_t *)row)[x * 4 + k];
+    int sgn = (hb >> 15) & 1, ex = (hb >> 10) & 0x1f, mant = hb & 0x3ff;
+    float v;
+    if (ex == 0)       v = (float)mant * (1.f / 16777216.f);
+    else if (ex == 31) v = 65504.f;
+    else {
+        union { uint32_t u; float f; } u;
+        u.u = (uint32_t)((ex - 15 + 127) << 23) | (uint32_t)(mant << 13);
+        v = u.f;
+    }
+    return tone8(sgn ? -v : v);
+}
+
 static unsigned long long g_mtl_lum_sum;
 static unsigned long long g_mtl_lum_n;
 
@@ -236,9 +273,16 @@ unsigned long kl_mtl_count_lit(int eye, int stage, int *out_w, int *out_h) {
         fprintf(stderr, "  [mtl] texture is not MTLStorageModeShared — cannot getBytes\n");
         return 0;
     }
+    size_t bpp = 0; int is_half = 0;
+    if (!klmtl_read_format(t.pixelFormat, &bpp, &is_half)) {
+        fprintf(stderr, "  [mtl] eye texture is MTLPixelFormat %u, which this "
+                        "readback cannot decode — no count rather than a wrong "
+                        "one\n", (unsigned)t.pixelFormat);
+        return 0;
+    }
     const NSUInteger step = 8;                 // every 8th row and column
-    size_t row_bytes = w * 8;                  // RGBA16F
-    uint16_t *row = malloc(row_bytes);
+    size_t row_bytes = w * bpp;
+    void *row = malloc(row_bytes);
     if (!row) return 0;
     unsigned long lit = 0;
     for (NSUInteger y = 0; y < h; y += step) {
@@ -246,19 +290,8 @@ unsigned long kl_mtl_count_lit(int eye, int stage, int *out_w, int *out_h) {
          fromRegion:MTLRegionMake2D(0, y, w, 1) mipmapLevel:0 slice:(NSUInteger)slice];
         for (NSUInteger x = 0; x < w; x += step) {
             unsigned lum = 0;
-            for (int k = 0; k < 3; k++) {           // half -> float -> the capture's 8-bit
-                uint16_t hb = row[x * 4 + k];
-                int sgn = (hb >> 15) & 1, ex = (hb >> 10) & 0x1f, mant = hb & 0x3ff;
-                float v;
-                if (ex == 0)       v = (float)mant * (1.f / 16777216.f);
-                else if (ex == 31) v = 65504.f;
-                else {
-                    union { uint32_t u; float f; } u;
-                    u.u = (uint32_t)((ex - 15 + 127) << 23) | (uint32_t)(mant << 13);
-                    v = u.f;
-                }
-                lum += tone8(sgn ? -v : v);
-            }
+            for (int k = 0; k < 3; k++)
+                lum += klmtl_chan8(row, x, k, is_half);
             g_mtl_lum_sum += lum;
             g_mtl_lum_n++;
             if (lum > 12) lit++;                    // kl_glfb's own threshold
@@ -279,8 +312,10 @@ int kl_mtl_dump_png(int eye, int stage, const char *path) {
     id<MTLTexture> t = (__bridge id<MTLTexture>)texp;
     if (t.storageMode != MTLStorageModeShared) return 0;
     int32_t w = (int32_t)t.width, h = (int32_t)t.height;
-    size_t row_bytes = (size_t)w * 8;
-    uint16_t *row = malloc(row_bytes);
+    size_t bpp = 0; int is_half = 0;
+    if (!klmtl_read_format(t.pixelFormat, &bpp, &is_half)) return 0;
+    size_t row_bytes = (size_t)w * bpp;
+    void *row = malloc(row_bytes);
     size_t stride = (size_t)w * 4, raw_n = (stride + 1) * (size_t)h;
     uint8_t *raw = malloc(raw_n);
     if (!row || !raw) { free(row); free(raw); return 0; }
@@ -296,19 +331,8 @@ int kl_mtl_dump_png(int eye, int stage, const char *path) {
         uint8_t *o = raw + (stride + 1) * (size_t)(h - 1 - y);
         *o++ = 0;                                  // PNG filter: none
         for (int32_t x = 0; x < w; x++) {
-            for (int k = 0; k < 3; k++) {
-                uint16_t hb = row[x * 4 + k];
-                int sgn = (hb >> 15) & 1, ex = (hb >> 10) & 0x1f, mant = hb & 0x3ff;
-                float v;
-                if (ex == 0)       v = (float)mant * (1.f / 16777216.f);
-                else if (ex == 31) v = 65504.f;
-                else {
-                    union { uint32_t u; float f; } u;
-                    u.u = (uint32_t)((ex - 15 + 127) << 23) | (uint32_t)(mant << 13);
-                    v = u.f;
-                }
-                o[x * 4 + k] = tone8(sgn ? -v : v);
-            }
+            for (int k = 0; k < 3; k++)
+                o[x * 4 + k] = klmtl_chan8(row, (size_t)x, k, is_half);
             o[x * 4 + 3] = 255;
         }
     }

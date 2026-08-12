@@ -1479,6 +1479,7 @@ static int  klfb_stage_of_tex(uint32_t tex);
 static int  klfb_stage_of_fbo(uint32_t fbo);
 static void klfb_map_fbo(uint32_t fbo, uint32_t tex);
 static void klfb_note_render_stage(int stage);
+static void klfb_note_eye_fbo(uint32_t fbo, uint32_t touched);
 static uint32_t g_draw_fb;
 
 // Is this target a DRAW binding? GL_FRAMEBUFFER binds both.
@@ -1511,7 +1512,13 @@ static void klfb_FramebufferTexture2D(uint32_t target, uint32_t attachment,
         klfb_map_fbo(g_draw_fb, texture);
         // Unity may attach per frame rather than bind a pre-built FBO, so the
         // attachment itself has to count as committing to a stage.
-        klfb_note_render_stage(klfb_stage_of_tex(texture));
+        // The capture's hint, and it is taken HERE and not at the bind above:
+        // this call carries the texture, where a bind only carries an FBO name
+        // whose attachment we have to look up in a map that a re-created
+        // swapchain has already made a liar (klfb_note_eye_fbo).
+        int st = klfb_stage_of_tex(texture);
+        klfb_note_eye_fbo(st >= 0 ? g_draw_fb : 0, g_draw_fb);
+        klfb_note_render_stage(st);
     }
     if (g_real_FramebufferTexture2D)
         g_real_FramebufferTexture2D(target, attachment, textarget, texture, level);
@@ -1831,6 +1838,28 @@ int kl_glfb_render_stages(uint32_t *mask, uint32_t *binds, uint64_t *tid) {
 uint64_t kl_glfb_stage_draw_count(int stage) {
     if ((unsigned)stage >= KLFB_MAX_STAGES) return 0;
     return __atomic_load_n(&g_stage_binds[stage], __ATOMIC_RELAXED);
+}
+
+// The framebuffer the guest ITSELF last drove with an eye texture attached —
+// and the reason the capture cannot just scan for one.
+//
+// A guest that re-creates its eye swapchain (1.40 does, 2290x2400 ->
+// 2748x2880) deletes the old textures, and GL reissues the very same names to
+// the new ones. Framebuffers the guest built for the old generation and then
+// abandoned still REPORT one of those names as their colour attachment, so a
+// scan matching on name finds a stale FBO first, reads the orphaned storage,
+// and prints "0 lit" on a run whose eye textures are full — with the eye
+// plainly attached and the size plainly right. Recency is what tells the two
+// apart, and only the guest's own calls carry it.
+static uint32_t g_last_eye_fbo;
+
+// `fbo` is the framebuffer that now holds an eye texture, or 0 if `touched` no
+// longer does — a guest that re-points the same FBO at something else must not
+// leave the hint asserting otherwise.
+static void klfb_note_eye_fbo(uint32_t fbo, uint32_t touched) {
+    if (fbo) __atomic_store_n(&g_last_eye_fbo, fbo, __ATOMIC_RELAXED);
+    else if (__atomic_load_n(&g_last_eye_fbo, __ATOMIC_RELAXED) == touched)
+        __atomic_store_n(&g_last_eye_fbo, 0, __ATOMIC_RELAXED);
 }
 
 // Called from both thunks: a stage is now the draw target. Reported once, so a
@@ -2235,6 +2264,14 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
     g_eye_mtl[eye][stage].gl_tex = gl_tex;
     g_eye_mtl[eye][stage].w      = w;
     g_eye_mtl[eye][stage].h      = h;
+    // ...and record the storage, exactly as the glTexStorage2D thunk would have
+    // if this texture had got ordinary GL storage. Nothing else can: an
+    // EGLImage-backed texture never passes through that thunk, and ES 3.0 has
+    // no glGetTexLevelParameteriv to ask with. Without it the capture finds the
+    // eye FBO by attachment and then reads it at the PBUFFER's size, which on
+    // this host is 4000x3200 against a 2748x2880 eye — a black PNG on the one
+    // path that has the picture, with the eye plainly attached.
+    klfb_note_tex_storage(gl_tex, internal_fmt, w, h);
     // Foveation, if a map is in force AND it was built for this size. Before the
     // guest renders into this texture, not after: ANGLE caches a framebuffer's
     // render pass descriptor and only rebuilds it on a GL state sync, so a map
@@ -4795,6 +4832,37 @@ static uint32_t klfb_read_from_texture(uint32_t tex) {
     return probe_fb;
 }
 
+// Is `fb` complete, and is its colour attachment one of the eye textures? The
+// answer is the FBO itself (0 for no), and on a hit the eye's own size, which
+// is not the pbuffer's — reading a 2748x2880 eye at the pbuffer's 4000x3200 is
+// an out-of-bounds read that comes back black.
+static uint32_t klfb_eye_fbo_take(uint32_t fb, int32_t *w, int32_t *h) {
+    static uint32_t (*r_CheckFramebufferStatus)(uint32_t);
+    static void (*r_BindFramebuffer)(uint32_t, uint32_t);
+    static void (*r_GetFbAttachmentParam)(uint32_t, uint32_t, uint32_t, int32_t *);
+    if (!r_CheckFramebufferStatus) {
+        r_CheckFramebufferStatus = asym("glCheckFramebufferStatus");
+        r_BindFramebuffer = asym("glBindFramebuffer");
+        r_GetFbAttachmentParam = asym("glGetFramebufferAttachmentParameteriv");
+    }
+    if (!r_CheckFramebufferStatus || !r_BindFramebuffer || !r_GetFbAttachmentParam)
+        return 0;
+    r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, fb);
+    if (r_CheckFramebufferStatus(0x8CA8) != 0x8CD5) return 0;
+    int32_t otype = 0, oname = 0;
+    r_GetFbAttachmentParam(0x8CA8, 0x8CE0, 0x8CD0, &otype);
+    r_GetFbAttachmentParam(0x8CA8, 0x8CE0, 0x8CD1, &oname);
+    if (otype != 0x1702 /* TEXTURE */ ||
+        ((uint32_t)oname != g_eye_tex[0] && (uint32_t)oname != g_eye_tex[1]))
+        return 0;
+    int32_t tw = 0, th = 0;
+    if (klfb_tex_info((uint32_t)oname, NULL, &tw, &th) && tw > 0 && th > 0) {
+        if (w) *w = tw;
+        if (h) *h = th;
+    }
+    return fb;
+}
+
 static unsigned glfb_capture_now(const char *dir) {
     if (!g_ready || !a_glReadPixels) return 0;
     if (a_glFinish) a_glFinish();
@@ -4830,23 +4898,12 @@ static unsigned glfb_capture_now(const char *dir) {
     int32_t src_w = g_w, src_h = g_h;
     if ((g_eye_tex[0] || g_eye_tex[1]) && a_BindFramebuffer &&
         a_GetFbAttachmentParam && a_glCheckFramebufferStatus) {
-        for (uint32_t i = 1; i <= g_fbomax && !src_fb; i++) {
-            a_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, i);
-            if (a_glCheckFramebufferStatus(0x8CA8) != 0x8CD5) continue;
-            int32_t otype = 0, oname = 0;
-            a_GetFbAttachmentParam(0x8CA8, 0x8CE0, 0x8CD0, &otype);
-            a_GetFbAttachmentParam(0x8CA8, 0x8CE0, 0x8CD1, &oname);
-            if (otype == 0x1702 /* TEXTURE */ &&
-                ((uint32_t)oname == g_eye_tex[0] ||
-                 (uint32_t)oname == g_eye_tex[1])) {
-                src_fb = i;
-                int32_t tw = 0, th = 0;
-                if (klfb_tex_info((uint32_t)oname, NULL, &tw, &th) && tw > 0 && th > 0) {
-                    src_w = tw;
-                    src_h = th;
-                }
-            }
-        }
+        // The guest's own answer first (g_last_eye_fbo): the scan matches on
+        // texture NAME, and a name outlives the object it was issued for.
+        uint32_t hint = __atomic_load_n(&g_last_eye_fbo, __ATOMIC_RELAXED);
+        if (hint) src_fb = klfb_eye_fbo_take(hint, &src_w, &src_h);
+        for (uint32_t i = 1; i <= g_fbomax && !src_fb; i++)
+            src_fb = klfb_eye_fbo_take(i, &src_w, &src_h);
         if (!src_fb) {
             // No framebuffer of the guest's has it attached any more — the
             // OpenXR case above. Read the named image directly rather than
@@ -4948,6 +5005,17 @@ static unsigned glfb_capture_now(const char *dir) {
         free(rbuf);
     } else {
         a_glReadPixels(0, 0, src_w, src_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        // OPAQUE, like the float path two branches up — and for the same
+        // reason: this file is a PICTURE, not a copy of the buffer. An eye
+        // layer is composited opaque by the runtime, so the guest has no reason
+        // to author alpha and Beat Saber 1.40 writes 0 everywhere. Passing that
+        // through wrote a fully transparent PNG over a correct RGB frame, which
+        // every image viewer then showed as its own background — "mostly black"
+        // or blank white, depending on the viewer, with the pixels right there.
+        // The float path has always forced 255 and 1.28's eyes were RGBA16F, so
+        // the difference arrived with the first 8-bit eye texture.
+        for (size_t i = 0; i < (size_t)src_w * (size_t)src_h; i++)
+            px[i * 4 + 3] = 255;
     }
     // The error could be the readback's own or one the guest left behind —
     // report both rather than blame the readback. Reading the pre-existing one

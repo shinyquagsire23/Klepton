@@ -3177,26 +3177,30 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
                             "format mismatch here is a silent black frame\n",
                     l->desc.format, glfmt);
         }
+        // P5: the storage IS a compositor MTLTexture when one is on offer,
+        // exactly as in klovrp_SetupEyeTexture2. Which of the two storages the
+        // name got is a branch INSIDE the creation, not a second way out of
+        // this function: the write to *color below is the whole point of the
+        // call, and an early return that skipped it handed the guest its own
+        // uninitialised stack slot as a texture name — a garbage attachment,
+        // GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT, and an eye texture nothing ever
+        // rendered into, on the P5 path only — so every host run without a
+        // provider was correct and it read as a compositor bug.
+        int mtl_backed = 0;
         if (l->is_eye) {
             kl_glfb_note_eye_texture(eye, stage, name);
-            // P5: the storage IS a compositor MTLTexture when one is on offer,
-            // exactly as in klovrp_SetupEyeTexture2.
-            if (kl_glfb_has_mtl_provider() &&
-                kl_glfb_bind_eye_mtl_texture(eye, stage, name, w, h, glfmt)) {
-                fprintf(stderr, "  [ovrp] GetLayerTexture2: eye %d stage %d = GL %u "
-                                "(MTLTexture-backed, %dx%d %s)\n",
-                        eye, stage, name, w, h, fname ? fname : "?");
-                return OVRP_SUCCESS;
-            }
+            mtl_backed = kl_glfb_has_mtl_provider() &&
+                         kl_glfb_bind_eye_mtl_texture(eye, stage, name, w, h, glfmt);
         }
-        if (gl_BindTexture && gl_TexStorage2D) {
+        if (!mtl_backed && gl_BindTexture && gl_TexStorage2D) {
             gl_BindTexture(0x0DE1 /* GL_TEXTURE_2D */, name);
             gl_TexStorage2D(0x0DE1, 1, glfmt, w, h);
         }
         fprintf(stderr, "  [ovrp] GetLayerTexture2: %s %d stage %d = GL %u "
-                        "(%dx%d %s / GL %#x)\n",
+                        "(%dx%d %s / GL %#x%s)\n",
                 l->is_eye ? "eye" : "dummy layer", eye, stage, name, w, h,
-                fname ? fname : "?", glfmt);
+                fname ? fname : "?", glfmt,
+                mtl_backed ? ", MTLTexture-backed" : "");
     }
     *color = *slot;
     return OVRP_SUCCESS;
