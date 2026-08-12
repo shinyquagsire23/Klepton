@@ -1353,6 +1353,18 @@ Read by the scripts themselves, never forwarded to the app.
   them; `KL_STAGE=1` — always stage, whatever the stamp says. The 2.2 GB
   upload is a ~20 s loop vs a ~20 min one; a reinstall rotates the data
   container, which is what the stamp guards against.
+- `KL_OBB_DIR=<dir>` — where `stage_assets.sh` finds the guest's OBB, default
+  `~/Library/Application Support/Klepton/userdata/<guest>/obb` — the same
+  directory a host run reads it from, since it is guest userdata and not part
+  of the repo. A **split application binary** guest keeps its data there rather
+  than in the APK (Beat Saber 1.40: a 53 MB APK beside a 1.3 GB
+  `main.1716.com.beatgames.beatsaber.obb`), and the guest finds it through
+  `getObbDirs()` -> `<files>/obb`, which on device is
+  `<container>/android-files/obb`. Present-or-absent: 1.28 and Steam Link have
+  none and nothing is staged for them.
+- `KL_SKIP_OBB=1` — stage everything except the OBB. It is the largest single
+  file by far and it changes only with the APK, so this is the knob for the
+  second upload onward.
 - `KL_LOG_OUT=<file>` — where the pulled log lands (device runs default
   `/tmp/klepton-device.log`; `build_run_slink.sh` uses it too, default
   `/tmp/slink.log`).

@@ -32,6 +32,23 @@ TREE="$KLT_TREE"
 [ -d "$ASSETS" ] || { echo "!! $ASSETS missing"; exit 1; }
 [ -f "$APK" ]    || { echo "!! $APK missing"; exit 1; }
 
+# The OBB, for a SPLIT APPLICATION BINARY guest. Beat Saber 1.40 is one: the APK
+# is 53 MB of code and the game's data ships beside it in
+# main.<versionCode>.<package>.obb, which the guest finds through getObbDirs()
+# -> <files>/obb (kl_jni.c, and the version code names the file, so a stale one
+# reads as missing game data). 1.28 has no OBB and neither does Steam Link, so
+# this is present-or-absent rather than required.
+#
+# It does NOT live in the repo — it is guest userdata, so it comes from the same
+# directory a host run reads it from, and lands in <container>/android-files/obb,
+# which is what kl_app.c hands kl_jni_set_files_dir. KL_OBB_DIR points elsewhere;
+# KL_SKIP_OBB=1 leaves it alone, which is what you want on the second upload of
+# a 1.3 GB file that has not changed.
+OBB="${KL_OBB_DIR:-$HOME/Library/Application Support/Klepton/userdata/$KLT_NAME/obb}"
+if [ "${KL_SKIP_OBB:-0}" = 1 ] || ! compgen -G "$OBB/*.obb" > /dev/null 2>&1; then
+  OBB=""
+fi
+
 TARGET="${1:-}"
 
 if [ -z "$TARGET" ]; then
@@ -47,6 +64,11 @@ if [ -z "$TARGET" ]; then
   # and a link would work here but hide a real failure on device.
   cp -R "$ASSETS" "$DEST/$TREE/assets"
   cp "$APK" "$DEST/$KLT_APK"
+  if [ -n "$OBB" ]; then
+    rm -rf "$DEST/android-files/obb"
+    mkdir -p "$DEST/android-files"
+    cp -R "$OBB" "$DEST/android-files/obb"
+  fi
   if [ -n "$KLT_QTPLUGINS" ]; then
     rm -rf "$DEST/$TREE/qtplugins"
     mkdir -p "$DEST/$TREE/qtplugins"
@@ -59,7 +81,7 @@ fi
 # Beat Saber's 2.2 GB is the reason any of this exists; Steam Link's is 44 MB
 # and takes seconds. Saying which is which up front is the difference between
 # waiting and wondering.
-echo "[stage] device $TARGET, $KLT_NAME ($(du -shc "$ASSETS" "$APK" | tail -1 | cut -f1))"
+echo "[stage] device $TARGET, $KLT_NAME ($(du -shc "$ASSETS" "$APK" ${OBB:+"$OBB"} | tail -1 | cut -f1))"
 copy() {   # <source> <destination-relative-to-container>
   xcrun devicectl device copy to --device "$TARGET" \
     --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
@@ -67,6 +89,9 @@ copy() {   # <source> <destination-relative-to-container>
 }
 copy "$ASSETS" "Documents/$TREE/assets"
 copy "$APK"    "Documents/$KLT_APK"
+# devicectl copies a DIRECTORY as a directory, so the whole obb/ goes across and
+# the destination is its parent's child, not the file's path.
+[ -n "$OBB" ] && copy "$OBB" "Documents/android-files/obb"
 # The Qt plugin .so files, when the target asks for them. They are DATA, not a
 # loader path — see the `qtplugins` note in targets.py: Qt globs this directory
 # and parses each candidate's ELF metadata before it will dlopen it, and the
