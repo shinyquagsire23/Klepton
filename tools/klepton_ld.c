@@ -235,6 +235,59 @@ int main(int argc, char **argv) {
     uint64_t pool_cap  = (uint64_t)x18_sites * KLX_VEN_MAX_INSN * 4;
     uint64_t image_shift = align_up(pool_va + pool_cap, PAGE);
 
+    // ...and then the shift is CHOSEN, not merely made large enough, because a
+    // 4 KB-aligned guest puts the writable bytes less than a host page above
+    // the executable ones.
+    //
+    // Beat Saber 1.40 ships p_align 4096 and four PT_LOADs (r--, r-x, rw-, rw-)
+    // with a 4 KB gap between the last read-only byte and the first writable
+    // one — libmain 0x1f00 -> 0x2f00, libunity 0x130e430 -> 0x130f430. Group
+    // them by writability and __TEXT's end rounds UP through that gap while
+    // __DATA's start rounds DOWN through it, so the two segments overlap and no
+    // amount of extra shift helps: S is added to both, so it moves them
+    // together. What it does move is where the 16 KB boundaries FALL, and
+    // kl_image.c says the same thing from the other side, about the mprotect
+    // version of this collision: "the only general way out is to place the
+    // image so that a host page boundary falls in the GAP between the
+    // executable segment and the writable bytes ... a property of the mapping
+    // rather than of the protections."
+    //
+    // So move the shift until a boundary lands in the gap — in steps of 4 KB,
+    // and that step is the whole subtlety.
+    //
+    // **The shift must stay a multiple of 4096 whatever else it does**, because
+    // `adrp` resolves against a 4 KB page: the linker encoded every
+    // PC-relative reference in this guest as a delta between the 4 KB page of
+    // the instruction and the 4 KB page of its target, and that delta survives
+    // relocation only if the whole image moves by a multiple of 4096. It cost a
+    // run to find out the interesting way: a shift of 0x5100 places the segments
+    // perfectly, produces a byte-faithful copy (one byte differs, the TLS
+    // rewrite), relocates identically to the ELF path — 20 relocations, same
+    // four kinds — and then libmain's JNI_OnLoad reads its own static table
+    // through an adrp/add pair that is now a page out and calls FindClass("").
+    // Nothing about that names the shift.
+    //
+    // Stepping by 4096 through one host page is exhaustive: if no offset in
+    // [0, PAGE) works, no shift does, since the layout repeats mod PAGE.
+    // For a guest aligned to 16 KB or more (1.28 at 64 KB, Steam Link at 16 KB)
+    // the first candidate is the old answer, so nothing about those changes.
+    #define ADRP_PAGE 0x1000ull
+    uint64_t first = image_shift;
+    for (uint64_t try = 0; ; try += ADRP_PAGE) {
+        if (try >= PAGE) {
+            image_shift = first;         // no offset works; let the layout below
+            break;                       // report which gap is too narrow
+        }
+        uint64_t s = first + try, prev_end = 0;
+        int ok = 1;
+        for (int g = 0; g < ngrp && ok; g++) {
+            uint64_t start = (g == 0) ? 0 : align_down(s + grp[g].vlo, PAGE);
+            if (g && start < prev_end) ok = 0;
+            prev_end = align_up(s + grp[g].vhi_mem, PAGE);
+        }
+        if (ok) { image_shift = s; break; }
+    }
+
     uint8_t *pool = NULL;
     if (pool_cap) { pool = calloc(1, (size_t)pool_cap); if (!pool) die("out of memory"); }
 
@@ -289,8 +342,15 @@ int main(int argc, char **argv) {
         uint64_t want = image_shift + grp[g].vlo;
         seg_vm[g] = (g == 0) ? 0 : align_down(want, PAGE);
         if (g && seg_vm[g] < seg_vmend[g - 1])
-            die("segment %d would overlap the previous one (image shift %#llx is "
-                "too small for this library's layout)", g, (unsigned long long)image_shift);
+            // The shift above places a page boundary at the FIRST writable
+            // group, which settles every library in this corpus. A third group
+            // that needs one too cannot have it — one shift, one boundary — so
+            // say which gap is too narrow rather than blaming the shift.
+            die("segment %d starts %#llx after the previous one ends, which is "
+                "less than the %#llx host page: no image shift can put a page "
+                "boundary between them", g,
+                (unsigned long long)(grp[g].vlo - grp[g - 1].vhi_mem),
+                (unsigned long long)PAGE);
         seg_vmend[g] = align_up(image_shift + grp[g].vhi_mem, PAGE);
     }
     // Make them gapless: each segment runs up to the next one's start.
@@ -398,7 +458,13 @@ int main(int argc, char **argv) {
         sec->addr = image_shift + grp[0].vlo;
         sec->size = grp[0].vhi_file - grp[0].vlo;
         sec->offset = (uint32_t)(seg_foff[0] + (sec->addr - seg_vm[0]));
-        sec->align = 14;                       // 16 KB
+        // What the address IS, not what it used to be: the shift is chosen to
+        // put a page boundary at the writable group, so on a 4 KB-aligned guest
+        // this section is no longer 16 KB aligned and claiming 14 would be a
+        // field that disagrees with the addr beside it.
+        sec->align = 0;
+        for (uint64_t a = sec->addr; a && !(a & 1) && sec->align < 14; a >>= 1)
+            sec->align++;
         sec->flags = S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
         lc += sz_text;
     }

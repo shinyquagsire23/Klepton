@@ -130,6 +130,15 @@ guestlibs:
 	@echo "not ELF:    $(filter-out $(GUEST_SOS),\
 	         $(basename $(notdir $(wildcard $(LIBS)/*.so))))"
 
+# ...and the same answer with nothing around it, for a caller rather than a
+# reader. visionos/targets.py asks for it with LIBS pointing at the target's own
+# srcdir, so the app bundle embeds exactly what this tree would translate — the
+# alternative is a pinned list in a second file, which is how 1.40 ended up with
+# an app carrying five of its eleven libraries and no libOculusXRPlugin.
+.PHONY: guestlibs-list
+guestlibs-list:
+	@echo $(GUEST_LIBS)
+
 # SL-1 — the second target's boot harness (PLANNING §11). Links the same
 # runtime as m_boot, minus the host-only diagnostics: this target has no
 # managed side to probe and no viewer yet.

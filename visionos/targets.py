@@ -26,10 +26,19 @@ import sys
 TARGETS = {
     "beatsaber": {
         # Unity + IL2CPP + Oculus Mobile SDK. The chain is staged: libmain
-        # dlopens libunity, which dlopens the rest — but all five are embedded,
+        # dlopens libunity, which dlopens the rest — but every one is embedded,
         # because kl_load_auto resolves a DT_NEEDED against Frameworks/ and does
         # not care who asked.
-        "libs":    "libmain lib_burst_generated libunityopus libunity libil2cpp",
+        #
+        # DISCOVERED, not pinned (None asks the Makefile — see libs_for below).
+        # It used to name five libraries, which was the whole of 1.28; 1.40
+        # ships eleven translatable ones and the pinned list silently left
+        # libOculusXRPlugin — the XR-SDK display provider, i.e. the entire
+        # render path — out of the bundle. On device that is not a fallback but
+        # a dead end: the ELF tree is deliberately not in the bundle, so a
+        # library with no translation cannot load at all. Same lesson as
+        # `4dc27b1`: the guest library set is a property of the APK.
+        "libs":    None,
         "srcdir":  "beatsaber/lib/arm64-v8a",
         "tree":    "beatsaber",
         "apk":     "beatsaber.apk",
@@ -98,6 +107,30 @@ TARGETS = {
 DEFAULT = "beatsaber"
 
 
+# `"libs": None` means "whatever this tree would translate for that srcdir",
+# which the Makefile already decides — the .so files that are really ELF, minus
+# the ones we REPLACE (libOVRPlugin, libovrplatformloader, libvrapi) and the
+# ones that are not part of the application (libfrda, libscript). Asking it
+# rather than restating it keeps one answer: a second copy of those rules here
+# would drift on the next guest, and the failure mode is a bundle missing a
+# library, which on device is a dlopen that cannot fall back to anything.
+#
+# It is a hard failure rather than a fallback to a pinned list, for the same
+# reason: a quietly incomplete bundle is worse than a build that stops.
+def libs_for(srcdir):
+    import subprocess, os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = subprocess.run(["make", "-s", "guestlibs-list", f"LIBS={srcdir}"],
+                         cwd=root, capture_output=True, text=True)
+    libs = out.stdout.strip()
+    if out.returncode != 0 or not libs:
+        print(f"!! could not discover the guest libraries in {srcdir!r} "
+              f"(make guestlibs-list said: {out.stderr.strip() or 'nothing'})",
+              file=sys.stderr)
+        sys.exit(1)
+    return libs
+
+
 def resolve(name):
     if name not in TARGETS:
         print(f"!! unknown target {name!r} — one of: {', '.join(sorted(TARGETS))}",
@@ -105,6 +138,8 @@ def resolve(name):
         sys.exit(1)
     t = dict(TARGETS[name])
     t["name"] = name
+    if t["libs"] is None:
+        t["libs"] = libs_for(t["srcdir"])
     return t
 
 
