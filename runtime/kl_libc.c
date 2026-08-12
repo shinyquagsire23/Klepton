@@ -21,7 +21,18 @@
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <sys/utsname.h>
-#include <sys/random.h>   // getentropy — behind klb_getrandom
+// getentropy, behind klb_getrandom. <sys/random.h> is a macOS-SDK header: XROS
+// and XRSimulator (26.0, checked) do not ship it, and getentropy has no public
+// declaration anywhere in those SDKs — but libSystem exports it there just the
+// same. So take the header where there is one and declare the function where
+// there is not, rather than lose the entropy source on the platform this
+// project exists for. The prototype is Darwin's; a wrong one would link and
+// then be wrong at the call.
+#if __has_include(<sys/random.h>)
+#include <sys/random.h>
+#else
+int getentropy(void *buf, size_t buflen);
+#endif
 #include <wchar.h>
 #include <ctype.h>
 #include "klepton.h"
