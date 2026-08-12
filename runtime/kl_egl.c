@@ -1214,6 +1214,14 @@ static EGLSurface klegl_GetCurrentSurface(int32_t which) {
     return which == EGL_READ ? g_read : g_draw;
 }
 
+// How many times the guest has presented through EGL. Read by the frame-complete
+// paths that are the ONLY presentation signal some guests give: Beat Saber 1.28's
+// legacy VRDevice swaps, and 1.40's XR-SDK display provider does not (measured:
+// `eglSwapBuffers: 0` across a whole 58-frame XR run), exactly as an OpenXR guest
+// does not. A capture seam that hangs off the swap alone is silently inert there,
+// and the tell is a run with a live frame loop and an empty output directory.
+unsigned long kl_egl_swap_count(void) { return g_frames; }
+
 static unsigned klegl_SwapBuffers(EGLDisplay dpy, EGLSurface s) {
     (void)dpy; (void)s;
     g_frames++;

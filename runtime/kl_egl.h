@@ -30,6 +30,13 @@ int   kl_egl_claims(const char *soname);
 int   kl_egl_is_handle(const void *h);
 void *kl_egl_sym(const char *name);        // the gateway itself
 
+// How many times the guest has called eglSwapBuffers. For the frame-complete
+// seams that have to know whether the swap is the guest's presentation signal at
+// all: Beat Saber 1.28 swaps, its 1.40 XR-SDK path never does, and neither does
+// an OpenXR guest. Zero here means "the capture and frontend seams hanging off
+// the swap have never fired, so this frame's completion is where they belong".
+unsigned long kl_egl_swap_count(void);
+
 // What the guest asked eglGetProcAddress for, and which of those it went on to
 // call. This is the M5 work list, in the order the guest wanted it.
 void kl_egl_report(FILE *f);

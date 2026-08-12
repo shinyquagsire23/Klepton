@@ -174,11 +174,54 @@ static volatile int g_view_quit;
 // lifecycle down with SIGSEGV in OUR code, which reads like a shim bug rather
 // than like a constant that expired.
 
-// Unity stamps its own version into libunity as a plain NUL-terminated string
-// ("2018.4.4f1"). libunity is stripped of everything useful -- 292 dynamic
-// symbols and not one GfxDevice among them -- so scanning for the stamp is the
-// only version signal available without a symbol table. One linear pass over
-// the mapped image, once, at pump start.
+// Matches 20NN.N[N].N[N]<a|b|f|p>N... at b+i, and returns the length of the
+// match, or 0. `want_rev` additionally requires the '_<revision>' suffix that
+// makes a stamp the build's own rather than a version merely mentioned.
+static size_t unity_version_at(const char *b, size_t n, size_t i, int want_rev) {
+    if (i + 10 >= n) return 0;
+    if (b[i] != '2' || b[i + 1] != '0') return 0;
+    size_t j = i + 2;
+    if (!isdigit((unsigned char)b[j]) || !isdigit((unsigned char)b[j + 1])) return 0;
+    j += 2;
+    if (j >= n || b[j] != '.') return 0;
+    j++;
+    size_t d0 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
+    if (j == d0 || j >= n || b[j] != '.') return 0;
+    j++;
+    size_t d1 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
+    if (j == d1 || j >= n) return 0;
+    if (b[j] != 'f' && b[j] != 'p' && b[j] != 'a' && b[j] != 'b') return 0;
+    j++;
+    size_t d2 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
+    if (j == d2 || j >= n) return 0;
+    size_t vlen = j - i;                       // the version, without any suffix
+    if (!want_rev) return b[j] == '\0' ? vlen : 0;
+    // The build stamp: '_' then hex revision digits, then the NUL.
+    if (b[j] != '_') return 0;
+    j++;
+    size_t r0 = j;
+    while (j < n && isxdigit((unsigned char)b[j])) j++;
+    if (j - r0 < 8 || j >= n || b[j] != '\0') return 0;
+    return vlen;
+}
+
+// Unity stamps its own version into libunity as a plain NUL-terminated string.
+// libunity is stripped of everything useful -- 292 dynamic symbols and not one
+// GfxDevice among them -- so scanning for the stamp is the only version signal
+// available without a symbol table. One linear pass over the mapped image, once,
+// at pump start.
+//
+// **A bare version string is not necessarily this build's version.** Beat Saber
+// 1.40's libunity is Unity 2022.3.33f1 and also contains the literal
+// "2018.3.0a1" at a LOWER address, so taking the first match reported the guest
+// as an eight-year-old alpha. That is a wrong answer that looks like a right one,
+// and everything keyed on the version inherits it.
+//
+// So the canonical BUILD STAMP is preferred: Unity writes the version with its
+// source revision attached ("2022.3.33f1_b2c853adf198"), and a version that
+// carries a revision is one this binary was built from rather than one it merely
+// mentions. The bare-string scan stays as the fallback, so a guest whose libunity
+// has no stamped revision behaves exactly as it did before.
 static const char *unity_version(void) {
     static char ver[32];
     static int done;
@@ -188,27 +231,14 @@ static const char *unity_version(void) {
     if (!u) return NULL;
     const char *b = (const char *)kl_base(u);
     size_t n = kl_span(u);
-    for (size_t i = 0; i + 10 < n; i++) {
-        // 20NN.N[N].N[N]<a|b|f|p>N... — the shape of every Unity version stamp.
-        if (b[i] != '2' || b[i + 1] != '0') continue;
-        size_t j = i + 2;
-        if (!isdigit((unsigned char)b[j]) || !isdigit((unsigned char)b[j + 1])) continue;
-        j += 2;
-        if (b[j] != '.') continue;
-        j++;
-        size_t d0 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
-        if (j == d0 || b[j] != '.') continue;
-        j++;
-        size_t d1 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
-        if (j == d1) continue;
-        if (b[j] != 'f' && b[j] != 'p' && b[j] != 'a' && b[j] != 'b') continue;
-        j++;
-        size_t d2 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
-        if (j == d2 || b[j] != '\0') continue;
-        if (j - i >= sizeof ver) continue;
-        memcpy(ver, b + i, j - i);
-        ver[j - i] = 0;
-        return ver;
+    for (int want_rev = 1; want_rev >= 0; want_rev--) {
+        for (size_t i = 0; i + 10 < n; i++) {
+            size_t len = unity_version_at(b, n, i, want_rev);
+            if (!len || len >= sizeof ver) continue;
+            memcpy(ver, b + i, len);
+            ver[len] = 0;
+            return ver;
+        }
     }
     return NULL;
 }
@@ -229,19 +259,28 @@ static int addr_mapped(const void *p, size_t len) {
     return mincore((void *)a, (size_t)(end - a), vec) == 0;
 }
 
-// libunity's texture-unit cap, direct from the horse's mouth: the singleton
-// getter at vaddr 0x313710 returns *(base + 0x122e340), and GfxDeviceGLES's
-// SetTexture rejects units >= *(singleton + 0xe8) with "Invalid texture unit!".
+// libunity's texture-unit cap, direct from the horse's mouth: a singleton getter
+// returns *(base + <singleton>), and GfxDeviceGLES's SetTexture rejects units
+// >= *(singleton + <field>) with "OpenGL Error: Invalid texture unit!".
 // Unity defaults it to 32 without ever querying GL, while its HLSLCC-baked
 // sampler bindings reach unit 35 on the post passes -- so the reject preempted
 // the binds and the samplers read stale unit-0 textures.
 //
-// BOTH offsets were measured against the Unity 2019.4 build and are meaningless
-// against any other, so the version is a GATE and not a comment. A title whose
-// version is not listed is left alone and told so by name: skipping costs at
-// worst the stale-texture artifact this works around, while poking costs a
-// 4-byte store through a garbage pointer, which is unrecoverable and lands
-// nowhere near the cause.
+// **How to measure a new row**, because it is the same four commands every time
+// and each one is checkable:
+//   1. `strings -a -t x libunity.so | grep 'Invalid texture unit'`  -> the string
+//   2. `tools/gxref.py libunity.so --to=<that offset>`              -> who builds it
+//   3. disassemble backwards from there to the guard: `bl <getter> / ldr wN,
+//      [x0, #<field>] / cmp / b.ls <the string's block>`            -> the FIELD
+//   4. disassemble <getter>: `adrp x8, <page> / ldr x0, [x8, #<lo>]`-> the SINGLETON
+// Both numbers are then vaddrs in that library and nothing else has to be taken
+// on faith.
+//
+// BOTH offsets are per-Unity-build and meaningless against any other, so the
+// version is a GATE and not a comment. A title whose version is not listed is
+// left alone and told so by name: skipping costs at worst the stale-texture
+// artifact this works around, while poking costs a 4-byte store through a
+// garbage pointer, which is unrecoverable and lands nowhere near the cause.
 //
 // TODO: DELETE THIS. It is a store into a reverse-engineered field of a private
 // engine object, and it cannot be made to generalise -- there is no symbol to
@@ -255,11 +294,27 @@ static int addr_mapped(const void *p, size_t len) {
 //   - handle it where the reject is observed: GfxDeviceGLES refuses the bind
 //     and logs "Invalid texture unit!", which kl_glfb can see -- remapping the
 //     out-of-range unit at bind time needs no offset into anything.
-// Until then it is OFF for every guest but the one it was measured on, which is
+// Until then it is OFF for every guest but the ones it was measured on, which is
 // the only honest state for a constant nobody can verify.
-#define POKE_VER_2019   "2019.4"
-#define POKE_SINGLETON  0x122e340
-#define POKE_FIELD      0xe8
+//
+// One row per measured (Unity version prefix, singleton vaddr, cap field offset).
+struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; };
+static const struct poke_cap_row k_poke_caps[] = {
+    // Unity 2019.4 — Beat Saber 1.28/1.6.0, the long-standing reference build.
+    // Getter 0x313710 serves *(base + 0x122e340); cap at +0xe8.
+    { "2019.4", 0x122e340, 0xe8 },
+    // Unity 2022.3 — Beat Saber 1.40 (2026-08-12). Measured by the recipe above:
+    //   0x14b20b  "OpenGL Error: Invalid texture unit!"
+    //   0xbd29b8  bl 0x6420f0            ; the singleton getter
+    //   0xbd29bc  ldr w8, [x0, #0xec]    ; the cap
+    //   0xbd29c0  cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x6420f0  adrp x8, 0x13d7000 / ldr x0, [x8, #0xcc0]
+    // The version string is why this row is keyed on 2022.3 and not on the
+    // "2018.3.0a1" an earlier reading reported: see unity_version() — that
+    // literal is present in this same libunity and is not its version.
+    { "2022.3", 0x13d7cc0, 0xec },
+};
+#define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])
 
 static void poke_texture_unit_cap(void) {
     const char *pv = getenv("KL_POKE_CAP");
@@ -267,17 +322,28 @@ static void poke_texture_unit_cap(void) {
     if (poke_n <= 1) return;
 
     const char *ver = unity_version();
+    const struct poke_cap_row *row = NULL;
+    for (size_t i = 0; ver && i < POKE_NROWS; i++)
+        if (strncmp(ver, k_poke_caps[i].ver, strlen(k_poke_caps[i].ver)) == 0) {
+            row = &k_poke_caps[i];
+            break;
+        }
     // KL_POKE_CAP is also the override for an unlisted version: asking for it
-    // explicitly is a statement that the offsets have been re-measured.
-    if (!pv && (!ver || strncmp(ver, POKE_VER_2019, strlen(POKE_VER_2019)) != 0)) {
-        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — measured against Unity "
-                        "%s.x, this guest is %s.\n"
-                        "         Re-measure libunity+%#x/+%#x for it, or set "
+    // explicitly is a statement that the offsets have been re-measured. It then
+    // runs against the FIRST row's offsets, and the shape checks below are what
+    // stop that from being a blind store.
+    if (!row && !pv) {
+        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — no measured offsets "
+                        "for Unity %s.\n"
+                        "         Measure libunity's GfxDeviceGLES singleton/cap for "
+                        "it (the recipe is above poke_texture_unit_cap), or set "
                         "KL_POKE_CAP=<n> to force.\n",
-                POKE_VER_2019, ver ? ver : "an unknown version",
-                POKE_SINGLETON, POKE_FIELD);
+                ver ? ver : "an unknown version");
         return;
     }
+    if (!row) row = &k_poke_caps[0];
+    const uint32_t POKE_SINGLETON = row->singleton;
+    const uint32_t POKE_FIELD     = row->field;
 
     kl_image *u = kl_find_image("libunity.so");
     if (!u) return;

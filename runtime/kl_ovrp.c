@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
@@ -18,6 +19,10 @@
 // klovrp_EndFrame). Up here rather than beside SetupEyeTexture2 now that the
 // timewarp bookkeeping needs it too.
 #include "kl_glfb.h"
+// kl_egl_sym (the GL gateway the eye textures are allocated through) and
+// kl_egl_swap_count (whether eglSwapBuffers is this guest's presentation
+// signal at all — see klovrp_end_frame_impl).
+#include "kl_egl.h"
 
 #define KL_OVRP_MAX 512
 static struct { const char *name; unsigned calls; } g_ovrp[KL_OVRP_MAX];
@@ -82,13 +87,89 @@ static uint64_t klovrp_called(const char *name) {
 #define OVRP_SUCCESS 0
 #define OVRP_TRUE    1
 
+// The failure half of ovrpResult, by name. Every value here is one the real
+// libOVRPlugin.so in this APK actually returns — the codes were counted in its
+// disassembly (-1000 x90, -1001 x279, -1002 x296, -1003 x126, -1004 x70, and on
+// down), which is what makes them a transcription rather than a guess. Naming
+// them matters because the family below is a chain of ovrpResult returns and
+// trap 10 is precisely about answering one of these with the wrong sign.
+#define OVRP_FAIL_INVALID_PARAM   (-1001)
+#define OVRP_FAIL_NOT_INITIALIZED (-1002)
+#define OVRP_FAIL_UNSUPPORTED     (-1004)
+
 // Record a call. The hand-written implementations below call this themselves so
 // that they stay in the report — the report is the M6 work list, and an entry
 // point silently dropping off it once implemented is how the list stops matching
 // what the guest actually does.
+// KL_OVRP_TRACE=1: log the live call SEQUENCE, with a global ordinal and the
+// caller's image+offset. The end-of-run work list prints TOTALS per name, and
+// totals cannot answer the question the 1.40 display arc turns on — whether the
+// guest re-enters the submit path per frame or entered it once and left. With
+// the sequence, "BeginFrame4 once, then DestroyLayer" reads as a teardown;
+// without it, it reads as a call count of 1.
+//
+// Everything the trace needs is already recorded, so this is a print and nothing
+// else — no register capture and no reads of guest memory. Filtered to the
+// frame/layer/display family, because the input pollers run thousands of times a
+// frame and would bury it. Set KL_OVRP_TRACE=all for every entry point.
+//
+// `caller` is the guest's return address, and it arrives as a PARAMETER rather
+// than being taken here: which __builtin_return_address level names the guest
+// depends on whether this function was inlined into ovrp_hit, so computing it
+// here would be a diagnostic that silently changes meaning with the optimiser.
+// ovrp_hit takes it at a fixed level and is noinline for exactly that reason.
+static void ovrp_trace(const char *name, void *caller) {
+    static int on = -1;
+    static uint64_t seq;
+    if (on < 0) {
+        const char *e = getenv("KL_OVRP_TRACE");
+        on = !e ? 0 : (strcmp(e, "all") == 0 ? 2 : kl_env_on("KL_OVRP_TRACE", 0));
+    }
+    if (!on) return;
+    if (on == 1) {
+        // The prefixes carry "ovrp_" so a match against the guest's own name is
+        // a prefix test: "ovrp_BeginFrame" matches BeginFrame4, and a bare
+        // "Update" could never be the first bytes of "ovrp_Update3".
+        static const char *const fam[] = {
+            "ovrp_Update", "ovrp_WaitToBeginFrame", "ovrp_BeginFrame",
+            "ovrp_EndFrame", "ovrp_EndEye", "ovrp_SetupDisplayObjects",
+            "ovrp_SetupDistortionWindow", "ovrp_SetupLayer",
+            "ovrp_CalculateLayerDesc", "ovrp_CalculateEyeLayerDesc",
+            "ovrp_CalculateEyeViewportRect", "ovrp_CalculateEyePreviewRect",
+            "ovrp_GetLayerTexture", "ovrp_GetEyeTexture",
+            "ovrp_SetupEyeTexture", "ovrp_SetClientColorDesc",
+            "ovrp_DestroyLayer", "ovrp_DestroyDistortionWindow",
+            "ovrp_SetTiledMultiRes", "ovrp_GetTiledMultiRes",
+            "ovrp_GetPredictedDisplayTime", "ovrp_SetFoveationEyeTracked",
+            "ovrp_GetAppHasVrFocus", "ovrp_GetAppShouldQuit",
+            "ovrp_Shutdown", "ovrp_Initialize",
+        };
+        int hit = 0;
+        for (size_t i = 0; i < sizeof fam / sizeof *fam; i++)
+            if (strncmp(name, fam[i], strlen(fam[i])) == 0) { hit = 1; break; }
+        if (!hit) return;
+    }
+    size_t off = 0;
+    const char *img = kl_addr_image(caller, &off);
+    fprintf(stderr, "  [ovrp+] %5llu %s <- %s+0x%zx\n",
+            (unsigned long long)seq++, name, img ? img : "?", off);
+}
+
+// noinline, and it must stay that way: level 0 is the entry-point handler that
+// called us and level 1 is the GUEST that called the handler, which only holds
+// while this function has a frame of its own. A handler must also not TAIL-call
+// it — none do; every one records the hit and then goes on to answer.
+__attribute__((noinline))
 static void ovrp_hit(const char *name) {
     int s = ovrp_slot(name);
     if (s >= 0) g_ovrp[s].calls++;
+    // -Wframe-address fires on any nonzero level. It is warning about exactly the
+    // assumption stated above, which the noinline and the no-tail-call rule are
+    // what make good; the fault reporter walks the same chain for the same reason.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wframe-address"
+    ovrp_trace(name, __builtin_return_address(1));
+#pragma clang diagnostic pop
 }
 
 // M7 discovery: log each distinct argument value an input-family entry point
@@ -451,7 +532,44 @@ double kl_ovrp_predicted_display_time(void) {
 
 static float klovrp_GetSystemDisplayFrequency(void) {
     ovrp_hit("ovrp_GetSystemDisplayFrequency");
-    return g_display_hz;
+    return kl_ovrp_display_frequency();
+}
+
+// The ...2 shape: ovrpResult with a float out-param, where the un-suffixed form
+// returns the float directly. 1.40's libOculusXRPlugin calls THIS one, from
+// OculusSystem::GetDisplayRefreshRate, which pre-zeroes its local and ignores
+// the result — so an unimplemented answer here is a refresh rate of 0.0 handed
+// to Unity's frame pacer rather than an error anyone reports.
+//
+// The real 0x170460 NULL-checks the out pointer (-1001), and on success returns
+// 0 having written s0 through it.
+static uint64_t klovrp_GetSystemDisplayFrequency2(float *out) {
+    ovrp_hit("ovrp_GetSystemDisplayFrequency2");
+    if (!out) return -1001;
+    *out = kl_ovrp_display_frequency();
+    return OVRP_SUCCESS;
+}
+
+// The rate the guest may ASK for. We do not own a display here — the one rate we
+// can actually present at is the one the compositor measured (or KL_DISPLAY_HZ,
+// or the Quest-2 default on a host run) — so the honest answer is a headset with
+// exactly one available mode: agree when asked for the rate we already run at,
+// and refuse otherwise rather than accept a rate we would not deliver.
+//
+// This is what a 72 Hz Quest 2 does when a title asks for 90, and Beat Saber has
+// that path: it reads the available list first, does not find what it wants, and
+// logs "Could not set display frequency of 90" without calling the setter at
+// all. A refusal here is therefore the same answer by a second route, and
+// accepting would be the invented one — the list is a promise (see
+// klovrp_GetSystemDisplayAvailableFrequencies).
+static uint64_t klovrp_SetSystemDisplayFrequency(float hz) {
+    ovrp_hit("ovrp_SetSystemDisplayFrequency");
+    float have = kl_ovrp_display_frequency();
+    if (hz == have) return OVRP_SUCCESS;
+    fprintf(stderr, "  [ovrp] SetSystemDisplayFrequency(%.1f) refused — this "
+                    "display runs at %.1f Hz and cannot switch\n",
+            (double)hz, (double)have);
+    return -1001;                     // ovrpFailure_InvalidParameter
 }
 
 // The per-eye render target size. Quest 2's recommendation until a frontend
@@ -604,6 +722,27 @@ static void klovrp_eye_offset(int eye, float *ox, float *oy, float *oz) {
         return;
     }
     *ox = g_eye_off[eye][0]; *oy = g_eye_off[eye][1]; *oz = g_eye_off[eye][2];
+}
+
+// ovrp_GetUserIPD2(float* ipd) — real 0x170e60, -1001 on NULL, writes s0 and
+// returns 0. 1.40's libOculusXRPlugin asks for it; 1.28 never did (kl_ovrp.h's
+// note that "there is no ovrp_GetUserIPD in the surface this title imports" was
+// true of that version and is not of this one).
+//
+// Derived from the SAME eye offsets everything else answers from, rather than
+// carried as a second number: the IPD is the distance between the two eye
+// positions, so answering it independently is how a guest gets a stereo
+// separation from one entry point that disagrees with the one it renders with.
+// It therefore also honours KL_OVRP_IPD for free.
+static uint64_t klovrp_GetUserIPD2(float *out) {
+    ovrp_hit("ovrp_GetUserIPD2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    float lx, ly, lz, rx, ry, rz;
+    klovrp_eye_offset(0, &lx, &ly, &lz);
+    klovrp_eye_offset(1, &rx, &ry, &rz);
+    float dx = rx - lx, dy = ry - ly, dz = rz - lz;
+    *out = sqrtf(dx * dx + dy * dy + dz * dz);
+    return OVRP_SUCCESS;
 }
 
 // Fills four f32 fov tangents at out+0x08..+0x14 (0x9bcbd4). libunity divides
@@ -1066,6 +1205,20 @@ static uint64_t klovrp_Update2(int step, int frame_index, double prediction) {
     return OVRP_SUCCESS;
 }
 
+// ovrp_Update3(step, frameIndex, predictionSeconds) — same three arguments and
+// the same latch, one ABI revision on (real 0x16eb90, and unlike ...2 it is
+// unambiguously ovrpResult: every exit is `mov w0, wzr` or a negative code).
+// 1.40's libOculusXRPlugin resolves both and calls whichever it has.
+static uint64_t klovrp_Update3(int step, int frame_index, double prediction) {
+    uint64_t r = klovrp_Update2(step, frame_index, prediction);
+    // klovrp_Update2 records itself as ovrp_Update2; correct the attribution so
+    // the work list says which numbered form the guest actually called.
+    int s2 = ovrp_slot("ovrp_Update2");
+    if (s2 >= 0 && g_ovrp[s2].calls) g_ovrp[s2].calls--;
+    ovrp_hit("ovrp_Update3");
+    return r;
+}
+
 // The pose for a given step, as the guest was told it. Falls back to the live
 // value only where Update2 has never been seen — a headless run, or a guest
 // that does not use this part of the API.
@@ -1258,8 +1411,7 @@ static uint64_t klovrp_BeginFrame4(int guest_frame_index, uint64_t extra) {
 // then "corrects" by a delta that was never real. Where the observation is
 // unavailable — the null GL driver, `make check`, any run without KL_GLFB —
 // the counter is still the fallback, and with a single stage it is exact.
-static uint64_t klovrp_EndFrame(int guest_frame_index) {
-    ovrp_hit("ovrp_EndFrame");
+static uint64_t klovrp_end_frame_impl(int guest_frame_index) {
     // Close the observation window opened at BeginFrame. `observed` is still
     // the sticky answer; `mask`/`binds` are what say whether it belongs to this
     // frame, and they are the difference between an association that is known
@@ -1387,7 +1539,60 @@ static uint64_t klovrp_EndFrame(int guest_frame_index) {
         }
     }
     pthread_mutex_unlock(&g_frames.mu);
+
+    // ...and this is the XR-SDK path's SWAP.
+    //
+    // kl_glfb's capture and both frontend seams hang off eglSwapBuffers, and
+    // 1.40's display provider never calls it — measured `eglSwapBuffers: 0`
+    // across a 58-frame run whose eye stages were demonstrably drawn into. So
+    // KL_GLFB_OUT was silently inert on the one path that had pixels, which is
+    // the same hole SL-13 found on the OpenXR path (kl_openxr.c's xrEndFrame
+    // carries the identical block, for the identical reason).
+    //
+    // Gated on the guest never having swapped rather than on a version test:
+    // 1.28's legacy VRDevice calls BOTH this and eglSwapBuffers, and presenting
+    // twice a frame would double every capture and hand a frontend two frames
+    // per frame. The swap count answers "is the swap this guest's presentation
+    // signal?" directly, which is the actual question.
+    if (kl_egl_swap_count() == 0) {
+        const char *out = kl_env_str("KL_GLFB_OUT", NULL);
+        if (kl_glfb_enabled() &&
+            (out || kl_glfb_has_frame_sink() || kl_glfb_has_gpu_fence()))
+            kl_glfb_present(out);
+    }
     return OVRP_SUCCESS;
+}
+
+// The two named entry points over the body above, for the same reason
+// BeginFrame/BeginFrame4 are separate: the work list counts by the name the call
+// actually hit.
+static uint64_t klovrp_EndFrame(int guest_frame_index) {
+    ovrp_hit("ovrp_EndFrame");
+    return klovrp_end_frame_impl(guest_frame_index);
+}
+
+// ovrp_EndFrame4(frameIndex, layerSubmits, layerSubmitCount, sync) — the 1.40
+// shape (real 0x16ed40, which -1001s only when layerSubmits is NULL *and* the
+// count is non-zero, so an empty submission is legal). The layer list is the
+// guest naming which layers it just filled; we know which stage it drew into
+// from the observation window that BeginFrame opened, which is a stronger
+// statement than the list (it is what the GL side actually saw), so the list is
+// named and dropped rather than parsed.
+//
+// **On this path `frameIndex % stages` is NOT the stage**, and the report says so
+// loudly: a 9000-frame 1.40 run counts 8786 "the guest's frame index disagreed".
+// That is not a fault. The XR-SDK display provider rotates its own TextureStage
+// ring and the index it passes here has no relation to it, where 1.28's legacy
+// VRDevice derived the stage from exactly this counter (and measured 0
+// disagreements). The observation is authoritative either way — the same run
+// reports 0 frames drawn into no stage, 0 into several and 0 off-thread — so the
+// counter is only ever the fallback for runs with no GL observation at all.
+static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submits,
+                                 int layer_submit_count, void *sync) {
+    ovrp_hit("ovrp_EndFrame4");
+    (void)sync;
+    if (!layer_submits && layer_submit_count) return OVRP_FAIL_INVALID_PARAM;
+    return klovrp_end_frame_impl(guest_frame_index);
 }
 
 int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out) {
@@ -2432,18 +2637,22 @@ static uint64_t klovrp_GetAppAsymmetricFov(char *out) {
     return OVRP_SUCCESS;
 }
 
-// (float *buf, int *count) -> int count (real plugin: second arg
-// null-checked to -1001, return clamped to >= 0). One frequency, matching
-// the GetSystemDisplayFrequency answer above.
+// (float *freqs, int *count) -> ovrpResult. The real 0x1704c0 null-checks the
+// SECOND argument (-1001) and passes the first through untested, which is the
+// two-phase query the managed side makes: once with freqs = NULL to learn the
+// count, then again with a buffer that size. Success is 0 like every other
+// entry point here (`csel w0, w0, wzr, lt`) — this returned the COUNT until
+// now, and a positive ovrpResult is not success.
 static uint64_t klovrp_GetSystemDisplayAvailableFrequencies(float *buf, int *count) {
     ovrp_hit("ovrp_GetSystemDisplayAvailableFrequencies");
+    if (!count) return -1001;
     // One rate, and it is the one we report as current. Offering a menu of
     // frequencies we cannot actually switch between would invite the guest to
-    // ask for one — ovrp_SetSystemDisplayFrequency is not implemented, and a
-    // list is a promise.
-    if (buf) buf[0] = g_display_hz;
+    // ask for one, and klovrp_SetSystemDisplayFrequency would then have to
+    // refuse it — a list is a promise, so it says exactly what we can present.
+    if (buf) buf[0] = kl_ovrp_display_frequency();
     *count = 1;
-    return 1;
+    return OVRP_SUCCESS;
 }
 
 // ovrpResult with an enum OUT-PARAM. ovrpXrApiType: 0 Unknown, 1 Oculus
@@ -2466,7 +2675,6 @@ static uint64_t klovrp_GetNativeXrApiType(int *out) {
 // (Unity's render thread — this call arrives inside
 // IVRDeviceCallback_CreateEyeTextureResources). fmt=2 maps to sRGB, matching
 // the eye-sized color textures Unity allocates for itself (0x8c43).
-#include "kl_egl.h"
 
 // GL_RGBA16F: Unity renders the scene into an RGBA16F MSAA renderbuffer
 // (measured: fmt 0x881a, samples=4, via the blit probe), and ES 3.0 makes a
@@ -2513,6 +2721,721 @@ static uint64_t klovrp_SetupEyeTexture2(int eye, int stage, uintptr_t handle,
         gl_TexStorage2D(0x0DE1, 1, KL_OVRP_TEXFMT_EYE, h, w);
     }
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// The layer family — Beat Saber 1.40's eye-texture seam
+// ---------------------------------------------------------------------------
+// 1.28 reached the eye textures through libunity's LEGACY VRDevice, which owns
+// the GL names and hands them down to ovrp_SetupEyeTexture2 for storage (above).
+// 1.40 is Unity 2022.3, where legacy VR is gone: libOculusXRPlugin.so is a real
+// XR-SDK display provider and the ownership is the other way round. OVRPlugin —
+// i.e. us — creates the eye textures and the provider ASKS for them:
+//
+//   OculusDisplayProvider::CreateLayer
+//     ovrp_CalculateEyeLayerDesc3(layout, ..., &desc)   "what shape is an eye layer?"
+//     ovrp_SetupLayer(device, &desc, &layerId)          "make me one"
+//     ovrp_CalculateEyeViewportRect / ...PreviewRect    "where does each eye sit in it?"
+//     ovrp_CalculateLayerDesc + ovrp_SetupLayer         ...again for a 1x1 dummy layer
+//   OculusDisplayProvider::CreateEyeTextures
+//     ovrp_GetLayerTextureStageCount(layerId, &n)
+//     ovrp_GetLayerTexture2(layerId, stage, eye, &color, &depth)
+//
+// So ovrp_GetLayerTexture2 is 1.40's ovrp_SetupEyeTexture2, and it routes
+// through the same two seams: kl_glfb_note_eye_texture (the capture's eye-FBO
+// census) and kl_glfb_bind_eye_mtl_texture (P5's MTLTexture backing). Nothing
+// downstream of those has to know which Unity version asked.
+//
+// Every ABI here is read off the REAL libOVRPlugin.so in this APK rather than
+// inferred from the caller: each function's argument shuffle and NULL check say
+// exactly which register carries the out-param, and every one of them ends in
+// `cmp w0,#0 / csel w0,w0,wzr,lt` — plain ovrpResult, success 0. That matters
+// twice over here, because the family is a chain: a positive return from any of
+// them is the trap 10 shape and reads as the failure that killed GfxThread_Start
+// (see g_ovrp_result_ok's note on ovrp_SetupDisplayObjects2).
+
+// ovrpLayerDesc_EyeFov. The type NAME is the guest's own — libOculusXRPlugin
+// exports `OculusSystem::SetRenderViewportScale(ovrpLayerDesc_EyeFov const&,
+// ovrpEye, float, ovrpRecti*)` — and the OFFSETS are the ones the provider
+// reads and writes in CreateLayer:
+//
+//   +0x08  read as an int and written back  -> TextureSize.w
+//   +0x28 +0x2c                             -> Fov[0].LeftTan / .RightTan
+//   +0x38 +0x3c                             -> Fov[1].LeftTan / .RightTan
+//   +0x60  written with the adjusted width  -> MaxViewportSize.w
+//
+// which pins Fov[] at +0x20 with ovrpFovf = {Up, Down, Left, Right}, and so
+// pins the whole base struct. The static asserts below are the guard: this
+// layout is load-bearing for a struct the guest writes into as well as reads.
+typedef struct { int w, h; } ovrp_sizei;
+typedef struct { int x, y, w, h; } ovrp_recti;
+typedef struct { float x, y, w, h; } ovrp_rectf;
+typedef struct { float up, down, left, right; } ovrp_fovf;
+
+typedef struct {
+    int         shape;             // +0x00 ovrpShape
+    int         layout;            // +0x04 ovrpLayout
+    ovrp_sizei  texture_size;      // +0x08
+    int         mip_levels;        // +0x10
+    int         sample_count;      // +0x14
+    int         format;            // +0x18 ovrpTextureFormat
+    int         layer_flags;       // +0x1c
+    ovrp_fovf   fov[2];            // +0x20
+    ovrp_rectf  visible_rect[2];   // +0x40
+    ovrp_sizei  max_viewport_size; // +0x60
+    int         depth_format;      // +0x68
+    int         mv_format;         // +0x6c
+    int         mv_depth_format;   // +0x70
+    ovrp_sizei  mv_texture_size;   // +0x74
+} ovrp_layer_desc_eyefov;          //  = 0x7c
+
+_Static_assert(offsetof(ovrp_layer_desc_eyefov, texture_size) == 0x08, "desc");
+_Static_assert(offsetof(ovrp_layer_desc_eyefov, layer_flags) == 0x1c, "desc");
+_Static_assert(offsetof(ovrp_layer_desc_eyefov, fov) == 0x20, "desc");
+_Static_assert(offsetof(ovrp_layer_desc_eyefov, visible_rect) == 0x40, "desc");
+_Static_assert(offsetof(ovrp_layer_desc_eyefov, max_viewport_size) == 0x60, "desc");
+
+// ovrpTextureFormat -> GL internalformat.
+//
+// The enum's ORDER is the guest's own: libOculusXRPlugin.so carries the names as
+// a string table (`ovrpTextureFormat_R8G8B8A8_sRGB`, `_R8G8B8A8`,
+// `_R16G16B16A16_FP`, `_R11G11B10_FP`, `_B8G8R8A8_sRGB`, `_B8G8R8A8`, `_R5G6B5`,
+// `_R16G16_FP`, `_A2B10G10R10`, `_D16`, `_D24_S8`, `_D32_FP`, `_D32_FP_S8`,
+// `_None`), in that sequence, at 0x165194 onward. So the numbers are read out of
+// the library rather than assumed, which matters because the two values this
+// title passes — 0 and 10 — are meaningless without them.
+//
+// **This is what was black.** klovrp_GetLayerTexture2 allocated RGBA16F
+// unconditionally, carried over from klovrp_SetupEyeTexture2 where 1.28's Unity
+// really does render HDR. 1.40 asks for format 0, R8G8B8A8_sRGB, and its scene
+// MSAA renderbuffer is GL_SRGB8_ALPHA8 (measured: `census fbo4: 5496000 lit —
+// rb=11 fmt=0x8c43 2748x2880`) — so the guest's resolve blit was sRGB8 -> RGBA16F,
+// which ES 3.0 makes INVALID_OPERATION. Unity reported it every frame
+// ("OPENGL NATIVE PLUG-IN ERROR: GL_INVALID_OPERATION") and the eye texture
+// stayed at 0 lit while the scene behind it was fully drawn.
+static uint32_t klovrp_gl_format(int ovrp_fmt, const char **name) {
+    switch (ovrp_fmt) {
+    case 0:  if (name) *name = "R8G8B8A8_sRGB";    return 0x8C43;  // GL_SRGB8_ALPHA8
+    case 1:  if (name) *name = "R8G8B8A8";         return 0x8058;  // GL_RGBA8
+    case 2:  if (name) *name = "R16G16B16A16_FP";  return 0x881A;  // GL_RGBA16F
+    case 3:  if (name) *name = "R11G11B10_FP";     return 0x8C3A;  // GL_R11F_G11F_B10F
+    // B8G8R8A8 has no ES internalformat — GL orders channels by the *format*
+    // argument, not the internalformat, and there is no GL_BGRA8 to allocate.
+    // RGBA8 is the same storage; a guest that means BGRA has to say so at upload
+    // time, and nothing here uploads.
+    case 4:  if (name) *name = "B8G8R8A8_sRGB";    return 0x8C43;
+    case 5:  if (name) *name = "B8G8R8A8";         return 0x8058;
+    case 6:  if (name) *name = "R5G6B5";           return 0x8D62;  // GL_RGB565
+    case 7:  if (name) *name = "R16G16_FP";        return 0x822F;  // GL_RG16F
+    case 8:  if (name) *name = "A2B10G10R10";      return 0x8059;  // GL_RGB10_A2
+    default: if (name) *name = NULL;               return 0;
+    }
+}
+
+// ovrpShape_EyeFov, and ovrpLayout's {Stereo, Mono, DoubleWide, Array}. The
+// provider derives its layout argument from Unity's texture-layout choice and
+// passes only 0 (separate 2D textures per eye) or 3 (one 2D array, two slices);
+// this title asks for 0, measured.
+#define KLOVRP_SHAPE_EYEFOV   3
+#define KLOVRP_LAYOUT_STEREO  0
+#define KLOVRP_LAYOUT_ARRAY   3
+
+// One entry per layer the provider sets up: the eye layer, and the 1x1 dummy
+// layer it makes afterwards on GLES. Four slots for two layers, because a
+// display-subsystem restart destroys and recreates both.
+#define KLOVRP_MAX_LAYERS 4
+static struct klovrp_layer {
+    int      id;                                  // 0 = free; ids start at 1
+    ovrp_layer_desc_eyefov desc;                  // as ovrp_SetupLayer received it
+    uint32_t tex[KLOVRP_MAX_STAGES][2];           // GL names, per stage per eye
+    int      is_eye;                              // eye layer, or the dummy
+    int      used;                                // this slot has been set up before
+} g_layers[KLOVRP_MAX_LAYERS];
+static int g_next_layer_id = 1;
+
+static struct klovrp_layer *klovrp_layer(int id) {
+    if (id <= 0) return NULL;
+    for (int i = 0; i < KLOVRP_MAX_LAYERS; i++)
+        if (g_layers[i].id == id) return &g_layers[i];
+    return NULL;
+}
+
+// Fill a desc for an eye layer. The arguments ARE the answer for the format and
+// count fields — this entry point's whole job is "turn these parameters into the
+// desc that describes them" — and the geometry is ours: the per-eye render
+// target size the display seam measured (kl_ovrp_eye_texture_size) and the
+// frustum tangents it measured with it (kl_ovrp_set_eye_frustum).
+//
+// textureScale is the render-scale multiplier Unity carries in its frame setup
+// hints; the real plugin applies it to the recommended size, so we do too, and
+// clamp to at least 1 pixel so a hint of 0 cannot produce a zero-sized layer.
+static void klovrp_fill_eye_desc(ovrp_layer_desc_eyefov *d, int layout,
+                                 int mip_levels, int sample_count, int format,
+                                 int depth_format, int mv_format,
+                                 int mv_depth_format,
+                                 int layer_flags, float texture_scale) {
+    int w = 0, h = 0;
+    kl_ovrp_eye_texture_size(&w, &h);
+    if (!(texture_scale > 0.0f)) texture_scale = 1.0f;
+    w = (int)((float)w * texture_scale);
+    h = (int)((float)h * texture_scale);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+
+    memset(d, 0, sizeof *d);
+    d->shape        = KLOVRP_SHAPE_EYEFOV;
+    d->layout       = layout;
+    d->texture_size = (ovrp_sizei){ w, h };
+    d->mip_levels   = mip_levels > 0 ? mip_levels : 1;
+    d->sample_count = sample_count > 0 ? sample_count : 1;
+    // Echoed, and then HONOURED: klovrp_GetLayerTexture2 allocates the storage
+    // through klovrp_gl_format(d->format), so the number reported and the
+    // storage made cannot disagree. That is the whole fix for the black eye
+    // texture — see klovrp_gl_format.
+    d->format       = format;
+    d->layer_flags  = layer_flags;
+    for (int eye = 0; eye < 2; eye++) {
+        // g_eye_tan is {left, right, top, bottom}; ovrpFovf is {up, down, left,
+        // right}. Transposing these is a silently wrong frustum, so it happens
+        // in exactly one place.
+        d->fov[eye] = (ovrp_fovf){ g_eye_tan[eye][2], g_eye_tan[eye][3],
+                                   g_eye_tan[eye][0], g_eye_tan[eye][1] };
+        d->visible_rect[eye] = (ovrp_rectf){ 0.0f, 0.0f, 1.0f, 1.0f };
+    }
+    d->max_viewport_size = d->texture_size;
+    // The remaining format fields are echoed for the same reason: they are what
+    // the caller asked for. No depth or motion-vector TEXTURE is handed out —
+    // ovrp_GetLayerTexture2 answers 0 for the depth id and nothing here submits
+    // motion vectors — so these describe the formats a provider would use if it
+    // asked, and it does not.
+    d->depth_format    = depth_format;
+    d->mv_format       = mv_format;
+    d->mv_depth_format = mv_depth_format;
+}
+
+// ovrp_CalculateEyeLayerDesc3(layout, mipLevels, sampleCount, format,
+//                             depthFormat, mvFormat, mvDepthFormat, layerFlags,
+//                             desc*, textureScale, scale2)
+//
+// Eight integer args in x0..x7, the out pointer as the ninth (the real 0x16e5f0
+// reads it from [x29+0x30], i.e. the first stack slot, and -1001s on NULL), and
+// two floats in s0/s1.
+//
+// The four format arguments are placed by lining the three numbered forms up
+// against each other in the real library: each one shuffles its integer args
+// down by one and calls a common builder, and the un-suffixed 0x179bc0 fills the
+// builder's last three format slots with 10 (D24_S8), ...2 (0x16e510) fills the
+// last two, and ...3 passes all three. So the argument this title sets to 0 is
+// the COLOUR format and the ones after it are depth and motion-vector — which is
+// then confirmed from the other side: format 0 is R8G8B8A8_sRGB and Unity's
+// scene MSAA renderbuffer really is GL_SRGB8_ALPHA8.
+static uint64_t klovrp_CalculateEyeLayerDesc3(int layout, int mip_levels,
+                                              int sample_count, int format,
+                                              int depth_format, int mv_format,
+                                              int mv_depth_format, int layer_flags,
+                                              ovrp_layer_desc_eyefov *out,
+                                              float texture_scale, float scale2) {
+    ovrp_hit("ovrp_CalculateEyeLayerDesc3");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    klovrp_fill_eye_desc(out, layout, mip_levels, sample_count, format,
+                         depth_format, mv_format, mv_depth_format,
+                         layer_flags, texture_scale);
+    const char *fname = NULL;
+    uint32_t gl = klovrp_gl_format(format, &fname);
+    fprintf(stderr, "  [ovrp] CalculateEyeLayerDesc: layout=%d %dx%d mips=%d "
+                    "samples=%d fmt=%d (%s -> GL %#x) depth=%d mv=%d/%d "
+                    "flags=%#x scale=%.3f/%.3f\n",
+            layout, out->texture_size.w, out->texture_size.h, mip_levels,
+            sample_count, format, fname ? fname : "UNMAPPED", gl,
+            depth_format, mv_format, mv_depth_format, (unsigned)layer_flags,
+            (double)texture_scale, (double)scale2);
+    return OVRP_SUCCESS;
+}
+
+// The ...2 form: one float, no motion-vector formats, and the out pointer in x6
+// (the real 0x16e510 -1001s on a NULL x6, and fills the builder's last two
+// format slots with 10 itself). Same answer — this is an ABI revision, not a
+// different question.
+static uint64_t klovrp_CalculateEyeLayerDesc2(int layout, int mip_levels,
+                                              int sample_count, int format,
+                                              int depth_format, int layer_flags,
+                                              ovrp_layer_desc_eyefov *out,
+                                              float texture_scale) {
+    ovrp_hit("ovrp_CalculateEyeLayerDesc2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    klovrp_fill_eye_desc(out, layout, mip_levels, sample_count, format,
+                         depth_format, 10 /* D24_S8, as ...2 itself does */,
+                         10, layer_flags, texture_scale);
+    return OVRP_SUCCESS;
+}
+
+// ovrp_CalculateLayerDesc(shape, layout, textureSize, mipLevels, sampleCount,
+//                         format, layerFlags, desc*)
+//
+// The non-eye sibling, used here for one thing only: the 1x1 dummy layer
+// CreateLayer makes on GLES after the eye layer. Its two failure paths are
+// non-fatal in the guest ("Unable to CalculateLayerDesc/SetupLayer for dummy
+// layer" and it carries on), but it is on the path, so it gets a real answer.
+//
+// textureSize is an ovrpSizei by value in x2 (the real 0x16e440 does `mov x3,x2`
+// — 64-bit, not `mov w3,w2`). This guest passes the ADDRESS of a `{1,1}`
+// constant in its own rodata there rather than the value, i.e. its header and
+// the shipped library disagree about by-value vs by-pointer; on a real Quest
+// that yields a nonsense size for a layer whose size is never used. We take the
+// size we can justify — the dummy layer's own 1x1 — and say so rather than
+// decoding whichever reading happens to look plausible.
+static uint64_t klovrp_CalculateLayerDesc(int shape, int layout, uint64_t texture_size,
+                                          int mip_levels, int sample_count, int format,
+                                          int layer_flags,
+                                          ovrp_layer_desc_eyefov *out) {
+    ovrp_hit("ovrp_CalculateLayerDesc");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    memset(out, 0, sizeof *out);
+    out->shape        = shape;
+    out->layout       = layout;
+    out->texture_size = (ovrp_sizei){ 1, 1 };
+    out->mip_levels   = mip_levels > 0 ? mip_levels : 1;
+    out->sample_count = sample_count > 0 ? sample_count : 1;
+    out->format       = format;
+    out->layer_flags  = layer_flags;
+    for (int eye = 0; eye < 2; eye++)
+        out->visible_rect[eye] = (ovrp_rectf){ 0.0f, 0.0f, 1.0f, 1.0f };
+    out->max_viewport_size = out->texture_size;
+    fprintf(stderr, "  [ovrp] CalculateLayerDesc: shape=%d layout=%d 1x1 "
+                    "(the guest passed size as %#llx — an address, see the note)\n",
+            shape, layout, (unsigned long long)texture_size);
+    return OVRP_SUCCESS;
+}
+
+// ovrp_SetupLayer(void* device, const ovrpLayerDesc* desc, int* layerId).
+// The real 0x16df60 NULL-checks the THIRD argument, which is what identifies
+// x2 as the out-param rather than the device.
+static uint64_t klovrp_SetupLayer(void *device, const ovrp_layer_desc_eyefov *desc,
+                                  int *layer_id) {
+    ovrp_hit("ovrp_SetupLayer");
+    if (!layer_id || !desc) return OVRP_FAIL_INVALID_PARAM;
+    // An eye layer is the one carrying a frustum. The dummy layer's desc has no
+    // Fov at all (klovrp_CalculateLayerDesc zeroes it), so this is the guest's
+    // own distinction rather than a call-order guess.
+    int is_eye = desc->fov[0].left > 0.0f || desc->fov[0].right > 0.0f;
+
+    // Prefer a freed slot that describes the SAME layer, and keep its textures.
+    // GfxThread_Stop destroys both layers and GfxThread_Start makes them again —
+    // it happened on the very first 1.40 run — so a fresh slot per setup both
+    // exhausts the table on the third cycle and hands the compositor a new set of
+    // GL names for a picture that has not changed. Matching on the geometry is
+    // what makes the reuse safe: a layer of a different size needs new storage.
+    struct klovrp_layer *l = NULL;
+    for (int i = 0; i < KLOVRP_MAX_LAYERS && !l; i++) {
+        struct klovrp_layer *c = &g_layers[i];
+        if (c->id || !c->used) continue;
+        if (c->is_eye == is_eye &&
+            c->desc.texture_size.w == desc->texture_size.w &&
+            c->desc.texture_size.h == desc->texture_size.h &&
+            c->desc.layout == desc->layout)
+            l = c;
+    }
+    int reused = l != NULL;
+    for (int i = 0; i < KLOVRP_MAX_LAYERS && !l; i++)
+        if (!g_layers[i].id) { l = &g_layers[i]; memset(l, 0, sizeof *l); }
+    if (!l) {
+        fprintf(stderr, "  [ovrp] SetupLayer: all %d layer slots are live — this "
+                        "guest creates two (an eye layer and a 1x1 dummy)\n",
+                KLOVRP_MAX_LAYERS);
+        return OVRP_FAIL_INVALID_PARAM;
+    }
+    // Ids start at 1 and never repeat: 0 is what an out-slot the guest zeroed
+    // already holds, so an id indistinguishable from "never set" is a class of
+    // bug we can decline to have, and a reused id would make a stale handle from
+    // before the restart address the new layer.
+    l->id     = g_next_layer_id++;
+    l->desc   = *desc;
+    l->is_eye = is_eye;
+    l->used   = 1;
+    *layer_id = l->id;
+    fprintf(stderr, "  [ovrp] SetupLayer(device=%p) -> layer %d, %s, %dx%d "
+                    "layout=%d fmt=%d samples=%d%s\n",
+            device, l->id, is_eye ? "EYE" : "dummy",
+            desc->texture_size.w, desc->texture_size.h, desc->layout,
+            desc->format, desc->sample_count,
+            reused ? " (reusing the previous layer's textures)" : "");
+    return OVRP_SUCCESS;
+}
+
+static uint64_t klovrp_DestroyLayer(int layer_id) {
+    ovrp_hit("ovrp_DestroyLayer");
+    struct klovrp_layer *l = klovrp_layer(layer_id);
+    // The teardown mirror. The GL names are NOT deleted here, and the slot keeps
+    // them: this arrives on the provider's gfx-thread stop, the eye textures are
+    // still attached to framebuffers the capture and the compositor hold, and
+    // deleting a name the compositor is sampling is a worse failure than holding
+    // it across a restart that is about to ask for the same layer again.
+    // klovrp_SetupLayer above is the other half — it hands the same textures back.
+    if (l) l->id = 0;
+    return OVRP_SUCCESS;
+}
+
+// ovrp_GetLayerTextureStageCount(layerId, int* out) — real 0x16e160,
+// -1001 on a NULL second argument.
+static uint64_t klovrp_GetLayerTextureStageCount(int layer_id, int *out) {
+    ovrp_hit("ovrp_GetLayerTextureStageCount");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    struct klovrp_layer *l = klovrp_layer(layer_id);
+    // The eye swapchain's depth is the one the rest of kl_ovrp is built around
+    // (KL_OVRP_STAGES, the frame ring, the compositor's stage association). The
+    // dummy layer needs exactly one — it is never rendered into.
+    *out = (l && l->is_eye) ? kl_ovrp_stage_count() : 1;
+    return OVRP_SUCCESS;
+}
+
+// ovrp_GetLayerTexture2(layerId, stage, eye, uint64_t* color, uint64_t* depth).
+// The real 0x16e1c0 requires at least one of the two out pointers (`orr x8, x3,
+// x5 / cbz x8 -> -1001`), so each is optional on its own.
+//
+// **The out-params are 64 bits wide, not 32.** The guest reads the slot back
+// with a full `ldr x8, [sp+0x78]` (CreateTexture+0x1b0) and the slot is OUTSIDE
+// the range it memset at entry, so writing only the low half leaves the top half
+// holding whatever was on the provider's stack — a GL name with garbage in bits
+// 32..63, handed to Unity as its native texture. A 64-bit slot for what is a
+// GLuint here is how OVRPlugin carries a VkImage in the same field.
+//
+// This is 1.40's eye-texture creation point, and the counterpart of 1.28's
+// ovrp_SetupEyeTexture2: the name is OURS to make, where in 1.28 Unity made it
+// and handed it down. Everything after that is the same seam.
+static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
+                                        uint64_t *color, uint64_t *depth) {
+    ovrp_hit("ovrp_GetLayerTexture2");
+    if (!color && !depth) return OVRP_FAIL_INVALID_PARAM;
+    struct klovrp_layer *l = klovrp_layer(layer_id);
+    if (!l) return OVRP_FAIL_INVALID_PARAM;
+    if ((unsigned)stage >= KLOVRP_MAX_STAGES || (unsigned)eye > 1)
+        return OVRP_FAIL_INVALID_PARAM;
+    // One texture per (stage, eye) is the Stereo layout and nothing else. Under
+    // ovrpLayout_Array the two eyes are SLICES of one array texture, and handing
+    // back two separate 2D names there would be accepted, wired up, and render
+    // to the wrong storage with no error anywhere — so it is refused by name
+    // instead. This title asks for Stereo (measured: layout=0), and
+    // ovrp_GetEyeTextureArraySupported already answers false, which is what the
+    // guest should be reading before it ever gets here.
+    if (l->is_eye && l->desc.layout != KLOVRP_LAYOUT_STEREO) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [ovrp] GetLayerTexture2: layer %d asks for layout %d "
+                            "(%s); only %d (Stereo, one texture per eye) is "
+                            "implemented — refusing rather than binding the wrong "
+                            "storage\n", layer_id, l->desc.layout,
+                    l->desc.layout == KLOVRP_LAYOUT_ARRAY ? "Array" : "?",
+                    KLOVRP_LAYOUT_STEREO);
+        }
+        return OVRP_FAIL_UNSUPPORTED;
+    }
+    // No depth storage is provided. Answering 0 is the truthful "this layer has
+    // no depth texture" — the provider asks for both in one call and uses
+    // whichever it got.
+    if (depth) *depth = 0;
+    if (!color) return OVRP_SUCCESS;
+
+    uint32_t *slot = &l->tex[stage][eye];
+    if (!*slot) {
+        static void (*gl_GenTextures)(int32_t, uint32_t *);
+        static void (*gl_BindTexture)(uint32_t, uint32_t);
+        static void (*gl_TexStorage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
+        if (!gl_GenTextures) {
+            gl_GenTextures  = kl_egl_sym("glGenTextures");
+            gl_BindTexture  = kl_egl_sym("glBindTexture");
+            gl_TexStorage2D = kl_egl_sym("glTexStorage2D");
+        }
+        uint32_t name = 0;
+        if (gl_GenTextures) gl_GenTextures(1, &name);
+        if (!name) {
+            fprintf(stderr, "  [ovrp] GetLayerTexture2(layer %d stage %d eye %d): "
+                            "glGenTextures produced no name — no GL context here\n",
+                    layer_id, stage, eye);
+            return OVRP_FAIL_NOT_INITIALIZED;
+        }
+        *slot = name;
+        // The size is the one WE put in the desc and the provider passed back
+        // through ovrp_SetupLayer, so it is used as declared — w wide, h tall.
+        // klovrp_SetupEyeTexture2 allocates its 1.28 textures TRANSPOSED, and
+        // that is not an inconsistency to fix here: there the size arrives from
+        // libunity's legacy VRDevice and the guest's own resolve blit was
+        // measured writing an (h, w) region, so the blit rect is ground truth
+        // and overrides the arguments. Here nothing else has an opinion — the
+        // provider hands this texture to Unity as desc.TextureSize — so
+        // transposing would be inventing a disagreement.
+        int w = l->desc.texture_size.w, h = l->desc.texture_size.h;
+        // The format the guest asked for in the desc, honoured. Allocating
+        // anything else is a resolve blit the driver refuses and a black eye
+        // texture with the scene fully drawn behind it (klovrp_gl_format).
+        const char *fname = NULL;
+        uint32_t glfmt = klovrp_gl_format(l->desc.format, &fname);
+        if (!glfmt) {
+            glfmt = KL_OVRP_TEXFMT_EYE;
+            fprintf(stderr, "  [ovrp] GetLayerTexture2: ovrpTextureFormat %d is not "
+                            "mapped — allocating GL %#x and saying so, because a "
+                            "format mismatch here is a silent black frame\n",
+                    l->desc.format, glfmt);
+        }
+        if (l->is_eye) {
+            kl_glfb_note_eye_texture(eye, stage, name);
+            // P5: the storage IS a compositor MTLTexture when one is on offer,
+            // exactly as in klovrp_SetupEyeTexture2.
+            if (kl_glfb_has_mtl_provider() &&
+                kl_glfb_bind_eye_mtl_texture(eye, stage, name, w, h, glfmt)) {
+                fprintf(stderr, "  [ovrp] GetLayerTexture2: eye %d stage %d = GL %u "
+                                "(MTLTexture-backed, %dx%d %s)\n",
+                        eye, stage, name, w, h, fname ? fname : "?");
+                return OVRP_SUCCESS;
+            }
+        }
+        if (gl_BindTexture && gl_TexStorage2D) {
+            gl_BindTexture(0x0DE1 /* GL_TEXTURE_2D */, name);
+            gl_TexStorage2D(0x0DE1, 1, glfmt, w, h);
+        }
+        fprintf(stderr, "  [ovrp] GetLayerTexture2: %s %d stage %d = GL %u "
+                        "(%dx%d %s / GL %#x)\n",
+                l->is_eye ? "eye" : "dummy layer", eye, stage, name, w, h,
+                fname ? fname : "?", glfmt);
+    }
+    *color = *slot;
+    return OVRP_SUCCESS;
+}
+
+// ovrp_GetLayerTextureFoveation(layerId, stage, eye, uint64_t* tex,
+//                               uint64_t* size) — real 0x16e240, which requires
+// BOTH out pointers (two consecutive `cbz`es to -1001) and, like
+// GetLayerTexture2 above, hands back 64-bit handles.
+//
+// Refused, and the refusal is the honest answer rather than a gap: this asks for
+// a fixed-foveated-rendering DENSITY MAP TEXTURE, the Qualcomm
+// QCOM_texture_foveated shape, which nothing on this host produces. Klepton
+// does foveate — an MTLRasterizationRateMap attached inside ANGLE's Metal
+// backend (KL_VRR, `make vrr`) — but that happens entirely below the guest and
+// there is no texture in it to hand out. Saying so keeps one story: we already
+// answer ovrp_GetTiledMultiResSupported false for the same reason.
+//
+// It is also a supported outcome for the caller, which is why this is a refusal
+// rather than an abort-by-name: OculusDisplayProvider::CreateTexture tests the
+// result (`cbnz w0`) and, on failure, simply does not attach a foveation texture
+// to the Unity render-texture descriptor and carries on to create it. Answering
+// SUCCESS with a zero handle would be the damaging answer — it sets the
+// descriptor's "has foveation" flag against texture id 0.
+static uint64_t klovrp_GetLayerTextureFoveation(int layer_id, int stage, int eye,
+                                                uint64_t *tex, uint64_t *size) {
+    ovrp_hit("ovrp_GetLayerTextureFoveation");
+    (void)layer_id; (void)stage; (void)eye;
+    if (!tex || !size) return OVRP_FAIL_INVALID_PARAM;
+    *tex = 0;
+    *size = 0;
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+// ---------------------------------------------------------------------------
+// The CPU/GPU performance levels — recorded, not applied
+// ---------------------------------------------------------------------------
+// OVRManager pushes a CPU and a GPU level (Quest's 0..3 clock hints) and 1.40's
+// plugin reads them back. They are RECORDED here and nothing acts on them, for
+// the same reason Process.setThreadPriority is recorded in kl_jni: Darwin sets
+// scheduling through pthread QoS on the thread itself, and there is no
+// per-app GPU clock hint at all.
+//
+// The read-back answers what the setter stored rather than a constant, because a
+// getter that disagrees with the setter is what trap 10's neighbours are made of
+// — the guest sets a level, reads a different one back, and concludes the
+// request was rejected. The un-suffixed setters go through the same store, so
+// there is one value and not two.
+//
+// The initial value is the mid level, 2, which is the Quest 2 default and
+// therefore agrees with the device we describe everywhere else. It is a
+// stand-in, and it is only ever visible in the window before the guest sets one.
+static int g_cpu_level = 2;
+static int g_gpu_level = 2;
+
+static uint64_t klovrp_SetSystemCpuLevel(int level) {
+    ovrp_hit("ovrp_SetSystemCpuLevel");
+    g_cpu_level = level;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_SetSystemCpuLevel2(int level) {
+    ovrp_hit("ovrp_SetSystemCpuLevel2");
+    g_cpu_level = level;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_GetSystemCpuLevel2(int *out) {
+    ovrp_hit("ovrp_GetSystemCpuLevel2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = g_cpu_level;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_SetSystemGpuLevel(int level) {
+    ovrp_hit("ovrp_SetSystemGpuLevel");
+    g_gpu_level = level;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_SetSystemGpuLevel2(int level) {
+    ovrp_hit("ovrp_SetSystemGpuLevel2");
+    g_gpu_level = level;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_GetSystemGpuLevel2(int *out) {
+    ovrp_hit("ovrp_GetSystemGpuLevel2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = g_gpu_level;
+    return OVRP_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// The compositor-telemetry group
+// ---------------------------------------------------------------------------
+// 1.40's plugin publishes Unity's XR stats every frame, which means asking
+// OVRPlugin how long the compositor took. There is no compositor here in the
+// sense these questions mean — no VrApi frame submission with a measured GPU
+// end and a vsync to be early or late for — so every one of them is refused
+// rather than answered with a plausible number. This is a GROUP answer on
+// purpose (CLAUDE.md's rule): a per-call mix of invented milliseconds would let
+// the guest derive a frame budget from figures that do not describe anything,
+// and the numbers would silently disagree with each other.
+//
+// The guest is built for the refusal: OculusSystem's own wrappers
+// (GetCompositorCPUTime, GetCompositorCPUStartToGPUEndTime,
+// GetGPUEndToVsyncElapsedTime) test the sign of the result and answer 0.0f when
+// it is negative, so a refusal is a path it already takes on hardware whose
+// runtime does not report these.
+//
+// Every out-param is still written before returning: a caller that ignores the
+// result and reads the slot gets a NEUTRAL value rather than whatever was on its
+// stack — 0 for a duration, and 1.0 for a SCALE, where 0 would read as "shrink
+// the render target to nothing".
+static uint64_t klovrp_GetAppCpuStartToGpuEndTime2(float *out) {
+    ovrp_hit("ovrp_GetAppCpuStartToGpuEndTime2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = 0.0f;
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+static uint64_t klovrp_GetAdaptiveGpuPerformanceScale2(float *out) {
+    ovrp_hit("ovrp_GetAdaptiveGpuPerformanceScale2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = 1.0f;                      // neutral scale — see the note above
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+// ovrp_IsPerfMetricsSupported(metric, ovrpBool* out) — real 0x1715d0, -1001 on a
+// NULL x1. Unlike the getters this one IS answerable, and the answer is false:
+// we publish no performance metrics at all, so the guest never asks for one.
+static uint64_t klovrp_IsPerfMetricsSupported(int metric, int *out) {
+    ovrp_hit("ovrp_IsPerfMetricsSupported");
+    (void)metric;
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = 0;
+    return OVRP_SUCCESS;
+}
+
+static uint64_t klovrp_GetPerfMetricsFloat(int metric, float *out) {
+    ovrp_hit("ovrp_GetPerfMetricsFloat");
+    (void)metric;
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = 0.0f;
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+// ovrp_GetAppPerfStats2(ovrpAppPerfStats* out) — real 0x171480: -1001 on NULL,
+// otherwise it memcpy's **292 bytes (0x124)** into the caller's buffer and
+// returns 0. That length is the one thing here worth taking from the
+// disassembly rather than from a struct definition, because it is what makes
+// zeroing the buffer safe: the caller memsets the same 292 bytes before the
+// call, then reads an int at +0x120 and uses it to index 0x38-byte entries from
+// the base, so an all-zero block is a coherent "no frame statistics", not a
+// half-written one.
+//
+// Refused for the same reason as the rest of the telemetry group, and the
+// caller's own wrapper answers 0.0f on a negative result. Distinct from
+// ovrp_GetAppPerfStats (the un-numbered 1.28 form), which is not an out-param
+// call at all — libunity reads the RETURNED pointer there.
+#define KLOVRP_APP_PERF_STATS_BYTES 292
+static uint64_t klovrp_GetAppPerfStats2(void *out) {
+    ovrp_hit("ovrp_GetAppPerfStats2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    memset(out, 0, KLOVRP_APP_PERF_STATS_BYTES);
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+static uint64_t klovrp_GetPerfMetricsInt(int metric, int *out) {
+    ovrp_hit("ovrp_GetPerfMetricsInt");
+    (void)metric;
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = 0;
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+// ovrp_GetViewportStencil(eye, type, ovrpVector2f* verts, int* vertexCount,
+//                         uint16_t* indices, int* indexCount) — real 0x171bf0,
+// whose register shuffle (x5->x7, x4->x6, x3->x5, x2->x4, w1->w2, w0->w1) is
+// what fixes this order. The provider calls it twice per eye from
+// SetupOcclusionMesh: once with NULL buffers to size them, then with buffers.
+//
+// Refused, for the same reason ovrp_GetEyeOcclusionMesh already answers false:
+// the viewport stencil is the headset's own hidden-area mesh, a property of a
+// physical lens assembly that is not here. There is nothing to hand over and
+// nothing to derive it from, and SetupOcclusionMesh tests the sign of the result
+// (`tbnz w0, #0x1f`) before touching the counts, so a refusal is a path the
+// guest already has.
+static uint64_t klovrp_GetViewportStencil(int eye, int type, void *verts,
+                                          int *vertex_count, void *indices,
+                                          int *index_count) {
+    ovrp_hit("ovrp_GetViewportStencil");
+    (void)eye; (void)type; (void)verts; (void)indices;
+    // Zeroed as well as refused: the guest allocates from these counts on the
+    // success path, and a stale count next to a failure is the shape that turns
+    // one wrong branch into an allocation.
+    if (vertex_count) *vertex_count = 0;
+    if (index_count)  *index_count  = 0;
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+// ovrp_CalculateEyeViewportRect(const ovrpLayerDesc*, ovrpEye, ovrpRecti* out,
+//                               float scale) — real 0x16e730, -1001 on a NULL
+// x2, scale in s0. The viewport an eye occupies inside the layer's texture.
+//
+// One eye per texture in every layout this guest asks for (Stereo gives two
+// separate textures, Array two slices), so the eye's viewport is the whole
+// thing — scaled by the render-viewport scale the caller passes, which is how
+// Unity's dynamic resolution reaches the layer.
+static uint64_t klovrp_CalculateEyeViewportRect(const ovrp_layer_desc_eyefov *desc,
+                                                int eye, ovrp_recti *out, float scale) {
+    ovrp_hit("ovrp_CalculateEyeViewportRect");
+    (void)eye;
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    int w = desc ? desc->texture_size.w : 0, h = desc ? desc->texture_size.h : 0;
+    if (!(scale > 0.0f) || scale > 1.0f) scale = 1.0f;
+    w = (int)((float)w * scale);
+    h = (int)((float)h * scale);
+    *out = (ovrp_recti){ 0, 0, w > 0 ? w : 1, h > 0 ? h : 1 };
+    return OVRP_SUCCESS;
+}
+
+// ovrp_CalculateEyePreviewRect(const ovrpLayerDesc*, ovrpEye, const ovrpRecti*
+//                              viewport, ovrpRectf* out) — real 0x16e810,
+// -1001 on a NULL x3, and it writes 16 bytes (`stp x8, x1, [x19]`), i.e. four
+// floats. The viewport expressed in the texture's normalised space, which for a
+// viewport that IS the texture is the unit rect.
+static uint64_t klovrp_CalculateEyePreviewRect(const ovrp_layer_desc_eyefov *desc,
+                                               int eye, const ovrp_recti *viewport,
+                                               ovrp_rectf *out) {
+    ovrp_hit("ovrp_CalculateEyePreviewRect");
+    (void)eye;
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    float x = 0.0f, y = 0.0f, w = 1.0f, h = 1.0f;
+    if (desc && viewport && desc->texture_size.w > 0 && desc->texture_size.h > 0) {
+        float tw = (float)desc->texture_size.w, th = (float)desc->texture_size.h;
+        x = (float)viewport->x / tw;
+        y = (float)viewport->y / th;
+        w = (float)viewport->w / tw;
+        h = (float)viewport->h / th;
+    }
+    *out = (ovrp_rectf){ x, y, w, h };
+    return OVRP_SUCCESS;
 }
 
 // The other half of SetupEyeTexture2, and for a long time a no-op — which is
@@ -2645,6 +3568,8 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetSystemProductName", (void *)klovrp_GetSystemProductName},
     {"ovrp_GetSystemProductName2", (void *)klovrp_GetSystemProductName2},
     {"ovrp_GetSystemDisplayFrequency", (void *)klovrp_GetSystemDisplayFrequency},
+    {"ovrp_GetSystemDisplayFrequency2", (void *)klovrp_GetSystemDisplayFrequency2},
+    {"ovrp_SetSystemDisplayFrequency", (void *)klovrp_SetSystemDisplayFrequency},
     {"ovrp_GetEyeTextureSize", (void *)klovrp_GetEyeTextureSize},
     {"ovrp_GetEyeTextureStageCount", (void *)klovrp_GetEyeTextureStageCount},
     {"ovrp_GetDesiredEyeTextureFormat", (void *)klovrp_GetDesiredEyeTextureFormat},
@@ -2665,6 +3590,33 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetNodePoseState", (void *)klovrp_GetNodePoseState_entry},
     {"ovrp_GetNodePoseState3", (void *)klovrp_GetNodePoseState3},
     {"ovrp_WaitToBeginFrame", (void *)klovrp_WaitToBeginFrame},
+    // The 1.40 layer family — see the block comment above klovrp_fill_eye_desc.
+    {"ovrp_CalculateEyeLayerDesc2", (void *)klovrp_CalculateEyeLayerDesc2},
+    {"ovrp_CalculateEyeLayerDesc3", (void *)klovrp_CalculateEyeLayerDesc3},
+    {"ovrp_CalculateLayerDesc", (void *)klovrp_CalculateLayerDesc},
+    {"ovrp_SetupLayer", (void *)klovrp_SetupLayer},
+    {"ovrp_DestroyLayer", (void *)klovrp_DestroyLayer},
+    {"ovrp_GetLayerTextureStageCount", (void *)klovrp_GetLayerTextureStageCount},
+    {"ovrp_GetLayerTexture2", (void *)klovrp_GetLayerTexture2},
+    {"ovrp_GetLayerTextureFoveation", (void *)klovrp_GetLayerTextureFoveation},
+    {"ovrp_GetViewportStencil", (void *)klovrp_GetViewportStencil},
+    {"ovrp_EndFrame4", (void *)klovrp_EndFrame4},
+    {"ovrp_Update3", (void *)klovrp_Update3},
+    {"ovrp_GetUserIPD2", (void *)klovrp_GetUserIPD2},
+    {"ovrp_GetAppCpuStartToGpuEndTime2", (void *)klovrp_GetAppCpuStartToGpuEndTime2},
+    {"ovrp_GetAdaptiveGpuPerformanceScale2", (void *)klovrp_GetAdaptiveGpuPerformanceScale2},
+    {"ovrp_IsPerfMetricsSupported", (void *)klovrp_IsPerfMetricsSupported},
+    {"ovrp_GetPerfMetricsFloat", (void *)klovrp_GetPerfMetricsFloat},
+    {"ovrp_GetPerfMetricsInt", (void *)klovrp_GetPerfMetricsInt},
+    {"ovrp_GetAppPerfStats2", (void *)klovrp_GetAppPerfStats2},
+    {"ovrp_SetSystemCpuLevel", (void *)klovrp_SetSystemCpuLevel},
+    {"ovrp_SetSystemCpuLevel2", (void *)klovrp_SetSystemCpuLevel2},
+    {"ovrp_GetSystemCpuLevel2", (void *)klovrp_GetSystemCpuLevel2},
+    {"ovrp_SetSystemGpuLevel", (void *)klovrp_SetSystemGpuLevel},
+    {"ovrp_SetSystemGpuLevel2", (void *)klovrp_SetSystemGpuLevel2},
+    {"ovrp_GetSystemGpuLevel2", (void *)klovrp_GetSystemGpuLevel2},
+    {"ovrp_CalculateEyeViewportRect", (void *)klovrp_CalculateEyeViewportRect},
+    {"ovrp_CalculateEyePreviewRect", (void *)klovrp_CalculateEyePreviewRect},
     {"ovrp_GetAppPerfStats", (void *)klovrp_GetAppPerfStats},
     {"ovrp_GetBoundaryDimensions", (void *)klovrp_GetBoundaryDimensions},
     {"ovrp_GetControllerState2", (void *)klovrp_GetControllerState2_entry},
@@ -2741,17 +3693,8 @@ static const char *const g_ovrp_result_ok[] = {
     // Pushed by the C# side despite GetDepthCompositingSupported=0; recorded
     // state, like the other setters.
     "ovrp_SetDepthProjInfo",
-    // Performance-level hints from OVRManager; recorded, not applied — same
-    // class as Process.setThreadPriority in kl_jni.
-    "ovrp_SetSystemCpuLevel", "ovrp_SetSystemGpuLevel",
     // Color-space hints from the C# side; recorded state, like the setters.
     "ovrp_SetClientColorDesc",
-    // Layer teardown the guest issues on reconfigure/shutdown (likely paired
-    // with a layer it never explicitly created on this path — nothing in the
-    // guest aborted on a setup call, so no layer state is tracked here to
-    // contradict). Real 0x16e400 takes the layer id in w0 and clamps any
-    // negative result to 0. Scalar, no out-param.
-    "ovrp_DestroyLayer",
     // Audio device ids — PC-legacy queries; NULL until the guest proves it
     // dereferences the answer. The ...2 forms are scalar int returns (the real
     // 0x16db20 NULL-checks its first arg and clamps a negative getter result
@@ -2763,6 +3706,32 @@ static const char *const g_ovrp_result_ok[] = {
     "ovrp_Media_Initialize", "ovrp_Media_SetMrcAudioSampleRate",
     "ovrp_Media_SetMrcInputVideoBufferType", "ovrp_Media_GetMrcInputVideoBufferType",
     "ovrp_Media_SetMrcActivationMode",
+    // The display-object / distortion-window lifecycle. These sat in
+    // g_ovrp_bool_yes until 1.40, under the reasoning that libunity's legacy
+    // VRDevice ignores the return and 1 is consistent with the other
+    // "it worked" answers. Ignored is not the same as unread, and **1.40 reads
+    // it**: `OculusDisplayProvider::CreateMobileDisplayObjects` does
+    // `cbnz w0 -> "Failed Oculus context setup: %d"` on the result of
+    // ovrp_SetupDisplayObjects2 and returns failure, `GfxThread_Start` bails on
+    // that, and Unity answers by stopping the display subsystem — which is why
+    // the whole 1.40 XR path was one GfxThread_Start immediately followed by
+    // GfxThread_Stop, with nothing in between and no error anywhere.
+    // **Trap 10, in the same subsystem, six months later.**
+    //
+    // The convention is not a guess: the real libOVRPlugin.so in this APK ends
+    // every one of these with `cmp w0, #0 / csel w0, w0, wzr, lt` and returns
+    // -1001/-1002 for bad-parameter / not-initialized, i.e. plain ovrpResult
+    // where success is 0 and only negatives are failures. Read it there rather
+    // than inferring it from what a caller does with it — a caller that ignores
+    // the value cannot tell you which value means yes.
+    //
+    // Un-suffixed and numbered forms are both listed rather than matched by
+    // prefix, for the reason trap 10 exists: a numbered suffix marks an ABI
+    // revision, and returning something different under a familiar name is
+    // exactly the failure being fixed here.
+    "ovrp_SetupDistortionWindow", "ovrp_SetupDistortionWindow3",
+    "ovrp_SetupDisplayObjects", "ovrp_SetupDisplayObjects2",
+    "ovrp_DestroyDistortionWindow", "ovrp_DestroyDistortionWindow2",
 };
 
 static const char *const g_ovrp_bool_yes[] = {
@@ -2791,17 +3760,6 @@ static const char *const g_ovrp_bool_yes[] = {
     "ovrp_GetInitialized",
     // Agrees with ovrp_Media_Initialize's success above.
     "ovrp_Media_GetInitialized",
-    // Setup calls whose return the guest ignores (0x9bba0c, 0x9bcd5c); 1 for
-    // consistency with the other "it worked" answers.
-    // The un-suffixed form is the OVRP_0_1_x shape that Unity 2018.4 (Beat
-    // Saber 1.6.0) calls where 2019.4 calls ...3 -- same call, same answer.
-    // Both are listed rather than matched by prefix: OVRPlugin's numbered
-    // suffixes mark ABI revisions, and trap 10's whole shape is a numbered
-    // variant that returns something DIFFERENT under a familiar name.
-    "ovrp_SetupDistortionWindow", "ovrp_SetupDistortionWindow3",
-    "ovrp_SetupDisplayObjects", "ovrp_SetupDisplayObjects2",
-    // ...and the teardown mirror, same lifecycle, same ignored return.
-    "ovrp_DestroyDistortionWindow", "ovrp_DestroyDistortionWindow2",
 };
 
 static const char *const g_ovrp_bool_no[] = {
