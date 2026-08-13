@@ -47,7 +47,7 @@ STAMP_DIR="build/staged"
 # had ever staged this target — a shell that aborts with `Could not find the Qt
 # platform plugin "virtual"` and a run.sh that says the assets are already
 # there. Bump this whenever stage_assets.sh stages something new.
-STAGE_SCHEMA=2
+STAGE_SCHEMA=3
 stage_stamp() {   # <target-key>
   local apk="../$KLT_APK" sig=""
   [ -f "$apk" ] && sig=$(stat -f '%z-%m' "$apk" 2>/dev/null || true)
@@ -55,6 +55,15 @@ stage_stamp() {   # <target-key>
        | tr -c 'A-Za-z0-9._-' '_')"
 }
 # stage_if_needed <target-key> <stage_assets.sh args...>
+#
+# The metadata beside assets/ — apktool.yml, AndroidManifest.xml — goes across
+# on EVERY run, outside the stamp and outside KL_SKIP_STAGE. 12 KB against the
+# 2.2 GB the gate exists for, and gating them with the rest is how a device
+# ended up carrying the right 1.3 GB OBB while the guest asked for 1.28's
+# versionCode: the fix was in the build, the file was on the device, and the
+# device loop runs KL_SKIP_STAGE=1 as a matter of course, so nothing ever
+# re-staged. Non-fatal on its own — a container that is not there yet is the
+# full stage's report to make, not this one's.
 stage_if_needed() {
   local key="$1"; shift
   local stamp; stamp=$(stage_stamp "$key")
@@ -65,7 +74,9 @@ stage_if_needed() {
   else
     ./stage_assets.sh "$@"
     mkdir -p "$STAMP_DIR" && : > "$stamp"
+    return 0
   fi
+  ./stage_assets.sh --meta "$@" || echo "  metadata: could not stage (see above)"
 }
 
 # Knobs forwarded from this shell into the app, on both the device and simulator

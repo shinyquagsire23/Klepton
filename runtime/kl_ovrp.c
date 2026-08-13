@@ -64,8 +64,17 @@ static uint64_t klovrp_called(const char *name) {
             fprintf(stderr, "  [ovrp] call (permissive, returning 0): %s\n", name);
         return 0;
     }
+    // Named WITH ITS CALLER. Every other entry point in this file is reached
+    // from libunity or libOculusXRPlugin, and the one time that was not true it
+    // cost a session: 1.40's libhaptics_sdk resolves two of these itself, on its
+    // own thread, and the report said only which name it was — so "the viewer
+    // crashes when a menu button highlights" and "the haptics SDK wants the PCM
+    // API" had nothing joining them.
+    size_t off = 0;
+    const char *img = kl_addr_image(__builtin_return_address(0), &off);
     fprintf(stderr, "\n[klepton] fatal: guest called unimplemented OVRPlugin entry "
-                    "point '%s'\n", name);
+                    "point '%s', from %s+0x%zx\n",
+            name, img ? img : "?", off);
     kl_ovrp_report(stderr);
     kl_fatal_prepare();
     abort();
@@ -240,14 +249,34 @@ static uint64_t klovrp_no(const char *name) {
 // (strings(1) reports 1.60.0; the package is ovrplugin-android-universal:28.0.0)
 // rather than picked: the guest's managed side was compiled against that plugin,
 // so any other number invites it down a path its own C# does not match.
+#define KLOVRP_VERSION "1.60.0"
+
 static const char *klovrp_GetVersion(void) {
     ovrp_hit("ovrp_GetVersion");
-    return "1.60.0";
+    return KLOVRP_VERSION;
 }
 
-static const char *klovrp_GetVersion2(void) {
+// **The 2-form is not the same function with a different name.** Real
+// ovrp_GetVersion2 (+0x16d970) is `ovrpResult ovrp_GetVersion2(const char **)`:
+// it `cbz x0` -> -1001, stores the string through `[x0]`, and returns 0. The
+// un-suffixed one at +0x175ab0 is a WRAPPER around it — a stack slot, a call,
+// and `csel x0, xzr, x8, lt` — which is what makes that one a scalar return.
+// This is exactly the convention klovrp_GetSystemProductName2 already documents
+// two hundred lines down, and this entry point was written the other way.
+//
+// Answering in x0 costs nothing where the CALLER also ignores it — libunity and
+// libOculusXRPlugin go through the C# `ovrp_GetVersion`, so it read correctly
+// for the whole project. **1.40's libhaptics_sdk calls the 2-form directly**,
+// from native Rust, and then `strlen`s what it believes we wrote: an
+// uninitialised stack slot, in practice NULL. That is a SIGSEGV at 0x0 inside
+// `_platform_strlen` with one guest frame above it and nothing naming haptics,
+// the version, or this function — and it only became reachable once the PCM
+// entry points stopped aborting first.
+static uint64_t klovrp_GetVersion2(const char **out) {
     ovrp_hit("ovrp_GetVersion2");
-    return "1.60.0";
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = KLOVRP_VERSION;
+    return OVRP_SUCCESS;
 }
 
 // ovrpSystemHeadset. The value is read out of the guest's own IL2CPP metadata
@@ -1365,6 +1394,12 @@ static uint64_t klovrp_begin_frame_impl(int guest_frame_index) {
     // rendered with the old field of view must keep being placed with the old
     // field of view, or it is resized by a change that happened after it.
     memcpy(r->tangents, g_eye_tan, sizeof r->tangents);
+    // Cleared, not carried: the render viewport is a per-frame statement the
+    // guest makes at EndFrame4, and a rect left over from the previous frame
+    // would keep cropping after the guest stopped asking for it. Zero reads as
+    // "the whole texture" everywhere (kl_ovrp.h).
+    memset(r->viewport, 0, sizeof r->viewport);
+    memset(r->viewport_of, 0, sizeof r->viewport_of);
     r->serial = s;
     r->stage = -1;
     r->complete = 0;
@@ -1411,7 +1446,21 @@ static uint64_t klovrp_BeginFrame4(int guest_frame_index, uint64_t extra) {
 // then "corrects" by a delta that was never real. Where the observation is
 // unavailable — the null GL driver, `make check`, any run without KL_GLFB —
 // the counter is still the fallback, and with a single stage it is exact.
-static uint64_t klovrp_end_frame_impl(int guest_frame_index) {
+// The eye layer's ViewportRect pair out of an ovrpLayerSubmit array, as eight
+// ints {x,y,w,h} per eye. Defined with the layer family below, where every
+// other ABI this guest's display provider speaks is transcribed. Returns 0 and
+// leaves `vp` alone when there is nothing to read.
+static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[8],
+                                   int of[2]);
+
+// `viewports` is that pair, or NULL where a caller cannot know — ovrp_EndFrame
+// (1.28's legacy VRDevice, which has no layers at all) and every non-Unity
+// guest. NULL leaves the record's zeroes in place, i.e. "the whole texture".
+// `viewport_of` is the texture size those rects are relative to, and travels
+// with them for the reason kl_ovrp.h gives: separately they can drift, and the
+// drift is a wrong picture with nothing reporting it.
+static uint64_t klovrp_end_frame_impl(int guest_frame_index, const int *viewports,
+                                      const int *viewport_of) {
     // Close the observation window opened at BeginFrame. `observed` is still
     // the sticky answer; `mask`/`binds` are what say whether it belongs to this
     // frame, and they are the difference between an association that is known
@@ -1500,6 +1549,14 @@ static uint64_t klovrp_end_frame_impl(int guest_frame_index) {
     // records, so the old behaviour is preserved rather than reasoned about.
     int drop = binds == 0 && observed >= 0;
     pthread_mutex_lock(&g_frames.mu);
+    // Before the record is filed, and into the same record: the viewport
+    // describes THIS frame's picture exactly as the pose and the tangents do,
+    // and a compositor that reads one from the stage ring and the other from a
+    // global would crop frame N's picture by frame N+1's rect on any run where
+    // the guest changes it — which is the moment this exists for.
+    if (viewports) memcpy(g_frames.pending.viewport, viewports, sizeof g_frames.pending.viewport);
+    if (viewport_of) memcpy(g_frames.pending.viewport_of, viewport_of,
+                            sizeof g_frames.pending.viewport_of);
     if (g_frames.serial && !drop) {
         // In order of how much the answer is *known*:
         //   the window saw exactly one stage      — measured, this frame's
@@ -1568,7 +1625,10 @@ static uint64_t klovrp_end_frame_impl(int guest_frame_index) {
 // actually hit.
 static uint64_t klovrp_EndFrame(int guest_frame_index) {
     ovrp_hit("ovrp_EndFrame");
-    return klovrp_end_frame_impl(guest_frame_index);
+    // No layer list on this path — 1.28's legacy VRDevice hands its eye
+    // textures down through ovrp_SetupEyeTexture2 and never describes a layer,
+    // so it can only ever have rendered into the whole thing.
+    return klovrp_end_frame_impl(guest_frame_index, NULL, NULL);
 }
 
 // ovrp_EndFrame4(frameIndex, layerSubmits, layerSubmitCount, sync) — the 1.40
@@ -1577,7 +1637,12 @@ static uint64_t klovrp_EndFrame(int guest_frame_index) {
 // guest naming which layers it just filled; we know which stage it drew into
 // from the observation window that BeginFrame opened, which is a stronger
 // statement than the list (it is what the GL side actually saw), so the list is
-// named and dropped rather than parsed.
+// not what the STAGE comes from.
+//
+// It is read for one thing, and it is the only place that thing is stated: the
+// per-eye **ViewportRect**, i.e. how much of the eye texture the guest actually
+// drew into this frame. See kl_ovrp_render_pose.viewport — a title lowering its
+// render resolution does it here, not by resizing anything.
 //
 // **On this path `frameIndex % stages` is NOT the stage**, and the report says so
 // loudly: a 9000-frame 1.40 run counts 8786 "the guest's frame index disagreed".
@@ -1592,7 +1657,10 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
     ovrp_hit("ovrp_EndFrame4");
     (void)sync;
     if (!layer_submits && layer_submit_count) return OVRP_FAIL_INVALID_PARAM;
-    return klovrp_end_frame_impl(guest_frame_index);
+    int vp[8], of[2] = { 0, 0 };
+    int have = klovrp_submit_viewports(layer_submits, layer_submit_count, vp, of);
+    return klovrp_end_frame_impl(guest_frame_index, have ? vp : NULL,
+                                 have ? of : NULL);
 }
 
 int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out) {
@@ -2363,7 +2431,11 @@ static int klovrp_hap_hands(int mask) {
     return hands;
 }
 
-static void klovrp_hap_enqueue(int hand, const uint8_t *s, int n) {
+// Returns how many of the n samples were TAKEN. Every caller but one ignores
+// that — the buffered API tells the guest how much room there is beforehand and
+// a shortfall there means it ignored the answer. The PCM API below is the one
+// where a partial take is the normal case and has to be reported back.
+static int klovrp_hap_enqueue(int hand, const uint8_t *s, int n) {
     struct klovrp_haptics *h = &g_hap[hand];
     double now = klovrp_mono();
     pthread_mutex_lock(&h->mu);
@@ -2382,6 +2454,18 @@ static void klovrp_hap_enqueue(int hand, const uint8_t *s, int n) {
         fprintf(stderr, "  [ovrp] haptics: hand %d queue full, dropped %d "
                         "sample(s) — the guest ignored SamplesAvailable\n",
                 hand, dropped);
+    return n - dropped;
+}
+
+// Drop whatever is still queued for a hand. The PCM API's Append=false means
+// "this is a new stream", which is a REPLACE and not an append — a clip that
+// starts while the last one is still draining must not be heard behind it.
+static void klovrp_hap_clear(int hand) {
+    struct klovrp_haptics *h = &g_hap[hand];
+    pthread_mutex_lock(&h->mu);
+    h->count = 0;
+    h->t_head = klovrp_mono();
+    pthread_mutex_unlock(&h->mu);
 }
 
 // (mask = w0, HapticsBuffer by value = x1/x2). The buffer is
@@ -2413,6 +2497,127 @@ static uint64_t klovrp_SetControllerHaptics(int mask, const void *samples,
     if (hands & 1) klovrp_hap_enqueue(0, samples, n);
     if (hands & 2) klovrp_hap_enqueue(1, samples, n);
     return 1;
+}
+
+// --- The PCM path, which is 1.40's and is a THIRD producer for this queue ----
+//
+// Beat Saber 1.40 ships `libhaptics_sdk.so` — Meta's Haptics SDK, a Rust engine
+// with its own player thread — and that library does not go through OVRHaptics
+// at all. It dlopens libOVRPlugin.so and resolves exactly two entry points by
+// name (they are in its strings, beside "Initializing OVRPlugin backend...",
+// "Starting playback at Hz on location" and "Only samples were consumed!"):
+// ovrp_GetControllerSampleRateHz and ovrp_SetControllerHapticsPcm. Both were
+// resolved and neither was implemented, so the FIRST haptic effect the game
+// plays — the pulse a menu button makes when the pointer highlights it — hit
+// the abort-by-name path, on the SDK's own thread. That reads as "the viewer
+// crashes when you hover a button" and names nothing about haptics.
+//
+// **The signatures are read out of the real libOVRPlugin.so in this APK**, not
+// transcribed from a header, because a shim entry is an unchecked contract
+// (trap 6b) and this one carries two pointers:
+//
+//   ovrp_GetControllerSampleRateHz  (+0x16fef0): w0 = controller, x1 = float*.
+//       `cbz x1` -> -1001, so the out pointer is x1 and nothing else is read.
+//   ovrp_SetControllerHapticsPcm    (+0x16fd70): w0 = controller, x1 = a
+//       32-byte struct BY REFERENCE (AAPCS64: composites over 16 bytes are
+//       passed as a pointer to a copy). It tests [x1+0x8] and [x1+0x18] for
+//       NULL and copies the whole 32 bytes with `ldp q0,q1,[x1]`, which fixes
+//       the layout as
+//           +0x00 uint32 BufferSize     (+4 padding)
+//           +0x08 const float *Buffer
+//           +0x10 float  SampleRateHz
+//           +0x14 ovrpBool Append
+//           +0x18 uint32 *SamplesConsumed
+//       — the C# HapticsPcmVibration, field for field.
+//
+// Two things make this fold into the existing queue rather than needing a
+// fourth source next to vib_amp/xr_amp (kl_ovrp.h): the samples are the same
+// quantity — an amplitude envelope — and the RATE is ours to choose, because
+// the SDK asks for it first and then sends at whatever we answered. Answering
+// KLOVRP_HAP_RATE makes the resample below an identity in the case that
+// actually happens, and keeps one playback model for all of them.
+#define KLOVRP_PCM_MAX 4000            // OVRP_MAX_HAPTICS_PCM_BUFFER_SIZE
+
+static uint64_t klovrp_GetControllerSampleRateHz(int controller, float *out) {
+    ovrp_hit("ovrp_GetControllerSampleRateHz");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    (void)controller;                            // one controller model, both hands
+    *out = (float)KLOVRP_HAP_RATE;
+    return OVRP_SUCCESS;
+}
+
+static uint64_t klovrp_SetControllerHapticsPcm(int controller, const void *vib) {
+    ovrp_hit("ovrp_SetControllerHapticsPcm");
+    if (!vib) return OVRP_FAIL_INVALID_PARAM;
+    const uint8_t *v = vib;
+    uint32_t      n_in     = *(const uint32_t *)(v + 0x00);
+    const float  *buffer   = *(const float *const *)(v + 0x08);
+    float         rate     = *(const float *)(v + 0x10);
+    int           append   = v[0x14] != 0;       // ovrpBool; a byte either way
+    uint32_t     *consumed = *(uint32_t *const *)(v + 0x18);
+    // The real plugin refuses both of these outright, so a caller cannot be
+    // relying on either being optional.
+    if (!buffer || !consumed) return OVRP_FAIL_INVALID_PARAM;
+    if (n_in > KLOVRP_PCM_MAX) n_in = KLOVRP_PCM_MAX;
+
+    // Ring slots per input sample. The SDK asked us for the rate and sends at
+    // it, so this is 1.0 in every run that has happened; the mapping exists so
+    // that a caller which sends at some other rate is played at the right SPEED
+    // rather than at the wrong one silently.
+    if (!(rate > 0.0f)) rate = (float)KLOVRP_HAP_RATE;
+    uint8_t  ring[KLOVRP_HAP_MAX];
+    long     n_ring = lrintf((float)n_in * (float)KLOVRP_HAP_RATE / rate);
+    if (n_ring > KLOVRP_HAP_MAX) n_ring = KLOVRP_HAP_MAX;
+    if (n_ring < 0) n_ring = 0;
+    for (long j = 0; j < n_ring; j++) {
+        long  i = (long)((double)j * rate / KLOVRP_HAP_RATE);
+        if (i >= (long)n_in) i = (long)n_in - 1;
+        float a = i >= 0 ? buffer[i] : 0.0f;
+        a = a < 0.0f ? 0.0f : a > 1.0f ? 1.0f : a;
+        ring[j] = (uint8_t)lrintf(a * 255.0f);
+    }
+
+    int hands = klovrp_hap_hands(controller);
+    if (!hands) { *consumed = 0; return OVRP_SUCCESS; }
+    if (!append) {
+        if (hands & 1) klovrp_hap_clear(0);
+        if (hands & 2) klovrp_hap_clear(1);
+    }
+    // Both hands take the same buffer, so what was consumed is what the
+    // FULLER queue could take — reporting the other hand's would ask the guest
+    // to re-send samples one hand already has.
+    int took = (int)n_ring;
+    if (hands & 1) { int t = klovrp_hap_enqueue(0, ring, (int)n_ring); if (t < took) took = t; }
+    if (hands & 2) { int t = klovrp_hap_enqueue(1, ring, (int)n_ring); if (t < took) took = t; }
+
+    // Back in the caller's OWN sample units, not ring slots. The SDK logs
+    // "Only N samples were consumed!" and re-sends the rest, so this number is
+    // load-bearing rather than informational — and taking the whole buffer is
+    // reported as the whole buffer rather than as whatever the rate conversion
+    // rounds to. The live rate is 2000 Hz in batches of 72 against our 320, so
+    // one ring slot is 6.25 of the caller's samples and the rounding is worth
+    // several of them; a short answer there asks it to re-send samples the hand
+    // has already been given.
+    uint32_t took_in = (took >= n_ring)
+        ? n_in
+        : (uint32_t)((double)took * rate / KLOVRP_HAP_RATE + 0.5);
+    if (took_in > n_in) took_in = n_in;
+    *consumed = took_in;
+
+    if (klovrp_hap_trace()) {
+        static int said;
+        float lo = 1.0f, hi = 0.0f;
+        for (uint32_t i = 0; i < n_in; i++) {
+            if (buffer[i] < lo) lo = buffer[i];
+            if (buffer[i] > hi) hi = buffer[i];
+        }
+        fprintf(stderr, "  [ovrp] haptics: SetControllerHapticsPcm(ctrl=0x%x) %u "
+                        "sample(s) @ %.1f Hz, %s, %.2f..%.2f -> %ld ring, %u consumed%s\n",
+                (unsigned)controller, n_in, (double)rate,
+                append ? "append" : "replace", (double)lo, (double)hi, n_ring, took_in,
+                said++ ? "" : "  <- libhaptics_sdk's PCM path, 1.40's own");
+    }
+    return OVRP_SUCCESS;
 }
 
 // The legacy level API: (mask = w0, frequency = s0, amplitude = s1), ovrpBool.
@@ -2852,12 +3057,127 @@ static struct klovrp_layer {
     int      used;                                // this slot has been set up before
 } g_layers[KLOVRP_MAX_LAYERS];
 static int g_next_layer_id = 1;
+// The size the eye storage currently IS, as opposed to what any layer's desc
+// says it should be. There is one set of eye textures for the whole process —
+// kl_glfb keys them by (eye, stage) — so this is a property of the runtime and
+// not of a layer, which is exactly why a per-layer desc could not express it.
+// 0 until the first eye texture is handed out. See klovrp_SetupLayer.
+static int g_eye_storage_w, g_eye_storage_h;
 
 static struct klovrp_layer *klovrp_layer(int id) {
     if (id <= 0) return NULL;
     for (int i = 0; i < KLOVRP_MAX_LAYERS; i++)
         if (g_layers[i].id == id) return &g_layers[i];
     return NULL;
+}
+
+// ---------------------------------------------------------------------------
+// ovrpLayerSubmit — what ovrp_EndFrame4 is handed, and where the render
+// viewport is stated
+// ---------------------------------------------------------------------------
+// **This layout is not inferred.** libOculusXRPlugin.so in this APK ships with
+// DWARF, so the struct is read out of the guest's own debug info rather than
+// guessed from a caller's stores:
+//
+//     0x00 int          LayerId
+//     0x04 int          TextureStage
+//     0x08 ovrpRecti    ViewportRect[2]        <-- what this exists for
+//     0x28 ovrpPosef    Pose
+//     0x44 int          LayerSubmitFlags
+//     0x48 ovrpVector4f ColorScale
+//     0x58 ovrpVector4f ColorOffset
+//     0x68 ovrpBool     OverrideTextureRectMatrix
+//     0x6c ovrpTextureRectMatrixf TextureRectMatrix
+//     ...                                       (0xbc total)
+//
+// and ovrpRecti is {ovrpVector2i Pos; ovrpSizei Size;}, four ints, 0x10 bytes.
+// `OculusDisplayProvider::SubmitFrame` then confirms it from the other side:
+// it stores the two rects at submit+0x08 and submit+0x18, the identity Pose at
+// +0x28, and the flags at +0x44, which pins every offset above twice over.
+//
+// **Where the rect comes from, and why it is the resolution knob.** In
+// `OculusDisplayProvider::CreateLayer` the provider takes Unity's
+// `renderViewportScale` out of the UnityXRFrameSetupHints (+0xc) and calls
+// `OculusSystem::SetRenderViewportScale(desc, eye, scale, &rect)` once per eye
+// — which is nothing but a forwarding wrapper around our own
+// ovrp_CalculateEyeViewportRect, whose answer is `{0, 0, w*scale, h*scale}`.
+// It caches both rects and submits them here, every frame. So the guest asks
+// US where to render, renders exactly there, tells us it did — and until this
+// was parsed, all three of those succeeded and the compositor still sampled
+// the whole texture.
+//
+// Overlay layers (a second submit) are ignored on purpose: only the eye layer
+// describes the picture the compositor reprojects, and it is identified by the
+// id we handed out at ovrp_SetupLayer rather than by position in the list.
+typedef struct {
+    int        layer_id;      // +0x00
+    int        texture_stage; // +0x04
+    ovrp_recti viewport[2];   // +0x08
+    // The rest is read by nobody here; it is named so the size assert below is
+    // a real check on the layout rather than on a prefix of it.
+    float      pose[7];       // +0x28 ovrpPosef {Orientation xyzw, Position xyz}
+    int        submit_flags;  // +0x44
+    float      color_scale[4];   // +0x48
+    float      color_offset[4];  // +0x58
+    int        override_texture_rect_matrix; // +0x68
+    float      texture_rect_matrix[16];      // +0x6c
+    int        override_per_layer_color;     // +0xac
+    int        has_blend_factors;            // +0xb0
+    int        src_blend_factor;             // +0xb4
+    int        dst_blend_factor;             // +0xb8
+} ovrp_layer_submit;                         //  = 0xbc
+
+_Static_assert(offsetof(ovrp_layer_submit, viewport) == 0x08, "submit");
+_Static_assert(offsetof(ovrp_layer_submit, pose) == 0x28, "submit");
+_Static_assert(offsetof(ovrp_layer_submit, submit_flags) == 0x44, "submit");
+_Static_assert(offsetof(ovrp_layer_submit, override_texture_rect_matrix) == 0x68, "submit");
+_Static_assert(offsetof(ovrp_layer_submit, dst_blend_factor) == 0xb8, "submit");
+_Static_assert(sizeof(ovrp_layer_submit) == 0xbc, "submit");
+_Static_assert(sizeof(ovrp_recti) == 0x10, "recti");
+
+// See the forward declaration beside klovrp_end_frame_impl.
+//
+// The argument is an array of POINTERS to submits (`const ovrpLayerSubmit* const*`),
+// which is the one part of this a struct layout cannot tell you and the
+// signature can.
+// `of` takes the layer's texture size — the size the rects are relative to.
+// A rect in pixels means nothing without it (kl_ovrp.h, viewport_of).
+static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[8],
+                                   int of[2]) {
+    const ovrp_layer_submit *const *list = layer_submits;
+    if (!list || count <= 0) return 0;
+    for (int i = 0; i < count; i++) {
+        const ovrp_layer_submit *s = list[i];
+        if (!s) continue;
+        struct klovrp_layer *l = klovrp_layer(s->layer_id);
+        if (!l || !l->is_eye) continue;
+        for (int eye = 0; eye < 2; eye++) {
+            vp[eye * 4 + 0] = s->viewport[eye].x;
+            vp[eye * 4 + 1] = s->viewport[eye].y;
+            vp[eye * 4 + 2] = s->viewport[eye].w;
+            vp[eye * 4 + 3] = s->viewport[eye].h;
+        }
+        of[0] = l->desc.texture_size.w;
+        of[1] = l->desc.texture_size.h;
+        // Said when it CHANGES, which is the event, and said for both eyes
+        // because a per-eye difference is the one thing a single unwarp grid
+        // cannot express (see the compositors). Silent on a run that never
+        // scales, so this costs a healthy title nothing.
+        static int have_last;
+        static int last[8];
+        if (!have_last || memcmp(last, vp, sizeof last) != 0) {
+            have_last = 1;
+            memcpy(last, vp, sizeof last);
+            fprintf(stderr, "  [ovrp] render viewport: eye0 %d,%d %dx%d  eye1 %d,%d %dx%d "
+                            "of a %dx%d eye texture (%.1f%% of the width)\n",
+                    vp[0], vp[1], vp[2], vp[3], vp[4], vp[5], vp[6], vp[7],
+                    l->desc.texture_size.w, l->desc.texture_size.h,
+                    l->desc.texture_size.w > 0
+                        ? 100.0 * (double)vp[2] / (double)l->desc.texture_size.w : 0.0);
+        }
+        return 1;
+    }
+    return 0;
 }
 
 // Fill a desc for an eye layer. The arguments ARE the answer for the format and
@@ -3025,6 +3345,25 @@ static uint64_t klovrp_SetupLayer(void *device, const ovrp_layer_desc_eyefov *de
     // exhausts the table on the third cycle and hands the compositor a new set of
     // GL names for a picture that has not changed. Matching on the geometry is
     // what makes the reuse safe: a layer of a different size needs new storage.
+    //
+    // **A slot's textures are not its own, and matching the geometry was not
+    // enough.** kl_glfb keys eye textures by (eye, stage) and nothing else, so
+    // an eye layer of a DIFFERENT size taking those slots overwrites them — and
+    // the freed slot goes on claiming storage it no longer has. 1.40 alternates
+    // two eye descs (3072x2464 at textureScale 1.0 and 3686x2956 at 1.2), so on
+    // device this happened four times in a ten-second run:
+    //
+    //   SetupLayer -> layer 6, EYE, 3072x2464 (reusing the previous layer's textures)
+    //   [cp] unwarp grid ... for a 3686x2956 eye texture (viewport 0,0 3072x2464)
+    //
+    // — the guest holding a 3072x2464 layer whose textures are 3686x2956, which
+    // then makes every size-derived thing on the path disagree at once: the eye
+    // texture the compositor samples, the rect the guest submits, and (with
+    // KL_VRR on) whether the guest's MSAA target matches the rate map at all,
+    // which kl_glfb reports as "left unfoveated" in the same run.
+    //
+    // So the reuse now also requires that the storage still BE that size.
+    // A same-size restart — the case this exists for — is unaffected.
     struct klovrp_layer *l = NULL;
     for (int i = 0; i < KLOVRP_MAX_LAYERS && !l; i++) {
         struct klovrp_layer *c = &g_layers[i];
@@ -3032,9 +3371,20 @@ static uint64_t klovrp_SetupLayer(void *device, const ovrp_layer_desc_eyefov *de
         if (c->is_eye == is_eye &&
             c->desc.texture_size.w == desc->texture_size.w &&
             c->desc.texture_size.h == desc->texture_size.h &&
-            c->desc.layout == desc->layout)
+            c->desc.layout == desc->layout &&
+            (!is_eye || !g_eye_storage_w ||
+             (g_eye_storage_w == desc->texture_size.w &&
+              g_eye_storage_h == desc->texture_size.h)))
             l = c;
     }
+    if (!l && is_eye && g_eye_storage_w &&
+        (g_eye_storage_w != desc->texture_size.w ||
+         g_eye_storage_h != desc->texture_size.h))
+        fprintf(stderr, "  [ovrp] SetupLayer: a freed %dx%d eye slot exists, but the "
+                        "eye storage is %dx%d now — allocating fresh rather than "
+                        "handing back textures another layer took\n",
+                desc->texture_size.w, desc->texture_size.h,
+                g_eye_storage_w, g_eye_storage_h);
     int reused = l != NULL;
     for (int i = 0; i < KLOVRP_MAX_LAYERS && !l; i++)
         if (!g_layers[i].id) { l = &g_layers[i]; memset(l, 0, sizeof *l); }
@@ -3196,6 +3546,11 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
             gl_BindTexture(0x0DE1 /* GL_TEXTURE_2D */, name);
             gl_TexStorage2D(0x0DE1, 1, glfmt, w, h);
         }
+        // What the eye storage now IS, which is what makes the reuse in
+        // klovrp_SetupLayer honest — see the comment there. kl_glfb keys the eye
+        // textures by (eye, stage) and nothing else, so this call has just
+        // OVERWRITTEN whatever the previous eye layer put in those slots.
+        if (l->is_eye) { g_eye_storage_w = w; g_eye_storage_h = h; }
         fprintf(stderr, "  [ovrp] GetLayerTexture2: %s %d stage %d = GL %u "
                         "(%dx%d %s / GL %#x%s)\n",
                 l->is_eye ? "eye" : "dummy layer", eye, stage, name, w, h,
@@ -3406,6 +3761,35 @@ static uint64_t klovrp_GetViewportStencil(int eye, int type, void *verts,
 // separate textures, Array two slices), so the eye's viewport is the whole
 // thing — scaled by the render-viewport scale the caller passes, which is how
 // Unity's dynamic resolution reaches the layer.
+//
+// **KL_OVRP_VIEWPORT_SCALE forces that scale, and it is the A/B this correction
+// had no way to run.** The whole render-viewport path is the guest's own
+// decision — Beat Saber shrinks it on entering a map — so on the host it is
+// reached only by playing to that point, and measured host runs never reach it
+// at all: every `[ovrp] render viewport` line in a viewer log so far reads
+// 100.0%. That left the compositors' crop untested by anything but the CPU
+// arithmetic in `make reproject`, and a device-only symptom with no host repro.
+//
+// It is forced HERE, and not by writing a rect into the frame record, on
+// purpose: this entry point is where the guest ASKS where to render. Answering
+// smaller makes it really set that GL viewport, really render into that
+// sub-rect, and really submit it at ovrp_EndFrame4 — so the knob exercises the
+// whole chain rather than the last link of it. A correct composite shows the
+// SAME picture at any scale, merely softer; a wrong one puts it in a corner or
+// stretches it, which is the failure being hunted.
+static float klovrp_viewport_scale(void) {
+    static float s = -1.0f;
+    if (s < 0.0f) {
+        s = kl_env_float("KL_OVRP_VIEWPORT_SCALE", 1.0f);
+        if (!(s > 0.0f) || s > 1.0f) s = 1.0f;
+        if (s != 1.0f)
+            fprintf(stderr, "  [ovrp] KL_OVRP_VIEWPORT_SCALE=%.3f — the guest is "
+                            "told to render into that fraction of its eye "
+                            "texture, whatever it asked for\n", (double)s);
+    }
+    return s;
+}
+
 static uint64_t klovrp_CalculateEyeViewportRect(const ovrp_layer_desc_eyefov *desc,
                                                 int eye, ovrp_recti *out, float scale) {
     ovrp_hit("ovrp_CalculateEyeViewportRect");
@@ -3413,6 +3797,11 @@ static uint64_t klovrp_CalculateEyeViewportRect(const ovrp_layer_desc_eyefov *de
     if (!out) return OVRP_FAIL_INVALID_PARAM;
     int w = desc ? desc->texture_size.w : 0, h = desc ? desc->texture_size.h : 0;
     if (!(scale > 0.0f) || scale > 1.0f) scale = 1.0f;
+    // Multiplied, not replaced: a guest already scaling to 0.8 and a knob of
+    // 0.5 means half of what it chose, so the knob cannot accidentally make the
+    // viewport LARGER than the guest's own decision — which would be a rect the
+    // guest never rendered into and a black border rather than a crop bug.
+    scale *= klovrp_viewport_scale();
     w = (int)((float)w * scale);
     h = (int)((float)h * scale);
     *out = (ovrp_recti){ 0, 0, w > 0 ? w : 1, h > 0 ? h : 1 };
@@ -3640,6 +4029,11 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetControllerHapticsState", (void *)klovrp_GetControllerHapticsState},
     {"ovrp_SetControllerHaptics", (void *)klovrp_SetControllerHaptics},
     {"ovrp_SetControllerVibration", (void *)klovrp_SetControllerVibration},
+    // ...and 1.40's own pair, which libhaptics_sdk resolves directly. Both, or
+    // neither: the SDK reads the rate before it will play, and refuses a rate
+    // it cannot get ("the actuator sample rate is invalid").
+    {"ovrp_GetControllerSampleRateHz", (void *)klovrp_GetControllerSampleRateHz},
+    {"ovrp_SetControllerHapticsPcm", (void *)klovrp_SetControllerHapticsPcm},
     {"ovrp_GetDepthCompositingSupported", (void *)klovrp_GetDepthCompositingSupported},
     {"ovrp_GetMixedRealityInitialized", (void *)klovrp_GetMixedRealityInitialized},
 };

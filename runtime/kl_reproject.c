@@ -304,33 +304,54 @@ void kl_reproject_grid_identity(simd_float2 *out) {
 }
 
 void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
+                             const float *vp,
                              float screen_w, float screen_h,
                              float tex_w, float tex_h,
                              kl_reproject_s2p fn, void *ctx) {
     // A degenerate grid would be a pass that draws nothing, which is a black
     // eye rather than an unfoveated one. Fall back to the identity, which is
-    // the correct picture for an unwarped texture and merely the wrong one for
-    // a warped one — the strictly better failure of the two.
+    // the correct picture for an unwarped, fully-drawn texture and merely the
+    // wrong one otherwise — the strictly better failure of the two.
     if (!out) return;
-    if (!fn || nx == 0 || ny == 0 || nx > KL_REPROJECT_GRID_MAX ||
+    if (nx == 0 || ny == 0 || nx > KL_REPROJECT_GRID_MAX ||
         ny > KL_REPROJECT_GRID_MAX || !(tex_w > 0) || !(tex_h > 0) ||
         !(screen_w > 0) || !(screen_h > 0)) {
         kl_reproject_grid_identity(out);
         return;
     }
+    // The span the guest drew, in screen pixels. Absent or nonsensical means it
+    // used the whole screen, which is what every guest that cannot answer does.
+    float vx = 0, vy = 0, vw = screen_w, vh = screen_h;
+    if (vp && vp[2] > 0 && vp[3] > 0) {
+        vx = vp[0]; vy = vp[1]; vw = vp[2]; vh = vp[3];
+        // Clamped rather than trusted: a rect reaching past the screen would
+        // send this through the rate map at coordinates it was not built for,
+        // and Metal's answer there is not defined by anything we can check.
+        if (vx < 0) vx = 0;
+        if (vy < 0) vy = 0;
+        if (vx + vw > screen_w) vw = screen_w - vx;
+        if (vy + vh > screen_h) vh = screen_h - vy;
+        if (!(vw > 0) || !(vh > 0)) { vx = vy = 0; vw = screen_w; vh = screen_h; }
+    }
     out[0] = simd_make_float2((float)nx, (float)ny);
     for (uint32_t y = 0; y <= ny; y++) {
         for (uint32_t x = 0; x <= nx; x++) {
-            // Grid vertex -> uv -> SCREEN pixels. Top-left origin throughout,
-            // which is both Metal's texture convention and the one
-            // mapScreenToPhysicalCoordinates speaks, so no axis is flipped
-            // anywhere in this function. The shader's separate question of
-            // which corner is "up" in clip space is about the POSITION and does
-            // not reach the coordinates built here.
-            float sx = screen_w * (float)x / (float)nx;
-            float sy = screen_h * (float)y / (float)ny;
+            // Grid vertex -> uv -> SCREEN pixels, inside the viewport. Top-left
+            // origin throughout, which is both Metal's texture convention and
+            // the one mapScreenToPhysicalCoordinates speaks, so no axis is
+            // flipped anywhere in this function. The shader's separate question
+            // of which corner is "up" in clip space is about the POSITION and
+            // does not reach the coordinates built here.
+            //
+            // With a full-screen viewport this is exactly what it was before
+            // the viewport existed, so the foveation measurements stand.
+            float sx = vx + vw * (float)x / (float)nx;
+            float sy = vy + vh * (float)y / (float)ny;
             float px = sx, py = sy;
-            fn(ctx, sx, sy, &px, &py);
+            // No map is the identity, not a reason to give up: an unfoveated
+            // eye with a shrunken viewport still has to be corrected, and it is
+            // the commonest case of the two (KL_VRR=0, and every host run).
+            if (fn) fn(ctx, sx, sy, &px, &py);
             out[1 + y * (nx + 1) + x] = simd_make_float2(px / tex_w, py / tex_h);
         }
     }

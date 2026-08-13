@@ -389,11 +389,237 @@ static void check_pixels(void) {
        "visible = 0 collapses the quad — the clear survives");
 }
 
+// The crop, THROUGH THE PASS — not the grid arithmetic, which check_viewport
+// above already covers on the CPU.
+//
+// The two are different assertions and only this one covers the wiring: a grid
+// built perfectly and then bound to the wrong index, drawn with the vertex
+// count of a different cell count, or read with the v axis running the other
+// way all produce a correct table and a wrong picture. And that failure has no
+// error surface anywhere — every Metal call succeeds and a plausible frame
+// comes out — so the only instrument left is a person wearing the headset,
+// which on this arc is the most expensive one there is.
+//
+// The source is 4x4 with the guest's picture in the BOTTOM-LEFT 2x2 (GL's
+// origin, so the guest's {0,0,w/2,h/2} viewport lands there) and a marker
+// colour everywhere else. If the crop is dropped, the marker is in the output;
+// if the crop is applied to the wrong corner, the output is all marker. Both
+// are the corner-of-the-eye bug, and this separates them.
+static void check_crop_pixels(void) {
+    printf("=== the crop, through the pass ===\n");
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    if (!dev || !q) { printf("  no Metal device — skipped\n"); return; }
+
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:
+                              [NSString stringWithUTF8String:kl_reproject_msl()]
+                                           options:nil error:&err];
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"kl_reproject_v"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"kl_reproject_f"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd
+                                                                       error:&err];
+    if (!ps) { ok(0, "pipeline for the crop check"); return; }
+
+    MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+    td.textureType = MTLTextureType2DArray;
+    td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    td.width = 4; td.height = 4; td.arrayLength = 2;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> src = [dev newTextureWithDescriptor:td];
+
+    // Memory row 0 is the picture's BOTTOM, exactly as in check_pixels and for
+    // the same reason: this texture stands in for one GL wrote through an
+    // EGLImage.
+    const uint8_t M[4] = { 255, 0, 255, 255 };          // magenta: never drawn
+    uint8_t s[4 * 4 * 4];
+    for (int i = 0; i < 4 * 4; i++) memcpy(s + i * 4, M, 4);
+    const uint8_t pic[4][4] = {                          // the guest's 2x2
+        { 0, 0, 255, 255 }, { 255, 255, 255, 255 },      // row 0 = picture bottom
+        { 255, 0, 0, 255 }, { 0, 255, 0, 255 },          // row 1 = picture top
+    };
+    memcpy(s + (0 * 4 + 0) * 4, pic[0], 4);
+    memcpy(s + (0 * 4 + 1) * 4, pic[1], 4);
+    memcpy(s + (1 * 4 + 0) * 4, pic[2], 4);
+    memcpy(s + (1 * 4 + 1) * 4, pic[3], 4);
+    [src replaceRegion:MTLRegionMake2D(0,0,4,4) mipmapLevel:0 slice:0
+             withBytes:s bytesPerRow:16 bytesPerImage:64];
+    uint8_t decoy[4 * 4 * 4];
+    for (int i = 0; i < 4 * 4; i++) { decoy[i*4]=0; decoy[i*4+1]=255; decoy[i*4+2]=255; decoy[i*4+3]=255; }
+    [src replaceRegion:MTLRegionMake2D(0,0,4,4) mipmapLevel:0 slice:1
+             withBytes:decoy bytesPerRow:16 bytesPerImage:64];
+
+    MTLTextureDescriptor *rd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:2 height:2 mipmapped:NO];
+    rd.usage = MTLTextureUsageRenderTarget;
+    rd.storageMode = MTLStorageModeShared;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:rd];
+
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.minFilter = MTLSamplerMinMagFilterNearest;
+    sd.magFilter = MTLSamplerMinMagFilterNearest;
+    sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    id<MTLSamplerState> samp = [dev newSamplerStateWithDescriptor:sd];
+
+    kl_ovrp_render_pose r = {0};
+    r.serial = 1; r.qw = 1;
+    for (int e = 0; e < 2; e++)
+        for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
+    simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
+    kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
+                                                 matrix_identity_float4x4, P, 0);
+
+    // The guest's rect: the bottom-left quarter, as ovrp_CalculateEyeViewportRect
+    // answers it and ovrp_EndFrame4 submits it.
+    const float vp[4] = { 0, 0, 2, 2 };
+    simd_float2 grid[kl_reproject_grid_entries(1, 1)];
+    kl_reproject_grid_build(grid, 1, 1, vp, 4, 4, 4, 4, NULL, NULL);
+
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    id<MTLCommandBuffer> cmd = [q commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:ps];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentSamplerState:samp atIndex:0];
+    [enc setVertexBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    [enc setVertexBytes:grid length:sizeof grid atIndex:1];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+             vertexCount:kl_reproject_grid_vertices(1, 1)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    uint8_t out[16] = {0};
+    [dst getBytes:out bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
+
+    // Row-reversed, for the reason check_pixels spells out: output row 0 is the
+    // top of the render target and the source's picture-top is its LAST row.
+    uint8_t want[16];
+    memcpy(want + 0, pic[2], 4); memcpy(want + 4,  pic[3], 4);
+    memcpy(want + 8, pic[0], 4); memcpy(want + 12, pic[1], 4);
+    int good = memcmp(out, want, 16) == 0;
+    ok(good, "a cropped viewport composites the sub-rect the guest drew, "
+             "full size and right way up");
+    if (!good)
+        printf("    got  %3u,%3u,%3u | %3u,%3u,%3u\n"
+               "         %3u,%3u,%3u | %3u,%3u,%3u\n"
+               "    want %3u,%3u,%3u | %3u,%3u,%3u\n"
+               "         %3u,%3u,%3u | %3u,%3u,%3u\n",
+               out[0],out[1],out[2],   out[4],out[5],out[6],
+               out[8],out[9],out[10],  out[12],out[13],out[14],
+               want[0],want[1],want[2],    want[4],want[5],want[6],
+               want[8],want[9],want[10],   want[12],want[13],want[14]);
+
+    // ...and the failing direction, so a pass here cannot be an accident of the
+    // marker colour never being sampled: the identity grid over the SAME source
+    // must show the magenta the crop excludes. If this one ever goes quiet, the
+    // assertion above has stopped measuring anything.
+    kl_reproject_grid_identity(grid);
+    cmd = [q commandBuffer];
+    enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:ps];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentSamplerState:samp atIndex:0];
+    [enc setVertexBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    [enc setVertexBytes:grid length:sizeof grid atIndex:1];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+             vertexCount:kl_reproject_grid_vertices(1, 1)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    uint8_t whole[16] = {0};
+    [dst getBytes:whole bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
+    int marker = 0;
+    for (int i = 0; i < 16; i += 4)
+        if (whole[i] == M[0] && whole[i+1] == M[1] && whole[i+2] == M[2]) marker++;
+    ok(marker > 0, "...and dropping the crop puts the unwritten texels back on "
+                   "screen — the corner-of-the-eye bug, reproduced");
+}
+
+// A stand-in rate map: screen -> physical, halving everything. Linear, so the
+// grid reproduces it exactly at any cell count, which is what lets the
+// composition below be asserted to the bit rather than to a tolerance.
+static void half_s2p(void *ctx, float sx, float sy, float *px, float *py) {
+    (void)ctx;
+    *px = sx * 0.5f;
+    *py = sy * 0.5f;
+}
+
+// The render viewport — the guest telling us it drew into only part of its eye
+// texture, which is how a title lowers its render resolution without
+// reallocating a swapchain (kl_ovrp.h). Ignoring it puts the picture in a
+// corner of the eye with unwritten texels around it, and NOTHING reports that:
+// every call succeeded and the guest rendered exactly what it was asked to.
+// Beat Saber does this on entering a map.
+//
+// CPU only, because the whole failure lives in four texture coordinates.
+static void check_viewport(void) {
+    printf("=== the render viewport ===\n");
+    const float W = 1000, H = 800;
+    simd_float2 g[kl_reproject_grid_entries(2, 2)];
+
+    // No crop, no map: the grid must be exactly what it was before any of this
+    // existed, or every unscaled title regresses.
+    kl_reproject_grid_build(g, 1, 1, NULL, W, H, W, H, NULL, NULL);
+    ok(g[1].x == 0 && g[1].y == 0 && g[4].x == 1 && g[4].y == 1,
+       "no viewport and no rate map is the identity grid");
+
+    // A viewport of half the texture, unfoveated — the KL_VRR=0 case, and the
+    // one the corner-of-the-eye bug lived on.
+    const float vp[4] = { 0, 0, W * 0.5f, H * 0.5f };
+    kl_reproject_grid_build(g, 1, 1, vp, W, H, W, H, NULL, NULL);
+    ok(g[1].x == 0.0f && g[1].y == 0.0f &&
+       g[4].x == 0.5f && g[4].y == 0.5f,
+       "a half viewport samples the half of the texture the guest drew");
+
+    // ...and composed with foveation, in that order: the viewport is in SCREEN
+    // space, so the rate map maps what survives it. Half a screen through a
+    // half-rate map is a quarter of the texture — which is also the arithmetic
+    // that says the two corrections must not be applied to each other's output.
+    kl_reproject_grid_build(g, 2, 2, vp, W, H, W, H, half_s2p, NULL);
+    ok(g[1].x == 0.0f && g[1].y == 0.0f &&
+       g[1 + 2 * 3 + 2].x == 0.25f && g[1 + 2 * 3 + 2].y == 0.25f,
+       "viewport then rate map compose, in that order");
+    // The middle vertex, which is what a 1x1 grid could not check: it must be
+    // half way along the PHYSICAL span, not half way along the screen one.
+    ok(fabsf(g[1 + 3 + 1].x - 0.125f) < 1e-6f &&
+       fabsf(g[1 + 3 + 1].y - 0.125f) < 1e-6f,
+       "the grid's interior follows the map inside the viewport");
+
+    // A rect the guest could not have rendered into is refused rather than
+    // handed to a rate map at coordinates it was not built for — Metal's answer
+    // there is not defined by anything checkable.
+    const float over[4] = { 0, 0, W * 4, H * 4 };
+    kl_reproject_grid_build(g, 1, 1, over, W, H, W, H, NULL, NULL);
+    ok(g[4].x == 1.0f && g[4].y == 1.0f,
+       "a viewport past the screen is clamped, not trusted");
+
+    // Zero is the "whole texture" spelling every guest that cannot answer uses
+    // — 1.28's legacy VRDevice, the null driver, an OpenXR guest. It must not
+    // read as an empty rect, which would draw nothing at all.
+    const float zero[4] = { 0, 0, 0, 0 };
+    kl_reproject_grid_build(g, 1, 1, zero, W, H, W, H, NULL, NULL);
+    ok(g[4].x == 1.0f && g[4].y == 1.0f,
+       "an unset viewport is the whole texture, not an empty one");
+}
+
 int main(void) {
     @autoreleasepool {
         check_math();
+        check_viewport();
         check_shader();
         check_pixels();
+        check_crop_pixels();
     }
     printf(g_fail ? "\n=== t_reproject FAILED ===\n"
                   : "\n=== t_reproject: the composite pass is a blit when nothing "

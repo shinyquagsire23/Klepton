@@ -484,6 +484,20 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   ovrp entry point the game only reaches from there. A probe that perturbs the
   run it measures is worse than no probe.
 - `KL_PROBE_EVERY=<frames>` — interval, default 120.
+- `KL_PROBE_ENUM=<Ns.Type[,Ns.Type...]>` — print an enum's **values**, read out
+  of the running IL2CPP runtime through `Enum.GetNames`/`GetValues`. Nested
+  types with `/` (`Oculus.Platform.Message/MessageType`); printed once, at the
+  first probe tick, so it needs `KL_PROBE_INPUT=1` and a `KL_PROBE_FROM` the
+  run actually reaches.
+  Exists because a C# enum's values are the one part of the guest's ABI that is
+  in neither its exported symbols nor its strings — `global-metadata.dat` holds
+  the names and the numbers live in a constant table whose layout is a
+  metadata-version detail. `kl_ovrplat` needs `Message.MessageType` exactly
+  right: `Message.ParseMessageHandle` switches on it and its `default` arm logs
+  "Unrecognized message type" and produces **no message at all**, so a guessed
+  number is indistinguishable from sending nothing. Same argument as
+  `OVRP_HEADSET_OCULUS_QUEST_2` — read the value out of the guest rather than
+  out of a header we do not have.
 - `KL_PROBE_TYPES=<a,b,...>` — types to census, as `Namespace.Type` (bare name
   for the global namespace); default is the menu pointer chain
   (`VRUIControls.VRPointer,…VRInputModule,…VRLaserPointer,…VRGraphicRaycaster`).
@@ -675,6 +689,24 @@ puts the camera on the ground with its hands underneath it.
   tangents pushed alongside would otherwise disagree with the picture's shape.
   Every change logs the requested size, the applied size and the resulting
   swapchain MiB.
+- `KL_OVRP_VIEWPORT_SCALE=<x>` — force the **render viewport** to that fraction
+  of the eye texture, default 1.0, accepted in 0..1 and multiplied by whatever
+  the guest itself asked for. This is not a resolution knob, it is the **A/B for
+  the composite's crop**: a title lowers its render resolution by shrinking this
+  rect and *not* by resizing the texture (Beat Saber does it on entering a map),
+  so a compositor that ignores it shows the picture in a corner of the eye with
+  unwritten texels around it — and every call on that path succeeds, so there is
+  no error anywhere. Forced at `ovrp_CalculateEyeViewportRect`, which is where
+  the guest *asks* where to render, so the guest really sets that GL viewport,
+  really renders into the sub-rect and really submits it at `ovrp_EndFrame4`:
+  the knob exercises the whole chain rather than the last link. **A correct
+  composite shows the same picture at any scale, merely softer.** Three log
+  lines say where a wrong one went wrong — `[ovrp] render viewport` (what the
+  guest submitted), `[view]`/`[cp] first render viewport read from the frame
+  record` (what the compositor read), and `[view]`/`[cp] render viewport … —
+  compositing that sub-rect` (what it did with it).
+  **On the macOS viewer this needs `KL_VIEW_TIMEWARP=1`**: the default viewer
+  path is the plain blit, which has no unwarp grid and therefore no crop.
 
 ### Haptics (`runtime/kl_ovrp.c` — the seam that runs OUT of the guest)
 
@@ -797,6 +829,13 @@ The composite/timewarp pass — one file, compiled by both compositors
   TODO on `poke_texture_unit_cap()` in `mains/m_boot.c` for the two fixes that
   would retire it, neither of which needs an offset into anything.
 
+- `KL_LOG=<file>` — where `build_run_viewer.sh` keeps the run's output, default
+  `/tmp/viewer.log`. Not a runtime knob: the script `tee`s through `script`, so
+  the pty forces line buffering and a death by SIGNAL still lands the
+  `kl_fault` report — the frame chain, the guest images, the managed method
+  names and every subsystem report. The interactive viewer is the only run that
+  reaches the parts of the game a pointer drives, and until this existed a
+  crash there left nothing but an OS `.ips`, which names a pc and no caller.
 - `KL_VIEW=1` — interactive one-eye viewer on SDL3; WASD+mouse-look drives
   the head pose ovrp reports. Requires `KL_GLFB=1`, runs the guest in-process
   on a spawned thread (no guard test, no re-exec), and pumps frames until the
@@ -846,6 +885,14 @@ The composite/timewarp pass — one file, compiled by both compositors
   and it is the A/B. Prints the delta in degrees every 120 composites — 0.00
   means the guest is keeping up and the pass is a blit, which is a proven
   identity (`make reproject`).
+  **Being off is why the viewer is not a stand-in for the device composite.**
+  The visionOS compositor has no blit path — it is always the reprojection pass
+  — so everything that lives only in that pass (the unwarp grid, the foveation
+  correction, the render-viewport crop, `visible`, the sRGB decode) is
+  unexercised by a default viewer run. "It looks right in the viewer" is
+  therefore not evidence about any of them; turn this on before comparing the
+  two, and the picture the viewer shows is then the picture the device's pass
+  computes.
 
 ## Audio (`runtime/kl_audio.c`)
 
@@ -1353,6 +1400,13 @@ Read by the scripts themselves, never forwarded to the app.
   them; `KL_STAGE=1` — always stage, whatever the stamp says. The 2.2 GB
   upload is a ~20 s loop vs a ~20 min one; a reinstall rotates the data
   container, which is what the stamp guards against.
+  **Neither knob covers the metadata beside `assets/`** — `apktool.yml` and
+  `AndroidManifest.xml`, 12 KB, which the guest reads through `<assets>/../`.
+  Those go across on every run (`stage_assets.sh --meta`, called by `run.sh`
+  outside the stamp), because gating them with the assets is how a device ran
+  for an hour with the right 1.3 GB OBB and a guest asking for 1.28's
+  versionCode: the fix was in the build, the file was on the device, and
+  nothing re-staged.
 - `KL_OBB_DIR=<dir>` — where `stage_assets.sh` finds the guest's OBB, default
   `~/Library/Application Support/Klepton/userdata/<guest>/obb` — the same
   directory a host run reads it from, since it is guest userdata and not part

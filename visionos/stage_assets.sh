@@ -49,6 +49,45 @@ if [ "${KL_SKIP_OBB:-0}" = 1 ] || ! compgen -G "$OBB/*.obb" > /dev/null 2>&1; th
   OBB=""
 fi
 
+# The two files the unpacker left BESIDE assets/, which the guest reads through
+# `<assets>/../` and which are not part of the asset tree, so nothing staged
+# them. Both are small, both are read, and each one's absence is silent:
+#
+#   apktool.yml          carries versionCode/versionName. Missing, klj_guest_version
+#                        falls back to 1.28's 545 — and a SPLIT APPLICATION BINARY
+#                        guest builds its OBB NAME out of that number, so the
+#                        1.3 GB of game data staged above is looked for under
+#                        main.545... and never opened. That is what left 1.40 on
+#                        device with `Unable to start Oculus XR Plugin` (the XR
+#                        subsystem descriptors live in the OBB, at
+#                        bin/Data/UnitySubsystems/OculusXRPlugin/) and Addressables
+#                        reporting `No Location found for Key=AppInit` — a black
+#                        immersive space, three layers from the missing file.
+#   AndroidManifest.xml  carries the <meta-data> Bundle and the <uses-permission>
+#                        list. Missing, every Oculus manifest setting reads as
+#                        "not declared" and every permission check as DENIED.
+#
+# Present-or-absent, like the OBB: a tree unpacked some other way still stages.
+META=()
+for m in apktool.yml AndroidManifest.xml; do
+  [ -f "$ROOT/$TREE/$m" ] && META+=("$ROOT/$TREE/$m")
+done
+
+# ...and they are stageable ON THEIR OWN, which is not a convenience.
+#
+#   ./stage_assets.sh --meta [<device-udid>]
+#
+# The gate in run.sh exists for a 2.2 GB upload and is skipped by default —
+# `KL_SKIP_STAGE=1` is in the device loop as a matter of course. These two files
+# are 12 KB, they change with the TREE rather than with the APK's size and
+# mtime, and one of them names the OBB. Staged together with the assets they
+# would have arrived only on a full re-upload: the run that found this had the
+# right OBB on the device, the fix in the build, and still looked for
+# main.545 — because nothing had re-staged since the fix. So run.sh calls this
+# every run, and the stamp only ever gates the expensive half.
+META_ONLY=0
+if [ "${1:-}" = "--meta" ]; then META_ONLY=1; shift; fi
+
 TARGET="${1:-}"
 
 if [ -z "$TARGET" ]; then
@@ -57,13 +96,19 @@ if [ -z "$TARGET" ]; then
   CONTAINER=$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data 2>/dev/null) || {
     echo "!! $BUNDLE_ID is not installed on $UDID — install the app first"; exit 1; }
   DEST="$CONTAINER/Documents"
-  echo "[stage] simulator $UDID -> $DEST ($KLT_NAME)"
   mkdir -p "$DEST/$TREE"
+  if [ "$META_ONLY" = 1 ]; then
+    [ ${#META[@]} -gt 0 ] && cp "${META[@]}" "$DEST/$TREE/"
+    echo "[stage] simulator $UDID: ${#META[@]} metadata file(s) -> $DEST/$TREE"
+    exit 0
+  fi
+  echo "[stage] simulator $UDID -> $DEST ($KLT_NAME)"
   rm -rf "$DEST/$TREE/assets"
   # A copy, not a symlink: the guest resolves paths by concatenation (trap 6c)
   # and a link would work here but hide a real failure on device.
   cp -R "$ASSETS" "$DEST/$TREE/assets"
   cp "$APK" "$DEST/$KLT_APK"
+  [ ${#META[@]} -gt 0 ] && cp "${META[@]}" "$DEST/$TREE/"
   if [ -n "$OBB" ]; then
     rm -rf "$DEST/android-files/obb"
     mkdir -p "$DEST/android-files"
@@ -81,14 +126,28 @@ fi
 # Beat Saber's 2.2 GB is the reason any of this exists; Steam Link's is 44 MB
 # and takes seconds. Saying which is which up front is the difference between
 # waiting and wondering.
-echo "[stage] device $TARGET, $KLT_NAME ($(du -shc "$ASSETS" "$APK" ${OBB:+"$OBB"} | tail -1 | cut -f1))"
 copy() {   # <source> <destination-relative-to-container>
   xcrun devicectl device copy to --device "$TARGET" \
     --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
     --source "$1" --destination "$2"
 }
+copy_meta() {
+  for m in "${META[@]:-}"; do
+    [ -n "$m" ] && copy "$m" "Documents/$TREE/$(basename "$m")" > /dev/null
+  done
+}
+if [ "$META_ONLY" = 1 ]; then
+  copy_meta
+  echo "[stage] device $TARGET: ${#META[@]} metadata file(s) -> Documents/$TREE"
+  exit 0
+fi
+# Beat Saber's 2.2 GB is the reason any of this exists; Steam Link's is 44 MB
+# and takes seconds. Saying which is which up front is the difference between
+# waiting and wondering.
+echo "[stage] device $TARGET, $KLT_NAME ($(du -shc "$ASSETS" "$APK" ${OBB:+"$OBB"} | tail -1 | cut -f1))"
 copy "$ASSETS" "Documents/$TREE/assets"
 copy "$APK"    "Documents/$KLT_APK"
+copy_meta
 # devicectl copies a DIRECTORY as a directory, so the whole obb/ goes across and
 # the destination is its parent's child, not the file's path.
 [ -n "$OBB" ] && copy "$OBB" "Documents/android-files/obb"

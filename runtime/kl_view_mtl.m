@@ -108,12 +108,27 @@ static void klvm_s2p(void *ctx, float sx, float sy, float *px, float *py) {
 static id<MTLBuffer> g_grid_buf;
 static void         *g_grid_map;
 static uint32_t      g_grid_w, g_grid_h, g_grid_verts;
+static float         g_grid_vp[4];
 
-static id<MTLBuffer> klvm_grid_buffer(id<MTLTexture> src, uint32_t *out_verts) {
+// `vp` is the guest's render viewport for this frame in eye-texture pixels, or
+// NULL for the whole texture — kl_ovrp_render_pose.viewport, read from the same
+// frame record the uniforms come from so the crop and the pose describe one
+// picture. It is part of the cache key: Beat Saber changes it on entering a
+// map, and a grid built for the menu's viewport crops the map's picture (or
+// fails to crop it) with nothing reporting either.
+static id<MTLBuffer> klvm_grid_buffer(id<MTLTexture> src, const float *vp,
+                                      uint32_t *out_verts) {
     void *map = kl_glfb_eye_rate_map();
     uint32_t tw = src ? (uint32_t)src.width : 0, th = src ? (uint32_t)src.height : 0;
-    if (!g_grid_buf || map != g_grid_map || tw != g_grid_w || th != g_grid_h) {
+    float want_vp[4] = { 0, 0, 0, 0 };
+    if (vp && vp[2] > 0 && vp[3] > 0) memcpy(want_vp, vp, sizeof want_vp);
+    if (!g_grid_buf || map != g_grid_map || tw != g_grid_w || th != g_grid_h ||
+        memcmp(want_vp, g_grid_vp, sizeof want_vp) != 0) {
         g_grid_map = map; g_grid_w = tw; g_grid_h = th;
+        memcpy(g_grid_vp, want_vp, sizeof want_vp);
+        int cropped = want_vp[2] > 0 && want_vp[3] > 0 &&
+                      ((uint32_t)want_vp[2] != tw || (uint32_t)want_vp[3] != th ||
+                       want_vp[0] != 0 || want_vp[1] != 0);
         uint32_t nx = 1, ny = 1;
         if (map) {
             // One cell per ZONE, so every grid vertex lands on a breakpoint of
@@ -149,14 +164,30 @@ static id<MTLBuffer> klvm_grid_buffer(id<MTLTexture> src, uint32_t *out_verts) {
             if (ny > KL_REPROJECT_GRID_MAX) ny = KL_REPROJECT_GRID_MAX;
             uint32_t n = kl_reproject_grid_entries(nx, ny);
             simd_float2 *tmp = calloc(n, sizeof *tmp);
-            kl_reproject_grid_build(tmp, nx, ny, (float)scr.width, (float)scr.height,
+            kl_reproject_grid_build(tmp, nx, ny, cropped ? want_vp : NULL,
+                                    (float)scr.width, (float)scr.height,
                                     (float)tw, (float)th, klvm_s2p, map);
             g_grid_buf = [g_dev newBufferWithBytes:tmp length:n * sizeof *tmp
                                            options:MTLResourceStorageModeShared];
             free(tmp);
             fprintf(stderr, "  [view] unwarp grid %ux%u for a %ux%u eye texture "
-                            "(screen %lux%lu)\n", nx, ny, tw, th,
-                    (unsigned long)scr.width, (unsigned long)scr.height);
+                            "(screen %lux%lu, viewport %.0f,%.0f %.0fx%.0f)\n", nx, ny, tw, th,
+                    (unsigned long)scr.width, (unsigned long)scr.height,
+                    cropped ? want_vp[0] : 0.f, cropped ? want_vp[1] : 0.f,
+                    cropped ? want_vp[2] : (float)tw, cropped ? want_vp[3] : (float)th);
+        } else if (cropped) {
+            // No rate map, but the guest still drew into part of the texture.
+            // One cell is enough — with no map the mapping is affine, so the
+            // four corners carry it exactly.
+            uint32_t n = kl_reproject_grid_entries(1, 1);
+            simd_float2 tmp[8];
+            kl_reproject_grid_build(tmp, 1, 1, want_vp, (float)tw, (float)th,
+                                    (float)tw, (float)th, NULL, NULL);
+            g_grid_buf = [g_dev newBufferWithBytes:tmp length:n * sizeof *tmp
+                                           options:MTLResourceStorageModeShared];
+            fprintf(stderr, "  [view] render viewport %.0f,%.0f %.0fx%.0f of a %ux%u eye "
+                            "texture — compositing that sub-rect\n",
+                    want_vp[0], want_vp[1], want_vp[2], want_vp[3], tw, th);
         } else {
             uint32_t n = kl_reproject_grid_entries(1, 1);
             simd_float2 tmp[8];
@@ -389,7 +420,54 @@ int kl_viewmtl_present(int win_w, int win_h) {
         // path caps at 4 KB and a grid dense enough to land on the map's zone
         // boundaries is bigger than that.
         uint32_t gverts = 0;
-        id<MTLBuffer> gbuf = klvm_grid_buffer(src, &gverts);
+        // ...and the crop, from the same record the uniforms above came from.
+        // Eye 0's, because this viewer composites eye 0 — the visionOS
+        // compositor is the one that has to reconcile a pair.
+        kl_ovrp_render_pose vr;
+        float vp[4] = { 0, 0, 0, 0 };
+        if (kl_ovrp_stage_render_pose(stage, &vr)) {
+            for (int i = 0; i < 4; i++) vp[i] = (float)vr.viewport[0][i];
+            // The same guard KleptonCompositor carries, and for the same reason:
+            // a rect measured against another eye texture describes nothing
+            // about this one, and cropping by it MAGNIFIES the picture by the
+            // ratio rather than mis-placing it (kl_ovrp.h, viewport_of). Refuse
+            // rather than rescale — with the two disagreeing, which texels the
+            // guest wrote is not known.
+            if (vp[2] > 0 && vr.viewport_of[0] > 0 && src &&
+                ((uint32_t)vr.viewport_of[0] != (uint32_t)src.width ||
+                 (uint32_t)vr.viewport_of[1] != (uint32_t)src.height)) {
+                static int said_skew;
+                if (!said_skew) {
+                    said_skew = 1;
+                    fprintf(stderr, "  [view] the render viewport is %dx%d of a %dx%d "
+                                    "eye texture, but the texture in hand is %ux%u — "
+                                    "NOT cropping, that rect describes another "
+                                    "texture\n",
+                            vr.viewport[0][2], vr.viewport[0][3],
+                            vr.viewport_of[0], vr.viewport_of[1],
+                            (unsigned)src.width, (unsigned)src.height);
+                }
+                vp[0] = vp[1] = vp[2] = vp[3] = 0;
+            }
+            // Once, and ALSO when it is zero — the same line KleptonCompositor
+            // prints, so a host run and a device run answer "did the rect reach
+            // the composite?" in the same words. `[ovrp] render viewport` is
+            // the guest's own thread saying what it submitted; this is the
+            // compositor saying what it read, and the two failures those
+            // separate are indistinguishable by eye.
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  [view] first render viewport read from the frame "
+                                "record: %d,%d %dx%d (stage %d, serial %llu)%s\n",
+                        vr.viewport[0][0], vr.viewport[0][1], vr.viewport[0][2],
+                        vr.viewport[0][3], stage, (unsigned long long)vr.serial,
+                        vr.viewport[0][2] <= 0
+                            ? "  <- ZERO, so no crop is applied; compare against "
+                              "the [ovrp] render viewport line" : "");
+            }
+        }
+        id<MTLBuffer> gbuf = klvm_grid_buffer(src, vp[2] > 0 ? vp : NULL, &gverts);
         [enc setVertexBuffer:gbuf offset:0 atIndex:1];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
         klvm_note_delta(stage);

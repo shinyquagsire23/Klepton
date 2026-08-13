@@ -13,6 +13,7 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include "klepton.h"
 #include "kl_jni.h"
@@ -2389,12 +2390,55 @@ static klj_val klj_ClassLoader_findLibrary(void *env, void *self, const klj_val 
 // with no OBB in it, so creating it turns "somebody still has to make this
 // directory" into "the file goes here".
 static void klj_mkdir_p(const char *path);          // defined further down
+static void klj_guest_version(long *code, const char **name);   // ...and this one
+
+// ...and the directory is READ once, here, for the one thing about it that
+// nothing downstream can report: whether the OBB in it is the one the guest is
+// about to ask for. The guest builds `main.<versionCode>.<package>.obb` itself
+// out of the number klj_guest_version answers, so a wrong version code and a
+// missing file are the same event from in here — Unity simply finds no asset
+// pack, and what surfaces is `Unable to start Oculus XR Plugin` (the XR
+// subsystem descriptors ship in the OBB, under bin/Data/UnitySubsystems/) and
+// Addressables' `No Location found for Key=AppInit`, several layers away and
+// naming neither the version nor the file.
+//
+// That is exactly what a device run did: nothing staged apktool.yml beside the
+// staged assets, klj_guest_version fell back to 1.28's 545, and the 1.3 GB of
+// 1.40 data sitting right here under main.1716... was never opened. So the
+// mismatch is named, by both numbers, at the moment we hand the path over.
+static void klj_obb_census(const char *dir) {
+    long code = 0;
+    klj_guest_version(&code, NULL);
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    int match = 0, others = 0;
+    char first_other[256] = {0};
+    while ((e = readdir(d)) != NULL) {
+        long got;
+        if (sscanf(e->d_name, "main.%ld.", &got) != 1) continue;
+        if (got == code) { match = 1; continue; }
+        others++;
+        if (!*first_other) snprintf(first_other, sizeof first_other, "%s", e->d_name);
+    }
+    closedir(d);
+    if (match || (!match && !others)) {
+        // No OBB at all is not an error here: 1.28 and Steam Link have none.
+        if (match) KLJ_LOG("obb: main.%ld.*.obb is present in %s", code, dir);
+        return;
+    }
+    KLJ_LOG("obb: %s holds %s but this guest is versionCode %ld, so it will look "
+            "for main.%ld.*.obb and find nothing. That is a MISSING GAME DATA "
+            "run — check that apktool.yml was staged beside assets/",
+            dir, first_other, code, code);
+}
 
 static const char *klj_obb_dir(void) {
     static char path[1024];
     if (!*path) {
         snprintf(path, sizeof path, "%s/obb", kl_jni_files_dir());
         klj_mkdir_p(path);
+        klj_obb_census(path);
     }
     return path;
 }
@@ -5097,6 +5141,14 @@ static void klj_guest_version(long *code, const char **name) {
     }
     if (code) *code = cached_code;
     if (name) *name = cached_name;
+}
+
+// ...and the same pair, for anything outside this file that has to describe the
+// application to the guest. kl_ovrplat answers ovr_Application_GetVersion out of
+// it, so the version the platform reports and the version PackageManager reports
+// are one number rather than two that can disagree.
+void kl_jni_guest_version(long *code, const char **name) {
+    klj_guest_version(code, name);
 }
 
 static klj_val klj_PackageInfo_versionCode(void) {

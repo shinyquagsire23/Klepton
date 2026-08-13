@@ -174,6 +174,63 @@ typedef struct {
     // — the ovrpFovf transposition happens inside kl_ovrp, at the one place that
     // speaks the guest's ABI.
     float    tangents[2][4];
+    // **The sub-rect of the eye texture the guest actually rendered into**, per
+    // eye, as {x, y, w, h} in that texture's own pixels. `w <= 0` means "the
+    // whole texture" and is what every path that cannot know answers — 1.28's
+    // legacy VRDevice, the null driver, an OpenXR guest — so a compositor's
+    // fallback is the picture those guests have always produced.
+    //
+    // This is Unity's `XRSettings.renderViewportScale` arriving from the other
+    // side, and it is NOT a resolution change: the eye texture keeps its size
+    // and the guest draws the same frustum into a smaller corner of it, which
+    // is how a title changes its render resolution without reallocating a
+    // swapchain. Beat Saber does exactly that on entering a map (it carries
+    // both `quality.renderViewportScale` and `quality.menuVRResolutionScaleMultiplier`
+    // as user settings), and 1.40's XR-SDK display provider asks us for the
+    // rect — ovrp_CalculateEyeViewportRect, which is `OculusSystem::
+    // SetRenderViewportScale` in libOculusXRPlugin — and then submits it in
+    // ovrpLayerSubmit.ViewportRect[eye] at ovrp_EndFrame4.
+    //
+    // A compositor that ignores it samples the whole texture and shows the
+    // picture squeezed into one corner with unwritten texels around it. There
+    // is no error anywhere on that path: every call succeeded and the guest
+    // rendered exactly what it was told to.
+    //
+    // **x and y are 0 in every run this can have**, because the rect is the one
+    // WE computed: ovrp_CalculateEyeViewportRect anchors it at the origin, as
+    // the real plugin does. That matters, because it is the one thing here
+    // whose convention is not pinned by a measurement — GL's viewport origin is
+    // bottom-left and OVRPlugin's rect appears to be top-down (the display
+    // provider flips Pos.y for one headset id), and with y = 0 the two agree.
+    // A non-zero origin would have to settle that first.
+    int      viewport[2][4];
+    // **The eye texture size that rect was measured against**, {w, h}, or 0 when
+    // nothing set it. A rect in pixels is meaningless without it, and this is
+    // not a theoretical objection — it is a bug that has been seen:
+    //
+    //   [view] render viewport 0,0 1374x1440 of a 2748x2880 eye texture
+    //
+    // one line before the same run said 1374x1440 of a **2290x2400** texture.
+    // Unity re-creates the eye swapchain at a new size (its own ~1.2x, and again
+    // on entering a map) and the record can be one generation behind the texture
+    // the compositor is sampling. Cropping the NEW texture by the OLD rect
+    // samples too little of it and stretches that across the whole quad: the
+    // picture is MAGNIFIED by exactly the ratio of the two generations, with no
+    // unwritten texels anywhere to give it away, and the binocular disparity is
+    // magnified with it — which is a picture that reads as distorted and
+    // cross-eyed rather than as a cropping bug.
+    //
+    // With this here a compositor uses the FRACTION (rect / viewport_of) and
+    // applies it to whatever texture it is actually holding, so a generation
+    // skew is harmless instead of a wrong picture: whichever texture the content
+    // is in, the guest filled the same fraction of it.
+    //
+    // Note this cannot be fixed by "read them at the same instant" — there is no
+    // instant at which they agree. The rect is filed by the guest's frame thread
+    // at ovrp_EndFrame4 and the texture is looked up by the compositor's own
+    // thread, and the two describe different frames whenever the guest is
+    // decoupled, which is the design.
+    int      viewport_of[2];
     uint64_t serial;              // guest frame serial, 1-based; 0 = nothing recorded
     int      stage;               // the swapchain stage this frame drew into
     int      complete;            // has ovrp_EndFrame been seen for this serial?

@@ -125,6 +125,31 @@ static int check_drm_guard(void) {
         return fail("entitlement guard answered 0 — that reads as 'not entitled' "
                     "and is the licence-failure path, not a neutral answer");
 
+    // 1b. ...and the COMPLETION says so, because the value alone stopped being
+    //     the answer. It is a request, not a predicate: the SDK wraps the return
+    //     in a `Request` and awaits a message, so a non-zero id with nothing
+    //     arriving for it is a guest that waits forever — which is exactly what
+    //     stopped 1.40 at the epilepsy screen, one request over. Assert the pair.
+    {
+        void *pop = kl_ovrplat_sym("ovr_PopMessage");
+        void *ent = kl_ovrplat_sym("ovr_Entitlement_GetIsViewerEntitled");
+        void *rid = kl_ovrplat_sym("ovr_Message_GetRequestID");
+        void *err = kl_ovrplat_sym("ovr_Message_IsError");
+        if (!pop || !ent || !rid || !err)
+            return fail("entitlement guard: the message pump resolved to nothing");
+        while (((void *(*)(void))pop)()) { }             // drain anything queued
+        uint64_t req = ((uint64_t (*)(void))ent)();
+        void    *msg = ((void *(*)(void))pop)();
+        if (!msg)
+            return fail("the entitlement request queued NO completion — the guest "
+                        "awaits one and would wait forever");
+        if (((uint64_t (*)(void *))rid)(msg) != req)
+            return fail("the entitlement completion carries the wrong request id");
+        if (((uint64_t (*)(void *))err)(msg))
+            return fail("the entitlement completion is an ERROR — that is the "
+                        "licence-failure path, not a neutral answer");
+    }
+
     // 2. Anything that would DELIVER paid content must still die rather than
     //    answer. This is also what proves the ovr_AssetFile_GetList carve-out
     //    below is an exact name and not a widening of the "AssetFile" marker to
@@ -146,9 +171,9 @@ static int check_drm_guard(void) {
         return fail("ovr_AssetFile_GetList aborted — enumerating DLC we do not have "
                     "is a fact about this host, not a licence decision");
 
-    printf("  the app's own entitlement answers yes, DLC delivery refuses and\n"
-           "  aborts (guard verified); DLC enumeration answers \"none\" without\n"
-           "  granting anything\n");
+    printf("  the app's own entitlement answers yes AND completes, DLC delivery\n"
+           "  refuses and aborts (guard verified); DLC enumeration answers\n"
+           "  \"none\" without granting anything\n");
     return 0;
 }
 

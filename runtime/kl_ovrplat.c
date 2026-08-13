@@ -4,7 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <pthread.h>
 #include "klepton.h"
+#include "kl_jni.h"
 #include "kl_ovrplat.h"
 
 #define KL_OVRPLAT_MAX 512
@@ -141,6 +143,138 @@ static uint64_t klplat_called(const char *name) {
 }
 
 // ---------------------------------------------------------------------------
+// The completion queue — an asynchronous request has to ARRIVE somewhere
+//
+// This is the half the "report the platform as absent" design was missing, and
+// Beat Saber 1.40 is where it stopped being free. Every request-shaped entry
+// point here answered `ovrRequest` 0 under a comment saying that a plausible id
+// "would be a lie with a tail: the caller would then poll ovr_PopMessage
+// forever for a completion that cannot come". The measurement says **0 has the
+// same tail**: the SDK builds its `Request` object either way and awaits it, so
+// what 0 bought was not an error path but silence.
+//
+// 1.40 gates a screen on that silence. Its `HealthWarningFlowCoordinator` hands
+// the epilepsy screen's Continue to `WaitForUserAgeCategory`, a coroutine
+// waiting on a category that `OculusInit.CheckUserAgeCategoryAsync` never sets
+// because `InitializeOculusAsync` is still awaiting the platform init — so the
+// button did nothing, silently, with the frame loop running normally. The whole
+// visible symptom was one un-delivered message.
+//
+// **What is asserted here, and by whose decision.** Answering the age category
+// at all means claiming an initialized platform, which is a real change from
+// "genuinely absent" — an absent platform cannot answer a demographic question.
+// The user asked for it and declared themselves over 18 (2026-08-12), which is
+// the only place that answer can legitimately come from here: it is a
+// self-declaration by the person running their own copy, not a fact we
+// discovered. **The DRM line does not move with it** — IAP, purchase records,
+// asset details and every delivery call still abort unconditionally, and
+// `check_drm_guard` still asserts both directions. What changes is that the
+// application's own entitlement, already answered yes, is now answered through
+// the channel the guest actually reads.
+//
+// The three completions are all this queues, and each is issued only in
+// response to the guest's own request:
+//
+//   ovr_UnityInitWrapperAsynchronous  -> Platform_InitializeAndroidAsynchronous,
+//                                        result Success
+//   ovr_Entitlement_GetIsViewerEntitled -> Entitlement_GetIsViewerEntitled, no
+//                                        payload; success IS the answer
+//   ovr_UserAgeCategory_Get           -> UserAgeCategory_Get, category Ad(ult)
+//
+// **The numbers are the guest's own**, read out of the running IL2CPP runtime
+// with `KL_PROBE_ENUM` (kl_mprobe.c) rather than taken from an SDK header we do
+// not have — the same move as OVRP_HEADSET_OCULUS_QUEST_2 in kl_ovrp.c, and
+// necessary rather than tidy: `Message.ParseMessageHandle` switches on the type
+// and its `default` arm logs "Unrecognized message type" and produces NO
+// message, so a guessed number is indistinguishable from the silence above.
+#define KLPLAT_MSG_PLATFORM_INIT   450037684u   // Message.MessageType
+#define KLPLAT_MSG_ENTITLEMENT     409688241u   //   .Platform_InitializeAndroidAsynchronous
+#define KLPLAT_MSG_AGE_CATEGORY    567009472u   //   .Entitlement_GetIsViewerEntitled
+#define KLPLAT_MSG_APP_VERSION    1751583246u   //   .UserAgeCategory_Get
+                                                //   .Application_GetVersion
+#define KLPLAT_INIT_SUCCESS        0            // PlatformInitializeResult.Success
+#define KLPLAT_AGE_ADULT           3            // AccountAgeCategory.Ad
+
+// A ring, because the guest holds a message only until it has read it and calls
+// ovr_FreeMessage; three per run is the whole traffic, so 16 slots cannot wrap
+// under a live message. The mutex is not defensive — the requests are issued
+// from managed code on the main thread and the pump runs there too, but nothing
+// in the API promises that.
+#define KLPLAT_MSGQ 16
+typedef struct { uint32_t type; uint64_t request; int32_t payload; } klplat_msg;
+static klplat_msg      g_msgq[KLPLAT_MSGQ];
+static unsigned        g_msg_head, g_msg_tail;
+static uint64_t        g_next_request = 1;
+static int             g_platform_up;
+static pthread_mutex_t g_msg_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// Issue a request and queue its completion. Returns the ovrRequest the guest
+// will wait on — non-zero, and matched by the message, which together are the
+// whole point.
+static uint64_t klplat_request(const char *what, uint32_t type, int32_t payload) {
+    pthread_mutex_lock(&g_msg_mu);
+    uint64_t id = g_next_request++;
+    if (g_msg_tail - g_msg_head < KLPLAT_MSGQ) {
+        klplat_msg *m = &g_msgq[g_msg_tail++ % KLPLAT_MSGQ];
+        m->type = type; m->request = id; m->payload = payload;
+    }
+    pthread_mutex_unlock(&g_msg_mu);
+    fprintf(stderr, "  [plat] %s -> request %llu, completion queued "
+                    "(type 0x%08x, payload %d)\n",
+            what, (unsigned long long)id, type, payload);
+    return id;
+}
+
+// The message pump. NULL still means "no messages queued", which is the
+// documented way to say it and is the steady state for all but three calls a
+// run — what changed is that it is no longer the ONLY thing this can say.
+static void *klplat_PopMessage(void) {
+    plat_hit("ovr_PopMessage");
+    void *out = NULL;
+    pthread_mutex_lock(&g_msg_mu);
+    if (g_msg_head != g_msg_tail) out = &g_msgq[g_msg_head++ % KLPLAT_MSGQ];
+    pthread_mutex_unlock(&g_msg_mu);
+    return out;
+}
+
+// The accessors the SDK's Message base class and the two payload wrappers call
+// on that handle. Real functions rather than named trampolines, because these
+// take the handle in x0 and a trampoline would put the entry point's NAME there.
+//
+// ovr_Message_GetError is deliberately absent: nothing here is ever an error, so
+// the guest never asks, and the fail-closed default would name it if that
+// changed. Same for every other Message accessor — a message shape we do not
+// produce should stop the run by name rather than answer.
+static uint64_t klplat_Message_GetType(const klplat_msg *m) {
+    plat_hit("ovr_Message_GetType");
+    return m ? m->type : 0;
+}
+static uint64_t klplat_Message_IsError(const klplat_msg *m) {
+    plat_hit("ovr_Message_IsError");
+    (void)m;
+    return 0;
+}
+static uint64_t klplat_Message_GetRequestID(const klplat_msg *m) {
+    plat_hit("ovr_Message_GetRequestID");
+    return m ? m->request : 0;
+}
+// The payload handle IS the message: there is one payload per message here, so
+// a separate allocation would only be a second thing to keep alive.
+static uint64_t klplat_Message_GetPayload(const klplat_msg *m) {
+    plat_hit("ovr_Message_GetPayload");
+    return (uint64_t)(uintptr_t)m;
+}
+static uint64_t klplat_payload_int(const klplat_msg *m) {
+    plat_hit("ovr_Payload_GetInt");
+    return m ? (uint64_t)(uint32_t)m->payload : 0;
+}
+static uint64_t klplat_FreeMessage(klplat_msg *m) {
+    plat_hit("ovr_FreeMessage");
+    (void)m;                      // the ring owns it; see the KLPLAT_MSGQ note
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // What we do implement: the platform reporting its own absence, honestly.
 //
 // ovr_IsPlatformInitialized answers false, because it is not initialised and
@@ -148,9 +282,15 @@ static uint64_t klplat_called(const char *name) {
 // so the guest's own "platform unavailable" path is a path it already has — its
 // metadata carries "Oculus Platform failed to initialize." and
 // "Initialize Error: Oculus platform failed to initialize due to exception."
+// ...and it answers TRUE once an init request has been completed, because the
+// SDK gates every other request on it — `Entitlements.IsUserEntitledToApplication`
+// and `Users.GetUserAgeCategory` both begin `if (Core.IsInitialized())`, and
+// Core.IsInitialized() IS this call. Answering false there is not a cautious
+// answer, it is a guarantee that no request is ever made and so no completion
+// is ever awaited-and-delivered; the two halves have to agree.
 static uint64_t klplat_IsPlatformInitialized(void) {
     plat_hit("ovr_IsPlatformInitialized");
-    return 0;
+    return (uint64_t)g_platform_up;
 }
 
 // The app's own licence check — see the g_plat_absent carve-out above for why
@@ -161,19 +301,90 @@ static uint64_t klplat_IsPlatformInitialized(void) {
 // the guest's licence-FAILURE path, not a neutral answer — so m_boot's
 // check_drm_guard asserts the value, in both directions along with the
 // refusals it sits beside.
+// It is a REQUEST, not a predicate — `Entitlements.IsUserEntitledToApplication()`
+// wraps its return in a `Request` and awaits the completion, so the old bare 1
+// was request id 1 with nothing ever arriving for it. The answer is unchanged
+// and so is the reasoning above; it is now delivered where the guest reads it,
+// as a non-error completion, which is how this API spells "entitled".
 static uint64_t klplat_Entitlement_GetIsViewerEntitled(void) {
     plat_hit("ovr_Entitlement_GetIsViewerEntitled");
-    return 1;
+    return klplat_request("ovr_Entitlement_GetIsViewerEntitled",
+                          KLPLAT_MSG_ENTITLEMENT, 0);
 }
 
-// The message pump. Returning NULL means "no messages queued", which is true and
-// is the documented way to say it — and it is what stops the poll loop that
-// tripped the real library's assert. Note this is *not* a refusal: an empty queue
-// is a legitimate steady state, not a fabricated answer.
-static void *klplat_PopMessage(void) {
-    plat_hit("ovr_PopMessage");
-    return NULL;
+// The age category, and the ONE answer in this file that is a declaration
+// rather than a measurement. See the completion-queue comment above: the user
+// declared themselves over 18 and this reports it; nothing here discovered it.
+// `Ad` is Oculus.Platform.AccountAgeCategory's own spelling, read out of the
+// guest, and Beat Saber maps it to its `UserAgeCategory.Adult`.
+static uint64_t klplat_UserAgeCategory_Get(void) {
+    plat_hit("ovr_UserAgeCategory_Get");
+    return klplat_request("ovr_UserAgeCategory_Get",
+                          KLPLAT_MSG_AGE_CATEGORY, KLPLAT_AGE_ADULT);
 }
+
+// The application's own version, which is the one question in this family we can
+// answer from something we actually have: the unpacked tree's apktool.yml, i.e.
+// exactly what PackageManager already tells the guest. `OculusInit`'s
+// GetAppVersionQuestAsync asks it during startup, behind the init completion.
+//
+// LATEST is answered as CURRENT, and that is a statement rather than a dodge:
+// there is no store here to ask what the newest build is, and "the installed
+// one is the newest one" is the only self-consistent thing to say — it means
+// "no update available", which is true of this host in the only sense available
+// to it. Reporting a HIGHER latest would advertise an update that cannot be
+// fetched, which is what drives Application_StartAppDownload.
+static uint64_t klplat_Application_GetVersion(void) {
+    plat_hit("ovr_Application_GetVersion");
+    return klplat_request("ovr_Application_GetVersion", KLPLAT_MSG_APP_VERSION, 0);
+}
+
+static uint64_t klplat_AppVersion_code(const void *h) {
+    plat_hit("ovr_ApplicationVersion_GetCode");
+    (void)h;
+    long code = 0; kl_jni_guest_version(&code, NULL);
+    return (uint64_t)(int64_t)code;
+}
+// The two fields of the same model we cannot answer from anything here. A
+// release date and a download size are properties of a STORE listing, and there
+// is no store; 0 is the SDK's own "not published" rather than a stand-in, and
+// the model reads every field at construction whether or not it uses them.
+static uint64_t klplat_AppVersion_unknown(const void *h) {
+    plat_hit("ovr_ApplicationVersion_unknown_field");
+    (void)h;
+    return 0;
+}
+
+static const char *klplat_AppVersion_name(const void *h) {
+    plat_hit("ovr_ApplicationVersion_GetName");
+    (void)h;
+    const char *name = NULL; kl_jni_guest_version(NULL, &name);
+    return name ? name : "";
+}
+
+// The ASYNCHRONOUS init. Its completion is what everything else waits behind,
+// so this is also where the platform becomes "up" for ovr_IsPlatformInitialized.
+// Only the async spellings come here: the synchronous ones return a
+// PlatformInitializeResult directly and keep their old answer.
+static uint64_t klplat_init_async(const char *name) {
+    plat_hit(name);
+    g_platform_up = 1;
+    return klplat_request(name, KLPLAT_MSG_PLATFORM_INIT, KLPLAT_INIT_SUCCESS);
+}
+
+static const char *const g_plat_init_async[] = {
+    "ovr_UnityInitWrapperAsynchronous",
+    "ovr_PlatformInitializeAndroidAsynchronous",
+    "ovr_PlatformInitializeAndroidAsynchronousWithOptions",
+    "ovr_PlatformInitializeWindowsAsynchronous",
+};
+
+static int plat_is_init_async(const char *name) {
+    for (size_t i = 0; i < sizeof g_plat_init_async / sizeof g_plat_init_async[0]; i++)
+        if (strcmp(g_plat_init_async[i], name) == 0) return 1;
+    return 0;
+}
+
 
 // Unity's native plugin interface. Every entry point in it returns void, and the
 // real platform loader uses them only to keep hold of the IUnityInterfaces
@@ -192,10 +403,9 @@ static const char *const g_plat_unity[] = {
     // returns int, and 0 is the truthful answer — this plugin wants no
     // render-thread extension events, so Unity will never issue them.
     "UnityRenderingExtEvent", "UnityRenderingExtQuery",
-    // Message lifecycle. ovr_PopMessage never hands out a message, so there is
-    // never anything to free — and a free of nothing is genuinely nothing to do,
-    // not a stub standing in for something.
-    "ovr_FreeMessage",
+    // ovr_FreeMessage used to sit here, under "ovr_PopMessage never hands out a
+    // message, so there is never anything to free". It does now, so it has a
+    // real implementation above.
 };
 
 static int plat_is_unity_hook(const char *name) {
@@ -362,7 +572,30 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"JNI_OnLoad",                (void *)klplat_JNI_OnLoad},
     {"ovr_IsPlatformInitialized", (void *)klplat_IsPlatformInitialized},
     {"ovr_PopMessage",            (void *)klplat_PopMessage},
-    {"ovr_Entitlement_GetIsViewerEntitled", (void *)klplat_Entitlement_GetIsViewerEntitled}
+    {"ovr_FreeMessage",           (void *)klplat_FreeMessage},
+    {"ovr_Entitlement_GetIsViewerEntitled", (void *)klplat_Entitlement_GetIsViewerEntitled},
+    {"ovr_UserAgeCategory_Get",   (void *)klplat_UserAgeCategory_Get},
+    {"ovr_Application_GetVersion",(void *)klplat_Application_GetVersion},
+    {"ovr_Message_GetApplicationVersion",      (void *)klplat_Message_GetPayload},
+    {"ovr_ApplicationVersion_GetCurrentCode",  (void *)klplat_AppVersion_code},
+    {"ovr_ApplicationVersion_GetLatestCode",   (void *)klplat_AppVersion_code},
+    {"ovr_ApplicationVersion_GetCurrentName",  (void *)klplat_AppVersion_name},
+    {"ovr_ApplicationVersion_GetLatestName",   (void *)klplat_AppVersion_name},
+    {"ovr_ApplicationVersion_GetReleaseDate",  (void *)klplat_AppVersion_unknown},
+    {"ovr_ApplicationVersion_GetSize",         (void *)klplat_AppVersion_unknown},
+    // The message accessors. Each takes the handle in x0, so they cannot go
+    // through a named trampoline — see the note above klplat_Message_GetType.
+    {"ovr_Message_GetType",       (void *)klplat_Message_GetType},
+    // "The native message" is this message — the SDK keeps the handle around to
+    // hand back to callers that want the raw pointer, and there is nothing
+    // behind ours that it is not already holding.
+    {"ovr_Message_GetNativeMessage", (void *)klplat_Message_GetPayload},
+    {"ovr_Message_IsError",       (void *)klplat_Message_IsError},
+    {"ovr_Message_GetRequestID",  (void *)klplat_Message_GetRequestID},
+    {"ovr_Message_GetPlatformInitialize",      (void *)klplat_Message_GetPayload},
+    {"ovr_PlatformInitialize_GetResult",       (void *)klplat_payload_int},
+    {"ovr_Message_GetUserAccountAgeCategory",  (void *)klplat_Message_GetPayload},
+    {"ovr_UserAccountAgeCategory_GetAgeCategory", (void *)klplat_payload_int},
 };
 
 static const char g_plat_handle[] = "klepton-ovrplatformloader";
@@ -408,6 +641,8 @@ void *kl_ovrplat_sym(const char *name) {
         return kl_named_stub(name, (void *)klplat_options_create);
     if (plat_is_options_sink(name))
         return kl_named_stub(name, (void *)klplat_void);
+    if (plat_is_init_async(name))
+        return kl_named_stub(name, (void *)klplat_init_async);
     if (plat_is_absent_ok(name) || plat_is_init(name) || plat_is_request(name))
         return kl_named_stub(name, (void *)klplat_init_fails);
     return kl_named_stub(name, (void *)klplat_called);

@@ -34,11 +34,24 @@ static int fails;
 typedef struct { int32_t rate, sample_bytes, safe_queued, min_buf, optimal_buf, max_buf; } hdesc;
 typedef struct { int32_t available, queued; } hstate;
 typedef struct { const uint8_t *samples; int32_t count; } hbuffer;
+// ...and 1.40's, which libhaptics_sdk passes. Declared BY VALUE and called by
+// value on purpose: at 32 bytes AAPCS64 makes the caller hand over a pointer to
+// a copy, so this is the one way to prove our x1 layout against the compiler's
+// rather than against our own reading of it.
+typedef struct {
+    uint32_t     buffer_size;
+    const float *buffer;
+    float        rate_hz;
+    uint32_t     append;
+    uint32_t    *consumed;
+} pcmvib;
 
 static hdesc  (*get_desc)(uint32_t);
 static hstate (*get_state)(uint32_t);
 static int32_t (*set_haptics)(uint32_t, hbuffer);
 static int32_t (*set_vibration)(uint32_t, float, float);
+static int32_t (*set_pcm)(uint32_t, pcmvib);
+static int32_t (*get_rate)(uint32_t, float *);
 
 #define LTOUCH 0x1u
 #define RTOUCH 0x2u
@@ -61,7 +74,10 @@ int main(void) {
     get_state     = kl_ovrp_sym("ovrp_GetControllerHapticsState");
     set_haptics   = kl_ovrp_sym("ovrp_SetControllerHaptics");
     set_vibration = kl_ovrp_sym("ovrp_SetControllerVibration");
-    if (!get_desc || !get_state || !set_haptics || !set_vibration) {
+    set_pcm       = kl_ovrp_sym("ovrp_SetControllerHapticsPcm");
+    get_rate      = kl_ovrp_sym("ovrp_GetControllerSampleRateHz");
+    if (!get_desc || !get_state || !set_haptics || !set_vibration
+        || !set_pcm || !get_rate) {
         printf("  FAIL: an entry point did not resolve\n");
         return 1;
     }
@@ -205,6 +221,83 @@ int main(void) {
     set_vibration(RTOUCH, 0.0f, 0.0f);
     nap(0.05);                             // past the 32 ms hold
     CHECK(!kl_ovrp_haptics_pull(1, &amp, &secs), "a stopped vibration kept buzzing");
+
+    // 12. The PCM path — 1.40's, and a different producer for the same queue.
+    //     libhaptics_sdk (Meta's Haptics SDK, a Rust engine on its own thread)
+    //     does not go through OVRHaptics at all: it dlopens libOVRPlugin and
+    //     resolves these two by name. Neither was implemented, so the first
+    //     haptic the game plays — the pulse a menu button makes when the
+    //     pointer highlights it — aborted by name on that thread, which
+    //     presented as "the viewer crashes when you hover a button".
+    //
+    //     The rate is checked against the DESCRIPTOR rather than against 320:
+    //     the SDK asks for it and then sends at whatever it was told, so the
+    //     two answers disagreeing is a clip played at the wrong speed with
+    //     nothing anywhere reporting it.
+    nap(0.5);
+    (void)kl_ovrp_haptics_pull(0, &amp, &secs);
+    (void)kl_ovrp_haptics_pull(1, &amp, &secs);
+    {
+        // The version comes first, because the SDK reads it while it is
+        // initializing its OVRPlugin backend and then formats it into a log
+        // line — i.e. it strlen()s whatever we left in its out pointer. The
+        // 2-form is `ovrpResult ovrp_GetVersion2(const char **)`, NOT a scalar
+        // string return like the un-suffixed one; getting that backwards is a
+        // SIGSEGV at 0x0 in _platform_strlen, on the SDK's thread, naming
+        // neither haptics nor the version.
+        int32_t (*get_version2)(const char **) = kl_ovrp_sym("ovrp_GetVersion2");
+        const char *(*get_version)(void)       = kl_ovrp_sym("ovrp_GetVersion");
+        const char *ver = (const char *)(uintptr_t)0xdeadbeef;
+        CHECK(get_version2 && get_version2(&ver) == 0, "ovrp_GetVersion2 failed");
+        CHECK(ver && ver != (const char *)(uintptr_t)0xdeadbeef && *ver,
+              "ovrp_GetVersion2 left its out pointer alone — that is a strlen(NULL) "
+              "in whatever native code reads it");
+        printf("  pcm: OVRPlugin version %s\n", ver ? ver : "(unwritten)");
+        CHECK(get_version && strcmp(get_version(), ver) == 0,
+              "the two version surfaces disagree");
+
+        float rate = 0;
+        CHECK(get_rate(LTOUCH, &rate) == 0, "ovrp_GetControllerSampleRateHz failed");
+        printf("  pcm: sample rate %.0f Hz\n", (double)rate);
+        CHECK(rate == (float)d.rate, "PCM rate %.0f but the descriptor says %d",
+              (double)rate, d.rate);
+        // A NULL out pointer is the real plugin's -1001, and it is what its own
+        // `cbz x1` answers — so a caller probing with one must not be served.
+        CHECK(get_rate(LTOUCH, NULL) != 0, "a NULL sample-rate pointer was served");
+
+        float    clip[32];
+        for (int i = 0; i < 32; i++) clip[i] = (float)i / 31.0f;   // 0 -> 1, a ramp
+        uint32_t consumed = 0xffffffffu;
+        pcmvib   v = { 32, clip, rate, 0 /* replace */, &consumed };
+        CHECK(set_pcm(RTOUCH, v) == 0, "ovrp_SetControllerHapticsPcm failed");
+        CHECK(consumed == 32, "%u of 32 PCM samples consumed", consumed);
+        // It landed in the SAME queue the buffered path feeds, at the same
+        // rate, which is the whole reason it is not a fourth source.
+        s = get_state(RTOUCH);
+        CHECK(s.queued >= 30 && s.queued <= 32, "%d queued after a 32-sample PCM push",
+              s.queued);
+        CHECK(get_state(LTOUCH).queued == 0, "the PCM push reached the OTHER hand");
+        nap(0.09);
+        CHECK(kl_ovrp_haptics_pull(1, &amp, &secs), "no level out of a PCM clip");
+        printf("  pcm: level %.2f from the ramp's first 90 ms\n", (double)amp);
+        CHECK(amp > 0.0f && amp < 0.99f, "a ramp's first third came out at %.2f",
+              (double)amp);
+
+        // Append=false is a REPLACE. A clip starting while the last one drains
+        // must not be heard behind it.
+        pcmvib again = { 32, clip, rate, 0, &consumed };
+        set_pcm(RTOUCH, again);
+        s = get_state(RTOUCH);
+        CHECK(s.queued <= 32, "%d queued after a replacing PCM push — it appended",
+              s.queued);
+
+        // ...and the pointers the real plugin refuses (it tests [x1+0x8] and
+        // [x1+0x18] before anything else), so a wrong layout here is loud.
+        pcmvib bad = { 32, NULL, rate, 0, &consumed };
+        CHECK(set_pcm(RTOUCH, bad) != 0, "a NULL PCM buffer was accepted");
+        pcmvib bad2 = { 32, clip, rate, 0, NULL };
+        CHECK(set_pcm(RTOUCH, bad2) != 0, "a NULL SamplesConsumed was accepted");
+    }
 
     printf(fails ? "\nFAIL: %d check(s)\n" : "\nPASS: the haptics seam behaves\n",
            fails);

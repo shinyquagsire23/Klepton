@@ -164,6 +164,15 @@ const char *kl_reproject_msl(void);
 //
 // self-describing so the pass needs no extra uniform, and so a caller cannot
 // bind a table that disagrees with the vertex count it draws.
+//
+// **The zone-aligned exactness is a full-viewport property.** Cells uniform in
+// screen space land on the map's own breakpoints only when they span the whole
+// screen; with a render viewport smaller than it (see `vp` below) the cells are
+// FINER than a zone and no longer coincide with the breakpoints, so the unwarp
+// becomes a dense sampling of the curve rather than a reproduction of it. That
+// is the same accuracy the built-map fallback has always had — sub-texel at
+// this cell count — and it is worth knowing before a hunt for a soft periphery
+// in a title that scales its resolution.
 #define KL_REPROJECT_GRID_MAX 64
 
 // Entries (each a simd_float2) a grid buffer needs, header included.
@@ -188,14 +197,30 @@ void kl_reproject_grid_identity(simd_float2 *out);
 // `fn` is the platform's screen->physical conversion — on Apple that is
 // `-[MTLRasterizationRateMap mapScreenToPhysicalCoordinates:forLayer:]`, which
 // exists on the CPU precisely so this can be precomputed. Both are in PIXELS.
+// **NULL is legal and means the identity**, which is what makes the two things
+// this grid corrects for one code path instead of two: a foveated eye and a
+// partly-used one are the same question — "which texels did the guest write?"
+// — asked of the rasterizer and of the viewport.
+//
+// `vp` is the guest's render viewport in SCREEN pixels, {x, y, w, h}, or NULL
+// for the whole screen. It comes from kl_ovrp_render_pose.viewport, i.e. the
+// rect the guest submitted with the frame; a title that lowers its render
+// resolution does it by shrinking this and NOT by resizing the texture, so a
+// grid that ignores it samples unwritten texels and puts the picture in a
+// corner. Composes with foveation in the obvious order: the viewport is in
+// screen space, so it is applied first and the rate map maps what survives.
 //
 // `tex_w`/`tex_h` are the eye texture's real dimensions, which the returned
 // coordinates are normalised against. They are the SCREEN size, not the
 // physical one: the runtime allocates eye textures at screen size and lets
 // Metal write the smaller physical region inside them, so that GL, the viewport
 // and the scissor all keep agreeing with each other (see kl_glfb.h).
+//
+// One grid serves BOTH eyes — it is bound once for an amplified pass — so a
+// caller with two different per-eye viewports has to pick one and say so.
 typedef void (*kl_reproject_s2p)(void *ctx, float sx, float sy, float *px, float *py);
 void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
+                             const float *vp,
                              float screen_w, float screen_h,
                              float tex_w, float tex_h,
                              kl_reproject_s2p fn, void *ctx);

@@ -133,6 +133,75 @@ static void str_ascii(Il2CppObject *s, char *out, size_t cap) {
     out[o] = 0;
 }
 
+// ---- KL_PROBE_ENUM: read an enum's VALUES out of the running guest --------
+//
+// The values of a C# enum are the one thing about the guest's ABI that is
+// neither in its exported symbols nor in its strings: global-metadata.dat holds
+// the names, and the numbers live in a constant table whose layout is a
+// metadata-version detail. But the runtime knows them, and it will answer
+// through ordinary reflection — `Enum.GetNames(t)` and `Enum.GetValues(t)`.
+//
+// This exists because kl_ovrplat has to hand the guest a MESSAGE, and a message
+// carries `Message.MessageType`, which the guest's own `ParseMessageHandle`
+// switches on: a number we guessed lands in its `default` arm, which logs
+// "Unrecognized message type" and produces no message at all. Same argument as
+// OVRP_HEADSET_OCULUS_QUEST_2 in kl_ovrp.c — read the value out of the guest
+// rather than out of a header we do not have — with reflection instead of a
+// metadata scan, because that also works for a nested type.
+//
+//   KL_PROBE_ENUM="Oculus.Platform.Message/MessageType,Oculus.Platform.User..."
+//
+// Comma-separated, `Namespace.Type` (nested types with `/`), printed once at
+// the first probe tick. Diagnostic only; nothing in the shipping path reads it.
+static void probe_dump_enum(const char *spec) {
+    char ns[128] = "", name[128] = "";
+    const char *dot = strrchr(spec, '.');
+    if (dot) {
+        size_t nl = (size_t)(dot - spec);
+        if (nl >= sizeof ns) nl = sizeof ns - 1;
+        memcpy(ns, spec, nl); ns[nl] = 0;
+        snprintf(name, sizeof name, "%s", dot + 1);
+    } else {
+        snprintf(name, sizeof name, "%s", spec);   // the global namespace
+    }
+    Il2CppClass *k = find_class(ns, name);
+    if (!k) { fprintf(stderr, "  [mprobe] enum: no class %s.%s\n", ns, name); return; }
+    void         *ty  = il.class_get_type(k);
+    Il2CppObject *tyo = ty ? il.type_get_object(ty) : NULL;
+    if (!tyo) { fprintf(stderr, "  [mprobe] enum: no System.Type for %s\n", spec); return; }
+
+    const MethodInfo *m_names  = find_method("System", "Enum", "GetNames", 1);
+    const MethodInfo *m_values = find_method("System", "Enum", "GetValues", 1);
+    void *args[1] = { tyo };
+    Il2CppObject *names  = invoke(m_names,  args, "Enum.GetNames");
+    Il2CppObject *values = invoke(m_values, args, "Enum.GetValues");
+    if (!names || !values) return;
+    uint32_t n = il.array_length(names);
+    // GetValues returns an array OF THE ENUM TYPE, so its elements are the
+    // underlying integer, not boxed objects. Four bytes unless the enum has an
+    // explicit wider base, which none of the ones this exists for do — the
+    // stride is checked against the array length rather than assumed, so a
+    // long-backed enum prints as such instead of silently reading halves.
+    const uint8_t *vdata = (const uint8_t *)values + ARR_DATA;
+    const void   **ndata = (const void **)((const uint8_t *)names + ARR_DATA);
+    fprintf(stderr, "  [mprobe] enum %s: %u value(s)\n", spec, n);
+    for (uint32_t i = 0; i < n; i++) {
+        char nm[128];
+        str_ascii((Il2CppObject *)ndata[i], nm, sizeof nm);
+        int32_t v; memcpy(&v, vdata + (size_t)i * 4, sizeof v);
+        fprintf(stderr, "  [mprobe]   %-56s = %d (0x%08x)\n", nm, v, (unsigned)v);
+    }
+}
+
+static void probe_dump_enums(void) {
+    const char *spec = kl_env_str("KL_PROBE_ENUM", NULL);
+    if (!spec || !*spec) return;
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", spec);
+    for (char *p = buf, *tok; (tok = strsep(&p, ",")) != NULL; )
+        if (*tok) probe_dump_enum(tok);
+}
+
 // The axes this title binds (PLANNING M7: parsed out of globalgamemanagers).
 static const char *const AXES[] = {
     "TriggerLeftHand", "TriggerRightHand",
@@ -158,6 +227,9 @@ void kl_mprobe_tick(unsigned frame) {
     }
     if (frame < from || frame % every) return;
     if (!mprobe_init()) { on = 0; return; }
+
+    static int dumped_enums;
+    if (!dumped_enums) { dumped_enums = 1; probe_dump_enums(); }
 
     // Input.GetJoystickNames and InputTracking.GetLocalPosition/Rotation are
     // NOT here: IL2CPP's managed stripping removed them, which is itself the

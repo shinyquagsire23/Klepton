@@ -443,6 +443,7 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@head -1 build/bcast.log && tail -1 build/bcast.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
 	@head -3 build/haptics.log && tail -1 build/haptics.log
+	@$(MAKE) -s ovrpabi
 # The opus roundtrip is the one gate here that RUNS guest code rather than
 # inspecting it, so it is worth keeping wherever it exists — but libunityopus.so
 # is a Unity 2019.x artifact (2018.4 has opus inside libunity and exports none of
@@ -788,6 +789,19 @@ build/t_haptics: tests/t_haptics.c $(RUNTIME) runtime/kl_ovrp.h
 .PHONY: haptics
 haptics: build/t_haptics
 	@./build/t_haptics
+
+# ...and the half t_haptics cannot see: whether our implementations agree with
+# the REAL libOVRPlugin.so about which arguments are OUT-parameters. Offline —
+# it disassembles the plugin in the guest tree, runs no guest and needs no
+# hardware, and takes about a second. It exists because that question has cost
+# two arcs now: trap 10 was its return-value half, and ovrp_GetVersion2 was its
+# argument half — an out pointer we never wrote, which is a strlen(NULL) in
+# whichever native library reads it and names nothing on the way down.
+# LIBS points it at whichever guest is current; a tree with no libOVRPlugin.so
+# says so and passes.
+.PHONY: ovrpabi
+ovrpabi:
+	@python3 tools/ovrp_abi.py $(LIBS)/libOVRPlugin.so runtime/kl_ovrp.c
 
 # A *vendored debug build* of ANGLE lives in vendor/ (gitignored) — the Metal
 # backend can be stepped into, which is what the AGX-abort investigation needs.

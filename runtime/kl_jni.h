@@ -90,6 +90,11 @@ void kl_jni_set_assets_dir(const char *dir);
 void kl_jni_set_files_dir(const char *dir);
 // The per-guest userdata root: ~/Library/Application Support/Klepton/userdata/<guest>,
 // or KL_FILES_DIR if set. Keyed on the guest rather than the APK so that swapping
+// The guest's own versionCode / versionName, as read from the unpacked tree
+// (apktool.yml). Exported because kl_ovrplat answers ovr_Application_GetVersion
+// from it — one number, not two that can disagree.
+void kl_jni_guest_version(long *code, const char **name);
+
 // Beat Saber versions keeps one save/pairing profile instead of repeating first
 // setup — and deliberately OUTSIDE build/, which `make clean` deletes. Drivers
 // pass the result to kl_jni_set_files_dir; visionOS overrides it with the app
