@@ -47,6 +47,16 @@
 // a gateway that can never say no.
 void *kl_openxr_lookup(const char *name);
 
+// The DLOPEN door, for a guest that opens the loader rather than importing from
+// it. libUnityOpenXR.so does exactly that, and unlike the other synthetic
+// libraries here the real libopenxr_loader.so IS present in a Unity guest tree
+// — so without this the Khronos loader loads and goes looking for the Android
+// runtime broker it needs. See the long note in kl_openxr.c.
+int   kl_openxr_claims(const char *soname);
+void *kl_openxr_dlopen(const char *soname);
+int   kl_openxr_is_handle(const void *h);
+void *kl_openxr_sym(const char *name);
+
 // Which xr* the guest resolved and which it called — the SL-8 work list, in the
 // shape kl_ovrp_report prints for M6.
 void kl_openxr_report(FILE *f);

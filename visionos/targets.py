@@ -123,6 +123,41 @@ TARGETS = {
         "product": "KleptonBonelab",
         "display": "Klepton BONELAB",
     },
+    "vrchat": {
+        # VRChat — Unity 2022.3.22f2-DWR + IL2CPP, and the FIFTH target. It is
+        # the first guest here that is not an Oculus title: this is the STEAM
+        # FRAME build, so there is no libOVRPlugin, no libvrapi and no Oculus
+        # Platform loader anywhere in it. It speaks OPENXR, through the stack
+        # Unity ships for it — libopenxr_loader (the Khronos loader),
+        # libUnityOpenXR (the XR SDK provider) and libUnityOpenXRHands — and
+        # boot.config says so in one line: `xrsdk-pre-init-library=UnityOpenXR`,
+        # where BONELAB's says OculusXRPlugin.
+        #
+        # That makes it the target that joins the project's two halves: the
+        # Unity/IL2CPP path (Beat Saber, SUPERHOT, BONELAB) and the OpenXR
+        # runtime written for Steam Link (runtime/kl_openxr.c), which until now
+        # only ever had a non-Unity guest on top of it.
+        #
+        # The front door is stock — com.unity3d.player.UnityPlayerActivity and
+        # libmain's JNI_OnLoad — even though the manifest names an OBFUSCATED
+        # Application class (aGGhd3.kN5sj1.jrtzH2.r3jyW1), which is the title's
+        # own and loads libloader.so from Java. We do not run Java, so nothing
+        # here depends on that library; if something ends up demanding it, that
+        # is a symptom to read rather than a step to pre-empt.
+        #
+        # Not a split binary: 317 MB of APK with assets/bin/Data inside it and
+        # no OBB beside it. libil2cpp.so alone is 297 MB.
+        "libs":    None,
+        "srcdir":  "vrchat/lib/arm64-v8a",
+        "tree":    "vrchat",
+        "apk":     "vrchat.apk",
+        "assets":  "vrchat/assets",
+        "qtplugins": "",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonVRChat",
+        "display": "Klepton VRChat",
+    },
     "steamlink-vr": {
         # BOTH front doors, because the app runs both: the 2D shell pairs in a
         # WindowGroup and hands off to the OpenXR half in an ImmersiveSpace, in

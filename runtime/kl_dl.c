@@ -12,6 +12,8 @@
 #include "kl_ovrplat.h"
 #include "kl_mediandk.h"
 #include "kl_vulkan.h"
+#include "kl_aaudio.h"
+#include "kl_openxr.h"
 
 #define KL_MAX_IMAGES 64
 typedef struct { char soname[128]; kl_image *img; } entry;
@@ -187,7 +189,8 @@ int kl_can_dlopen(const char *path) {
     if (!path) return 0;
     return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||
            kl_ovrplat_claims(path) || kl_mediandk_claims(path) ||
-           kl_vulkan_claims(path) || kl_can_load(path);
+           kl_vulkan_claims(path) || kl_aaudio_claims(path) ||
+           kl_openxr_claims(path) || kl_can_load(path);
 }
 
 void *klb_dlopen(const char *path, int flags) {
@@ -213,6 +216,18 @@ void *klb_dlopen(const char *path, int flags) {
     // thing it tries — it is the only graphics API this build probes.
     void *vk = kl_vulkan_dlopen(path);
     if (vk) return vk;
+    // AAudio. FMOD dlopens it by name on every Unity guest and there is no file
+    // to fall through to, so a miss here is silently no audio at all — see
+    // kl_aaudio.c. (Steam Link reaches the same code through DT_NEEDED instead,
+    // which is why this door was missing for so long.)
+    void *aa = kl_aaudio_dlopen(path);
+    if (aa) return aa;
+    // The OpenXR loader. This one is NOT like the lines above it: the file
+    // really is in the guest tree, so this must come first to keep the real
+    // Khronos loader from loading successfully and then failing at the Android
+    // runtime broker. See kl_openxr.c.
+    void *xrl = kl_openxr_dlopen(path);
+    if (xrl) return xrl;
     pthread_mutex_lock(&g_lock);
     kl_image *found = kl_find_image(path);           // already loaded? refcount is coarse
     pthread_mutex_unlock(&g_lock);
@@ -239,6 +254,8 @@ void *klb_dlsym(void *handle, const char *name) {
     if (kl_ovrplat_is_handle(handle)) return kl_ovrplat_sym(name);
     if (kl_mediandk_is_handle(handle)) return kl_mediandk_sym(name);
     if (kl_vulkan_is_handle(handle)) return kl_vulkan_sym(name);
+    if (kl_aaudio_is_handle(handle)) return kl_aaudio_sym(name);
+    if (kl_openxr_is_handle(handle)) return kl_openxr_sym(name);
     if (handle == NULL || handle == (void *)-1) {    // RTLD_DEFAULT / RTLD_NEXT
         void *s = kl_shim_lookup(name);
         if (s) return s;

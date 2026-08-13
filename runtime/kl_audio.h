@@ -68,6 +68,12 @@ void kl_audio_resume(void);
 // output unit initialised against the wrong rate fails at AudioUnitInitialize.
 void kl_audio_session_ready(double sample_rate);
 
+// How many times the render callback found the ring empty while the guest
+// thought it was playing. Exposed because AAudio's AAudioStream_getXRunCount is
+// exactly this number and FMOD polls it to size its own buffer — answering a
+// constant 0 there is a claim that the device never underruns.
+unsigned kl_audio_underruns(void);
+
 void kl_audio_report(FILE *f);
 
 #endif

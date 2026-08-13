@@ -1047,16 +1047,45 @@ static unsigned klegl_Terminate(EGLDisplay dpy) {
     (void)dpy; g_display.initialised = 0; return EGL_TRUE;
 }
 
+// EGL_EXTENSIONS names exactly the three extensions this runtime implements
+// entry points for, and nothing else. Every name here is a promise, and Unity
+// branches hard on this string — advertising one we do not serve buys a failure
+// much further from its cause, which is why the list is the implemented set
+// rather than a plausible one:
+//
+//   EGL_KHR_image_base                    eglCreateImageKHR / eglDestroyImageKHR
+//   EGL_ANDROID_image_native_buffer       ...and EGL_NATIVE_BUFFER_ANDROID, the
+//                                         only image target we accept
+//   EGL_ANDROID_get_native_client_buffer  eglGetNativeClientBufferANDROID
+//
+// It used to be the empty string, on the reasoning that promising nothing is
+// the safest thing to promise. It is not, and VRChat is what said so: AVPro
+// Video's OpenGLESPlayerRenderer::setupEglContext strdup()s this string and
+// walks it with strtok, and its loop is BOTTOM-tested — the first token is
+// logged and strlen'd before the NULL check that ends the loop. So an empty
+// list, which is a legal answer no conformant driver on Android ever actually
+// gives, is a strlen(NULL) on the boot path. The symptom names EGL only if you
+// read the guest's own last log line ("- (null)"); the frame it dies on is
+// _platform_strlen.
+//
+// The empty string is still one env-var away, because the two answers are worth
+// being able to A/B against a guest that branches on a name here.
+static const char *klegl_extensions(void) {
+    static const char *s;
+    if (!s) s = kl_env_str("KL_EGL_EXTENSIONS",
+                           "EGL_KHR_image_base "
+                           "EGL_ANDROID_image_native_buffer "
+                           "EGL_ANDROID_get_native_client_buffer");
+    return s;
+}
+
 static const char *klegl_QueryString(EGLDisplay dpy, int32_t name) {
     (void)dpy;
     KLEGL_TRACE("eglQueryString(%#x)", name);
     switch (name) {
     case EGL_VENDOR:  return "Klepton";
     case EGL_VERSION: return "1.5 Klepton";
-    // Deliberately empty. Every extension named here is a promise, and Unity
-    // branches hard on this string — advertising one we do not implement buys a
-    // failure much further from its cause.
-    case EGL_EXTENSIONS:  return "";
+    case EGL_EXTENSIONS:  return klegl_extensions();
     case EGL_CLIENT_APIS: return "OpenGL_ES";
     }
     g_error = EGL_BAD_PARAMETER;
@@ -1252,6 +1281,49 @@ static EGLContext klegl_CreateContext(EGLDisplay dpy, EGLConfig cfg,
     return (EGLContext)c;
 }
 
+// eglQueryContext — core EGL 1.0, and the getter for what eglCreateContext was
+// told. VRChat's AVPro asks; nothing before it did, so it was an abort by name.
+//
+// Three of the four attributes are answerable from state we keep or from facts
+// about this runtime, and the fourth is refused rather than guessed:
+//
+//   EGL_CONTEXT_CLIENT_VERSION  the attribute the guest itself passed in
+//   EGL_CONTEXT_CLIENT_TYPE     always EGL_OPENGL_ES_API — klegl_BindAPI serves
+//                               no other, so this cannot be anything else
+//   EGL_RENDER_BUFFER           EGL_BACK_BUFFER. Every surface here is a window
+//                               or pbuffer we double-buffer; a single-buffered
+//                               answer would be a promise that a draw is visible
+//                               without a swap.
+//
+// EGL_CONFIG_ID is the refusal: configs here are two fixed picks (see
+// klegl_ChooseConfig) and are not identified by id anywhere, so an id we
+// invented would not round-trip through eglGetConfigs — and a guest that used
+// it to re-find its config would get the wrong one, silently.
+#define EGL_OPENGL_ES_API         0x30A0   // also klegl_BindAPI, below
+#define EGL_CONFIG_ID             0x3028
+#define EGL_CONTEXT_CLIENT_TYPE   0x3097
+#define EGL_CONTEXT_CLIENT_VER    0x3098
+#define EGL_RENDER_BUFFER         0x3086
+#define EGL_BACK_BUFFER           0x3084
+
+static unsigned klegl_QueryContext(EGLDisplay dpy, EGLContext ctx,
+                                   int32_t attr, int32_t *value) {
+    KLEGL_TRACE("eglQueryContext(%#x)", attr);
+    (void)dpy;
+    const kl_egl_context *c = (const kl_egl_context *)ctx;
+    if (!c || !value) { g_error = EGL_BAD_PARAMETER; return EGL_FALSE; }
+    switch (attr) {
+    case EGL_CONTEXT_CLIENT_VER:  *value = c->client_version; break;
+    case EGL_CONTEXT_CLIENT_TYPE: *value = EGL_OPENGL_ES_API; break;
+    case EGL_RENDER_BUFFER:       *value = EGL_BACK_BUFFER;   break;
+    default:
+        fprintf(stderr, "  [egl] eglQueryContext: unhandled attribute 0x%x\n", attr);
+        g_error = 0x3004 /* EGL_BAD_ATTRIBUTE */;
+        return EGL_FALSE;
+    }
+    return EGL_TRUE;
+}
+
 static unsigned klegl_DestroyContext(EGLDisplay dpy, EGLContext c) {
     KLEGL_TRACE("eglDestroyContext");
     (void)dpy; if (c == g_current) g_current = NULL; return EGL_TRUE;
@@ -1403,7 +1475,6 @@ static unsigned klegl_DestroyImageKHR(EGLDisplay dpy, void *image) {
 // only API this runtime serves — there is no desktop GL and no OpenVG behind us.
 // Refusing anything else is the honest answer and keeps a guest that wanted a
 // different API from proceeding as though it had got one.
-#define EGL_OPENGL_ES_API 0x30A0
 static unsigned klegl_BindAPI(unsigned api) {
     KLEGL_TRACE("eglBindAPI");
     if (api == EGL_OPENGL_ES_API) return EGL_TRUE;
@@ -1518,6 +1589,7 @@ static const struct { const char *name; void *fn; } g_egl[] = {
     E("eglSurfaceAttrib",       klegl_SurfaceAttrib),
     E("eglCreateContext",       klegl_CreateContext),
     E("eglDestroyContext",      klegl_DestroyContext),
+    E("eglQueryContext",        klegl_QueryContext),
     E("eglMakeCurrent",         klegl_MakeCurrent),
     E("eglGetCurrentContext",   klegl_GetCurrentContext),
     E("eglGetCurrentDisplay",   klegl_GetCurrentDisplay),

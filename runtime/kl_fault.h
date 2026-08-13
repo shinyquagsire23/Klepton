@@ -25,4 +25,10 @@ void kl_fault_install(void);
 #define KL_FAULT_MAX_REPORTERS 8
 void kl_fault_add_reporter(void (*fn)(FILE *));
 
+// Walk and print an AAPCS64 frame chain, naming guest images and IL2CPP
+// methods. Pass NULL for `fp` to start at the caller. The fault handler does
+// this for a SIGNAL; this is the same walk for the ORDERLY aborts, where the
+// name of the call is already known and the caller is the open question.
+void kl_fault_print_frames(FILE *f, void *fp);
+
 #endif

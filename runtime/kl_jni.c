@@ -17,8 +17,14 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <zlib.h>        // a split-binary guest reads its OBB, and an OBB is a zip
+#define COMMON_DIGEST_FOR_OPENSSL 0
+#include <CommonCrypto/CommonDigest.h>   // AVPro's Manager.SHA256 — see below
+#include <CommonCrypto/CommonKeyDerivation.h>  // ...and its KeyDerivationPBKDF
+#include <CommonCrypto/CommonCryptoError.h>    // kCCSuccess
+#include <CommonCrypto/CommonCryptor.h>        // ...and its AES-CBC cryptor
 #include "klepton.h"
 #include "kl_jni.h"
+#include "kl_fault.h"
 #include "kl_target.h"   // the default target's userdata key
 #include "kl_env.h"
 #include "kl_ovrp.h"
@@ -411,8 +417,27 @@ static void *klj_GetObjectClass(void *env, void *obj) {
     if (!o) {
         KLJ_LOG("GetObjectClass on an untagged pointer %p — every jobject the guest "
                 "holds should have come from us", obj);
+        // The pointer says nothing; the caller says everything. A jobject that
+        // did not come from us is almost always a return value of OURS that the
+        // guest did not expect to be NULL, and the frame above names which one.
+        kl_fault_print_frames(stderr, NULL);
+        // Scouting: the frame names the CALLER, and the call that follows this
+        // one names the OBJECT — libunity's generic "resolve a method on a
+        // cached handle" helper does GetObjectClass then GetMethodID, so
+        // surviving one more call turns "some jobject is NULL" into a method
+        // and a signature. java/lang/Object is the least wrong class to hand
+        // back; anything done with it afterwards is invented, hence
+        // KL_PERMISSIVE only.
+        if (kl_permissive()) {
+            KLJ_LOG("KL_PERMISSIVE: answering java/lang/Object so the NEXT call "
+                    "names what the guest wanted from it");
+            pthread_mutex_lock(&g_lock);
+            void *c = klj_intern_class_locked("java/lang/Object")->as_object;
+            pthread_mutex_unlock(&g_lock);
+            return c;
+        }
         kl_jni_report(stderr);
-    kl_egl_report(stderr);
+        kl_egl_report(stderr);
         kl_fatal_prepare(); abort();
     }
     pthread_mutex_lock(&g_lock);
@@ -1504,6 +1529,32 @@ static const klj_field g_fields[] = {
     KLJ_FFN("android/content/pm/ApplicationInfo", "splitPublicSourceDirs", "[Ljava/lang/String;", klj_appinfo_splitSourceDirs),
     KLJ_FINT("android/content/pm/ApplicationInfo", "flags", 0),
 
+    // android.hardware.Sensor's type constants. Android's own numbers, from the
+    // platform API — nothing here is chosen, and they are only meaningful as
+    // arguments to SensorManager.getDefaultSensor, which answers null for every
+    // one of them (below).
+    //
+    // The whole family goes in rather than the one that was asked for, because
+    // the guest enumerates: Unity's sensor setup probes a series of types and
+    // keeps whichever come back non-null, so stopping at the first is one abort
+    // per rerun for no new information.
+    KLJ_FINT("android/hardware/Sensor", "TYPE_ACCELEROMETER",          1),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_MAGNETIC_FIELD",         2),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_GYROSCOPE",              4),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_LIGHT",                  5),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_PRESSURE",               6),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_PROXIMITY",              8),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_GRAVITY",                9),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_LINEAR_ACCELERATION",   10),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_ROTATION_VECTOR",       11),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_RELATIVE_HUMIDITY",     12),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_AMBIENT_TEMPERATURE",   13),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_GAME_ROTATION_VECTOR",  15),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_SIGNIFICANT_MOTION",    17),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_STEP_DETECTOR",         18),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_STEP_COUNTER",          19),
+    KLJ_FINT("android/hardware/Sensor", "TYPE_HEART_RATE",            21),
+
     // Both read from the unpacked tree's apktool.yml — see klj_guest_version.
     // A split-binary guest builds its OBB FILENAME from the version code, so a
     // constant here goes stale into a missing-game-data error on every swap.
@@ -1530,6 +1581,13 @@ static const klj_field g_fields[] = {
     // they cannot become two different activities.
     KLJ_FFN("com/unity3d/player/UnityPlayer", "currentActivity", "Landroid/app/Activity;", klj_currentActivity_field),
     KLJ_FFN("com/unity3d/player/UnityPlayer", "currentActivity", "Ljava/lang/Object;", klj_currentActivity_field),
+    // ...and currentContext, which UnityPlayer's constructor sets from the SAME
+    // parameter it passes to initJni (UnityPlayer.smali:540, `sput-object p1`).
+    // So it must be the same object, not a fresh Context: the guest reaches its
+    // Activity through either name and compares what it gets. Two signatures
+    // for one field again — the declared type and libunity's erased one.
+    KLJ_FFN("com/unity3d/player/UnityPlayer", "currentContext", "Landroid/content/Context;", klj_currentActivity_field),
+    KLJ_FFN("com/unity3d/player/UnityPlayer", "currentContext", "Ljava/lang/Object;", klj_currentActivity_field),
     KLJ_FFN("android/graphics/PorterDuff$Mode", "CLEAR", "Landroid/graphics/PorterDuff$Mode;", klj_porterduff_clear),
 
     KLJ_FFN("android/content/pm/PackageItemInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),
@@ -1726,8 +1784,7 @@ static klj_val klj_Class_getClassLoader(void *env, void *self, const klj_val *a,
 // Class.forName(name, initialize, loader). Our FindClass never fails and there
 // is no initialization to run, so this is just interning under another name.
 // Note the JVM spelling: dots, not slashes.
-static klj_val klj_Class_forName(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
+static klj_val klj_class_by_dotted_name(const klj_val *a, int n) {
     const char *dotted = n > 0 ? klj_str(a[0].l) : NULL;
     if (!dotted) return (klj_val){0};
     char internal[224];
@@ -1739,6 +1796,27 @@ static klj_val klj_Class_forName(void *env, void *self, const klj_val *a, int n)
     void *c = klj_intern_class_locked(internal)->as_object;
     pthread_mutex_unlock(&g_lock);
     return (klj_val){.l = c};
+}
+
+static klj_val klj_Class_forName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return klj_class_by_dotted_name(a, n);
+}
+
+// ClassLoader.findClass(name) — the same operation reached through the loader
+// rather than through Class, and the one a guest uses when it wants a class from
+// a library it has just System.load()ed. Unity's ReflectionHelper takes this
+// door for the Java half of a native plugin (AVProVideo2's `Manager`), because
+// the plugin's classes are not on the boot classpath.
+//
+// Interning is the whole of it here for the same reason forName is: FindClass
+// never fails, so there is no loader delegation to model and no
+// ClassNotFoundException to throw. The distinction that matters on Android —
+// which ClassLoader a class came from — has no meaning against a synthetic
+// registry with exactly one namespace in it.
+static klj_val klj_ClassLoader_findClass(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return klj_class_by_dotted_name(a, n);
 }
 
 // StringBuilder. Unity uses it to assemble strings it then hands back to us, so
@@ -3378,6 +3456,28 @@ static klj_val klj_UnityPlayer_requestUserAuthorization(void *env, void *self,
     return (klj_val){.l = NULL};
 }
 
+// UnityPermissions.hasUserAuthorizedPermission(Activity, String) — the STATIC
+// form of the same question Context.checkCallingOrSelfPermission and
+// Activity.checkSelfPermission already answer, so it reads the same
+// klj_permission_state rather than deciding again. A permission that is granted
+// through one door and denied through another is the group-answer mistake the
+// display panel and the GLES capability set exist to avoid, and this door is
+// the one Unity's C# Permission.HasUserAuthorizedPermission takes.
+//
+// Note the signature in g_bindings: Unity builds it with DOTS in the class name
+// (`Lcom.unity3d.player.UnityPlayerActivity;`), not slashes. That is the guest's
+// string and a binding is matched on it exactly, so it is transcribed as the
+// guest spells it rather than corrected.
+static klj_val klj_UnityPermissions_hasUserAuthorized(void *env, void *self,
+                                                      const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *p = n > 1 ? klj_str(a[1].l) : "", *why = "";
+    int granted = klj_permission_state(p, &why);
+    KLJ_LOG("UnityPermissions.hasUserAuthorizedPermission(\"%s\") -> %s%s", p,
+            granted ? "true" : "false", why);
+    return (klj_val){.j = granted ? 1u : 0u};
+}
+
 // Resources.getIdentifier looks a name up in the APK's resource table. We have
 // no resource table, and 0 is Android's own "no such resource" — the caller must
 // already handle it, since a name that is not in the APK returns the same thing.
@@ -4854,6 +4954,208 @@ void *kl_jni_activity(void) {
     return activity;
 }
 
+// SensorManager.getDefaultSensor(type) -> null, for every type.
+//
+// This is not a gap, it is the SAME answer kl_ndk.c's ASensorManager already
+// gives through the other door, and the two must not disagree: Vision Pro
+// exposes no Android-shaped accelerometer or gyro to the guest, and a VR title
+// does not want one — head and controller poses arrive through the XR runtime,
+// not through Input.acceleration. An empty sensor set is a configuration real
+// Android devices ship, so the engine already handles it, whereas a fabricated
+// sensor would feed it invented motion.
+//
+// Null is also what makes the guest STOP asking: Unity keeps the non-null ones
+// and never registers a listener for the rest, so nothing downstream waits on
+// an event that cannot come.
+static klj_val klj_SensorManager_getDefaultSensor(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)env; (void)self;
+    static int said;
+    if (!said++)
+        KLJ_LOG("SensorManager.getDefaultSensor(%d) -> null; no Android sensors are "
+                "presented (the NDK ASensor list is empty for the same reason)",
+                n > 0 ? (int)a[0].j : -1);
+    return (klj_val){.l = NULL};
+}
+
+// ---- org.fmod.FmodAndroidAudioManager — FMOD's Java device census ----
+//
+// FMOD keeps a Java singleton that answers questions about audio DEVICES:
+// which ones exist, whether a Bluetooth headset is among them, whether a
+// sample rate is available for capture. VRChat's FMOD build reaches it as soon
+// as the output stream is open.
+//
+// Almost none of this is a decision. Every device question in the class is
+// written as a loop over `AudioManager.getDevices(...)`, and this shim already
+// answers that with an EMPTY array — so each one falls to its own not-found
+// branch, and the values below are that branch read out of the smali rather
+// than picked:
+//
+//   getBluetoothInputDeviceId      -1     (the `const/4 p0, -0x1` arm)
+//   isBluetoothInputDeviceAvailable false
+//   isBuiltinInputDeviceAvailable   false
+//   isBuiltinSpeakerDevice(id)      false
+//   isInputSampleRateAvailable(hz)  false
+//
+// So this is not a second opinion about the audio hardware, it is the same
+// opinion arriving through another door — which is the point. The one that
+// would be a decision if it disagreed is isBuiltinInputDeviceAvailable, and it
+// must be false: kl_aaudio.c refuses capture streams by design (kl_aaudio.h),
+// and a census that advertises a microphone the open call then denies is the
+// worst of both.
+//
+// isBluetoothScoConnected reads a field that only startBluetoothSco sets, and
+// that call cannot succeed here, so it is false by the same chain. The two
+// setters record and do nothing, exactly as HFPStatus's do.
+static klj_val klj_fmod_audio_manager(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *singleton;
+    if (!singleton) {
+        singleton = kl_jni_new_object("org/fmod/FmodAndroidAudioManager");
+        ((klj_object *)singleton)->pinned = 1;   // a static getInstance(); it never dies
+    }
+    return (klj_val){.l = singleton};
+}
+static klj_val klj_fmod_bt_input_id(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)-1};    // no device of TYPE_BLUETOOTH_SCO to find
+}
+static klj_val klj_fmod_false(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_fmod_void(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};
+}
+
+// UnityPlayer.getNetworkConnectivity() — the native side of Unity's
+// Application.internetReachability, and the THIRD door onto a question this
+// file already answers twice (ConnectivityManager.getActiveNetworkInfo ->
+// isConnected/getType). It reads the same conclusion for the same reason: a
+// network that exists is connected, and the device we present is a Quest 2,
+// which has no cellular radio — so the only transport it can have is the local
+// one.
+//
+// The values are Unity's NetworkReachability enum, which is not Android's
+// ConnectivityManager.TYPE_*: 0 NotReachable, 1 ReachableViaCarrierDataNetwork,
+// 2 ReachableViaLocalAreaNetwork. Two tables that happen to overlap at 1 with
+// DIFFERENT meanings, which is exactly the trap-16b shape — so the constant is
+// spelled out here rather than borrowed from the ConnectivityManager block.
+enum { KLJ_UNITY_REACHABLE_VIA_LAN = 2 };
+static klj_val klj_UnityPlayer_getNetworkConnectivity(void *env, void *self,
+                                                      const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("UnityPlayer.getNetworkConnectivity() -> ReachableViaLocalAreaNetwork "
+                "(the same link NetworkInfo.getType() reports as WIFI)");
+    return (klj_val){.j = KLJ_UNITY_REACHABLE_VIA_LAN};
+}
+
+// ---- io.sentry.Sentry — an optional SDK this APK does not ship ----
+//
+// VRChat's managed code reaches for `io.sentry.Sentry` through Unity's
+// ReflectionHelper and calls close(). There is NO io/sentry class anywhere in
+// this APK: on a device the AndroidJavaClass lookup throws
+// ClassNotFoundException and the C# catches it, which is how "close Sentry if
+// the Android SDK is present" is written.
+//
+// We cannot reproduce that, and the reason is a settled design decision rather
+// than an oversight: FindClass here never fails (it interns any name) and the
+// exception state is always clear, so a guest cannot discover that a class is
+// absent. That is right for the Android framework, every class of which we
+// implement — and it is exactly wrong for an application's OPTIONAL dependency,
+// where the absence IS the answer. The failure it produces is an abort on a
+// method call the guest was fully prepared to have fail.
+//
+// close() is answered rather than the design changed, because a no-op is the
+// truth twice over: nothing was ever initialised, so there is nothing to close,
+// and Sentry is crash TELEMETRY — "closed, sending nothing" is the state we
+// want to be in and the one we are actually in.
+//
+// Deliberately only close(). If this guest ever calls Sentry.init or
+// captureException it should stop by name and be decided on then, because
+// those are a translated guest phoning home about a machine it is not running
+// on, which is not ours to answer for.
+static klj_val klj_Sentry_close(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("io/sentry/Sentry.close() — this APK ships no Sentry SDK, so "
+                "there is nothing initialised to close");
+    return (klj_val){0};
+}
+
+// ---- HFPStatus: the Bluetooth hands-free profile, which is not here ----
+//
+// com/unity3d/player/HFPStatus manages a Bluetooth SCO link so a headset's
+// microphone can be recorded from. Nothing on this host presents one, so the
+// four methods libunity calls are answered from that single fact rather than
+// invented one at a time. They come as a group for the usual reason: a
+// requestHFPStat that appears to start something, paired with a getHFPStat that
+// says nothing started, is worse than a consistent "no such device".
+//
+// The honest position is that there is no hands-free device, and the guest's
+// own Java already has that path — HFPStatus.requestHFPStat logs
+// "startBluetoothSco() failed. no bluetooth device connected." and carries on.
+static klj_val klj_HFP_clear(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // Tear-down of a link that was never up: unregisterReceiver + stopBluetoothSco
+    // over nothing. Genuinely a no-op, not a stub.
+    return (klj_val){0};
+}
+static klj_val klj_HFP_get(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};      // no SCO link is up, and none can be
+}
+static klj_val klj_HFP_request(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("HFPStatus.requestHFPStat() — no Bluetooth hands-free device is "
+                "presented, so this is the guest's own \"no bluetooth device "
+                "connected\" path");
+    return (klj_val){0};
+}
+static klj_val klj_HFP_set_recording(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    // AudioManager.setMode(MODE_NORMAL) on the far side. Recorded, not applied —
+    // the same position as Process.setThreadPriority: the host audio route is
+    // not the guest's to pick.
+    KLJ_LOG("HFPStatus.setHFPRecordingStat(%d) — recorded, not applied",
+            n > 0 ? (int)a[0].j : 0);
+    return (klj_val){0};
+}
+
+// See kl_jni.h. UnityPlayer's constructor runs initJni and then builds its
+// helper objects; this is that second half, for the helpers whose constructors
+// hand themselves to libunity through a private native.
+//
+// Only HFPStatus so far, because only HFPStatus is FORCED — libunity keeps its
+// handle and calls clearHFPStat on it unconditionally. Camera2Wrapper (with
+// initCamera2Jni) has exactly the same shape two lines earlier in the same
+// constructor and is deliberately not done here: nothing has asked for it, and
+// a camera we announce is a camera something may try to open.
+void kl_jni_unity_construct_helpers(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+
+    // HFPStatus.<init>(Context) stores the context, gets the AudioManager, and
+    // calls initHFPStatusJni() — which is how libunity comes to hold this
+    // object at all. The two field reads have no observable effect here; the
+    // native call is the whole point.
+    void *init = kl_jni_native("com/unity3d/player/HFPStatus", "initHFPStatusJni", NULL);
+    if (!init) return;             // a guest that never registered it wants none of this
+    void *thiz = kl_jni_new_object("com/unity3d/player/HFPStatus");
+    ((klj_object *)thiz)->pinned = 1;   // libunity keeps it for the process's life
+    KLJ_LOG("HFPStatus: constructed and handed to initHFPStatusJni()");
+    kl_jni_local_frame_push();
+    ((void (*)(void *, void *))init)(kl_jni_env(), thiz);
+    kl_jni_local_frame_pop();
+}
+
 // PorterDuff.Mode.CLEAR — the blend mode the guest hands Canvas.drawColor to
 // wipe its WebView bitmap. Our Canvas has no pixel store, so the mode is never
 // read; it has to be a non-null object of the right class and nothing more.
@@ -5530,6 +5832,17 @@ static klj_val klj_PackageInfo_versionCode(void) {
     long code; klj_guest_version(&code, NULL);
     return (klj_val){.j = (uint64_t)(int64_t)code};
 }
+// API 28's replacement for the int field, and the same number: getLongVersionCode
+// is defined as (versionCodeMajor << 32) | versionCode, and nothing here has a
+// major — apktool.yml carries one versionCode and the manifest declares no
+// android:versionCodeMajor. Answering anything else would give a guest two
+// different versions of itself depending on which accessor it used.
+static klj_val klj_PackageInfo_getLongVersionCode(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return klj_PackageInfo_versionCode();
+}
+
 static klj_val klj_PackageInfo_versionName(void) {
     const char *name; klj_guest_version(NULL, &name);
     return (klj_val){.l = kl_jni_new_string(name)};
@@ -6287,6 +6600,160 @@ static klj_val klj_InputStream_close(void *env, void *self, const klj_val *a, in
     klj_stream *st = o ? o->data : NULL;
     klj_stream_close(st);
     return (klj_val){.l = NULL};
+}
+
+// ---- AVPro Video's Java crypto helpers ----
+//
+// VRChat ships RenderHeads' AVPro Video, whose native half keeps five crypto
+// primitives on the JAVA side and calls down to them: a digest, a KDF, and a
+// three-call streaming cipher. They are reached from libAVProVideo2Native's
+// JNI_OnLoad — the plugin PROBES them at load, before any video exists — so
+// they are not on some encrypted-playback branch a host run would never take.
+// They are the first thing between this guest and a frame.
+//
+// Every one is transcribed from com/renderheads/AVPro/Video/Manager.smali, and
+// that matters more here than usual: a cipher is entirely specification. Get
+// the mode, the padding, the key length or the bit-vs-byte convention wrong and
+// each call still SUCCEEDS and returns plausible bytes, which is a failure with
+// no error surface anywhere near it.
+//
+// What this is NOT is an ownership check. The guest supplies its own key and
+// its own IV and decrypts its own media with them, so this is a primitive in
+// the same category as zlib or opus — the DRM line (see kl_ovrplat.c) is about
+// entitlement and delivery, and nothing here asks or answers either.
+//
+// AVPro Video's Manager.SHA256(byte[]) -> byte[]. Its Java body is three lines
+// — MessageDigest.getInstance("SHA-256"), update, digest — so this is a pure
+// function of its argument and nothing about it is invented; CommonCrypto
+// computes the same 32 bytes java.security would.
+//
+// Answering it rather than stubbing it matters: the caller is the plugin's own
+// integrity path, and a digest we make up is a digest that will not match
+// whatever it is compared against, which is a failure several layers away from
+// here. A NULL argument gets the digest of the empty input, which is what
+// MessageDigest.update(null) would NOT do — but the guest never passes one, and
+// answering the empty digest is closer than answering null.
+static klj_val klj_AVPro_SHA256(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_array *in = n > 0 ? klj_arr(a[0].l) : NULL;
+    void *out = klj_new_array('B', NULL, CC_SHA256_DIGEST_LENGTH);
+    CC_SHA256(in ? in->data : "", in ? (CC_LONG)in->len : 0, klj_arr(out)->data);
+    return (klj_val){.l = out};
+}
+
+// ...and its sibling, Manager.KeyDerivationPBKDF(password, salt, iterations,
+// out) -> the number of bytes written. Transcribed from the same class's smali
+// rather than guessed, because every parameter of a KDF is load-bearing:
+//
+//   algorithm   PBKDF2WithHmacSHA256
+//   password    the bytes of `password`, all `capacity()` of them. Java decodes
+//               them to a char[] and PBEKeySpec re-encodes as UTF-8, so the
+//               round trip is the identity — and it is only the identity
+//               because the guest sizes the char[] at the buffer's CAPACITY,
+//               which throws unless one char came out per byte.
+//   salt        the bytes of `salt`, all of its capacity
+//   rounds      the int, verbatim
+//   dkLen       out.capacity() — Java asks for `* 8` because PBEKeySpec counts
+//               BITS and CommonCrypto counts bytes. Getting that conversion
+//               backwards produces a key of the right length and wrong content.
+//
+// All three buffers are direct, so they are guest memory and the derived key is
+// written where the guest is already looking.
+static klj_val klj_AVPro_KeyDerivationPBKDF(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n < 4) return (klj_val){.j = (uint64_t)-1};
+    klj_direct_buffer *pw = klj_direct(a[0].l), *salt = klj_direct(a[1].l),
+                      *out = klj_direct(a[3].l);
+    unsigned rounds = (unsigned)a[2].j;
+    if (!pw || !salt || !out) return (klj_val){.j = (uint64_t)-1};
+    int rc = CCKeyDerivationPBKDF(kCCPBKDF2, pw->addr, (size_t)pw->capacity,
+                                  salt->addr, (size_t)salt->capacity,
+                                  kCCPRFHmacAlgSHA256, rounds,
+                                  out->addr, (size_t)out->capacity);
+    // Java returns -1 on failure and the key length on success; a partially
+    // written output buffer would be a key the guest cannot tell from a good one.
+    return (klj_val){.j = rc == kCCSuccess ? (uint64_t)out->capacity : (uint64_t)-1};
+}
+
+// AES-CBC with no padding, the algorithm Manager.CreateCryptor names, and
+// DECRYPT only: its own body refuses every other mode with "Only decrypt mode
+// is supported currently", so an encryptor here would be a capability the guest
+// declines to have.
+typedef struct {
+    CCCryptorRef ref;
+    uint8_t      iv[kCCBlockSizeAES128];
+    int          has_iv;
+} klj_cryptor;
+
+static const char KLJ_CLASS_CIPHER[] = "javax/crypto/Cipher";
+
+static klj_cryptor *klj_cryptor_of(void *o_) {
+    klj_object *o = klj_as_object(o_);
+    return (o && strcmp(o->cls, KLJ_CLASS_CIPHER) == 0) ? o->data : NULL;
+}
+
+// CreateCryptor(opmode, key, iv) -> Cipher, or null. opmode is
+// javax.crypto.Cipher.DECRYPT_MODE (2); the guest's own code returns null for
+// anything else, so we do too rather than widening its contract.
+static klj_val klj_AVPro_CreateCryptor(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n < 3 || (int)a[0].j != 2) return (klj_val){.l = NULL};
+    klj_array *key = klj_arr(a[1].l), *iv = klj_arr(a[2].l);
+    if (!key || !iv || iv->len != kCCBlockSizeAES128) return (klj_val){.l = NULL};
+
+    klj_cryptor *c = calloc(1, sizeof *c);
+    if (!c) return (klj_val){.l = NULL};
+    memcpy(c->iv, iv->data, sizeof c->iv);
+    c->has_iv = 1;
+    // ccNoPadding: "AES/CBC/NoPadding" says so, and padding is the one option
+    // whose effect is invisible until the LAST block of a stream.
+    if (CCCryptorCreate(kCCDecrypt, kCCAlgorithmAES, 0 /* no padding */,
+                        key->data, (size_t)key->len, c->iv, &c->ref) != kCCSuccess) {
+        free(c);
+        return (klj_val){.l = NULL};   // Java logs and returns null here too
+    }
+    return (klj_val){.l = klj_new_object_data(KLJ_CLASS_CIPHER, c)};
+}
+
+// UpdateCryptor(cipher, in, out) -> bytes written. Both buffers are direct, so
+// they are guest memory; this project models a direct ByteBuffer as address +
+// capacity, and Java's Cipher.update(ByteBuffer, ByteBuffer) consumes
+// in.remaining() — for a buffer that has never had its position moved, that is
+// its capacity.
+//
+// A too-small output is the guest's own "outBuf is not large enough" branch,
+// which logs and returns 0 rather than throwing; CCCryptorGetOutputLength asks
+// the same question CommonCrypto would answer with kCCBufferTooSmall.
+static klj_val klj_AVPro_UpdateCryptor(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n < 3) return (klj_val){.j = 0};
+    klj_cryptor *c = klj_cryptor_of(a[0].l);
+    klj_direct_buffer *in = klj_direct(a[1].l), *out = klj_direct(a[2].l);
+    if (!c || !in || !out) return (klj_val){.j = 0};
+    size_t moved = 0;
+    if (CCCryptorUpdate(c->ref, in->addr, (size_t)in->capacity,
+                        out->addr, (size_t)out->capacity, &moved) != kCCSuccess)
+        return (klj_val){.j = 0};
+    return (klj_val){.j = (uint64_t)moved};
+}
+
+// FinaliseCryptor(cipher, out) -> bytes written. Java calls doFinal(), which
+// with NoPadding and a block-aligned stream yields nothing — and which RESETS
+// the cipher to its post-init state, ready for the next stream under the same
+// key. CCCryptorReset(ref, iv) is that reset exactly, which is why the IV is
+// kept on the record: without it the next Update would silently chain from the
+// wrong block and produce garbage that decrypts without error.
+static klj_val klj_AVPro_FinaliseCryptor(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n < 2) return (klj_val){.j = 0};
+    klj_cryptor *c = klj_cryptor_of(a[0].l);
+    klj_direct_buffer *out = klj_direct(a[1].l);
+    if (!c || !out) return (klj_val){.j = 0};
+    size_t moved = 0;
+    if (CCCryptorFinal(c->ref, out->addr, (size_t)out->capacity, &moved) != kCCSuccess)
+        moved = 0;
+    CCCryptorReset(c->ref, c->has_iv ? c->iv : NULL);
+    return (klj_val){.j = (uint64_t)moved};
 }
 
 // ---- SharedPreferences ----
@@ -7211,6 +7678,46 @@ static const klj_binding g_bindings[] = {
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},
     {"java/lang/ClassLoader", "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", klj_ClassLoader_findLibrary},
+    {"java/lang/ClassLoader", "findClass", "(Ljava/lang/String;)Ljava/lang/Class;", klj_ClassLoader_findClass},
+    {"org/fmod/FmodAndroidAudioManager", "getInstance",
+     "()Lorg/fmod/FmodAndroidAudioManager;",        klj_fmod_audio_manager},
+    {"org/fmod/FmodAndroidAudioManager", "getBluetoothInputDeviceId", "()I",
+                                                    klj_fmod_bt_input_id},
+    {"org/fmod/FmodAndroidAudioManager", "isBluetoothInputDeviceAvailable", "()Z",
+                                                    klj_fmod_false},
+    {"org/fmod/FmodAndroidAudioManager", "isBluetoothScoConnected",   "()Z", klj_fmod_false},
+    {"org/fmod/FmodAndroidAudioManager", "isBuiltinInputDeviceAvailable", "()Z",
+                                                    klj_fmod_false},
+    {"org/fmod/FmodAndroidAudioManager", "isBuiltinSpeakerDevice",    "(I)Z", klj_fmod_false},
+    {"org/fmod/FmodAndroidAudioManager", "isInputSampleRateAvailable","(I)Z", klj_fmod_false},
+    {"org/fmod/FmodAndroidAudioManager", "setActivity",
+     "(Landroid/app/Activity;)V",                   klj_fmod_void},
+    {"org/fmod/FmodAndroidAudioManager", "setUseBluetooth",   "(Z)V", klj_fmod_void},
+    {"org/fmod/FmodAndroidAudioManager", "startBluetoothSco", "()V",  klj_fmod_void},
+    {"org/fmod/FmodAndroidAudioManager", "stopBluetoothSco",  "()V",  klj_fmod_void},
+    {"android/content/pm/PackageInfo", "getLongVersionCode", "()J",
+     klj_PackageInfo_getLongVersionCode},
+    {"com/unity3d/player/UnityPermissions", "hasUserAuthorizedPermission",
+     "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z",
+                                                 klj_UnityPermissions_hasUserAuthorized},
+    {"com/unity3d/player/UnityPlayer", "getNetworkConnectivity", "()I",
+     klj_UnityPlayer_getNetworkConnectivity},
+    {"android/hardware/SensorManager", "getDefaultSensor",
+     "(I)Landroid/hardware/Sensor;",              klj_SensorManager_getDefaultSensor},
+    {"io/sentry/Sentry", "close", "()V", klj_Sentry_close},
+    {"com/unity3d/player/HFPStatus", "clearHFPStat",   "()V",  klj_HFP_clear},
+    {"com/unity3d/player/HFPStatus", "getHFPStat",     "()Z",  klj_HFP_get},
+    {"com/unity3d/player/HFPStatus", "requestHFPStat", "()V",  klj_HFP_request},
+    {"com/unity3d/player/HFPStatus", "setHFPRecordingStat", "(Z)V", klj_HFP_set_recording},
+    {"com/renderheads/AVPro/Video/Manager", "SHA256", "([B)[B", klj_AVPro_SHA256},
+    {"com/renderheads/AVPro/Video/Manager", "KeyDerivationPBKDF",
+     "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;ILjava/nio/ByteBuffer;)I", klj_AVPro_KeyDerivationPBKDF},
+    {"com/renderheads/AVPro/Video/Manager", "CreateCryptor", "(I[B[B)Ljavax/crypto/Cipher;",
+     klj_AVPro_CreateCryptor},
+    {"com/renderheads/AVPro/Video/Manager", "UpdateCryptor",
+     "(Ljavax/crypto/Cipher;Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I", klj_AVPro_UpdateCryptor},
+    {"com/renderheads/AVPro/Video/Manager", "FinaliseCryptor",
+     "(Ljavax/crypto/Cipher;Ljava/nio/ByteBuffer;)I", klj_AVPro_FinaliseCryptor},
 
     {"java/lang/StringBuilder", "<init>",   "()V",                  klj_SB_init},
     {"java/lang/StringBuilder", "toString", "()Ljava/lang/String;", klj_SB_toString},

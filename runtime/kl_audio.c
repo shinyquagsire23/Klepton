@@ -711,6 +711,8 @@ size_t kl_audio_write(const void *pcm, size_t bytes) {
     return written == frames ? bytes : written * in_frame;
 }
 
+unsigned kl_audio_underruns(void) { return atomic_load(&g_underruns); }
+
 void kl_audio_report(FILE *f) {
     if (!g_writes && !g_open) return;
     dump_close();   // the report is the last thing a clean run does

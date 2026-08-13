@@ -84,12 +84,14 @@ typedef void    (*klaa_error_cb)(void *stream, void *user, aaudio_result_t err);
 typedef struct {
     int32_t direction, format, channels, rate, buffer_capacity;
     int32_t performance_mode, sharing_mode, input_preset;
+    int32_t frames_per_data_cb, device_id;
     klaa_data_cb  data_cb;   void *data_user;
     klaa_error_cb error_cb;  void *error_user;
 } klaa_builder;
 
 typedef struct klaa_stream {
     int32_t rate, channels, format, burst;
+    int32_t buffer_size;         // the guest's requested size, <= capacity
     klaa_data_cb  data_cb;   void *data_user;
     klaa_error_cb error_cb;  void *error_user;
 
@@ -244,6 +246,17 @@ static void klaa_setChannelCount(klaa_builder *b, int32_t v)     { if (b) b->cha
 static void klaa_setSampleRate(klaa_builder *b, int32_t v)       { if (b) b->rate = v; }
 static void klaa_setBufferCapacityInFrames(klaa_builder *b, int32_t v) { if (b) b->buffer_capacity = v; }
 static void klaa_setInputPreset(klaa_builder *b, int32_t v)      { if (b) b->input_preset = v; }
+static void klaa_setDeviceId(klaa_builder *b, int32_t v)         { if (b) b->device_id = v; }
+
+// setFramesPerDataCallback is the guest asking for a FIXED callback size, and
+// it is honoured rather than recorded: FMOD sets it to its own mixer block and
+// then assumes every callback is exactly that many frames. Our burst is what
+// the feeder passes, so the two must be the same number or FMOD mixes a block
+// and submits a different one. AAUDIO_UNSPECIFIED means "you choose", which is
+// the default we already had.
+static void klaa_setFramesPerDataCallback(klaa_builder *b, int32_t v) {
+    if (b) b->frames_per_data_cb = v;
+}
 
 static void klaa_setDataCallback(klaa_builder *b, klaa_data_cb cb, void *user) {
     if (b) { b->data_cb = cb; b->data_user = user; }
@@ -286,7 +299,11 @@ static aaudio_result_t klaa_openStream(klaa_builder *b, klaa_stream **out) {
     if (!s) return AAUDIO_ERROR_NO_MEMORY;
     pthread_mutex_init(&s->lock, NULL);
     s->rate = rate; s->channels = channels; s->format = format;
-    s->burst = klaa_burst_frames();
+    s->burst = b->frames_per_data_cb > 0 ? b->frames_per_data_cb : klaa_burst_frames();
+    // Capacity is the guest's if it asked for one, and at least one burst
+    // either way — a capacity below the callback size is a buffer that cannot
+    // hold one callback's output.
+    s->buffer_size = b->buffer_capacity > s->burst ? b->buffer_capacity : s->burst;
     s->data_cb = b->data_cb;   s->data_user = b->data_user;
     s->error_cb = b->error_cb; s->error_user = b->error_user;
     s->state = AAUDIO_STREAM_STATE_OPEN;
@@ -367,6 +384,46 @@ static int32_t klaa_getFramesPerBurst(klaa_stream *s) {
     return s ? s->burst : 0;
 }
 
+// The buffer-size trio. FMOD tunes latency with these — it reads the capacity,
+// sets a size inside it, and reads back what it actually got. Answering the
+// capacity for both is not a stand-in: kl_audio.c's ring IS the buffer, the
+// guest cannot resize it, and reporting a size we did not adopt would have
+// FMOD compute a latency it does not have. Returning the value actually in
+// force is what the ABI asks for — setBufferSizeInFrames returns the size it
+// SETTLED on, not the one requested.
+static int32_t klaa_getBufferCapacityInFrames(klaa_stream *s) {
+    return s ? s->buffer_size : 0;
+}
+static int32_t klaa_getBufferSizeInFrames(klaa_stream *s) {
+    return s ? s->buffer_size : 0;
+}
+static int32_t klaa_setBufferSizeInFrames(klaa_stream *s, int32_t frames) {
+    if (!s) return AAUDIO_ERROR_NULL;
+    if (frames < s->burst) frames = s->burst;               // clamped, as the HAL does
+    if (frames > s->buffer_size) frames = s->buffer_size;
+    return frames;
+}
+
+// AAUDIO_UNSPECIFIED is the ABI's own "no particular device", and it is the
+// truth: kl_audio.c opens whatever CoreAudio calls the default output, and that
+// is not a thing with an AAudio device id. A fabricated id would be one the
+// guest could pass back to setDeviceId and get a different device for.
+static int32_t klaa_getDeviceId(klaa_stream *s) { (void)s; return AAUDIO_UNSPECIFIED; }
+
+// Underruns. kl_audio.c counts them for its own report; this is that number,
+// because FMOD polls it to decide whether to grow its buffer — a hardcoded 0
+// says "never underruns", which is a claim about a device we do not have.
+static int32_t klaa_getXRunCount(klaa_stream *s) {
+    (void)s;
+    return (int32_t)kl_audio_underruns();
+}
+
+// MMAP is the low-latency shared-memory path into the Android audio HAL. There
+// is no such path here — every frame goes through the ring in kl_audio.c — so
+// this is false, and false is also what makes FMOD choose its ordinary timing
+// model rather than one built on a promise we cannot keep.
+static int32_t klaa_isMMapUsed(klaa_stream *s) { (void)s; return 0; }
+
 // The guest's idiom is "ask to start, then wait for STARTING to become
 // something else". Our start is synchronous, so the state has already moved
 // and this returns immediately — which is the same answer a fast HAL gives.
@@ -433,7 +490,15 @@ static const klaa_entry g_aaudio[] = {
     A("AAudioStream_requestStop",                  klaa_requestStop),
     A("AAudioStream_close",                        klaa_close),
     A("AAudioStream_getFramesPerBurst",            klaa_getFramesPerBurst),
+    A("AAudioStreamBuilder_setFramesPerDataCallback", klaa_setFramesPerDataCallback),
+    A("AAudioStreamBuilder_setDeviceId",           klaa_setDeviceId),
     A("AAudioStream_waitForStateChange",           klaa_waitForStateChange),
+    A("AAudioStream_getBufferCapacityInFrames",    klaa_getBufferCapacityInFrames),
+    A("AAudioStream_getBufferSizeInFrames",        klaa_getBufferSizeInFrames),
+    A("AAudioStream_setBufferSizeInFrames",        klaa_setBufferSizeInFrames),
+    A("AAudioStream_getDeviceId",                  klaa_getDeviceId),
+    A("AAudioStream_getXRunCount",                 klaa_getXRunCount),
+    A("AAudioStream_isMMapUsed",                   klaa_isMMapUsed),
 };
 #undef A
 
@@ -442,6 +507,63 @@ void *kl_aaudio_lookup(const char *name) {
     for (size_t i = 0; i < sizeof g_aaudio / sizeof g_aaudio[0]; i++)
         if (!strcmp(g_aaudio[i].name, name)) return g_aaudio[i].fn;
     return NULL;                // must be able to say no — see the header
+}
+
+// ...and the DLOPEN door, which is a second one and not the same one.
+//
+// Steam Link DT_NEEDEDs libaaudio.so, so its nineteen names bind at relocation
+// time through kl_aaudio_lookup above and no file is ever opened. Unity does
+// not: FMOD dlopen()s "libaaudio.so" by name at output-device selection and
+// resolves each entry point with dlsym. There is no such file in a guest tree,
+// so that fell through to the ELF loader and failed — and FMOD's answer to a
+// NULL handle is to give up on the device entirely:
+//
+//   E/Unity: FMOD failed to initialize the output device.: (60)
+//
+// which is a SILENT loss of all audio, reported once, several layers from the
+// dlopen that caused it. Same reasoning as the libGLESv2/libvulkan lines in
+// klb_dlopen: there is nothing on disk to fall through TO, so the synthetic
+// handle has to come first.
+// Abort BY NAME rather than at address zero — the project's standing rule for
+// the difference between "we do not serve this" (a NULL from the lookup above,
+// which a prober is entitled to see) and "the guest called it anyway".
+static uint64_t klaa_unimplemented(const char *name) {
+    fprintf(stderr, "\n[klepton] fatal: guest called unimplemented AAudio entry "
+                    "point '%s'\n", name);
+    kl_fatal_prepare();
+    abort();
+}
+
+static const char g_aa_handle[] = "klepton-aaudio";
+
+int kl_aaudio_claims(const char *soname) {
+    if (!soname) return 0;
+    const char *b = strrchr(soname, '/');
+    b = b ? b + 1 : soname;
+    return strcmp(b, "libaaudio.so") == 0;
+}
+
+void *kl_aaudio_dlopen(const char *soname) {
+    if (!kl_aaudio_claims(soname)) return NULL;
+    const char *b = strrchr(soname, '/');
+    b = b ? b + 1 : soname;
+    fprintf(stderr, "  [aaudio] guest dlopen(\"%s\") -> synthetic AAudio handle\n", b);
+    return (void *)g_aa_handle;
+}
+
+int kl_aaudio_is_handle(const void *h) { return h == (const void *)g_aa_handle; }
+
+// dlsym on that handle. Unlike the import door this must NOT answer NULL for a
+// name we do not serve: FMOD probes for entry points it can do without, and a
+// NULL is how it learns that — but a name it then CALLS must fail by name
+// rather than at address zero. kl_named_stub is that distinction, and it is the
+// same choice kl_opensl_sym makes.
+void *kl_aaudio_sym(const char *name) {
+    if (!name) return NULL;
+    void *fn = kl_aaudio_lookup(name);
+    if (fn) return fn;
+    if (strncmp(name, "AAudio", 6) != 0) return NULL;   // not ours to answer for
+    return kl_named_stub(name, (void *)klaa_unimplemented);
 }
 
 void kl_aaudio_report(FILE *f) {

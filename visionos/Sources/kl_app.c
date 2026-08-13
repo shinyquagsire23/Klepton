@@ -721,6 +721,10 @@ int kl_app_boot(void) {
     ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, kl_jni_activity());
     kl_jni_local_frame_pop();
     printf("  initJni returned\n");
+    // ...and the rest of that same constructor — see kl_jni.h. The host driver
+    // makes the identical call; a helper object constructed on one and not the
+    // other is a guest described differently by two drivers.
+    kl_jni_unity_construct_helpers();
 
     printf("\n=== P4 EXIT CRITERION MET: initJni completed on visionOS, "
            "no unimplemented JNI calls ===\n");

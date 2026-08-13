@@ -420,10 +420,13 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     /* instance and system */                                                  \
     X(xrGetInstanceProcAddr)                                                   \
     X(xrEnumerateInstanceExtensionProperties)                                  \
+    X(xrEnumerateApiLayerProperties)                                           \
     X(xrCreateInstance) X(xrDestroyInstance)                                   \
     X(xrGetInstanceProperties) X(xrResultToString)                             \
     X(xrGetSystem) X(xrGetSystemProperties)                                    \
     X(xrEnumerateViewConfigurationViews)                                       \
+    X(xrEnumerateViewConfigurations) X(xrGetViewConfigurationProperties)       \
+    X(xrEnumerateEnvironmentBlendModes) X(xrStructureTypeToString)             \
     /* session lifecycle */                                                    \
     X(xrCreateSession) X(xrDestroySession)                                     \
     X(xrBeginSession) X(xrEndSession) X(xrRequestExitSession)                  \
@@ -431,6 +434,7 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     /* spaces */                                                               \
     X(xrCreateReferenceSpace) X(xrDestroySpace)                                \
     X(xrGetReferenceSpaceBoundsRect) X(xrLocateSpace)                          \
+    X(xrEnumerateReferenceSpaces)                                              \
     /* swapchains */                                                           \
     X(xrEnumerateSwapchainFormats)                                             \
     X(xrCreateSwapchain) X(xrDestroySwapchain)                                 \
@@ -797,6 +801,114 @@ static XrResult klxr_EnumerateInstanceExtensionProperties(
                  "%s", g_extensions[i].name);
         props[i].extensionVersion = g_extensions[i].version;
     }
+    return KLXR_SUCCESS;
+}
+
+// xrEnumerateApiLayerProperties — zero layers, and zero is the truth rather
+// than a stand-in. API layers are a LOADER feature: the Khronos loader finds
+// them on disk and interposes them between the app and the runtime. We replace
+// that loader (see kl_openxr_dlopen), we interpose nothing, and there is no
+// filesystem location here for a layer to be found in.
+//
+// It has to be SERVED even so, and Unity is what proved it: this is not an
+// extension entry point a caller may skip, it is core OpenXR 1.0 that
+// UnityOpenXR calls unconditionally as its first act, and it treats a failure
+// as fatal. Answering XR_ERROR_FUNCTION_UNSUPPORTED — which is what an unknown
+// name gets from klxr_GetInstanceProcAddr, correctly — threw straight out of
+// Display_Initialize with the whole XR stack unstarted:
+//
+//   Error: XrResult failure [XR_ERROR_FUNCTION_UNSUPPORTED]
+//       Origin: xrEnumerateApiLayerProperties(0, &layerCount, nullptr)
+//
+// It is also callable with no instance, like its sibling above, which is why
+// klxr_GetInstanceProcAddr does not validate one.
+static XrResult klxr_EnumerateApiLayerProperties(uint32_t capacity,
+                                                 uint32_t *count_out, void *props) {
+    (void)props;   // never written: the count is always zero
+    return klxr_two_call(capacity, count_out, 0);
+}
+
+
+// ---- the "what do you support?" enumerators ---------------------------------
+//
+// Four two-call queries that a UNITY guest makes and Steam Link never did, and
+// none of them is a decision: each one reports exactly what this runtime
+// already implements elsewhere in this file, so the answer is a restatement
+// rather than a new claim. Getting one to disagree with its implementation
+// would be the worst kind of bug here — the guest would ask for the thing it
+// was told about and be refused at creation time, several calls later.
+//
+// They come as a group because that is how UnityOpenXR's CreateSessionIfNeeded
+// walks them, and because a guest that is told about a reference space it
+// cannot create is in a worse state than one that stopped at the first name.
+
+// Stereo, and only stereo — the same single configuration
+// klxr_EnumerateViewConfigurationViews and klxr_BeginSession already refuse
+// everything else in favour of.
+static XrResult klxr_EnumerateViewConfigurations(void *instance, XrSystemId system_id,
+                                                 uint32_t capacity, uint32_t *count_out,
+                                                 int32_t *configs) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    XrResult r = klxr_two_call(capacity, count_out, 1);
+    if (r != KLXR_SUCCESS || capacity == 0) return r;
+    if (!configs) return KLXR_ERROR_VALIDATION_FAILURE;
+    configs[0] = KLXR_VIEW_CONFIG_PRIMARY_STEREO;
+    return KLXR_SUCCESS;
+}
+
+// XrViewConfigurationProperties is { type, next, viewConfigurationType,
+// fovMutable }. fovMutable is FALSE and that is load-bearing rather than
+// conservative: it says the app may not change the field of view, and the
+// frusta here are the display's own (kl_ovrp_eye_view / the compositor's
+// measured tangents). A guest told it could mutate them would submit a picture
+// rendered for a projection the compositor is not going to use.
+#define KLXR_TYPE_VIEW_CONFIGURATION_PROPERTIES 42
+static XrResult klxr_GetViewConfigurationProperties(void *instance, XrSystemId system_id,
+                                                    int32_t view_config_type, void *props) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (view_config_type != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
+        return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    if (!props) return KLXR_ERROR_VALIDATION_FAILURE;
+    char *p = props;
+    *(int32_t *)(p + 0)  = KLXR_TYPE_VIEW_CONFIGURATION_PROPERTIES;
+    klxr_log_chain("xrGetViewConfigurationProperties", *(void **)(p + 8));
+    *(int32_t *)(p + 16) = KLXR_VIEW_CONFIG_PRIMARY_STEREO;
+    *(int32_t *)(p + 20) = 0;                     // fovMutable = XR_FALSE
+    return KLXR_SUCCESS;
+}
+
+// OPAQUE only. The guest's picture covers the display and nothing of the room
+// shows through it — which is what every compositor path in this project does
+// (kl_reproject draws the eye texture as the whole scene). ADDITIVE and
+// ALPHA_BLEND are the passthrough modes, and offering one would have the guest
+// leave its background transparent for a blend that never happens: trap 33's
+// failure, arrived at deliberately.
+enum { KLXR_BLEND_OPAQUE = 1 };
+static XrResult klxr_EnumerateEnvironmentBlendModes(void *instance, XrSystemId system_id,
+                                                    int32_t view_config_type,
+                                                    uint32_t capacity, uint32_t *count_out,
+                                                    int32_t *modes) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (view_config_type != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
+        return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    XrResult r = klxr_two_call(capacity, count_out, 1);
+    if (r != KLXR_SUCCESS || capacity == 0) return r;
+    if (!modes) return KLXR_ERROR_VALIDATION_FAILURE;
+    modes[0] = KLXR_BLEND_OPAQUE;
+    return KLXR_SUCCESS;
+}
+
+// xrStructureTypeToString, the sibling of xrResultToString. Diagnostic only —
+// the guest prints it — so the honest answer for a type we have no name for is
+// the NUMBER, which is still enough to look up. XR_MAX_STRUCTURE_NAME_SIZE is
+// 64 and the buffer is the caller's.
+static XrResult klxr_StructureTypeToString(void *instance, int32_t value, char *buffer) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (!buffer) return KLXR_ERROR_VALIDATION_FAILURE;
+    snprintf(buffer, 64, "XR_TYPE_%d", value);
     return KLXR_SUCCESS;
 }
 
@@ -1601,6 +1713,22 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
 // — xrLocateViews and the self-test — where "tracked" is not a question.
 static XrPosef klxr_space_pose(const klxr_space *sp) {
     return klxr_space_pose_ex(sp, NULL, NULL, NULL);
+}
+
+// The three reference spaces klxr_space_pose can place, and no others —
+// xrCreateReferenceSpace refuses everything outside this set, so this list and
+// that check are the same fact.
+static XrResult klxr_EnumerateReferenceSpaces(void *session, uint32_t capacity,
+                                              uint32_t *count_out, int32_t *spaces) {
+    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    static const int32_t have[] = { KLXR_REF_SPACE_VIEW, KLXR_REF_SPACE_LOCAL,
+                                    KLXR_REF_SPACE_STAGE };
+    const uint32_t n = sizeof have / sizeof have[0];
+    XrResult r = klxr_two_call(capacity, count_out, n);
+    if (r != KLXR_SUCCESS || capacity == 0) return r;
+    if (!spaces) return KLXR_ERROR_VALIDATION_FAILURE;
+    memcpy(spaces, have, sizeof have);
+    return KLXR_SUCCESS;
 }
 
 static XrResult klxr_CreateReferenceSpace(void *session,
@@ -3348,6 +3476,12 @@ static void klxr_install(void) {
         {"xrEndSession",           (void *)klxr_EndSession},
         {"xrRequestExitSession",   (void *)klxr_RequestExitSession},
         {"xrPollEvent",            (void *)klxr_PollEvent},
+        {"xrEnumerateApiLayerProperties", (void *)klxr_EnumerateApiLayerProperties},
+        {"xrEnumerateReferenceSpaces",  (void *)klxr_EnumerateReferenceSpaces},
+        {"xrEnumerateViewConfigurations", (void *)klxr_EnumerateViewConfigurations},
+        {"xrGetViewConfigurationProperties", (void *)klxr_GetViewConfigurationProperties},
+        {"xrEnumerateEnvironmentBlendModes", (void *)klxr_EnumerateEnvironmentBlendModes},
+        {"xrStructureTypeToString",     (void *)klxr_StructureTypeToString},
         // spaces — xrLocateSpace is deliberately still a refusal, see above
         {"xrCreateReferenceSpace", (void *)klxr_CreateReferenceSpace},
         {"xrDestroySpace",         (void *)klxr_DestroySpace},
@@ -3402,6 +3536,55 @@ void *kl_openxr_lookup(const char *name) {
     if (!row) return NULL;      // a lookup must still be able to say no
     row->resolved++;
     return row->fn;
+}
+
+// ...and the DLOPEN door, which is how a UNITY guest arrives.
+//
+// Steam Link imports its xr* names, so they bind at relocation time through the
+// lookup above and libopenxr_loader.so is never opened. VRChat does the
+// opposite: libUnityOpenXR.so dlopen()s "libopenxr_loader.so" and dlsym()s
+// xrGetInstanceProcAddr out of it — and unlike libaaudio.so, that file EXISTS
+// in the guest tree, so the fall-through does not fail, it succeeds. The real
+// Khronos loader maps, runs, and starts looking for a runtime.
+//
+// It cannot find one, and the way it fails is the reason this replacement
+// exists at all (kl_openxr.h): on Android the loader discovers runtimes through
+// a ContentProvider BROKER — it builds `content://org.khronos.openxr.
+// runtime_broker/...` with android.net.Uri$Builder and queries it. There is no
+// package manager here and no broker to query, so the honest end of that road
+// is "no runtime installed". Serving the loader's own entry points instead is
+// the same call this project already made for libOVRPlugin and
+// libovrplatformloader: replace the thing whose whole job is to find a system
+// service that is not here.
+//
+// The tell that this was missing was NOT an OpenXR failure. It was an abort in
+// android/net/Uri$Builder.scheme — three layers away, in a class that has
+// nothing to do with XR.
+static const char g_xr_handle[] = "klepton-openxr-loader";
+
+int kl_openxr_claims(const char *soname) {
+    if (!soname) return 0;
+    const char *b = strrchr(soname, '/');
+    b = b ? b + 1 : soname;
+    return strcmp(b, "libopenxr_loader.so") == 0;
+}
+
+void *kl_openxr_dlopen(const char *soname) {
+    if (!kl_openxr_claims(soname)) return NULL;
+    fprintf(stderr, "  [xr] guest dlopen(\"libopenxr_loader.so\") -> synthetic OpenXR "
+                    "runtime (the real loader would look for an Android broker)\n");
+    return (void *)g_xr_handle;
+}
+
+int kl_openxr_is_handle(const void *h) { return h == (const void *)g_xr_handle; }
+
+// dlsym on that handle. NULL for a name we do not know, exactly as the import
+// door does — the loader's own surface is bigger than the runtime's, and a
+// caller probing for an extension entry point is entitled to be told no. A name
+// we DO know but have not implemented still aborts by name when called, which
+// is klxr_install's business rather than this function's.
+void *kl_openxr_sym(const char *name) {
+    return kl_openxr_lookup(name);
 }
 
 // --- SL-16: the space algebra, with no session and no guest -----------------

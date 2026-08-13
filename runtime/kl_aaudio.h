@@ -32,6 +32,16 @@
 // stays in the unresolved-import report instead of becoming a silent stub.
 void *kl_aaudio_lookup(const char *name);
 
+// The DLOPEN door, which is a different door from the import one above. FMOD
+// (every Unity guest) dlopen()s "libaaudio.so" and dlsym()s its way in, where
+// Steam Link DT_NEEDEDs it. There is no such file in any guest tree, so without
+// this the dlopen fails and FMOD reports only "failed to initialize the output
+// device" — all audio gone, named nowhere near the cause.
+int   kl_aaudio_claims(const char *soname);
+void *kl_aaudio_dlopen(const char *soname);
+int   kl_aaudio_is_handle(const void *h);
+void *kl_aaudio_sym(const char *name);
+
 void kl_aaudio_report(FILE *f);
 
 #endif

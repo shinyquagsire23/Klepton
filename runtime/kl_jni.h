@@ -49,6 +49,19 @@ void *kl_jni_native(const char *cls, const char *name, const char *sig);
 // GetObjectClass answer truthfully instead of guessing.
 void *kl_jni_new_object(const char *class_name);
 
+// The rest of UnityPlayer's constructor, for a driver that has just run initJni.
+//
+// initJni is not the whole of `new UnityPlayer(context, events)` — the
+// constructor goes on to build a handful of helper objects, and each of those
+// hands ITSELF to libunity through a private native in its own constructor.
+// Where the guest keeps one of those handles and later calls a method on it, a
+// driver that stopped at initJni has left it NULL, and libunity does not check:
+// VRChat dies in GetObjectClass(NULL) resolving `HFPStatus.clearHFPStat`.
+//
+// Both drivers must call this, which is why it lives here rather than in either
+// one (see runtime/kl_slink.c for the same argument). Idempotent.
+void kl_jni_unity_construct_helpers(void);
+
 // The interned jclass for a name — the host side of FindClass. A native method
 // is called with its declaring class as the second argument, and a guest may
 // keep it: SDL3's nativeSetupJNI stashes it in a global ref and makes every

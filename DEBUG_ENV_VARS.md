@@ -57,6 +57,15 @@ answers GL and kl_glfb never initializes.
 - `KL_GLFB=1` — enable the one-eye reference renderer on ANGLE/Metal.
   Host-only; it exists to produce the known-good frame a real backend gets
   diffed against.
+- `KL_EGL_EXTENSIONS=<space-separated list>` — override what
+  `eglQueryString(EGL_EXTENSIONS)` answers. The default names the three we
+  actually implement (`EGL_KHR_image_base`,
+  `EGL_ANDROID_image_native_buffer`, `EGL_ANDROID_get_native_client_buffer`);
+  set it EMPTY to restore the pre-VRChat behaviour. Worth having as an A/B
+  because a guest may branch on a name here — and because an empty list, though
+  legal, is what no Android driver actually ships: AVPro Video walks this string
+  with `strtok` in a bottom-tested loop and `strlen(NULL)`s the first token
+  (notes/VRCHAT.md).
 - `KL_EGL_TRACE=1` — log every EGL entry point the guest actually REACHES, in
   order, with the interesting arguments. A census, not a diagnostic: it says
   nothing about what we answered. It exists because every EGL symbol binds at

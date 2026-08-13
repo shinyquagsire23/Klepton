@@ -488,6 +488,10 @@ static int recon_run(int view_pump) {
         ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, context);
         kl_jni_local_frame_pop();
         printf("  initJni returned\n");
+        // ...and the rest of that same constructor. See kl_jni.h: the helper
+        // objects hand THEMSELVES to libunity, so a driver that stops at
+        // initJni leaves handles libunity does not null-check.
+        kl_jni_unity_construct_helpers();
     }
 
     // Lifecycle, in the order UnityPlayerActivity drives it: attach a

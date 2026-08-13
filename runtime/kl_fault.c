@@ -29,6 +29,42 @@ void kl_fault_add_reporter(void (*fn)(FILE *)) {
     if (fn && g_extra_n < KL_FAULT_MAX_REPORTERS) g_extra[g_extra_n++] = fn;
 }
 
+// Walk an AAPCS64 frame chain and name each return address, guest images
+// included. x29 is the frame pointer and {fp, lr} sit at [fp], which both the
+// guest and our own code honour.
+//
+// This is the fault handler's own walk, lifted out so the ORDERLY abort paths
+// can use it too. They could not before, and the gap is a real one: an abort by
+// name says WHAT the guest asked for and nothing about WHO asked. For an
+// unimplemented call that is enough, because the name is the work item — but
+// for a call that is malformed rather than missing (a JNI handle that never
+// came from us, an out pointer we were handed as NULL) the name is the one
+// thing already known and the caller is the entire question.
+//
+// `fp` is NULL for "start from here", which drops this function's own frame.
+void kl_fault_print_frames(FILE *f, void *fp_) {
+    void **fp = fp_ ? (void **)fp_ : (void **)__builtin_frame_address(0);
+    for (int depth = 0; fp && depth < 16; depth++) {
+        void *ret = fp[1];
+        if (!ret) break;
+        size_t roff = 0;
+        const char *rimg = kl_addr_image(ret, &roff);
+        const char *mm = kl_il2cpp_method_at(ret);
+        Dl_info rdi;
+        if (mm)                      fprintf(f, "    #%-2d %s  [%s+0x%zx]\n", depth, mm,
+                                             rimg ? rimg : "?", roff);
+        else if (rimg)               fprintf(f, "    #%-2d %s+0x%zx\n", depth, rimg, roff);
+        else if (dladdr(ret, &rdi) && rdi.dli_sname)
+            fprintf(f, "    #%-2d %s+0x%tx\n", depth, rdi.dli_sname,
+                    (const char *)ret - (const char *)rdi.dli_saddr);
+        else                         fprintf(f, "    #%-2d %p\n", depth, ret);
+        void **next = (void **)fp[0];
+        if (next <= fp) break;                  // stacks grow down; anything else is junk
+        fp = next;
+    }
+    fflush(f);
+}
+
 // This has to survive being called in a broken process, so it uses write(2)
 // rather than stdio and does not attempt a symbolised backtrace.
 static void report_fault(int sig, siginfo_t *si, void *uctx) {
