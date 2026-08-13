@@ -716,7 +716,8 @@ final class KleptonControllers {
     private func pollButtons() {
         guard #available(visionOS 26.0, *) else { return }
 
-        // Clear both hands *first*, then fill in whatever is connected.
+        // Clear the hands that have NO CONTROLLER ATTACHED, then fill in the
+        // ones that do.
         //
         // The two halves of this seam have independent lifecycles and they do
         // not agree on timing: GameController connect/disconnect is one event
@@ -727,12 +728,34 @@ final class KleptonControllers {
         // never fires. A controller unpaired mid-press would leave the guest
         // holding that trigger down for the rest of the run.
         //
+        // **Which is why the clear is keyed on ATTACHMENT and not, as it was,
+        // on a new input state having arrived.** `nextInputState()` returns nil
+        // when nothing has been queued since the last call — a controller
+        // nobody is moving publishes nothing, because there is nothing to
+        // publish — and the loop below `continue`s on that. With both hands
+        // cleared up front, every such frame told the guest the exact opposite
+        // of what was happening: buttons released, triggers at 0, stick
+        // CENTRED, at whatever rate the poll outran the device.
+        //
+        // Both of the bugs that were reported as separate are this: SUPERHOT
+        // retriggering its grab sound over and over while an object was held
+        // (the grip read press/release/press, so the guest heard a new grab
+        // each time), and Steam Link's stick snapping back to centre while
+        // forward was held. One is a button and one is an axis, which is what
+        // made them look like two problems; nil means "unchanged", and the only
+        // faithful reading of it is to leave the last sample alone.
+        //
         // Poses are deliberately NOT cleared here: they belong to the ARKit
         // stream, which reports its own `.removed`. Clearing them on the
         // GameController schedule would drop a pose that is still being
         // tracked.
+        let spatial = GCController.controllers()
+            .filter { $0.productCategory == GCProductCategorySpatialController }
+        var attached = [false, false]
+        for c in spatial { attached[Self.hand(of: c)] = true }
+
         lock.lock()
-        for i in 0...1 {
+        for i in 0...1 where !attached[i] {
             state[i].buttons = 0; state[i].touches = 0
             state[i].indexTrigger = 0; state[i].handTrigger = 0
             state[i].stick = .zero; state[i].fromController = false
@@ -743,8 +766,7 @@ final class KleptonControllers {
         }
         lock.unlock()
 
-        for c in GCController.controllers()
-            where c.productCategory == GCProductCategorySpatialController {
+        for c in spatial {
 
             // Chirality by name (`Self.hand(of:)`), because GCController itself
             // does not carry the hand — Accessory does, and the two objects are
@@ -753,6 +775,9 @@ final class KleptonControllers {
             let hand = Self.hand(of: c)
 
             c.input.inputStateQueueDepth = 1
+            // nil is "nothing new since you last asked", NOT "everything is
+            // released". Leave this hand's last sample standing — see the
+            // clear-on-attachment note above, which is the other half of this.
             guard let s = c.input.nextInputState() else { continue }
             let b = s.buttons, ax = s.axes, dp = s.dpads
 
