@@ -116,6 +116,11 @@ echo "[1/5] runtime + guest translations ($KLT_NAME)…"
 if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
 ./mkguest.sh | tail -1
 ./mkangle.sh | tail -1
+# ...and the Vulkan renderer, for a guest whose graphics API is not GLES. Unlike
+# ANGLE this needs no source checkout and no build — `make mvk` is a 180 MB
+# prebuilt — so the script just re-wraps whatever is vendored and says so when
+# nothing is. gen_xcodeproj.py embeds it only if this produced something.
+./mkmvk.sh | tail -1
 
 echo "[2/5] project…"
 python3 gen_xcodeproj.py | head -1
@@ -191,7 +196,93 @@ print(phys[0]["identifier"])
   [ -z "${KL_FRAMES:-}" ]     || OPEN_ENDED=1
   [ -z "${KL_SLINK_WAIT:-}" ] || OPEN_ENDED=1
   case "${KL_IMMERSIVE:-1}" in 0|no|off|false|"") ;; *) OPEN_ENDED=1 ;; esac
-  if [ -z "$OPEN_ENDED" ]; then
+
+  # ...and the third mode, which is the one an open-ended run should take:
+  # --console in the BACKGROUND, streaming into the local log.
+  #
+  # The two above are a false dichotomy that cost every device run minutes of
+  # pure waiting. --console blocks until the app exits, so an immersive run
+  # could not use it — but "blocks" is a property of running it in the
+  # foreground, not of the bridge. Backgrounded, it delivers the app's stdout
+  # and stderr live at no cost, and the watch loop becomes a local `wc -l`.
+  #
+  # What it replaces was expensive in a way the log's SIZE never was:
+  # `devicectl device copy from` is ~27 s per call on this hardware regardless
+  # of how many bytes it moves, and the poller made one every 5 s until the log
+  # stopped growing for KL_QUIET (32) consecutive samples. That is ~32 s a
+  # sample and up to an hour of transfer for a run measured in minutes.
+  #
+  # It needs KL_LOG_FILE=0 to be worth anything: kl_app.c redirects stdout into
+  # the container by default, and a bridged stdout that has been freopen'd to a
+  # file carries nothing. Set here rather than left to the caller, because the
+  # two halves are one decision — a console launch whose app still logs to a
+  # file is a run with no output at all, which is the worst of both.
+  #
+  # KL_CONSOLE=0 restores the copy-polling path. Keep it working: a launch from
+  # the Home View has no console, and a run whose app dies still leaves the
+  # container's file behind for the next launch to pull.
+  CONSOLE=""
+  case "${KL_CONSOLE:-1}" in 0|no|off|false|"") ;; *) [ -n "$OPEN_ENDED" ] && CONSOLE=1 ;; esac
+
+  if [ -n "$CONSOLE" ]; then
+    LOCAL="${KL_LOG_OUT:-/tmp/klepton-device.log}"
+    ENVJSON="${ENVJSON%\}},\"KL_LOG_FILE\":\"0\"}"
+    : > "$LOCAL"
+    # A sentinel rather than a second copy of the OPEN_ENDED/KL_CONSOLE test:
+    # build_run_vpro.sh has to know whether this log was STREAMED, because
+    # pulling the container's file on top of a streamed one replaces this run's
+    # output with an older run's. Recomputing the condition there would be two
+    # copies of one decision, which is how they come to disagree.
+    : > "$LOCAL.streamed"
+    xcrun devicectl device process launch --device "$DEVID" --console \
+      --terminate-existing --environment-variables "$ENVJSON" \
+      "$BUNDLE_ID" >> "$LOCAL" 2>&1 &
+    CONSOLE_PID=$!
+    # Ctrl-C stops the app as well as the wait, which is what the old loop's
+    # "Ctrl-C to stop" promised and could not deliver: there, the app was
+    # detached and kept running.
+    trap 'kill $CONSOLE_PID 2>/dev/null; echo; echo "    log: $LOCAL"; exit 0' INT
+    echo "    streaming the app's output live (--console); done when it stops growing"
+    last=-1; same=0
+    for _ in $(seq 1 "${KL_WATCH:-120}"); do
+      sleep 5
+      n=$(wc -l < "$LOCAL" | tr -d ' ')
+      printf '    %s lines\n' "$n"
+      # No relaunch rule here, and none is needed: this file is OURS and is
+      # appended to, so a device-side relaunch cannot truncate the evidence the
+      # way it truncates the container's copy. It shows up as the log simply
+      # continuing, which is the honest rendering of what happened.
+      if [ "$n" = "$last" ]; then
+        same=$((same+1))
+        [ "$same" -lt "${KL_QUIET:-32}" ] || { echo "    output stopped"; break; }
+      else
+        same=0
+      fi
+      last="$n"
+      kill -0 $CONSOLE_PID 2>/dev/null || { echo "    app exited"; break; }
+    done
+    trap - INT
+    # NOT killed when the watch ends, and that is the whole difference between
+    # this and a foreground --console: signals sent to devicectl are FORWARDED
+    # to the app, so tearing the bridge down at the end of the loop would quit
+    # the thing on the headset the moment the script stopped watching it. The
+    # detached-launch path never did that, and a run you cannot keep looking at
+    # is not the same measurement.
+    #
+    # Left streaming instead: it keeps appending to $LOCAL after this script
+    # exits, and the next run's --terminate-existing ends both the app and this
+    # bridge with it, so at most one is ever outstanding.
+    if kill -0 $CONSOLE_PID 2>/dev/null; then
+      if [ "${KL_CONSOLE_STOP:-0}" = 1 ]; then
+        kill $CONSOLE_PID 2>/dev/null || true
+        echo "    app stopped (KL_CONSOLE_STOP=1)"
+      else
+        echo "    app is STILL RUNNING on the headset and still streaming into"
+        echo "    the log (KL_CONSOLE_STOP=1 to quit it here instead)"
+      fi
+    fi
+    echo "    log: $LOCAL"
+  elif [ -z "$OPEN_ENDED" ]; then
     # P4's shape: --console blocks until the app terminates, which for a UI app
     # means until it is quit by hand. Fine for a run that finishes in seconds.
     xcrun devicectl device process launch --device "$DEVID" --console \
@@ -218,6 +309,7 @@ print(phys[0]["identifier"])
     echo
     echo "    watching the log; it is done when it stops growing (Ctrl-C to stop)"
     LOCAL="${KL_LOG_OUT:-/tmp/klepton-device.log}"
+    rm -f "$LOCAL.streamed"        # this run's log came from the container
     last=-1; same=0
     for _ in $(seq 1 "${KL_WATCH:-120}"); do
       sleep 5

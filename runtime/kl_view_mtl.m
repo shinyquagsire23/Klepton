@@ -25,6 +25,7 @@
 #include "kl_ovrp.h"
 #include "kl_reproject.h"
 #include "kl_view_mtl.h"
+#include "kl_vulkan.h"
 #include "kl_env.h"
 
 // The liveness downsample. 64x64 is 16 KB read back in a completion handler —
@@ -201,7 +202,7 @@ static id<MTLBuffer> klvm_grid_buffer(id<MTLTexture> src, const float *vp,
     return g_grid_buf;
 }
 
-static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice) {
+static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice, int flip_y) {
     kl_ovrp_render_pose r;
     int have = kl_ovrp_stage_render_pose(stage, &r);
 
@@ -220,26 +221,51 @@ static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice) {
     const float *t = have ? r.tangents[0] : (const float[]){1, 1, 1, 1};
     simd_float4x4 proj = kl_reproject_projection(t[0], t[1], t[2], t[3], 0.03f);
     return kl_reproject_build(have ? &r : NULL, 0, device,
-                              matrix_identity_float4x4, proj, slice);
+                              matrix_identity_float4x4, proj, slice, flip_y);
+}
+
+// Which frame of the guest's this composite would be showing, and 0 for "none
+// yet". Two sources, because the two graphics APIs answer it in different
+// places: ANGLE signals an MTLSharedEvent from inside its own command stream
+// (kl_glfb), and a Vulkan guest has no such event — kl_vulkan waits for its
+// queue at ovrp_EndFrame4 and publishes a serial instead. Both are monotonic and
+// both mean "there is a NEW, COMPLETE picture", which is all this file wants of
+// them.
+//
+// `*fenced` is the difference that matters at the encoder: a GL value is one the
+// guest's queue really signals on our MTLSharedEvent, so the composite can WAIT
+// on it, and a Vulkan serial is not — kl_vulkan already made the queue idle
+// before publishing it. Waiting on the event for a Vulkan serial would be a
+// command buffer that is committed and never executes: a presented drawable,
+// healthy counters, and a black window (KL_CP_NOFENCE's failure, in the one
+// place it cannot be turned off).
+static uint64_t klvm_frame_value(int *fenced) {
+    uint64_t v = kl_glfb_gpu_fence_value();
+    if (fenced) *fenced = v != 0;
+    return v ? v : (uint64_t)kl_vulkan_frame_serial();
 }
 
 int kl_viewmtl_start(void *metal_layer) {
     if (g_started) return 1;
     if (!metal_layer) return 0;
 
-    // ANGLE's own MTLDevice, not MTLCreateSystemDefaultDevice(): the eye
-    // textures were allocated on it (the extension requires that — PLANNING
-    // §12.9) and a drawable from a different device cannot be a destination for
-    // a pass that samples them.
-    void *devp = kl_glfb_mtl_device();
-    if (!devp) return 0;
-
     // Nothing to composite until the guest has taken its eye textures, which
     // happens inside nativeRecreateGfxState. Returning 0 here is not a failure,
     // it is "not yet" — kl_view.c retries every frame.
-    if (!kl_glfb_eye_mtl_texture(0, 0, NULL)) return 0;
+    void *eyep = kl_glfb_eye_mtl_texture(0, 0, NULL);
+    if (!eyep) return 0;
 
-    g_dev = (__bridge id<MTLDevice>)devp;
+    // **The device is the EYE TEXTURE's, not MTLCreateSystemDefaultDevice() and
+    // no longer ANGLE's either.** A drawable from a different device cannot be
+    // the destination of a pass that samples this texture, so the only device
+    // that can possibly be right is the one that owns the thing being sampled —
+    // and asking the texture is the one phrasing that is right for both guests.
+    // On GL that is ANGLE's device by construction (the extension requires the
+    // eye texture to belong to the display's device, PLANNING §12.9); on the
+    // Vulkan path it is MoltenVK's, and `kl_glfb_mtl_device()` answers NULL
+    // there because ANGLE was never brought up at all.
+    g_dev = ((__bridge id<MTLTexture>)eyep).device;
+    if (!g_dev) return 0;
     g_queue = [g_dev newCommandQueue];
     g_event = [g_dev newSharedEvent];
     if (!g_queue || !g_event) {
@@ -298,11 +324,20 @@ int kl_viewmtl_start(void *metal_layer) {
     // Registering the fence is what switches kl_glfb's swap handling from
     // "read the eye back" to "signal that the frame is done". From here on
     // nothing copies pixels.
-    kl_glfb_set_gpu_fence((__bridge void *)g_event);
+    //
+    // Only when ANGLE is the renderer. On the Vulkan path kl_glfb has no
+    // context, no swap and nothing to signal, and registering an event it will
+    // never touch would make kl_glfb_has_gpu_fence() answer yes for a fence
+    // that does not exist — which is a claim the end-of-run report and
+    // kl_ovrp's present gate both read.
+    int gl = kl_glfb_mtl_device() != NULL;
+    if (gl) kl_glfb_set_gpu_fence((__bridge void *)g_event);
 
     g_started = 1;
     fprintf(stderr, "  [vmtl] hardware compositor on %s — no readback, "
-                    "no CPU copies%s\n", g_dev.name.UTF8String,
+                    "no CPU copies%s%s\n", g_dev.name.UTF8String,
+            gl ? "" : ", VULKAN guest (the eye texture is MoltenVK's and the "
+                      "frame seam is kl_vulkan's serial)",
             g_timewarp ? ", reprojecting against the guest's render pose" : "");
     return 1;
 }
@@ -372,8 +407,13 @@ int kl_viewmtl_present(int win_w, int win_h) {
     void *texp = kl_glfb_eye_mtl_texture(0, stage, &slice);
     if (!texp) return 0;
     id<MTLTexture> src = (__bridge id<MTLTexture>)texp;
+    // Which way up the guest drew it, recorded with the texture — see
+    // kl_reproject.h. Read per (eye, stage) rather than decided once, because
+    // it is a property of the storage and not of this compositor.
+    int flip = kl_glfb_eye_mtl_origin_top_left(0, stage);
 
-    uint64_t v = kl_glfb_gpu_fence_value();
+    int fenced = 0;
+    uint64_t v = klvm_frame_value(&fenced);
     if (!v || v == g_last_value) return 0;   // no new guest frame
 
     if (win_w <= 0 || win_h <= 0) return 0;
@@ -390,7 +430,12 @@ int kl_viewmtl_present(int win_w, int win_h) {
     // queues on its own. Without this the compositor samples a texture the
     // guest may still be rendering into — which reads as intermittent tearing
     // and is exactly the kind of bug that gets blamed on the guest.
-    [cmd encodeWaitForEvent:g_event value:v];
+    //
+    // ...when the value is one ANGLE's queue signals. A Vulkan serial is
+    // published only after kl_vulkan has made the guest's queue idle, so the
+    // ordering has already happened on the CPU and there is nothing to wait for
+    // — see klvm_frame_value.
+    if (fenced) [cmd encodeWaitForEvent:g_event value:v];
 
     // Letterbox: the eye is ~1832x1920, the window is not.
     NSUInteger sw = src.width, sh = src.height;
@@ -408,9 +453,9 @@ int kl_viewmtl_present(int win_w, int win_h) {
                                     dw, dh, 0.0, 1.0 }];
     [enc setFragmentTexture:src atIndex:0];
     [enc setFragmentSamplerState:g_samp atIndex:0];
-    uint32_t sl = (uint32_t)slice;
+    kl_blit_uniforms bu = { (uint32_t)slice, (uint32_t)(flip ? 1 : 0) };
     if (g_pipe_rp) {
-        kl_reproject_uniforms u = klvm_uniforms(stage, sl);
+        kl_reproject_uniforms u = klvm_uniforms(stage, bu.slice, flip);
         [enc setRenderPipelineState:g_pipe_rp];
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
@@ -473,7 +518,7 @@ int kl_viewmtl_present(int win_w, int win_h) {
         klvm_note_delta(stage);
     } else {
         [enc setRenderPipelineState:g_pipe];
-        [enc setFragmentBytes:&sl length:sizeof sl atIndex:0];
+        [enc setFragmentBytes:&bu length:sizeof bu atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
     [enc endEncoding];
@@ -492,7 +537,7 @@ int kl_viewmtl_present(int win_w, int win_h) {
         [se setRenderPipelineState:g_pipe];
         [se setFragmentTexture:src atIndex:0];
         [se setFragmentSamplerState:g_samp atIndex:0];
-        [se setFragmentBytes:&sl length:sizeof sl atIndex:0];
+        [se setFragmentBytes:&bu length:sizeof bu atIndex:0];
         [se drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [se endEncoding];
         int cw = (int)sw, ch = (int)sh;
@@ -520,6 +565,7 @@ void kl_viewmtl_stop(void) {
 }
 
 unsigned kl_viewmtl_frames(void) { return g_frames; }
+unsigned long long kl_viewmtl_guest_frame(void) { return g_last_value; }
 unsigned long kl_viewmtl_lit(void) {
     return __atomic_load_n(&g_lit, __ATOMIC_RELAXED);
 }

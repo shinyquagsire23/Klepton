@@ -66,7 +66,7 @@ static void check_math(void) {
     // pass is a blit when there is nothing to correct, so turning reprojection
     // on cannot change a picture that was already right.
     kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
-                                                 matrix_identity_float4x4, P, 0);
+                                                 matrix_identity_float4x4, P, 0, 0);
     int exact = 1;
     for (int i = 0; i < 4; i++) {
         simd_float4 n = corner_ndc(u, (float)(i & 1), (float)(i >> 1));
@@ -95,7 +95,7 @@ static void check_math(void) {
     simd_float4x4 dev = simd_matrix4x4(simd_quaternion(10.0f * (float)M_PI / 180.0f,
                                                        simd_make_float3(0, 1, 0)));
     kl_reproject_uniforms uy = kl_reproject_build(&r, 0, dev,
-                                                  matrix_identity_float4x4, P, 0);
+                                                  matrix_identity_float4x4, P, 0, 0);
     float shift = corner_ndc(uy, 0.5f, 0.5f).x - corner_ndc(u, 0.5f, 0.5f).x;
     ok(shift > 0.10f && shift < 0.25f,
        "a +10 deg yaw moves the picture right, by about tan(10 deg)");
@@ -113,7 +113,7 @@ static void check_math(void) {
     // that could move the corners is the rotation under test.
     simd_float4x4 Pd = kl_reproject_projection(1, 1, 1, 1, 0.03f);
     kl_reproject_uniforms un = kl_reproject_build(NULL, 0, dev,
-                                                  matrix_identity_float4x4, Pd, 0);
+                                                  matrix_identity_float4x4, Pd, 0, 0);
     int quiet = 1;
     for (int i = 0; i < 4; i++) {
         simd_float4 n = corner_ndc(un, (float)(i & 1), (float)(i >> 1));
@@ -259,7 +259,7 @@ static void check_pixels(void) {
         for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
     simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
     kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
-                                                 matrix_identity_float4x4, P, 0);
+                                                 matrix_identity_float4x4, P, 0, 0);
 
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = dst;
@@ -303,6 +303,75 @@ static void check_pixels(void) {
                out[8],out[9],out[10], out[12],out[13],out[14],
                want[0],want[1],want[2],    want[4],want[5],want[6],
                want[8],want[9],want[10],   want[12],want[13],want[14]);
+
+    // ...and the same source read as a VULKAN guest's, which is the same
+    // picture stored the other way up (kl_reproject.h, `flip_y`). The output
+    // must then be the source in memory order, i.e. exactly the inverse of the
+    // assertion above.
+    //
+    // This is worth a pass of its own rather than an inspection of the shader
+    // because an upside-down composite is a *correct-looking* picture — every
+    // Metal call succeeds, every counter is healthy, and the only instrument
+    // that has ever caught it is a person looking at a loading screen. It is
+    // also the one assertion here that would fail if the flip were applied
+    // unconditionally, which is what both compositors did until this existed.
+    u.flip_y = 1;
+    cmd = [q commandBuffer];
+    enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:ps];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
+    [enc setVertexBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    klr_draw(enc);
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    uint8_t outf[16] = {0};
+    [dst getBytes:outf bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
+    ok(memcmp(outf, s0, 16) == 0,
+       "flip_y = 1 reads a top-left-origin (Vulkan) picture the right way up");
+    ok(memcmp(outf, want, 16) != 0,
+       "...and that is NOT the same output as flip_y = 0");
+    u.flip_y = 0;
+
+    // ...and the same two answers through the BLIT, which is a separate shader
+    // with a separate uv convention and is the viewer's DEFAULT path — the one
+    // that actually ran when BONELAB's loading screen first appeared in a
+    // window. Checking only the reprojection pass would leave the flip proven
+    // in the shader nobody runs unless KL_VIEW_TIMEWARP is set.
+    {
+        NSError *berr = nil;
+        id<MTLLibrary> blib = [dev newLibraryWithSource:
+                                   [NSString stringWithUTF8String:kl_reproject_blit_msl()]
+                                                options:nil error:&berr];
+        MTLRenderPipelineDescriptor *bpd = [MTLRenderPipelineDescriptor new];
+        bpd.vertexFunction = [blib newFunctionWithName:@"kl_blit_v"];
+        bpd.fragmentFunction = [blib newFunctionWithName:@"kl_blit_f"];
+        bpd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        id<MTLRenderPipelineState> bps =
+            [dev newRenderPipelineStateWithDescriptor:bpd error:&berr];
+        if (!bps) ok(0, "pipeline for the blit's pixel check");
+        for (int flip = 0; bps && flip < 2; flip++) {
+            kl_blit_uniforms bu = { 0, (uint32_t)flip };
+            cmd = [q commandBuffer];
+            enc = [cmd renderCommandEncoderWithDescriptor:rp];
+            [enc setRenderPipelineState:bps];
+            [enc setFragmentTexture:src atIndex:0];
+            [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
+            [enc setFragmentBytes:&bu length:sizeof bu atIndex:0];
+            // Three vertices, no grid: the blit is a full-screen triangle.
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+            uint8_t b[16] = {0};
+            [dst getBytes:b bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
+            ok(memcmp(b, flip ? s0 : want, 16) == 0,
+               flip ? "blit: flip_y = 1 reads a Vulkan picture the right way up"
+                    : "blit: flip_y = 0 reads a GL picture the right way up");
+        }
+    }
 
     // The same picture through the other slice must NOT be the same picture.
     u.slice = 1;
@@ -471,7 +540,7 @@ static void check_crop_pixels(void) {
         for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
     simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
     kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
-                                                 matrix_identity_float4x4, P, 0);
+                                                 matrix_identity_float4x4, P, 0, 0);
 
     // The guest's rect: the bottom-left quarter, as ovrp_CalculateEyeViewportRect
     // answers it and ovrp_EndFrame4 submits it.

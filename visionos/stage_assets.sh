@@ -148,9 +148,27 @@ echo "[stage] device $TARGET, $KLT_NAME ($(du -shc "$ASSETS" "$APK" ${OBB:+"$OBB
 copy "$ASSETS" "Documents/$TREE/assets"
 copy "$APK"    "Documents/$KLT_APK"
 copy_meta
-# devicectl copies a DIRECTORY as a directory, so the whole obb/ goes across and
-# the destination is its parent's child, not the file's path.
-[ -n "$OBB" ] && copy "$OBB" "Documents/android-files/obb"
+# The OBB, FILE BY FILE and through the RESOLVED path — not `copy "$OBB"`.
+#
+# The obb directory a host run reads is deliberately symlinks into bonelab_obb/
+# (6.8 GB is not worth a second copy on this machine), and `devicectl device
+# copy to` copies a symlink AS a symlink. The device then holds two ~175-byte
+# files with exactly the right names, pointing at a path that does not exist
+# there — so every name-based check passes, `getObbDirs()` finds them, and the
+# only symptom is Unity saying the OBB's GUID is `''` a thousand log lines
+# later. kl_jni.c's obb census now stats them and says so by name; this is the
+# other half, which is not staging a link in the first place.
+#
+# Passing each resolved path dereferences naturally, and it also means the
+# destination is the FILE's path rather than the directory's parent, which is
+# why this cannot just gain a flag.
+if [ -n "$OBB" ]; then
+  for f in "$OBB"/*.obb; do
+    [ -e "$f" ] || continue          # a dangling link on THIS machine too
+    real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$f")
+    copy "$real" "Documents/android-files/obb/$(basename "$f")"
+  done
+fi
 # The Qt plugin .so files, when the target asks for them. They are DATA, not a
 # loader path — see the `qtplugins` note in targets.py: Qt globs this directory
 # and parses each candidate's ELF metadata before it will dlopen it, and the

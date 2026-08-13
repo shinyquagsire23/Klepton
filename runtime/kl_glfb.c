@@ -1933,7 +1933,12 @@ static void *g_mtl_provider_ctx;
 // attached to. A map is built for one screen size; attaching it to a texture of
 // another is a warp against coordinates that do not exist, and nothing in Metal
 // or ANGLE reports it.
-static struct { void *tex; int slice; void *image; uint32_t gl_tex; int w, h; }
+// `top_left` records which way up the guest rendered — see
+// kl_glfb_eye_mtl_origin_top_left. It stays 0 for everything that arrives
+// through the GL path below, which is every entry this table had until the
+// Vulkan seam existed.
+static struct { void *tex; int slice; void *image; uint32_t gl_tex; int w, h;
+                int top_left; }
     g_eye_mtl[2][KL_MTL_MAX_STAGES];
 
 void kl_glfb_set_mtl_provider(kl_glfb_mtl_provider fn, void *ctx) {
@@ -2075,6 +2080,33 @@ void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice) {
     if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) return NULL;
     if (out_slice) *out_slice = g_eye_mtl[eye][stage].slice;
     return g_eye_mtl[eye][stage].tex;
+}
+
+// The Vulkan path's way into the same table — see kl_glfb.h. There is no
+// EGLImage and no GL name on that path, so those two fields stay zero and
+// kl_glfb_release_eye_texture has nothing of its own to drop; the VkImage is
+// kl_vulkan.c's to free.
+void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
+                                  int w, int h) {
+    if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) return;
+    if (g_eye_mtl[eye][stage].tex == texture &&
+        g_eye_mtl[eye][stage].slice == slice) return;
+    g_eye_mtl[eye][stage].tex   = texture;
+    g_eye_mtl[eye][stage].slice = slice;
+    g_eye_mtl[eye][stage].image = NULL;
+    g_eye_mtl[eye][stage].gl_tex = 0;
+    g_eye_mtl[eye][stage].w = w;
+    g_eye_mtl[eye][stage].h = h;
+    // Vulkan's framebuffer origin is the top left, like Metal's and unlike GL's.
+    g_eye_mtl[eye][stage].top_left = 1;
+    fprintf(stderr, "  [glfb] eye %d stage %d is MTLTexture %p slice %d (%dx%d), "
+                    "from Vulkan — top-left origin, the compositor can sample it\n",
+            eye, stage, texture, slice, w, h);
+}
+
+int kl_glfb_eye_mtl_origin_top_left(int eye, int stage) {
+    if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) return 0;
+    return g_eye_mtl[eye][stage].top_left;
 }
 
 // The teardown half, called from ovrp_DestroyEyeTexture — the only thing in the

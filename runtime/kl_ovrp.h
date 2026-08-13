@@ -412,6 +412,19 @@ float kl_ovrp_display_frequency(void);
 void kl_ovrp_set_eye_texture_size(int w, int h);
 void kl_ovrp_eye_texture_size(int *w, int *h);
 
+// Do we tell the guest the two eyes may be ARRAY LAYERS of one texture rendered
+// in a single pass — Unity's Single Pass Instanced / Multiview? This is the one
+// answer that picks the guest's whole stereo rendering mode, so it is a function
+// rather than a constant per call site: ovrp_GetSystemMultiViewSupported,
+// ...Supported2, ovrp_GetEyeTextureArraySupported and ...Supported2 all read it,
+// and two of them disagreeing is a guest told it may render single-pass into
+// storage that has one layer.
+//
+// False on the GL gateway always — ANGLE-on-Metal has no multiview here. On the
+// Vulkan path it follows KL_OVRP_MULTIVIEW, because MoltenVK implements
+// VK_KHR_multiview and kl_vulkan.c can allocate the two-layer image.
+int kl_ovrp_multiview(void);
+
 // ---------------------------------------------------------------------------
 // The eye view, for a guest that is not OVRPlugin's
 //

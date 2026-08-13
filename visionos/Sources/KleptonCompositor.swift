@@ -173,6 +173,12 @@ extension Duration {
 private struct EyeAllocation {
     var texture: MTLTexture
     var slice: Int
+    // 1 if the guest drew this picture with its origin at the TOP left — i.e.
+    // with Vulkan rather than GL. Recorded per texture rather than decided once
+    // (kl_reproject.h): getting it wrong is a correct-looking picture that is
+    // upside down, and nothing in Metal, Compositor Services or the guest can
+    // report it.
+    var flipY: Bool = false
 }
 
 /// GL internal format -> MTLPixelFormat, for the eye textures the guest asks
@@ -523,9 +529,16 @@ final class KleptonCompositor {
         buildPipeline()
 
         guard angle != nil else {
-            NSLog("[cp] ANGLE has no MTLDevice — no eye textures this run "
-                  + "(KL_GLFB unset?); drawables will be cleared and presented, "
-                  + "and the guest still gets its frames")
+            // Not necessarily a run without a picture: a VULKAN guest never
+            // brings ANGLE up at all, and its eye textures arrive from MoltenVK
+            // through kl_glfb's eye table instead of through the provider below
+            // (see eyeSource). Everything ANGLE-specific — the provider and the
+            // shared event — is what is skipped here, and neither exists on
+            // that path.
+            NSLog("[cp] ANGLE has no MTLDevice — no GL provider and no GL frame "
+                  + "fence this run (KL_GLFB unset, or the guest is Vulkan); "
+                  + "drawables will be cleared and presented, and any eye "
+                  + "texture that reaches kl_glfb's table is still composited")
             return
         }
 
@@ -1145,6 +1158,38 @@ final class KleptonCompositor {
     ///           is the whole hypothesis, and nothing else in the run would show
     ///           it: every count stays healthy while the compositor samples a
     ///           texture the guest has stopped writing to.
+    /// The storage to sample for one (eye, stage), from whichever half of the
+    /// seam produced it.
+    ///
+    /// Two halves, and they run in opposite directions. On the **GL** path this
+    /// compositor ALLOCATES the eye texture and hands it to ANGLE through the
+    /// provider, so `eyes` is the authority and the guest renders into
+    /// something we already hold. On the **VULKAN** path there is no provider at
+    /// all: MoltenVK has already backed the guest's eye VkImage with an
+    /// MTLTexture of its own, and kl_vulkan publishes that one into kl_glfb's
+    /// eye table (`kl_glfb_note_eye_mtl_texture`). Nothing here can allocate it,
+    /// so nothing here can be asked for it — the only way to find it is to look
+    /// it up.
+    ///
+    /// The table is checked FIRST, and that is not arbitrary: it is filled by
+    /// both paths (the provider registers its allocation there too), so it is
+    /// the one place that always describes the storage the guest is actually
+    /// rendering into. `eyes` remains the fallback because it survives the gap
+    /// between ovrp_DestroyEyeTexture and the next SetupEyeTexture2, where the
+    /// table is deliberately empty and showing the last good frame beats showing
+    /// black.
+    private func eyeSource(_ eye: Int, _ stage: Int) -> EyeAllocation? {
+        var slice: Int32 = 0
+        if let t = kl_glfb_eye_mtl_texture(Int32(eye), Int32(stage), &slice) {
+            let tex = Unmanaged<MTLTexture>.fromOpaque(t).takeUnretainedValue() as MTLTexture
+            return EyeAllocation(texture: tex, slice: Int(slice),
+                                 flipY: kl_glfb_eye_mtl_origin_top_left(Int32(eye),
+                                                                        Int32(stage)) != 0)
+        }
+        eyesLock.lock(); let a = eyes[Self.key(eye, stage)]; eyesLock.unlock()
+        return a
+    }
+
     private func stageSummary() -> String {
         var out = "stages:"
         var bad = false
@@ -1310,15 +1355,23 @@ final class KleptonCompositor {
         // Order this pass after the guest's rendering. The value only advances
         // when the guest swaps, so an unchanged one also means "no new picture"
         // — which is not an error, it is the case reprojection is for.
-        let frameValue = kl_glfb_gpu_fence_value()
+        // Which guest frame this composite would show. Two sources, one
+        // quantity: ANGLE signals our MTLSharedEvent from inside its own
+        // command stream, and a VULKAN guest has no such event — kl_vulkan
+        // makes the guest's queue idle at ovrp_EndFrame4 and publishes a serial
+        // instead. `guestFrameEvent` being nil on that path is what keeps the
+        // wait below from being encoded against a value nothing ever signals,
+        // which would be a command buffer that is committed and never executes.
+        let glFence = kl_glfb_gpu_fence_value()
+        let frameValue = glFence != 0 ? glFence : kl_vulkan_frame_serial()
         // KL_CP_NOFENCE=1 skips the wait. A composite command buffer that waits
         // on an event value the guest's queue never signals is COMMITTED and
         // never EXECUTES: the drawable is presented, every counter here looks
         // healthy, and the display shows nothing. That failure is invisible
         // from this side, so it needs its own A/B — and cmdCompleted below is
         // the measurement that says whether it is happening.
-        if let ev = guestFrameEvent, frameValue != 0, !noFence {
-            cmd.encodeWaitForEvent(ev, value: frameValue)
+        if let ev = guestFrameEvent, glFence != 0, !noFence {
+            cmd.encodeWaitForEvent(ev, value: glFence)
         }
         if frameValue != 0 && frameValue == lastGuestFrame {
             staleInARow += 1
@@ -1363,7 +1416,7 @@ final class KleptonCompositor {
             // with nil is the case kl_reproject_build already handles.
             var probe = kl_reproject_build(nil, 0, matrix_identity_float4x4,
                                            drawable.views[0].transform,
-                                           drawable.computeProjection(viewIndex: 0), 0)
+                                           drawable.computeProjection(viewIndex: 0), 0, 0)
             let ndcZ = withUnsafePointer(to: &probe) { kl_reproject_ndc_depth($0) }
             NSLog(String(format: "[cp] drawable depthRange = %@ (x=far, y=near in "
                                  + "reverse-Z); quad at %.1f m lands at NDC z %.6f "
@@ -1606,7 +1659,7 @@ final class KleptonCompositor {
         var visible = 0
         for vi in viewIndices {
             let view = drawable.views[vi]
-            eyesLock.lock(); let a = eyes[Self.key(vi, stage)]; eyesLock.unlock()
+            let a = eyeSource(vi, stage)
             // No eye texture yet — the guest is still in _begin, or it has not
             // reached ovrp_SetupEyeTexture2 for this stage. The pass still runs,
             // because the clear above is the point: a drawable that is presented
@@ -1618,7 +1671,8 @@ final class KleptonCompositor {
                 kl_reproject_build(haveRendered ? r : nil, Int32(vi),
                                    originFromDevice, view.transform,
                                    drawable.computeProjection(viewIndex: vi),
-                                   UInt32(alloc?.slice ?? 0))
+                                   UInt32(alloc?.slice ?? 0),
+                                   (alloc?.flipY ?? false) ? 1 : 0)
             }
             // KL_CP_EYE=<0|1> — composite ONLY that eye and leave the other
             // cleared. The measurement this whole hunt has been missing: it
@@ -1657,6 +1711,39 @@ final class KleptonCompositor {
             uniforms.append(u)
         }
         guard let source, visible > 0 else { enc.endEncoding(); return 0 }
+
+        // What each eye is ACTUALLY being placed with, said once per pass shape.
+        //
+        // This exists because a stereo geometry error has no error surface at
+        // all: every call succeeds, the counters stay healthy, and the only
+        // instrument is a person wearing the headset saying one eye looks wrong
+        // — which cannot say WHICH of three things is wrong. The three are
+        // separable from these numbers alone:
+        //
+        //   * `slice` — eye 1 sampling slice 0 is the right eye showing the
+        //     LEFT eye's picture. Placed with eye 1's quad, that is a ~20 degree
+        //     horizontal shift, because the display's per-eye tangents are
+        //     mirror images (l=1.73/r=1.00 against l=1.00/r=1.73).
+        //   * `tan` — the same shift with the pictures the right way round, if
+        //     the quad is built with the other eye's frustum.
+        //   * `rec=no` — no frame record, so BOTH quads fall back to the
+        //     symmetric 90 degree default while the guest rendered asymmetric
+        //     pictures. That one is wrong in both eyes, unequally.
+        //
+        // Keyed on the values rather than a bare `once`: the interesting case is
+        // the one where they CHANGE (a stage re-created, a swapchain rebuilt),
+        // and a first-frame-only line is exactly what would miss it.
+        let shape = viewIndices.map { vi -> String in
+            let u = uniforms[viewIndices.firstIndex(of: vi)!]
+            return String(format: "v%d slice=%u tan(l%.3f r%.3f t%.3f b%.3f) vis=%u flip=%u",
+                          vi, u.slice, u.tangents.x, u.tangents.y, u.tangents.z,
+                          u.tangents.w, u.visible, u.flip_y)
+        }.joined(separator: " | ")
+        if shape != lastEyeShape {
+            lastEyeShape = shape
+            NSLog("[cp] eye placement: \(shape) | rec=\(haveRendered ? "yes" : "no") "
+                  + "layered=\(layered) stage=\(stage)")
+        }
 
         // The viewport matters here in a way it did not for a full-screen
         // triangle: the quad is projected, so it lands where the projection
@@ -1728,6 +1815,9 @@ final class KleptonCompositor {
         return visible
     }
     private var loggedSplitEyes = false
+    /// The last per-eye placement described by `[cp] eye placement`, so the line
+    /// is printed when it CHANGES rather than only on the first frame.
+    private var lastEyeShape = ""
     /// KL_CP_EYE=<0|1>, the binocular/temporal split. See encodeViews.
     private static let onlyEye: Int? = {
         guard let e = ProcessInfo.processInfo.environment["KL_CP_EYE"],

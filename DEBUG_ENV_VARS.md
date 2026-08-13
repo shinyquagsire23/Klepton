@@ -528,6 +528,25 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   number is indistinguishable from sending nothing. Same argument as
   `OVRP_HEADSET_OCULUS_QUEST_2` — read the value out of the guest rather than
   out of a header we do not have.
+- `KL_PROBE_XR=1` — print `XRSettings`: the loaded device name, `enabled`, the
+  **stereo rendering mode**, the eye texture size and the render viewport scale.
+  Every one of those is a number WE answered (through ovrp), and this is the far
+  end of the round trip — Unity's own conclusion about the display rather than
+  what we said. It is what cleared the display of suspicion when BONELAB threw
+  once a frame, and then what confirmed the fix (`stereo=3
+  (SinglePassMultiview)`). Independent of `KL_PROBE_INPUT`.
+  `KL_PROBE_XR_FROM` (default 60) and `KL_PROBE_XR_EVERY` (300) pick when.
+  **Sample LATE.** The pump's frame counter is not Unity's: the first run of
+  this landed before `XRApi: XR Subsystem Start` and reported `enabled=0
+  eyeTexture=0x0`, which is not a measurement of anything. Frame 400+ on
+  BONELAB.
+- `KL_PROBE_STACKTRACE=<0|1|2>` — force Unity's stack traces on for every
+  LogType (`Application.SetStackTraceLogType`; 0 None, 1 ScriptOnly, 2 Full,
+  default 1), **printing what it found before changing it**. That report is the
+  point: it separates "the game turned traces off" from "this build has none".
+  BONELAB already answers `Exception: ScriptOnly` and still emits an empty
+  stack, so it is a dead end there and `notes/BONELAB.md` says not to retry it.
+  Independent of `KL_PROBE_INPUT`; runs once, at the first tick.
 - `KL_PROBE_TYPES=<a,b,...>` — types to census, as `Namespace.Type` (bare name
   for the global namespace); default is the menu pointer chain
   (`VRUIControls.VRPointer,…VRInputModule,…VRLaserPointer,…VRGraphicRaycaster`).
@@ -867,9 +886,15 @@ The composite/timewarp pass — one file, compiled by both compositors
   reaches the parts of the game a pointer drives, and until this existed a
   crash there left nothing but an OS `.ips`, which names a pc and no caller.
 - `KL_VIEW=1` — interactive one-eye viewer on SDL3; WASD+mouse-look drives
-  the head pose ovrp reports. Requires `KL_GLFB=1`, runs the guest in-process
-  on a spawned thread (no guard test, no re-exec), and pumps frames until the
-  window closes instead of `KL_FRAMES` times.
+  the head pose ovrp reports. Runs the guest in-process on a spawned thread (no
+  guard test, no re-exec) and pumps frames until the window closes instead of
+  `KL_FRAMES` times. Wants `KL_LIFECYCLE=1` beside it, or the guest stops at
+  `initJni` and never renders.
+  `KL_GLFB=1` is needed for a **GLES** guest and is not a hard requirement any
+  more: a Vulkan guest never brings ANGLE up at all and its eye textures reach
+  the compositor from MoltenVK, so without `KL_GLFB` the viewer takes the
+  compositor path and waits for one from whichever source produces it. Setting
+  neither on a GLES guest is a black window, and the startup line says so.
   Controls: mouse-look aims, **mouse-L = right index trigger** (the menu
   click), mouse-R = grip, `Z`/`X` = A/B, `C`/`V` = X/Y, `G`/`H` = left
   trigger/grip, arrows = right thumbstick, WASD/`R`/`F` move.
@@ -1274,12 +1299,31 @@ vendored the whole path refuses by name and none of these do anything.
   capture and no readback cost.
 - `KL_VK_OUT_EVERY=N` — capture every Nth frame (default 1). A full eye pair is
   ~21 MB of readback, so 1 is only for short runs.
-- `KL_VK_EYE_TINT=1` — pre-clear every eye image to GREEN before the guest ever
-  sees it. **The A/B that separates the two ways an eye texture comes back
-  wrong**, which are otherwise identical in the capture: if the green survives,
-  the guest never drew into the image; if it does not, the guest drew and the
-  content is really what it rendered. This is what proved the uniform magenta
-  was uninitialised memory rather than Unity's error shader.
+- `KL_VK_EYE_TINT=1` — pre-clear every eye image before the guest ever sees it:
+  **GREEN for eye 0 and BLUE for eye 1**. Two A/Bs in one. It separates the two
+  ways an eye texture comes back wrong, which are otherwise identical in the
+  capture — if the tint survives, the guest never drew into the image; if it
+  does not, the guest drew and the content is really what it rendered (this is
+  what proved the uniform magenta was uninitialised memory rather than Unity's
+  error shader). And under the Array layout, where the two eyes are two SLICES
+  of one image, the per-layer colours say whether the capture reads the right
+  slice — a capture reading layer 0 twice produces two byte-identical PNGs,
+  which is exactly what a guest rendering only the left eye produces too.
+- `KL_OVRP_MULTIVIEW` — Vulkan path only, **default 1** (kl_ovrp.c). Do we tell
+  the guest the two eyes may be array LAYERS of one texture rendered in one
+  pass, i.e. Unity's Single Pass Instanced? `0` restores MultiPass, which is the
+  configuration in which BONELAB's SRP threw `ArgumentOutOfRangeException` once
+  a frame and drew nothing — so this is the A/B for that whole failure. Always
+  false for a GLES guest whatever this says: ANGLE-on-Metal has no multiview,
+  and telling one yes is an eye texture it renders half of.
+- `KL_VK_FRAME_SYNC` — **default 1** (kl_vulkan.c). Wait for the guest's VkQueue
+  to go idle at `ovrp_EndFrame4` before publishing the frame serial a compositor
+  reads. That is a real CPU stall on the guest's frame thread, and it is there
+  because there is no cross-queue GPU fence on this path: the GL side signals an
+  MTLSharedEvent from inside ANGLE's own command stream, and the guest owns the
+  VkQueue here, so nothing of ours is in its submissions. `0` keeps the serial
+  and drops the wait — the A/B for "is the compositor showing a torn frame?",
+  and the shape a timeline-semaphore version would have.
 - `KL_VK_TRACE=1` — the loader's own chatter: which MoltenVK was opened, which
   extension names were dropped, acquire/submit failures.
 - `KL_VK_WIDTH` / `KL_VK_HEIGHT` — the synthetic Android surface's size
@@ -1520,6 +1564,29 @@ Read by the scripts themselves, never forwarded to the app.
 - `KL_KEEP_LONGEST=` (empty) — let a shorter fresh log overwrite a longer
   previous one; default keeps the longest, because a launch that never
   happened leaves the previous run's file in place.
+- `KL_CONSOLE=0` — go back to polling the container's log with
+  `devicectl device copy from` instead of streaming the app's output over
+  `devicectl device process launch --console`. **Streaming is the default for
+  an open-ended run**, and the reason is measured rather than stylistic: a
+  `copy from` costs **~27 s per call whatever the file's size** (150 KB and
+  15 MB are indistinguishable), and the poller made one every 5 s until the log
+  had not grown for `KL_QUIET` samples — up to an hour of transfer for a run
+  measured in minutes. Streaming costs nothing and is live. Keep the old path
+  working: a launch from the Home View has no console at all, and a run whose
+  app dies still leaves the container's file for the next launch to pull.
+  Streaming implies `KL_LOG_FILE=0` (below) — `run.sh` sets it, because a
+  console launch whose app still redirects into a file produces no output
+  anywhere.
+- `KL_CONSOLE_STOP=1` — quit the app when the watch loop ends. Default leaves
+  it **running on the headset**, still streaming: signals sent to `devicectl`
+  are forwarded to the app, so tearing the bridge down would quit the thing you
+  are looking at the moment the script stops watching it. The next run's
+  `--terminate-existing` ends both, so at most one bridge is ever outstanding.
+- `KL_LOG_FILE=0` — the app does **not** redirect stdout/stderr into
+  `Documents/klepton-boot.log` (visionOS, `kl_app.c`). The only way anything
+  outside the process can read them live; the in-window boot report and the
+  after-the-fact pull both go empty in exchange, so this is set by the console
+  path rather than by hand.
 
 ## Host environment pass-through
 

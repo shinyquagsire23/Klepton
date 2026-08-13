@@ -117,6 +117,7 @@ static const char kl_msl_reproject[] =
 "    float    depth;      // metres — see kl_reproject.h\n"
 "    uint     visible;    // 0 = collapse the quad, this eye has no picture\n"
 "    uint     srgbDecode; // 1 = the sample is an sRGB code value, not linear\n"
+"    uint     flipY;      // 1 = the picture's origin is the TOP left (Vulkan)\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -206,7 +207,16 @@ static const char kl_msl_reproject[] =
 "    // unwarp. The identity grid holds exactly float2(c.x, c.y), so the\n"
 "    // convention derived above is preserved rather than re-derived — and the\n"
 "    // table is built in this same uv space, so nothing here flips.\n"
-"    o.uv = grid[1u + g.y * (nx + 1u) + g.x];\n"
+"    float2 uv = grid[1u + g.y * (nx + 1u) + g.x];\n"
+// ...except for a guest whose framebuffer origin is the TOP left. That is
+// Vulkan, and it is the one thing about the picture that the API the guest drew
+// with decides rather than anything here (kl_reproject.h, `flip_y`). Applied
+// AFTER the grid, which is exact today because the Vulkan path has no
+// foveation: with a rate map in play the unwarp and the flip are both in the
+// texture's own space and this composition would want checking against a
+// foveated Vulkan eye, which nothing has produced yet.
+"    if (u.flipY != 0u) uv.y = 1.0 - uv.y;\n"
+"    o.uv = uv;\n"
 "    return o;\n"
 "}\n"
 "\n"
@@ -248,7 +258,7 @@ static const char kl_msl_reproject[] =
 "    o.srgb = ua[amp].srgbDecode;\n"
 "    o.pos = ua[amp].visible == 0u ? kl_offscreen\n"
 "                                  : float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
-"    o.uv  = float2(p.x, p.y);\n"
+"    o.uv  = float2(p.x, ua[amp].flipY != 0u ? 1.0 - p.y : p.y);\n"
 "    return o;\n"
 "}\n"
 "\n"
@@ -267,6 +277,11 @@ static const char kl_msl_blit[] =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "struct VOut { float4 pos [[position]]; float2 uv; };\n"
+// Matches kl_blit_uniforms in kl_reproject.h. The flip lives in the FRAGMENT
+// stage here rather than in the vertex shader, because this pass has no grid
+// and no per-vertex table — one branch on a uniform is the whole difference
+// between a GL guest's picture and a Vulkan guest's.
+"struct KLBlit { uint slice; uint flipY; };\n"
 "vertex VOut kl_blit_v(uint vid [[vertex_id]]) {\n"
 "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
 "    VOut o;\n"
@@ -284,8 +299,9 @@ static const char kl_msl_blit[] =
 "fragment float4 kl_blit_f(VOut in [[stage_in]],\n"
 "                          texture2d_array<float> tex [[texture(0)]],\n"
 "                          sampler samp [[sampler(0)]],\n"
-"                          constant uint &slice [[buffer(0)]]) {\n"
-"    return float4(tex.sample(samp, in.uv, slice).rgb, 1.0);\n"
+"                          constant KLBlit &u [[buffer(0)]]) {\n"
+"    float2 uv = float2(in.uv.x, u.flipY != 0u ? 1.0 - in.uv.y : in.uv.y);\n"
+"    return float4(tex.sample(samp, uv, u.slice).rgb, 1.0);\n"
 "}\n";
 
 const char *kl_reproject_msl(void)      { return kl_msl_reproject; }
@@ -379,10 +395,15 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
                                          simd_float4x4 origin_from_device,
                                          simd_float4x4 device_from_view,
                                          simd_float4x4 projection,
-                                         uint32_t slice) {
+                                         uint32_t slice, int flip_y) {
     kl_reproject_uniforms u;
     u.projection = projection;
     u.slice = slice;
+    // Passed in rather than read from a global, unlike srgb_decode below: the
+    // flip is a property of ONE (eye, stage) texture and its recorded answer
+    // lives in kl_glfb's eye table, which this file cannot reach without taking
+    // a dependency `make reproject` exists without.
+    u.flip_y = flip_y ? 1u : 0u;
     // Visible unless the caller says otherwise: only the visionOS compositor
     // has an eye it may have no picture for, and it clears the flag itself.
     u.visible = 1;

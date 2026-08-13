@@ -600,8 +600,7 @@ int kl_view_main(const char *libdir, int hw) {
             hud_last = t_now;
             char frames[64];
             if (hw) snprintf(frames, sizeof frames, "frame %llu, shown %u",
-                             (unsigned long long)kl_glfb_gpu_fence_value(),
-                             kl_viewmtl_frames());
+                             kl_viewmtl_guest_frame(), kl_viewmtl_frames());
             else    snprintf(frames, sizeof frames, "frame %u", g_frame_seq);
             // A flat guest has no pose, and printing one would invite the
             // reader to debug a number that means nothing here. `lit` still

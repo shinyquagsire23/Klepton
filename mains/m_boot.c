@@ -651,12 +651,22 @@ static int recon_run(int view_pump) {
             // it is directly comparable with the reference path's number: the two
             // should agree, and a lit reference frame beside a black interop one
             // means the binding took and the rendering went elsewhere.
-            if (kl_glfb_has_mtl_provider()) {
+            // ...and it fires for an eye MTLTexture that arrived any way at
+            // all, not just through a registered provider. On the VULKAN path
+            // there IS no provider: MoltenVK backs the guest's eye VkImage with
+            // a texture of its own and kl_vulkan.c publishes that one
+            // (kl_glfb_note_eye_mtl_texture), so a provider test would have
+            // skipped the only guest whose compositor wiring is new.
+            if (kl_glfb_has_mtl_provider() || kl_glfb_eye_mtl_texture(0, 0, NULL)) {
                 printf("\n=== P5 interop: the guest's frame, read back through Metal ===\n");
                 // Under the viewer's hardware compositor there IS no reference:
                 // registering a GPU fence replaces the readback, so kl_glfb has
                 // counted nothing and a bare 0 here would read as a black frame.
-                if (kl_glfb_has_gpu_fence())
+                if (!kl_glfb_has_mtl_provider())
+                    printf("  reference: KL_VK_OUT — on the Vulkan path the eye "
+                           "is read back from the VkImage, and this is the SAME "
+                           "storage seen as Metal\n");
+                else if (kl_glfb_has_gpu_fence())
                     printf("  reference: none — the GPU compositor is driving, "
                            "so nothing was read back\n");
                 else
@@ -725,11 +735,20 @@ static int view_run(void) {
     // kl_env_on, not getenv: this has to agree with kl_glfb_enabled() about what
     // KL_GLFB=0 means, or the viewer starts on the strength of a knob the
     // renderer read as off and then displays nothing.
-    if (!kl_env_on("KL_GLFB", 0)) {
-        fprintf(stderr, "KL_VIEW=1 requires KL_GLFB=1 — the viewer displays "
-                        "what the reference renderer reads back\n");
-        return 1;
-    }
+    //
+    // ...unless the guest's API is Vulkan, and that is not knowable here: it is
+    // measured by kl_vulkan_guest_active() long after this point, from what the
+    // guest actually did. A Vulkan guest never brings ANGLE up at all, and its
+    // eye textures reach the compositor from MoltenVK instead
+    // (kl_glfb_note_eye_mtl_texture), so KL_GLFB has nothing to do with whether
+    // there is a picture. Refusing here would refuse the one target whose
+    // compositing is new. So this is a NOTE now, not a refusal — the viewer
+    // waits for an eye texture from whichever source produces one, and says so
+    // in its HUD if none ever arrives.
+    if (!kl_env_on("KL_GLFB", 0))
+        fprintf(stderr, "view: KL_GLFB is not set — nothing will be displayed "
+                        "unless the guest turns out to render through VULKAN, "
+                        "whose eye textures do not come from ANGLE\n");
     if (!kl_view_available()) {
         fprintf(stderr, "KL_VIEW=1 but t_boot was built without SDL3\n");
         return 1;
@@ -747,6 +766,15 @@ static int view_run(void) {
     int hw = 0;
     if (getenv("KL_VIEW_CPU")) {
         fprintf(stderr, "view: KL_VIEW_CPU=1 — readback path\n");
+    } else if (!kl_env_on("KL_GLFB", 0)) {
+        // No GL renderer was asked for, so there is no readback to fall back
+        // to and nothing to bring ANGLE up for. The compositor path is the only
+        // one that can show anything, and it finds the guest's eye texture by
+        // itself whichever API produced it — which for a Vulkan guest is the
+        // only way a picture exists at all.
+        hw = 1;
+        fprintf(stderr, "view: no GL renderer — the compositor will wait for an "
+                        "eye texture (Vulkan)\n");
     } else if (!kl_glfb_mtl_device()) {
         fprintf(stderr, "view: no MTLDevice from ANGLE — readback path\n");
     } else {

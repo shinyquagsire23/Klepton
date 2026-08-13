@@ -39,6 +39,13 @@ void kl_viewmtl_stop(void);
 // Frames this compositor has presented.
 unsigned kl_viewmtl_frames(void);
 
+// ...and the GUEST frame the last of them showed. Monotonic, 0 before the first
+// composite. It is kl_glfb's fence value for a GL guest and kl_vulkan's frame
+// serial for a Vulkan one, which is exactly why the HUD asks here instead of
+// reading either directly — the two are the same quantity and only this file
+// knows which one is live.
+unsigned long long kl_viewmtl_guest_frame(void);
+
 // Lit-pixel count of the last composited frame, on kl_glfb's definition
 // (tone-mapped channel sum > 12), estimated from a 64x64 downsample of the same
 // pass and scaled to the eye's pixel count so the HUD line stays comparable to

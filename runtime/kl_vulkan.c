@@ -58,7 +58,17 @@ int   kl_vulkan_guest_active(void) { return 0; }
 unsigned long long kl_vulkan_eye_image(int s, int e, unsigned w, unsigned h, int srgb) {
     (void)s; (void)e; (void)w; (void)h; (void)srgb; return 0;
 }
+// Was missing, and it is what kl_ovrp.c actually calls — so a checkout that has
+// never run `make mvk` did not fail to *compile*, it failed to LINK, which is
+// the one failure this whole `#if` exists to prevent. Every entry point in the
+// header belongs here.
+unsigned long long kl_vulkan_eye_image_layers(int s, int e, unsigned w, unsigned h,
+                                             int srgb, int layers) {
+    (void)s; (void)e; (void)w; (void)h; (void)srgb; (void)layers; return 0;
+}
 void  kl_vulkan_capture_eyes(unsigned f, int s) { (void)f; (void)s; }
+void  kl_vulkan_frame_done(int s) { (void)s; }
+unsigned long long kl_vulkan_frame_serial(void) { return 0; }
 
 #else  /* MoltenVK headers present */
 
@@ -69,7 +79,13 @@ void  kl_vulkan_capture_eyes(unsigned f, int s) { (void)f; (void)s; }
 // AHardwareBuffer` itself and includes nothing. Transcribing the struct instead
 // would have been four fields of avoidable risk.
 #define VK_USE_PLATFORM_ANDROID_KHR 1
+// ...and the Metal half, for `VK_EXT_metal_objects` — how the MTLTexture behind
+// an eye VkImage is reached and handed to the compositor. Equally safe in plain
+// C: vulkan_metal.h typedefs every Metal handle to `void *` unless __OBJC__ is
+// defined, which it is not here.
+#define VK_USE_PLATFORM_METAL_EXT 1
 #include <vulkan/vulkan.h>
+#include "kl_glfb.h"
 
 #include <zlib.h>
 
@@ -196,6 +212,7 @@ typedef struct {
     PFN_vkWaitForFences               WaitForFences;
     PFN_vkResetFences                 ResetFences;
     PFN_vkDeviceWaitIdle              DeviceWaitIdle;
+    PFN_vkQueueWaitIdle               QueueWaitIdle;
     // Readback scratch, created on first use and shared by every capture path
     // (swapchain present and the OVRPlugin eye layer). Sized to the largest
     // image captured so far and grown as needed.
@@ -437,7 +454,7 @@ static void dev_resolve(klvk_device *d) {
     R(BeginCommandBuffer); R(EndCommandBuffer); R(ResetCommandBuffer);
     R(CmdPipelineBarrier); R(CmdCopyImageToBuffer); R(CmdClearColorImage); R(QueueSubmit);
     R(CreateFence); R(DestroyFence); R(WaitForFences); R(ResetFences);
-    R(DeviceWaitIdle);
+    R(DeviceWaitIdle); R(QueueWaitIdle);
 #undef R
 }
 
@@ -471,6 +488,14 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     // missing nicety.
     if (have && ext_supported(have, nhave, "VK_KHR_portability_subset"))
         ext_add(&keep, "VK_KHR_portability_subset");
+    // ...and one the guest never asks for and we need: `vkExportMetalObjectsEXT`
+    // is how the MTLTexture behind an eye VkImage reaches the compositor, and
+    // calling it on a device that did not enable this is undefined. It adds no
+    // behaviour of its own — nothing else in the device's operation changes —
+    // and eye_mtl_texture falls back to MoltenVK's own deprecated entry point if
+    // it is absent, so this is an upgrade rather than a requirement.
+    if (have && ext_supported(have, nhave, "VK_EXT_metal_objects"))
+        ext_add(&keep, "VK_EXT_metal_objects");
 
     VkDeviceCreateInfo mine = ci ? *ci : (VkDeviceCreateInfo){
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
@@ -816,9 +841,15 @@ static const char *cap_dir(void) { return kl_env_str("KL_VK_OUT", NULL); }
 // implement image layouts** — Metal has no such concept — so the barrier is in
 // practice a memory barrier and the transition is bookkeeping. It is still
 // written correctly, because this file is also the model for the device path.
-static int cap_image(klvk_device *d, VkQueue q, VkImage img, uint32_t w, uint32_t h,
-                     VkFormat fmt, VkImageLayout cur, const char *path,
-                     const VkSemaphore *waits, uint32_t nwait) {
+// `layer` is the array slice to read. It is 0 for every 2D image here and 0/1
+// for the two eyes of an Array-layout eye image, and it has to travel all the
+// way into the copy region: a barrier and a copy that both say slice 0 read the
+// LEFT eye twice and produce two identical PNGs, which reads exactly like a
+// guest that renders one eye — the failure this capture exists to distinguish.
+static int cap_image_layer(klvk_device *d, VkQueue q, VkImage img, uint32_t w, uint32_t h,
+                           VkFormat fmt, VkImageLayout cur, uint32_t layer,
+                           const char *path,
+                           const VkSemaphore *waits, uint32_t nwait) {
     VkDeviceSize need = (VkDeviceSize)w * h * 4;
     if (!cap_prepare(d, need)) { VKI("capture setup failed\n"); return 0; }
 
@@ -838,14 +869,14 @@ static int cap_image(klvk_device *d, VkQueue q, VkImage img, uint32_t w, uint32_
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = img,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1 },
     };
     d->CmdPipelineBarrier(d->cap_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_src);
 
     VkBufferImageCopy region = {
         .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1 },
         .imageOffset = { 0, 0, 0 },
         .imageExtent = { w, h, 1 },
     };
@@ -928,6 +959,12 @@ static int cap_image(klvk_device *d, VkQueue q, VkImage img, uint32_t w, uint32_
     return ok;
 }
 
+static int cap_image(klvk_device *d, VkQueue q, VkImage img, uint32_t w, uint32_t h,
+                     VkFormat fmt, VkImageLayout cur, const char *path,
+                     const VkSemaphore *waits, uint32_t nwait) {
+    return cap_image_layer(d, q, img, w, h, fmt, cur, 0, path, waits, nwait);
+}
+
 static void cap_frame(klvk_swapchain *sc, VkQueue q, uint32_t idx,
                       const VkSemaphore *waits, uint32_t nwait) {
     char path[1024];
@@ -950,20 +987,134 @@ static void cap_frame(klvk_swapchain *sc, VkQueue q, uint32_t idx,
 // Vulkan path those names go straight into `vkCreateImageView` as VkImage
 // handles, which is a segfault inside MoltenVK with a GL name for an address.
 // So the eye textures have to be real VkImages, and this is where they are made.
+// Two eye LAYOUTS reach here, and they differ in how many images exist rather
+// than in anything about one image:
+//
+//   Stereo (ovrpLayout 0) — one 2D image per (stage, eye), array layer 0.
+//   Array  (ovrpLayout 3) — ONE image per stage with two array layers, handed
+//                           back for both eyes; the eye IS the layer index.
+//
+// The second is what Unity calls Single Pass Instanced / Multiview, and it is
+// how this title ships on a Quest. `layers` is therefore a property of the
+// stage, not of the eye: kl_ovrp.c passes 2 for Array and 1 for Stereo, and the
+// slot for eye 1 is left empty under Array so nothing can hand out a second
+// image that does not exist.
 #define KLVK_EYE_STAGES 4
 static struct {
     VkImage        img;
     VkDeviceMemory mem;
     uint32_t       w, h;
+    uint32_t       layers;
     VkFormat       fmt;
 } g_eye[KLVK_EYE_STAGES][2];
 
 int kl_vulkan_guest_active(void) { return g_avail && g_ndev > 0; }
 
-unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned h,
-                                       int srgb) {
+// ---------------------------------------------------------------------------
+// The compositor seam — the MTLTexture behind an eye VkImage
+// ---------------------------------------------------------------------------
+//
+// P5's compositors (KleptonCompositor.swift on device, kl_view_mtl.m on the
+// host) sample an `id<MTLTexture>` the guest rendered into, found through
+// `kl_glfb_eye_mtl_texture`. On the GL path the host ALLOCATES that texture and
+// ANGLE is told to use it as the eye's storage. On the Vulkan path the
+// direction is the other way round and it is simpler: MoltenVK has already
+// backed our VkImage with an MTLTexture, so there is nothing to import,
+// negotiate a format for, or keep in step — we ask for the one that exists.
+//
+// **That asymmetry is the whole reason there is no provider call here.** An
+// import (`VkImportMetalTextureInfoEXT`, or the deprecated `vkSetMTLTextureMVK`)
+// would let the host choose the storage, and buys nothing: this eye image is
+// never a drawable, the compositor only ever reads it, and a host-chosen
+// texture would have to agree with the VkFormat exactly — the same
+// "Incompatible format" class kl_glfb.h records for ANGLE, in an API where the
+// failure is silent instead.
+//
+// Two entry points can answer, and they are tried in that order:
+//
+//   vkExportMetalObjectsEXT   VK_EXT_metal_objects, the standard one. Needs the
+//                             extension ENABLED on the device, which is why
+//                             klvk_CreateDevice adds it.
+//   vkGetMTLTextureMVK        MoltenVK's own, deprecated but a plain dylib
+//                             export that needs no extension — the fallback for
+//                             a device created before this existed.
+//
+// Failure is not fatal anywhere: the capture path reads the VkImage directly
+// and does not need this at all. A run with no compositor (every host run today)
+// simply publishes a texture nobody samples.
+static void *eye_mtl_texture(klvk_device *d, VkImage img) {
+    if (!d || !img) return NULL;
+
+    // vkGetMTLTextureMVK's own prototype lives in MoltenVK/mvk_deprecated_api.h,
+    // which is an Objective-C header (`id<MTLTexture> *`) and cannot be included
+    // from this plain-C file. The ABI is a pointer either way, so it is declared
+    // here rather than dragging the translation unit into ObjC for one symbol.
+    typedef void (*pfn_get_mtl_texture_mvk)(VkImage, void **);
+
+    static PFN_vkExportMetalObjectsEXT export_ext;
+    static pfn_get_mtl_texture_mvk     get_mvk;
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        export_ext = (PFN_vkExportMetalObjectsEXT)
+            (real_gdpa ? real_gdpa(d->dev, "vkExportMetalObjectsEXT") : NULL);
+        get_mvk = (pfn_get_mtl_texture_mvk)mvk_sym("vkGetMTLTextureMVK");
+        if (!export_ext && !get_mvk)
+            VKI("no way to reach the MTLTexture behind an eye image — neither "
+                "vkExportMetalObjectsEXT nor vkGetMTLTextureMVK resolves; the "
+                "compositor will have nothing to sample (the capture is "
+                "unaffected)\n");
+    }
+
+    if (export_ext) {
+        VkExportMetalTextureInfoEXT tex = {
+            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
+            .image = img,
+            .plane = VK_IMAGE_ASPECT_PLANE_0_BIT,
+        };
+        VkExportMetalObjectsInfoEXT info = {
+            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+            .pNext = &tex,
+        };
+        export_ext(d->dev, &info);
+        if (tex.mtlTexture) return (void *)tex.mtlTexture;
+    }
+    if (get_mvk) {
+        void *t = NULL;
+        get_mvk(img, &t);
+        return t;
+    }
+    return NULL;
+}
+
+// Tell kl_glfb which MTLTexture is which eye, so every compositor and readback
+// finds the Vulkan eyes through the same accessor it already uses for the GL
+// ones. Under the Array layout one texture serves both eyes and the eye is the
+// SLICE, which is exactly what that table's `slice` field was added for.
+static void eye_publish_mtl(int stage, int eye, int layers) {
+    klvk_device *d = g_devs[0];
+    VkImage img = g_eye[stage][eye].img;
+    void *tex = eye_mtl_texture(d, img);
+    if (!tex) return;
+    int w = (int)g_eye[stage][eye].w, h = (int)g_eye[stage][eye].h;
+    if (layers > 1) {
+        kl_glfb_note_eye_mtl_texture(0, stage, tex, 0, w, h);
+        kl_glfb_note_eye_mtl_texture(1, stage, tex, 1, w, h);
+    } else {
+        kl_glfb_note_eye_mtl_texture(eye, stage, tex, 0, w, h);
+    }
+}
+
+unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,
+                                              int srgb, int layers) {
     if (!kl_vulkan_guest_active()) return 0;
     if (stage < 0 || stage >= KLVK_EYE_STAGES || eye < 0 || eye > 1) return 0;
+    if (layers < 1) layers = 1;
+    if (layers > 2) layers = 2;
+    // Under the Array layout there is one image for the stage and both eyes get
+    // it; slot 0 owns it, so the eye argument selects a LAYER later and not a
+    // second allocation here.
+    if (layers > 1) eye = 0;
     klvk_device *d = g_devs[0];
     if (g_eye[stage][eye].img) return (uint64_t)(uintptr_t)g_eye[stage][eye].img;
 
@@ -974,7 +1125,7 @@ unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned 
         .format = fmt,
         .extent = { w, h, 1 },
         .mipLevels = 1,
-        .arrayLayers = 1,
+        .arrayLayers = (uint32_t)layers,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         // The guest renders into it, samples it for its own post chain, and we
@@ -1028,31 +1179,58 @@ unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned 
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = img,
-            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+            // EVERY layer: under the Array layout the two eyes are layers of
+            // this one image, and tinting only layer 0 would leave the right
+            // eye's "did the guest draw?" question unanswered.
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, (uint32_t)layers },
         };
         d->CmdPipelineBarrier(d->cap_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
-        VkClearColorValue col = { .float32 = { 0.0f, 1.0f, 0.0f, 1.0f } };  // green
-        VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        d->CmdClearColorImage(d->cap_cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                              &col, 1, &rng);
+        // A DIFFERENT colour per array layer, and that is the second question
+        // this diagnostic answers. Under the Array layout the two eyes are two
+        // slices of one image, and "the guest drew" and "the capture reads the
+        // right slice" are separate failures that look identical in the files:
+        // a capture that reads layer 0 twice produces two byte-identical PNGs,
+        // which is exactly what a guest rendering only the left eye produces
+        // too. Green for eye 0, blue for eye 1 — so a run says which.
+        static const VkClearColorValue TINT[2] = {
+            { .float32 = { 0.0f, 1.0f, 0.0f, 1.0f } },   // eye 0: green
+            { .float32 = { 0.0f, 0.0f, 1.0f, 1.0f } },   // eye 1: blue
+        };
+        for (int ly = 0; ly < layers; ly++) {
+            VkImageSubresourceRange rng =
+                { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, (uint32_t)ly, 1 };
+            d->CmdClearColorImage(d->cap_cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  &TINT[layers > 1 ? ly : (eye & 1)], 1, &rng);
+        }
         d->EndCommandBuffer(d->cap_cmd);
         VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                             .commandBufferCount = 1, .pCommandBuffers = &d->cap_cmd };
         d->ResetFences(d->dev, 1, &d->cap_fence);
         if (d->QueueSubmit(d->queue, 1, &si, d->cap_fence) == VK_SUCCESS)
             d->WaitForFences(d->dev, 1, &d->cap_fence, VK_TRUE, 2000000000ull);
-        VKI("eye image stage %d eye %d pre-cleared GREEN (KL_VK_EYE_TINT)\n", stage, eye);
+        VKI("eye image stage %d pre-cleared: %s (KL_VK_EYE_TINT)\n", stage,
+            layers > 1 ? "layer 0 GREEN, layer 1 BLUE"
+                       : (eye ? "eye 1 BLUE" : "eye 0 GREEN"));
     }
 
     g_eye[stage][eye].img = img;
     g_eye[stage][eye].mem = mem;
     g_eye[stage][eye].w = w;
     g_eye[stage][eye].h = h;
+    g_eye[stage][eye].layers = (uint32_t)layers;
     g_eye[stage][eye].fmt = fmt;
-    VKI("eye image stage %d eye %d = VkImage %p (%ux%u %s)\n", stage, eye,
+    eye_publish_mtl(stage, eye, layers);
+    VKI("eye image stage %d %s = VkImage %p (%ux%u %s)\n", stage,
+        layers > 1 ? "both eyes (2 array layers)" :
+                     (eye ? "eye 1" : "eye 0"),
         (void *)img, w, h, srgb ? "R8G8B8A8_SRGB" : "R8G8B8A8_UNORM");
     return (uint64_t)(uintptr_t)img;
+}
+
+unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned h,
+                                       int srgb) {
+    return kl_vulkan_eye_image_layers(stage, eye, w, h, srgb, 1);
 }
 
 void kl_vulkan_capture_eyes(unsigned frame, int stage) {
@@ -1064,18 +1242,75 @@ void kl_vulkan_capture_eyes(unsigned frame, int stage) {
     if (stage < 0 || stage >= KLVK_EYE_STAGES) return;
 
     klvk_device *d = g_devs[0];
+    // Under the Array layout slot 0 holds the only image and the two eyes are
+    // its layers, so the eye index selects a layer there and an image here. The
+    // filename stays `eyeN` either way — it names what was drawn, not where it
+    // was stored.
+    int layered = g_eye[stage][0].img && g_eye[stage][0].layers > 1;
     for (int eye = 0; eye < 2; eye++) {
-        if (!g_eye[stage][eye].img) continue;
+        int slot = layered ? 0 : eye;
+        if (!g_eye[stage][slot].img) continue;
         char path[1024];
         snprintf(path, sizeof path, "%s/vk_f%05u_s%d_eye%d.png", dir, frame, stage, eye);
         // The guest submitted this to a compositor, so it left it readable by
         // one — SHADER_READ_ONLY_OPTIMAL. See cap_image on why a wrong guess
         // here is cheap on MoltenVK specifically.
-        if (cap_image(d, d->queue, g_eye[stage][eye].img, g_eye[stage][eye].w,
-                      g_eye[stage][eye].h, g_eye[stage][eye].fmt,
-                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, path, NULL, 0))
+        if (cap_image_layer(d, d->queue, g_eye[stage][slot].img, g_eye[stage][slot].w,
+                            g_eye[stage][slot].h, g_eye[stage][slot].fmt,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            layered ? (uint32_t)eye : 0u, path, NULL, 0))
             g_presented++;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The frame seam — "this eye texture is finished, a compositor may sample it"
+// ---------------------------------------------------------------------------
+//
+// The GL path answers this with an MTLSharedEvent queued into ANGLE's own
+// command stream (kl_glfb's klfb_gpu_frame_now): the compositor's command
+// buffer waits on a value the guest's queue signals, and nothing ever stalls on
+// the CPU. There is no equivalent here, and the reason is not an oversight —
+// **the guest owns the VkQueue and we do not add work to its submissions.** A
+// cross-queue GPU wait needs a shared event signalled *after* the guest's
+// rendering, and the only ways to get one are to signal a timeline semaphore on
+// the guest's queue (which needs `VK_KHR_timeline_semaphore` enabled on a device
+// the GUEST creates) or to export the MTLCommandQueue and encode the signal
+// ourselves in Objective-C, which this plain-C file cannot do.
+//
+// So this waits. `vkQueueWaitIdle` on the guest's own queue, at the moment the
+// guest asserts the eye textures are drawn (ovrp_EndFrame4), and then a serial
+// the compositor reads: past it, the picture is not merely submitted but
+// COMPLETE, so no compositor-side ordering is needed at all.
+//
+// It is a real stall on the guest's frame thread and it is named as one. The
+// capture path (KL_VK_OUT) already pays exactly this cost on every captured
+// frame, and no device run has happened, so it buys correctness at a price
+// nothing has yet measured. `KL_VK_FRAME_SYNC=0` removes the wait and keeps the
+// serial — the A/B for "is the compositor showing a torn frame?", and the shape
+// the timeline-semaphore version would have.
+static uint64_t g_frame_serial;
+
+unsigned long long kl_vulkan_frame_serial(void) {
+    return __atomic_load_n(&g_frame_serial, __ATOMIC_ACQUIRE);
+}
+
+void kl_vulkan_frame_done(int stage) {
+    (void)stage;
+    if (!kl_vulkan_guest_active()) return;
+    klvk_device *d = g_devs[0];
+    if (kl_env_on("KL_VK_FRAME_SYNC", 1) && d && d->queue) {
+        VkResult r = d->QueueWaitIdle ? d->QueueWaitIdle(d->queue)
+                   : d->DeviceWaitIdle ? d->DeviceWaitIdle(d->dev)
+                                       : VK_SUCCESS;
+        if (r != VK_SUCCESS) {
+            static int said;
+            if (!said++)
+                VKI("waiting for the guest's queue at frame end answered %d — a "
+                    "compositor may sample an eye the GPU is still writing\n", (int)r);
+        }
+    }
+    __atomic_add_fetch(&g_frame_serial, 1, __ATOMIC_RELEASE);
 }
 
 static VkResult klvk_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {

@@ -253,6 +253,59 @@ static uint8_t klmtl_chan8(const void *row, size_t x, int k, int is_half) {
     return tone8(sgn ? -v : v);
 }
 
+// A texture this readback can call `getBytes` on.
+//
+// The GL path's eye textures are MTLStorageModeShared because the host
+// allocated them that way for exactly this. The VULKAN path's are not: MoltenVK
+// backs the guest's eye VkImage with a PRIVATE texture, because kl_vulkan.c asks
+// for DEVICE_LOCAL memory — which is the right thing for storage the GPU renders
+// into every frame, and unreadable from the CPU.
+//
+// So a private texture is staged through a shared one with a blit, rather than
+// refused. Refusing it was worse than useless here: `kl_mtl_count_lit` returned
+// 0, and 0 lit is printed as `<<< BLACK` — a diagnostic that reports a working
+// pipeline as a broken one, which is the failure this whole file exists to
+// avoid making.
+//
+// The staged copy is one SLICE, so the returned texture is always a plain 2D
+// one and the caller's slice becomes 0.
+static id<MTLTexture> klmtl_readable(id<MTLTexture> t, NSUInteger slice,
+                                     NSUInteger *out_slice) {
+    if (out_slice) *out_slice = slice;
+    if (!t || t.storageMode == MTLStorageModeShared) return t;
+
+    id<MTLDevice> dev = t.device;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:t.pixelFormat
+                                     width:t.width
+                                    height:t.height
+                                 mipmapped:NO];
+    d.storageMode = MTLStorageModeShared;
+    d.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:d];
+    if (!dst) return nil;
+
+    // A queue per call. This runs once at the end of a run, so the allocation is
+    // free and it keeps the readback from owning any state.
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromTexture:t
+              sourceSlice:slice
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(t.width, t.height, 1)
+                toTexture:dst
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (out_slice) *out_slice = 0;
+    return dst;
+}
+
 static unsigned long long g_mtl_lum_sum;
 static unsigned long long g_mtl_lum_n;
 
@@ -269,10 +322,13 @@ unsigned long kl_mtl_count_lit(int eye, int stage, int *out_w, int *out_h) {
     NSUInteger w = t.width, h = t.height;
     if (out_w) *out_w = (int)w;
     if (out_h) *out_h = (int)h;
-    if (t.storageMode != MTLStorageModeShared) {
-        fprintf(stderr, "  [mtl] texture is not MTLStorageModeShared — cannot getBytes\n");
+    NSUInteger rslice = 0;
+    t = klmtl_readable(t, (NSUInteger)slice, &rslice);
+    if (!t) {
+        fprintf(stderr, "  [mtl] eye texture could not be staged for readback\n");
         return 0;
     }
+    slice = (int)rslice;
     size_t bpp = 0; int is_half = 0;
     if (!klmtl_read_format(t.pixelFormat, &bpp, &is_half)) {
         fprintf(stderr, "  [mtl] eye texture is MTLPixelFormat %u, which this "
@@ -310,7 +366,11 @@ int kl_mtl_dump_png(int eye, int stage, const char *path) {
     void *texp = kl_glfb_eye_mtl_texture(eye, stage, &slice);
     if (!texp || !path) return 0;
     id<MTLTexture> t = (__bridge id<MTLTexture>)texp;
-    if (t.storageMode != MTLStorageModeShared) return 0;
+    int top_left = kl_glfb_eye_mtl_origin_top_left(eye, stage);
+    NSUInteger rslice = 0;
+    t = klmtl_readable(t, (NSUInteger)slice, &rslice);
+    if (!t) return 0;
+    slice = (int)rslice;
     int32_t w = (int32_t)t.width, h = (int32_t)t.height;
     size_t bpp = 0; int is_half = 0;
     if (!klmtl_read_format(t.pixelFormat, &bpp, &is_half)) return 0;
@@ -328,7 +388,14 @@ int kl_mtl_dump_png(int eye, int stage, const char *path) {
         // flip the picture is upside down — which is how this was found, and is
         // exactly the mistake the compositor pass must not make when it samples
         // these textures for real (see PLANNING §12.9, P5b).
-        uint8_t *o = raw + (stride + 1) * (size_t)(h - 1 - y);
+        //
+        // ...and NOT flipped when a Vulkan guest rendered it, because Vulkan's
+        // origin is the top left like Metal's. The flip is a property of the API
+        // the guest drew with, so it is asked rather than assumed — the
+        // unconditional version put BONELAB's loading screen upside down with
+        // every other part of the seam working.
+        uint8_t *o = raw + (stride + 1) *
+                     (size_t)(top_left ? y : (h - 1 - y));
         *o++ = 0;                                  // PNG filter: none
         for (int32_t x = 0; x < w; x++) {
             for (int k = 0; k < 3; k++)

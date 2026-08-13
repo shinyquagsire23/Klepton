@@ -79,10 +79,30 @@ int kl_vulkan_guest_active(void);
 unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned h,
                                        int srgb);
 
+// ...and the same thing for the layout where the two eyes are ARRAY LAYERS of
+// one image rather than two images — ovrpLayout_Array, which is what Unity
+// calls Single Pass Instanced / Multiview and what a Quest title normally ships
+// with. `layers` is 2 there and 1 for Stereo. Under Array both eyes get the
+// SAME handle back and the eye is the layer index, so kl_ovrp.c must not treat
+// two identical handles as a mistake.
+unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,
+                                              int srgb, int layers);
+
 // Write both eyes of a stage out as PNGs. Called at frame submission, which on
 // this path is ovrp_EndFrame4 — the guest's own assertion that it has finished
 // drawing them.
 void kl_vulkan_capture_eyes(unsigned frame, int stage);
+
+// "The guest has finished drawing this stage's eye textures." Called from the
+// same place the capture is (ovrp_EndFrame4), and it is what a COMPOSITOR waits
+// on: it makes the guest's queue idle and then advances a serial, so past that
+// serial the picture in the eye MTLTexture is complete rather than merely
+// submitted. `kl_vulkan_frame_serial` is the value — monotonic, 0 before the
+// first frame, and exactly the role kl_glfb_gpu_fence_value plays on the GL
+// path (where the wait is on the GPU instead). See the implementation for why
+// this one is a CPU stall and what would remove it.
+void kl_vulkan_frame_done(int stage);
+unsigned long long kl_vulkan_frame_serial(void);
 
 // How many frames have been presented, and how many were written out. The
 // end-of-run report reads these; a run with a healthy frame loop and zero

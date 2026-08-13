@@ -214,6 +214,40 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
 // pass samples, and what a test reads back to check the guest's frame arrived.
 void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice);
 
+// Record an MTLTexture that is an eye's storage but did NOT come through the
+// GL path above — the Vulkan one (kl_vulkan.c). There the guest renders into a
+// VkImage, MoltenVK backs that with an MTLTexture of its own, and there is no
+// EGLImage and no GL name anywhere in the picture; what the compositor needs is
+// the same thing either way, so it goes in the same table and every consumer of
+// `kl_glfb_eye_mtl_texture` is unchanged.
+//
+// `slice` is the array layer, which is how BOTH eyes arrive on the Vulkan path:
+// the Array layout puts them in one two-layer image (see kl_ovrp_multiview).
+// Registering the same texture twice with different slices is the normal case
+// here, not a mistake.
+//
+// This does not take a reference. The image belongs to kl_vulkan.c for the life
+// of the swapchain generation, and releasing it is that file's business — which
+// is why this is `note` and not `bind`: nothing here allocates, so nothing here
+// frees.
+void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
+                                  int w, int h);
+
+// Which way up is the picture in (eye, stage)? 1 = row 0 is the TOP of the
+// image, 0 = row 0 is the bottom.
+//
+// This is not a detail and it has no error surface: a flip is a correct-looking
+// picture that is wrong, and it is a property of the API the GUEST rendered
+// with, not of Metal. GL puts the origin at the bottom left, so every eye
+// texture ANGLE filled has to be flipped when it is sampled or written out —
+// which is how the readback in tests/t_mtl_provider.m was written and why it
+// flips unconditionally. **Vulkan's origin is the TOP left, the same as
+// Metal's**, so an eye a Vulkan guest rendered must NOT be flipped, and doing
+// it anyway produces the loading screen upside down with everything else about
+// the pipeline working — measured, on the first run of the Vulkan compositor
+// seam.
+int kl_glfb_eye_mtl_origin_top_left(int eye, int stage);
+
 // ---------------------------------------------------------------------------
 // The decoded-video image (SL-13) — the guest's eglCreateImageKHR over an
 // AHardwareBuffer, which here is a VideoToolbox CVPixelBuffer. kl_egl.c serves

@@ -211,7 +211,138 @@ static const char *const AXES[] = {
 };
 #define N_AXES (sizeof AXES / sizeof AXES[0])
 
+// ---- KL_PROBE_STACKTRACE: make Unity's own exception log say WHERE ---------
+//
+// A managed exception that prints its message and nothing else is a name
+// without an address. BONELAB throws `ArgumentOutOfRangeException` once a
+// frame out of Unity's SRP `XRSystem` and the log carries three blank lines
+// where the stack should be — which has two very different causes, and they
+// are not distinguishable from the native side: either the build strips
+// managed stack traces, or the game called `Application.SetStackTraceLogType`
+// to turn them off. `Application.GetStackTraceLogType` answers that, so this
+// PRINTS the setting it found before changing it: a probe that reports
+// "already ScriptOnly" is telling you the traces are genuinely unavailable and
+// that this instrument is a dead end, which is worth as much as a trace.
+//
+// StackTraceLogType { None = 0, ScriptOnly = 1, Full = 2 } and
+// LogType { Error = 0, Assert = 1, Warning = 2, Log = 3, Exception = 4 } — both
+// are UnityEngine enums stable since 5.x. Enums marshal as their underlying
+// int, so il2cpp_runtime_invoke takes the ADDRESS of each value.
+//
+// Diagnostic only, and it changes the guest's logging configuration, so it is
+// off unless asked for.
+static void probe_stack_traces(void) {
+    static const char *const LOGTYPE[] = { "Error", "Assert", "Warning", "Log",
+                                           "Exception" };
+    static const char *const STLT[] = { "None", "ScriptOnly", "Full" };
+
+    const MethodInfo *m_get = find_method("UnityEngine", "Application",
+                                          "GetStackTraceLogType", 1);
+    const MethodInfo *m_set = find_method("UnityEngine", "Application",
+                                          "SetStackTraceLogType", 2);
+    if (!m_get || !m_set) return;
+
+    // What the guest asked for, before we touch it.
+    int want = (int)kl_env_uint("KL_PROBE_STACKTRACE", 1);
+    if (want < 0 || want > 2) want = 1;
+    for (int lt = 0; lt < 5; lt++) {
+        int arg = lt;
+        void *ga[1] = { &arg };
+        Il2CppObject *r = invoke(m_get, ga, "Application.GetStackTraceLogType");
+        int had = r ? *(int32_t *)il.object_unbox(r) : -1;
+        int set = want;
+        void *sa[2] = { &arg, &set };
+        invoke(m_set, sa, "Application.SetStackTraceLogType");
+        fprintf(stderr, "  [mprobe] stack traces for %-9s: %s -> %s\n",
+                LOGTYPE[lt],
+                (had >= 0 && had <= 2) ? STLT[had] : "?",
+                STLT[want]);
+    }
+}
+
+// ---- KL_PROBE_XR: what Unity thinks the XR display IS ---------------------
+//
+// Every number on this path is one WE answered — the eye texture size through
+// ovrp_CalculateEyeLayerDesc, the layout through ovrp_GetSystemMultiViewSupported,
+// the viewport through ovrp_CalculateEyeViewportRect — and they travel through
+// libunity and the Oculus XR provider before Unity's own render loop reads them
+// back. That round trip is where they can stop agreeing, and nothing on the
+// native side can see the far end of it: our log says what we said, not what
+// Unity concluded. `XRSettings` is Unity's conclusion, in Unity's words.
+//
+// The reason this exists: BONELAB throws `ArgumentOutOfRangeException` once per
+// frame out of the SRP render loop with an EMPTY stack trace (the build carries
+// none — `KL_PROBE_STACKTRACE` measured that and is a dead end), so the throw
+// site cannot be named from either side. What can be named is a disagreement,
+// and the first candidate is the stereo mode: a title authored for Single Pass
+// Instanced whose display hands back two separate 2D textures is a shape its
+// renderer may never have run.
+static void probe_xr_display(unsigned frame) {
+    // UnityEngine.XR.StereoRenderingMode { MultiPass = 0, SinglePass = 1,
+    // SinglePassInstanced = 2, SinglePassMultiview = 3 }.
+    static const char *const SRM[] = { "MultiPass", "SinglePass",
+                                       "SinglePassInstanced",
+                                       "SinglePassMultiview" };
+    static const MethodInfo *m_mode, *m_w, *m_h, *m_vps, *m_en, *m_dev, *m_occ;
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        m_mode = find_method("UnityEngine.XR", "XRSettings",
+                             "get_stereoRenderingMode", 0);
+        m_w    = find_method("UnityEngine.XR", "XRSettings", "get_eyeTextureWidth", 0);
+        m_h    = find_method("UnityEngine.XR", "XRSettings", "get_eyeTextureHeight", 0);
+        m_vps  = find_method("UnityEngine.XR", "XRSettings",
+                             "get_renderViewportScale", 0);
+        m_en   = find_method("UnityEngine.XR", "XRSettings", "get_enabled", 0);
+        m_dev  = find_method("UnityEngine.XR", "XRSettings", "get_loadedDeviceName", 0);
+        m_occ  = find_method("UnityEngine.XR", "XRSettings",
+                             "get_useOcclusionMesh", 0);
+    }
+    Il2CppObject *mo = invoke(m_mode, NULL, "XRSettings.stereoRenderingMode");
+    Il2CppObject *wo = invoke(m_w,    NULL, "XRSettings.eyeTextureWidth");
+    Il2CppObject *ho = invoke(m_h,    NULL, "XRSettings.eyeTextureHeight");
+    Il2CppObject *so = invoke(m_vps,  NULL, "XRSettings.renderViewportScale");
+    Il2CppObject *eo = invoke(m_en,   NULL, "XRSettings.enabled");
+    Il2CppObject *oo = invoke(m_occ,  NULL, "XRSettings.useOcclusionMesh");
+    Il2CppObject *dv = invoke(m_dev,  NULL, "XRSettings.loadedDeviceName");
+    int mode = mo ? *(int32_t *)il.object_unbox(mo) : -1;
+    char dn[128] = "?";
+    if (dv) str_ascii(dv, dn, sizeof dn);
+    fprintf(stderr, "  [mprobe f%u] XRSettings: device=\"%s\" enabled=%s "
+                    "stereo=%d (%s) eyeTexture=%dx%d viewportScale=%.3f "
+                    "occlusionMesh=%s\n",
+            frame, dn,
+            eo ? (*(uint8_t *)il.object_unbox(eo) ? "1" : "0") : "?",
+            mode, (mode >= 0 && mode <= 3) ? SRM[mode] : "?",
+            wo ? *(int32_t *)il.object_unbox(wo) : -1,
+            ho ? *(int32_t *)il.object_unbox(ho) : -1,
+            so ? (double)*(float *)il.object_unbox(so) : -1.0,
+            oo ? (*(uint8_t *)il.object_unbox(oo) ? "1" : "0") : "?");
+}
+
 void kl_mprobe_tick(unsigned frame) {
+    // Independent of KL_PROBE_INPUT and of KL_PROBE_FROM: this one has to land
+    // BEFORE the throw it exists to describe, and the throw here is on the
+    // first frame. It runs once, on the first tick that finds IL2CPP up.
+    static int st_done;
+    if (!st_done && kl_env_str("KL_PROBE_STACKTRACE", NULL) && mprobe_init()) {
+        st_done = 1;
+        probe_stack_traces();
+    }
+    // Also independent, and for the same reason: the disagreement it looks for
+    // is settled long before KL_PROBE_FROM's default, and reading XRSettings
+    // runs no cctor the guest has not already run.
+    static unsigned xr_from, xr_every;
+    if (kl_env_str("KL_PROBE_XR", NULL)) {
+        if (!xr_every) {
+            xr_from  = kl_env_uint("KL_PROBE_XR_FROM", 60u);
+            xr_every = kl_env_uint("KL_PROBE_XR_EVERY", 300u);
+            if (!xr_every) xr_every = 300;
+        }
+        if (frame >= xr_from && frame % xr_every == 0 && mprobe_init())
+            probe_xr_display(frame);
+    }
+
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_PROBE_INPUT", 0);
     static unsigned every, from;

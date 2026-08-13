@@ -2539,19 +2539,51 @@ static void klj_obb_census(const char *dir) {
     struct dirent *e;
     int match = 0, others = 0;
     char first_other[256] = {0};
+    // ...and how big the matching one actually is. A NAME is not a file: the
+    // host stages this directory as SYMLINKS into bonelab_obb/ (6.8 GB is not
+    // worth duplicating), `devicectl device copy to` copies the links rather
+    // than what they point at, and the device then holds two 174-byte files with
+    // exactly the right names. Every check that reads the name passed, and the
+    // failure surfaced a thousand lines later as Unity's `Application OBB has
+    // mismatching GUID ... got ''` — which reads as a wrong OBB rather than an
+    // empty one, and names nothing that would lead back to staging.
+    //
+    // Stat, not open: a dangling symlink fails here, which is the device case,
+    // and a short-but-real file is the one worth printing a size for.
+    long long bytes = -1;
     while ((e = readdir(d)) != NULL) {
         long got;
         if (sscanf(e->d_name, "main.%ld.", &got) != 1) continue;
-        if (got == code) { match = 1; continue; }
+        if (got == code) {
+            char p[1024];
+            struct stat st;
+            snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+            bytes = stat(p, &st) == 0 ? (long long)st.st_size : -1;
+            match = 1;
+            continue;
+        }
         others++;
         if (!*first_other) snprintf(first_other, sizeof first_other, "%s", e->d_name);
     }
     closedir(d);
-    if (match || (!match && !others)) {
-        // No OBB at all is not an error here: 1.28 and Steam Link have none.
-        if (match) KLJ_LOG("obb: main.%ld.*.obb is present in %s", code, dir);
+    if (match) {
+        // 1 MB is not a threshold anyone has to tune: the smallest real OBB in
+        // this project is hundreds of megabytes, and the failures this catches
+        // are a dangling link (no size at all) and a copied link (~175 bytes).
+        if (bytes < 0 || bytes < (1 << 20))
+            KLJ_LOG("obb: main.%ld.*.obb in %s is %lld bytes — that is NOT the "
+                    "archive. A staged SYMLINK copies as a link, so the name is "
+                    "right and the data is absent; this run has no game content "
+                    "and Unity will say the OBB's GUID is ''. Re-stage the obb "
+                    "directory with the links RESOLVED",
+                    code, dir, bytes);
+        else
+            KLJ_LOG("obb: main.%ld.*.obb is present in %s (%lld bytes)",
+                    code, dir, bytes);
         return;
     }
+    // No OBB at all is not an error here: 1.28 and Steam Link have none.
+    if (!others) return;
     KLJ_LOG("obb: %s holds %s but this guest is versionCode %ld, so it will look "
             "for main.%ld.*.obb and find nothing. That is a MISSING GAME DATA "
             "run — check that apktool.yml was staged beside assets/",

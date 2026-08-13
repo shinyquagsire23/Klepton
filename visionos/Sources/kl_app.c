@@ -231,6 +231,50 @@ int kl_app_configure(const char *resources, const char *container) {
     // still wins, which is how a run points at a different build.
     setenv("KL_ANGLE_DIR", g_dylibs, 0);
 
+    // ...and so does MoltenVK, for a guest whose graphics API is Vulkan
+    // (BONELAB). Same rule, same reason: the app knows where its own Frameworks
+    // are and the launcher does not.
+    //
+    // kl_vulkan.c would find it anyway — its last resort is
+    // `@rpath/MoltenVK.framework/MoltenVK`, and @rpath here IS this directory.
+    // Naming it explicitly costs nothing and buys the failure message: without
+    // this, the two dlopens that precede the @rpath attempt are against the
+    // HOST's vendored path, so a run where MoltenVK is genuinely missing from
+    // the bundle reports `vendor-moltenvk/out/macos/...: no such file`, which
+    // names a directory that has never existed on a headset.
+    setenv("KL_MVK_DIR", g_dylibs, 0);
+
+    // The capture knobs, resolved against the CONTAINER when they are relative.
+    //
+    // Every one of these names an output directory, and on device there is
+    // exactly one writable place and no shell to expand a path against: the
+    // process's cwd is `/`, so `KL_VK_OUT=vkcap` writes to `/vkcap` and fails,
+    // silently, on a run that otherwise looks healthy. An absolute path still
+    // wins outright, and the container's own UUID changes on reinstall — so
+    // spelling one out at the launcher is not a workaround either, it is a value
+    // that goes stale between runs.
+    //
+    // Relative-means-container is also what makes the file RETRIEVABLE: only the
+    // app data container can be read back with `devicectl device copy from`.
+    static const char *const cap_knobs[] = {
+        "KL_VK_OUT", "KL_GLFB_OUT", "KL_DUMP_SHADERS", "KL_DUMP_TEXTURES",
+        "KL_VTDEC_DUMP",
+    };
+    for (size_t i = 0; i < sizeof cap_knobs / sizeof *cap_knobs; i++) {
+        const char *v = getenv(cap_knobs[i]);
+        if (!v || !*v || *v == '/') continue;
+        char abs[1200];
+        snprintf(abs, sizeof abs, "%s/%s", container, v);
+        setenv(cap_knobs[i], abs, 1);
+        // ...and created, because none of the capture paths make their own
+        // directory: on the host you `mkdir /tmp/vk` first, and on device there
+        // is nowhere to type that. A capture whose directory does not exist
+        // fails per FILE, quietly, and the run looks like one where the guest
+        // never drew.
+        mkdir(abs, 0755);
+        printf("[app] %s is relative — resolved to %s\n", cap_knobs[i], abs);
+    }
+
     // ...and the app uses it by default. KL_GLFB stays opt-IN for the host,
     // where the null driver is a legitimate answer — `make check` and every
     // lifecycle loop run on it, and the reference renderer is a deliberate
@@ -253,7 +297,29 @@ int kl_app_configure(const char *resources, const char *container) {
 // a fully-buffered stream loses the whole report when the process dies on a
 // signal — which on the host reads as a much earlier failure than actually
 // happened, and on device would be the only evidence there is.
+//
+// KL_LOG_FILE=0 leaves both streams alone, which is the ONLY way anything
+// outside this process can read them live: `devicectl device process launch
+// --console` bridges the app's stdout and stderr, and a freopen'd stdout is
+// bridged to a file nobody is watching. Polling the file instead costs a
+// `devicectl device copy from` per sample, and that call is ~27 seconds on this
+// hardware whatever the file's SIZE — 150 KB and 15 MB take the same time — so a
+// run watched by copying is minutes of transfer per minute of run. Nothing here
+// is smaller in that mode; the same bytes go somewhere the host can already see.
+//
+// The file stays the default because it is what survives the process: an
+// unimplemented JNI call aborts by design, a launch from the Home View has no
+// console at all, and the in-window boot report is read back out of this path.
 static int open_log(void) {
+    if (!kl_env_on("KL_LOG_FILE", 1)) {
+        // Same buffering discipline either way. The reason is unchanged — a
+        // fully-buffered stream loses the report when the process dies on a
+        // signal — and it applies harder here, because the far end of the bridge
+        // is another process that only ever sees what was actually written.
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        setvbuf(stderr, NULL, _IOLBF, 0);
+        return 0;
+    }
     if (!freopen(g_log, "w", stdout)) return 1;
     setvbuf(stdout, NULL, _IOLBF, 0);
     dup2(fileno(stdout), STDERR_FILENO);   // the guest's own writes(2) land here too

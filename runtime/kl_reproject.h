@@ -104,7 +104,35 @@ typedef struct {
     // for Beat Saber, whose eye textures are RGBA16F and already linear, and
     // off for any guest that leaves the encode alone.
     uint32_t      srgb_decode;
+    // 1 = the picture in this texture has its ORIGIN AT THE TOP LEFT, so the
+    // sample's v has to be flipped before it is read.
+    //
+    // **This is a property of the API the guest rendered with, not of Metal,
+    // and it has no error surface.** GL's framebuffer origin is the bottom
+    // left, so an eye texture ANGLE filled reads correctly with the mapping
+    // this pass was derived against — and every eye texture in this project
+    // came from ANGLE until the Vulkan path existed. Vulkan's origin is the TOP
+    // left, like Metal's, so a picture a Vulkan guest drew comes out upside
+    // down through the same mapping, with everything else about the pipeline
+    // working. Measured, on the first run of the Vulkan compositor seam
+    // (notes/BONELAB.md).
+    //
+    // The authority is kl_glfb_eye_mtl_origin_top_left(eye, stage) — recorded
+    // with the texture when it is registered, because two guests can be in one
+    // process's lifetime and a global would be a guess. The compositors read it
+    // there and pass it in; this file stays linkable against nothing but kl_env
+    // (see kl_reproject_set_srgb_decode for why that matters).
+    uint32_t      flip_y;
 } kl_reproject_uniforms;
+
+// The blit's uniforms — buffer(0) of its FRAGMENT stage. It carried a bare
+// `uint slice` until the flip existed; a second scalar could have gone in
+// another buffer slot, but the two are read together on every path that draws
+// this pass and one struct is what stops a caller binding half of it.
+typedef struct {
+    uint32_t slice;    // array slice of the eye texture to sample
+    uint32_t flip_y;   // as above — 1 for a picture with a top-left origin
+} kl_blit_uniforms;
 
 // Whether the composite should decode its sample from sRGB (above). Pushed
 // rather than queried so this file stays linkable on its own — `make reproject`
@@ -242,6 +270,11 @@ const char *kl_reproject_blit_msl(void);
 //                       one-eye window.
 //   projection          the drawable's projection for this eye
 //   slice               which array slice holds this eye's picture
+//   flip_y              1 if that picture has a top-left origin — i.e. the guest
+//                       rendered it with Vulkan rather than GL. See the
+//                       `flip_y` field above; the caller reads it from
+//                       kl_glfb_eye_mtl_origin_top_left(eye, stage), which is
+//                       where it was recorded with the texture.
 //
 // `rendered` may be NULL, which means "no pose was recorded" — the uniforms then
 // describe an unreprojected picture rather than an undefined one.
@@ -249,7 +282,7 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
                                          simd_float4x4 origin_from_device,
                                          simd_float4x4 device_from_view,
                                          simd_float4x4 projection,
-                                         uint32_t slice);
+                                         uint32_t slice, int flip_y);
 
 // A perspective projection from tangents, all positive, right-handed looking
 // down -Z, reverse-Z (near maps to 1). For the viewer, which has no Compositor

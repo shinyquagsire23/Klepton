@@ -207,9 +207,24 @@ echo "knobs     : ${KL_FRAMES:+KL_FRAMES=$KL_FRAMES }${KL_IMMERSIVE:+KL_IMMERSIV
 echo "            (unset knobs take the app's defaults: immersive + ANGLE, autoboot)"
 echo
 
+# Cleared before, not after: the sentinel says how THIS run produced its log, and
+# a leftover from the previous one would make a KL_CONSOLE=0 run skip the pull it
+# needs and then summarise the older run's file.
+rm -f "$LOCAL_LOG.streamed"
+
 visionos/run.sh device
 
 # run.sh polls the log itself while the run is live; this is the final read, and
 # it re-pulls because the run may have written more after the poller gave up.
-pull_log || true
+#
+# ...unless the run STREAMED it (run.sh's --console path, the default for an
+# open-ended run). There the log in $LOCAL_LOG is the live one and the container
+# holds only whatever a previous file-logging run left behind — so pulling would
+# replace this run's output with an older run's, and the "keep the longest"
+# rule protects the wrong one when the stale log is the longer.
+if [ -f "$LOCAL_LOG.streamed" ]; then
+  echo "    (streamed live over --console; the container's log is not this run's)"
+else
+  pull_log || true
+fi
 summarise

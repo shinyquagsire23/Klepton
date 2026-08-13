@@ -633,7 +633,15 @@ loaddylib: dylibs build/t_load
 # simulator and fail the device.
 XROS_SDK  := $(shell xcrun --sdk xros --show-sdk-path)
 XRSIM_SDK := $(shell xcrun --sdk xrsimulator --show-sdk-path)
-XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64
+# $(MVK_INC) for the same reason CFLAGS carries it, and its absence here was a
+# real hole rather than an omission: kl_vulkan.c is guarded by __has_include, so
+# without the Vulkan headers on the command line it still COMPILES — as the stub
+# that refuses by name. The device build therefore had no Vulkan at all while the
+# host had a working one, which is the worst shape a divergence can take (nothing
+# fails; a Vulkan guest simply reports that the hardware does not meet its
+# requirements, on device only). Nothing links against MoltenVK either way —
+# kl_vulkan.c is VK_NO_PROTOTYPES and dlopens it — so this is headers only.
+XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC)
 
 .PHONY: xros xros-device xros-sim swiftcheck
 xros: xros-device xros-sim build/Klepton.xcframework swiftcheck

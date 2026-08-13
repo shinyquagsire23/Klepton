@@ -29,3 +29,11 @@
 // what a click is.
 #import "kl_present.h"
 #import "kl_mono.h"
+// ...and by one for the VULKAN guest's frame seam. The compositor needs one
+// thing from it and nothing else: WHEN a Vulkan guest's eye picture is
+// complete. On the GL path that is an MTLSharedEvent kl_glfb signals from
+// inside ANGLE's command stream; there is no such event on this path, so
+// kl_vulkan publishes a serial instead and the compositor reads it exactly
+// where it reads the fence value. The eye TEXTURE still arrives through
+// kl_glfb's own table, so nothing else about this seam widens.
+#import "kl_vulkan.h"

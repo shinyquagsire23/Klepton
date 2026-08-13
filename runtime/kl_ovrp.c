@@ -360,13 +360,81 @@ static uint64_t klovrp_GetFoveationEyeTrackedSupported(int *out) {
     return OVRP_SUCCESS;
 }
 
+// Multiview — "can the two eyes be two ARRAY LAYERS of one texture, rendered in
+// one pass?" — is the single answer that decides the guest's whole stereo
+// rendering mode, and it is ours to give.
+//
+// **It is OFF by default and that is a property of the GL gateway, not of the
+// hardware.** ANGLE-on-Metal has no multiview here, so every GLES guest must be
+// told no, and the un-suffixed scalar form in g_ovrp_bool_no says the same
+// thing. Answering yes to a GLES guest is an eye texture it renders half of.
+//
+// On the VULKAN path the answer is YES, because MoltenVK implements
+// `VK_KHR_multiview` and kl_vulkan.c hands back a two-layer image.
+//
+// **That is not a performance choice, it is what makes BONELAB render at all.**
+// Answering no put Unity in MultiPass, and in MultiPass this title's SRP threw
+// `ArgumentOutOfRangeException` once per frame before drawing anything — 856 in
+// a 255-frame run, each followed by `XRSystem.ReleaseFrame() was not called!`,
+// with an EMPTY stack trace because the build carries none. Nothing about the
+// XR display was wrong: `XRSettings` reported `enabled=1`, the right
+// 2208x2400 eye texture and a healthy `oculus display`. It was the RENDERING
+// MODE — a Quest title ships its shader variants and its renderer for Single
+// Pass Instanced, and MultiPass is a path it may never have run. Flipping this
+// one answer took the exception count to 0 and put the loading screen in the
+// eye images on the first try.
+//
+// It only takes effect once the guest has actually brought a Vulkan device up
+// through us, so a GLES guest is unaffected: ANGLE-on-Metal has no multiview
+// here, and telling one yes is an eye texture it renders half of.
+// `KL_OVRP_MULTIVIEW=0` is the A/B, and it restores the failing configuration
+// exactly — which is the only way to see that exception again.
+//
+// The two forms must not disagree: ovrp_GetEyeTextureArraySupported is the same
+// question and reads this.
+int kl_ovrp_multiview(void) {
+    if (!kl_vulkan_guest_active()) return 0;
+    return kl_env_on("KL_OVRP_MULTIVIEW", 1);
+}
+
 // The 2-form of the multiview capability is ovrpResult + int* out (real
 // 0x171090), unlike the scalar-bool un-suffixed form already refused in
-// g_ovrp_bool_no. Same answer as that form: no multiview in our GL gateway.
+// g_ovrp_bool_no.
+// Both 2-forms `cbz x0 -> -1001` before doing anything (read at +0x12a1b0 and
+// +0x12a210), so a NULL out is INVALID_PARAM rather than a success that wrote
+// nothing — `make ovrpabi` checks exactly this against the real library.
 static uint64_t klovrp_GetSystemMultiViewSupported2(int *out) {
     ovrp_hit("ovrp_GetSystemMultiViewSupported2");
-    if (out) *out = 0;
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = kl_ovrp_multiview();
     return OVRP_SUCCESS;
+}
+
+// The same question under its other name — the provider asks this one to decide
+// whether the eye textures can be a 2-slice array. Answering it separately from
+// the multiview form is how a guest ends up told it may render single-pass into
+// storage that has one layer.
+static uint64_t klovrp_GetEyeTextureArraySupported2(int *out) {
+    ovrp_hit("ovrp_GetEyeTextureArraySupported2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = kl_ovrp_multiview();
+    return OVRP_SUCCESS;
+}
+
+// The un-suffixed pair. Both are plain `bool` WRAPPERS around the 2-forms in the
+// real plugin — `bl ...2; csel w0, wzr, w8, lt`, i.e. the out value when the
+// Result was non-negative and false otherwise (read at +0x130bc0 / +0x130b60) —
+// so they are the scalar-bool shape and must answer whatever the 2-forms do.
+// They were a flat "no" in g_ovrp_bool_no until the Vulkan path made the answer
+// conditional, and a constant beside a variable is trap 10's neighbour: the
+// guest asks twice under two names and acts on whichever it read last.
+static uint64_t klovrp_GetEyeTextureArraySupported(void) {
+    ovrp_hit("ovrp_GetEyeTextureArraySupported");
+    return (uint64_t)kl_ovrp_multiview();
+}
+static uint64_t klovrp_GetSystemMultiViewSupported(void) {
+    ovrp_hit("ovrp_GetSystemMultiViewSupported");
+    return (uint64_t)kl_ovrp_multiview();
 }
 
 // Guardian boundary: there is no boundary system on this host, so the
@@ -721,6 +789,82 @@ void kl_ovrp_set_eye_frustum(int eye, float left, float right, float top, float 
     g_eye_tan[eye][2] = top;   g_eye_tan[eye][3] = bottom;
 }
 
+// **A MULTIVIEW guest renders ONE frustum for both eyes, so it must be TOLD
+// one.**
+//
+// Measured on BONELAB, on device: it asks `ovrp_GetNodeFrustum2` for node 0 and
+// node 1 from the render path itself
+// (`OculusDisplayProvider::GfxThread_PopulateNextFrameDesc`), is handed this
+// display's genuinely mirrored per-eye cones (l=1.732/r=1.000 against
+// l=1.000/r=1.732), and renders both eyes with the SAME cone anyway. Cross-
+// correlating the two captured eye layers puts them 0.5% of the width apart —
+// the IPD parallax and nothing else — where honouring the two frusta would put
+// them 26.8% apart. That is Single Pass Instanced doing what it does: one shared
+// projection for both views.
+//
+// The damage is not in the guest's picture, which is fine. It is that
+// kl_reproject places each eye's quad using `g_eye_tan[eye]` — the frustum we
+// SAID it rendered with — so the right eye's picture is placed on a quad built
+// from a cone that is a mirror image of the one actually drawn. That is a ~27%
+// mis-registration, in opposite directions per eye: a warped, displaced,
+// pivoting right eye, with every call on the path returning success.
+//
+// So on a multiview guest both eyes are told the UNION of the two cones. The
+// union rather than one eye's: taking eye 0's would leave the right eye blind
+// to the outer field it can actually see, and the guest would render pixels for
+// a region that eye does not display. The union covers both, the composite's
+// quad then matches what was drawn for BOTH eyes, and the display's real
+// per-eye asymmetry is applied where it belongs — by the composite's own
+// projection, which is what kl_reproject.h calls "the frustum does not match
+// the display's" and exists to correct.
+//
+// The cost is pixels: the union is wider than either eye needs, so some of each
+// eye texture is never displayed. That is the right trade against a picture that
+// is wrong.
+//
+// NOT applied on a single-pass-per-eye guest. Beat Saber and SUPERHOT render an
+// eye at a time and honour the two cones, so unioning would only waste their
+// pixels — and they are measurably correct on this display today, which is the
+// evidence that the per-eye path works when the guest takes it.
+// KL_OVRP_UNIFY_FRUSTUM forces it either way.
+//
+// **Decided when the frustum is READ, never when it is written**, and that
+// distinction is the whole reason the first version of this did nothing. The
+// compositor pushes the display's cones from primeDisplay, which runs before the
+// guest has brought Vulkan up — so at write time `kl_ovrp_multiview()` is still
+// false, the union is skipped, and nothing ever revisits it. A mode that is
+// decided later cannot be consulted earlier; reading through this function is
+// what makes the order irrelevant.
+//
+// Every consumer of g_eye_tan goes through here: what the guest is told
+// (ovrp_GetNodeFrustum2, the eye layer desc), what kl_ovrp_eye_view reports, and
+// the frame record the composite builds its quad from. That last one is not
+// optional — it is the half that has to AGREE with what the guest rendered, and
+// a consumer that reads g_eye_tan directly is exactly the bug this is fixing.
+static const float *klovrp_eye_tan(int eye) {
+    // Written by whichever thread reads first and rewritten with identical
+    // values by any other — the inputs are the display's, fixed for the run.
+    static float u[2][4];
+    if ((unsigned)eye > 1) eye = 0;
+    int on = kl_env_int("KL_OVRP_UNIFY_FRUSTUM", -1);
+    if (on < 0) on = kl_ovrp_multiview();
+    if (!on) return g_eye_tan[eye];
+    for (int i = 0; i < 4; i++)
+        u[0][i] = u[1][i] =
+            g_eye_tan[0][i] > g_eye_tan[1][i] ? g_eye_tan[0][i] : g_eye_tan[1][i];
+    // Said once, and said with the numbers: a frustum that is silently widened
+    // is indistinguishable from one that was measured that way, and the eye
+    // texture's pixel budget moved with it.
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [ovrp] multiview: both eyes told ONE frustum "
+                        "l=%.4f r=%.4f t=%.4f b=%.4f (the union — this guest "
+                        "renders one cone for both views; KL_OVRP_UNIFY_FRUSTUM=0 "
+                        "restores the per-eye cones)\n",
+                (double)u[0][0], (double)u[0][1], (double)u[0][2], (double)u[0][3]);
+    return u[eye];
+}
+
 // The head->eye offsets, head-local metres, and the guest's whole source of
 // stereo separation — see kl_ovrp.h. Zero is the historical host behaviour and
 // stays the default; the visionOS compositor pushes the display's own numbers.
@@ -806,6 +950,27 @@ static uint64_t klovrp_GetUserIPD2(float *out) {
     return OVRP_SUCCESS;
 }
 
+// ...and the un-suffixed form, which is trap 10b's pair shape once more:
+// `float ovrp_GetUserIPD(void)`, the value in s0 and no arguments at all.
+//
+// The real 0x1309c0 is a WRAPPER around the 2-form — it stack-allocates a float,
+// pre-zeroes it, calls ovrp_GetUserIPD2, and `fcsel`s between 0.0f and the
+// written slot on `w0 < 0`. So it is not an independent measurement and must not
+// be implemented as one; answering it from anywhere but klovrp_GetUserIPD2 is a
+// stereo separation that can disagree with the one the eyes are rendered with.
+//
+// BONELAB is the first guest to call it: it comes from managed code (the C#
+// `OVRP_1_3_0.ovrp_GetUserIPD` binding), where the return convention is the
+// whole contract — return OVRP_SUCCESS's 0 here by mistake and Unity gets an IPD
+// of 0.0 rather than an error, which is SL-12's finding one API over: zero is
+// read as "the eyes coincide", not as "nobody answered".
+static float klovrp_GetUserIPD(void) {
+    ovrp_hit("ovrp_GetUserIPD");
+    float ipd = 0.0f;
+    if ((int64_t)klovrp_GetUserIPD2(&ipd) < 0) return 0.0f;
+    return ipd;
+}
+
 // Fills four f32 fov tangents at out+0x08..+0x14 (0x9bcbd4). libunity divides
 // by their max for the aspect, so 0 is not survivable.
 //
@@ -824,10 +989,25 @@ static uint64_t klovrp_GetUserIPD2(float *out) {
 // the struct layout and this transposition.
 static uint64_t klovrp_GetNodeFrustum2(int node, void *out) {
     ovrp_hit("ovrp_GetNodeFrustum2");
+    // WHICH node the guest asks about, once per (node, caller).
+    //
+    // The fallback below is only "true enough to be honest" while the display is
+    // near-symmetric, and Vision Pro's is not: its per-eye tangents are mirror
+    // images (l=1.732/r=1.000 against l=1.000/r=1.732), so the optical axis sits
+    // at 63.4% of the width in one eye and 36.6% in the other. A guest that asks
+    // about EyeCenter — or about anything that is not exactly node 1 — is
+    // therefore handed the LEFT eye's cone for both eyes, renders one picture,
+    // and the composite then places it on two quads built from two different
+    // asymmetric frusta. Measured on BONELAB: the two eye images differ by 0.4%
+    // of the width where honouring the frusta would make it 26.8%.
+    //
+    // None of that has an error surface — every call returns success — so the
+    // node number is the one thing worth naming.
+    ovrp_log_arg("ovrp_GetNodeFrustum2", node, __builtin_return_address(0));
     // Nodes 0/1 are EyeLeft/EyeRight; anything else asking about a frustum
     // (EyeCenter, Head) gets the left eye's, which is what a symmetric or
     // near-symmetric display makes true enough to be honest.
-    const float *t = g_eye_tan[node == 1 ? 1 : 0];
+    const float *t = klovrp_eye_tan(node == 1 ? 1 : 0);
     float *f = (float *)out;
     f[2] = t[2];    // UpTan    <- top
     f[3] = t[3];    // DownTan  <- bottom
@@ -1213,7 +1393,7 @@ void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz,
     if (pz) *pz = head.pz + oz;
     if (qx) *qx = e.qx; if (qy) *qy = e.qy;
     if (qz) *qz = e.qz; if (qw) *qw = e.qw;
-    if (tangents) memcpy(tangents, g_eye_tan[eye], sizeof g_eye_tan[eye]);
+    if (tangents) memcpy(tangents, klovrp_eye_tan(eye), sizeof g_eye_tan[eye]);
 }
 
 // The guest's head — the latched one. See the header for why this is a
@@ -1386,6 +1566,13 @@ static struct {
     // read-while-writing race it exists to remove is still there.
     uint64_t            filed[KLOVRP_MAX_STAGES];
     uint64_t            guessed;
+    // Frames filed on the stage the GUEST named in its submit, and how many of
+    // those the frame counter would have put somewhere else. The second number
+    // is the whole justification for reading the submit at all: if it is 0 the
+    // counter was right all along, and if it is large every compositor frame on
+    // the Vulkan path was sampling the wrong stage before this existed.
+    uint64_t            named;
+    uint64_t            named_disagree;
     uint64_t            serial;         // frames begun
     int                 last_complete;  // stage of the last completed frame, -1 = none
     pthread_mutex_t     mu;
@@ -1485,7 +1672,11 @@ static uint64_t klovrp_begin_frame_impl(int guest_frame_index) {
     // compositor, because a frontend may push a new one at any time: a picture
     // rendered with the old field of view must keep being placed with the old
     // field of view, or it is resized by a change that happened after it.
-    memcpy(r->tangents, g_eye_tan, sizeof r->tangents);
+    // Through klovrp_eye_tan, NOT g_eye_tan: this is what the composite
+    // builds its quad from, so it has to be the frustum the guest was
+    // actually told to render with, unified or not.
+    for (int e = 0; e < 2; e++)
+        memcpy(r->tangents[e], klovrp_eye_tan(e), sizeof r->tangents[e]);
     // Cleared, not carried: the render viewport is a per-frame statement the
     // guest makes at EndFrame4, and a rect left over from the previous frame
     // would keep cropping after the guest stopped asking for it. Zero reads as
@@ -1555,8 +1746,19 @@ static int klovrp_submit_stage(const void *layer_submits, int count);
 // `viewport_of` is the texture size those rects are relative to, and travels
 // with them for the reason kl_ovrp.h gives: separately they can drift, and the
 // drift is a wrong picture with nothing reporting it.
+//
+// `named_stage` is the stage the guest itself said it drew into — the
+// `TextureStage` field of the eye layer's submit — or -1 where there is no
+// submit list to read it from. It sits between the GL observation and the frame
+// counter in the ordering below, and it exists because on the VULKAN path the
+// observation cannot work at all: kl_glfb watches GL framebuffer attachments and
+// a Vulkan guest makes none, so every frame would fall through to
+// `serial % stages`. That counter is measurably wrong on the XR-SDK display
+// provider (8786 disagreements in a 9000-frame 1.40 run, see EndFrame4), and a
+// compositor keyed on kl_ovrp_last_complete_stage() would then sample the stage
+// the guest is drawing into NEXT — a torn picture with every counter healthy.
 static uint64_t klovrp_end_frame_impl(int guest_frame_index, const int *viewports,
-                                      const int *viewport_of) {
+                                      const int *viewport_of, int named_stage) {
     // Close the observation window opened at BeginFrame. `observed` is still
     // the sticky answer; `mask`/`binds` are what say whether it belongs to this
     // frame, and they are the difference between an association that is known
@@ -1658,13 +1860,21 @@ static uint64_t klovrp_end_frame_impl(int guest_frame_index, const int *viewport
         //   the window saw exactly one stage      — measured, this frame's
         //   the window saw several                — measured but ambiguous, take
         //                                           the last and count it
-        //   the observation has never worked      — the counter, as before
+        //   the guest NAMED one in its submit     — its own assertion, and the
+        //                                           only answer available on a
+        //                                           Vulkan guest
+        //   nothing above                         — the counter, as before
         int stage;
         if (binds && nstages == 1)
             stage = __builtin_ctz(mask);
         else if (binds && observed >= 0 && observed < stages)
             stage = observed;
-        else
+        else if (named_stage >= 0 && named_stage < stages) {
+            stage = named_stage;
+            g_frames.named++;
+            if (named_stage != (int)((g_frames.serial - 1) % (unsigned)stages))
+                g_frames.named_disagree++;
+        } else
             stage = (int)((g_frames.serial - 1) % (unsigned)stages);
         g_frames.pending.stage = stage;
         g_frames.pending.complete = 1;
@@ -1724,7 +1934,7 @@ static uint64_t klovrp_EndFrame(int guest_frame_index) {
     // No layer list on this path — 1.28's legacy VRDevice hands its eye
     // textures down through ovrp_SetupEyeTexture2 and never describes a layer,
     // so it can only ever have rendered into the whole thing.
-    return klovrp_end_frame_impl(guest_frame_index, NULL, NULL);
+    return klovrp_end_frame_impl(guest_frame_index, NULL, NULL, -1);
 }
 
 // ovrp_EndFrame4(frameIndex, layerSubmits, layerSubmitCount, sync) — the 1.40
@@ -1755,21 +1965,30 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
     if (!layer_submits && layer_submit_count) return OVRP_FAIL_INVALID_PARAM;
     int vp[8], of[2] = { 0, 0 };
     int have = klovrp_submit_viewports(layer_submits, layer_submit_count, vp, of);
+    // The guest's own answer to "which stage did I just draw?", at submit+0x04.
+    // -1 when there is no eye layer in the list to read it from, which is a
+    // different thing from stage 0 and has to stay distinguishable — the frame
+    // record's fallback ladder tests it (klovrp_end_frame_impl).
+    int named = klovrp_submit_stage(layer_submits, layer_submit_count);
     uint64_t r = klovrp_end_frame_impl(guest_frame_index, have ? vp : NULL,
-                                       have ? of : NULL);
+                                       have ? of : NULL, named);
 
     // BONELAB / the Vulkan path: this call IS the guest's assertion that it has
-    // finished drawing the eye textures, so it is where they can be read back.
+    // finished drawing the eye textures, so it is where they can be read back
+    // and where a compositor is told the picture is ready.
     //
-    // The stage comes out of the submit the guest handed us rather than from
+    // The stage comes out of the submit rather than from
     // kl_ovrp_last_complete_stage(), and that is not a shortcut — the latter is
     // derived from GL draw observation (kl_glfb_render_stages), which sees
-    // nothing at all on a Vulkan guest and would answer -1 forever. The guest
-    // NAMES the stage it drew, at submit+0x04.
+    // nothing at all on a Vulkan guest.
     if (kl_vulkan_guest_active()) {
         static unsigned vk_frame;
-        kl_vulkan_capture_eyes(vk_frame++,
-                               klovrp_submit_stage(layer_submits, layer_submit_count));
+        kl_vulkan_capture_eyes(vk_frame++, named < 0 ? 0 : named);
+        // After the capture, not before: the capture's own submit is work on
+        // the same queue, and a compositor let loose between the two would race
+        // it. Ordinary runs write no captures at all, so this is the only
+        // frame-completion point either way.
+        kl_vulkan_frame_done(named < 0 ? 0 : named);
     }
     return r;
 }
@@ -1822,7 +2041,11 @@ void kl_ovrp_frame_begin_external(void) {
     kl_ovrp_render_pose *r = &g_frames.pending;
     r->px = h.px; r->py = h.py; r->pz = h.pz;
     r->qx = h.qx; r->qy = h.qy; r->qz = h.qz; r->qw = h.qw;
-    memcpy(r->tangents, g_eye_tan, sizeof r->tangents);
+    // Through klovrp_eye_tan, NOT g_eye_tan: this is what the composite
+    // builds its quad from, so it has to be the frustum the guest was
+    // actually told to render with, unified or not.
+    for (int e = 0; e < 2; e++)
+        memcpy(r->tangents[e], klovrp_eye_tan(e), sizeof r->tangents[e]);
     r->serial = s;
     r->stage = -1;
     r->complete = 0;
@@ -3256,16 +3479,20 @@ _Static_assert(sizeof(ovrp_recti) == 0x10, "recti");
 // The eye layer's texture stage, straight out of the submit. Only the EYE layer
 // is consulted — an overlay submit carries its own unrelated stage, and picking
 // the wrong one would read back a texture the guest never drew this frame.
+// -1 for "the guest named no eye layer", which is NOT the same as stage 0 — a
+// caller that cannot tell them apart files every unnamed frame against stage 0
+// and the picture is one stage stale forever. Both callers make the distinction
+// explicitly.
 static int klovrp_submit_stage(const void *layer_submits, int count) {
     const ovrp_layer_submit *const *list = layer_submits;
-    if (!list || count <= 0) return 0;
+    if (!list || count <= 0) return -1;
     for (int i = 0; i < count; i++) {
         const ovrp_layer_submit *s = list[i];
         if (!s) continue;
         struct klovrp_layer *l = klovrp_layer(s->layer_id);
         if (l && l->is_eye) return s->texture_stage;
     }
-    return 0;
+    return -1;
 }
 
 static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[8],
@@ -3344,8 +3571,8 @@ static void klovrp_fill_eye_desc(ovrp_layer_desc_eyefov *d, int layout,
         // g_eye_tan is {left, right, top, bottom}; ovrpFovf is {up, down, left,
         // right}. Transposing these is a silently wrong frustum, so it happens
         // in exactly one place.
-        d->fov[eye] = (ovrp_fovf){ g_eye_tan[eye][2], g_eye_tan[eye][3],
-                                   g_eye_tan[eye][0], g_eye_tan[eye][1] };
+        const float *et = klovrp_eye_tan(eye);
+        d->fov[eye] = (ovrp_fovf){ et[2], et[3], et[0], et[1] };
         d->visible_rect[eye] = (ovrp_rectf){ 0.0f, 0.0f, 1.0f, 1.0f };
     }
     d->max_viewport_size = d->texture_size;
@@ -3586,14 +3813,21 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
     if (!l) return OVRP_FAIL_INVALID_PARAM;
     if ((unsigned)stage >= KLOVRP_MAX_STAGES || (unsigned)eye > 1)
         return OVRP_FAIL_INVALID_PARAM;
-    // One texture per (stage, eye) is the Stereo layout and nothing else. Under
-    // ovrpLayout_Array the two eyes are SLICES of one array texture, and handing
-    // back two separate 2D names there would be accepted, wired up, and render
-    // to the wrong storage with no error anywhere — so it is refused by name
-    // instead. This title asks for Stereo (measured: layout=0), and
-    // ovrp_GetEyeTextureArraySupported already answers false, which is what the
-    // guest should be reading before it ever gets here.
-    if (l->is_eye && l->desc.layout != KLOVRP_LAYOUT_STEREO) {
+    // One texture per (stage, eye) is the Stereo layout. Under ovrpLayout_Array
+    // the two eyes are SLICES of one array texture, and handing back two
+    // separate 2D names there would be accepted, wired up, and render to the
+    // wrong storage with no error anywhere.
+    //
+    // The Array layout is served on the VULKAN path only (the branch below
+    // makes a two-layer VkImage and gives both eyes the same handle) and
+    // refused by name everywhere else, because the GL gateway has no multiview
+    // to render it with. A guest only reaches here asking for Array if
+    // kl_ovrp_multiview() said yes, so a refusal here would be the two answers
+    // disagreeing — it is kept as the guard for exactly that.
+    if (l->is_eye && l->desc.layout == KLOVRP_LAYOUT_ARRAY &&
+        kl_vulkan_guest_active() && kl_ovrp_multiview()) {
+        /* served below */
+    } else if (l->is_eye && l->desc.layout != KLOVRP_LAYOUT_STEREO) {
         static int said;
         if (!said) {
             said = 1;
@@ -3633,8 +3867,13 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
         const char *fname = NULL;
         uint32_t glfmt = klovrp_gl_format(l->desc.format, &fname);
         int srgb = (glfmt == 0x8C43);              // GL_SRGB8_ALPHA8
+        // Array layout: ONE image for the stage with a layer per eye, and both
+        // eyes get the same handle. Unity addresses the eye with
+        // renderParams[].textureArraySlice, which is the provider's business
+        // and not ours.
+        int layers = (l->desc.layout == KLOVRP_LAYOUT_ARRAY) ? 2 : 1;
         unsigned long long img =
-            kl_vulkan_eye_image(stage, eye, (unsigned)w, (unsigned)h, srgb);
+            kl_vulkan_eye_image_layers(stage, eye, (unsigned)w, (unsigned)h, srgb, layers);
         if (!img) {
             fprintf(stderr, "  [ovrp] GetLayerTexture2(layer %d stage %d eye %d): "
                             "no VkImage — the guest is on Vulkan and the eye "
@@ -3644,8 +3883,9 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
         }
         *color = img;
         fprintf(stderr, "  [ovrp] GetLayerTexture2: eye %d stage %d = VkImage %#llx "
-                        "(%dx%d %s)\n", eye, stage, img, w, h,
-                fname ? fname : "?");
+                        "(%dx%d %s%s)\n", eye, stage, img, w, h,
+                fname ? fname : "?",
+                layers > 1 ? ", array slice — both eyes share this image" : "");
         return OVRP_SUCCESS;
     }
 
@@ -4214,6 +4454,9 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetFoveationEyeTrackedSupported",
      (void *)klovrp_GetFoveationEyeTrackedSupported},
     {"ovrp_GetSystemMultiViewSupported2", (void *)klovrp_GetSystemMultiViewSupported2},
+    {"ovrp_GetSystemMultiViewSupported",  (void *)klovrp_GetSystemMultiViewSupported},
+    {"ovrp_GetEyeTextureArraySupported2", (void *)klovrp_GetEyeTextureArraySupported2},
+    {"ovrp_GetEyeTextureArraySupported",  (void *)klovrp_GetEyeTextureArraySupported},
     {"ovrp_GetBoundaryConfigured2", (void *)klovrp_GetBoundaryConfigured2},
     {"ovrp_GetAppHasVrFocus2", (void *)klovrp_GetAppHasVrFocus2},
     {"ovrp_GetUserPresent2", (void *)klovrp_GetUserPresent2},
@@ -4265,6 +4508,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_EndFrame4", (void *)klovrp_EndFrame4},
     {"ovrp_Update3", (void *)klovrp_Update3},
     {"ovrp_GetUserIPD2", (void *)klovrp_GetUserIPD2},
+    {"ovrp_GetUserIPD", (void *)klovrp_GetUserIPD},
     {"ovrp_GetAppCpuStartToGpuEndTime2", (void *)klovrp_GetAppCpuStartToGpuEndTime2},
     {"ovrp_GetAdaptiveGpuPerformanceScale2", (void *)klovrp_GetAdaptiveGpuPerformanceScale2},
     {"ovrp_IsPerfMetricsSupported", (void *)klovrp_IsPerfMetricsSupported},
@@ -4490,9 +4734,11 @@ static const char *const g_ovrp_bool_no[] = {
     // recenter; quit/recreate tear things down).
     "ovrp_GetAppShouldRecenter", "ovrp_GetAppShouldQuit",
     "ovrp_GetAppShouldRecreateDistortionWindow",
-    // Capabilities we do not have: no eye texture arrays, no multiview in
-    // our GL gateway, no preview-rect override (return 0 = skip, 0x9bcf9c).
-    "ovrp_GetEyeTextureArraySupported", "ovrp_GetSystemMultiViewSupported",
+    // No preview-rect override (return 0 = skip, 0x9bcf9c).
+    // ovrp_GetEyeTextureArraySupported / ovrp_GetSystemMultiViewSupported used
+    // to live here as a flat no. They are answers now, not constants — see
+    // kl_ovrp_multiview() — because on the Vulkan path the honest answer can be
+    // yes, and a constant here would have contradicted the 2-forms.
     "ovrp_GetEyePreviewRect",
     // No Guardian here — bool return (real plugin maps failure to false).
     "ovrp_GetBoundaryGeometry2",
@@ -4591,6 +4837,7 @@ void kl_ovrp_report(FILE *f) {
     uint64_t serial = g_frames.serial, guessed = g_frames.guessed;
     uint64_t unobserved = g_frames.unobserved, multi = g_frames.multi;
     uint64_t cross = g_frames.cross_thread, disagree = g_frames.stage_disagree;
+    uint64_t named = g_frames.named, named_dis = g_frames.named_disagree;
     uint64_t filed[KLOVRP_MAX_STAGES];
     memcpy(filed, g_frames.filed, sizeof filed);
     pthread_mutex_unlock(&g_frames.mu);
@@ -4603,6 +4850,16 @@ void kl_ovrp_report(FILE *f) {
                    "%llu where the guest's frame index disagreed)\n",
                 (unsigned long long)serial, (unsigned long long)guessed,
                 (unsigned long long)disagree);
+        // The submit-named stage, and whether it was worth reading. On a Vulkan
+        // guest this is the ONLY thing that can say which stage holds a
+        // finished picture — the GL observation sees nothing there — so a large
+        // disagreement here is a compositor that was reading the stage the
+        // guest is drawing into next.
+        if (named)
+            fprintf(f, "  ...of which %llu took the stage the guest NAMED in its "
+                       "submit, %llu of them differing from the frame counter%s\n",
+                    (unsigned long long)named, (unsigned long long)named_dis,
+                    named_dis ? "  <-- the counter would have been wrong there" : "");
         // What the GL side saw, independently of any of the bookkeeping above.
         // A stage whose draw count stops climbing is a frozen picture, and that
         // is a different bug from a mis-filed pose even though both look like

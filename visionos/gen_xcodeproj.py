@@ -121,6 +121,18 @@ ENTITLEMENTS_SETTING = (f"\t\t\t\tCODE_SIGN_ENTITLEMENTS = {ENTITLEMENTS_FILE};\
                         if ENTITLEMENTS else "")
 GUEST = KLT["libs"].split()
 ANGLE = ["ANGLE_libEGL", "ANGLE_libGLESv2"]
+# ...and the OTHER renderer, for a guest whose graphics API is Vulkan (BONELAB).
+# Same treatment as ANGLE for the same reasons: one driver for every guest that
+# asks, dlopened by path at runtime (runtime/kl_vulkan.c), and 4.6 MB a slice —
+# so making it per-target would cost a table row to save less than the row.
+#
+# OPTIONAL, unlike ANGLE, and that is the only difference: MoltenVK is a
+# vendored prebuilt (`make mvk`) that a bare checkout does not have, and three of
+# the four targets never ask for Vulkan. Absent, kl_vulkan.c's __has_include stub
+# refuses BY NAME, which is the right answer for those three; making it mandatory
+# would stop everyone's build for a dependency most targets do not use.
+MVK = ["MoltenVK"] if os.path.isdir(
+    os.path.join(HERE, "Frameworks", "MoltenVK.xcframework")) else []
 # Where each set is staged on the SOURCE side. The guest's is per-target so the
 # two apps do not overwrite each other's translations in place; ANGLE's is not,
 # because it is the same renderer for every guest. Inside the built .app both
@@ -130,7 +142,7 @@ ANGLE_DIR = "Frameworks"
 # Both sets are embedded-not-linked, so the pbxproj treatment is identical and
 # the generator stays data-driven — the two lists differ only in what a missing
 # one means, which is why main() reports them separately.
-EMBED = GUEST + ANGLE
+EMBED = GUEST + ANGLE + MVK
 
 
 def detect_team():
@@ -509,6 +521,11 @@ def main():
     print(f"  PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID}")
     print(f"  embedded guest frameworks: {', '.join(GUEST)}")
     print(f"  embedded ANGLE:            {', '.join(ANGLE)}")
+    # Named either way. An absent MoltenVK is legitimate for three of the four
+    # targets and fatal for the fourth, and the difference is invisible until a
+    # Vulkan guest is on a headset — so the build says which one it made.
+    print(f"  embedded MoltenVK:         "
+          + (', '.join(MVK) if MVK else "(none - run 'make mvk' for a Vulkan guest)"))
     return 0
 
 
