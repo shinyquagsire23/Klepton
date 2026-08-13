@@ -57,6 +57,16 @@ answers GL and kl_glfb never initializes.
 - `KL_GLFB=1` — enable the one-eye reference renderer on ANGLE/Metal.
   Host-only; it exists to produce the known-good frame a real backend gets
   diffed against.
+- `KL_EGL_TRACE=1` — log every EGL entry point the guest actually REACHES, in
+  order, with the interesting arguments. A census, not a diagnostic: it says
+  nothing about what we answered. It exists because every EGL symbol binds at
+  LOAD time (libEGL.so is a DT_NEEDED of libunity), so "resolved" says nothing
+  about "called" — and a guest that fails a graphics capability check *before*
+  it touches EGL is otherwise indistinguishable from one whose call we answered
+  wrongly. That is how BONELAB's renderer was identified: Beat Saber's per-API
+  probe runs `eglChooseConfig` -> `eglCreateContext` (GLES 3) ->
+  `eglDestroyContext`, and BONELAB's stops after `eglInitialize` because the
+  only API in its list is Vulkan (`notes/BONELAB.md`).
 - `KL_ANGLE_DIR=<dir>` — where to load `libEGL.dylib`/`libGLESv2.dylib` from.
   Default: `vendor/out/Debug` when its libEGL is present, else Google Chrome's
   framework Libraries dir. Also read by spikes s09, s10, s11.

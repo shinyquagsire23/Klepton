@@ -28,6 +28,7 @@
 #include <string.h>
 #include <zlib.h>
 #include "klepton.h"
+#include "kl_env.h"
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_glfb.h"
@@ -1006,9 +1007,35 @@ static int gl_is_void(const char *name) {
 }
 
 // ---------- EGL ----------
-static EGLDisplay klegl_GetDisplay(void *native) { (void)native; return DISPLAY; }
+// ---------- KL_EGL_TRACE: which entry points the guest actually REACHES ----------
+//
+// There was no way to see this, and the gap has a shape: every EGL symbol binds
+// at LOAD time (libEGL.so is a DT_NEEDED of libunity), so "resolved" says
+// nothing about "called" — and a guest that fails a capability check *before*
+// it ever calls EGL is indistinguishable, from every log this project prints,
+// from a guest whose call we answered wrongly. BONELAB's `gles-api-check` is
+// exactly that question, and reasoning about it from the disassembly is how an
+// afternoon goes.
+//
+// Off by default; it is a census, not a diagnostic, so it prints the call and
+// its interesting arguments and nothing about what we decided.
+static int klegl_tracing(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_EGL_TRACE", 0);
+    return on;
+}
+#define KLEGL_TRACE(...) do { if (klegl_tracing()) { \
+        fprintf(stderr, "  [egl] "); fprintf(stderr, __VA_ARGS__); \
+        fputc('\n', stderr); fflush(stderr); } } while (0)
+
+static EGLDisplay klegl_GetDisplay(void *native) {
+    (void)native;
+    KLEGL_TRACE("eglGetDisplay(%p) -> %p", native, (void *)DISPLAY);
+    return DISPLAY;
+}
 
 static unsigned klegl_Initialize(EGLDisplay dpy, int32_t *major, int32_t *minor) {
+    KLEGL_TRACE("eglInitialize(%p)", (void *)dpy);
     if (dpy != DISPLAY) { g_error = EGL_BAD_DISPLAY; return EGL_FALSE; }
     g_display.initialised = 1;
     if (major) *major = 1;
@@ -1022,6 +1049,7 @@ static unsigned klegl_Terminate(EGLDisplay dpy) {
 
 static const char *klegl_QueryString(EGLDisplay dpy, int32_t name) {
     (void)dpy;
+    KLEGL_TRACE("eglQueryString(%#x)", name);
     switch (name) {
     case EGL_VENDOR:  return "Klepton";
     case EGL_VERSION: return "1.5 Klepton";
@@ -1038,6 +1066,7 @@ static const char *klegl_QueryString(EGLDisplay dpy, int32_t name) {
 static unsigned klegl_ChooseConfig(EGLDisplay dpy, const int32_t *attribs,
                                    EGLConfig *configs, int32_t size, int32_t *num) {
     (void)dpy;
+    KLEGL_TRACE("eglChooseConfig(size=%d)", size);
     // The attribute list is honoured only far enough to be self-consistent:
     // report the MSAA config when samples were asked for, otherwise the plain
     // one. Unity re-queries everything it cares about with eglGetConfigAttrib.
@@ -1061,6 +1090,7 @@ static unsigned klegl_ChooseConfig(EGLDisplay dpy, const int32_t *attribs,
 // must not be confused with a zero-sized buffer.
 static unsigned klegl_GetConfigs(EGLDisplay dpy, EGLConfig *configs,
                                  int32_t size, int32_t *num) {
+    KLEGL_TRACE("eglGetConfigs");
     (void)dpy;
     if (!num) { g_error = EGL_BAD_PARAMETER; return EGL_FALSE; }
     if (!configs) { *num = NCONFIGS; return EGL_TRUE; }
@@ -1072,6 +1102,7 @@ static unsigned klegl_GetConfigs(EGLDisplay dpy, EGLConfig *configs,
 
 static unsigned klegl_GetConfigAttrib(EGLDisplay dpy, EGLConfig cfg,
                                       int32_t attr, int32_t *value) {
+    KLEGL_TRACE("eglGetConfigAttrib");
     (void)dpy;
     if (!value) { g_error = EGL_BAD_PARAMETER; return EGL_FALSE; }
     const typeof(g_configs[0]) *c = cfg ? (const typeof(g_configs[0]) *)cfg : &g_configs[0];
@@ -1124,6 +1155,7 @@ static EGLSurface new_surface(int32_t w, int32_t h, int pbuffer) {
 
 static EGLSurface klegl_CreateWindowSurface(EGLDisplay dpy, EGLConfig cfg,
                                             void *win, const int32_t *attribs) {
+    KLEGL_TRACE("eglCreateWindowSurface");
     (void)dpy; (void)cfg; (void)attribs;
     int32_t w, h;
     kl_ndk_window_size(win, &w, &h);   // the size Unity will build its target from
@@ -1143,6 +1175,7 @@ static EGLSurface klegl_CreateWindowSurface(EGLDisplay dpy, EGLConfig cfg,
 
 static EGLSurface klegl_CreatePbufferSurface(EGLDisplay dpy, EGLConfig cfg,
                                              const int32_t *attribs) {
+    KLEGL_TRACE("eglCreatePbufferSurface");
     (void)dpy; (void)cfg;
     int32_t w = 1, h = 1;
     for (const int32_t *a = attribs; a && *a != EGL_NONE; a += 2) {
@@ -1153,11 +1186,13 @@ static EGLSurface klegl_CreatePbufferSurface(EGLDisplay dpy, EGLConfig cfg,
 }
 
 static unsigned klegl_DestroySurface(EGLDisplay dpy, EGLSurface s) {
+    KLEGL_TRACE("eglDestroySurface");
     (void)dpy; (void)s; return EGL_TRUE;      // storage is never reclaimed
 }
 
 static unsigned klegl_QuerySurface(EGLDisplay dpy, EGLSurface surf,
                                    int32_t attr, int32_t *value) {
+    KLEGL_TRACE("eglQuerySurface");
     (void)dpy;
     const kl_egl_surface *s = (const kl_egl_surface *)surf;
     if (!s || !value) { g_error = EGL_BAD_PARAMETER; return EGL_FALSE; }
@@ -1173,8 +1208,40 @@ static unsigned klegl_QuerySurface(EGLDisplay dpy, EGLSurface surf,
     return EGL_TRUE;
 }
 
+// eglSurfaceAttrib — the setter whose getter is right above. BONELAB's libunity
+// imports it (it was the only unresolved EGL name in that guest), and an
+// unresolved import is an abort BY NAME the first time it is called, so a guest
+// that merely states a preference about its back buffer would have died in it.
+//
+// EGL_SWAP_BEHAVIOR is the one that carries meaning here and it is ACCEPTED
+// rather than acted on: our surfaces are destroyed-on-swap already, which is
+// what klegl_QuerySurface has always answered, so a guest asking for that is
+// asking for what it has. Asking to PRESERVE the buffer is refused rather than
+// silently agreed with — that is a promise about contents surviving a swap, and
+// nothing here keeps it.
+static unsigned klegl_SurfaceAttrib(EGLDisplay dpy, EGLSurface surf,
+                                    int32_t attr, int32_t value) {
+    KLEGL_TRACE("eglSurfaceAttrib(%#x, %d)", attr, value);
+    (void)dpy;
+    if (!surf) { g_error = EGL_BAD_PARAMETER; return EGL_FALSE; }
+    switch (attr) {
+    case EGL_SWAP_BEHAVIOR:
+        if (value == EGL_BUFFER_DESTROYED) return EGL_TRUE;
+        fprintf(stderr, "  [egl] eglSurfaceAttrib: EGL_SWAP_BEHAVIOR %#x is not "
+                        "EGL_BUFFER_DESTROYED — refusing rather than promising "
+                        "the back buffer survives a swap\n", value);
+        g_error = 0x3004 /* EGL_BAD_ATTRIBUTE */;
+        return EGL_FALSE;
+    default:
+        fprintf(stderr, "  [egl] eglSurfaceAttrib: unhandled attribute 0x%x\n", attr);
+        g_error = 0x3004;
+        return EGL_FALSE;
+    }
+}
+
 static EGLContext klegl_CreateContext(EGLDisplay dpy, EGLConfig cfg,
                                       EGLContext share, const int32_t *attribs) {
+    KLEGL_TRACE("eglCreateContext");
     (void)dpy; (void)cfg; (void)share;
     if (g_nctx >= sizeof g_contexts / sizeof g_contexts[0]) return NULL;
     kl_egl_context *c = &g_contexts[g_nctx++];
@@ -1186,11 +1253,13 @@ static EGLContext klegl_CreateContext(EGLDisplay dpy, EGLConfig cfg,
 }
 
 static unsigned klegl_DestroyContext(EGLDisplay dpy, EGLContext c) {
+    KLEGL_TRACE("eglDestroyContext");
     (void)dpy; if (c == g_current) g_current = NULL; return EGL_TRUE;
 }
 
 static unsigned klegl_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
                                   EGLSurface read, EGLContext ctx) {
+    KLEGL_TRACE("eglMakeCurrent");
     (void)dpy; g_draw = draw; g_read = read; g_current = ctx;
     // Whichever thread this is, it is the one that will now issue GL — or, when
     // the guest releases the context (NULL), the one giving it up; migration
@@ -1202,8 +1271,10 @@ static unsigned klegl_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
     return EGL_TRUE;
 }
 
-static EGLContext klegl_GetCurrentContext(void) { return g_current; }
+static EGLContext klegl_GetCurrentContext(void) {
+    KLEGL_TRACE("eglGetCurrentContext"); return g_current; }
 static EGLDisplay klegl_GetCurrentDisplay(void) {
+    KLEGL_TRACE("eglGetCurrentDisplay");
     // The EGL 1.5 companion to the two above: the display for the current
     // context, or EGL_NO_DISPLAY when nothing is current — that is the spec's
     // answer for a thread with no context, and it is what 1.40's
@@ -1211,6 +1282,7 @@ static EGLDisplay klegl_GetCurrentDisplay(void) {
     return g_current ? DISPLAY : (EGLDisplay)0;   /* EGL_NO_DISPLAY */
 }
 static EGLSurface klegl_GetCurrentSurface(int32_t which) {
+    KLEGL_TRACE("eglGetCurrentSurface");
     return which == EGL_READ ? g_read : g_draw;
 }
 
@@ -1223,6 +1295,7 @@ static EGLSurface klegl_GetCurrentSurface(int32_t which) {
 unsigned long kl_egl_swap_count(void) { return g_frames; }
 
 static unsigned klegl_SwapBuffers(EGLDisplay dpy, EGLSurface s) {
+    KLEGL_TRACE("eglSwapBuffers");
     (void)dpy; (void)s;
     g_frames++;
     // The GL object census, on the frame clock: a class whose live count climbs
@@ -1247,6 +1320,7 @@ static unsigned klegl_SwapBuffers(EGLDisplay dpy, EGLSurface s) {
 }
 
 static unsigned klegl_SwapInterval(EGLDisplay dpy, int32_t interval) {
+    KLEGL_TRACE("eglSwapInterval");
     (void)dpy; (void)interval; return EGL_TRUE;
 }
 
@@ -1266,6 +1340,7 @@ static unsigned klegl_SwapInterval(EGLDisplay dpy, int32_t interval) {
 // not recognise has no pixels we could ever find — so answer NULL rather than
 // let it reach eglCreateImageKHR as something that looks valid.
 static void *klegl_GetNativeClientBufferANDROID(void *ahb) {
+    KLEGL_TRACE("eglGetNativeClientBufferANDROID");
     if (!kl_mediandk_buffer_pixels(ahb)) {
         fprintf(stderr, "  [egl] eglGetNativeClientBufferANDROID(%p): not one of our "
                         "AHardwareBuffers — nothing else allocates them here\n", ahb);
@@ -1277,6 +1352,7 @@ static void *klegl_GetNativeClientBufferANDROID(void *ahb) {
 
 static void *klegl_CreateImageKHR(EGLDisplay dpy, void *ctx, uint32_t target,
                                   void *buffer, const int32_t *attrs) {
+    KLEGL_TRACE("eglCreateImageKHR");
     (void)dpy; (void)ctx;
     if (target != EGL_NATIVE_BUFFER_ANDROID) {
         fprintf(stderr, "  [egl] eglCreateImageKHR target 0x%x is not "
@@ -1311,6 +1387,7 @@ static void *klegl_CreateImageKHR(EGLDisplay dpy, void *ctx, uint32_t target,
 }
 
 static unsigned klegl_DestroyImageKHR(EGLDisplay dpy, void *image) {
+    KLEGL_TRACE("eglDestroyImageKHR");
     (void)dpy;
     if (!kl_glfb_is_image(image)) {
         fprintf(stderr, "  [egl] eglDestroyImageKHR(%p): not one of ours\n", image);
@@ -1328,6 +1405,7 @@ static unsigned klegl_DestroyImageKHR(EGLDisplay dpy, void *image) {
 // different API from proceeding as though it had got one.
 #define EGL_OPENGL_ES_API 0x30A0
 static unsigned klegl_BindAPI(unsigned api) {
+    KLEGL_TRACE("eglBindAPI");
     if (api == EGL_OPENGL_ES_API) return EGL_TRUE;
     fprintf(stderr, "  [egl] eglBindAPI(0x%x): only EGL_OPENGL_ES_API is served\n", api);
     g_error = EGL_BAD_PARAMETER;
@@ -1335,7 +1413,8 @@ static unsigned klegl_BindAPI(unsigned api) {
 }
 static unsigned klegl_QueryAPI(void) { return EGL_OPENGL_ES_API; }
 
-static int32_t klegl_GetError(void) { int e = g_error; g_error = EGL_SUCCESS; return e; }
+static int32_t klegl_GetError(void) {
+    KLEGL_TRACE("eglGetError"); int e = g_error; g_error = EGL_SUCCESS; return e; }
 
 // The gateway. Never fails, never aborts — see the header comment.
 void *kl_egl_sym(const char *name) {
@@ -1359,7 +1438,8 @@ void *kl_egl_sym(const char *name) {
     return kl_named_stub(name, (void *)klgl_called);
 }
 
-static void *klegl_GetProcAddress(const char *name) { return kl_egl_sym(name); }
+static void *klegl_GetProcAddress(const char *name) {
+    KLEGL_TRACE("eglGetProcAddress"); return kl_egl_sym(name); }
 
 // The second door. Unity does dlopen("libGLESv2.so") + dlsym rather than going
 // through eglGetProcAddress for the core entry points; a failed dlopen there
@@ -1435,6 +1515,7 @@ static const struct { const char *name; void *fn; } g_egl[] = {
     E("eglCreatePbufferSurface",klegl_CreatePbufferSurface),
     E("eglDestroySurface",      klegl_DestroySurface),
     E("eglQuerySurface",        klegl_QuerySurface),
+    E("eglSurfaceAttrib",       klegl_SurfaceAttrib),
     E("eglCreateContext",       klegl_CreateContext),
     E("eglDestroyContext",      klegl_DestroyContext),
     E("eglMakeCurrent",         klegl_MakeCurrent),

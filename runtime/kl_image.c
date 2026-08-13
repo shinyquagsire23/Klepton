@@ -70,8 +70,14 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 #define STB_WEAK 2
 
 struct kl_image {
-    uint8_t   *base;        // mapping base; ELF vaddr V lives at base + V
-    size_t     span;
+    uint8_t   *base;        // ELF vaddr V lives at base + V (V relative to the
+                            // lowest PT_LOAD); the load bias the guest sees
+    size_t     span;        // ...and the vaddr span, base to the last mapped byte
+    // Where `base` sits inside the mapping we actually asked the kernel for, and
+    // how big that mapping is. Nonzero map_off only for a guest whose p_align is
+    // finer than the host page — see choose_bias(). munmap needs both, since
+    // base is then not the address mmap returned.
+    size_t     map_off, map_size;
     Elf64_Sym *symtab;
     size_t     nsyms;       // from DT_HASH's nchain; 0 if the image had none
     const char *strtab;
@@ -667,61 +673,137 @@ int kl_can_load(const char *path) {
 // Anything left is a page that genuinely needs both, which no permission can
 // express. It fails by name rather than silently mis-protecting, because the
 // symptom on either side is a fault a long way from here.
-static int protect_pages(kl_image *img, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
-                         const Elf64_Shdr *sh, uint64_t lo) {
-    const uintptr_t pg = (uintptr_t)getpagesize();
-    const size_t npages = (img->span + pg - 1) / pg;
-    uint8_t *want = calloc(npages, 1);          // ELF PF_* bits, per host page
-    if (!want) { err("out of memory for %zu page protections", npages); return -1; }
+// How many host pages an image of `span` bytes placed `bias` into its mapping
+// covers, and which one a guest vaddr lands on. Both are here rather than
+// inline so the planner and the applier cannot disagree about the arithmetic.
+static size_t page_count(size_t span, size_t bias, uintptr_t pg) {
+    return (span + bias + pg - 1) / pg;
+}
+
+// Fill `want` — the ELF PF_* bits each host page needs, as the union of every
+// segment on it — and then resolve the unions that cannot be applied, by the
+// two rules above. Returns 0 if every page came out expressible, -1 otherwise;
+// on -1 `*bad_va` is the guest vaddr the first unresolvable page starts at.
+//
+// `want` may be NULL, which is the bias search asking whether a placement is
+// loadable at all rather than what its protections would be.
+static int plan_pages(const Elf64_Ehdr *eh, const Elf64_Phdr *ph, const Elf64_Shdr *sh,
+                      uint64_t lo, size_t span, size_t bias, uintptr_t pg,
+                      uint8_t *want, int64_t *bad_va) {
+    const size_t npages = page_count(span, bias, pg);
+    uint8_t *bits = want ? want : calloc(npages, 1);
+    if (!bits) return -1;
+    if (want) memset(want, 0, npages);
 
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD || !ph[i].p_memsz) continue;
-        size_t s = (size_t)((ph[i].p_vaddr - lo) / pg);
-        size_t e = (size_t)((ph[i].p_vaddr - lo + ph[i].p_memsz + pg - 1) / pg);
-        for (size_t p = s; p < e && p < npages; p++) want[p] |= (uint8_t)ph[i].p_flags;
+        size_t off = (size_t)(ph[i].p_vaddr - lo) + bias;
+        size_t s = off / pg, e = (off + (size_t)ph[i].p_memsz + pg - 1) / pg;
+        for (size_t p = s; p < e && p < npages; p++) bits[p] |= (uint8_t)ph[i].p_flags;
     }
 
+    int rc = 0;
     for (size_t p = 0; p < npages; p++) {
-        if ((want[p] & (PF_W | PF_X)) != (PF_W | PF_X)) continue;
-        uint64_t ps = lo + (uint64_t)p * pg, pe = ps + pg;
+        if ((bits[p] & (PF_W | PF_X)) != (PF_W | PF_X)) continue;
+        // Signed, because with a bias the first page starts BELOW the image's
+        // lowest vaddr — the bytes there are padding we own and nothing claims.
+        int64_t ps = (int64_t)lo + (int64_t)(p * pg) - (int64_t)bias;
+        int64_t pe = ps + (int64_t)pg;
 
         int has_code = 0;
         for (int i = 0; sh && i < eh->e_shnum; i++)
             if ((sh[i].sh_flags & SHF_EXECINSTR) && sh[i].sh_type != SHT_NOBITS
-                && sh[i].sh_addr < pe && sh[i].sh_addr + sh[i].sh_size > ps)
+                && (int64_t)sh[i].sh_addr < pe
+                && (int64_t)(sh[i].sh_addr + sh[i].sh_size) > ps)
                 has_code = 1;
-        if (!has_code) { want[p] &= (uint8_t)~PF_X; continue; }
+        if (!has_code) { bits[p] &= (uint8_t)~PF_X; continue; }
 
         // Every writable byte on this page must be inside a PT_GNU_RELRO range.
         int relro_covers = 1;
         for (int i = 0; i < eh->e_phnum && relro_covers; i++) {
             if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_W)) continue;
-            uint64_t ws = ph[i].p_vaddr, we = ws + ph[i].p_memsz;
+            int64_t ws = (int64_t)ph[i].p_vaddr, we = ws + (int64_t)ph[i].p_memsz;
             if (ws >= pe || we <= ps) continue;
             if (ws < ps) ws = ps;
             if (we > pe) we = pe;
             int covered = 0;
             for (int j = 0; j < eh->e_phnum; j++)
-                if (ph[j].p_type == PT_GNU_RELRO && ph[j].p_vaddr <= ws
-                    && ph[j].p_vaddr + ph[j].p_memsz >= we)
+                if (ph[j].p_type == PT_GNU_RELRO && (int64_t)ph[j].p_vaddr <= ws
+                    && (int64_t)(ph[j].p_vaddr + ph[j].p_memsz) >= we)
                     covered = 1;
             if (!covered) relro_covers = 0;
         }
-        if (relro_covers) { want[p] &= (uint8_t)~PF_W; continue; }
+        if (relro_covers) { bits[p] &= (uint8_t)~PF_W; continue; }
 
+        if (bad_va) *bad_va = ps;
+        rc = -1;
+        break;
+    }
+    if (!want) free(bits);
+    return rc;
+}
+
+// ...and the third way out, which is not a protection at all: MOVE THE IMAGE.
+//
+// The refusal above used to be the end of the road, under a comment naming this
+// as "the only general way out" and leaving it undone — because the corpus at
+// the time did not need it. BONELAB does. Its libmain.so has just TWO PT_LOADs,
+// r-x at 0 and rw- at 0x2d80, so both live in host page 0; PT_GNU_RELRO covers
+// 0x2d80..0x3000 and the 0x40 bytes above it are ordinary .data. Rule 1 cannot
+// apply (there is real code on the page) and rule 2 cannot (those 0x40 bytes are
+// writable and outside RELRO), so the library that IS the entry point failed to
+// load, before any of the interesting questions about the title could be asked.
+//
+// What no permission can express, placement can: the mapping is ours to choose,
+// and shifting the image inside it moves where the host page boundaries FALL
+// without moving any segment relative to any other. Put a boundary in the gap
+// between the last executable byte and the first writable one and the collision
+// is gone rather than resolved. klepton_ld.c does exactly this offline for the
+// dylib path (see its `image_shift` search) — this is the runtime's half, and
+// the two now agree that a guest's placement is part of loading it.
+//
+// **The shift must be a multiple of 4096**, whatever else it does: `adrp`
+// resolves against a 4 KB page, so every PC-relative reference the linker
+// encoded survives only if the whole image moves by a multiple of that. A shift
+// that is not costs a run to diagnose — klepton_ld.c's comment records what it
+// looks like (a static table read one page out, and nothing naming the shift).
+//
+// Stepping by 4 KB through one host page is exhaustive, because the layout
+// repeats mod the host page size. Bias 0 is tried FIRST and wins whenever it is
+// loadable, so every guest that loads today is placed exactly where it is
+// placed today — a 16 KB-or-coarser guest never reaches the second candidate.
+#define KL_ADRP_PAGE 0x1000u
+static size_t choose_bias(const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
+                          const Elf64_Shdr *sh, uint64_t lo, size_t span,
+                          uintptr_t pg) {
+    for (size_t bias = 0; bias < (size_t)pg; bias += KL_ADRP_PAGE)
+        if (plan_pages(eh, ph, sh, lo, span, bias, pg, NULL, NULL) == 0)
+            return bias;
+    return 0;   // none works; protect_pages reports which page and why
+}
+
+static int protect_pages(kl_image *img, const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
+                         const Elf64_Shdr *sh, uint64_t lo) {
+    const uintptr_t pg = (uintptr_t)getpagesize();
+    const size_t npages = page_count(img->span, img->map_off, pg);
+    uint8_t *want = calloc(npages, 1);          // ELF PF_* bits, per host page
+    if (!want) { err("out of memory for %zu page protections", npages); return -1; }
+
+    int64_t bad_va = 0;
+    if (plan_pages(eh, ph, sh, lo, img->span, img->map_off, pg, want, &bad_va) != 0) {
         uint64_t minalign = 0;
         for (int i = 0; i < eh->e_phnum; i++)
             if (ph[i].p_type == PT_LOAD && (!minalign || ph[i].p_align < minalign))
                 minalign = ph[i].p_align;
-        // Nameable, because the fix is not in this function: the only general
-        // way out is to place the image so that a host page boundary falls in
-        // the GAP between the executable segment and the writable bytes (here
-        // 0x11250..0x13910, wide enough that some offset works), which is a
-        // property of the mapping rather than of the protections.
-        err("%s: page %#llx needs W and X together and neither rule applies — "
-            "executable sections are present AND writable bytes outside "
-            "PT_GNU_RELRO share it (LOAD p_align %#llx < host page %#lx)",
-            img->path, (unsigned long long)ps,
+        // Reached only when NO placement works either — choose_bias has already
+        // tried every 4 KB offset through a host page. So the gap between the
+        // executable bytes and the writable ones is narrower than a page
+        // everywhere, which is a property of the file and not of this run.
+        err("%s: page at vaddr %#llx needs W and X together and neither rule "
+            "applies — executable sections are present AND writable bytes "
+            "outside PT_GNU_RELRO share it, at every 4 KB placement of the "
+            "image (LOAD p_align %#llx < host page %#lx)",
+            img->path, (unsigned long long)bad_va,
             (unsigned long long)minalign, (unsigned long)pg);
         free(want);
         return -1;
@@ -729,6 +811,7 @@ static int protect_pages(kl_image *img, const Elf64_Ehdr *eh, const Elf64_Phdr *
 
     // Coalesce equal-protection runs: libil2cpp is 5380 pages and would
     // otherwise cost 5380 syscalls and as many VM map entries.
+    uint8_t *map = img->base - img->map_off;
     for (size_t p = 0; p < npages; ) {
         if (!want[p]) { p++; continue; }        // a gap between segments; leave RW
         size_t q = p;
@@ -736,9 +819,9 @@ static int protect_pages(kl_image *img, const Elf64_Ehdr *eh, const Elf64_Phdr *
         int prot = ((want[p] & PF_R) ? PROT_READ  : 0) |
                    ((want[p] & PF_W) ? PROT_WRITE : 0) |
                    ((want[p] & PF_X) ? PROT_EXEC  : 0);
-        if (mprotect(img->base + p * pg, (q - p) * pg, prot) != 0)
+        if (mprotect(map + p * pg, (q - p) * pg, prot) != 0)
             fprintf(stderr, "  [klepton] mprotect(%p,%#zx,%d) failed: %s\n",
-                    (void *)(img->base + p * pg), (q - p) * pg, prot, strerror(errno));
+                    (void *)(map + p * pg), (q - p) * pg, prot, strerror(errno));
         p = q;
     }
     free(want);
@@ -774,11 +857,30 @@ kl_image *kl_load(const char *path) {
     img->span = (size_t)(hi - lo);
     snprintf(img->path, sizeof img->path, "%s", path);
 
-    // One RW mapping for the whole vaddr span; permissions tightened after relocation.
-    img->base = mmap(NULL, img->span, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (img->base == MAP_FAILED) { err("mmap image: %s", strerror(errno));
-                                   free(img); munmap(file, sb.st_size); return NULL; }
+    // Section headers are read here rather than at the rewrite passes below
+    // because the placement decision needs them too: rule 1 asks which pages
+    // carry executable SECTIONS, not which carry the executable segment.
+    const Elf64_Shdr *sh = (eh->e_shoff && eh->e_shnum)
+                         ? (const Elf64_Shdr *)(file + eh->e_shoff) : NULL;
+
+    // One RW mapping for the whole vaddr span; permissions tightened after
+    // relocation. The span is padded by a host page and the image placed
+    // `map_off` into it, so that a guest whose p_align is finer than the host
+    // page can have a page boundary land between its executable bytes and its
+    // writable ones — see choose_bias(). map_off is 0 for every guest that does
+    // not need it, which is every guest aligned to 16 KB or coarser.
+    const uintptr_t pg = (uintptr_t)getpagesize();
+    img->map_off  = choose_bias(eh, ph, sh, lo, img->span, pg);
+    img->map_size = (img->span + img->map_off + pg - 1) & ~((size_t)pg - 1);
+    uint8_t *map = mmap(NULL, img->map_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (map == MAP_FAILED) { err("mmap image: %s", strerror(errno));
+                             free(img); munmap(file, sb.st_size); return NULL; }
+    img->base = map + img->map_off;
+    if (img->map_off)
+        fprintf(stderr, "  [klepton] %s: placed %#zx into its mapping so a host "
+                        "page boundary falls between the executable bytes and "
+                        "the writable ones\n", path, img->map_off);
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
         memcpy(img->base + ph[i].p_vaddr - lo, file + ph[i].p_offset, ph[i].p_filesz);
@@ -800,8 +902,7 @@ kl_image *kl_load(const char *path) {
     // relocations sitting behind PF_X. Rewriting a word that merely looks like
     // an instruction in there would corrupt data, and the x18 pass patches
     // branches rather than flipping one bit, so it would corrupt it loudly.
-    const Elf64_Shdr *sh = (eh->e_shoff && eh->e_shnum)
-                         ? (const Elf64_Shdr *)(file + eh->e_shoff) : NULL;
+    // (`sh` is read above — the placement decision needs the same distinction.)
 
     // The authoritative .dynsym entry count, and the reason it is taken from the
     // SECTION rather than from DT_HASH: DT_HASH is optional. Steam Link's VR APK
@@ -926,7 +1027,7 @@ void *kl_sym(kl_image *img, const char *name) {
 void kl_unload(kl_image *img) {
     if (!img) return;
     if (img->dl_handle) dlclose(img->dl_handle);   // M1b: dyld owns the mapping
-    else                munmap(img->base, img->span);
+    else                munmap(img->base - img->map_off, img->map_size);
     free(img);
 }
 

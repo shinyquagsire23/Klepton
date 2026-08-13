@@ -6,6 +6,7 @@
 // one named abort stub per slot. Nothing here hardcodes a slot number, which is
 // what keeps this immune to the off-by-one class of bug.
 #include <ctype.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +16,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <zlib.h>        // a split-binary guest reads its OBB, and an OBB is a zip
 #include "klepton.h"
 #include "kl_jni.h"
 #include "kl_target.h"   // the default target's userdata key
@@ -536,6 +538,19 @@ static const struct { const char *cls, *super; } g_supers[] = {
     // getIntent() on it. That is an Activity method, so without this edge every
     // inherited Activity method would need re-declaring against NativeActivity.
     {"android/app/NativeActivity",             "android/app/Activity"},
+    // BONELAB's own libSLZQuestNative reaches its Context the way a native
+    // plugin with no Context has to: ActivityThread.currentActivityThread()
+    // .getApplication(). An Application IS a Context (through ContextWrapper),
+    // and this edge is what lets it call getExternalCacheDir() on the result
+    // rather than needing every Context method re-declared against it.
+    // The dialog's checkbox: the guest resolves setOnCheckedChangeListener
+    // against CompoundButton and setText against TextView, not against CheckBox,
+    // so the real widget chain is what makes one binding serve both.
+    {"android/widget/CheckBox",                "android/widget/CompoundButton"},
+    {"android/widget/CompoundButton",          "android/widget/Button"},
+    {"android/widget/Button",                  "android/widget/TextView"},
+    {"android/widget/TextView",                "android/view/View"},
+    {"android/app/Application",                "android/content/ContextWrapper"},
     {"android/app/Activity",                   "android/view/ContextThemeWrapper"},
     {"android/view/ContextThemeWrapper",       "android/content/ContextWrapper"},
     {"android/content/ContextWrapper",         "android/content/Context"},
@@ -1452,6 +1467,11 @@ static const klj_field g_fields[] = {
              "android.media.property.OUTPUT_SAMPLE_RATE"),
     KLJ_FSTR("android/media/AudioManager", "PROPERTY_OUTPUT_FRAMES_PER_BUFFER",
              "android.media.property.OUTPUT_FRAMES_PER_BUFFER"),
+    // DialogInterface's button ids, which a listener switches on to tell
+    // Continue from Abort. Negative by Android's definition, not by ours.
+    KLJ_FINT("android/content/DialogInterface", "BUTTON_POSITIVE", -1),
+    KLJ_FINT("android/content/DialogInterface", "BUTTON_NEGATIVE", -2),
+    KLJ_FINT("android/content/DialogInterface", "BUTTON_NEUTRAL",  -3),
     KLJ_FINT("android/media/AudioManager", "GET_DEVICES_OUTPUTS", 2),
     KLJ_FINT("android/media/AudioManager", "STREAM_MUSIC", 3),
 
@@ -1672,6 +1692,21 @@ const char *kl_jni_build_string(const char *field) {
                 || strcmp(f->cls, "android/os/Build$VERSION") == 0))
             return klj_field_sval(f);
     return NULL;
+}
+
+// ...and the same lookup for an INT Build field. `ro.build.version.sdk` is the
+// one property whose Build twin is not a string, and reading it from SDK_INT
+// rather than from a second literal is what stops the two from disagreeing —
+// which is not hypothetical: they are the same question asked over JNI and over
+// __system_property_get, and a guest that asks both and gets 29 and 0 will
+// believe the 0.
+int kl_jni_build_int(const char *field, int dflt) {
+    for (const klj_field *f = g_fields; f->cls; f++)
+        if (!f->sval && strcmp(f->name, field) == 0
+            && (strcmp(f->cls, "android/os/Build") == 0
+                || strcmp(f->cls, "android/os/Build$VERSION") == 0))
+            return (int)f->ival;
+    return dflt;
 }
 
 // ------------------------------------------------------------ Java class impls
@@ -2134,7 +2169,12 @@ static klj_val klj_generic_init(void *env, void *clazz, const klj_val *a, int n)
 // We are the Java side, so the proxy is just an object remembering the pointer.
 // Nothing calls back into it until we start synthesising Android events, but the
 // interface list is worth logging — it names every callback the engine expects.
-typedef struct { int64_t native_ptr; void *classes; } klj_proxy;
+// `disabled` is the guest telling us the native object behind this proxy is
+// gone. It is not bookkeeping: klj_proxy_invoke calls THROUGH native_ptr, so
+// invoking a disabled proxy is a call into freed guest memory, and the callback
+// that would do it (a Choreographer frame, a posted Runnable) can be sitting in
+// a queue at the moment the guest disables it.
+typedef struct { int64_t native_ptr; void *classes; int disabled; } klj_proxy;
 
 static klj_val klj_JNIBridge_newInterfaceProxy(void *env, void *clazz, const klj_val *a, int n) {
     (void)env; (void)clazz;
@@ -2153,6 +2193,25 @@ static klj_val klj_JNIBridge_newInterfaceProxy(void *env, void *clazz, const klj
     klj_as_object(obj)->data = p;
     klj_as_object(obj)->pinned = 1;   // guest-held long-term via native_ptr
     return (klj_val){.l = obj};
+}
+
+// ...and the other end of it. Unity calls this when the native object behind a
+// proxy is destroyed; every later call on that proxy must become a no-op rather
+// than a call through a dangling pointer.
+static klj_val klj_JNIBridge_disableInterfaceProxy(void *env, void *clazz,
+                                                   const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    klj_object *o = n > 0 ? klj_as_object(a[0].l) : NULL;
+    klj_proxy  *p = (o && strcmp(o->cls, KLJ_CLASS_PROXY) == 0) ? o->data : NULL;
+    if (p) {
+        p->disabled = 1;
+        KLJ_LOG("disableInterfaceProxy: proxy 0x%llx is dead",
+                (unsigned long long)p->native_ptr);
+    } else {
+        KLJ_LOG("disableInterfaceProxy: %s is not a proxy — ignored",
+                o ? o->cls : "(not an object)");
+    }
+    return (klj_val){0};
 }
 
 static klj_val klj_Context_getPackageManager(void *env, void *self, const klj_val *a, int n) {
@@ -2568,9 +2627,50 @@ static void klj_msg_enqueue(const char *via, void *message) {
     KLJ_LOG("%s: queued (%u pending)", via, g_ui_task_n);
 }
 
+// Forward-declared: the inline path below calls into the guest, and the JNIBridge
+// machinery that does it lives further down beside the other host->guest calls.
+static void *klj_proxy_invoke(void *proxy, const char *iface,
+                              const char *name, const char *sig, void *args);
+
+// ...and here is the "unless already on that thread" half, which was missing and
+// is not a nicety: `Activity.runOnUiThread` runs the action IMMEDIATELY and
+// inline when the caller is already the UI thread, and a guest is allowed to
+// depend on that having happened by the time the call returns.
+//
+// BONELAB does. Its `gles-api-check` warning is posted this way and then WAITED
+// ON — the poster blocks on a condition variable the dialog's own callback
+// signals — so queuing it deadlocked the process against itself: the only
+// thread that drains the queue was the thread inside the wait
+// (`__psynch_cvwait` under libunity, with the task still pending). Nothing in
+// the log named a dialog; it read as a hung engine.
+//
+// "Am I the UI thread" is answered by WHO DRAINS THE QUEUE, which is a
+// definition rather than a guess: the UI thread is the thread that runs posted
+// work, so the thread inside kl_jni_drain_ui_tasks() is that thread and no
+// other. A recorded id from the driver would be a second opinion about the same
+// fact, and the two would eventually differ (they already do across drivers —
+// kl_slink prepares a looper on its activity thread, the Unity path never
+// does, so a looper test answers false for exactly the thread that matters).
+//
+// A thread that has never drained still queues, which is what Android does for
+// a worker thread.
+static pthread_t g_ui_thread;
+static int       g_ui_thread_known;
+
+static int klj_on_ui_thread(void) {
+    return (g_ui_thread_known && pthread_equal(g_ui_thread, pthread_self()))
+        || kl_ndk_thread_has_looper();
+}
+
 static klj_val klj_Activity_runOnUiThread(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
-    klj_ui_enqueue("runOnUiThread", n > 0 ? a[0].l : NULL, 0);
+    void *r = n > 0 ? a[0].l : NULL;
+    if (r && klj_on_ui_thread()) {
+        KLJ_LOG("runOnUiThread: already on the UI thread — running it inline");
+        klj_proxy_invoke(r, "java/lang/Runnable", "run", "()V", NULL);
+        return (klj_val){0};
+    }
+    klj_ui_enqueue("runOnUiThread", r, 0);
     return (klj_val){0};
 }
 
@@ -3428,6 +3528,11 @@ static void *klj_proxy_invoke(void *proxy, const char *iface,
         return NULL;
     }
     klj_proxy *p = o->data;
+    if (p->disabled) {
+        KLJ_LOG("proxy 0x%llx is disabled — not invoking %s.%s",
+                (unsigned long long)p->native_ptr, iface, name);
+        return NULL;
+    }
     // A static native is (JNIEnv*, jclass, args...). The frame pair is the
     // JVM's pop on native return — the method object, the args array, and
     // whatever the guest allocates inside the callback all die at the pop.
@@ -3492,6 +3597,18 @@ static void klj_deliver_message(void *message) {
             m->what, cbo ? cbo->cls : "(none)");
 }
 
+// ...and an int, for the same reason: a dialog button id reaches the guest's
+// listener as an Integer in that Object[].
+static void *klj_box_int(int32_t v) {
+    klj_pref *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    e->kind = 'I';
+    e->ival = v;
+    void *obj = kl_jni_new_object("java/lang/Integer");
+    klj_as_object(obj)->data = e;
+    return obj;
+}
+
 // Box a long for JNIBridge.invoke, which takes its arguments as an Object[].
 static void *klj_box_long(int64_t v) {
     klj_pref *e = calloc(1, sizeof *e);
@@ -3535,6 +3652,9 @@ void kl_jni_tick_choreographer(void) {
 unsigned kl_jni_drain_ui_tasks(void) {
     struct { void *runnable, *message; } batch[KLJ_MAX_UI_TASKS];
     unsigned n;
+    // Whoever runs the posted work IS the UI thread — see klj_on_ui_thread.
+    g_ui_thread = pthread_self();
+    g_ui_thread_known = 1;
     pthread_mutex_lock(&g_lock);
     n = g_ui_task_n;
     for (unsigned i = 0; i < n; i++) {
@@ -4998,7 +5118,28 @@ static klj_val klj_Uri_encode(void *env, void *self, const klj_val *a, int n) {
 // for a dialog when it has something to say, and the title and message it sets
 // are the engine's own diagnosis — far more useful logged than drawn. Nothing
 // here renders anything; the builder records and reports.
-typedef struct { char *title, *message; } klj_dialog;
+// ...and then BONELAB raised one that has to be ANSWERED. Unity's
+// `gles-api-check` warning ("Your device does not match the hardware
+// requirements of this application.") offers Continue and Abort, and blocks the
+// engine until one of them is pressed — so a builder that only records leaves
+// the guest waiting forever on a dialog nobody can see.
+//
+// We press CONTINUE, and that is a decision rather than a default: the question
+// is "run this application on hardware it does not recognise?", which is the
+// question the person launching Klepton has already answered by launching it.
+// Nothing is fabricated about the hardware — the warning is logged in full,
+// including which button was pressed, so a run that then fails downstream says
+// plainly that it was allowed to.
+//
+// It is the POSITIVE button specifically, because that is where Android puts
+// "proceed" and where Unity put Continue. A dialog with no positive listener is
+// left alone: pressing something we were not offered would be inventing an
+// answer, which is the thing this file does not do.
+typedef struct {
+    char *title, *message;
+    char *positive, *negative;
+    void *on_positive;          // the guest's OnClickListener proxy, pinned
+} klj_dialog;
 
 static klj_dialog *klj_dlg(void *self) {
     klj_object *o = klj_as_object(self);
@@ -5026,6 +5167,89 @@ static klj_val klj_AlertBuilder_init(void *env, void *clazz, const klj_val *a, i
 KLJ_ALERT_SET(Title,   title)
 KLJ_ALERT_SET(Message, message)
 #undef KLJ_ALERT_SET
+
+// setPositiveButton(label, listener) / setNegativeButton(...). The listener is
+// a JNIBridge proxy and is PINNED: the guest builds it inside a local frame,
+// and the press happens at show(), which is later.
+static klj_val klj_AlertBuilder_button(void *self, const klj_val *a, int n,
+                                       int positive) {
+    klj_dialog *d = klj_dlg(self);
+    const char *label = n > 0 ? klj_str(a[0].l) : NULL;
+    void       *l     = n > 1 ? a[1].l : NULL;
+    if (d) {
+        char **slot = positive ? &d->positive : &d->negative;
+        free(*slot);
+        *slot = label ? strdup(label) : NULL;
+        if (positive) {
+            d->on_positive = l;
+            klj_object *o = klj_as_object(l);
+            if (o) o->pinned++;
+        }
+    }
+    KLJ_LOG("AlertDialog.%s button: \"%s\"%s", positive ? "positive" : "negative",
+            label ? label : "(null)", l ? "" : " (no listener)");
+    return (klj_val){.l = self};
+}
+static klj_val klj_AlertBuilder_setPositive(void *env, void *self, const klj_val *a, int n) {
+    (void)env; return klj_AlertBuilder_button(self, a, n, 1);
+}
+static klj_val klj_AlertBuilder_setNegative(void *env, void *self, const klj_val *a, int n) {
+    (void)env; return klj_AlertBuilder_button(self, a, n, 0);
+}
+// The chainable no-ops: they configure how a dialog we do not draw would look.
+static klj_val klj_AlertBuilder_self(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = self};
+}
+// create() hands back the dialog, which for us is the same object: the Builder
+// already holds everything show() needs, and two objects would be two states.
+static klj_val klj_AlertBuilder_create(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = self};
+}
+
+// The dialog's furniture: Unity puts a "do not show this again" CheckBox in the
+// warning through Builder.setView(). Nothing draws it and nobody can tick it, so
+// isChecked() is FALSE — the suppression is a choice the user never made, and
+// answering true would silently hide the next run's warning too.
+static klj_val klj_View_new(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object(klj_class_name(clazz))};
+}
+static klj_val klj_View_void(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = NULL};
+}
+static klj_val klj_CheckBox_isChecked(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// DialogInterface.BUTTON_POSITIVE. Android's button ids are negative and this
+// one is -1, which the listener switches on.
+#define KLJ_BUTTON_POSITIVE (-1)
+static void *klj_box_int(int32_t v);
+static klj_val klj_AlertBuilder_show(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_dialog *d = klj_dlg(self);
+    if (!d) return (klj_val){.l = self};
+    KLJ_LOG("AlertDialog.show: \"%s\" — %s", d->title ? d->title : "(no title)",
+            d->message ? d->message : "(no message)");
+    if (!d->on_positive) {
+        KLJ_LOG("AlertDialog: nothing to press (no positive listener) — the "
+                "guest may be waiting on this");
+        return (klj_val){.l = self};
+    }
+    KLJ_LOG("AlertDialog: pressing \"%s\" — running this guest on this hardware "
+            "is the decision already made by launching it",
+            d->positive ? d->positive : "the positive button");
+    void *args = klj_new_array('L', "java/lang/Object", 2);
+    ((void **)klj_arr(args)->data)[0] = self;            // the DialogInterface
+    ((void **)klj_arr(args)->data)[1] = klj_box_int(KLJ_BUTTON_POSITIVE);
+    klj_proxy_invoke(d->on_positive, "android/content/DialogInterface$OnClickListener",
+                     "onClick", "(Landroid/content/DialogInterface;I)V", args);
+    return (klj_val){.l = self};
+}
 
 // ---- manifest meta-data ----
 // PackageItemInfo.metaData is the <meta-data> block from AndroidManifest.xml,
@@ -5349,7 +5573,34 @@ static klj_val klj_Context_getCacheDir(void *env, void *self, const klj_val *a, 
     (void)env; (void)self; (void)a; (void)n;
     char path[1024];
     snprintf(path, sizeof path, "%s/cache", kl_jni_files_dir());
+    klj_mkdir_p(path);
     return (klj_val){.l = klj_new_file(path)};
+}
+// Android's two cache directories differ in which volume they are on and in
+// nothing else that matters here: one storage, one answer. It is CREATED for
+// the same reason the OBB directory is — the caller is asking where to put a
+// file, and a path that does not exist is a write that fails much later.
+// BONELAB's Vulkan plugin keeps its pipeline-state cache here.
+static klj_val klj_Context_getExternalCacheDir(void *env, void *self, const klj_val *a, int n) {
+    return klj_Context_getCacheDir(env, self, a, n);
+}
+
+// ---- android.app.ActivityThread ----
+// The back door to a Context, for native code that was never handed one:
+// ActivityThread.currentActivityThread().getApplication(). It is @hide, and
+// every Unity-era native plugin that wants a Context without an Activity uses
+// it anyway. Both are singletons here, and the Application IS the application
+// Context object — the same one getApplicationContext() answers with, so a
+// plugin and the engine cannot end up with two different ideas of it.
+static klj_val klj_ActivityThread_current(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz; (void)a; (void)n;
+    static void *at;
+    return klj_singleton("android/app/ActivityThread", &at);
+}
+static klj_val klj_ActivityThread_getApplication(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *app;
+    return klj_singleton("android/app/Application", &app);
 }
 
 // Our storage is a plain writable directory, so "mounted" is the honest state.
@@ -5547,7 +5798,61 @@ static klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, in
 
 // InputStream carries the whole asset in memory: assets read this way are small
 // config blobs, and it makes Scanner a pure string walk.
-typedef struct { char *data; size_t len, pos; } klj_stream;
+//
+// ...which stopped being the whole story when a guest opened its OBB through
+// java.util.zip. That file is 3.4 GB, so a stream over an entry in it is a
+// WINDOW into a file rather than a buffer, and the two kinds are distinguished
+// by which of `data` and `f` is set. Nothing chooses between them at the read
+// site: klj_stream_read serves both.
+typedef struct {
+    char  *data;        // the whole contents, when the stream was slurped...
+    FILE  *f;           // ...or the file it is a window into (then data == NULL)
+    size_t base;        // where that window starts in that file
+    size_t len, pos;
+} klj_stream;
+
+static size_t klj_stream_read(klj_stream *st, void *buf, size_t want) {
+    if (!st || st->pos >= st->len) return 0;
+    size_t take = st->len - st->pos;
+    if (take > want) take = want;
+    if (st->data) {
+        memcpy(buf, st->data + st->pos, take);
+    } else if (st->f) {
+        // Seek every time rather than trusting the handle's position: a stream
+        // is the only thing that knows where it is, and two of them over one
+        // file would otherwise read each other's bytes.
+        if (fseeko(st->f, (off_t)(st->base + st->pos), SEEK_SET) != 0) return 0;
+        take = fread(buf, 1, take, st->f);
+    } else {
+        return 0;
+    }
+    st->pos += take;
+    return take;
+}
+
+// Scanner walks the bytes directly, so a window into a file has to become bytes
+// first. Nothing takes this path today — Scanner is the assets path and those
+// are slurped — and it is here so that a stream from a zip cannot silently scan
+// as empty, which is a wrong answer with no error anywhere.
+static const char *klj_stream_bytes(klj_stream *st) {
+    if (!st) return NULL;
+    if (!st->data && st->f) {
+        char *d = malloc(st->len + 1);
+        if (!d) return NULL;
+        size_t got = 0;
+        if (fseeko(st->f, (off_t)st->base, SEEK_SET) == 0)
+            got = fread(d, 1, st->len, st->f);
+        d[got] = '\0';
+        st->data = d;
+        st->len  = got;
+    }
+    return st->data;
+}
+
+static void klj_stream_close(klj_stream *st) {
+    if (!st) return;
+    if (st->f) { fclose(st->f); st->f = NULL; }
+}
 
 static klj_val klj_AssetManager_open(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
@@ -5615,6 +5920,7 @@ static klj_val klj_Scanner_next(void *env, void *self, const klj_val *a, int n) 
         return (klj_val){.l = NULL};   // guest catches NoSuchElementException
 
     klj_stream *st   = sc->st;
+    if (!klj_stream_bytes(st)) return (klj_val){.l = NULL};
     const char *rest = st->data + st->pos;
     const char *end  = klj_delim_whole_input(sc->delim) ? NULL : strstr(rest, sc->delim);
     size_t take = end ? (size_t)(end - rest) : st->len - st->pos;
@@ -5628,6 +5934,327 @@ static klj_val klj_Scanner_next(void *env, void *self, const klj_val *a, int n) 
     void *s = kl_jni_new_string(tok);
     free(tok);
     return (klj_val){.l = s};
+}
+
+// ---- java.util.zip.ZipFile ----
+//
+// A split application binary keeps its data in an OBB, and an OBB is a zip:
+// BONELAB ships main.2974 and patch.2974 beside a 75 MB APK, 6.8 GB together.
+// Unity opens them through the JAVA zip classes rather than through its own
+// native reader (the class name is a string in libunity, resolved lazily), so
+// three methods stand between the guest and its entire asset tree.
+//
+// It is a reader, never a writer: nothing here creates, appends to or rewrites
+// an archive. `getEntry` locates and `getInputStream` reads.
+//
+// The entry table is read once, from the central directory, and then the file
+// is only ever seeked and read — an OBB entry can be hundreds of megabytes and
+// the archive itself is larger than this process would like to hold, so a
+// stream over an entry is a window (klj_stream above) rather than a buffer. The
+// one exception is a DEFLATEd entry, which has to be inflated to be a window at
+// all; every entry in both of BONELAB's OBBs is STORED, which is how Unity maps
+// assets straight out of one, so that path is the unusual one and says so.
+#define KLJ_EOCD_SIG 0x06054b50u
+#define KLJ_CEN_SIG  0x02014b50u
+
+typedef struct {
+    char     name[512];
+    uint16_t method;
+    uint64_t csize, size, lhdr;   // ...and the LOCAL header's offset, which is
+                                  // where the data is found from
+} klj_zent;
+
+typedef struct {
+    char      path[1024];
+    FILE     *f;
+    klj_zent *e;
+    unsigned  n;
+} klj_zip;
+
+static uint16_t klj_rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t klj_rd32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Returns 0 on success. The failures are all named: a zip we cannot read is
+// every asset the guest has, so "it opened and found nothing" is the one answer
+// that must not be possible to reach quietly.
+static int klj_zip_open(klj_zip *z, const char *path) {
+    snprintf(z->path, sizeof z->path, "%s", path);
+    z->f = fopen(path, "rb");
+    if (!z->f) { KLJ_LOG("ZipFile: cannot open %s: %s", path, strerror(errno)); return -1; }
+
+    if (fseeko(z->f, 0, SEEK_END) != 0) return -1;
+    off_t fsz = ftello(z->f);
+    // The end-of-central-directory record is last, but a zip comment (up to
+    // 64 KB) may follow it, so it is found by scanning back rather than read.
+    size_t tail = (fsz < 66000) ? (size_t)fsz : 66000;
+    uint8_t *buf = malloc(tail ? tail : 1);
+    if (!buf) return -1;
+    if (fseeko(z->f, fsz - (off_t)tail, SEEK_SET) != 0 || fread(buf, 1, tail, z->f) != tail) {
+        free(buf); KLJ_LOG("ZipFile: short read on %s", path); return -1;
+    }
+    ssize_t eocd = -1;
+    for (ssize_t i = (ssize_t)tail - 22; i >= 0; i--)
+        if (klj_rd32(buf + i) == KLJ_EOCD_SIG) { eocd = i; break; }
+    if (eocd < 0) { free(buf); KLJ_LOG("ZipFile: no end-of-central-directory in %s "
+                                       "— not a zip", path); return -1; }
+    uint32_t count = klj_rd16(buf + eocd + 10);
+    uint32_t cdsz  = klj_rd32(buf + eocd + 12);
+    uint32_t cdoff = klj_rd32(buf + eocd + 16);
+    free(buf);
+    // ZIP64 replaces the field it cannot hold with all-ones and puts the real
+    // value in an extra record. Both OBBs here are under 4 GB and under 65535
+    // entries, so this is refused BY NAME rather than half-read: a truncated
+    // count reads as a working archive that is missing most of its files.
+    if (count == 0xffffu || cdsz == 0xffffffffu || cdoff == 0xffffffffu) {
+        KLJ_LOG("ZipFile: %s is ZIP64 (count=%u cdsz=%#x cdoff=%#x) and this "
+                "reader is not — refusing rather than reading part of it",
+                path, count, cdsz, cdoff);
+        return -1;
+    }
+
+    uint8_t *cd = malloc(cdsz ? cdsz : 1);
+    if (!cd) return -1;
+    if (fseeko(z->f, (off_t)cdoff, SEEK_SET) != 0 || fread(cd, 1, cdsz, z->f) != cdsz) {
+        free(cd); KLJ_LOG("ZipFile: cannot read the central directory of %s", path);
+        return -1;
+    }
+    z->e = calloc(count, sizeof *z->e);
+    if (!z->e) { free(cd); return -1; }
+    size_t p = 0;
+    for (uint32_t i = 0; i < count && p + 46 <= cdsz; i++) {
+        if (klj_rd32(cd + p) != KLJ_CEN_SIG) break;
+        uint16_t nlen = klj_rd16(cd + p + 28), xlen = klj_rd16(cd + p + 30),
+                 clen = klj_rd16(cd + p + 32);
+        if (p + 46 + nlen > cdsz) break;
+        klj_zent *e = &z->e[z->n];
+        size_t take = nlen < sizeof e->name - 1 ? nlen : sizeof e->name - 1;
+        memcpy(e->name, cd + p + 46, take);
+        e->name[take] = '\0';
+        e->method = klj_rd16(cd + p + 10);
+        e->csize  = klj_rd32(cd + p + 20);
+        e->size   = klj_rd32(cd + p + 24);
+        e->lhdr   = klj_rd32(cd + p + 42);
+        z->n++;
+        p += 46u + nlen + xlen + clen;
+    }
+    free(cd);
+    KLJ_LOG("ZipFile(\"%s\") -> %u entries", path, z->n);
+    if (z->n != count)
+        KLJ_LOG("ZipFile: the central directory of %s ended after %u of %u "
+                "entries — the archive is truncated or malformed", path, z->n, count);
+    return 0;
+}
+
+static const klj_zent *klj_zip_find(const klj_zip *z, const char *name) {
+    for (unsigned i = 0; i < z->n; i++)
+        if (strcmp(z->e[i].name, name) == 0) return &z->e[i];
+    return NULL;
+}
+
+// Where an entry's bytes begin. The central directory records the LOCAL header's
+// offset, and only that header knows how long its own name and extra fields are
+// — they are allowed to differ from the central copies, so this cannot be
+// computed from what we already parsed.
+static int klj_zip_data_off(const klj_zip *z, const klj_zent *e, uint64_t *out) {
+    uint8_t h[30];
+    if (fseeko(z->f, (off_t)e->lhdr, SEEK_SET) != 0 || fread(h, 1, sizeof h, z->f) != sizeof h)
+        return -1;
+    if (klj_rd32(h) != 0x04034b50u) return -1;
+    *out = e->lhdr + 30u + klj_rd16(h + 26) + klj_rd16(h + 28);
+    return 0;
+}
+
+static klj_val klj_ZipFile_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *path = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!path) return (klj_val){.l = NULL};
+    klj_zip *z = calloc(1, sizeof *z);
+    if (!z) return (klj_val){.l = NULL};
+    if (klj_zip_open(z, path) != 0) {
+        if (z->f) fclose(z->f);
+        free(z->e); free(z);
+        return (klj_val){.l = NULL};      // guest catches IOException
+    }
+    void *obj = kl_jni_new_object("java/util/zip/ZipFile");
+    klj_as_object(obj)->data = z;
+    return (klj_val){.l = obj};
+}
+
+// The entry object carries the archive too: getInputStream is given only this,
+// and an entry that does not know which file it came from could be read out of
+// the wrong one.
+typedef struct { klj_zip *z; const klj_zent *e; } klj_zeobj;
+
+static klj_val klj_ZipFile_getEntry(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_object *o = klj_as_object(self);
+    klj_zip    *z = o ? o->data : NULL;
+    const char *name = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!z || !name) return (klj_val){.l = NULL};
+    const klj_zent *e = klj_zip_find(z, name);
+    KLJ_LOG("ZipFile.getEntry(\"%s\") -> %s", name,
+            e ? (e->method == 0 ? "stored" : "deflated") : "MISSING");
+    if (!e) return (klj_val){.l = NULL};   // Java answers null; not an exception
+    klj_zeobj *ze = calloc(1, sizeof *ze);
+    ze->z = z; ze->e = e;
+    return (klj_val){.l = klj_new_object_data("java/util/zip/ZipEntry", ze)};
+}
+
+static klj_val klj_ZipFile_getInputStream(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_object *eo = n > 0 ? klj_as_object(a[0].l) : NULL;
+    klj_zeobj  *ze = eo ? eo->data : NULL;
+    if (!ze || !ze->z || !ze->e) return (klj_val){.l = NULL};
+    uint64_t off;
+    if (klj_zip_data_off(ze->z, ze->e, &off) != 0) {
+        KLJ_LOG("ZipFile.getInputStream(\"%s\"): no local header at %#llx",
+                ze->e->name, (unsigned long long)ze->e->lhdr);
+        return (klj_val){.l = NULL};
+    }
+
+    klj_stream *st = calloc(1, sizeof *st);
+    if (!st) return (klj_val){.l = NULL};
+    if (ze->e->method == 0) {
+        // A window. Its own handle, so two streams over one archive cannot
+        // disturb each other's position.
+        st->f    = fopen(ze->z->path, "rb");
+        st->base = off;
+        st->len  = (size_t)ze->e->size;
+        if (!st->f) { free(st); return (klj_val){.l = NULL}; }
+    } else if (ze->e->method == 8) {
+        // Inflated whole, because a window into compressed bytes is not a
+        // window into anything. Named, and sized from the entry rather than
+        // grown, so an implausible one is visible here rather than as memory.
+        KLJ_LOG("ZipFile.getInputStream(\"%s\"): DEFLATED, inflating %llu bytes",
+                ze->e->name, (unsigned long long)ze->e->size);
+        uint8_t *cbuf = malloc((size_t)ze->e->csize ? (size_t)ze->e->csize : 1);
+        char    *out  = malloc((size_t)ze->e->size + 1);
+        if (!cbuf || !out) { free(cbuf); free(out); free(st); return (klj_val){.l = NULL}; }
+        if (fseeko(ze->z->f, (off_t)off, SEEK_SET) != 0
+            || fread(cbuf, 1, (size_t)ze->e->csize, ze->z->f) != (size_t)ze->e->csize) {
+            free(cbuf); free(out); free(st); return (klj_val){.l = NULL};
+        }
+        z_stream zs; memset(&zs, 0, sizeof zs);
+        zs.next_in = cbuf; zs.avail_in = (uInt)ze->e->csize;
+        zs.next_out = (Bytef *)out; zs.avail_out = (uInt)ze->e->size;
+        int rc = inflateInit2(&zs, -MAX_WBITS);     // raw: a zip has no zlib header
+        if (rc == Z_OK) { rc = inflate(&zs, Z_FINISH); inflateEnd(&zs); }
+        free(cbuf);
+        if (rc != Z_STREAM_END) {
+            KLJ_LOG("ZipFile.getInputStream(\"%s\"): inflate failed (%d)", ze->e->name, rc);
+            free(out); free(st); return (klj_val){.l = NULL};
+        }
+        out[ze->e->size] = '\0';
+        st->data = out;
+        st->len  = (size_t)ze->e->size;
+    } else {
+        KLJ_LOG("ZipFile.getInputStream(\"%s\"): compression method %u is neither "
+                "stored nor deflate", ze->e->name, ze->e->method);
+        free(st);
+        return (klj_val){.l = NULL};
+    }
+    KLJ_LOG("ZipFile.getInputStream(\"%s\") -> %zu bytes at %#llx",
+            ze->e->name, st->len, (unsigned long long)off);
+    void *obj = kl_jni_new_object("java/io/InputStream");
+    klj_as_object(obj)->data = st;
+    return (klj_val){.l = obj};
+}
+
+static klj_val klj_ZipFile_close(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    klj_zip    *z = o ? o->data : NULL;
+    // The entry table stays: a ZipEntry the guest still holds names it, and Java
+    // would throw IllegalStateException on a read rather than fault. Only the
+    // handle goes, which is the resource close() exists to release.
+    if (z && z->f) { fclose(z->f); z->f = NULL; }
+    return (klj_val){.l = NULL};
+}
+
+// The entry's own description. Three getters rather than one, because they are
+// one answer asked three ways and each would otherwise be its own abort.
+static klj_val klj_ZipEntry_getName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o  = klj_as_object(self);
+    klj_zeobj  *ze = o ? o->data : NULL;
+    return (klj_val){.l = ze && ze->e ? kl_jni_new_string(ze->e->name) : NULL};
+}
+static klj_val klj_ZipEntry_getSize(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o  = klj_as_object(self);
+    klj_zeobj  *ze = o ? o->data : NULL;
+    return (klj_val){.j = ze && ze->e ? ze->e->size : (uint64_t)-1};
+}
+static klj_val klj_ZipEntry_getCompressedSize(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o  = klj_as_object(self);
+    klj_zeobj  *ze = o ? o->data : NULL;
+    return (klj_val){.j = ze && ze->e ? ze->e->csize : (uint64_t)-1};
+}
+static klj_val klj_ZipEntry_getMethod(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o  = klj_as_object(self);
+    klj_zeobj  *ze = o ? o->data : NULL;
+    return (klj_val){.j = ze && ze->e ? ze->e->method : (uint64_t)-1};
+}
+
+// ---- java.io.InputStream ----
+// Handed out by AssetManager.open and ZipFile.getInputStream, and until a guest
+// read one through anything but Scanner it had no methods at all. The read
+// family comes as a group for the usual reason: a stream that answers read([BII)
+// and aborts on read([B) is not a partially-working stream, it is a guest
+// wedged on the one call it happened to make.
+static klj_val klj_InputStream_read_off(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_object *o  = klj_as_object(self);
+    klj_stream *st = o ? o->data : NULL;
+    klj_array  *b  = n > 0 ? klj_arr(a[0].l) : NULL;
+    if (!st || !b) return (klj_val){.j = (uint64_t)-1};
+    int off = n > 1 ? (int)a[1].j : 0, want = n > 2 ? (int)a[2].j : b->len;
+    if (off < 0 || want < 0 || off + want > b->len) return (klj_val){.j = (uint64_t)-1};
+    size_t got = klj_stream_read(st, (uint8_t *)b->data + off, (size_t)want);
+    // Java's end-of-stream is -1, and 0 means "asked for none" — a read that
+    // answered 0 at EOF is an infinite loop in the caller.
+    return (klj_val){.j = got ? (uint64_t)got : (want ? (uint64_t)-1 : 0)};
+}
+static klj_val klj_InputStream_read_all(void *env, void *self, const klj_val *a, int n) {
+    klj_array *b = n > 0 ? klj_arr(a[0].l) : NULL;
+    klj_val args[3] = { a[0], {.j = 0}, {.j = b ? (uint64_t)b->len : 0} };
+    return klj_InputStream_read_off(env, self, args, 3);
+}
+static klj_val klj_InputStream_read1(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o  = klj_as_object(self);
+    klj_stream *st = o ? o->data : NULL;
+    uint8_t c;
+    return (klj_val){.j = klj_stream_read(st, &c, 1) == 1 ? (uint64_t)c : (uint64_t)-1};
+}
+static klj_val klj_InputStream_skip(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_object *o  = klj_as_object(self);
+    klj_stream *st = o ? o->data : NULL;
+    int64_t want = n > 0 ? (int64_t)a[0].j : 0;
+    if (!st || want <= 0) return (klj_val){.j = 0};
+    size_t left = st->len - st->pos;
+    size_t take = (size_t)want < left ? (size_t)want : left;
+    st->pos += take;
+    return (klj_val){.j = (uint64_t)take};
+}
+static klj_val klj_InputStream_available(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o  = klj_as_object(self);
+    klj_stream *st = o ? o->data : NULL;
+    return (klj_val){.j = st ? (uint64_t)(st->len - st->pos) : 0};
+}
+static klj_val klj_InputStream_close(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o  = klj_as_object(self);
+    klj_stream *st = o ? o->data : NULL;
+    klj_stream_close(st);
+    return (klj_val){.l = NULL};
 }
 
 // ---- SharedPreferences ----
@@ -5820,6 +6447,17 @@ static void klj_prefs_load(klj_prefs *p) {
 static klj_prefs g_prefs_files[KLJ_MAX_PREF_FILES];
 static void     *g_prefs_objs[KLJ_MAX_PREF_FILES];
 static unsigned  g_nprefs_files;
+
+// Activity.getPreferences(mode) is getSharedPreferences() with the activity's
+// own class name as the file — Android's per-activity default store. Named
+// here rather than pointed at "default", because the name IS the file on disk
+// and a guest that later asks for it by name must find the same one.
+static klj_val klj_Context_getSharedPreferences(void *env, void *self, const klj_val *a, int n);
+static klj_val klj_Activity_getPreferences(void *env, void *self, const klj_val *a, int n) {
+    klj_val args[2] = { {.l = kl_jni_new_string("com.unity3d.player.UnityPlayerActivity")},
+                        { .j = n > 0 ? a[0].j : 0 } };
+    return klj_Context_getSharedPreferences(env, self, args, 2);
+}
 
 static klj_val klj_Context_getSharedPreferences(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
@@ -6646,6 +7284,36 @@ static const klj_binding g_bindings[] = {
      "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;", klj_AlertBuilder_setTitle},
     {"android/app/AlertDialog$Builder", "setMessage",
      "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;", klj_AlertBuilder_setMessage},
+    {"android/app/AlertDialog$Builder", "setPositiveButton",
+     "(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)"
+     "Landroid/app/AlertDialog$Builder;", klj_AlertBuilder_setPositive},
+    {"android/app/AlertDialog$Builder", "setNegativeButton",
+     "(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)"
+     "Landroid/app/AlertDialog$Builder;", klj_AlertBuilder_setNegative},
+    {"android/app/AlertDialog$Builder", "setCancelable", "(Z)Landroid/app/AlertDialog$Builder;",
+     klj_AlertBuilder_self},
+    {"android/app/AlertDialog$Builder", "setOnCancelListener",
+     "(Landroid/content/DialogInterface$OnCancelListener;)Landroid/app/AlertDialog$Builder;",
+     klj_AlertBuilder_self},
+    {"android/app/AlertDialog$Builder", "setOnKeyListener",
+     "(Landroid/content/DialogInterface$OnKeyListener;)Landroid/app/AlertDialog$Builder;",
+     klj_AlertBuilder_self},
+    {"android/app/AlertDialog$Builder", "setOnDismissListener",
+     "(Landroid/content/DialogInterface$OnDismissListener;)Landroid/app/AlertDialog$Builder;",
+     klj_AlertBuilder_self},
+    {"android/app/AlertDialog$Builder", "create", "()Landroid/app/AlertDialog;",
+     klj_AlertBuilder_create},
+    {"android/app/AlertDialog$Builder", "show", "()Landroid/app/AlertDialog;",
+     klj_AlertBuilder_show},
+    {"android/app/AlertDialog", "show", "()V", klj_AlertBuilder_show},
+    {"android/app/AlertDialog$Builder", "setView", "(Landroid/view/View;)Landroid/app/AlertDialog$Builder;",
+     klj_AlertBuilder_self},
+    {"android/widget/CheckBox", "<init>", "(Landroid/content/Context;)V", klj_View_new},
+    {"android/widget/TextView", "setText", "(Ljava/lang/CharSequence;)V", klj_View_void},
+    {"android/widget/CompoundButton", "setChecked", "(Z)V", klj_View_void},
+    {"android/widget/CompoundButton", "isChecked", "()Z", klj_CheckBox_isChecked},
+    {"android/widget/CompoundButton", "setOnCheckedChangeListener",
+     "(Landroid/widget/CompoundButton$OnCheckedChangeListener;)V", klj_View_void},
 
     {"org/libsdl/app/SDLAudioManager", "audioSetThreadPriority", "(ZI)V",
      klj_SDLAM_audioSetThreadPriority},
@@ -6768,6 +7436,14 @@ static const klj_binding g_bindings[] = {
     {"android/content/Context", "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;", klj_Context_getExternalFilesDir},
     {"android/content/Context", "getFilesDir", "()Ljava/io/File;", klj_Context_getFilesDir},
     {"android/content/Context", "getCacheDir", "()Ljava/io/File;", klj_Context_getCacheDir},
+    {"android/app/Activity", "getPreferences", "(I)Landroid/content/SharedPreferences;",
+     klj_Activity_getPreferences},
+    {"android/content/Context", "getExternalCacheDir", "()Ljava/io/File;",
+     klj_Context_getExternalCacheDir},
+    {"android/app/ActivityThread", "currentActivityThread", "()Landroid/app/ActivityThread;",
+     klj_ActivityThread_current},
+    {"android/app/ActivityThread", "getApplication", "()Landroid/app/Application;",
+     klj_ActivityThread_getApplication},
     {"android/content/Context", "getPackageCodePath", "()Ljava/lang/String;", klj_Context_getPackageCodePath},
     {"android/content/Context", "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", klj_Context_getApplicationInfo},
     {"android/content/Context", "getObbDirs", "()[Ljava/io/File;", klj_Context_getObbDirs},
@@ -6830,6 +7506,23 @@ static const klj_binding g_bindings[] = {
     {"java/io/File", "getCanonicalPath","()Ljava/lang/String;", klj_File_getPath},
     {"java/io/File", "getParent",       "()Ljava/lang/String;", klj_File_getParent},
     {"android/content/res/AssetManager", "open", "(Ljava/lang/String;)Ljava/io/InputStream;", klj_AssetManager_open},
+    // The OBB, for a split application binary (BONELAB). A reader only.
+    {"java/util/zip/ZipFile", "<init>",   "(Ljava/lang/String;)V", klj_ZipFile_init},
+    {"java/util/zip/ZipFile", "getEntry", "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;",
+     klj_ZipFile_getEntry},
+    {"java/util/zip/ZipFile", "getInputStream", "(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;",
+     klj_ZipFile_getInputStream},
+    {"java/util/zip/ZipFile", "close",    "()V",                   klj_ZipFile_close},
+    {"java/util/zip/ZipEntry", "getName", "()Ljava/lang/String;",  klj_ZipEntry_getName},
+    {"java/util/zip/ZipEntry", "getSize", "()J",                   klj_ZipEntry_getSize},
+    {"java/util/zip/ZipEntry", "getCompressedSize", "()J",         klj_ZipEntry_getCompressedSize},
+    {"java/util/zip/ZipEntry", "getMethod", "()I",                 klj_ZipEntry_getMethod},
+    {"java/io/InputStream", "read",      "([BII)I", klj_InputStream_read_off},
+    {"java/io/InputStream", "read",      "([B)I",   klj_InputStream_read_all},
+    {"java/io/InputStream", "read",      "()I",     klj_InputStream_read1},
+    {"java/io/InputStream", "skip",      "(J)J",    klj_InputStream_skip},
+    {"java/io/InputStream", "available", "()I",     klj_InputStream_available},
+    {"java/io/InputStream", "close",     "()V",     klj_InputStream_close},
     {"android/content/pm/PackageManager", "queryIntentActivities",
      "(Landroid/content/Intent;I)Ljava/util/List;", klj_PM_queryIntentActivities},
     {"java/lang/Object", "<init>",   "()V",                   klj_generic_init},
@@ -6868,6 +7561,8 @@ static const klj_binding g_bindings[] = {
 
     {"bitter/jnibridge/JNIBridge", "newInterfaceProxy",
      "(J[Ljava/lang/Class;)Ljava/lang/Object;", klj_JNIBridge_newInterfaceProxy},
+    {"bitter/jnibridge/JNIBridge", "disableInterfaceProxy",
+     "(Ljava/lang/Object;)V", klj_JNIBridge_disableInterfaceProxy},
 
     {"android/os/Bundle", "getString",  "(Ljava/lang/String;)Ljava/lang/String;", klj_Bundle_getString},
     {"android/os/Bundle", "getString",  "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", klj_Bundle_getString},

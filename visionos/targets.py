@@ -89,6 +89,40 @@ TARGETS = {
         "product": "KleptonSuperhot",
         "display": "Klepton SUPERHOT",
     },
+    "bonelab": {
+        # BONELAB — Unity 2021.3.16f1 + IL2CPP, and the same front door again
+        # (com.unity3d.player.UnityPlayerActivity, the Oculus VR intent
+        # category). Two things make it the fourth target rather than a fourth
+        # copy of the third:
+        #
+        #   - it is a SPLIT APPLICATION BINARY with TWO obbs. Beat Saber 1.40
+        #     taught this project that a guest's data can live beside the APK;
+        #     this one ships main.2974 AND patch.2974, 6.8 GB together, and the
+        #     patch is where the UnitySubsystems manifests and the whole
+        #     Addressables catalogue are. Nothing here pins "main" — the obb
+        #     directory is staged wholesale, so a guest that reads a patch reads
+        #     one (see stage_assets.sh).
+        #   - its boot.config takes the XR SDK path (`xrsdk-pre-init-library=
+        #     OculusXRPlugin`, `xr-meta-enabled=1`), which is 1.40's path and not
+        #     SUPERHOT's legacy `vr-device-list=Oculus`. It also SHIPS
+        #     libopenxr_loader and libMicrosoftOpenXRPlugin, which the pre-init
+        #     line says it does not use — so a run that ends up in OpenXR is a
+        #     run that fell out of the Oculus path, and that is worth reading as
+        #     a symptom rather than as a second front door.
+        #
+        # libSLZQuestNative and libRF_CNative_andr are the title's own; neither
+        # is replaced, so both translate like any other guest library.
+        "libs":    None,
+        "srcdir":  "bonelab/lib/arm64-v8a",
+        "tree":    "bonelab",
+        "apk":     "bonelab.apk",
+        "assets":  "bonelab/assets",
+        "qtplugins": "",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonBonelab",
+        "display": "Klepton BONELAB",
+    },
     "steamlink-vr": {
         # BOTH front doors, because the app runs both: the 2D shell pairs in a
         # WindowGroup and hands off to the OpenXR half in an ImmersiveSpace, in

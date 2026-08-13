@@ -167,5 +167,9 @@ void kl_jni_local_frame_pop(void);
 // ways and compares (CShellSystem::BIsVRHeadset), so a drift between them is
 // not cosmetic, it is a contradiction the guest can see.
 const char *kl_jni_build_string(const char *field);
+// ...and the int-valued ones (SDK_INT). See the implementation comment: this is
+// what lets __system_property_get("ro.build.version.sdk") answer from the same
+// place Build.VERSION.SDK_INT does.
+int kl_jni_build_int(const char *field, int dflt);
 
 #endif

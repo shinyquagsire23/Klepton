@@ -12,6 +12,7 @@
 #endif
 
 KL_TARGET_ROW("beatsaber", "beatsaber", "beatsaber.apk", "beatsaber/assets", "beatsaber/lib/arm64-v8a", "libmain", KL_GUEST_UNITY)
+KL_TARGET_ROW("bonelab", "bonelab", "bonelab.apk", "bonelab/assets", "bonelab/lib/arm64-v8a", "libmain", KL_GUEST_UNITY)
 KL_TARGET_ROW("steamlink-vr", "steamlink-vr", "steamlink-vr.apk", "steamlink-vr/assets", "steamlink-vr/lib/arm64-v8a", "libvrlink_scene", KL_GUEST_STEAMLINK)
 KL_TARGET_ROW("superhot", "superhot", "superhot.apk", "superhot/assets", "superhot/lib/arm64-v8a", "libmain", KL_GUEST_UNITY)
 

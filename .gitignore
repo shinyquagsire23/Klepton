@@ -4,6 +4,10 @@
 /steamlink-android/*
 /steamlink-vr/*
 /superhot/*
+/bonelab/*
+# ...and its game data, which does not ship in the APK: BONELAB is a split
+# application binary and the two .obb files beside it are 6.8 GB.
+/bonelab_obb/*
 *.apk
 
 # claude — CLAUDE.md and its notes/ satellites are local working notes

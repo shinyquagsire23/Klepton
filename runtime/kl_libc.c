@@ -175,8 +175,29 @@ static const struct { const char *prop, *build_field; } g_sysprops[] = {
     {"ro.build.version.codename",    "CODENAME"},
 };
 
+// `ro.build.version.sdk` is the API LEVEL, and it is the one property here whose
+// Build twin is an int rather than a string. It gets its own line because
+// leaving it out was expensive: bionic answers an unset property with an empty
+// string, every caller reads that as **0**, and a guest that asks the platform
+// how old it is and hears "zero" concludes it is running on something that
+// predates everything it needs.
+//
+// BONELAB is where that surfaced. Unity's native AndroidGetApiLevel() reads this
+// property (the JNI Build.VERSION.SDK_INT we answer 29 to is a DIFFERENT door to
+// the same fact), so the engine decided no graphics API was supported — first
+// the "Your device does not match the hardware requirements of this
+// application" warning, then a GLES **2** context, then `Desired shader compiler
+// platform 5 is not available in shader blob`, because platform 5 is GLES20 and
+// the game ships no GLES2 shaders. Three symptoms, all graphics-shaped, none of
+// them naming a property. Trap 6d again, and the table's own comment above
+// predicted it.
 static const char *sysprop_value(const char *n) {
     if (!n) return NULL;
+    if (strcmp(n, "ro.build.version.sdk") == 0) {
+        static char sdk[16];
+        snprintf(sdk, sizeof sdk, "%d", kl_jni_build_int("SDK_INT", 29));
+        return sdk;
+    }
     for (size_t i = 0; i < sizeof g_sysprops / sizeof *g_sysprops; i++)
         if (strcmp(n, g_sysprops[i].prop) == 0)
             return kl_jni_build_string(g_sysprops[i].build_field);
@@ -190,6 +211,10 @@ static const char *sysprop_value(const char *n) {
 // only ever passed straight back to __system_property_read.
 const void *klb_sysprop_find(const char *n) {
     if (!n) return NULL;
+    // The sdk entry is not in the table (its value is an int, not a Build
+    // string) and must still be findable, or the two-step form answers "no such
+    // property" for one this one-step form serves.
+    if (strcmp(n, "ro.build.version.sdk") == 0) return "ro.build.version.sdk";
     for (size_t i = 0; i < sizeof g_sysprops / sizeof *g_sysprops; i++)
         if (strcmp(n, g_sysprops[i].prop) == 0 && sysprop_value(n))
             return g_sysprops[i].prop;
