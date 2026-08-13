@@ -1486,7 +1486,7 @@ static int klxr_action_space_hand(const klxr_space *sp, int *is_aim);
 // two guests cannot be made to disagree by this knob. If this ever needs to
 // move into kl_ovrp, it needs a per-guest split at that moment — the shared
 // seam is the reason, not the knob.
-#define KLXR_GRIP_PITCH_DEFAULT (35.0f)
+#define KLXR_GRIP_PITCH_DEFAULT (37.0f)
 #define KLXR_AIM_PITCH_DEFAULT  (0.0f)
 static void klxr_pitch_about_x(XrPosef *p, float degrees) {
     if (degrees == 0.0f) return;

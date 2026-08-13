@@ -118,6 +118,7 @@ static const char kl_msl_reproject[] =
 "    uint     visible;    // 0 = collapse the quad, this eye has no picture\n"
 "    uint     srgbDecode; // 1 = the sample is an sRGB code value, not linear\n"
 "    uint     flipY;      // 1 = the picture's origin is the TOP left (Vulkan)\n"
+"    uint     gridEye;    // which grid BLOCK this view reads — kl_reproject.h\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -177,7 +178,15 @@ static const char kl_msl_reproject[] =
 "    //\n"
 "    // An unfoveated pass binds the 1x1 identity grid, and everything below\n"
 "    // reduces to the two triangles that used to be a 4-vertex strip.\n"
+"    //\n"
+"    // The coordinates may start past 1: the two eyes can have been rendered\n"
+"    // into DIFFERENT sub-rects of one texture (kl_reproject.h, `grid_per_eye`),\n"
+"    // so a grid can carry one BLOCK per eye and u.gridEye says which is this\n"
+"    // view's. Derived from the nx/ny read out of the header rather than passed\n"
+"    // in, so a grid that fell back to the identity moves both the header and\n"
+"    // every block's base together and no view can be left pointing past it.\n"
 "    uint nx = uint(grid[0].x), ny = uint(grid[0].y);\n"
+"    uint base = 1u + u.gridEye * (nx + 1u) * (ny + 1u);\n"
 "    uint cell = vid / 6u, k = vid % 6u;\n"
 "    uint2 g = uint2(cell % nx, cell / nx);\n"
 "    // Two triangles a cell: (0,0)(1,0)(0,1) and (1,0)(1,1)(0,1).\n"
@@ -207,7 +216,7 @@ static const char kl_msl_reproject[] =
 "    // unwarp. The identity grid holds exactly float2(c.x, c.y), so the\n"
 "    // convention derived above is preserved rather than re-derived — and the\n"
 "    // table is built in this same uv space, so nothing here flips.\n"
-"    float2 uv = grid[1u + g.y * (nx + 1u) + g.x];\n"
+"    float2 uv = grid[base + g.y * (nx + 1u) + g.x];\n"
 // ...except for a guest whose framebuffer origin is the TOP left. That is
 // Vulkan, and it is the one thing about the picture that the API the guest drew
 // with decides rather than anything here (kl_reproject.h, `flip_y`). Applied
@@ -324,6 +333,16 @@ void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
                              float screen_w, float screen_h,
                              float tex_w, float tex_h,
                              kl_reproject_s2p fn, void *ctx) {
+    kl_reproject_grid_build_eye(out, 0, nx, ny, vp, screen_w, screen_h,
+                                tex_w, tex_h, fn, ctx);
+}
+
+void kl_reproject_grid_build_eye(simd_float2 *out, uint32_t eye,
+                                 uint32_t nx, uint32_t ny,
+                                 const float *vp,
+                                 float screen_w, float screen_h,
+                                 float tex_w, float tex_h,
+                                 kl_reproject_s2p fn, void *ctx) {
     // A degenerate grid would be a pass that draws nothing, which is a black
     // eye rather than an unfoveated one. Fall back to the identity, which is
     // the correct picture for an unwarped, fully-drawn texture and merely the
@@ -332,7 +351,18 @@ void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
     if (nx == 0 || ny == 0 || nx > KL_REPROJECT_GRID_MAX ||
         ny > KL_REPROJECT_GRID_MAX || !(tex_w > 0) || !(tex_h > 0) ||
         !(screen_w > 0) || !(screen_h > 0)) {
+        // The identity, in this EYE's block of a 1x1 grid: the shader derives
+        // every block's base from the header it reads, so collapsing the header
+        // to 1x1 moves eye 1's base to 5 whether this call or the other one
+        // took the fallback. Writing it at 1 unconditionally would leave a
+        // second eye reading whatever followed.
         kl_reproject_grid_identity(out);
+        if (eye) {
+            out[5] = simd_make_float2(0.0f, 0.0f);
+            out[6] = simd_make_float2(1.0f, 0.0f);
+            out[7] = simd_make_float2(0.0f, 1.0f);
+            out[8] = simd_make_float2(1.0f, 1.0f);
+        }
         return;
     }
     // The span the guest drew, in screen pixels. Absent or nonsensical means it
@@ -350,6 +380,11 @@ void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
         if (!(vw > 0) || !(vh > 0)) { vx = vy = 0; vw = screen_w; vh = screen_h; }
     }
     out[0] = simd_make_float2((float)nx, (float)ny);
+    // Where this eye's block starts — the same arithmetic kl_reproject_build
+    // puts in the uniform, and the reason it is not a second convention: both
+    // read kl_reproject_grid_stride, so a block written here and the base
+    // handed to the shader cannot disagree.
+    const uint32_t base = 1u + eye * kl_reproject_grid_stride(nx, ny);
     for (uint32_t y = 0; y <= ny; y++) {
         for (uint32_t x = 0; x <= nx; x++) {
             // Grid vertex -> uv -> SCREEN pixels, inside the viewport. Top-left
@@ -368,7 +403,7 @@ void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
             // eye with a shrunken viewport still has to be corrected, and it is
             // the commonest case of the two (KL_VRR=0, and every host run).
             if (fn) fn(ctx, sx, sy, &px, &py);
-            out[1 + y * (nx + 1) + x] = simd_make_float2(px / tex_w, py / tex_h);
+            out[base + y * (nx + 1) + x] = simd_make_float2(px / tex_w, py / tex_h);
         }
     }
 }
@@ -395,10 +430,17 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
                                          simd_float4x4 origin_from_device,
                                          simd_float4x4 device_from_view,
                                          simd_float4x4 projection,
-                                         uint32_t slice, int flip_y) {
+                                         uint32_t slice, int flip_y,
+                                         int grid_per_eye) {
     kl_reproject_uniforms u;
     u.projection = projection;
     u.slice = slice;
+    // Which grid block this eye reads. `eye` and `slice` are not the same
+    // number and neither could stand in for this one: an Array-layout guest has
+    // slice == eye, a Stereo-layout one has two textures and slice 0 for both,
+    // and a caller that built a single shared block wants block 0 whatever the
+    // eye is.
+    u.grid_eye = (grid_per_eye && eye == 1) ? 1u : 0u;
     // Passed in rather than read from a global, unlike srgb_decode below: the
     // flip is a property of ONE (eye, stage) texture and its recorded answer
     // lives in kl_glfb's eye table, which this file cannot reach without taking

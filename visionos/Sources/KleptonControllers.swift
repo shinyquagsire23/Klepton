@@ -288,10 +288,10 @@ private struct KLSenseTune {
     /// log line and the source agree on where each degree came from.
     static let psvr2Tilt: Float = 5.037
     static let hiltPitch: Float =
-        ProcessInfo.processInfo.environment["KL_SENSE_PITCH"].flatMap { Float($0) } ?? -35
+        ProcessInfo.processInfo.environment["KL_SENSE_PITCH"].flatMap { Float($0) } ?? -37
 
     var rot = klEulerXYZ(SIMD3<Float>(psvr2Tilt + hiltPitch, 0, 0))
-    var pos = SIMD3<Float>(0.002, 0, -0.01)
+    var pos = SIMD3<Float>(-0.004, 0.02, -0.06)
 
     static let shared: [KLSenseTune] = [make(0), make(1)]
 

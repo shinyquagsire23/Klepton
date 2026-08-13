@@ -111,6 +111,25 @@ static void         *g_grid_map;
 static uint32_t      g_grid_w, g_grid_h, g_grid_verts;
 static float         g_grid_vp[4];
 
+// Which eye this window shows. One, because the window is one flat surface —
+// but WHICH one is a question worth being able to ask: a guest under Oculus
+// symmetric projection renders the two eyes into different sub-rects of one
+// texture (notes/BONELAB.md), so eye 1 is the one whose crop and whose quad can
+// be wrong while eye 0 looks perfect. Without this the only instrument for that
+// is a person wearing the headset.
+//
+// Pairs with KL_OVRP_EYE_TAN, which is what gives a host run a canted display
+// to have the problem on in the first place.
+static int klvm_eye(void) {
+    static int eye = -1;
+    if (eye < 0) {
+        eye = kl_env_int("KL_VIEW_EYE", 0);
+        if (eye != 1) eye = 0;
+        if (eye) fprintf(stderr, "  [view] KL_VIEW_EYE=1: compositing the RIGHT eye\n");
+    }
+    return eye;
+}
+
 // `vp` is the guest's render viewport for this frame in eye-texture pixels, or
 // NULL for the whole texture — kl_ovrp_render_pose.viewport, read from the same
 // frame record the uniforms come from so the crop and the pose describe one
@@ -218,10 +237,13 @@ static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice, int flip_y
         device = simd_matrix4x4(simd_quaternion(r.qx, r.qy, r.qz, r.qw));
     }
 
-    const float *t = have ? r.tangents[0] : (const float[]){1, 1, 1, 1};
+    int eye = klvm_eye();
+    const float *t = have ? r.tangents[eye] : (const float[]){1, 1, 1, 1};
     simd_float4x4 proj = kl_reproject_projection(t[0], t[1], t[2], t[3], 0.03f);
-    return kl_reproject_build(have ? &r : NULL, 0, device,
-                              matrix_identity_float4x4, proj, slice, flip_y);
+    // grid_per_eye = 0: this window draws ONE eye, so the grid it binds has one
+    // block and that block was built with this eye's viewport.
+    return kl_reproject_build(have ? &r : NULL, eye, device,
+                              matrix_identity_float4x4, proj, slice, flip_y, 0);
 }
 
 // Which frame of the guest's this composite would be showing, and 0 for "none
@@ -404,13 +426,14 @@ int kl_viewmtl_present(int win_w, int win_h) {
     int stage = kl_ovrp_last_complete_stage();
     if (stage < 0) stage = 0;
     int slice = 0;
-    void *texp = kl_glfb_eye_mtl_texture(0, stage, &slice);
+    int eye = klvm_eye();
+    void *texp = kl_glfb_eye_mtl_texture(eye, stage, &slice);
     if (!texp) return 0;
     id<MTLTexture> src = (__bridge id<MTLTexture>)texp;
     // Which way up the guest drew it, recorded with the texture — see
     // kl_reproject.h. Read per (eye, stage) rather than decided once, because
     // it is a property of the storage and not of this compositor.
-    int flip = kl_glfb_eye_mtl_origin_top_left(0, stage);
+    int flip = kl_glfb_eye_mtl_origin_top_left(eye, stage);
 
     int fenced = 0;
     uint64_t v = klvm_frame_value(&fenced);
@@ -465,13 +488,14 @@ int kl_viewmtl_present(int win_w, int win_h) {
         // path caps at 4 KB and a grid dense enough to land on the map's zone
         // boundaries is bigger than that.
         uint32_t gverts = 0;
-        // ...and the crop, from the same record the uniforms above came from.
-        // Eye 0's, because this viewer composites eye 0 — the visionOS
-        // compositor is the one that has to reconcile a pair.
+        // ...and the crop, from the same record the uniforms above came from,
+        // for the eye this window is showing. The two are not interchangeable
+        // — see klvm_eye — and the visionOS compositor, which draws both in one
+        // pass, carries a grid block per eye rather than picking.
         kl_ovrp_render_pose vr;
         float vp[4] = { 0, 0, 0, 0 };
         if (kl_ovrp_stage_render_pose(stage, &vr)) {
-            for (int i = 0; i < 4; i++) vp[i] = (float)vr.viewport[0][i];
+            for (int i = 0; i < 4; i++) vp[i] = (float)vr.viewport[eye][i];
             // The same guard KleptonCompositor carries, and for the same reason:
             // a rect measured against another eye texture describes nothing
             // about this one, and cropping by it MAGNIFIES the picture by the
@@ -488,7 +512,7 @@ int kl_viewmtl_present(int win_w, int win_h) {
                                     "eye texture, but the texture in hand is %ux%u — "
                                     "NOT cropping, that rect describes another "
                                     "texture\n",
-                            vr.viewport[0][2], vr.viewport[0][3],
+                            vr.viewport[eye][2], vr.viewport[eye][3],
                             vr.viewport_of[0], vr.viewport_of[1],
                             (unsigned)src.width, (unsigned)src.height);
                 }
@@ -505,9 +529,9 @@ int kl_viewmtl_present(int win_w, int win_h) {
                 said = 1;
                 fprintf(stderr, "  [view] first render viewport read from the frame "
                                 "record: %d,%d %dx%d (stage %d, serial %llu)%s\n",
-                        vr.viewport[0][0], vr.viewport[0][1], vr.viewport[0][2],
-                        vr.viewport[0][3], stage, (unsigned long long)vr.serial,
-                        vr.viewport[0][2] <= 0
+                        vr.viewport[eye][0], vr.viewport[eye][1], vr.viewport[eye][2],
+                        vr.viewport[eye][3], stage, (unsigned long long)vr.serial,
+                        vr.viewport[eye][2] <= 0
                             ? "  <- ZERO, so no crop is applied; compare against "
                               "the [ovrp] render viewport line" : "");
             }

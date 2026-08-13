@@ -1416,7 +1416,7 @@ final class KleptonCompositor {
             // with nil is the case kl_reproject_build already handles.
             var probe = kl_reproject_build(nil, 0, matrix_identity_float4x4,
                                            drawable.views[0].transform,
-                                           drawable.computeProjection(viewIndex: 0), 0, 0)
+                                           drawable.computeProjection(viewIndex: 0), 0, 0, 0)
             let ndcZ = withUnsafePointer(to: &probe) { kl_reproject_ndc_depth($0) }
             NSLog(String(format: "[cp] drawable depthRange = %@ (x=far, y=near in "
                                  + "reverse-Z); quad at %.1f m lands at NDC z %.6f "
@@ -1672,7 +1672,10 @@ final class KleptonCompositor {
                                    originFromDevice, view.transform,
                                    drawable.computeProjection(viewIndex: vi),
                                    UInt32(alloc?.slice ?? 0),
-                                   (alloc?.flipY ?? false) ? 1 : 0)
+                                   (alloc?.flipY ?? false) ? 1 : 0,
+                                   // Shared grid for now; the block per eye is
+                                   // assigned below, once the grid is known.
+                                   0)
             }
             // KL_CP_EYE=<0|1> — composite ONLY that eye and leave the other
             // cleared. The measurement this whole hunt has been missing: it
@@ -1745,6 +1748,66 @@ final class KleptonCompositor {
                   + "layered=\(layered) stage=\(stage)")
         }
 
+        // ---------------------------------------------------------------
+        // The crop, from the same frame record `rendered` came from — and it is
+        // read PER EYE.
+        //
+        // The comment that stood here said one grid serves the amplified pass,
+        // so two eyes with different viewports could not both be honoured, took
+        // eye 0's, and justified it: Unity derives both from a single
+        // `renderViewportScale`, so they are equal in every measured run. That
+        // is true of a title that scales its resolution and FALSE of one using
+        // Oculus symmetric projection, where both eyes are rendered with one
+        // union frustum into a widened texture and each eye's own cone is a
+        // different sub-rect of it — measured on BONELAB, eye 0 at x=0 and eye 1
+        // at x=609, both 2271 wide of 2880 (notes/BONELAB.md). Eye 1 read
+        // through eye 0's crop is its picture shifted by that offset, with every
+        // call on the path returning success.
+        //
+        // So the grid carries a BLOCK PER EYE when the two rects differ, and one
+        // block when they do not — which is bit-for-bit the old path for every
+        // guest that has ever run here.
+        var vp0 = SIMD4<Float>.zero
+        var vp1 = SIMD4<Float>.zero
+        var vpOf = SIMD2<Float>.zero
+        if haveRendered {
+            let l = rendered.viewport.0, r = rendered.viewport.1
+            vp0 = SIMD4<Float>(Float(l.0), Float(l.1), Float(l.2), Float(l.3))
+            vp1 = SIMD4<Float>(Float(r.0), Float(r.1), Float(r.2), Float(r.3))
+            vpOf = SIMD2<Float>(Float(rendered.viewport_of.0),
+                                Float(rendered.viewport_of.1))
+            // Said once, and said even when it is ZERO — which is the whole
+            // point. `[ovrp] render viewport` is printed by the guest's own
+            // EndFrame4 on the guest's thread, and until this line existed there
+            // was nothing anywhere saying whether the number reached the
+            // COMPOSITE. Those are different failures with one symptom: a rect
+            // the submit never carried, a rect filed against another stage, and
+            // a rect read correctly and cropped wrongly all look identical from
+            // inside the headset. Zeroes here beside a non-100% line there is
+            // the first; agreement is the third.
+            if !loggedReadViewport {
+                loggedReadViewport = true
+                NSLog("[cp] first render viewport read from the frame record: "
+                      + "\(l.0),\(l.1) \(l.2)x\(l.3) (stage \(stage), serial "
+                      + "\(rendered.serial))"
+                      + (l.2 <= 0 ? " — ZERO, so no crop is applied; compare "
+                                  + "against the [ovrp] render viewport line" : ""))
+            }
+        }
+        let (gridBuf, gridVerts, gridPerEye) =
+            unwarpGrid(source, viewport0: vp0, viewport1: vp1, viewportOf: vpOf)
+        // ...and which block each view reads. Assigned here rather than passed
+        // to kl_reproject_build above because the decision needs the eye
+        // texture, which is not known until the loop that builds the uniforms
+        // has run — so the uniforms are built for a shared grid (grid_per_eye
+        // 0, the default and the old behaviour) and only a grid that really
+        // carries two blocks moves eye 1 onto its own.
+        if gridPerEye {
+            for (n, vi) in viewIndices.enumerated() where vi == 1 {
+                uniforms[n].grid_eye = 1
+            }
+        }
+
         // The viewport matters here in a way it did not for a full-screen
         // triangle: the quad is projected, so it lands where the projection
         // says, and the view's own bounds within a shared texture are part of
@@ -1772,43 +1835,6 @@ final class KleptonCompositor {
         // The unwarp grid, bound to the VERTEX stage. Identity until the guest's
         // eye textures are foveated; after that it carries the squeeze this pass
         // has to undo. See unwarpGrid and kl_reproject.h.
-        // The crop, from the same frame record `rendered` came from. ONE grid is
-        // bound for an amplified pass, so two eyes with different viewports
-        // cannot both be honoured — take eye 0's and say so once. Unity derives
-        // both from a single `renderViewportScale`, so they are equal in every
-        // measured run; a difference would be a change of shape, not a tweak.
-        var vp = SIMD4<Float>.zero
-        var vpOf = SIMD2<Float>.zero
-        if haveRendered {
-            let l = rendered.viewport.0, r = rendered.viewport.1
-            vp = SIMD4<Float>(Float(l.0), Float(l.1), Float(l.2), Float(l.3))
-            vpOf = SIMD2<Float>(Float(rendered.viewport_of.0),
-                                Float(rendered.viewport_of.1))
-            // Said once, and said even when it is ZERO — which is the whole
-            // point. `[ovrp] render viewport` is printed by the guest's own
-            // EndFrame4 on the guest's thread, and until this line existed there
-            // was nothing anywhere saying whether the number reached the
-            // COMPOSITE. Those are different failures with one symptom: a rect
-            // the submit never carried, a rect filed against another stage, and
-            // a rect read correctly and cropped wrongly all look identical from
-            // inside the headset. Zeroes here beside a non-100% line there is
-            // the first; agreement is the third.
-            if !loggedReadViewport {
-                loggedReadViewport = true
-                NSLog("[cp] first render viewport read from the frame record: "
-                      + "\(l.0),\(l.1) \(l.2)x\(l.3) (stage \(stage), serial "
-                      + "\(rendered.serial))"
-                      + (l.2 <= 0 ? " — ZERO, so no crop is applied; compare "
-                                  + "against the [ovrp] render viewport line" : ""))
-            }
-            if (r.0, r.1, r.2, r.3) != (l.0, l.1, l.2, l.3), !loggedSplitViewports {
-                loggedSplitViewports = true
-                NSLog("[cp] the eyes submitted DIFFERENT render viewports "
-                      + "(\(l.0),\(l.1) \(l.2)x\(l.3) vs \(r.0),\(r.1) \(r.2)x\(r.3)) "
-                      + "— one unwarp grid serves both, so eye 0's is used")
-            }
-        }
-        let (gridBuf, gridVerts) = unwarpGrid(source, viewport: vp, viewportOf: vpOf)
         enc.setVertexBuffer(gridBuf, offset: 0, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
         enc.endEncoding()
@@ -1966,6 +1992,13 @@ final class KleptonCompositor {
     private var gridTexW = -1, gridTexH = -1
     private var gridVertexCount = 0
     private var gridViewport: SIMD4<Float> = .zero
+    /// Eye 1's rect, and whether the built grid carries a block for it. Part of
+    /// the cache key: a guest that starts using symmetric projection partway
+    /// through (BONELAB does — the plugin turns it on once the eye textures are
+    /// sized) changes only this one, and a grid keyed on eye 0's alone would
+    /// never be rebuilt.
+    private var gridViewportR: SIMD4<Float> = .zero
+    private var gridPerEye = false
     private var loggedSplitViewports = false
     private var loggedReadViewport = false
     private var loggedViewportOfSkew = false
@@ -1991,14 +2024,17 @@ final class KleptonCompositor {
     /// the key: Beat Saber shrinks it on entering a map (§ the render-viewport
     /// note in kl_ovrp.h), and a grid built for the previous viewport crops the
     /// wrong rectangle with nothing anywhere reporting it.
+    /// Returns the grid, the vertex count, and whether it carries a BLOCK PER
+    /// EYE — which it does exactly when the two eyes submitted different rects.
     private func unwarpGrid(_ source: MTLTexture?,
-                            viewport: SIMD4<Float>,
-                            viewportOf: SIMD2<Float>) -> (MTLBuffer?, Int) {
+                            viewport0: SIMD4<Float>,
+                            viewport1: SIMD4<Float>,
+                            viewportOf: SIMD2<Float>) -> (MTLBuffer?, Int, Bool) {
         let map = kl_glfb_eye_rate_map()
         let tw = source?.width ?? 0, th = source?.height ?? 0
         // A viewport that IS the whole texture is not a crop, and keeping it as
         // .zero means an unscaled title never leaves the pre-existing path.
-        var vp = viewport
+        //
         // **A rect measured against another texture is not a crop, it is a
         // coincidence.** `viewportOf` is the eye texture size the guest's submit
         // was relative to (kl_ovrp.h); when it is not the texture in hand, the
@@ -2014,23 +2050,46 @@ final class KleptonCompositor {
         // which region the guest wrote, and inventing one is how the first
         // version of this went wrong. Not cropping is the pre-viewport
         // behaviour — visibly wrong if it ever fires, which is the point.
-        if vp.z > 0, viewportOf.x > 0, viewportOf.y > 0,
-           Int(viewportOf.x) != tw || Int(viewportOf.y) != th {
-            if !loggedViewportOfSkew {
-                loggedViewportOfSkew = true
-                NSLog("[cp] the render viewport is \(Int(vp.z))x\(Int(vp.w)) of a "
-                      + "\(Int(viewportOf.x))x\(Int(viewportOf.y)) eye texture, but "
-                      + "the texture in hand is \(tw)x\(th) — NOT cropping, because "
-                      + "that rect describes another texture (kl_ovrp.h viewport_of)")
+        //
+        // Applied to BOTH eyes, and it is one decision for the pair: a texture
+        // the rects do not describe does not describe either of them.
+        func sanitise(_ r: SIMD4<Float>) -> SIMD4<Float> {
+            var vp = r
+            if vp.z > 0, viewportOf.x > 0, viewportOf.y > 0,
+               Int(viewportOf.x) != tw || Int(viewportOf.y) != th {
+                if !loggedViewportOfSkew {
+                    loggedViewportOfSkew = true
+                    NSLog("[cp] the render viewport is \(Int(vp.z))x\(Int(vp.w)) of a "
+                          + "\(Int(viewportOf.x))x\(Int(viewportOf.y)) eye texture, but "
+                          + "the texture in hand is \(tw)x\(th) — NOT cropping, because "
+                          + "that rect describes another texture (kl_ovrp.h viewport_of)")
+                }
+                vp = .zero
             }
-            vp = .zero
+            if vp.z <= 0 || vp.w <= 0 ||
+                (vp.x == 0 && vp.y == 0 && Int(vp.z) == tw && Int(vp.w) == th) { vp = .zero }
+            return vp
         }
-        if vp.z <= 0 || vp.w <= 0 ||
-            (vp.x == 0 && vp.y == 0 && Int(vp.z) == tw && Int(vp.w) == th) { vp = .zero }
+        let vp = sanitise(viewport0)
+        let vpR = sanitise(viewport1)
+        // Two blocks only when the eyes really disagree. Equal rects — every
+        // guest measured here before BONELAB's symmetric projection — take the
+        // single-block path unchanged, cache key and all.
+        let perEye = vp != vpR
+        if perEye, !loggedSplitViewports {
+            loggedSplitViewports = true
+            NSLog("[cp] the eyes submitted DIFFERENT render viewports "
+                  + "(\(Int(vp.x)),\(Int(vp.y)) \(Int(vp.z))x\(Int(vp.w)) vs "
+                  + "\(Int(vpR.x)),\(Int(vpR.y)) \(Int(vpR.z))x\(Int(vpR.w))) "
+                  + "— the unwarp grid carries a block per eye")
+        }
         let cropped = vp.z > 0 && vp.w > 0
+        let croppedR = vpR.z > 0 && vpR.w > 0
+        let eyes: UInt32 = perEye ? 2 : 1
         if gridBuffer == nil || map != gridMap || tw != gridTexW || th != gridTexH
-            || vp != gridViewport {
-            gridMap = map; gridTexW = tw; gridTexH = th; gridViewport = vp
+            || vp != gridViewport || vpR != gridViewportR {
+            gridMap = map; gridTexW = tw; gridTexH = th
+            gridViewport = vp; gridViewportR = vpR
             var nx: UInt32 = 1, ny: UInt32 = 1
             if let map, tw > 0, th > 0,
                let rm = Unmanaged<AnyObject>.fromOpaque(map)
@@ -2052,45 +2111,58 @@ final class KleptonCompositor {
                 let cap = Int32(KL_REPROJECT_GRID_MAX)
                 nx = UInt32(max(1, min(cap, zx)))
                 ny = UInt32(max(1, min(cap, zy)))
-                let n = Int(kl_reproject_grid_entries(nx, ny))
+                let n = Int(kl_reproject_grid_entries_n(nx, ny, eyes))
                 var table = [SIMD2<Float>](repeating: .zero, count: n)
                 let scr = rm.screenSize
-                var rect = [vp.x, vp.y, vp.z, vp.w]
-                table.withUnsafeMutableBufferPointer { buf in
-                    rect.withUnsafeBufferPointer { r in
-                        kl_reproject_grid_build(buf.baseAddress, nx, ny,
-                                                cropped ? r.baseAddress : nil,
-                                                Float(scr.width), Float(scr.height),
-                                                Float(tw), Float(th),
-                                                Self.screenToPhysical, map)
+                var rects = [[vp.x, vp.y, vp.z, vp.w], [vpR.x, vpR.y, vpR.z, vpR.w]]
+                let croppedEye = [cropped, croppedR]
+                for e in 0..<Int(eyes) {
+                    table.withUnsafeMutableBufferPointer { buf in
+                        rects[e].withUnsafeBufferPointer { r in
+                            kl_reproject_grid_build_eye(buf.baseAddress, UInt32(e), nx, ny,
+                                                        croppedEye[e] ? r.baseAddress : nil,
+                                                        Float(scr.width), Float(scr.height),
+                                                        Float(tw), Float(th),
+                                                        Self.screenToPhysical, map)
+                        }
                     }
                 }
                 gridBuffer = queue?.device.makeBuffer(bytes: table,
                                                       length: n * MemoryLayout<SIMD2<Float>>.stride)
-                NSLog("[cp] unwarp grid \(nx)x\(ny) for a \(tw)x\(th) eye texture "
+                NSLog("[cp] unwarp grid \(nx)x\(ny)\(perEye ? " x2 eyes" : "") for a "
+                      + "\(tw)x\(th) eye texture "
                       + "(map screen \(scr.width)x\(scr.height), viewport "
                       + (cropped ? "\(Int(vp.x)),\(Int(vp.y)) \(Int(vp.z))x\(Int(vp.w))"
-                                 : "whole texture") + ")")
-            } else if cropped {
+                                 : "whole texture")
+                      + (perEye ? " / \(Int(vpR.x)),\(Int(vpR.y)) "
+                                  + "\(Int(vpR.z))x\(Int(vpR.w))" : "") + ")")
+            } else if cropped || croppedR {
                 // No rate map, and still a crop to do. One cell suffices: with
                 // no map the screen->texture mapping is affine, so the four
                 // corners carry it exactly. THIS is the path a KL_VRR=0 run
-                // takes, and the one the corner-of-the-eye bug lived on.
-                let n = Int(kl_reproject_grid_entries(1, 1))
+                // takes, and the one the corner-of-the-eye bug lived on — and
+                // the one BONELAB's symmetric projection lands on today.
+                let n = Int(kl_reproject_grid_entries_n(1, 1, eyes))
                 var table = [SIMD2<Float>](repeating: .zero, count: n)
-                var rect = [vp.x, vp.y, vp.z, vp.w]
-                table.withUnsafeMutableBufferPointer { buf in
-                    rect.withUnsafeBufferPointer { r in
-                        kl_reproject_grid_build(buf.baseAddress, 1, 1, r.baseAddress,
-                                                Float(tw), Float(th),
-                                                Float(tw), Float(th), nil, nil)
+                var rects = [[vp.x, vp.y, vp.z, vp.w], [vpR.x, vpR.y, vpR.z, vpR.w]]
+                let croppedEye = [cropped, croppedR]
+                for e in 0..<Int(eyes) {
+                    table.withUnsafeMutableBufferPointer { buf in
+                        rects[e].withUnsafeBufferPointer { r in
+                            kl_reproject_grid_build_eye(buf.baseAddress, UInt32(e), 1, 1,
+                                                        croppedEye[e] ? r.baseAddress : nil,
+                                                        Float(tw), Float(th),
+                                                        Float(tw), Float(th), nil, nil)
+                        }
                     }
                 }
                 gridBuffer = queue?.device.makeBuffer(bytes: table,
                                                       length: n * MemoryLayout<SIMD2<Float>>.stride)
                 NSLog("[cp] render viewport \(Int(vp.x)),\(Int(vp.y)) "
-                      + "\(Int(vp.z))x\(Int(vp.w)) of a \(tw)x\(th) eye texture "
-                      + "— compositing that sub-rect")
+                      + "\(Int(vp.z))x\(Int(vp.w))"
+                      + (perEye ? " / \(Int(vpR.x)),\(Int(vpR.y)) "
+                                  + "\(Int(vpR.z))x\(Int(vpR.w))" : "")
+                      + " of a \(tw)x\(th) eye texture — compositing that sub-rect")
             } else {
                 let n = Int(kl_reproject_grid_entries(1, 1))
                 var table = [SIMD2<Float>](repeating: .zero, count: n)
@@ -2099,8 +2171,9 @@ final class KleptonCompositor {
                                                       length: n * MemoryLayout<SIMD2<Float>>.stride)
             }
             gridVertexCount = Int(kl_reproject_grid_vertices(nx, ny))
+            gridPerEye = perEye
         }
-        return (gridBuffer, gridVertexCount)
+        return (gridBuffer, gridVertexCount, gridPerEye)
     }
 
     private func pushEyeTextureSize(_ drawable: LayerRenderer.Drawable) {

@@ -650,6 +650,27 @@ puts the camera on the ground with its hands underneath it.
 - `KL_OVRP_EYE_CANT=0` — ignore the per-eye rotation the frontend pushes
   (`kl_ovrp_set_eye_rotation`) and restore the dropped-cant behaviour as the
   A/B. Identity by default, so host and headless runs are unchanged.
+- `KL_OVRP_EYE_TAN=vision` or `=l,r,t,b` — force a **canted** pair of eye
+  frusta, overriding whatever the frontend measured. `vision` is Vision Pro's
+  own (eye 0 `l=1.73205 r=1.0 t=1.0 b=1.19175`, eye 1 the horizontal mirror);
+  the four-number form takes eye 0's cone and mirrors it. **This is what makes
+  the canted-display failures reproducible on the host**: with the default
+  symmetric `{1,1,1,1}` a guest that collapses the two cones is
+  indistinguishable from one that honours them, every per-eye viewport comes
+  back full width, and the only instrument left is a person in the headset.
+  Pairs with `KL_VIEW_EYE=1`. Read on the same path as the union below, so it
+  overrides the compositor on device too.
+- `KL_OVRP_UNIFY_FRUSTUM=1` — tell **both** eyes the union of the two cones.
+  **Default 0 as of 2026-08-13**; it used to default to on for a multiview
+  guest, which was the stopgap for BONELAB's warped right eye. That is now
+  understood — it is Oculus symmetric projection, the plugin computes the same
+  union itself and submits a per-eye `ViewportRect` saying where each eye's
+  picture landed, and the composite honours those (notes/BONELAB.md). Told the
+  union, the guest stops widening its own eye texture and each eye loses ~21% of
+  its horizontal pixels. Renders correctly on device with it **off**
+  (2026-08-13, user-confirmed), so 1 is now purely the A/B — and the answer for
+  any guest ever found that collapses the cones without submitting per-eye
+  rects, which would be unservable any other way.
 - `KL_OVRP_QUEST_FOV=1` — keep the synthetic symmetric 90° frustum and the
   Quest 2's 72 Hz instead of the display's own measured numbers (the visionOS
   compositor's priming pass measures and logs both either way). A free A/B if
@@ -932,6 +953,12 @@ The composite/timewarp pass — one file, compiled by both compositors
   Measured 23.5 fps against the hardware compositor's 54.7 on the same scene,
   and it needs no Metal interop — which is what makes it the A/B when the
   compositor shows the wrong picture.
+- `KL_VIEW_EYE=1` — composite the **right** eye instead of the left. The window
+  shows one eye, and which one is not a detail: a guest under Oculus symmetric
+  projection renders the two eyes into different sub-rects of one texture
+  (notes/BONELAB.md), so eye 1 is the one whose crop and whose quad can be wrong
+  while eye 0 looks perfect. With `KL_OVRP_EYE_TAN=vision` and
+  `KL_VIEW_TIMEWARP=1` this is the whole canted-stereo failure, on macOS.
 - `KL_VIEW_TIMEWARP=1` — composite the viewer's frame through the reprojection
   pass, against the pose the guest *actually rendered it with* (`kl_ovrp`'s
   stage-keyed record) instead of the current one — mouse-look motion between

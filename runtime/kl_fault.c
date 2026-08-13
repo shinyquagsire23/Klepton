@@ -10,6 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/ucontext.h>
+#include <mach/mach.h>
 #include "klepton.h"
 #include "kl_fault.h"
 #include "kl_egl.h"
@@ -56,6 +57,59 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                       (unsigned long long)tid,
                       pthread_main_np() ? " (main)" : " (a guest worker thread)");
     if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+
+    // WHAT KIND OF PAGE the address is, for a memory fault.
+    //
+    // "signal 10 at 0x13fc5c000" and "signal 11 at 0x9c0" are different bugs
+    // that the signal number alone barely separates, and the interesting middle
+    // case is invisible without this: an address that IS mapped, at a
+    // protection that refuses the access. A page-aligned SIGBUS one page past
+    // live data is a GUARD page — a buffer walked off its end — and reads
+    // identically to an unmapped address from here.
+    //
+    // mach_vm_region names the enclosing region and its protection, so the line
+    // says which of the three it is. It is not async-signal-safe and neither is
+    // anything else in this function; we are already dying.
+    if ((sig == SIGSEGV || sig == SIGBUS) && si && si->si_addr) {
+        // vm_region_64, not mach_vm_region: `mach/mach_vm.h` is an `#error` on
+        // the xrOS SDK, and on arm64 vm_address_t is 64 bits anyway, so the
+        // portable spelling loses nothing and builds for every platform this
+        // reporter has to exist on.
+        vm_address_t a = (vm_address_t)(uintptr_t)si->si_addr;
+        vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        vm_address_t start = a;
+        kern_return_t kr = vm_region_64(mach_task_self(), &start, &sz,
+                                        VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS)
+            n = snprintf(buf, sizeof buf,
+                         "    the address is in NO mapping at all\n");
+        else if (start > a)
+            // The first region at or after the address starts past it, so the
+            // address itself is in a hole.
+            n = snprintf(buf, sizeof buf,
+                         "    the address is UNMAPPED — the next region starts "
+                         "%llu bytes on\n", (unsigned long long)(start - a));
+        else
+            n = snprintf(buf, sizeof buf,
+                         "    in a %llu-byte region at %p, prot %c%c%c (max %c%c%c)"
+                         "%s%s\n",
+                         (unsigned long long)sz, (void *)(uintptr_t)start,
+                         info.protection & VM_PROT_READ    ? 'r' : '-',
+                         info.protection & VM_PROT_WRITE   ? 'w' : '-',
+                         info.protection & VM_PROT_EXECUTE ? 'x' : '-',
+                         info.max_protection & VM_PROT_READ    ? 'r' : '-',
+                         info.max_protection & VM_PROT_WRITE   ? 'w' : '-',
+                         info.max_protection & VM_PROT_EXECUTE ? 'x' : '-',
+                         info.protection == VM_PROT_NONE
+                             ? " — a GUARD page: something walked off the end of "
+                               "the mapping before it" : "",
+                         info.reserved ? " (reserved)" : "");
+        if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+    }
 
     // Walk the frame chain. The faulting pc is usually in libsystem — memmove
     // with a null pointer says nothing about who passed it — so what matters is

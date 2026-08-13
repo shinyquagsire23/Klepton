@@ -789,44 +789,43 @@ void kl_ovrp_set_eye_frustum(int eye, float left, float right, float top, float 
     g_eye_tan[eye][2] = top;   g_eye_tan[eye][3] = bottom;
 }
 
-// **A MULTIVIEW guest renders ONE frustum for both eyes, so it must be TOLD
-// one.**
+// **KL_OVRP_UNIFY_FRUSTUM — the frustum union, and it is OFF, because the thing
+// it was covering for is now understood and served properly.**
 //
-// Measured on BONELAB, on device: it asks `ovrp_GetNodeFrustum2` for node 0 and
-// node 1 from the render path itself
+// What was measured: BONELAB asks `ovrp_GetNodeFrustum2` for node 0 and node 1
+// from the render path itself
 // (`OculusDisplayProvider::GfxThread_PopulateNextFrameDesc`), is handed this
 // display's genuinely mirrored per-eye cones (l=1.732/r=1.000 against
-// l=1.000/r=1.732), and renders both eyes with the SAME cone anyway. Cross-
-// correlating the two captured eye layers puts them 0.5% of the width apart —
-// the IPD parallax and nothing else — where honouring the two frusta would put
-// them 26.8% apart. That is Single Pass Instanced doing what it does: one shared
-// projection for both views.
+// l=1.000/r=1.732), and renders both eyes with the SAME cone anyway — the two
+// captured eye layers correlate 0.5% of the width apart, the IPD parallax and
+// nothing else, where honouring the two frusta would put them 26.8% apart.
+// Handing both eyes the UNION of the cones made the picture right, because the
+// composite's quad then matched what was drawn.
 //
-// The damage is not in the guest's picture, which is fine. It is that
-// kl_reproject places each eye's quad using `g_eye_tan[eye]` — the frustum we
-// SAID it rendered with — so the right eye's picture is placed on a quad built
-// from a cone that is a mirror image of the one actually drawn. That is a ~27%
-// mis-registration, in opposite directions per eye: a warped, displaced,
-// pivoting right eye, with every call on the path returning success.
+// **It is Oculus SYMMETRIC PROJECTION, and the plugin computes that same union
+// itself** — read out of libOculusXRPlugin.so and then reproduced on the host
+// (notes/BONELAB.md). The plugin takes max(L0,L1)/max(R0,R1), renders both eyes
+// with it, WIDENS its own eye texture by the ratio so the angular density is
+// preserved, and submits a per-eye `ViewportRect` naming the sub-rect of that
+// texture holding each eye's own cone — measured on BONELAB with a canted
+// display forced on the host: desc 2290x2400 becomes a 2880x2400 layer, eye 0
+// at 0,0 2271x2400 and eye 1 at 609,0 2271x2400. It turns on for a title that
+// asks for it when the renderer is Vulkan, the stereo mode is Multiview and the
+// headset is not a Quest 1 — which is why it appeared the day
+// ovrp_GetSystemMultiViewSupported2 started answering yes.
 //
-// So on a multiview guest both eyes are told the UNION of the two cones. The
-// union rather than one eye's: taking eye 0's would leave the right eye blind
-// to the outer field it can actually see, and the guest would render pixels for
-// a region that eye does not display. The union covers both, the composite's
-// quad then matches what was drawn for BOTH eyes, and the display's real
-// per-eye asymmetry is applied where it belongs — by the composite's own
-// projection, which is what kl_reproject.h calls "the frustum does not match
-// the display's" and exists to correct.
+// So the union here was the plugin's own arithmetic applied a layer too early,
+// and it COST: told the union, the guest computes a widening ratio of 1, keeps
+// the original texture width, and each eye's own cone lands on 78.9% of the
+// pixels it should have had. The per-eye rects come back full-width, so nothing
+// downstream can tell.
 //
-// The cost is pixels: the union is wider than either eye needs, so some of each
-// eye texture is never displayed. That is the right trade against a picture that
-// is wrong.
-//
-// NOT applied on a single-pass-per-eye guest. Beat Saber and SUPERHOT render an
-// eye at a time and honour the two cones, so unioning would only waste their
-// pixels — and they are measurably correct on this display today, which is the
-// evidence that the per-eye path works when the guest takes it.
-// KL_OVRP_UNIFY_FRUSTUM forces it either way.
+// The right answer is to tell the guest the truth and honour what it submits:
+// the composite reads a per-eye viewport (kl_reproject.h, `grid_per_eye`) and
+// places each eye's quad with that eye's own cone. `KL_OVRP_UNIFY_FRUSTUM=1`
+// restores the union as the A/B, and is what to reach for if a guest is ever
+// found that collapses the cones WITHOUT submitting per-eye rects — that one
+// would be unservable any other way.
 //
 // **Decided when the frustum is READ, never when it is written**, and that
 // distinction is the whole reason the first version of this did nothing. The
@@ -841,26 +840,81 @@ void kl_ovrp_set_eye_frustum(int eye, float left, float right, float top, float 
 // the frame record the composite builds its quad from. That last one is not
 // optional — it is the half that has to AGREE with what the guest rendered, and
 // a consumer that reads g_eye_tan directly is exactly the bug this is fixing.
+// KL_OVRP_EYE_TAN — push a CANTED pair of cones on a run that has no display to
+// measure one from, which on the host is every run.
+//
+// Without it `g_eye_tan` stays the symmetric {1,1,1,1} default, and a symmetric
+// display makes every question about asymmetry unaskable: the union equals each
+// eye's own cone, a guest that collapses the two is indistinguishable from one
+// that honours them, and any per-eye viewport the guest derives comes out full
+// width. Every failure in this family is therefore invisible on the host and
+// costs a device run — which is exactly the shape `make xrspace` and `make ctr`
+// exist to break.
+//
+//   KL_OVRP_EYE_TAN=vision     Vision Pro's own, measured off the drawable:
+//                              eye 0 l=1.73205 r=1.0 t=1.0 b=1.19175, eye 1 the
+//                              horizontal mirror. (tan 60/45 out/in, tan 45/50
+//                              up/down — CLAUDE.md's table, and the same numbers
+//                              ALVR's visionOS client carries as its defaults.)
+//   KL_OVRP_EYE_TAN=l,r,t,b    that pair, from eye 0's cone, mirrored for eye 1
+//
+// Applied on the READ side with the union, for the reason recorded above it:
+// what a run is told has to be decided after the mode is known, and this is a
+// statement about the display rather than about who pushed it, so it overrides
+// the frontend on device too. That makes it the A/B for "is our idea of this
+// display's cones the thing the guest is reacting to".
+static const float *klovrp_forced_tan(void) {
+    static float t[2][4];
+    static int state;                        // 0 unread, 1 none, 2 forced
+    if (!state) {
+        const char *s = kl_env_str("KL_OVRP_EYE_TAN", NULL);
+        float l = 0, r = 0, tp = 0, b = 0;
+        if (s && (*s == 'v' || *s == 'V')) {
+            l = 1.73205f; r = 1.0f; tp = 1.0f; b = 1.19175f;
+        } else if (s && *s) {
+            if (sscanf(s, "%f,%f,%f,%f", &l, &r, &tp, &b) != 4) l = 0;
+        }
+        if (l > 0 && r > 0 && tp > 0 && b > 0) {
+            t[0][0] = l;  t[0][1] = r;  t[0][2] = tp; t[0][3] = b;
+            t[1][0] = r;  t[1][1] = l;  t[1][2] = tp; t[1][3] = b;
+            fprintf(stderr, "  [ovrp] KL_OVRP_EYE_TAN: forcing a CANTED display "
+                            "— eye 0 l=%.5f r=%.5f t=%.5f b=%.5f, eye 1 mirrored\n",
+                    (double)l, (double)r, (double)tp, (double)b);
+            state = 2;
+        } else {
+            if (s && *s)
+                fprintf(stderr, "  [ovrp] KL_OVRP_EYE_TAN=%s is not `vision` or "
+                                "four positive tangents l,r,t,b — ignored\n", s);
+            state = 1;
+        }
+    }
+    return state == 2 ? &t[0][0] : NULL;
+}
+
 static const float *klovrp_eye_tan(int eye) {
     // Written by whichever thread reads first and rewritten with identical
     // values by any other — the inputs are the display's, fixed for the run.
     static float u[2][4];
     if ((unsigned)eye > 1) eye = 0;
-    int on = kl_env_int("KL_OVRP_UNIFY_FRUSTUM", -1);
-    if (on < 0) on = kl_ovrp_multiview();
-    if (!on) return g_eye_tan[eye];
+    const float *forced = klovrp_forced_tan();
+    const float (*src)[4] = forced ? (const float (*)[4])forced
+                                   : (const float (*)[4])g_eye_tan;
+    // Read once: this is on the frame path (every ovrp_GetNodeFrustum2, every
+    // layer desc, every frame record) and the answer cannot change mid-run.
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OVRP_UNIFY_FRUSTUM", 0);
+    if (!on) return src[eye];
     for (int i = 0; i < 4; i++)
-        u[0][i] = u[1][i] =
-            g_eye_tan[0][i] > g_eye_tan[1][i] ? g_eye_tan[0][i] : g_eye_tan[1][i];
+        u[0][i] = u[1][i] = src[0][i] > src[1][i] ? src[0][i] : src[1][i];
     // Said once, and said with the numbers: a frustum that is silently widened
     // is indistinguishable from one that was measured that way, and the eye
     // texture's pixel budget moved with it.
     static int said;
     if (!said++)
-        fprintf(stderr, "  [ovrp] multiview: both eyes told ONE frustum "
-                        "l=%.4f r=%.4f t=%.4f b=%.4f (the union — this guest "
-                        "renders one cone for both views; KL_OVRP_UNIFY_FRUSTUM=0 "
-                        "restores the per-eye cones)\n",
+        fprintf(stderr, "  [ovrp] KL_OVRP_UNIFY_FRUSTUM=1: both eyes told ONE "
+                        "frustum l=%.4f r=%.4f t=%.4f b=%.4f (the union of the "
+                        "two cones — the guest then renders at the union's "
+                        "angular density and submits full-width per-eye rects)\n",
                 (double)u[0][0], (double)u[0][1], (double)u[0][2], (double)u[0][3]);
     return u[eye];
 }

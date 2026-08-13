@@ -123,6 +123,22 @@ typedef struct {
     // there and pass it in; this file stays linkable against nothing but kl_env
     // (see kl_reproject_set_srgb_decode for why that matters).
     uint32_t      flip_y;
+    // Which BLOCK of the grid bound at buffer(1) this eye reads: 0 for a grid
+    // with one block, `eye` for a grid with one block per eye. Set by
+    // kl_reproject_build from the `grid_per_eye` it is given; the shader turns
+    // it into an index using the cell counts it reads out of the grid's own
+    // header, so the two cannot disagree about where a block starts.
+    //
+    // **It exists because the two eyes' render viewports genuinely differ.**
+    // The comment this replaced said they could not, on the grounds that Unity
+    // derives both from one `renderViewportScale` — true of a title that scales
+    // its resolution, and false of one using Oculus SYMMETRIC PROJECTION, where
+    // both eyes are rendered with a single union frustum into one widened
+    // texture and each eye's own cone is a different SUB-RECT of it (measured
+    // on BONELAB: eye 0 at x=0, eye 1 at x=609, both 2271 of 2880 wide —
+    // notes/BONELAB.md). Sampling eye 1 through eye 0's crop shifts its picture
+    // by that offset, which is a warped, displaced right eye and nothing else.
+    uint32_t      grid_eye;
 } kl_reproject_uniforms;
 
 // The blit's uniforms — buffer(0) of its FRAGMENT stage. It carried a bare
@@ -188,10 +204,22 @@ const char *kl_reproject_msl(void);
 // **Buffer layout**, bound at buffer(1) of the VERTEX stage:
 //
 //     [0]      = (nx, ny) as floats — the cell counts
-//     [1 + y*(nx+1) + x] = the texture coordinate for grid vertex (x, y)
+//     [base + y*(nx+1) + x] = the texture coordinate for grid vertex (x, y),
+//                             where `base` is the drawing view's
+//                             kl_reproject_uniforms.grid_base
 //
-// self-describing so the pass needs no extra uniform, and so a caller cannot
-// bind a table that disagrees with the vertex count it draws.
+// self-describing in nx/ny, so the pass needs no extra uniform for the cell
+// counts and a caller cannot bind a table that disagrees with the vertex count
+// it draws.
+//
+// **One block per eye is allowed, and sometimes required.** The cell counts are
+// shared — one draw, one mesh — but the COORDINATES need not be: under Oculus
+// symmetric projection each eye's picture is a different sub-rect of one
+// texture, so each eye needs its own crop. Build with
+// kl_reproject_grid_build_eye() into a buffer of kl_reproject_grid_entries_n()
+// entries and pass grid_per_eye = 1 to kl_reproject_build. A caller with one
+// viewport for both eyes builds one block and passes 0, which is exactly what
+// this was before per-eye blocks existed.
 //
 // **The zone-aligned exactness is a full-viewport property.** Cells uniform in
 // screen space land on the map's own breakpoints only when they span the whole
@@ -206,6 +234,19 @@ const char *kl_reproject_msl(void);
 // Entries (each a simd_float2) a grid buffer needs, header included.
 static inline uint32_t kl_reproject_grid_entries(uint32_t nx, uint32_t ny) {
     return 1u + (nx + 1u) * (ny + 1u);
+}
+
+// Coordinates in ONE eye's block — the distance from one eye's block to the
+// next, and what kl_reproject_build wants as `grid_stride`.
+static inline uint32_t kl_reproject_grid_stride(uint32_t nx, uint32_t ny) {
+    return (nx + 1u) * (ny + 1u);
+}
+
+// ...and the size of a buffer holding `eyes` blocks, header included.
+static inline uint32_t kl_reproject_grid_entries_n(uint32_t nx, uint32_t ny,
+                                                   uint32_t eyes) {
+    if (eyes < 1u) eyes = 1u;
+    return 1u + eyes * kl_reproject_grid_stride(nx, ny);
 }
 
 // Vertices to draw. Two triangles a cell, six vertices, no index buffer —
@@ -244,9 +285,19 @@ void kl_reproject_grid_identity(simd_float2 *out);
 // Metal write the smaller physical region inside them, so that GL, the viewport
 // and the scissor all keep agreeing with each other (see kl_glfb.h).
 //
-// One grid serves BOTH eyes — it is bound once for an amplified pass — so a
-// caller with two different per-eye viewports has to pick one and say so.
+// One grid buffer is bound for the whole amplified pass, so two eyes with
+// different viewports are served by two BLOCKS in it rather than by two
+// buffers: kl_reproject_grid_build_eye writes the header (identical either way)
+// and the block for `eye`, and kl_reproject_build points each eye at its own.
+// kl_reproject_grid_build is that with eye 0, i.e. the single-block grid every
+// caller with one viewport still wants.
 typedef void (*kl_reproject_s2p)(void *ctx, float sx, float sy, float *px, float *py);
+void kl_reproject_grid_build_eye(simd_float2 *out, uint32_t eye,
+                                 uint32_t nx, uint32_t ny,
+                                 const float *vp,
+                                 float screen_w, float screen_h,
+                                 float tex_w, float tex_h,
+                                 kl_reproject_s2p fn, void *ctx);
 void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
                              const float *vp,
                              float screen_w, float screen_h,
@@ -275,6 +326,14 @@ const char *kl_reproject_blit_msl(void);
 //                       `flip_y` field above; the caller reads it from
 //                       kl_glfb_eye_mtl_origin_top_left(eye, stage), which is
 //                       where it was recorded with the texture.
+//   grid_per_eye        nonzero if the grid bound with this draw carries one
+//                       block per eye, so this eye should read its own; **0 for
+//                       one shared block**, which is what a caller with a single
+//                       viewport (and every caller before per-eye blocks
+//                       existed) wants. Stated rather than derived because this
+//                       file cannot see the buffer the caller will bind, and an
+//                       eye reading another eye's crop has no error surface at
+//                       all.
 //
 // `rendered` may be NULL, which means "no pose was recorded" — the uniforms then
 // describe an unreprojected picture rather than an undefined one.
@@ -282,7 +341,8 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
                                          simd_float4x4 origin_from_device,
                                          simd_float4x4 device_from_view,
                                          simd_float4x4 projection,
-                                         uint32_t slice, int flip_y);
+                                         uint32_t slice, int flip_y,
+                                         int grid_per_eye);
 
 // A perspective projection from tangents, all positive, right-handed looking
 // down -Z, reverse-Z (near maps to 1). For the viewer, which has no Compositor

@@ -66,7 +66,7 @@ static void check_math(void) {
     // pass is a blit when there is nothing to correct, so turning reprojection
     // on cannot change a picture that was already right.
     kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
-                                                 matrix_identity_float4x4, P, 0, 0);
+                                                 matrix_identity_float4x4, P, 0, 0, 0);
     int exact = 1;
     for (int i = 0; i < 4; i++) {
         simd_float4 n = corner_ndc(u, (float)(i & 1), (float)(i >> 1));
@@ -95,7 +95,7 @@ static void check_math(void) {
     simd_float4x4 dev = simd_matrix4x4(simd_quaternion(10.0f * (float)M_PI / 180.0f,
                                                        simd_make_float3(0, 1, 0)));
     kl_reproject_uniforms uy = kl_reproject_build(&r, 0, dev,
-                                                  matrix_identity_float4x4, P, 0, 0);
+                                                  matrix_identity_float4x4, P, 0, 0, 0);
     float shift = corner_ndc(uy, 0.5f, 0.5f).x - corner_ndc(u, 0.5f, 0.5f).x;
     ok(shift > 0.10f && shift < 0.25f,
        "a +10 deg yaw moves the picture right, by about tan(10 deg)");
@@ -113,7 +113,7 @@ static void check_math(void) {
     // that could move the corners is the rotation under test.
     simd_float4x4 Pd = kl_reproject_projection(1, 1, 1, 1, 0.03f);
     kl_reproject_uniforms un = kl_reproject_build(NULL, 0, dev,
-                                                  matrix_identity_float4x4, Pd, 0, 0);
+                                                  matrix_identity_float4x4, Pd, 0, 0, 0);
     int quiet = 1;
     for (int i = 0; i < 4; i++) {
         simd_float4 n = corner_ndc(un, (float)(i & 1), (float)(i >> 1));
@@ -259,7 +259,7 @@ static void check_pixels(void) {
         for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
     simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
     kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
-                                                 matrix_identity_float4x4, P, 0, 0);
+                                                 matrix_identity_float4x4, P, 0, 0, 0);
 
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = dst;
@@ -540,7 +540,7 @@ static void check_crop_pixels(void) {
         for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
     simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
     kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
-                                                 matrix_identity_float4x4, P, 0, 0);
+                                                 matrix_identity_float4x4, P, 0, 0, 0);
 
     // The guest's rect: the bottom-left quarter, as ovrp_CalculateEyeViewportRect
     // answers it and ovrp_EndFrame4 submits it.
@@ -613,6 +613,130 @@ static void check_crop_pixels(void) {
         if (whole[i] == M[0] && whole[i+1] == M[1] && whole[i+2] == M[2]) marker++;
     ok(marker > 0, "...and dropping the crop puts the unwritten texels back on "
                    "screen — the corner-of-the-eye bug, reproduced");
+}
+
+// TWO EYES, TWO CROPS, ONE GRID — the symmetric-projection case.
+//
+// A guest using Oculus symmetric projection renders both eyes with one union
+// frustum into one widened texture and submits a DIFFERENT sub-rect per eye
+// (measured on BONELAB: eye 0 at x=0, eye 1 at x=609, both 2271 wide of 2880 —
+// notes/BONELAB.md). The composite draws both eyes from one grid buffer, so the
+// buffer carries a BLOCK PER EYE and kl_reproject_uniforms.grid_eye says which
+// one a view reads.
+//
+// Nothing else can check this. Both blocks are built by code check_viewport
+// already covers, both draws succeed, and reading the wrong block is a picture
+// shifted by the offset between the two rects — which on a headset is a warped,
+// displaced right eye and from inside the process is silence.
+//
+// The source is 4x1 columns of four distinct colours. Eye 0's rect is the left
+// half, eye 1's the right; if the blocks are laid out or indexed wrongly the two
+// draws produce the same two columns, which the failing-direction check below
+// asserts really would be visible.
+static void check_split_crop_pixels(void) {
+    printf("=== two eyes, two crops, one grid ===\n");
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    if (!dev || !q) { printf("  no Metal device — skipped\n"); return; }
+
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:
+                              [NSString stringWithUTF8String:kl_reproject_msl()]
+                                           options:nil error:&err];
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"kl_reproject_v"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"kl_reproject_f"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd
+                                                                       error:&err];
+    if (!ps) { ok(0, "pipeline for the split-crop check"); return; }
+
+    MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+    td.textureType = MTLTextureType2DArray;
+    td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    td.width = 4; td.height = 2; td.arrayLength = 1;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> src = [dev newTextureWithDescriptor:td];
+    // Four columns, four colours, both rows the same — so a HORIZONTAL shift is
+    // the only thing this can see, which is the only thing the two rects differ
+    // by.
+    const uint8_t col[4][4] = { { 255,0,0,255 }, { 0,255,0,255 },
+                                { 0,0,255,255 }, { 255,255,255,255 } };
+    uint8_t s[4 * 2 * 4];
+    for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 4; x++) memcpy(s + (y * 4 + x) * 4, col[x], 4);
+    [src replaceRegion:MTLRegionMake2D(0,0,4,2) mipmapLevel:0 slice:0
+             withBytes:s bytesPerRow:16 bytesPerImage:32];
+
+    MTLTextureDescriptor *rd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:2 height:2 mipmapped:NO];
+    rd.usage = MTLTextureUsageRenderTarget;
+    rd.storageMode = MTLStorageModeShared;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:rd];
+
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.minFilter = MTLSamplerMinMagFilterNearest;
+    sd.magFilter = MTLSamplerMinMagFilterNearest;
+    sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    id<MTLSamplerState> samp = [dev newSamplerStateWithDescriptor:sd];
+
+    kl_ovrp_render_pose r = {0};
+    r.serial = 1; r.qw = 1;
+    for (int e = 0; e < 2; e++)
+        for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
+    simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
+
+    // One buffer, two blocks. The left half is eye 0's, the right half eye 1's.
+    const float vp0[4] = { 0, 0, 2, 2 }, vp1[4] = { 2, 0, 2, 2 };
+    simd_float2 grid[kl_reproject_grid_entries_n(1, 1, 2)];
+    kl_reproject_grid_build_eye(grid, 0, 1, 1, vp0, 4, 2, 4, 2, NULL, NULL);
+    kl_reproject_grid_build_eye(grid, 1, 1, 1, vp1, 4, 2, 4, 2, NULL, NULL);
+    ok(grid[1].x == 0.0f && grid[2].x == 0.5f,
+       "eye 0's block is still its own after eye 1's is written");
+    ok(grid[5].x == 0.5f && grid[6].x == 1.0f,
+       "eye 1's block starts one stride on and carries its own rect");
+
+    uint8_t got[2][16];
+    for (int eye = 0; eye < 2; eye++) {
+        kl_reproject_uniforms u =
+            kl_reproject_build(&r, eye, matrix_identity_float4x4,
+                               matrix_identity_float4x4, P, 0, 0, /*grid_per_eye*/1);
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = dst;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        id<MTLCommandBuffer> cmd = [q commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:ps];
+        [enc setFragmentTexture:src atIndex:0];
+        [enc setFragmentSamplerState:samp atIndex:0];
+        [enc setVertexBytes:&u length:sizeof u atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+        [enc setVertexBytes:grid length:sizeof grid atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+                 vertexCount:kl_reproject_grid_vertices(1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        [dst getBytes:got[eye] bytesPerRow:8
+           fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
+    }
+
+    int e0 = memcmp(got[0] + 0, col[0], 3) == 0 && memcmp(got[0] + 4, col[1], 3) == 0;
+    int e1 = memcmp(got[1] + 0, col[2], 3) == 0 && memcmp(got[1] + 4, col[3], 3) == 0;
+    ok(e0, "eye 0 composites the left sub-rect the guest drew for it");
+    ok(e1, "eye 1 composites its OWN sub-rect, not eye 0's");
+    if (!e0 || !e1)
+        printf("    eye0 %3u,%3u,%3u | %3u,%3u,%3u    eye1 %3u,%3u,%3u | %3u,%3u,%3u\n",
+               got[0][0],got[0][1],got[0][2], got[0][4],got[0][5],got[0][6],
+               got[1][0],got[1][1],got[1][2], got[1][4],got[1][5],got[1][6]);
+    // The failing direction: the two eyes must not have produced the same
+    // picture, or the assertions above would pass with the indexing removed.
+    ok(memcmp(got[0], got[1], 16) != 0,
+       "...and reading one block for both eyes really is a different picture");
 }
 
 // A stand-in rate map: screen -> physical, halving everything. Linear, so the
@@ -689,6 +813,7 @@ int main(void) {
         check_shader();
         check_pixels();
         check_crop_pixels();
+        check_split_crop_pixels();
     }
     printf(g_fail ? "\n=== t_reproject FAILED ===\n"
                   : "\n=== t_reproject: the composite pass is a blit when nothing "
