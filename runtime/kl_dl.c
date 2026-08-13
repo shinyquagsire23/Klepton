@@ -11,6 +11,7 @@
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
 #include "kl_mediandk.h"
+#include "kl_vulkan.h"
 
 #define KL_MAX_IMAGES 64
 typedef struct { char soname[128]; kl_image *img; } entry;
@@ -185,7 +186,8 @@ const char *kl_addr_image(const void *addr, size_t *offset) {
 int kl_can_dlopen(const char *path) {
     if (!path) return 0;
     return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||
-           kl_ovrplat_claims(path) || kl_mediandk_claims(path) || kl_can_load(path);
+           kl_ovrplat_claims(path) || kl_mediandk_claims(path) ||
+           kl_vulkan_claims(path) || kl_can_load(path);
 }
 
 void *klb_dlopen(const char *path, int flags) {
@@ -206,6 +208,11 @@ void *klb_dlopen(const char *path, int flags) {
     if (plat) return plat;
     void *md = kl_mediandk_dlopen(path);
     if (md) return md;
+    // Vulkan (BONELAB). Same reasoning as the GL line above: there is no
+    // libvulkan.so on disk to fall through to, and Unity dlopens it as the FIRST
+    // thing it tries — it is the only graphics API this build probes.
+    void *vk = kl_vulkan_dlopen(path);
+    if (vk) return vk;
     pthread_mutex_lock(&g_lock);
     kl_image *found = kl_find_image(path);           // already loaded? refcount is coarse
     pthread_mutex_unlock(&g_lock);
@@ -231,6 +238,7 @@ void *klb_dlsym(void *handle, const char *name) {
     if (kl_ovrp_is_handle(handle)) return kl_ovrp_sym(name);
     if (kl_ovrplat_is_handle(handle)) return kl_ovrplat_sym(name);
     if (kl_mediandk_is_handle(handle)) return kl_mediandk_sym(name);
+    if (kl_vulkan_is_handle(handle)) return kl_vulkan_sym(name);
     if (handle == NULL || handle == (void *)-1) {    // RTLD_DEFAULT / RTLD_NEXT
         void *s = kl_shim_lookup(name);
         if (s) return s;

@@ -23,6 +23,7 @@
 // kl_egl_swap_count (whether eglSwapBuffers is this guest's presentation
 // signal at all — see klovrp_end_frame_impl).
 #include "kl_egl.h"
+#include "kl_vulkan.h"
 
 #define KL_OVRP_MAX 512
 static struct { const char *name; unsigned calls; } g_ovrp[KL_OVRP_MAX];
@@ -1543,6 +1544,10 @@ static uint64_t klovrp_BeginFrame4(int guest_frame_index, uint64_t extra) {
 // leaves `vp` alone when there is nothing to read.
 static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[8],
                                    int of[2]);
+// Which texture stage the guest says it just drew the EYE layer into. Forward
+// declared for the same reason as the line above: ovrpLayerSubmit's layout is
+// stated further down, next to the DWARF it was read out of.
+static int klovrp_submit_stage(const void *layer_submits, int count);
 
 // `viewports` is that pair, or NULL where a caller cannot know — ovrp_EndFrame
 // (1.28's legacy VRDevice, which has no layers at all) and every non-Unity
@@ -1750,8 +1755,23 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
     if (!layer_submits && layer_submit_count) return OVRP_FAIL_INVALID_PARAM;
     int vp[8], of[2] = { 0, 0 };
     int have = klovrp_submit_viewports(layer_submits, layer_submit_count, vp, of);
-    return klovrp_end_frame_impl(guest_frame_index, have ? vp : NULL,
-                                 have ? of : NULL);
+    uint64_t r = klovrp_end_frame_impl(guest_frame_index, have ? vp : NULL,
+                                       have ? of : NULL);
+
+    // BONELAB / the Vulkan path: this call IS the guest's assertion that it has
+    // finished drawing the eye textures, so it is where they can be read back.
+    //
+    // The stage comes out of the submit the guest handed us rather than from
+    // kl_ovrp_last_complete_stage(), and that is not a shortcut — the latter is
+    // derived from GL draw observation (kl_glfb_render_stages), which sees
+    // nothing at all on a Vulkan guest and would answer -1 forever. The guest
+    // NAMES the stage it drew, at submit+0x04.
+    if (kl_vulkan_guest_active()) {
+        static unsigned vk_frame;
+        kl_vulkan_capture_eyes(vk_frame++,
+                               klovrp_submit_stage(layer_submits, layer_submit_count));
+    }
+    return r;
 }
 
 int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out) {
@@ -3233,6 +3253,21 @@ _Static_assert(sizeof(ovrp_recti) == 0x10, "recti");
 // signature can.
 // `of` takes the layer's texture size — the size the rects are relative to.
 // A rect in pixels means nothing without it (kl_ovrp.h, viewport_of).
+// The eye layer's texture stage, straight out of the submit. Only the EYE layer
+// is consulted — an overlay submit carries its own unrelated stage, and picking
+// the wrong one would read back a texture the guest never drew this frame.
+static int klovrp_submit_stage(const void *layer_submits, int count) {
+    const ovrp_layer_submit *const *list = layer_submits;
+    if (!list || count <= 0) return 0;
+    for (int i = 0; i < count; i++) {
+        const ovrp_layer_submit *s = list[i];
+        if (!s) continue;
+        struct klovrp_layer *l = klovrp_layer(s->layer_id);
+        if (l && l->is_eye) return s->texture_stage;
+    }
+    return 0;
+}
+
 static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[8],
                                    int of[2]) {
     const ovrp_layer_submit *const *list = layer_submits;
@@ -3576,6 +3611,43 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
     // whichever it got.
     if (depth) *depth = 0;
     if (!color) return OVRP_SUCCESS;
+
+    // BONELAB / the Vulkan path. Everything below this branch makes a GL texture
+    // NAME, and on a Vulkan guest that name is read back as a VkImage handle and
+    // handed to vkCreateImageView — which is a segfault inside MoltenVK with a
+    // small integer for an address (measured: `MVKImageView::MVKImageView+0x90`,
+    // fault at 0x9, from libunity's own CreateTexture). The 64-bit out-parameter
+    // this function has always filled is exactly the field OVRPlugin carries a
+    // VkImage in, so nothing about the seam changes except what makes the
+    // storage.
+    //
+    // The test is what the guest DID — whether it brought a Vulkan device up
+    // through kl_vulkan.c — rather than a renderer enum we were told. A guest
+    // that resolves vk* and then picks GLES answers false here, correctly.
+    if (kl_vulkan_guest_active()) {
+        int w = l->desc.texture_size.w, h = l->desc.texture_size.h;
+        // The desc format is the guest's own request, echoed back to us through
+        // ovrp_SetupLayer. Only the sRGB-ness matters for the allocation; the
+        // channel order is fixed because that is what klovrp_gl_format's table
+        // says this format is (measured here: fmt=0 -> R8G8B8A8_sRGB).
+        const char *fname = NULL;
+        uint32_t glfmt = klovrp_gl_format(l->desc.format, &fname);
+        int srgb = (glfmt == 0x8C43);              // GL_SRGB8_ALPHA8
+        unsigned long long img =
+            kl_vulkan_eye_image(stage, eye, (unsigned)w, (unsigned)h, srgb);
+        if (!img) {
+            fprintf(stderr, "  [ovrp] GetLayerTexture2(layer %d stage %d eye %d): "
+                            "no VkImage — the guest is on Vulkan and the eye "
+                            "storage could not be allocated\n",
+                    layer_id, stage, eye);
+            return OVRP_FAIL_NOT_INITIALIZED;
+        }
+        *color = img;
+        fprintf(stderr, "  [ovrp] GetLayerTexture2: eye %d stage %d = VkImage %#llx "
+                        "(%dx%d %s)\n", eye, stage, img, w, h,
+                fname ? fname : "?");
+        return OVRP_SUCCESS;
+    }
 
     uint32_t *slot = &l->tex[stage][eye];
     if (!*slot) {
@@ -3997,6 +4069,96 @@ static int klovrp_JNI_OnLoad(void *vm, void *reserved) {
     return 0x00010006;                 // JNI_VERSION_1_6, as the real one returns
 }
 
+// BONELAB / the Vulkan path. libOculusXRPlugin asks OVRPlugin which Vulkan
+// extensions the *runtime* needs before it creates the instance and the device,
+// and hands the answer straight to vkCreateInstance / vkCreateDevice.
+//
+// **It is an array of STRING POINTERS, not a character buffer**, and getting
+// that wrong is trap 10b's family in a new API — a `strlen` of whatever the
+// caller's uninitialised slot happened to hold, on a thread whose crash report
+// names nothing. It cost one run to find and the evidence is worth keeping,
+// because the two readings are indistinguishable from the real plugin alone:
+//
+//   0x126f50 <ovrp_GetInstanceExtensionsVk>:
+//     cbz  x1, +0x28        -> mov w0, #-1001   (invalid parameter)
+//     ...initialized?       -> mov w0, #-1003
+//     and  w0, w0, w0, asr #31                  (plain ovrpResult)
+//
+// That says x1 is required and x0 is not checked — consistent with BOTH
+// `(char *buf, uint32_t *cap)` and the truth. What settles it is the CALLER,
+// whose C++ name survived in libOculusXRPlugin.so:
+//
+//   OculusSystem::GetVulkanExtensions(void*, unsigned, unsigned*, char*,
+//                                     ovrpResult (*)(char const**, int*))
+//
+// `PPKc` is `const char **` and `Pi` is `int *`. Its loop reads the argument
+// back as `ldr x0, [x8, x23, lsl #3]` — an 8-byte stride — and hands each
+// element to `strlen`. So x0 is an array of pointers the caller owns, and
+// writing a NUL "string" into it corrupts a pointer rather than emptying a
+// buffer.
+//
+// The answer is NO extensions, and that is a measurement rather than a
+// convenience. On a Quest this list is how the Oculus runtime says which
+// external-memory extensions it needs in order to share eye textures with its
+// compositor. Here the "runtime" is this file plus MoltenVK, and it shares
+// nothing through Vulkan — so requiring anything would be inventing a
+// constraint, and inventing one MoltenVK does not have would fail the guest's
+// own vkCreateInstance. A count of 0 makes the caller's `cmp w8, #1 / b.lt`
+// skip the whole loop, so no element is ever read.
+static int32_t klovrp_GetInstanceExtensionsVk(const char **names, int *count) {
+    (void)names;
+    if (!count) return OVRP_FAIL_INVALID_PARAM;
+    *count = 0;
+    return OVRP_SUCCESS;
+}
+
+static int32_t klovrp_GetDeviceExtensionsVk(const char **names, int *count) {
+    (void)names;
+    if (!count) return OVRP_FAIL_INVALID_PARAM;
+    *count = 0;
+    return OVRP_SUCCESS;
+}
+
+// The hand-SKELETON family (BONELAB). Distinct from the node poses this file
+// already answers: this is the 64-bone finger rig, asked for once at startup.
+//
+//   0x12b3c0 <ovrp_GetSkeleton2>:
+//     mov w1, w0 / cmp w1, #3 / b.hi -> -1001     (skeletonType, 0..3)
+//     cbz x2 -> -1001                             (the out struct is required)
+//     ...no singleton -> -1002
+//
+// so it is `ovrpResult f(ovrpSkeletonType, ovrpSkeleton2 *)`.
+//
+// **Refused, and deliberately without writing the out struct.** Every other
+// out-parameter in this file is filled — trap 10b is precisely about the cost of
+// not doing so — but that rule cannot be followed here honestly: `ovrpSkeleton2`
+// is a large struct whose layout is NOT available anywhere in this APK (no DWARF
+// for it, and the C# side is IL2CPP'd), so zeroing it would mean guessing a size
+// and memset-ing that many bytes of the caller's stack. A guessed size is a
+// stack smash; a refusal is a code path the caller already has.
+//
+// It is safe here because the caller CHECKS: OVRPlugin's C# wrapper is
+// `return ovrp_GetSkeleton2(t, out s) == Result.Success`, so a negative result
+// is a `false` return and the guest skips its skeleton setup. If a future guest
+// ignores the result, the symptom will be garbage bones rather than a crash, and
+// the fix is to find the layout — not to invent one.
+// The whole family answers the same way, so it is one function rather than one
+// per entry point. That is normally exactly what trap 10 warns against — a
+// numbered suffix marks an ABI change, so `ovrp_Foo` and `ovrp_Foo2` must not be
+// assumed to share a shape. It is safe HERE and only here because this handler
+// reads no argument and writes no out-parameter: it returns a constant negative
+// whatever the calling convention is, so there is no shape to get wrong.
+//
+// Each name is still listed explicitly rather than matched by prefix, so a new
+// `ovrp_Hand*` in a future SDK lands on the fail-closed abort-by-name and gets
+// classified deliberately.
+static int32_t klovrp_hand_unsupported(void) { return OVRP_FAIL_UNSUPPORTED; }
+
+static int32_t klovrp_GetSkeleton2(int skeleton_type, void *out) {
+    if (skeleton_type < 0 || skeleton_type > 3 || !out) return OVRP_FAIL_INVALID_PARAM;
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
 static const char g_ovrp_handle[] = "klepton-ovrplugin";
 
 // Assembly entry thunks that capture the x8 sret pointer before any call can
@@ -4030,6 +4192,17 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"UnityPluginLoad",   (void *)klovrp_UnityPluginLoad},
     {"UnityPluginUnload", (void *)klovrp_UnityPluginUnload},
     {"JNI_OnLoad",        (void *)klovrp_JNI_OnLoad},
+    {"ovrp_GetSkeleton2", (void *)klovrp_GetSkeleton2},
+    // ...and the rest of the hand-tracking surface, refused as a group. See
+    // klovrp_hand_unsupported for why one handler may serve numbered siblings
+    // here when it may not anywhere else in this file.
+    {"ovrp_GetSkeleton",  (void *)klovrp_hand_unsupported},
+    {"ovrp_GetSkeleton3", (void *)klovrp_hand_unsupported},
+    {"ovrp_GetHandState",  (void *)klovrp_hand_unsupported},
+    {"ovrp_GetHandState2", (void *)klovrp_hand_unsupported},
+    {"ovrp_GetMesh",  (void *)klovrp_hand_unsupported},
+    {"ovrp_GetInstanceExtensionsVk", (void *)klovrp_GetInstanceExtensionsVk},
+    {"ovrp_GetDeviceExtensionsVk",   (void *)klovrp_GetDeviceExtensionsVk},
     {"ovrp_GetVersion",   (void *)klovrp_GetVersion},
     {"ovrp_GetVersion2",   (void *)klovrp_GetVersion2},
     {"ovrp_GetNativeSDKVersion",  (void *)klovrp_GetNativeSDKVersion},

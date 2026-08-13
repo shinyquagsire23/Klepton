@@ -73,6 +73,7 @@ int getentropy(void *buffer, size_t size);
 #include "kl_openxr.h"
 #include "kl_mediandk.h"
 #include "kl_aaudio.h"
+#include "kl_vulkan.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
 #include "kl_jni.h"
@@ -1773,5 +1774,17 @@ void *kl_shim_lookup(const char *name) {
     // so the order of these two tests does not matter.
     if (!strncmp(name, "AAudio", 6))
         return kl_aaudio_lookup(name);
+
+    // Tier 10: Vulkan (BONELAB). libvulkan.so is REPLACED for the same reason
+    // libopenxr_loader is — the real one is Android's loader, looking for an ICD
+    // through driver plumbing that does not exist here, and MoltenVK IS the ICD.
+    // libunity reaches it through dlopen/dlsym, but libSLZQuestNative names six
+    // vk* symbols directly, so they have to bind at relocation time too.
+    //
+    // The third character is checked as well as the first two: `vk` alone would
+    // claim any guest symbol starting with those letters, and this tier runs
+    // before the miss falls through to the unresolved report.
+    if (name[0] == 'v' && name[1] == 'k' && name[2] >= 'A' && name[2] <= 'Z')
+        return kl_vulkan_lookup(name);
     return NULL;
 }

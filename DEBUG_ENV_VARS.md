@@ -1262,6 +1262,47 @@ Standalone reproducers, not part of the runtime; each reads its own knobs.
 - `S10_EYE=1` — run only the eye-sized SRGB8_ALPHA8 FBO draw-and-blit stage.
 - `S11_SIZE=WxH` — pbuffer size for s11_draw (default 1832x1920).
 
+## Vulkan (`runtime/kl_vulkan.c`) — the synthetic libvulkan.so
+
+BONELAB's graphics API (`notes/BONELAB.md`). Needs `make mvk`; with no MoltenVK
+vendored the whole path refuses by name and none of these do anything.
+
+- `KL_VK_OUT=<dir>` — write each submitted frame there as a PNG. On this guest
+  that is the OVRPlugin eye layer, one file per eye
+  (`vk_f<frame>_s<stage>_eye<n>.png`), written at `ovrp_EndFrame4`; on a flat
+  Vulkan guest it is the swapchain image at `vkQueuePresentKHR`. Unset means no
+  capture and no readback cost.
+- `KL_VK_OUT_EVERY=N` — capture every Nth frame (default 1). A full eye pair is
+  ~21 MB of readback, so 1 is only for short runs.
+- `KL_VK_EYE_TINT=1` — pre-clear every eye image to GREEN before the guest ever
+  sees it. **The A/B that separates the two ways an eye texture comes back
+  wrong**, which are otherwise identical in the capture: if the green survives,
+  the guest never drew into the image; if it does not, the guest drew and the
+  content is really what it rendered. This is what proved the uniform magenta
+  was uninitialised memory rather than Unity's error shader.
+- `KL_VK_TRACE=1` — the loader's own chatter: which MoltenVK was opened, which
+  extension names were dropped, acquire/submit failures.
+- `KL_VK_WIDTH` / `KL_VK_HEIGHT` — the synthetic Android surface's size
+  (default 2064x2208). Only reachable by a guest that creates a WSI swapchain,
+  which BONELAB does not.
+- `KL_MVK_DIR=<dir>` — where to load MoltenVK from (default
+  `vendor-moltenvk/out/macos`); `KL_MVK_DYLIB=<path>` names the file outright.
+  Both are the A/B against a different MoltenVK build.
+
+## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
+
+The Vulkan side of BONELAB (`notes/BONELAB.md`). Not part of the runtime yet —
+these are the gate's own knobs.
+
+- `KL_MVK_DYLIB=<path>` — which MoltenVK to load (default
+  `vendor-moltenvk/out/macos/libMoltenVK.dylib`, i.e. what `make mvk` stages).
+  The A/B against another MoltenVK build.
+- `KL_MVK_VERBOSE=1` — restore MoltenVK's own info-level logging, which the gate
+  otherwise silences (it sets `MVK_CONFIG_LOG_LEVEL=1` before the dlopen,
+  because the device census buries the gate's own output). Worth setting once on
+  a new machine: it is the fastest answer to which GPU and which Metal feature
+  set are present.
+
 ## visionOS app (`visionos/Sources/*.swift`, `visionos/Sources/kl_app.c`)
 
 Read on the device/simulator; `visionos/run.sh` forwards every `KL_*` it sees

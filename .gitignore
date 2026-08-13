@@ -41,6 +41,12 @@ PLANNING.md
 
 # vendored ANGLE toolchain + build (too large to commit)
 vendor/
+# ...and the MoltenVK prebuilt, for the same reason. Separate from vendor/ on
+# purpose: vendor/ IS the ANGLE checkout (ANGLE sits at its root), so anything
+# else living in there would be an untracked stowaway inside another project's
+# git. Recreated by `make mvk`; the tracked artifacts are tools/mvk_fetch.sh,
+# tools/mvk_retarget.sh, and the version+sha256 pin inside the former.
+vendor-moltenvk/
 fbo_dump/
 tex_dump/
 metal_workload.trace/

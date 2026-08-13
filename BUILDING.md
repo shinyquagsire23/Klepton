@@ -42,6 +42,7 @@ where a version is load-bearing it says so.
 | SDL3 | 3.4.12 | macOS interactive viewer (**optional**) | `brew install sdl3` |
 | apktool | 2.11.1 | unpacking the guest APKs | `brew install apktool` |
 | ANGLE (vendored, **patched**) | ANGLE `25e7211`, depot_tools `6afa997` | any real-GL path | `make angle-all` |
+| MoltenVK (vendored, **prebuilt**) | `v1.4.2` | any Vulkan path (BONELAB) | `make mvk` |
 | Android NDK | r25c (`25.2.9519653`) | `make guest` only (**optional**) | Android Studio SDK Manager |
 | Vision Pro + Apple Developer account | — | device runs only | — |
 
@@ -100,6 +101,62 @@ source checkout and build intermediates:
 
 
 `vtool` is used to retarget the iOS builds to visionOS.
+
+---
+
+## MoltenVK
+
+```bash
+make mvk             # pull the pinned prebuilt + stage all three slices
+make mvk-check       # ...and prove it: link for xros, then RUN it on the host
+make mvk-status      # what platform and floor each staged slice carries
+```
+
+The host side of a synthetic `libvulkan.so` — BONELAB boots completely and
+cannot render because its graphics API is Vulkan (`notes/BONELAB.md`). Seconds
+and ~360 MB, not ANGLE's ~18 GiB and hour: it is vendored as a **prebuilt
+release tarball**, because unlike ANGLE nothing here patches it. If that ever
+changes, this becomes a source checkout and the asymmetry goes away.
+
+`vendor-moltenvk/` is gitignored like `vendor/`, and kept separate from it on
+purpose — `vendor/` *is* the ANGLE checkout, with ANGLE at its root, so anything
+else in there would be an untracked stowaway inside another project's git. The
+tracked artifacts are `tools/mvk_fetch.sh`, `tools/mvk_retarget.sh`, and the
+version + sha256 pin inside the former.
+
+Two things invert what the ANGLE section above says, and both are the reason
+this is cheap:
+
+- **The platform needs no forgery.** Khronos ships native `xros-arm64` and
+  `xros-arm64_x86_64-simulator` slices in `MoltenVK-all.tar`, already stamped
+  `VISIONOS` / `VISIONOSSIMULATOR`. ANGLE's iOS→visionOS `vtool` trick is not
+  needed here and would be strictly worse than a real build. **Use
+  `MoltenVK-all.tar`, not `MoltenVK-ios.tar`** — the latter carries an
+  `ios-arm64` device slice and no visionOS anything.
+- **The deployment floor does.** The release is built against the visionOS
+  26.5 SDK and stamps `minos 26.5`; dyld refuses an image whose minimum exceeds
+  the OS running it, and this tree's SDK is 26.0. `tools/mvk_retarget.sh` lowers
+  it to 1.0 with `vtool` and rewrites `MinimumOSVersion` in the framework's
+  `Info.plist` — the plist carries the floor a second time, and left alone it is
+  a bundle-validation failure at *install* time, before dyld ever runs.
+
+Lowering the floor is safe rather than hopeful: the same tarball's iOS slice is
+built from these sources with `minos 15.0`, so nothing in MoltenVK needs a 26.x
+API. `make mvk-check` is what settles it instead of arguing it — it links a
+probe against the retargeted device slice with the local xrOS SDK
+(`-Wl,-no_weak_imports`, so a symbol that would be missing at runtime on the
+lowered floor is a link error), and then loads the macOS slice and brings up a
+real `VkInstance`, enumerating a physical device by name. Known-good on an
+M1 Max: `Apple M1 Max — Vulkan 1.0.357`.
+
+| slice | platform | used by |
+|---|---|---|
+| `vendor-moltenvk/out/macos/libMoltenVK.dylib` | MACOS, floor 12.0, untouched | the host loop |
+| `vendor-moltenvk/out/xrsim/MoltenVK.framework` | VISIONOSSIMULATOR, floor 1.0 | the Simulator |
+| `vendor-moltenvk/out/xros/MoltenVK.framework` | VISIONOS, floor 1.0 | the device |
+
+The simulator slice ships fat (`x86_64` + `arm64`) and is thinned to `arm64`
+before `vtool`, which rewrites one architecture at a time.
 
 ---
 

@@ -1,5 +1,11 @@
 CC      := clang
-CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64
+# The Vulkan headers ship with the vendored MoltenVK (`make mvk`). The -I is
+# unconditional and harmless when the directory is absent: kl_vulkan.c is
+# guarded by __has_include, so a bare checkout still compiles and reports the
+# missing dependency BY NAME when a guest asks for Vulkan, rather than failing
+# the build for everyone who does not need it.
+MVK_INC := -Ivendor-moltenvk/out/include
+CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
 # RUNTIME_SHIP — everything that links the runtime needs them.
@@ -25,6 +31,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
            runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_vtdec.c \
+           runtime/kl_vulkan.c \
            runtime/kl_slink.c \
            runtime/kl_aaudio.c \
            runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
@@ -957,6 +964,81 @@ angle-status:
 	      then echo "  patch      $(ANGLE_PATCH) is up to date"; \
 	      else echo "  patch      DIFFERS from vendor/ — run 'make angle-save'"; fi; \
 	  else echo "  patch      $(ANGLE_PATCH) missing — run 'make angle-save'"; fi; \
+	fi
+
+# ---- MoltenVK (BONELAB / the synthetic libvulkan.so arc) ----------------------
+#
+# BONELAB boots completely and cannot render because the build's graphics API is
+# Vulkan (notes/BONELAB.md). MoltenVK is the host side of the answer, and unlike
+# ANGLE it is vendored as a PREBUILT: nothing here patches it, so a 180 MB
+# tarball buys what an ~18 GiB checkout and a 30-60 minute build would.
+#
+# Two things about the retarget are worth knowing before editing either script,
+# because both invert what the ANGLE block next door does:
+#
+#   * the PLATFORM needs no forgery. Khronos ships native `xros-arm64` and
+#     `xros-arm64_x86_64-simulator` slices in MoltenVK-all.tar, already stamped
+#     VISIONOS / VISIONOSSIMULATOR. angle_retarget.sh's iOS->visionOS trick is
+#     not needed and would be strictly worse than a real build.
+#   * the FLOOR does. The release is built against the visionOS 26.5 SDK and
+#     stamps `minos 26.5`; dyld refuses an image whose minimum exceeds the OS,
+#     and this machine's SDK is 26.0. That is what vtool fixes here.
+#
+# vendor-moltenvk/ is gitignored exactly as vendor/ is — the tracked artifacts
+# are the two scripts and the version+sha256 pin inside mvk_fetch.sh.
+.PHONY: mvk mvk-fetch mvk-retarget mvk-check mvk-status
+mvk-fetch:
+	@./tools/mvk_fetch.sh
+
+mvk-retarget:
+	@./tools/mvk_retarget.sh
+
+# The build-it-once target: pull and stage all three slices. Both halves are
+# idempotent, so re-running is a fast no-op.
+mvk: mvk-fetch
+	@./tools/mvk_retarget.sh
+
+MVK_OUT := vendor-moltenvk/out
+
+# The host half of the gate — MoltenVK loaded and RUN, not inspected. See
+# tests/t_mvk.c for why every cheaper check is a false answer.
+build/t_mvk: tests/t_mvk.c
+	@mkdir -p build
+	@test -d $(MVK_OUT)/include || { echo "  !! run 'make mvk' first"; exit 1; }
+	$(CC) $(CFLAGS) -I$(MVK_OUT)/include -o $@ tests/t_mvk.c
+
+# ...and the visionOS half, which the host cannot run: link against the
+# retargeted device slice with the LOCAL SDK. This is what proves the lowered
+# floor is consumable rather than merely written — a framework whose minos still
+# exceeded the deployment target fails right here, at the link, instead of on a
+# headset. `-Wl,-no_weak_imports` is deliberate: it turns "this symbol will be
+# missing at runtime on your floor" from a silent weak import into a link error,
+# which is the whole question being asked about a 26.5 binary stamped 1.0.
+mvk-check: build/t_mvk
+	@echo "=== MoltenVK: visionOS device slice, linked against the local SDK"
+	@mkdir -p build
+	@printf '#include <vulkan/vulkan.h>\nVkResult klmvk_probe(const VkInstanceCreateInfo *ci, VkInstance *out);\nVkResult klmvk_probe(const VkInstanceCreateInfo *ci, VkInstance *out) { return vkCreateInstance(ci, 0, out); }\n' > build/mvk_link.c
+	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
+	   -I$(MVK_OUT)/include -dynamiclib -o build/mvk_link.dylib build/mvk_link.c \
+	   -F$(MVK_OUT)/xros -framework MoltenVK -Wl,-no_weak_imports \
+	   -install_name @rpath/mvk_link.dylib
+	@printf '  ok   links for xros1.0 against %s\n' "$(MVK_OUT)/xros/MoltenVK.framework"
+	@echo
+	@./build/t_mvk
+
+mvk-status:
+	@if [ ! -d $(MVK_OUT) ]; then echo "  vendor-moltenvk/ absent — run 'make mvk'"; else \
+	  for d in xros xrsim; do \
+	    b=$(MVK_OUT)/$$d/MoltenVK.framework/MoltenVK; \
+	    if [ -f $$b ]; then printf '  %-8s ' $$d; \
+	      xcrun vtool -show-build $$b | awk '/platform/{p=$$2} /minos/{m=$$2} /sdk/{s=$$2} \
+	        END{printf "%-20s minos %-6s sdk %s\n", p, m, s}'; \
+	    else printf '  %-8s absent\n' $$d; fi; done; \
+	  b=$(MVK_OUT)/macos/libMoltenVK.dylib; \
+	  if [ -f $$b ]; then printf '  %-8s ' macos; \
+	    xcrun vtool -show-build -arch arm64 $$b | awk '/platform/{p=$$2} /minos/{m=$$2} \
+	      END{printf "%-20s minos %s\n", p, m}'; \
+	  else printf '  %-8s absent\n' macos; fi; \
 	fi
 
 # `make angle` / `make shared` exercise the vendored debug build — build it
