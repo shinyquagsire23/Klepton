@@ -95,6 +95,13 @@ void kl_jni_set_files_dir(const char *dir);
 // from it — one number, not two that can disagree.
 void kl_jni_guest_version(long *code, const char **name);
 
+// ...and the guest's package name, read from the same tree's
+// AndroidManifest.xml. It is half an OBB's filename
+// (main.<versionCode>.<package>.obb) and how the guest looks itself up through
+// the PackageManager, so it is a property of the APK rather than a constant —
+// see klj_guest_package.
+const char *kl_jni_guest_package(void);
+
 // Beat Saber versions keeps one save/pairing profile instead of repeating first
 // setup — and deliberately OUTSIDE build/, which `make clean` deletes. Drivers
 // pass the result to kl_jni_set_files_dir; visionOS overrides it with the app

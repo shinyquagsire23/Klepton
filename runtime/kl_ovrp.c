@@ -105,6 +105,11 @@ static uint64_t klovrp_called(const char *name) {
 #define OVRP_FAIL_INVALID_PARAM   (-1001)
 #define OVRP_FAIL_NOT_INITIALIZED (-1002)
 #define OVRP_FAIL_UNSUPPORTED     (-1004)
+// ...and the one the real plugin uses for "there is nothing to hand you",
+// which is not an error condition at the call site — ovrp_PollEvent2's own
+// empty-queue path returns it (+0x26750), and the managed event loop reads any
+// negative result as "stop polling this frame".
+#define OVRP_FAIL_OPERATION       (-1006)
 
 // Record a call. The hand-written implementations below call this themselves so
 // that they stay in the report — the report is the M6 work list, and an entry
@@ -274,6 +279,32 @@ static const char *klovrp_GetVersion(void) {
 // entry points stopped aborting first.
 static uint64_t klovrp_GetVersion2(const char **out) {
     ovrp_hit("ovrp_GetVersion2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = KLOVRP_VERSION;
+    return OVRP_SUCCESS;
+}
+
+// ...and the SDK-version pair, which is the same two functions in the same
+// relationship — `ovrp_GetNativeSDKVersion` (+0x26c18 in SUPERHOT's plugin, a
+// 44-byte wrapper, no argument refused) around
+// `ovrp_GetNativeSDKVersion2(const char **)` (+0x22b4c, `cbz x0` -> -1001),
+// confirmed with tools/ovrp_abi.py against the real library rather than assumed
+// from the naming. Writing this pair the other way round is trap 10b exactly.
+//
+// What it reports is the version of the NATIVE SDK under the plugin — VrApi on
+// a Quest. There is none here (PLANNING §3.1: libvrapi.so is never loaded), so
+// the honest answer is the one thing that is true, our own plugin version, and
+// it is the same string ovrp_GetVersion answers so the two cannot describe
+// different plugins. Unity's own use of it is diagnostic — OVRManager logs
+// "OVRPlugin v{0}, SDK v{1}" — and SUPERHOT's C# reached it during its startup
+// logging, where an unimplemented entry point is an abort.
+static const char *klovrp_GetNativeSDKVersion(void) {
+    ovrp_hit("ovrp_GetNativeSDKVersion");
+    return KLOVRP_VERSION;
+}
+
+static uint64_t klovrp_GetNativeSDKVersion2(const char **out) {
+    ovrp_hit("ovrp_GetNativeSDKVersion2");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
     *out = KLOVRP_VERSION;
     return OVRP_SUCCESS;
@@ -812,16 +843,76 @@ static uint64_t klovrp_GetNodeFrustum2(int node, void *out) {
 // below the floor, out of frustum. Recorded here and read by the pose defaults.
 static int g_tracking_origin;          // 0 = eye level, until the guest says otherwise
 int kl_ovrp_tracking_origin(void) { return g_tracking_origin; }
+//
+// **The v1 and v2 spellings of this pair are four different ABIs, not two**, and
+// three of the four were wrong here. Read out of the real plugin (SUPERHOT's
+// +0x270f4 and beatsaber's +0x176390 agree):
+//
+//   ovrp_SetTrackingOriginType (origin)      -> ovrpBool   (1 on success)
+//   ovrp_SetTrackingOriginType2(origin)      -> ovrpResult (0 on success)
+//   ovrp_GetTrackingOriginType()             -> the ORIGIN, returned in w0
+//   ovrp_GetTrackingOriginType2(int *out)    -> ovrpResult, origin through x0
+//
+// The getter's v1 form takes NO ARGUMENT: the real one calls the 2-form with a
+// stack slot and answers `csel w0, wzr, w8, lt`, i.e. the value it read, or 0 if
+// the call failed. Ours took an `int *` and STORED through it, so a guest
+// calling the argument-less form had whatever happened to be in x0 written to —
+// a wild store from a getter, which is a SIGBUS or silent corruption depending
+// on what the register held, and unattributable to this function from anywhere.
+// It survived because Beat Saber reaches the origin through the 2-form.
+// Trap 10b's shape with the halves swapped: there the 2-form was implemented as
+// a scalar return, here the scalar form was implemented as an out-param.
 static uint64_t klovrp_SetTrackingOriginType(int origin) {
     ovrp_hit("ovrp_SetTrackingOriginType");
     ovrp_log_arg("ovrp_SetTrackingOriginType", origin, __builtin_return_address(0));
     g_tracking_origin = origin;
-    return OVRP_TRUE;
+    return OVRP_TRUE;                       // ovrpBool
 }
-static uint64_t klovrp_GetTrackingOriginType(int *out) {
+static uint64_t klovrp_SetTrackingOriginType2(int origin) {
+    ovrp_hit("ovrp_SetTrackingOriginType2");
+    ovrp_log_arg("ovrp_SetTrackingOriginType2", origin, __builtin_return_address(0));
+    g_tracking_origin = origin;
+    return OVRP_SUCCESS;                    // ovrpResult
+}
+// The plugin's own event queue, which OVRManager drains every frame.
+//
+// Signature read straight out of the real 1.59 body (+0x266dc), because both
+// arguments are pointers it WRITES and getting that wrong is trap 10b:
+//
+//   ovrpResult ovrp_PollEvent2(ovrpEventType *type, void **eventData)
+//
+// It refuses either NULL with -1001, answers -1002 with no plugin, and when its
+// internal fetch comes back empty it answers **-1006** without touching either
+// pointer. That last one is the steady state here: we generate no plugin events
+// at all — no display refresh changes, no boundary or tracking-state
+// transitions, none of the things the queue carries — so every poll is an empty
+// one. Answering ovrpSuccess instead would tell the guest an event IS waiting
+// and hand it an uninitialised type and pointer to parse.
+//
+// Deliberately NOT a shared-handler entry: the out-params are the whole call.
+static uint64_t klovrp_PollEvent2(uint32_t *type, void **data) {
+    ovrp_hit("ovrp_PollEvent2");
+    if (!type || !data) return OVRP_FAIL_INVALID_PARAM;
+    return OVRP_FAIL_OPERATION;                    // the queue is empty
+}
+
+// The v1 spelling takes the buffer by reference and fills a type field inside
+// it; same empty answer, and the same refusal for a NULL.
+static uint64_t klovrp_PollEvent(void *buf) {
+    ovrp_hit("ovrp_PollEvent");
+    if (!buf) return OVRP_FAIL_INVALID_PARAM;
+    return OVRP_FAIL_OPERATION;
+}
+
+static uint64_t klovrp_GetTrackingOriginType(void) {
     ovrp_hit("ovrp_GetTrackingOriginType");
-    if (out) *out = g_tracking_origin;
-    return OVRP_TRUE;
+    return (uint64_t)(uint32_t)g_tracking_origin;
+}
+static uint64_t klovrp_GetTrackingOriginType2(int *out) {
+    ovrp_hit("ovrp_GetTrackingOriginType2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = g_tracking_origin;
+    return OVRP_SUCCESS;
 }
 
 // The per-frame node loop's tracked/valid probes (0x9bbe78..0x9bbeb4): u32
@@ -3941,6 +4032,8 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"JNI_OnLoad",        (void *)klovrp_JNI_OnLoad},
     {"ovrp_GetVersion",   (void *)klovrp_GetVersion},
     {"ovrp_GetVersion2",   (void *)klovrp_GetVersion2},
+    {"ovrp_GetNativeSDKVersion",  (void *)klovrp_GetNativeSDKVersion},
+    {"ovrp_GetNativeSDKVersion2", (void *)klovrp_GetNativeSDKVersion2},
     {"ovrp_GetSystemHeadsetType", (void *)klovrp_GetSystemHeadsetType},
     {"ovrp_GetSystemHeadsetType2", (void *)klovrp_GetSystemHeadsetType2},
     {"ovrp_GetLocalTrackingSpaceRecenterCount",
@@ -3967,8 +4060,11 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetEyeTextureStageCount", (void *)klovrp_GetEyeTextureStageCount},
     {"ovrp_GetDesiredEyeTextureFormat", (void *)klovrp_GetDesiredEyeTextureFormat},
     {"ovrp_SetTrackingOriginType", (void *)klovrp_SetTrackingOriginType},
-    {"ovrp_SetTrackingOriginType2", (void *)klovrp_SetTrackingOriginType},
+    {"ovrp_SetTrackingOriginType2", (void *)klovrp_SetTrackingOriginType2},
     {"ovrp_GetTrackingOriginType", (void *)klovrp_GetTrackingOriginType},
+    {"ovrp_GetTrackingOriginType2", (void *)klovrp_GetTrackingOriginType2},
+    {"ovrp_PollEvent",  (void *)klovrp_PollEvent},
+    {"ovrp_PollEvent2", (void *)klovrp_PollEvent2},
     {"ovrp_GetNodeFrustum2", (void *)klovrp_GetNodeFrustum2},
     // Real implementations only so that the frame boundary can be *observed* —
     // both still answer ovrpSuccess and neither has an out-param. This is the
@@ -4052,6 +4148,13 @@ static const char *const g_ovrp_result_ok[] = {
     // Unity's native plugin interface. All void.
     "UnitySetGraphicsDevice", "UnitySetEventQueue", "UnityShaderCompilerExtEvent",
     "UnityRenderingExtEvent",
+    // ...and the audio-plugin enumeration, which libunity's AudioPluginManager
+    // dlsyms speculatively on every native plugin handle it holds. It returns a
+    // COUNT of effect definitions, so 0 is "this plugin publishes no audio
+    // effects" — the same thing the real library says by not exporting it at
+    // all, which on Android is a failed dlsym. Ours resolves everything by
+    // design (a lookup is a measurement, kl_ovrp.h), so it has to answer.
+    "UnityGetAudioEffectDefinitions",
     // Bring-up. This is the decision recorded in PLANNING M6: we answer success
     // and stand behind it, rather than reporting a failure Unity would be right
     // to believe.
@@ -4141,6 +4244,14 @@ static const char *const g_ovrp_bool_yes[] = {
     // refusing it would only desync Unity from what we report elsewhere.
     "ovrp_SetEyeTextureScale", "ovrp_SetEyeViewportScale",
     "ovrp_SetEyeTextureFlippedY",
+    // The managed side's desired-format push, and the same class: recorded
+    // state, and a bool rather than an ovrpResult — the real 1.59 body
+    // (+0x2837c) ends `blr <backend>; and w0, w0, #0x1`, and answers 0 only
+    // when the plugin is uninitialised. Recorded, not applied: what the eye
+    // textures ARE is what ovrp_GetDesiredEyeTextureFormat already answers and
+    // what kl_glfb allocates, so accepting the push keeps the guest's story and
+    // ours the same. SUPERHOT pushes it during OVRManager's init.
+    "ovrp_SetDesiredEyeTextureFormat",
     // Per-frame predicates (0x9bbe58 gate; focus gates whether Unity renders
     // at all). The head is present and the app is focused: true.
     "ovrp_GetNodePresent", "ovrp_GetAppHasVrFocus", "ovrp_GetUserPresent",
@@ -4158,6 +4269,43 @@ static const char *const g_ovrp_bool_yes[] = {
     "ovrp_GetInitialized",
     // Agrees with ovrp_Media_Initialize's success above.
     "ovrp_Media_GetInitialized",
+    // The tracking-capability block, which OVRManager reads while it builds a
+    // camera rig and SUPERHOT reaches during its main scene's init. Every one of
+    // these is a bool in the real 1.59 plugin, by the two v1 wrapper shapes:
+    // the getters take no argument and return the ...2 form's value, the setters
+    // return `!(result < 0)`. YES is also what is true here rather than merely
+    // convenient — we pose the head with full position AND orientation every
+    // frame, so reporting either as unsupported or switched off would contradict
+    // the poses we hand over on the next call. The setters accept for the same
+    // reason the eye-texture ones do: recorded state, with nothing here to
+    // switch off.
+    "ovrp_GetTrackingPositionSupported", "ovrp_GetTrackingOrientationSupported",
+    "ovrp_GetTrackingPositionEnabled",   "ovrp_GetTrackingOrientationEnabled",
+    "ovrp_GetTrackingIPDEnabled",
+    "ovrp_SetTrackingPositionEnabled",   "ovrp_SetTrackingOrientationEnabled",
+    "ovrp_SetTrackingIPDEnabled",
+    // Chromatic-aberration correction. Both halves are `return GetInitialized()`
+    // stubs in the real plugin (the correction moved compositor-side and the
+    // entry points survive for ABI only), so the bool-yes is the real library's
+    // own answer rather than an invention — and ignoring the coefficients is
+    // safe because the real stub ignores them too.
+    "ovrp_GetAppChromaticCorrection",
+    // Recorded state, like the setters above: there is no boundary here to show
+    // or hide, but refusing the call would desync the guest from the coherent
+    // "no guardian" story the getters tell.
+    "ovrp_SetBoundaryVisible",
+    // The quit path's answer that we initialised fine (bool: `!(result < 0)`).
+    "ovrp_Shutdown",
+    // A setter that answers ovrpBOOL, which is not what a setter next to it
+    // does — ovrp_SetAppAsymmetricFov two hundred bytes away in the same real
+    // library returns ovrpResult 0. Read out of SUPERHOT's own libOVRPlugin.so
+    // (+0x29f4c) rather than inferred from the name: the whole body is
+    // `bl ovrp_GetInitialized; cmp w0, #0; cset w0, ne; ret`. It IGNORES its
+    // argument — there is no per-app chromatic correction to set on this
+    // hardware — and answers whether the plugin came up, so with
+    // ovrp_Initialize5 answered success this is 1. Answering ovrpResult's 0
+    // here would read to the caller as false, which is trap 10 exactly.
+    "ovrp_SetAppChromaticCorrection",
 };
 
 static const char *const g_ovrp_bool_no[] = {
@@ -4175,6 +4323,23 @@ static const char *const g_ovrp_bool_no[] = {
     "ovrp_GetEyePreviewRect",
     // No Guardian here — bool return (real plugin maps failure to false).
     "ovrp_GetBoundaryGeometry2",
+    // ...and the v1 predicate beside it, which SUPERHOT's OVRManager asks while
+    // it builds its camera rig. Also a bool, by the v1 wrapper shape rather than
+    // by its name: the real 1.59 (+0x27b60) calls ovrp_GetBoundaryConfigured2
+    // with a stack out-param and answers `csel w0, wzr, w8, lt` — the value if
+    // the Result was non-negative, false otherwise. NO is the coherent answer:
+    // it agrees with the zero boundary dimensions and the geometry answer above,
+    // and this host has no guardian to describe. A title that gated play on a
+    // configured boundary would need this revisited — SUPERHOT does not.
+    "ovrp_GetBoundaryConfigured",
+    // ...and whether one is currently being SHOWN. Nothing shows it here, which
+    // is the same answer for the same reason.
+    "ovrp_GetBoundaryVisible",
+    // Monoscopic rendering: recorded state in the real plugin that starts
+    // CLEARED, and we render both eyes for real — so "no" is what is true as
+    // well as what an untouched plugin would say. OVRManager reads it while
+    // building the camera rig.
+    "ovrp_GetAppMonoscopic",
     // No occlusion mesh data exists on this host (bool return).
     "ovrp_GetEyeOcclusionMesh",
     // No fixed-foveated/tiled multires rendering in our GL gateway.

@@ -15,6 +15,9 @@
 #include <wchar.h>
 #include <wctype.h>
 #include <math.h>
+#include <fenv.h>        // feclearexcept/fetestexcept: SUPERHOT's libOVRLipSync
+                         // imports them, and a direct forward needs the
+                         // DECLARATION here, not just the symbol in libSystem
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>

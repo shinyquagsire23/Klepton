@@ -10,11 +10,19 @@
 # full blocks, and a death by SIGNAL loses the buffer — which is exactly the
 # report you wanted (CLAUDE.md, "Operating the M4 loop"). A pty forces line
 # buffering. The SDL window and the mouse are unaffected; only stdio moves.
+#
+# Which guest, as the first argument, defaulting to beatsaber —
+# `./build_run_viewer.sh superhot`. The name goes straight to m_boot, which
+# resolves it through the same target table the visionOS build reads, so the
+# libraries, the APK, the assets and the userdata directory move together.
+# The log is named after it for the same reason build_run_vpro.sh's is: two
+# targets writing one path means the second run's evidence overwrites the first.
 make build/m_boot || exit 1
-LOG="${KL_LOG:-/tmp/viewer.log}"
-echo "[viewer] logging to $LOG"
+TARGET="${1:-beatsaber}"
+LOG="${KL_LOG:-/tmp/viewer-$TARGET.log}"
+echo "[viewer] $TARGET, logging to $LOG"
 KL_GLFB_ERRSCAN=1 KL_OVRP_HANDS_IN_VIEW=1 KL_NET_OFFLINE=1 KL_TRACE_FS=1 KL_GLFB_EXPOSURE=1.0 KL_GLFB_GAMMA=0.45 KL_POKE_CAP=64 KL_VIEW=1 KL_GLFB=1 KL_LIFECYCLE=1 \
-  script -q /dev/null ./build/m_boot beatsaber/lib/arm64-v8a 2>&1 | tee "$LOG"
+  script -q /dev/null ./build/m_boot "$TARGET" 2>&1 | tee "$LOG"
 echo "[viewer] exit ${pipestatus[1]:-?} — report: LC_ALL=C grep -a -n 'fault:' $LOG"
 #KL_VIEW=1 KL_GLFB=1 KL_GLFB_OUT=$(pwd)/fbo_dump KL_GLFB_DUMP_FBOS=1 KL_GLFB_OUT_EVERY=200 KL_LIFECYCLE=1 KL_FRAMES=2400 ./build/m_boot beatsaber/lib/arm64-v8a
 #KL_DUMP_TEXTURES=tex_dump KL_TRACE_FS=1 KL_GLFB_EXPOSURE=1.0 KL_GLFB_GAMMA=0.45 KL_POKE_CAP=64 KL_FRAMES=20000 KL_LIFECYCLE=1 ./build/m_boot beatsaber/lib/arm64-v8a

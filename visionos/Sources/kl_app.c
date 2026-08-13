@@ -25,35 +25,21 @@
 
 // --- Which guest ------------------------------------------------------------
 //
-// Everything below used to say "beatsaber" in five places, which was honest
-// while there was one guest and became a lie the moment a second app was built
-// from this tree. A target is the small set of facts that differ: what the tree
-// is called, which library the chain starts at, and which boot sequence runs.
+// The table itself is runtime/kl_target.h now — one row per guest, generated
+// from visionos/targets.py, and shared with `build/m_boot` so the host driver
+// and the app cannot describe one guest differently. This file used to carry
+// its own array of literals; that was the third copy of the same table.
 //
 // The default is baked in at BUILD time (KL_TARGET_DEFAULT, set by
 // gen_xcodeproj.py) rather than read from the environment, because the app has
 // to know which guest it is when it is launched by hand from the Home View with
 // no environment at all. KL_TARGET still overrides it, which is what makes an
 // A/B possible from `run.sh` without regenerating the project.
+#include "kl_target.h"
+
 #ifndef KL_TARGET_DEFAULT
-#define KL_TARGET_DEFAULT "beatsaber"
+#define KL_TARGET_DEFAULT KL_TARGET_DEFAULT_NAME
 #endif
-
-typedef struct {
-    const char *name;      // KL_TARGET / KL_TARGET_DEFAULT
-    const char *tree;      // the unpacked APK's directory, under the container
-    const char *apk;       // ...and the APK itself, which is load-bearing
-    const char *entry_lib; // the library whose presence proves the guest was embedded
-    int         steamlink; // which boot sequence: Unity's, or kl_slink's VR door
-} kl_target;
-
-static const kl_target TARGETS[] = {
-    { "beatsaber",    "beatsaber",    "beatsaber.apk",    "libmain",           0 },
-    // Both front doors, in one app. The shell pairs in a WindowGroup and hands
-    // off to the OpenXR half in an ImmersiveSpace — see boot_steamlink and
-    // app_vrlink_handoff.
-    { "steamlink-vr", "steamlink-vr", "steamlink-vr.apk", "libvrlink_scene",   1 },
-};
 
 static const kl_target *g_target;
 
@@ -77,14 +63,10 @@ static int           g_vr_loaded;
 // exactly that.
 static volatile int  g_guest_quit;
 
-static const kl_target *target_lookup(const char *name) {
-    for (unsigned i = 0; i < sizeof TARGETS / sizeof *TARGETS; i++)
-        if (!strcmp(TARGETS[i].name, name)) return &TARGETS[i];
-    return NULL;
-}
-
 const char *kl_app_target_name(void) { return g_target ? g_target->name : "(unconfigured)"; }
-int kl_app_target_is_steamlink(void) { return g_target && g_target->steamlink; }
+int kl_app_target_is_steamlink(void) {
+    return g_target && g_target->kind == KL_GUEST_STEAMLINK;
+}
 
 static char g_libdir[1024];
 static char g_assets[1024];
@@ -119,7 +101,7 @@ int kl_app_configure(const char *resources, const char *container) {
     if (!resources || !container) return missing("path", "(null)");
 
     const char *want = kl_env_str("KL_TARGET", KL_TARGET_DEFAULT);
-    g_target = target_lookup(want);
+    g_target = kl_target_lookup(want);
     if (!g_target) return missing("guest target (KL_TARGET)", want);
 
     // Trap 11, claimed HERE rather than wherever the first guest library happens
@@ -171,7 +153,7 @@ int kl_app_configure(const char *resources, const char *container) {
     if (!have(g_apk))    return missing("staged APK (run stage_assets.sh)", g_apk);
     mkdir(g_files, 0755);
 
-    if (g_target->steamlink) {
+    if (kl_app_target_is_steamlink()) {
         // Which front door this launch opens. The SHELL is the default because
         // it is the only one that can produce a session: the VR half reads its
         // own out of the launching Intent and leaves before its first frame
@@ -602,7 +584,7 @@ int kl_app_boot(void) {
     // environment at all. A run that was meant to carry a session and silently
     // took the shell instead is indistinguishable from a broken handoff, and
     // the first thing it does is open a screen that looks like it is working.
-    if (g_target->steamlink)
+    if (kl_app_target_is_steamlink())
         printf("  front door: %s   (KL_SLINK_SARGS %s, KL_SLINK_VR %s, "
                "KL_SLINK_SHELL %s)\n",
                g_door == KL_SLINK_VR ? "VR (libvrlink_scene)" : "SHELL (libshell + Qt)",
@@ -617,7 +599,7 @@ int kl_app_boot(void) {
     printf("  files     : %s\n\n", g_files);
     fflush(NULL);
 
-    if (g_target->steamlink) return boot_steamlink();
+    if (kl_app_target_is_steamlink()) return boot_steamlink();
 
     char path[1200];
     snprintf(path, sizeof path, "%s/libmain.so", g_libdir);
@@ -744,7 +726,7 @@ int kl_app_lifecycle_begin(void) {
     // ALooper_forThread() and the guest hangs its UIThreadCallbackHandler off
     // exactly that looper. Splitting the two across threads leaves the guest
     // with callbacks nobody will ever run and no error anywhere.
-    if (g_target->steamlink) {
+    if (kl_app_target_is_steamlink()) {
         g_phase = "proc";
         report_proc();
         g_alarm_secs = kl_env_int("KL_ALARM", 120);
@@ -842,7 +824,7 @@ int kl_app_frame(void) {
     // a call per display frame. Pacing happens where OpenXR puts it — xrWaitFrame
     // blocks on the compositor's published pose (kl_openxr_set_pacer) — so a
     // caller that pumped here as well would be a second, disagreeing clock.
-    if (g_target && g_target->steamlink) return -1;
+    if (kl_app_target_is_steamlink()) return -1;
     if (!g_render || !g_thiz) return -1;
     alarm(g_alarm_secs);
     // Pin this frame's poses before anything in the frame can ask. The
@@ -867,7 +849,7 @@ int kl_app_frame(void) {
 }
 
 void kl_app_lifecycle_report(void) {
-    if (g_target && g_target->steamlink) {
+    if (kl_app_target_is_steamlink()) {
         // Media, audio, XR and GL — which between them ARE the VR half of this
         // app. Every one of them otherwise reports only on kl_fault.c's abort
         // path, which a working run never takes, so the run that most needs
@@ -903,7 +885,7 @@ int kl_app_lifecycle(unsigned frames) {
     // measurement P4 is for Beat Saber and has to stay takeable for this guest
     // too. `frames` would be a number with nothing behind it, so the deadline is
     // KL_SLINK_WAIT's, in seconds, as it is on the command line.
-    if (g_target->steamlink) {
+    if (kl_app_target_is_steamlink()) {
         // ...and the shell has no deadline at all by default, which is the one
         // place the two doors differ here. A bounded pump measures how far a
         // guest got by itself; the shell is not measuring, it is being USED —
@@ -1036,7 +1018,7 @@ static void *guest_thread(void *unused) {
     // is a turning looper and nothing else. Pacing is not lost by that: it moves
     // to where OpenXR puts it, xrWaitFrame, which blocks on the same published
     // pose through kl_openxr_set_pacer. One clock either way.
-    if (g_target->steamlink) {
+    if (kl_app_target_is_steamlink()) {
         printf("\n=== guest thread pumping the activity's looper ===\n");
         fflush(NULL);
         double secs = kl_slink_vr_pump(-1.0, &g_guest_quit);
@@ -1100,7 +1082,7 @@ int kl_app_guest_start(void) {
     // pacer installed there would block the guest on a pose nobody will ever
     // publish. Installing it here also closes the window in which the guest could
     // reach its first xrWaitFrame unpaced, because the guest does not exist yet.
-    if (g_target && g_target->steamlink) kl_openxr_set_frame_pacer(guest_pace_wait);
+    if (kl_app_target_is_steamlink()) kl_openxr_set_frame_pacer(guest_pace_wait);
 
     // User-interactive, because this thread is now the one producing frames.
     // A plain pthread gets an unspecified QoS, and a guest demoted below the

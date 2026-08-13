@@ -5,8 +5,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <sys/stat.h>              // the cloud-save directory is created
 #include "klepton.h"
 #include "kl_jni.h"
+#include "kl_env.h"
 #include "kl_ovrplat.h"
 
 #define KL_OVRPLAT_MAX 512
@@ -192,6 +194,7 @@ static uint64_t klplat_called(const char *name) {
 #define KLPLAT_MSG_AGE_CATEGORY    567009472u   //   .Entitlement_GetIsViewerEntitled
 #define KLPLAT_MSG_APP_VERSION    1751583246u   //   .UserAgeCategory_Get
                                                 //   .Application_GetVersion
+#define KLPLAT_MSG_CLOUD_DIR      1990471406u   //   .CloudStorage2_GetUserDirectoryPath
 #define KLPLAT_INIT_SUCCESS        0            // PlatformInitializeResult.Success
 #define KLPLAT_AGE_ADULT           3            // AccountAgeCategory.Ad
 
@@ -201,7 +204,12 @@ static uint64_t klplat_called(const char *name) {
 // from managed code on the main thread and the pump runs there too, but nothing
 // in the API promises that.
 #define KLPLAT_MSGQ 16
-typedef struct { uint32_t type; uint64_t request; int32_t payload; } klplat_msg;
+// `str` is the STRING payload, for the messages whose managed wrapper is a
+// `Message<string>` — it is read through ovr_Message_GetString rather than
+// through the int payload above, and a message carries one or the other.
+typedef struct {
+    uint32_t type; uint64_t request; int32_t payload; const char *str;
+} klplat_msg;
 static klplat_msg      g_msgq[KLPLAT_MSGQ];
 static unsigned        g_msg_head, g_msg_tail;
 static uint64_t        g_next_request = 1;
@@ -211,18 +219,25 @@ static pthread_mutex_t g_msg_mu = PTHREAD_MUTEX_INITIALIZER;
 // Issue a request and queue its completion. Returns the ovrRequest the guest
 // will wait on — non-zero, and matched by the message, which together are the
 // whole point.
-static uint64_t klplat_request(const char *what, uint32_t type, int32_t payload) {
+static uint64_t klplat_request_str(const char *what, uint32_t type,
+                                   int32_t payload, const char *str) {
     pthread_mutex_lock(&g_msg_mu);
     uint64_t id = g_next_request++;
     if (g_msg_tail - g_msg_head < KLPLAT_MSGQ) {
         klplat_msg *m = &g_msgq[g_msg_tail++ % KLPLAT_MSGQ];
-        m->type = type; m->request = id; m->payload = payload;
+        m->type = type; m->request = id; m->payload = payload; m->str = str;
     }
     pthread_mutex_unlock(&g_msg_mu);
     fprintf(stderr, "  [plat] %s -> request %llu, completion queued "
-                    "(type 0x%08x, payload %d)\n",
-            what, (unsigned long long)id, type, payload);
+                    "(type 0x%08x, payload %d%s%s)\n",
+            what, (unsigned long long)id, type, payload,
+            str ? ", string " : "", str ? str : "");
     return id;
+}
+
+// ...and the int-payload spelling, which is all but one caller.
+static uint64_t klplat_request(const char *what, uint32_t type, int32_t payload) {
+    return klplat_request_str(what, type, payload, NULL);
 }
 
 // The message pump. NULL still means "no messages queued", which is the
@@ -268,6 +283,14 @@ static uint64_t klplat_payload_int(const klplat_msg *m) {
     plat_hit("ovr_Payload_GetInt");
     return m ? (uint64_t)(uint32_t)m->payload : 0;
 }
+// ...and the string one. `Message<string>` reads its data with this rather than
+// through the payload handle, so a message whose managed wrapper is a string
+// carries `str` and answers here. NULL for every other message, which is what
+// the SDK expects for one that has no string.
+static const char *klplat_Message_GetString(const klplat_msg *m) {
+    plat_hit("ovr_Message_GetString");
+    return m ? m->str : NULL;
+}
 static uint64_t klplat_FreeMessage(klplat_msg *m) {
     plat_hit("ovr_FreeMessage");
     (void)m;                      // the ring owns it; see the KLPLAT_MSGQ note
@@ -293,6 +316,57 @@ static uint64_t klplat_IsPlatformInitialized(void) {
     return (uint64_t)g_platform_up;
 }
 
+// ...and the SYNCHRONOUS Android wrapper, which is the same decision reached
+// through a different door — and a different RETURN TYPE, which is what made it
+// worth measuring rather than grouping.
+//
+// `Oculus.Platform.Core.Initialize(appId)` calls this one and THROWS when it is
+// false: `UnityException("Oculus Platform failed to initialize.")`. It is not an
+// ovrRequest and not a PlatformInitializeResult — the real export builds a byte
+// (`and w8, w8, #1; strb w8, [sp, ...]`), i.e. a plain bool, checked in both
+// this tree's loaders (superhot +0x51934, beatsaber +0x8aae4). Trap 10's shape
+// exactly: grouped with the request-returning init family it would answer 0,
+// and 0 in a bool is false.
+//
+// Why it answers TRUE, given the file's standing objection to inventing success:
+// that objection is about a request id nothing completes, and it no longer
+// applies. This branch has a message queue, the async init already answers
+// success and sets g_platform_up, and the app's own entitlement completes
+// through it. Answering false HERE while answering success THERE is the two
+// halves disagreeing — and the cost of the disagreement is not an error path,
+// it is the whole title: a guest running the stock
+// `Oculus.Platform.Samples.EntitlementCheck` behaviour catches the throw, runs
+// its failure handler, and calls `UnityEngine.Application.Quit()`. Unity's quit
+// gate then makes `nativeRender` a no-op for the rest of the process's life, so
+// what a person sees is not an error message but a frozen frame, reprojected
+// forever, with every counter healthy. SUPERHOT VR is such a guest.
+//
+// **The DRM line does not move with this.** Asking to connect to the platform is
+// not an ownership question (that is why this family was never among the
+// refusals); IAP, purchase records, asset details and every delivery call still
+// abort unconditionally and check_drm_guard still asserts both directions.
+// What init being answered buys is that the app's own licence check — the one
+// carve-out this project deliberately made — becomes REACHABLE. A guest that
+// quits before it can ask is not a guest being refused; it is one that never got
+// to the question.
+//
+// Deliberately narrow: only this name. The Asynchronous / Standalone spellings
+// have their own answers above, and the `ovr_PlatformInitialize*` family returns
+// an `ovrPlatformInitializeResult` (a THIRD convention, whose Success is 0).
+static uint64_t klplat_UnityInitWrapper(const char *app_id) {
+    plat_hit("ovr_UnityInitWrapper");
+    g_platform_up = 1;
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [plat] ovr_UnityInitWrapper(\"%s\") -> true (the "
+                        "synthetic platform reports it came up, so the app's own "
+                        "entitlement check can be asked and answered; every "
+                        "ownership query still refuses)\n", app_id ? app_id : "");
+    }
+    return 1;
+}
+
 // The app's own licence check — see the g_plat_absent carve-out above for why
 // this one is answered and the rest of the family is not: the user unpacked
 // their own APK, so a licence to the application itself is something we can
@@ -310,6 +384,51 @@ static uint64_t klplat_Entitlement_GetIsViewerEntitled(void) {
     plat_hit("ovr_Entitlement_GetIsViewerEntitled");
     return klplat_request("ovr_Entitlement_GetIsViewerEntitled",
                           KLPLAT_MSG_ENTITLEMENT, 0);
+}
+
+// Where the user's saves live — and the one member of the CloudStorage family
+// that is answered rather than refused.
+//
+// The rest of that family stays refused, and the split is the same one the DRM
+// line is drawn along: `ovr_CloudStorage_Load` / `_Save` move DATA to and from a
+// service that is not here, so 0 ("the request could not be made") is the truth
+// about them. This one moves no data at all. It asks where on the local
+// filesystem the save directory IS — the directory the platform would later
+// synchronise — and that is a question this host can answer completely.
+//
+// Refusing it is what a black launch screen looks like. SUPERHOT's
+// `VRSaveManager::LoadAsync` chains its whole load off this request, so a 0
+// leaves the SDK waiting on a completion it will never post: no save data, no
+// scene, and the launch precache's own `ClearRenderTarget` command buffer parked
+// on the camera in the meantime — which renders as black, forever, with every
+// frame counter healthy. "A game that cannot reach the cloud writes locally" is
+// only true if something tells it where local is.
+//
+// It is a REQUEST returning `Request<string>` (the SDK's `MessageWithString`),
+// so the path arrives as a message payload read through ovr_Message_GetString —
+// not as a return value. The type number is the guest's own, read out of the
+// running IL2CPP runtime with KL_PROBE_ENUM like the three above it.
+//
+// The directory is created, and that is not a convenience: the guest calls its
+// own IsDirectoryWritable on the answer before it uses it, and a path that does
+// not exist fails that test — which is the same stall wearing a different hat.
+// It sits beside the guest's files directory, so it is per-target and follows
+// KL_FILES_DIR like everything else the guest writes.
+static const char *klplat_cloud_dir(void) {
+    static char dir[1024];
+    if (!*dir) {
+        const char *env = kl_env_str("KL_PLAT_CLOUD_DIR", NULL);
+        if (env && *env) snprintf(dir, sizeof dir, "%s", env);
+        else snprintf(dir, sizeof dir, "%s/cloudstorage", kl_jni_files_dir());
+        mkdir(dir, 0755);
+    }
+    return dir;
+}
+
+static uint64_t klplat_CloudStorage2_GetUserDirectoryPath(void) {
+    plat_hit("ovr_CloudStorage2_GetUserDirectoryPath");
+    return klplat_request_str("ovr_CloudStorage2_GetUserDirectoryPath",
+                              KLPLAT_MSG_CLOUD_DIR, 0, klplat_cloud_dir());
 }
 
 // The age category, and the ONE answer in this file that is a declaration
@@ -403,6 +522,11 @@ static const char *const g_plat_unity[] = {
     // returns int, and 0 is the truthful answer — this plugin wants no
     // render-thread extension events, so Unity will never issue them.
     "UnityRenderingExtEvent", "UnityRenderingExtQuery",
+    // Audio-plugin enumeration, dlsym'd speculatively by libunity's
+    // AudioPluginManager on every plugin handle. A COUNT of effect definitions,
+    // so 0 is "none here" — which is what the real loader says by not exporting
+    // it. Same answer, same reasoning, as kl_ovrp.c's copy.
+    "UnityGetAudioEffectDefinitions",
     // ovr_FreeMessage used to sit here, under "ovr_PopMessage never hands out a
     // message, so there is never anything to free". It does now, so it has a
     // real implementation above.
@@ -436,8 +560,11 @@ static uint64_t klplat_init_fails(const char *name) {
     return 0;
 }
 
+// ovr_UnityInitWrapper is NOT here — it is a bool, not an ovrRequest, and it has
+// its own implementation above. It is the only one of these whose contract can
+// report success without owing anybody a completion message.
 static const char *const g_plat_init[] = {
-    "ovr_UnityInitWrapper", "ovr_UnityInitWrapperAsynchronous",
+    "ovr_UnityInitWrapperAsynchronous",
     "ovr_UnityInitWrapperStandalone", "ovr_UnityInitGlobals",
     "ovr_PlatformInitializeAndroid", "ovr_PlatformInitializeAndroidAsynchronous",
     "ovr_PlatformInitializeAndroidAsynchronousWithOptions",
@@ -533,6 +660,74 @@ static int plat_is_options_create(const char *name) {
     return strstr(name, "Options_Create") != NULL;
 }
 
+// ---------------------------------------------------------------------------
+// Launch details: HOW the app was started.
+//
+// Not a request — a plain accessor returning an opaque handle that the managed
+// SDK immediately picks apart, reading a dozen ovr_LaunchDetails_* fields off it
+// in `Models.LaunchDetails`'s constructor. SUPERHOT asks while building its main
+// scene.
+//
+// The truthful answer is "normally, by the user, with nothing attached": no
+// deeplink message, no destination, no room, no invited users, LaunchType 0
+// (Unknown). That is precisely what every accessor answers below, because 0 is
+// simultaneously the zero enum, the zero integer and the NULL pointer — and the
+// SDK null-checks each optional list before wrapping it, so NULL is how it
+// spells "there was none", not a hole.
+//
+// The handle itself must be NON-NULL for the same reason the options cookie is:
+// it is carried straight into those accessors, and on a real platform a NULL
+// there is a null dereference inside the library rather than an empty answer.
+static const char g_launch_cookie[] = "klepton-launch-details";
+
+static uint64_t klplat_launch_details(const char *name) {
+    plat_hit(name);
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [plat] %s -> opaque handle: launched normally, by the "
+                        "user, with nothing attached (no deeplink, no destination, "
+                        "no invited users)\n", name);
+    }
+    return (uint64_t)(uintptr_t)g_launch_cookie;
+}
+
+static uint64_t klplat_launch_field(const char *name) {
+    plat_hit(name);
+    return 0;                 // the zero enum, the zero int and NULL, all at once
+}
+
+static int plat_is_launch_details(const char *name) {
+    return strcmp(name, "ovr_ApplicationLifecycle_GetLaunchDetails") == 0;
+}
+
+static int plat_is_launch_field(const char *name) {
+    return strncmp(name, "ovr_LaunchDetails_", 18) == 0;
+}
+
+// ...and the empty ARRAY that a NULL list handle turns into one call later.
+//
+// The managed `DeserializableList<T>` reads three things off a list handle —
+// GetSize, GetElement and GetNextUrl — and this SDK version wraps the pointer
+// WITHOUT null-checking it first, so answering ovr_LaunchDetails_GetUsers with
+// NULL (correctly: nobody was invited) still ends in ovr_UserArray_GetSize(NULL)
+// one call later. Size 0 is the same answer the NULL was: there is nobody in it.
+//
+// GetElement is deliberately NOT here. It can only be reached on an array with
+// elements, which is an array we did not produce, so it keeps the fail-closed
+// default and would stop the run by name rather than hand back a User the guest
+// would then read fields off.
+static int plat_is_empty_array(const char *name) {
+    const char *p = strstr(name, "Array_Get");
+    if (!p) return 0;
+    return strcmp(p, "Array_GetSize") == 0 || strcmp(p, "Array_GetNextUrl") == 0;
+}
+
+static uint64_t klplat_empty_array(const char *name) {
+    plat_hit(name);
+    return 0;                 // no elements, and no next page to fetch them from
+}
+
 // The setters and the destructor. Both are genuinely nothing to do, not stubs
 // standing in for something: there is no options state to keep.
 static int plat_is_options_sink(const char *name) {
@@ -571,6 +766,7 @@ static uint64_t klplat_JNI_OnLoad(void *vm, void *reserved) {
 static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"JNI_OnLoad",                (void *)klplat_JNI_OnLoad},
     {"ovr_IsPlatformInitialized", (void *)klplat_IsPlatformInitialized},
+    {"ovr_UnityInitWrapper",      (void *)klplat_UnityInitWrapper},
     {"ovr_PopMessage",            (void *)klplat_PopMessage},
     {"ovr_FreeMessage",           (void *)klplat_FreeMessage},
     {"ovr_Entitlement_GetIsViewerEntitled", (void *)klplat_Entitlement_GetIsViewerEntitled},
@@ -596,6 +792,10 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_PlatformInitialize_GetResult",       (void *)klplat_payload_int},
     {"ovr_Message_GetUserAccountAgeCategory",  (void *)klplat_Message_GetPayload},
     {"ovr_UserAccountAgeCategory_GetAgeCategory", (void *)klplat_payload_int},
+    // The string payload, and the one request that carries one.
+    {"ovr_Message_GetString",     (void *)klplat_Message_GetString},
+    {"ovr_CloudStorage2_GetUserDirectoryPath",
+                                  (void *)klplat_CloudStorage2_GetUserDirectoryPath},
 };
 
 static const char g_plat_handle[] = "klepton-ovrplatformloader";
@@ -639,6 +839,12 @@ void *kl_ovrplat_sym(const char *name) {
         return kl_named_stub(name, (void *)klplat_void);
     if (plat_is_options_create(name))
         return kl_named_stub(name, (void *)klplat_options_create);
+    if (plat_is_launch_details(name))
+        return kl_named_stub(name, (void *)klplat_launch_details);
+    if (plat_is_launch_field(name))
+        return kl_named_stub(name, (void *)klplat_launch_field);
+    if (plat_is_empty_array(name))
+        return kl_named_stub(name, (void *)klplat_empty_array);
     if (plat_is_options_sink(name))
         return kl_named_stub(name, (void *)klplat_void);
     if (plat_is_init_async(name))

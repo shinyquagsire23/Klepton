@@ -21,7 +21,7 @@ LDLIBS  := -lz -framework AudioToolbox \
 RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_va_handlers.c runtime/kl_va_thunks.S \
            runtime/kl_libc.c runtime/kl_libc_slink.c runtime/kl_pthread.c runtime/kl_dl.c \
-           runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c \
+           runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c runtime/kl_target.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
            runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_vtdec.c \
@@ -33,10 +33,24 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
 RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
+# ...and every header they include, as a PREREQUISITE (never as a compiler
+# input — a .h on the command line is compiled as a header, not included).
+#
+# A wildcard rather than a list, because the two that matter most are GENERATED:
+# kl_libc_table.h and kl_target_table.h are written by tools, included by
+# kl_shim.c and kl_target.c, and were prerequisites of nothing. That is not a
+# missed rebuild, it is a missed FAILURE — regenerating the libc table with a
+# name Darwin does not declare (SUPERHOT's `sched_getcpu`) left a table that
+# cannot compile, make rebuilt nothing because no prerequisite had changed, and
+# the whole of `make check` then passed against the PREVIOUS binary. Over-
+# triggering costs a 20-second recompile; under-triggering costs a green gate
+# that measured a build nobody has.
+RUNTIME_HDRS := $(wildcard runtime/*.h) $(wildcard tests/*.h)
+
 .PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
 all: build/t_opus
 
-build/t_opus: tests/t_opus.c $(RUNTIME) runtime/klepton.h
+build/t_opus: tests/t_opus.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_opus.c $(RUNTIME) $(LDLIBS)
 
@@ -81,11 +95,21 @@ guestswap:
 	@echo "  next: 'make check' (rebuilds what the table changed), then 'make dylibs'"
 	@echo "        if you use the dylib or visionOS paths."
 
-build/t_load: tests/t_load.c $(RUNTIME) runtime/klepton.h
+build/t_load: tests/t_load.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_load.c $(RUNTIME) $(LDLIBS)
 
-LIBS ?= beatsaber/lib/arm64-v8a
+# Which guest the host gates run against. `make check TARGET=superhot` points
+# every one of them at another title's tree — the libraries, the assets and the
+# APK together, which is the pairing that matters (a run with one version's
+# libraries and another's assets reports itself as corrupt game data). The names
+# are visionos/targets.py's, and the tree layout is the convention every unpacked
+# APK here follows, so this needs no Python.
+#
+# LIBS stays overridable on its own because the Steam Link gates set it to a
+# path directly.
+TARGET ?= beatsaber
+LIBS ?= $(TARGET)/lib/arm64-v8a
 
 # The guest library set is DISCOVERED, not listed. It is a property of the APK,
 # and pinning it means every version swap silently degrades: the 2019.4 Beat
@@ -150,8 +174,7 @@ guestlibs-list:
 # provide, and the readback sink needs no Metal interop), but the symbols must
 # resolve.
 build/m_slink: mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
-               runtime/kl_view_mtl.m runtime/klepton.h runtime/kl_jni.h \
-               runtime/kl_view.h runtime/kl_view_mtl.h tests/t_mtl_provider.h
+               runtime/kl_view_mtl.m $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
 	  mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
@@ -262,7 +285,7 @@ slink-vr-run: build/m_slink
 # that can be checked with no guest and no Steam host — an elementary stream in,
 # frames out, both ends knowable — so it is where the assertions live. See
 # tests/t_hevc.c for what each one catches. Seconds; in `make check`.
-build/t_hevc: tests/t_hevc.c $(RUNTIME) runtime/kl_vtdec.h
+build/t_hevc: tests/t_hevc.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_hevc.c $(RUNTIME) $(LDLIBS)
 
@@ -275,7 +298,7 @@ hevc: build/t_hevc
 # head's own position was a person turning their head in a live stream, at the
 # cost of a fresh pairing. Asserted here instead, with no guest, no headset and
 # no Steam host. Seconds; in `make check`.
-build/t_xrspace: tests/t_xrspace.c $(RUNTIME) runtime/kl_openxr.h
+build/t_xrspace: tests/t_xrspace.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_xrspace.c $(RUNTIME) $(LDLIBS)
 
@@ -289,14 +312,14 @@ xrspace: build/t_xrspace
 # draws a correct picture, and the only instrument that could see one is a
 # person holding a controller inside a live stream. No guest, no headset, no
 # Steam host; seconds, in `make check`.
-build/t_xrinput: tests/t_xrinput.c $(RUNTIME) runtime/kl_openxr.h runtime/kl_ovrp.h
+build/t_xrinput: tests/t_xrinput.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_xrinput.c $(RUNTIME) $(LDLIBS)
 
 xrinput: build/t_xrinput
 	./build/t_xrinput
 
-build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME)
+build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(LDLIBS)
 
@@ -311,8 +334,7 @@ vatest: build/t_variadic
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
 build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
-              runtime/kl_view_mtl.m runtime/klepton.h runtime/kl_jni.h \
-              runtime/kl_view.h runtime/kl_view_mtl.h tests/t_mtl_provider.h
+              runtime/kl_view_mtl.m $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
 	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
@@ -343,7 +365,7 @@ build/guest_torture.so: guest/torture.c guest/torture.h
 	@test -x "$(NDK_CC)" || { echo "ANDROID_NDK_HOME is not set to an NDK with a darwin-x86_64 toolchain"; exit 1; }
 	$(NDK_CC) $(GUEST_CFLAGS) -o $@ guest/torture.c
 
-build/t_guest: tests/t_guest.c guest/torture.c guest/torture.h $(RUNTIME)
+build/t_guest: tests/t_guest.c guest/torture.c guest/torture.h $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_guest.c guest/torture.c $(RUNTIME) $(LDLIBS)
 
@@ -375,7 +397,7 @@ ctr: build/t_ctr
 # at loopback, so it exercises the discovery path without putting 254 datagrams
 # on anyone's network. The path is otherwise reachable only from a live Qt
 # frontend with a Steam host on the LAN.
-build/t_bcast: tests/t_bcast.c $(RUNTIME) runtime/klepton.h
+build/t_bcast: tests/t_bcast.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_bcast.c $(RUNTIME) $(LDLIBS)
 
@@ -417,7 +439,16 @@ x18-slink: build/t_x18
 jnislots:
 	python3 tools/gen_jni_slots.py > runtime/kl_jni_slots.h
 
-build/t_il2cpp: tests/t_il2cpp.c $(RUNTIME) runtime/klepton.h
+# ...and kl_target_table.h likewise, from visionos/targets.py — regenerate after
+# adding or editing a target there. Checked in for the same reason the other two
+# are: a build must not depend on Python, and the diff of a generated table is
+# worth reading.
+.PHONY: targets
+targets:
+	python3 visionos/targets.py --c-table > runtime/kl_target_table.h
+	@echo "runtime/kl_target_table.h: $$(python3 visionos/targets.py --list | tr '\n' ' ')"
+
+build/t_il2cpp: tests/t_il2cpp.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_il2cpp.c $(RUNTIME) $(LDLIBS)
 
@@ -478,7 +509,7 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@if [ -x "$(NDK_CC)" ]; then echo "=== guest differential (S0.5) ===" && \
 	   $(MAKE) -s guest | grep -E 'x18 sites|identical to the host|lost '; \
 	 else echo "=== guest differential: SKIPPED (set ANDROID_NDK_HOME) ==="; fi
-	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so beatsaber/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log
+	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so $(TARGET)/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log
 	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/m_boot $(LIBS) > build/boot.log 2>/dev/null && \
 	  grep -E 'guard verified|DLC enumeration|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|M3 EXIT|M4 \(partial\)' build/boot.log
 
@@ -782,7 +813,7 @@ reproject: build/t_reproject
 # OVRPlugin entry points AS THE GUEST RESOLVES THEM (through kl_ovrp_sym, so
 # the struct returns go through the real sret thunk), the queue behind them,
 # and the pulses a frontend pulls. Fast and deterministic; part of `check`.
-build/t_haptics: tests/t_haptics.c $(RUNTIME) runtime/kl_ovrp.h
+build/t_haptics: tests/t_haptics.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Iruntime -o $@ tests/t_haptics.c $(RUNTIME) $(LDLIBS)
 
@@ -962,7 +993,7 @@ shared: build/s10_shared
 # The GL tracing trampoline's ABI contract (runtime/kl_gl_trace.S). It forwards an
 # unknown signature, so nothing else can check it — and a trampoline that drops a
 # register produces a wrong picture rather than a crash.
-build/t_trace: tests/t_trace.c $(RUNTIME) runtime/klepton.h
+build/t_trace: tests/t_trace.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_trace.c $(RUNTIME) $(LDLIBS)
 

@@ -57,12 +57,19 @@ BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", KLT["bundle"])
 #          support the Extended Virtual Addressing and Increased Memory Limit
 #          capability.
 #   error: Failed Registering Bundle Identifier: the app identifier
-#          "dev.klepton.app" cannot be registered to your development team
+#          "…dev.klepton.target.beatsaber" cannot be registered to your
+#          development team
 #
 # That pair of errors means the App ID is not set up, not that the entitlements
 # are wrong. Enable both capabilities on it (Xcode > Settings > Accounts, or the
 # developer portal) — or build with KLEPTON_ENTITLEMENTS=0 to get moving without
 # them, at the cost of the memory headroom.
+#
+# The SECOND error has another cause worth telling apart, and it is why the id
+# carries $USER (targets.py, bundle_for): an App ID belongs to exactly one team,
+# so an UNSCOPED id is registered by whoever builds first and refused to everyone
+# else — the same sentence, about a name already spoken for rather than about
+# capabilities. If it appears with a scoped id, it really is the App ID setup.
 ENTITLEMENTS = os.environ.get("KLEPTON_ENTITLEMENTS", "1") != "0"
 
 # ...and the keys that are NOT self-service, each with its own escape hatch.

@@ -18,6 +18,7 @@ apktool d -f -o beatsaber   beatsaber.apk
 apktool d -f -o steamlink-vr steamlink-vr.apk
 
 make check                               # the regression sweep — start here
+make check TARGET=superhot               # ...against another guest, same gates
 make angle-all                           # pull, patch and build ANGLE (slow)
 ```
 
@@ -45,8 +46,11 @@ where a version is load-bearing it says so.
 | Vision Pro + Apple Developer account | — | device runs only | — |
 
 visionOS signing is auto-detected from your keychain's `Apple Development`
-certificate; override with `KLEPTON_TEAM=<teamid>`, bundle id with
-`KLEPTON_BUNDLE_ID` (default `dev.klepton.app`). The Simulator needs neither.
+certificate; override with `KLEPTON_TEAM=<teamid>`. The Simulator needs neither.
+
+The bundle id is set to `$USER.dev.klepton.target.<target>` in order to avoid collisions.
+Set `KLEPTON_BUNDLE_SCOPE` to use something else instead of `$USER`, or `KLEPTON_BUNDLE_ID` 
+to override the the whole id.
 
 ---
 
@@ -57,6 +61,7 @@ certificate; override with `KLEPTON_TEAM=<teamid>`, bundle id with
 | target | APK | unpacked to | needed by |
 |---|---|---|---|
 | Beat Saber (Quest 1.28.0) | `beatsaber.apk` | `beatsaber/` | `make check`, everything Beat Saber |
+| SUPERHOT VR (Quest) | `superhot.apk` | `superhot/` | `make check TARGET=superhot`, `./build/m_boot superhot` |
 | Steam Link (VR build) | `steamlink-vr.apk` | `steamlink-vr/` | `make slink-vr`, `slink-main`, `slink-shell` |
 | Steam Link (flat build) | `steamlink-android.apk` | `steamlink-android/` | `make x18-slink` only |
 
@@ -64,8 +69,12 @@ Unpack with **apktool**:
 
 ```bash
 apktool d -f -o beatsaber    beatsaber.apk
+apktool d -f -o superhot     superhot.apk
 apktool d -f -o steamlink-vr steamlink-vr.apk
 ```
+
+Additional targets can be defined in `visionos/targets.py` for the project generation.
+
 
 **Keep the `.apk` files themselves.** `getPackageCodePath()` hands Unity the APK path
 and Unity opens it as a zip.

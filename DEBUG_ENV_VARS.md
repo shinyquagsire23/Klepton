@@ -301,7 +301,10 @@ Built for the loading-pace investigation; all default off.
   saves, PlayerPrefs and Steam Link's pairing credentials live.
 
   Default is **`~/Library/Application Support/Klepton/userdata/<guest>`**, where
-  `<guest>` is `beatsaber` or `steamlink`. Two properties are deliberate. It is
+  `<guest>` is the TARGET's name (`beatsaber`, `superhot`, `steamlink`) — the
+  host driver applies it from the target table (`runtime/kl_target.c`), so a run
+  cannot write one title's saves into another's. Two properties are deliberate.
+  It is
   **outside `build/`** — it used to be `build/android-files`, so `make clean`
   cost a Beat Saber first-run setup and a Steam Link re-pairing every time it
   ran. And it is keyed on the **guest, not the APK**, so swapping Beat Saber
@@ -312,6 +315,21 @@ Built for the loading-pace investigation; all default off.
   under them — or to give a run a scratch profile without disturbing the real
   one. visionOS ignores it: the app container is the only writable location
   there and `kl_app.c` passes it in explicitly.
+
+- `KL_PLAT_CLOUD_DIR=<dir>` (`runtime/kl_ovrplat.c`) — where
+  `ovr_CloudStorage2_GetUserDirectoryPath` says the user's cloud-save directory
+  is. Default `<files-dir>/cloudstorage`, a sibling of the `files` directory
+  that is `Application.persistentDataPath`, and created if it is not there —
+  the guest runs its own writability check on the answer before it uses it, and
+  a path that does not exist fails that check.
+
+  It is the one member of the CloudStorage family that is answered rather than
+  refused, and the split is the DRM line's: `_Load`/`_Save` move data to and
+  from a service that is absent, while this call moves nothing and only names a
+  local directory. Refusing it is what a black launch screen looks like —
+  SUPERHOT's save loader chains its whole load off this one request, so a
+  refusal leaves the SDK waiting on a completion that never comes, behind the
+  launch precache's own black clear.
 
 ## Device identity (`runtime/kl_jni.c`)
 
@@ -488,7 +506,9 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   of the running IL2CPP runtime through `Enum.GetNames`/`GetValues`. Nested
   types with `/` (`Oculus.Platform.Message/MessageType`); printed once, at the
   first probe tick, so it needs `KL_PROBE_INPUT=1` and a `KL_PROBE_FROM` the
-  run actually reaches.
+  run actually reaches — **and a `KL_PROBE_EVERY` that divides a frame the run
+  reaches**, because the tick is `frame % every`, so a large interval on a short
+  run simply never fires and reads as the probe being broken.
   Exists because a C# enum's values are the one part of the guest's ABI that is
   in neither its exported symbols nor its strings — `global-metadata.dat` holds
   the names and the numbers live in a constant table whose layout is a
@@ -1237,7 +1257,7 @@ Standalone reproducers, not part of the runtime; each reads its own knobs.
 Read on the device/simulator; `visionos/run.sh` forwards every `KL_*` it sees
 except its own control vars (next section). See PLANNING §12.
 
-- `KL_TARGET=<name>` — which guest the app boots: `beatsaber` or
+- `KL_TARGET=<name>` — which guest the app boots: `beatsaber`, `superhot` or
   `steamlink-vr` (`visionos/targets.py --list`). The **default is compiled in**
   (`KL_TARGET_DEFAULT`, set by `gen_xcodeproj.py` from `KLEPTON_TARGET`), not
   read from the environment, because an app launched by hand from the Home View
@@ -1391,8 +1411,27 @@ Read by the scripts themselves, never forwarded to the app.
   and with that the `.xcodeproj`, the `.app`, the derived-data directory and the
   `Frameworks/<target>/` the translations are staged into, so two apps built
   from this tree never write to the same place. Default `beatsaber`.
-- `KLEPTON_BUNDLE_ID=...` — override the target's bundle id;
-  `KLEPTON_TEAM=<id>` — override the signing team;
+  `./build_run_vpro.sh <target>` sets it from its first bare argument, which is
+  the shortest way to say which guest a device run is for — and the same table
+  then decides which app's log that run pulls back, so the two cannot disagree.
+  The HOST driver takes the same names: `./build/m_boot <target>` (or a path to
+  a guest lib directory, which is what every Makefile gate passes), and
+  `make check TARGET=<name>` points the host gates at another title's tree.
+- `KLEPTON_BUNDLE_SCOPE=<name>` — the front of the bundle id, which is
+  `<scope>.dev.klepton.target.<target>` and defaults the scope to **`$USER`**.
+  It is derived rather than stored, so a new target needs no id invented for it,
+  and it is scoped per user because an App ID can be registered to exactly one
+  team: without that, whoever builds this tree first takes the id, and everyone
+  else gets `Failed Registering Bundle Identifier` plus the loss of the two
+  memory entitlements, which need an explicit App ID. Sanitised to the
+  characters a bundle id may hold; an empty or unset scope leaves the id
+  unscoped rather than emitting a leading dot.
+- `KLEPTON_BUNDLE_ID=...` — override the whole id, which is also how an
+  already-installed app's identity is KEPT. Changing the id makes a new app with
+  an empty container: assets, OBB and the guest's saves stay in the old one. The
+  staging stamp is keyed on the id, so the next build re-stages by itself rather
+  than launching into an empty container — it is just not free.
+- `KLEPTON_TEAM=<id>` — override the signing team;
   `KLEPTON_DEVICE=<udid>` — skip device auto-detection;
   `KLEPTON_ENTITLEMENTS=0` — build without the two memory capabilities (see
   `gen_xcodeproj.py` for why that is the unusual build).

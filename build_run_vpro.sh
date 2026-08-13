@@ -12,6 +12,16 @@
 #
 #   ./build_run_vpro.sh                 # what a normal launch does: immersive +
 #                                       #   ANGLE, autoboot, frames until stopped
+#   ./build_run_vpro.sh superhot        # ...for another guest. The first bare
+#                                       #   argument is the TARGET, defaulting to
+#                                       #   beatsaber; `--list` names them. Each
+#                                       #   one has its own bundle id, its own
+#                                       #   app, its own container and so its own
+#                                       #   userdata — visionos/targets.py is the
+#                                       #   table, and everything downstream (the
+#                                       #   .xcodeproj, the .app, the derived
+#                                       #   data, the log this script pulls back)
+#                                       #   is keyed on it
 #   ./build_run_vpro.sh --frames 30     # bound the guest's frame count
 #   ./build_run_vpro.sh --p4            # P4's shape: boot to initJni, no compositor
 #   ./build_run_vpro.sh --window --frames 300
@@ -43,10 +53,10 @@ IMMERSIVE=""      # unset => the app's default (on)
 GLFB=""           # unset => the app's default (on)
 STAGE=""          # empty => KL_SKIP_STAGE=1 (assets persist across installs)
 LOG_ONLY=""
-LOCAL_LOG="${KL_LOG_OUT:-/tmp/klepton-device.log}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --list)       python3 visionos/targets.py --list; exit 0 ;;
     --frames)     FRAMES="$2"; shift 2 ;;
     --p4)         FRAMES=""; IMMERSIVE=0; shift ;;    # boot only — P4's measurement
     --window)     IMMERSIVE=0; shift ;;
@@ -55,10 +65,36 @@ while [ $# -gt 0 ]; do
     --sync)       export KL_SYNC_GUEST=1; shift ;;
     --quest-fov)  export KL_OVRP_QUEST_FOV=1; shift ;;
     --log)        LOG_ONLY=1; shift ;;
-    -h|--help)    sed -n '2,30p' "$0"; exit 0 ;;
-    *)            echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
+    -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
+    -*)           echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
+    # A bare word is the TARGET. One only: a second would silently be ignored,
+    # and "which guest did that run actually build" is not a question worth
+    # having to ask of a device run that takes minutes.
+    *)            [ -z "${TARGET_ARG:-}" ] || {
+                    echo "!! two targets given ($TARGET_ARG and $1)" >&2; exit 2; }
+                  TARGET_ARG="$1"; shift ;;
   esac
 done
+
+# The target decides the bundle id, and the bundle id is what the log is pulled
+# out of — so a wrong one here does not fail, it silently reads the OTHER app's
+# log and reports on a run that never happened. targets.py resolves it, and an
+# unknown name stops the script there rather than after a build.
+export KLEPTON_TARGET="${TARGET_ARG:-${KLEPTON_TARGET:-}}"
+# Resolved into a variable first, because `eval "$(...)"` reports the EVAL's
+# status, not the command's: an unknown target printed its own error and then
+# the script carried on to die on an unbound KLT_NAME, which buries the one line
+# that said what was wrong.
+KLT_VARS=$(python3 visionos/targets.py "$KLEPTON_TARGET") || exit 1
+eval "$KLT_VARS"
+export KLEPTON_TARGET="$KLT_NAME"
+BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
+
+# ...and the log lands under the target's own name, for the same reason: two
+# targets writing to one path means the second run's summary describes the
+# first, and the "keep the longest log" rule below would actively preserve the
+# wrong one.
+LOCAL_LOG="${KL_LOG_OUT:-/tmp/klepton-$KLT_NAME.log}"
 
 # Device discovery, so --log works without a build and so the summary below can
 # name the device. Same JSON route as run.sh: device names contain non-breaking
@@ -98,7 +134,7 @@ export KLEPTON_DEVICE="$DEVID"
 pull_log() {
   local tmp; tmp="$(mktemp)"
   xcrun devicectl device copy from --device "$DEVID" \
-    --domain-type appDataContainer --domain-identifier "${KLEPTON_BUNDLE_ID:-dev.klepton.app}" \
+    --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
     --source Documents/klepton-boot.log --destination "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
   local new old
   new=$(wc -l < "$tmp" | tr -d ' ')
@@ -165,6 +201,7 @@ fi
 export KL_ALARM="${KL_ALARM:-180}"
 export KL_LOG_OUT="$LOCAL_LOG"
 
+echo "target    : $KLT_NAME ($BUNDLE_ID, $KLT_PRODUCT.app)"
 echo "device    : $DEVID"
 echo "knobs     : ${KL_FRAMES:+KL_FRAMES=$KL_FRAMES }${KL_IMMERSIVE:+KL_IMMERSIVE=$KL_IMMERSIVE }${KL_GLFB:+KL_GLFB=$KL_GLFB }KL_ALARM=$KL_ALARM${KL_SYNC_GUEST:+ KL_SYNC_GUEST=1}${KL_OVRP_QUEST_FOV:+ KL_OVRP_QUEST_FOV=1}${KL_SKIP_STAGE:+ (assets not re-staged)}"
 echo "            (unset knobs take the app's defaults: immersive + ANGLE, autoboot)"

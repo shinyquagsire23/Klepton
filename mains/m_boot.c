@@ -33,9 +33,23 @@
 #include "../runtime/kl_mprobe.h"
 #include "../runtime/kl_il2cpp.h"
 #include "../runtime/kl_fault.h"
+#include "../runtime/kl_target.h"
 #include "../tests/t_mtl_provider.h"
 
-static const char *LIBDIR = "beatsaber/lib/arm64-v8a";
+// Which guest, and where its libraries are. Both come from the target table
+// (runtime/kl_target.h) rather than from four literals here and in kl_jni.c's
+// defaults — the APK, the asset tree and the userdata directory have to agree
+// with the libraries, and when they did not it was silent: SUPERHOT's libraries
+// opening Beat Saber's APK is a guest reading someone else's game data.
+//
+//   ./build/m_boot                      the default target (beatsaber)
+//   ./build/m_boot superhot             ...by name
+//   ./build/m_boot superhot/lib/arm64-v8a   ...the same, by path
+//
+// The path form is what every command in CLAUDE.md and every Makefile gate
+// passes, and it resolves to the same target as the name.
+static const kl_target *TARGET;
+static const char *LIBDIR;
 
 typedef int  (*jni_onload_fn)(void *vm, void *reserved);
 typedef int8_t (*nativeloader_load_fn)(void *env, void *clazz, void *path);
@@ -757,8 +771,19 @@ static int view_run(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1) LIBDIR = argv[1];
-    kl_set_library_path(LIBDIR);
+    TARGET = kl_target_resolve(argc > 1 ? argv[1] : NULL);
+    if (!TARGET) {
+        fprintf(stderr, "FAIL: unknown target '%s' — one of: %s "
+                        "(or a path to a guest lib directory)\n",
+                argv[1], kl_target_names());
+        return 1;
+    }
+    LIBDIR = TARGET->libdir;
+    // Everything the guest is told about itself, from one row: the library
+    // path, the assets, the APK it opens as a zip, and the userdata directory
+    // its saves land in.
+    kl_target_apply_host(TARGET, NULL);
+    printf("=== target: %s (%s, %s) ===\n", TARGET->name, LIBDIR, TARGET->apk);
 
     // Re-entry of the re-exec'd recon child (see below).
     if (getenv("KL_RECON_CHILD"))

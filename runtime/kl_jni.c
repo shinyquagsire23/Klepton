@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include "klepton.h"
 #include "kl_jni.h"
+#include "kl_target.h"   // the default target's userdata key
 #include "kl_env.h"
 #include "kl_ovrp.h"
 #include "kl_egl.h"
@@ -1294,6 +1295,8 @@ static void *g_field_cache[KLJ_MAX_FIELDS];
 static void   *klj_new_file(const char *path);
 static klj_val klj_PackageInfo_versionCode(void);
 static klj_val klj_PackageInfo_versionName(void);
+static klj_val klj_PackageInfo_packageName(void);
+static const char *klj_guest_package(void);
 static klj_val klj_appinfo_sourceDir(void);
 static klj_val klj_appinfo_nativeLibraryDir(void);
 static klj_val klj_appinfo_dataDir(void);
@@ -1488,7 +1491,11 @@ static const klj_field g_fields[] = {
             klj_PackageInfo_versionName),
     KLJ_FFN("android/content/pm/PackageInfo", "versionCode", "I",
             klj_PackageInfo_versionCode),
-    KLJ_FSTR("android/content/pm/PackageInfo", "packageName", "com.beatgames.beatsaber"),
+    // ...and so is the package name, out of AndroidManifest.xml, for the same
+    // reason: it is the other half of the OBB's filename, and it is how the
+    // guest looks itself up. See klj_guest_package.
+    KLJ_FFN("android/content/pm/PackageInfo", "packageName", "Ljava/lang/String;",
+            klj_PackageInfo_packageName),
 
     // Unity's own static handle on the Activity. Must be the *same* object the
     // Context was, not another instance of the class — Unity passes one to native
@@ -1569,6 +1576,16 @@ static const klj_field g_fields[] = {
     KLJ_CTX_SVC("CLIPBOARD_SERVICE",    "clipboard"),
     KLJ_CTX_SVC("NOTIFICATION_SERVICE", "notification"),
     KLJ_CTX_SVC("MEDIA_ROUTER_SERVICE", "media_router"),
+
+    // The transport constants NetworkInfo.getType() is compared against. The
+    // guest reads them as fields rather than hardcoding them, so answering
+    // getType() without these leaves it comparing our number to nothing —
+    // which stops the run by name (it did). Values from android-34's
+    // android.jar; TYPE_WIFI is what we answer, for the reason at
+    // klj_NetworkInfo_getType.
+    KLJ_FINT("android/net/ConnectivityManager", "TYPE_MOBILE",   0),
+    KLJ_FINT("android/net/ConnectivityManager", "TYPE_WIFI",     1),
+    KLJ_FINT("android/net/ConnectivityManager", "TYPE_ETHERNET", 9),
 
     // Unity asks the MediaRouter for the live-video route to find out whether it
     // should be presenting to an external display. Values are from android-34's
@@ -2147,7 +2164,7 @@ static klj_val klj_Context_getPackageManager(void *env, void *self, const klj_va
 // itself up through the PackageManager and to derive storage paths.
 static klj_val klj_Context_getPackageName(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.l = kl_jni_new_string("com.beatgames.beatsaber")};
+    return (klj_val){.l = kl_jni_new_string(klj_guest_package())};
 }
 // ---- WifiManager, for the VR half ----
 //
@@ -2177,6 +2194,52 @@ static klj_val klj_ConnectivityManager_getActiveNetwork(void *env, void *self,
     (void)env; (void)self; (void)a; (void)n;
     static void *net;
     return klj_singleton("android/net/Network", &net);
+}
+
+// ...and the older spelling of the same question, which is what a Unity 2018
+// title reaches for. SUPERHOT asks it before it tries to sync achievements, and
+// the honest answer is the one above's: this device is on a network. Note that
+// this is a statement about the DEVICE, not about the Oculus platform — the
+// achievement calls behind it still fail on their own terms, by their own
+// request path, which is where that absence belongs.
+//
+// The NetworkInfo it hands back answers only what the guest actually asks of it;
+// anything else stops the run by name, as everywhere else here.
+static klj_val klj_ConnectivityManager_getActiveNetworkInfo(void *env, void *self,
+                                                            const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *info;
+    return klj_singleton("android/net/NetworkInfo", &info);
+}
+
+// A network that exists is connected: there is no "connecting" state to model
+// here, because nothing about this host's networking is asynchronous from the
+// guest's point of view. isAvailable is the same answer for the same reason.
+static klj_val klj_NetworkInfo_isConnected(void *env, void *self,
+                                           const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("NetworkInfo.isConnected() -> true");
+    return (klj_val){.j = 1};
+}
+
+// ConnectivityManager.TYPE_WIFI. The pair isConnected()+getType() is the
+// standard "is this a link I may use freely, or is it someone's mobile data"
+// test, and the coherent answer is the one the rest of this file already
+// gives: we present a Quest 2 (Build.MODEL, settled), a Quest 2 has no cellular
+// radio at all, so WIFI is the only transport the device we describe can have.
+// Answering MOBILE would claim hardware that device does not have; answering
+// NONE would contradict isConnected() one line above.
+//
+// This does not reopen "we model no WifiManager" (getConnectionInfo -> null):
+// that refuses to invent an SSID and a signal strength, which are measurements.
+// Which KIND of link this is follows from the device we are already claiming to
+// be, and the guest asks it as a policy question rather than a measurement.
+#define KLJ_CONNECTIVITY_TYPE_WIFI 1
+static klj_val klj_NetworkInfo_getType(void *env, void *self,
+                                       const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("NetworkInfo.getType() -> TYPE_WIFI");
+    return (klj_val){.j = KLJ_CONNECTIVITY_TYPE_WIFI};
 }
 
 // A WifiLock is not a claim about connectivity — it is a request to the power
@@ -2303,7 +2366,10 @@ const char *kl_userdata_dir(const char *guest) {
 static const char *g_files_dir;
 void kl_jni_set_files_dir(const char *dir) { g_files_dir = klj_abspath(dir); }
 const char *kl_jni_files_dir(void) {
-    if (!g_files_dir) g_files_dir = kl_userdata_dir("beatsaber");
+    // The DEFAULT target's key, not a literal: a driver that never called
+    // kl_target_apply_host still gets the guest the rest of this file defaults
+    // to, and the two cannot drift apart.
+    if (!g_files_dir) g_files_dir = kl_userdata_dir(kl_target_default()->userdata);
     return g_files_dir;
 }
 
@@ -5151,6 +5217,59 @@ void kl_jni_guest_version(long *code, const char **name) {
     klj_guest_version(code, name);
 }
 
+// ---------- ...and the package name, which NAMES THE SAME FILE ----------
+//
+// `com.beatgames.beatsaber` was a constant here for the whole project, and it is
+// the version code's problem wearing a different hat: an OBB is
+// `main.<versionCode>.<package>.obb`, so the package name is half that filename,
+// and it is also how the guest looks ITSELF up through the PackageManager and
+// derives its storage paths. A second Unity title inherits the wrong one
+// silently — SUPERHOT VR is `unity.SUPERHOT_Team.SUPERHOT_VR_QA`, and a guest
+// told it is Beat Saber is a guest asking the platform about a different
+// application.
+//
+// So it is read from the guest's own AndroidManifest.xml, which apktool has
+// already decoded to text beside the assets and which is staged on every device
+// run for exactly this reason. The parse is the same deliberately-narrow shape
+// as klj_manifest_metadata's: the `package="..."` attribute of the root
+// <manifest> element.
+static const char *klj_guest_package(void) {
+    static char cached[192];
+    if (!*cached) {
+        snprintf(cached, sizeof cached, "com.beatgames.beatsaber");  // historical
+        char path[1024];
+        snprintf(path, sizeof path, "%s/../AndroidManifest.xml", g_assets_dir);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            char head[4096];
+            size_t got = fread(head, 1, sizeof head - 1, f);
+            fclose(f);
+            head[got] = '\0';
+            const char *m = strstr(head, "<manifest");
+            const char *end = m ? strchr(m, '>') : NULL;
+            const char *p = m ? klj_xml_attr(m, end ? end : head + got, "package=\"") : NULL;
+            const char *pe = p ? strchr(p, '"') : NULL;
+            if (p && pe && pe > p && (size_t)(pe - p) < sizeof cached) {
+                snprintf(cached, sizeof cached, "%.*s", (int)(pe - p), p);
+                KLJ_LOG("guest package %s (from %s)", cached, path);
+            } else {
+                KLJ_LOG("no package= in %s — falling back to %s", path, cached);
+            }
+        } else {
+            KLJ_LOG("no AndroidManifest.xml beside %s — falling back to package %s. "
+                    "A split-binary guest builds its OBB NAME from this.",
+                    g_assets_dir, cached);
+        }
+    }
+    return cached;
+}
+
+const char *kl_jni_guest_package(void) { return klj_guest_package(); }
+
+static klj_val klj_PackageInfo_packageName(void) {
+    return (klj_val){.l = kl_jni_new_string(klj_guest_package())};
+}
+
 static klj_val klj_PackageInfo_versionCode(void) {
     long code; klj_guest_version(&code, NULL);
     return (klj_val){.j = (uint64_t)(int64_t)code};
@@ -6636,6 +6755,12 @@ static const klj_binding g_bindings[] = {
      klj_WifiManager_getConnectionInfo},
     {"android/net/ConnectivityManager", "getActiveNetwork", "()Landroid/net/Network;",
      klj_ConnectivityManager_getActiveNetwork},
+    {"android/net/ConnectivityManager", "getActiveNetworkInfo", "()Landroid/net/NetworkInfo;",
+     klj_ConnectivityManager_getActiveNetworkInfo},
+    {"android/net/NetworkInfo", "isConnected",   "()Z", klj_NetworkInfo_isConnected},
+    {"android/net/NetworkInfo", "isAvailable",   "()Z", klj_NetworkInfo_isConnected},
+    {"android/net/NetworkInfo", "isConnectedOrConnecting", "()Z", klj_NetworkInfo_isConnected},
+    {"android/net/NetworkInfo", "getType",       "()I", klj_NetworkInfo_getType},
     {"android/net/wifi/WifiManager", "createWifiLock", "(ILjava/lang/String;)Landroid/net/wifi/WifiManager$WifiLock;",
      klj_WifiManager_createWifiLock},
     {"android/net/wifi/WifiManager$WifiLock", "acquire", "()V", klj_WifiLock_acquire},

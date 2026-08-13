@@ -45,11 +45,13 @@ make check                                    # full regression sweep
 Quick run scripts:
 
 ```bash
-./build_run_viewer.sh # build and run macOS Beat Saber frontend
-./build_run_vpro.sh   # build and run Vision Pro Beat Saber frontend
+./build_run_viewer.sh [target] # build and run macOS frontend
+./build_run_vpro.sh [target]  # build and run Vision Pro frontend
 ./build_run_slink.sh --shell --view  # macOS Steam VR Link frontend (WIP)
 ```
 
+Where `[target]` is the name of the target, defaulting to `beatsaber`.
+
 ## Status
 
-Beat Saber is working on macOS and visionOS with minor graphical issues, Steam VR Link and improving generalizability/build tooling is still WIP.
+Beat Saber is working on macOS and visionOS with minor graphical issues for versions 1.6, 1.28, and 1.40, Steam VR Link and improving generalizability/build tooling is still WIP. SUPERHOT VR renders on macOS; it has not been run on a headset yet.

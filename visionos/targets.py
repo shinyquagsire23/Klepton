@@ -13,6 +13,16 @@ So this is the table, and the shells read it the same way the generator does:
     python3 targets.py <target> <field>      # one field, bare
     python3 targets.py <target>              # every field, as shell assignments
     python3 targets.py --list
+    python3 targets.py --c-table             # ...and the RUNTIME's copy, generated
+
+The last one is the fifth consumer and the reason this file grew `entry` and
+`kind`: the runtime needs the same table (which tree, which APK, which library
+the chain starts at, which boot sequence), and it needed it twice — once in
+`visionos/Sources/kl_app.c` for the app and once in `mains/m_boot.c` for the
+host driver. Two hand-written C copies of a Python table is the exact failure
+this file's header warns about, so `make targets` generates
+`runtime/kl_target_table.h` from here instead. It is committed, like
+`kl_libc_table.h` and `kl_jni_slots.h`, so a build never depends on Python.
 
 Two apps built from this tree must not collide, and a bundle ID separates none
 of the things that would (PLANNING §11, "Next up"). So the target also decides
@@ -46,9 +56,38 @@ TARGETS = {
         # Nothing in this guest reads a library as a FILE, so no ELF goes into
         # the container at all. See steamlink-vr's `qtplugins`.
         "qtplugins": "",
+        # The library the chain STARTS at — libmain's JNI_OnLoad is the whole
+        # entry point for a Unity title (CLAUDE.md, "Facts worth not
+        # rediscovering") — and, on device, the one whose translation being
+        # present proves this target's guest was embedded rather than the other
+        # app's.
+        "entry":   "libmain",
+        # Which boot sequence runs. "unity" is libmain -> NativeLoader.load ->
+        # libunity -> the Android lifecycle; "steamlink" is kl_slink's doors.
+        "kind":    "unity",
         "product": "Klepton",
         "display": "Klepton",
-        "bundle":  "dev.klepton.app",
+    },
+    "superhot": {
+        # SUPERHOT VR — Unity + IL2CPP + the Oculus Mobile SDK, i.e. the same
+        # shape as Beat Saber and the reason it is the third target: it shares
+        # the entire Unity path and exercises it against an APK nothing here was
+        # written against. Its own manifest declares the same
+        # com.unity3d.player.UnityPlayerActivity and the same VR intent
+        # category, so nothing about the front door differs.
+        #
+        # Not a split-binary build: the assets are in the APK, so there is no
+        # OBB to stage (stage_assets.sh treats one as present-or-absent).
+        "libs":    None,
+        "srcdir":  "superhot/lib/arm64-v8a",
+        "tree":    "superhot",
+        "apk":     "superhot.apk",
+        "assets":  "superhot/assets",
+        "qtplugins": "",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonSuperhot",
+        "display": "Klepton SUPERHOT",
     },
     "steamlink-vr": {
         # BOTH front doors, because the app runs both: the 2D shell pairs in a
@@ -98,9 +137,13 @@ TARGETS = {
         # Six files, 544 KB — not the whole 75 MB tree, because these are the
         # only libraries anything reads rather than loads.
         "qtplugins": "steamlink-vr/lib/arm64-v8a",
+        # The VR door's library. The shell's fourteen load on top of it in the
+        # same process; this is the one whose translation being in the bundle
+        # says the Steam Link guest was embedded.
+        "entry":   "libvrlink_scene",
+        "kind":    "steamlink",
         "product": "KleptonSteamLink",
         "display": "Klepton Steam Link",
-        "bundle":  "dev.klepton.steamlink",
     },
 }
 
@@ -131,6 +174,54 @@ def libs_for(srcdir):
     return libs
 
 
+# A bundle id is GLOBAL, so the one in the table is not usable as it stands.
+#
+# An App ID can be registered to exactly one team, and automatic signing tries to
+# register one on the first build. So the second person to build this tree does
+# not get a warning, they get a signing failure that names neither the cause nor
+# the fix:
+#
+#   error: Failed Registering Bundle Identifier: the app identifier
+#          "dev.klepton.app" cannot be registered to your development team
+#
+# ...and because both memory entitlements need an EXPLICIT App ID, that failure
+# takes them down with it — which is the thing that stopped the
+# loading-transition kills on device (see ENTITLEMENTS in gen_xcodeproj.py). One
+# person's registration is enough to block everyone else's build of the same
+# commit.
+#
+# So the account building it supplies the front of the id. $USER is the right key
+# because it is per-machine-account, always set in a login shell, and needs no
+# configuration at all to be different for different people.
+#
+# The rest is DERIVED from the target name rather than stored per target:
+#
+#     <user>.dev.klepton.target.<target>
+#
+# One shape for every target, so a new one needs no id invented for it and the
+# table cannot hold an id that disagrees with the key above it. (The three that
+# used to be there did exactly that — `dev.klepton.app`, `dev.klepton.steamlink`
+# and `dev.klepton.target.superhot` were three conventions for three targets.)
+#
+# Sanitised, because a bundle id may hold only alphanumerics, hyphens and
+# periods: anything else becomes a hyphen, and a scope that sanitises to nothing
+# (or an unset USER, as in some CI) leaves the id unscoped rather than emitting
+# a leading dot. KLEPTON_BUNDLE_SCOPE overrides the key; KLEPTON_BUNDLE_ID still
+# overrides the whole id, everywhere, and is how an ALREADY-INSTALLED app's
+# identity is kept — changing this orphans the container the assets were staged
+# into, so the first build after it re-stages (run.sh's stamp is keyed on the id,
+# which is what makes that automatic rather than a silent empty container).
+BUNDLE_PREFIX = "dev.klepton.target"
+
+
+def bundle_for(name):
+    import os, re
+    scope = os.environ.get("KLEPTON_BUNDLE_SCOPE", os.environ.get("USER", ""))
+    scope = re.sub(r"[^A-Za-z0-9-]", "-", scope).strip("-").lower()
+    ident = re.sub(r"[^A-Za-z0-9.-]", "-", f"{BUNDLE_PREFIX}.{name}")
+    return f"{scope}.{ident}" if scope else ident
+
+
 def resolve(name):
     if name not in TARGETS:
         print(f"!! unknown target {name!r} — one of: {', '.join(sorted(TARGETS))}",
@@ -138,15 +229,52 @@ def resolve(name):
         sys.exit(1)
     t = dict(TARGETS[name])
     t["name"] = name
+    t["bundle"] = bundle_for(name)
     if t["libs"] is None:
         t["libs"] = libs_for(t["srcdir"])
     return t
+
+
+# The runtime's copy of the table, as an X-macro list. Only the fields C needs
+# are here: the visionOS product/bundle/display are the BUILD's business and the
+# app already knows which one it is by the time it runs, and `libs` is discovered
+# per build rather than being a property anything at runtime should believe.
+#
+# The DEFAULT is emitted too, so `build/m_boot` with no argument and an app built
+# with no -DKL_TARGET_DEFAULT agree about which guest that means.
+def c_table():
+    out = [
+        "// GENERATED by visionos/targets.py — do not edit. Regenerate: make targets",
+        "//",
+        "// The target table, as the runtime sees it. visionos/targets.py is the",
+        "// authority (it also carries the bundle id, product and display name, which",
+        "// only the build needs); this is its C half, generated so that the two",
+        "// cannot disagree about which tree, which APK or which boot sequence a",
+        "// target means. See runtime/kl_target.h for the struct these expand into.",
+        "",
+        "// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, kind)",
+        "#ifndef KL_TARGET_ROW",
+        "#error \"include this through runtime/kl_target.c\"",
+        "#endif",
+        "",
+    ]
+    for name in sorted(TARGETS):
+        t = TARGETS[name]
+        kind = "KL_GUEST_" + t["kind"].upper()
+        out.append('KL_TARGET_ROW("%s", "%s", "%s", "%s", "%s", "%s", %s)'
+                   % (name, t["tree"], t["apk"], t["assets"], t["srcdir"],
+                      t["entry"], kind))
+    out += ["", '#define KL_TARGET_DEFAULT_NAME "%s"' % DEFAULT, ""]
+    return "\n".join(out)
 
 
 def main(argv):
     if len(argv) > 1 and argv[1] == "--list":
         for k in sorted(TARGETS):
             print(k)
+        return 0
+    if len(argv) > 1 and argv[1] == "--c-table":
+        print(c_table())
         return 0
     name = argv[1] if len(argv) > 1 and argv[1] else DEFAULT
     t = resolve(name)

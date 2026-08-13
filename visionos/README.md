@@ -7,13 +7,64 @@ for answering device questions. This is the app those answers were for.
 ```bash
 ./run.sh              # the booted visionOS Simulator — rung 2, tests dyld
 ./run.sh device       # a physical Vision Pro         — rung 3, tests AMFI
+
+KLEPTON_TARGET=superhot ./run.sh device      # ...for another guest
+../build_run_vpro.sh superhot                # the same, wrapped: builds, runs,
+                                             # and reads the log back
 ```
 
 Both do the same five steps: build the runtime (`make xros`), translate the
-five guest libraries (`mkguest.sh`), regenerate the project, install, stage
+guest libraries (`mkguest.sh`), regenerate the project, install, stage
 assets, launch. `KL_SKIP_STAGE=1` skips the upload when the assets are already
 there, which on device is the difference between a 20-second loop and a
 20-minute one.
+
+## Which guest — one table, five consumers
+
+`targets.py` is the authority: tree, APK, asset directory, entry library, boot
+sequence, bundle id, display name and **product name**. `run.sh`, `mkguest.sh`,
+`stage_assets.sh` and `gen_xcodeproj.py` all read it, and `make targets`
+generates `runtime/kl_target_table.h` from it so the C runtime — the app's
+`Sources/kl_app.c` and the host's `build/m_boot` — reads the same row.
+
+That last one is not tidiness. Two drivers describing one guest differently is a
+class of bug with no error surface at all: the build succeeds, the app installs,
+and the guest is told the wrong thing about itself. The failure is silent in
+both directions — one title's APK opened as another's zip, or a title writing
+its saves into another's directory.
+
+**A bundle id separates the installed apps and nothing else about a build**, so
+the target also carries the PRODUCT name, and with it the `.xcodeproj`, the
+`.app`, the derived-data directory and the `Frameworks/<target>/` the
+translations are staged into. ANGLE is deliberately not per-target: it is the
+same renderer for every guest and `mkangle.sh` writes it once, into
+`Frameworks/` itself.
+
+The id itself is **derived, not stored**: `$USER.dev.klepton.target.<target>`.
+Two halves, for two different collisions. The `<target>` half separates the apps
+on one device. **The `$USER` half separates DEVELOPERS**, and that one is not
+cosmetic: an App ID can be registered to exactly one team, automatic signing
+registers it on the first build, and so whoever builds this tree first silently
+takes the id away from everyone else — the next person's build fails with
+`Failed Registering Bundle Identifier: … cannot be registered to your
+development team`, which reads like a broken project rather than a name already
+spoken for, and it takes the two memory entitlements with it because those need
+an explicit App ID.
+
+`KLEPTON_BUNDLE_SCOPE` overrides the `$USER` part (an unset or empty one leaves
+the id unscoped rather than emitting a leading dot); `KLEPTON_BUNDLE_ID`
+overrides the whole id. **Changing the id orphans the container** — the assets,
+the OBB and the guest's saves live in the old app's Documents, and the new id is
+a new app with an empty one. That is not silent: the staging stamp is keyed on
+the bundle id, so the first build after a change re-stages by itself. It is
+still a 2.2 GB upload, and the old app is still installed until you delete it.
+
+`KLEPTON_TARGET` selects it at BUILD time; the chosen name is compiled into the
+app as `KL_TARGET_DEFAULT`, because an app launched by hand from the Home View
+has no environment at all. `KL_TARGET` overrides that at run time — but the two
+apps embed *different* guest frameworks, so pointing one at the other's target
+stops at `kl_app_configure` with "missing guest libraries" rather than
+misbehaving.
 
 ## What lives where, and why
 
@@ -52,7 +103,8 @@ ShareLink afterwards; on the simulator it is easier to read straight off disk:
 
 ```bash
 UDID=$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1)
-LC_ALL=C less "$(xcrun simctl get_app_container $UDID dev.klepton.app data)/Documents/klepton-boot.log"
+BUNDLE=$(python3 targets.py beatsaber bundle)     # $USER.dev.klepton.target.<target>
+LC_ALL=C less "$(xcrun simctl get_app_container $UDID $BUNDLE data)/Documents/klepton-boot.log"
 ```
 
 `LC_ALL=C` because the log contains guest bytes — the same trap as on the host.
