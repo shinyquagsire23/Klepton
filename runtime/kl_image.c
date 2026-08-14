@@ -23,6 +23,7 @@
 #include <mach-o/getsect.h>
 #include "klepton.h"
 #include "kl_x18.h"
+#include "kl_guestpatch.h"
 
 
 // ---------- ELF64 subset ----------
@@ -311,6 +312,15 @@ const void *kl_phdrs(kl_image *i, unsigned *count) {
 // klx_looks_like_data). Each one is counted apart from the x18 population and
 // named by address, because the address is what makes it a five-minute
 // disassembly instead of a bisect.
+// The guest-patch table's view of this mapping: one contiguous span, so a guest
+// vaddr is a subtraction. Out of range answers NULL, which the table reports by
+// address rather than treating as a miss.
+static uint32_t *gp_at(void *ctx, uint64_t va) {
+    struct gp_ctx { uint8_t *base; uint64_t lo, span; } *c = ctx;
+    if (va < c->lo || va + 4 > c->lo + c->span) return NULL;
+    return (uint32_t *)(c->base + (va - c->lo));
+}
+
 static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
                         kl_stats *st) {
     uint32_t *w = (uint32_t *)p;
@@ -971,6 +981,15 @@ kl_image *kl_load(const char *path) {
             img->stats.ctr_refused += xs.ctr_refused;
         }
     }
+    // Measured guest patches, here because this is the last moment the image is
+    // writable and the icache flush below already covers whatever they wrote.
+    // Every row is guarded by the word it expects to find, so a library this
+    // table has never heard of costs one strcmp — see kl_guestpatch.c.
+    struct gp_ctx { uint8_t *base; uint64_t lo, span; } gpc = {
+        img->base, lo, (uint64_t)img->span
+    };
+    kl_guest_patch_apply(path, gp_at, &gpc);
+
     sys_icache_invalidate(img->base, img->span);
 
     if (protect_pages(img, eh, ph, sh, lo) != 0) {

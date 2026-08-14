@@ -33,6 +33,7 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include "../runtime/kl_x18.h"
+#include "../runtime/kl_guestpatch.h"
 
 // ---------- ELF64 subset (macOS has no <elf.h>) ----------
 typedef struct { uint8_t e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version;
@@ -62,6 +63,25 @@ static void die(const char *fmt, ...) {
     fprintf(stderr, "\n");
     va_end(a);
     exit(1);
+}
+
+// ---------- where a guest vaddr lives in this buffer (kl_guestpatch.h) ----------
+// The runtime loader can subtract, because its mapping is contiguous and laid
+// out by vaddr. This buffer is the FILE, so the PT_LOAD that contains the
+// address is what converts one to the other. Only `p_filesz` counts: a vaddr in
+// the .bss tail has no bytes here to patch, and answering NULL for it is the
+// same "not in this image" the header already defines.
+struct gp_ctx_shape { uint8_t *img; const Elf64_Phdr *ph; int n; };
+static uint32_t *gp_at(void *ctx, uint64_t va) {
+    struct gp_ctx_shape *c = (struct gp_ctx_shape *)ctx;
+    for (int i = 0; i < c->n; i++) {
+        if (c->ph[i].p_type != PT_LOAD) continue;
+        if (va < c->ph[i].p_vaddr) continue;
+        uint64_t off = va - c->ph[i].p_vaddr;
+        if (off + 4 > c->ph[i].p_filesz) continue;
+        return (uint32_t *)(c->img + c->ph[i].p_offset + off);
+    }
+    return NULL;
 }
 
 // ---------- S0.1: the TLS rewrite, moved offline ----------
@@ -336,6 +356,19 @@ int main(int argc, char **argv) {
                         "answer %#llx%s (trap 26)\n", in, x18st.ctr_sites,
                 x18st.ctr_patched, (unsigned long long)kl_x18_ctr_value(),
                 x18st.ctr_refused ? " — SOME REFUSED, they will SIGILL" : "");
+
+    // ---- the measured guest patches (kl_guestpatch.c) ----
+    // The same table the runtime loader applies, at the same point in the same
+    // order — after the TLS and x18 rewrites, so both passes see identical
+    // words and an `expect` measured on one path can never be wrong on the
+    // other. This is the OFFLINE half, and it is the only half a headset ever
+    // gets: a klepton-ld dylib's __TEXT is signed, so kl_image.c cannot write
+    // it there. Without this a device run behaves as `KL_GUEST_PATCH=0` while
+    // the host does not, which is the worst kind of difference — one that only
+    // shows up on the hardware.
+    struct gp_ctx_shape gpc = { img, ph, eh->e_phnum };
+    unsigned patched = kl_guest_patch_apply(in, gp_at, &gpc);
+    (void)patched;
 
     uint64_t seg_vm[10], seg_vmend[10], seg_foff[10], seg_fsize[10];
     for (int g = 0; g < ngrp; g++) {

@@ -171,6 +171,24 @@ int kl_errno_from_linux(int e);
 // KL_TRACE_FS reporting for guest file operations (see kl_libc.c).
 void kl_fs_trace_open(const char *path, int flags, int fd);
 
+// A diagnostic's view of the guest's file operations, so RUNTIME_SHIP does not
+// have to know that RUNTIME_DIAG exists. NULL unless something installs one;
+// `kl_metadump_watch_install` is the only caller today, and it wants exactly
+// two events — which fd a path was opened on, and where that fd got mapped.
+//
+// `path` is set for "open" and NULL for "mmap"; `caller` is the GUEST's return
+// address where one is available, which is the whole point of the hook (an
+// obfuscated library's call sites are not findable any other way).
+typedef void (*kl_file_watch_fn)(const char *op, const char *path, int fd,
+                                 void *addr, size_t len, long long off,
+                                 void *caller);
+extern kl_file_watch_fn kl_file_watch;
+
+// ...and the same idea one layer down: a diagnostic's answer for a shim symbol,
+// consulted by kl_shim_lookup before any tier. NULL unless installed. Return
+// NULL for a name the diagnostic does not want, which is all of them.
+extern void *(*kl_shim_override)(const char *name);
+
 // Mutex owner table dump (kl_pthread.c): who holds each translated guest
 // mutex and from where it was locked. Called from t_boot's fault handler so
 // a hang names the contested mutex's owner, not just its waiters.

@@ -19,8 +19,9 @@ LDLIBS  := -lz -framework AudioToolbox \
 # compile for the device — which is the point of keeping it separate rather
 # than discovering the divergence at port time.
 #
-# RUNTIME_DIAG is host-only instrumentation: the sampling profiler and the
-# managed-side probe. Nothing in RUNTIME_SHIP includes their headers (only
+# RUNTIME_DIAG is host-only instrumentation: the sampling profiler, the
+# managed-side probe and the metadata dump. Nothing in RUNTIME_SHIP includes
+# their headers (only
 # tests/m_boot.c does), so the boundary holds by construction rather than by
 # discipline. runtime/kl_view.c (SDL viewer) is host-only too and is named by
 # the m_boot rule alone.
@@ -36,8 +37,9 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_aaudio.c \
            runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_mono.c \
-           runtime/kl_il2cpp.c runtime/kl_fault.c
-RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c
+           runtime/kl_il2cpp.c runtime/kl_fault.c runtime/kl_guestpatch.c \
+           runtime/kl_guestpoke.c
+RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c runtime/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
 # ...and every header they include, as a PREREQUISITE (never as a compiler
@@ -532,9 +534,11 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 # was never remade, and the link error only appeared the first time something
 # forced a rebuild. A stale translator is not a harmless one: it bakes
 # KLX_TSD_SLOT into every veneer it emits.
-build/klepton-ld: tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c runtime/kl_x18.h
+build/klepton-ld: tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c runtime/kl_x18.h \
+                  runtime/kl_guestpatch.c runtime/kl_guestpatch.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c
+	$(CC) $(CFLAGS) -o $@ tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c \
+	    runtime/kl_guestpatch.c
 
 # P1 — the same t_opus roundtrip that M1a passes, through the translated dylib.
 # t_opus picks its loader from the file's magic, so this is one test over two

@@ -97,15 +97,18 @@ enum {
     XR_TYPE_SPACE_LOCATION              = 42,
     XR_TYPE_ACTION_STATE_BOOLEAN        = 23,
     XR_TYPE_ACTION_STATE_FLOAT          = 24,
+    XR_TYPE_ACTION_STATE_VECTOR2F       = 25,
     XR_TYPE_ACTION_STATE_POSE           = 27,
     XR_TYPE_ACTION_SET_CREATE_INFO      = 28,
     XR_TYPE_ACTION_CREATE_INFO          = 29,
     XR_TYPE_ACTION_SPACE_CREATE_INFO    = 38,
     XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING = 51,
     XR_TYPE_INTERACTION_PROFILE_STATE   = 53,
+    XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO = 54,
     XR_TYPE_ACTION_STATE_GET_INFO       = 58,
     XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO = 60,
     XR_TYPE_ACTIONS_SYNC_INFO           = 61,
+    XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO = 62,
     XR_TYPE_SWAPCHAIN_CREATE_INFO       = 9,
     XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO = 55,
     XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO   = 56,
@@ -190,6 +193,7 @@ typedef struct { int32_t type; const void *next;
 
 typedef struct { float x, y, z, w; } XrQuaternionf;
 typedef struct { float x, y, z; } XrVector3f;
+typedef struct { float x, y; } XrVector2f;
 typedef struct { XrQuaternionf orientation; XrVector3f position; } XrPosef;
 typedef struct { float width, height; } XrExtent2Df;
 
@@ -257,6 +261,27 @@ typedef struct { int32_t type; void *next;
                  int64_t lastChangeTime; XrBool32 isActive; } XrActionStateFloat;
 typedef struct { int32_t type; void *next;
                  XrBool32 isActive; } XrActionStatePose;
+typedef struct { int32_t type; void *next;
+                 XrVector2f currentState; XrBool32 changedSinceLastSync;
+                 int64_t lastChangeTime; XrBool32 isActive; } XrActionStateVector2f;
+
+// Which physical paths an action is bound to — the resize/no-resize two-call
+// shape the enumerators use everywhere else, and answered only for the paths
+// that are currently ACTIVE, which is what the spec means by "bound".
+typedef struct { int32_t type; const void *next;
+                 void *action; } XrBoundSourcesForActionEnumerateInfo;
+
+// A display name for a source path — "Oculus Quest2 Left Controller" and the
+// like. The whichComponents bits are the spec's (USER_PATH / PROFILE /
+// COMPONENT / UNIQUE_ID); we never claim to know a unique id, so the two bits
+// that matter are the first and third.
+typedef struct { int32_t type; const void *next;
+                 XrPath sourcePath; uint32_t whichComponents;
+               } XrInputSourceLocalizedNameGetInfo;
+#define XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT            0x00000001
+#define XR_INPUT_SOURCE_LOCALIZED_NAME_INTERACTION_PROFILE_BIT 0x00000002
+#define XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT           0x00000004
+#define XR_INPUT_SOURCE_LOCALIZED_NAME_UNIQUE_ID_BIT           0x00000008
 
 // ---- haptics: the one action family that runs OUT of the guest ----
 //
@@ -450,7 +475,9 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     X(xrSuggestInteractionProfileBindings) X(xrAttachSessionActionSets)        \
     X(xrGetCurrentInteractionProfile) X(xrSyncActions)                         \
     X(xrGetActionStateBoolean) X(xrGetActionStateFloat)                        \
+    X(xrGetActionStateVector2f)                                                \
     X(xrGetActionStatePose)                                                    \
+    X(xrEnumerateBoundSourcesForAction) X(xrGetInputSourceLocalizedName)       \
     /* haptics */                                                              \
     X(xrApplyHapticFeedback) X(xrStopHapticFeedback)                           \
     /* extensions — NOT in any import list, reachable only through             \
@@ -704,11 +731,60 @@ static const struct { const char *name; uint32_t version; } g_extensions[] = {
 // the last entry. Advertising it changes what the client publishes to the
 // Steam host, so this is the knob that says whether a change in host behaviour
 // came from here.
+// KL_XR_EXTRA_EXTENSIONS="<name> <name> ..." appends names to the advertised
+// list. It is SCOUTING ONLY and a lie by construction — an extension we name
+// here is one we have no entry points for, so a guest that takes us up on it
+// resolves NULL or aborts by name. It exists because "what does this guest do
+// differently when the runtime claims X?" is otherwise a rebuild per question,
+// and for this corpus the answer is usually "nothing", which is worth knowing
+// cheaply: VRChat requests exactly one feature extension
+// (XR_VALVE_frame_controller_interaction, from Valve's Steam Frame OpenXR
+// package) and Unity reports it as unsupported in the startup diagnostic, so
+// it is the only thing the guest asks for and does not get. Claiming it is how
+// you find out whether anything downstream was keyed on it.
+#define KLXR_EXT_EXTRA_MAX 8
+static struct { const char *name; uint32_t version; } g_ext_extra[KLXR_EXT_EXTRA_MAX];
+static uint32_t g_ext_nextra;
+static void klxr_ext_extra_init(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    const char *e = getenv("KL_XR_EXTRA_EXTENSIONS");
+    if (!e || !*e) return;
+    char *dup = strdup(e);                  // kept: the names are handed out
+    if (!dup) return;
+    for (char *t = strtok(dup, " ,\t"); t && g_ext_nextra < KLXR_EXT_EXTRA_MAX;
+         t = strtok(NULL, " ,\t")) {
+        g_ext_extra[g_ext_nextra].name    = t;
+        g_ext_extra[g_ext_nextra].version = 1;
+        g_ext_nextra++;
+        fprintf(stderr, "  [xr] KL_XR_EXTRA_EXTENSIONS: advertising %s — SCOUTING "
+                        "ONLY, nothing implements it\n", t);
+    }
+}
 static uint32_t klxr_ext_count(void) {
+    klxr_ext_extra_init();
     const char *e = getenv("KL_XR_REFRESH_EXT");
-    return (e && !strcmp(e, "0")) ? KLXR_EXT_ALL - 1 : KLXR_EXT_ALL;
+    uint32_t base = (e && !strcmp(e, "0")) ? KLXR_EXT_ALL - 1 : KLXR_EXT_ALL;
+    return base + g_ext_nextra;
 }
 #define KLXR_EXT_COUNT (klxr_ext_count())
+
+// One accessor so the three consumers cannot disagree about where the extras
+// live. Index >= the built-in count reads the KL_XR_EXTRA_EXTENSIONS tail; the
+// hidden-refresh-rate case cannot collide with it, because that entry is the
+// LAST built-in and dropping it drops the count with it.
+static const char *klxr_ext_at(uint32_t i, uint32_t *version_out) {
+    uint32_t base = KLXR_EXT_COUNT - g_ext_nextra;
+    const char *name;
+    uint32_t v;
+    if (i < base)      { name = g_extensions[i].name;        v = g_extensions[i].version; }
+    else if (i - base < g_ext_nextra)
+                       { name = g_ext_extra[i - base].name;  v = g_ext_extra[i - base].version; }
+    else return NULL;
+    if (version_out) *version_out = v;
+    return name;
+}
 
 // The two-call idiom, which every enumerate in OpenXR uses and which is easy to
 // get subtly wrong: capacityInput 0 means "just tell me the count" and must
@@ -796,10 +872,11 @@ static XrResult klxr_EnumerateInstanceExtensionProperties(
     if (!props) return KLXR_ERROR_VALIDATION_FAILURE;
 
     for (uint32_t i = 0; i < KLXR_EXT_COUNT; i++) {
+        uint32_t ver = 1;
+        const char *nm = klxr_ext_at(i, &ver);
         props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
-        snprintf(props[i].extensionName, sizeof props[i].extensionName,
-                 "%s", g_extensions[i].name);
-        props[i].extensionVersion = g_extensions[i].version;
+        snprintf(props[i].extensionName, sizeof props[i].extensionName, "%s", nm);
+        props[i].extensionVersion = ver;
     }
     return KLXR_SUCCESS;
 }
@@ -940,8 +1017,10 @@ static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **ins
     for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
         const char *name = info->enabledExtensionNames[i];
         int known = 0;
-        for (uint32_t k = 0; k < KLXR_EXT_COUNT; k++)
-            if (strcmp(name, g_extensions[k].name) == 0) known = 1;
+        for (uint32_t k = 0; k < KLXR_EXT_COUNT; k++) {
+            const char *kn = klxr_ext_at(k, NULL);
+            if (kn && strcmp(name, kn) == 0) known = 1;
+        }
         fprintf(stderr, "  [xr]   extension: %-40s %s\n", name,
                 known ? "enabled" : "NOT PRESENT");
         if (!known) { g_instance.magic = 0; return KLXR_ERROR_EXTENSION_NOT_PRESENT; }
@@ -1840,7 +1919,31 @@ enum { KLXR_ACTION_TYPE_BOOLEAN = 1, KLXR_ACTION_TYPE_FLOAT = 2,
 // "hollywood", ovrp_GetSystemHeadsetType), and the guest's own oculus entry
 // reads "Oculus Quest2 (Left Controller)" / "oculus_touch". Answering a
 // different profile would be the inconsistent act.
+//
+// It is not, however, the ONLY profile we can drive, and 2026-08-14 proved
+// WHY it cannot stay hardcoded: VRChat NEVER suggests the Touch profile. A
+// Steam Frame build binds exclusively under /interaction_profiles/valve/
+// frame_controller_valve (48 bindings), and with Touch hardcoded as active
+// every one of them decoded "inactive profile" — so VRChat had controllers and
+// nobody was told. The active profile is therefore decided PER RUN: which
+// driveable profile the guest actually suggested, preferring Touch (the
+// honest answer for Quest-shaped hardware) and falling back to the Valve frame
+// (the only profile VRChat knows). klxr_profile_driveable is the whole list of
+// profiles whose inputs we can produce; any guest profile outside it stays an
+// inactive suggestion, exactly as before.
 #define KLXR_ACTIVE_PROFILE "/interaction_profiles/oculus/touch_controller"
+#define KLXR_VALVE_PROFILE  "/interaction_profiles/valve/frame_controller_valve"
+
+// The profile the CURRENT run answers as bound, decided from the guest's own
+// suggestions (see the note above). Empty until one is suggested; the getter
+// falls back to Touch. Never both at once — only one active profile may exist
+// per top-level path, and the two are never both suggested by one guest.
+static char g_active_profile[96];
+
+static int klxr_profile_driveable(const char *profile) {
+    return strcmp(profile, KLXR_ACTIVE_PROFILE) == 0 ||
+           strcmp(profile, KLXR_VALVE_PROFILE) == 0;
+}
 
 // What one binding path reads, once decoded.
 enum {
@@ -1851,6 +1954,7 @@ enum {
     KLXR_SRC_HAND_TRIGGER,
     KLXR_SRC_STICK_X,
     KLXR_SRC_STICK_Y,
+    KLXR_SRC_STICK_VEC,       // the whole stick, read as a Vector2f
     KLXR_SRC_POSE,            // .../input/grip/pose — the hilt
     KLXR_SRC_POSE_AIM,        // .../input/aim/pose  — the ray
     KLXR_SRC_HAPTIC,
@@ -1868,24 +1972,68 @@ enum {
 // Deliberately absent, and each absence is a measurement we cannot make rather
 // than an oversight:
 //   /input/thumbrest/touch  — no capacitive thumbrest on any source here
-//   /input/squeeze/click    — vive_focus3 only, so never in the active profile
-//   /input/trigger/click    — the same
+//   /input/trigger/click    — analog-only trigger, no separate press bit
+//   /input/bumper/(click|touch) — the Valve frame's shoulder button; no
+//                                shoulder exists on any source here
+//
+// Two profiles share this table, and the same suffix can mean different hands
+// in each (the Valve frame controller is NOT a Quest controller):
+//   oculus/touch_controller — A/B are the right hand, X/Y the left, x/y on the
+//        right (and a/b on the left) are absent and stay unbound.
+//   valve/frame_controller_valve — VRChat binds the RIGHT face buttons as
+//        y(top)/b(outside)/a(bottom)/x(inside) and the LEFT as a dpad. A
+//        Quest-shaped hand has two face buttons, not four, so the mapping is
+//        deliberately lossy (decided with the user, 2026-08-14): the two
+//        RIGHT buttons collapse onto A/B and the dpad directions onto X/Y,
+//        because the face buttons are mostly menu garnish and the sticks,
+//        triggers and grips are what VRChat actually uses.
 static const struct { const char *suffix; int kind; uint32_t bit[2]; }
 g_xr_sources[] = {
+    // oculus: right hand. valve: right hand again (a = bottom, b = outside) —
+    // the two profiles AGREE here, which is why these rows never changed.
     { "/input/a/click",          KLXR_SRC_BUTTON, { 0, KL_OVRP_RAW_A } },
     { "/input/b/click",          KLXR_SRC_BUTTON, { 0, KL_OVRP_RAW_B } },
-    { "/input/x/click",          KLXR_SRC_BUTTON, { KL_OVRP_RAW_X, 0 } },
-    { "/input/y/click",          KLXR_SRC_BUTTON, { KL_OVRP_RAW_Y, 0 } },
+    // oculus: x/y are the LEFT hand and the right stays unbound. valve: y and
+    // x are the RIGHT hand's top/inside buttons, aliased onto the right
+    // controller's B and A. Both readings are served by one row: the left bit
+    // is the oculus one and the right bit is the valve one.
+    { "/input/x/click",          KLXR_SRC_BUTTON, { KL_OVRP_RAW_X, KL_OVRP_RAW_A } },
+    { "/input/y/click",          KLXR_SRC_BUTTON, { KL_OVRP_RAW_Y, KL_OVRP_RAW_B } },
     { "/input/menu/click",       KLXR_SRC_BUTTON, { KL_OVRP_RAW_START,
                                                     KL_OVRP_RAW_START } },
     { "/input/system/click",     KLXR_SRC_BUTTON, { KL_OVRP_RAW_BACK,
                                                     KL_OVRP_RAW_BACK } },
     { "/input/thumbstick/click", KLXR_SRC_BUTTON, { KL_OVRP_RAW_LTHUMBSTICK,
                                                     KL_OVRP_RAW_RTHUMBSTICK } },
+    // valve only: the left hand's dpad. The two dpad directions collapse onto
+    // the two left face buttons (Y is the top button on the left, X the lower)
+    // — see the mapping note above.
+    { "/input/dpad_up/click",    KLXR_SRC_BUTTON, { KL_OVRP_RAW_Y, 0 } },
+    { "/input/dpad_down/click",  KLXR_SRC_BUTTON, { KL_OVRP_RAW_X, 0 } },
+    { "/input/dpad_left/click",  KLXR_SRC_BUTTON, { KL_OVRP_RAW_X, 0 } },
+    { "/input/dpad_right/click", KLXR_SRC_BUTTON, { KL_OVRP_RAW_Y, 0 } },
+    { "/input/view/click",       KLXR_SRC_BUTTON, { KL_OVRP_RAW_BACK,
+                                                    KL_OVRP_RAW_BACK } },
+    // valve only: squeeze/click. Deliberate for vive (never in the active
+    // profile), served now because valve is driveable and VRChat's grip press
+    // is a real action. The only grip signal we have is the hand trigger's
+    // own threshold bit, which is what "fully squeezed" means on this side.
+    { "/input/squeeze/click",    KLXR_SRC_BUTTON, { KL_OVRP_RAW_LHAND_TRIGGER,
+                                                    KL_OVRP_RAW_RHAND_TRIGGER } },
     { "/input/a/touch",          KLXR_SRC_TOUCH,  { 0, KL_OVRP_RAW_A } },
     { "/input/b/touch",          KLXR_SRC_TOUCH,  { 0, KL_OVRP_RAW_B } },
-    { "/input/x/touch",          KLXR_SRC_TOUCH,  { KL_OVRP_RAW_X, 0 } },
-    { "/input/y/touch",          KLXR_SRC_TOUCH,  { KL_OVRP_RAW_Y, 0 } },
+    { "/input/x/touch",          KLXR_SRC_TOUCH,  { KL_OVRP_RAW_X, KL_OVRP_RAW_A } },
+    { "/input/y/touch",          KLXR_SRC_TOUCH,  { KL_OVRP_RAW_Y, KL_OVRP_RAW_B } },
+    { "/input/dpad_up/touch",    KLXR_SRC_TOUCH,  { KL_OVRP_RAW_Y, 0 } },
+    { "/input/dpad_down/touch",  KLXR_SRC_TOUCH,  { KL_OVRP_RAW_X, 0 } },
+    { "/input/dpad_left/touch",  KLXR_SRC_TOUCH,  { KL_OVRP_RAW_X, 0 } },
+    { "/input/dpad_right/touch", KLXR_SRC_TOUCH,  { KL_OVRP_RAW_Y, 0 } },
+    { "/input/view/touch",       KLXR_SRC_TOUCH,  { KL_OVRP_RAW_BACK,
+                                                    KL_OVRP_RAW_BACK } },
+    { "/input/menu/touch",       KLXR_SRC_TOUCH,  { KL_OVRP_RAW_START,
+                                                    KL_OVRP_RAW_START } },
+    { "/input/squeeze/touch",    KLXR_SRC_TOUCH,  { KL_OVRP_RAW_LHAND_TRIGGER,
+                                                    KL_OVRP_RAW_RHAND_TRIGGER } },
     { "/input/trigger/touch",    KLXR_SRC_TOUCH,  { KL_OVRP_RAW_LINDEX_TRIGGER,
                                                     KL_OVRP_RAW_RINDEX_TRIGGER } },
     { "/input/thumbstick/touch", KLXR_SRC_TOUCH,  { KL_OVRP_RAW_LTHUMBSTICK,
@@ -1894,6 +2042,10 @@ g_xr_sources[] = {
     { "/input/squeeze/value",    KLXR_SRC_HAND_TRIGGER,  { 0, 0 } },
     { "/input/thumbstick/x",     KLXR_SRC_STICK_X, { 0, 0 } },
     { "/input/thumbstick/y",     KLXR_SRC_STICK_Y, { 0, 0 } },
+    // valve only: the whole-stick path, which is what a Vector2f action binds
+    // to. Valve does not split the stick into x/y paths; xrGetActionStateVector2f
+    // reads this kind, and it is why that entry point had to exist.
+    { "/input/thumbstick",       KLXR_SRC_STICK_VEC, { 0, 0 } },
     { "/input/grip/pose",        KLXR_SRC_POSE,     { 0, 0 } },
     { "/input/aim/pose",         KLXR_SRC_POSE_AIM, { 0, 0 } },
     { "/output/haptic",          KLXR_SRC_HAPTIC, { 0, 0 } },
@@ -1925,6 +2077,7 @@ static const char *klxr_src_name(int kind) {
         case KLXR_SRC_HAND_TRIGGER:  return "hand trigger";
         case KLXR_SRC_STICK_X:       return "thumbstick x";
         case KLXR_SRC_STICK_Y:       return "thumbstick y";
+        case KLXR_SRC_STICK_VEC:     return "thumbstick";
         case KLXR_SRC_POSE:          return "grip pose";
         case KLXR_SRC_POSE_AIM:      return "aim pose";
         case KLXR_SRC_HAPTIC:        return "haptic";
@@ -1958,6 +2111,7 @@ typedef struct {
     // frame disagree, and would make "changed" a function of how often the
     // guest asked rather than of what the user did.
     float    value[2];
+    float    value2[2];    // the Y component of a KLXR_SRC_STICK_VEC action
     int      active[2], changed[2];
     int64_t  change_time[2];
     // Three different questions the end-of-run report has to keep apart: was
@@ -2145,12 +2299,14 @@ static int klxr_action_space_hand(const klxr_space *sp, int *is_aim) {
 // it, and — for the profile we report active — KEEP it, because this is the
 // only statement anywhere of which control each action reads.
 //
-// A guest suggests bindings for every controller it knows (this one does six),
-// and only the active profile's may be honoured: binding an action to the vive
-// `squeeze/click` it also offers would have a Touch controller reporting a
-// control it does not have. So the profile test is a correctness rule, not a
-// filter for tidiness — and it is why an action bound ONLY under another
-// profile correctly ends up inactive.
+// A guest suggests bindings for every controller it knows (Steam Link does
+// six, VRChat exactly one), and only the active profile's may be honoured:
+// binding an action to the vive `squeeze/click` it also offers would have a
+// Touch controller reporting a control it does not have. So the profile test is
+// a correctness rule, not a filter for tidiness — and it is why an action
+// bound ONLY under another profile correctly ends up inactive. Which profile
+// is active is decided HERE, from what the guest actually suggested (see the
+// note above g_active_profile), not from a constant.
 static XrResult klxr_SuggestInteractionProfileBindings(
         void *instance, const XrInteractionProfileSuggestedBinding *bindings) {
     if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
@@ -2160,17 +2316,26 @@ static XrResult klxr_SuggestInteractionProfileBindings(
     klxr_log_chain("xrSuggestInteractionProfileBindings", bindings->next);
 
     const char *profile = klxr_path_str(bindings->interactionProfile);
-    int active = strcmp(profile, KLXR_ACTIVE_PROFILE) == 0;
+    int active = klxr_profile_driveable(profile);
     int detail = kl_env_on("KL_XR_BINDINGS", 0);
     fprintf(stderr, "  [xr] suggested bindings for %s (%u)%s\n",
             profile, bindings->countSuggestedBindings,
-            active ? "  <- the active profile" : "");
+            active ? "  <- driveable (taken)" : "");
 
-    // A second call for the same profile REPLACES the first — the spec is
-    // explicit, and an app that rebinds mid-session (a settings screen) would
-    // otherwise accumulate both maps and read whichever won the last write.
-    // Cheap to get right here and impossible to notice later.
-    if (active)
+    // Only one profile is ever reported active per top-level path, and the
+    // last driveable suggestion is the one. Recording it is REQUIRED by the
+    // guest, not a nicety: xrGetCurrentInteractionProfile is what VRChat's
+    // whole controller surface hangs off, and GetCurrentInteractionProfile
+    // cannot stay hardcoded to Touch while the map it must describe is the
+    // Valve frame controller's. Wiping the previous driveable profile's map
+    // is the same replace rule the spec makes a SECOND call for ONE profile
+    // obey: two profiles must not both be reports we answer with.
+    if (active) {
+        snprintf(g_active_profile, sizeof g_active_profile, "%s", profile);
+        // A second call for the same profile REPLACES the first — the spec is
+        // explicit, and an app that rebinds mid-session (a settings screen)
+        // would otherwise accumulate both maps and read whichever won the
+        // last write. Cheap to get right here and impossible to notice later.
         for (int i = 0; i < KLXR_ACTION_MAX; i++)
             if (g_actions[i].magic)
                 for (int h = 0; h < 2; h++) {
@@ -2178,6 +2343,7 @@ static XrResult klxr_SuggestInteractionProfileBindings(
                     g_actions[i].bit[h] = 0;
                     g_actions[i].bind[h] = 0;
                 }
+    }
 
     unsigned took = 0, unknown = 0;
     for (uint32_t i = 0; i < bindings->countSuggestedBindings; i++) {
@@ -2292,8 +2458,16 @@ static XrResult klxr_GetCurrentInteractionProfile(void *session, XrPath top_leve
         // through xrStringToPath's own interner is what guarantees the XrPath
         // we hand back is the SAME integer the guest gets when it interns the
         // string itself, which is the only thing it can compare against.
-        klxr_StringToPath(s->instance, KLXR_ACTIVE_PROFILE,
-                          &state->interactionProfile);
+        //
+        // The answer is the profile the guest actually suggested and we can
+        // drive, not a constant: VRChat never suggests Touch, so answering
+        // Touch there would describe a controller the guest's whole map is
+        // not written for. Steam Link suggests Touch, so it falls back
+        // uneventfully. g_active_profile is empty only if nothing driveable
+        // was ever suggested, and Touch is then the Quest-shaped answer.
+        const char *profile = g_active_profile[0] ? g_active_profile
+                                                  : KLXR_ACTIVE_PROFILE;
+        klxr_StringToPath(s->instance, profile, &state->interactionProfile);
     }
     static int said;
     if (!said++)
@@ -2326,7 +2500,10 @@ static float klxr_eval(const klxr_action *a, int hand, const klxr_hand_input *in
         case KLXR_SRC_STICK_Y:       return in->stick_y;
         // A pose action's "value" is only ever its activity; a haptic action
         // has no input state at all. Both are 1 so the pose getter can report
-        // isActive from the same field as everything else.
+        // isActive from the same field as everything else. STICK_VEC behaves
+        // like POSE here too — its real value is a vector and is handled in
+        // klxr_SyncActions — and 1 on the way in is only the activity marker.
+        case KLXR_SRC_STICK_VEC:
         case KLXR_SRC_POSE:
         case KLXR_SRC_POSE_AIM:
         case KLXR_SRC_HAPTIC:        return 1.0f;
@@ -2355,14 +2532,30 @@ static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
         if (!a->magic) continue;
         for (int h = 0; h < 2; h++) {
             int active = a->kind[h] != KLXR_SRC_NONE && in[h].present;
-            float v = active ? klxr_eval(a, h, &in[h]) : 0.0f;
+            float v = 0.0f, w = 0.0f;
+            if (active) {
+                if (a->kind[h] == KLXR_SRC_STICK_VEC) {
+                    // The whole-stick action: both components, sampled once.
+                    // A Vector2f must never be assembled from two reads that
+                    // could straddle a sync (the reason nothing here reads
+                    // kl_ovrp live), so the vector is captured here the same
+                    // way the scalars are.
+                    v = in[h].stick_x; w = in[h].stick_y;
+                } else {
+                    v = klxr_eval(a, h, &in[h]);
+                }
+            }
             // "Changed" only between two ACTIVE syncs. A controller appearing
             // is not the user pressing anything, and reporting it as a change
             // would fire every edge-triggered handler the guest has the moment
-            // a hand comes into view.
-            a->changed[h] = active && a->active[h] && v != a->value[h];
+            // a hand comes into view. For a vector, either component moving is
+            // a change.
+            a->changed[h] = active && a->active[h] &&
+                (a->kind[h] == KLXR_SRC_STICK_VEC
+                     ? (v != a->value[h] || w != a->value2[h]) : v != a->value[h]);
             if (a->changed[h]) a->change_time[h] = now;
             a->value[h]  = v;
+            a->value2[h] = w;
             a->active[h] = active;
         }
     }
@@ -2521,6 +2714,130 @@ static XrResult klxr_GetActionStatePose(void *session, const XrActionStateGetInf
     return KLXR_SUCCESS;
 }
 
+// The thumbstick, read as a vector — the action VRChat's `steamframecontroller`
+// set calls `thumbstick`, and until 2026-08-14 the getter did not exist at all
+// (the entry point resolved to the named-refusal stub), so the guest's whole
+// locomotion input read from an action that reported itself active-and-zero.
+// The combined-hands rule is the FLOAT rule, not the boolean OR: movement is
+// the larger push, so a stick pushed on one hand must not be cancelled by a
+// centred one on the other. The value comes from the SNAPSHOT (see the
+// struct's comment), never from a live read.
+static XrResult klxr_GetActionStateVector2f(void *session,
+                                            const XrActionStateGetInfo *info,
+                                            XrActionStateVector2f *state) {
+    klxr_action *a = NULL;
+    XrResult r = klxr_action_state_pre(session, info, "xrGetActionStateVector2f", &a);
+    if (r != KLXR_SUCCESS) return r;
+    if (!state) return KLXR_ERROR_VALIDATION_FAILURE;
+    state->type = XR_TYPE_ACTION_STATE_VECTOR2F;
+    state->currentState = (XrVector2f){ 0, 0 };
+    state->changedSinceLastSync = 0; state->lastChangeTime = 0; state->isActive = 0;
+
+    int hands = klxr_hands_for(a, info->subactionPath, NULL);
+    for (int h = 0; h < 2; h++) {
+        if (!(hands & (1 << h)) || !a->active[h]) continue;
+        if (!state->isActive) a->active_reads++;
+        state->isActive = 1;
+        float mx = a->value[h], my = a->value2[h];
+        float cm = mx * mx + my * my;
+        float pm = state->currentState.x * state->currentState.x +
+                   state->currentState.y * state->currentState.y;
+        if (cm > pm) {
+            state->currentState = (XrVector2f){ mx, my };
+            if (cm > 0.0f) klxr_note_active(a, h, sqrtf(cm));
+        }
+        if (a->changed[h]) state->changedSinceLastSync = 1;
+        if (a->change_time[h] > state->lastChangeTime)
+            state->lastChangeTime = a->change_time[h];
+    }
+    if (!state->isActive) {
+        state->currentState = (XrVector2f){ 0, 0 };
+        state->changedSinceLastSync = 0; state->lastChangeTime = 0;
+    }
+    return KLXR_SUCCESS;
+}
+
+// Which physical paths an action is currently bound to, OUT of the guest and
+// back into it. Unity/XR interaction code uses this to build a remapping UI
+// and, more importantly, to discover which of an action's potential sources
+// are actually live — so an unanswered version is not merely a missing
+// convenience, it is one more way the "is this control reachable at all"
+// question cannot be asked.
+static XrResult klxr_EnumerateBoundSourcesForAction(
+        void *session, const XrBoundSourcesForActionEnumerateInfo *info,
+        uint32_t sourceCapacityInput, uint32_t *sourceCountOutput,
+        XrPath *sources) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !sourceCountOutput) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO)
+        return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_action *a = klxr_action_of(info->action);
+    if (!a) return KLXR_ERROR_HANDLE_INVALID;
+    if (!s->action_sets_attached) return KLXR_ERROR_ACTIONSET_NOT_ATTACHED;
+    klxr_log_chain("xrEnumerateBoundSourcesForAction", info->next);
+
+    // "Bound" is the ACTIVE map, and only that: an action suggested under an
+    // inactive profile is not bound to anything, which is exactly what the
+    // guest is trying to find out by calling this.
+    uint32_t n = 0;
+    XrPath all[2];
+    for (int h = 0; h < 2; h++)
+        if (a->kind[h] != KLXR_SRC_NONE && a->bind[h]) all[n++] = a->bind[h];
+    *sourceCountOutput = n;
+    if (sourceCapacityInput == 0) return KLXR_SUCCESS;   // the two-call shape
+    if (sourceCapacityInput < n) return KLXR_ERROR_SIZE_INSUFFICIENT;
+    if (n && !sources) return KLXR_ERROR_VALIDATION_FAILURE;
+    for (uint32_t i = 0; i < n; i++) sources[i] = all[i];
+    return KLXR_SUCCESS;
+}
+
+// A display name for a source path — the input catalogue, spelled for a
+// person. The profile arm is answered only as a name we can stand behind, and
+// the component arm by the last path element, because that is the only
+// component granularity we actually have. A name is never load-bearing; the
+// `whichComponents` bits only say how much of one to build.
+static const char *klxr_src_display_name(const char *path) {
+    const char *hand = strstr(path, "/user/hand/");
+    const char *hand_name = "Controller";
+    if (hand) {
+        const char *base = hand + strlen("/user/hand/");
+        const char *sl = strchr(base, '/');
+        size_t n = sl ? (size_t)(sl - base) : strlen(base);
+        if (n == 4 && strncmp(base, "left", 4) == 0)
+            hand_name = "Left Controller";
+        else if (n == 5 && strncmp(base, "right", 5) == 0)
+            hand_name = "Right Controller";
+    }
+    static __thread char buf[128];
+    const char *comp = strrchr(path, '/');
+    const char *comp_name = comp ? comp + 1 : path;
+    snprintf(buf, sizeof buf, "%s — %s", hand_name, comp_name);
+    return buf;
+}
+
+static XrResult klxr_GetInputSourceLocalizedName(
+        void *session, const XrInputSourceLocalizedNameGetInfo *info,
+        uint32_t bufferCapacityInput, uint32_t *bufferCountOutput,
+        char *buffer) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    if (!info || !bufferCountOutput) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->type != XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO)
+        return KLXR_ERROR_VALIDATION_FAILURE;
+    if (info->sourcePath == 0 || info->sourcePath > g_path_count)
+        return KLXR_ERROR_PATH_INVALID;
+    klxr_log_chain("xrGetInputSourceLocalizedName", info->next);
+
+    const char *name = klxr_src_display_name(klxr_path_str(info->sourcePath));
+    uint32_t need = (uint32_t)strlen(name) + 1;  // count includes the NUL
+    *bufferCountOutput = need;
+    if (bufferCapacityInput < need) return KLXR_ERROR_SIZE_INSUFFICIENT;
+    if (!buffer) return KLXR_ERROR_VALIDATION_FAILURE;
+    memcpy(buffer, name, need);
+    return KLXR_SUCCESS;
+}
+
 // ---- haptics: the action family that runs OUT of the guest ------------------
 //
 // These two were in the entry-point list and NOT in the dispatch table, so they
@@ -2602,7 +2919,7 @@ static void klxr_input_report(FILE *f) {
 
     fprintf(f, "  --- input (actions) ---\n");
     fprintf(f, "    %u binding(s) taken from %s\n", g_xr_input.bound,
-            KLXR_ACTIVE_PROFILE);
+            g_active_profile[0] ? g_active_profile : KLXR_ACTIVE_PROFILE);
     fprintf(f, "    %u xrSyncActions; hands live: %s%s%s\n", g_xr_input.syncs,
             (g_xr_input.hands_seen & 1) ? "left " : "",
             (g_xr_input.hands_seen & 2) ? "right" : "",
@@ -2871,16 +3188,17 @@ static void klxr_back_eye_images(klxr_swapchain *sc, int eye) {
     if (klxr_format_is_depth(sc->format)) return;
     // The provider hands back a slice of a 2-slice array, one per eye, and the
     // compositor's amplified pass depends on both eyes sharing that texture. A
-    // swapchain that is itself an array is a different shape — the guest would
-    // be rendering both eyes into one of ours — so it is named and left alone
-    // rather than half-served.
+    // swapchain that is itself an array is a different shape — the guest renders
+    // BOTH eyes into one texture of ours, and the re-point below cannot serve it
+    // at all, because glEGLImageTargetTexture2DOES only takes a GL_TEXTURE_2D.
+    // klxr_mirror_eye_image is that case and the caller routes it there; this
+    // one is unreachable and stays as the statement of what is not served here.
     if (sc->array_size != 1 || sc->mip_count != 1) {
         static int said;
         if (!said) {
             said = 1;
             fprintf(stderr, "  [xr] eye %d swapchain is %u array slice(s) x %u mip(s) "
-                            "— not backed by an MTLTexture; the compositor has "
-                            "nothing to sample for it\n",
+                            "— not backed by an MTLTexture directly\n",
                     eye, sc->array_size, sc->mip_count);
         }
         return;
@@ -2914,6 +3232,48 @@ static void klxr_back_eye_images(klxr_swapchain *sc, int eye) {
                 eye, done, sc->count, sc->width, sc->height,
                 (unsigned long long)sc->format);
     }
+}
+
+// ...and the array case, which is every Unity OpenXR guest: one swapchain, two
+// eyes, told apart by `imageArrayIndex`. There is nothing to re-point, so the
+// presented layer is copied into storage the compositor owns — see
+// kl_glfb_mirror_eye_layer for why a copy and what it costs.
+//
+// Unlike the re-point this is per FRAME, not once per swapchain: the guest keeps
+// its own images and keeps rotating them, and each frame's picture has to be
+// carried across. The stage is the image the guest just presented, so the
+// destinations rotate exactly as its images do — and it is the same number
+// `drawn_stage` files the frame record under, which is what keeps the pose and
+// the picture the compositor pairs belonging to one frame.
+static void klxr_mirror_eye_image(klxr_swapchain *sc, int eye, int layer) {
+    if (!kl_glfb_has_mtl_provider()) return;
+    // KL_XR_EYE_MIRROR=0 restores the failing configuration exactly: no eye
+    // MTLTexture, so both compositors show black for this guest. Worth a knob
+    // because the copy is the one thing on this path that costs per frame, and
+    // "is the mirror why X" should be one run rather than a rebuild.
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_XR_EYE_MIRROR", 1);
+    if (!on) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [xr] KL_XR_EYE_MIRROR=0 — the array eye swapchain is "
+                            "not copied, so the compositor has nothing to sample\n");
+        return;
+    }
+    if (klxr_format_is_depth(sc->format)) return;
+    if (sc->last_released < 0 || sc->last_released >= sc->count) return;
+    if (sc->mip_count != 1) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [xr] eye %d swapchain has %u mips — only level 0 is "
+                            "copied to the compositor\n", eye, sc->mip_count);
+    }
+    if (layer < 0 || (uint32_t)layer >= sc->array_size) layer = 0;
+    kl_glfb_mirror_eye_layer(eye, sc->last_released,
+                             sc->tex[sc->last_released],
+                             sc->array_size > 1 ? layer : -1,
+                             (int)sc->width, (int)sc->height,
+                             (uint32_t)sc->format);
 }
 
 static XrResult klxr_DestroySwapchain(void *swapchain) {
@@ -3209,7 +3569,19 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             // this call is the first moment anything knows which swapchain is
             // an eye. Only the composited layer's, and only once per (swapchain,
             // eye) — klxr_back_eye_images returns immediately after that.
-            if ((int)li == cap_layer) klxr_back_eye_images(sc, (int)v);
+            //
+            // Which of the two routes depends on the shape the guest asked for,
+            // and it is not a preference: a 2-slice swapchain (every Unity
+            // OpenXR guest, one texture for both eyes) cannot be re-pointed at
+            // an MTLTexture at all, so it is copied instead — every frame,
+            // rather than once.
+            if ((int)li == cap_layer) {
+                if (sc->array_size > 1)
+                    klxr_mirror_eye_image(sc, (int)v,
+                                          (int)proj->views[v].subImage.imageArrayIndex);
+                else
+                    klxr_back_eye_images(sc, (int)v);
+            }
             if (sc->eye == (int)v) continue;            // already this eye
             sc->eye = (int)v;
             for (int k = 0; k < sc->count; k++)
@@ -3514,7 +3886,12 @@ static void klxr_install(void) {
         {"xrSyncActions",          (void *)klxr_SyncActions},
         {"xrGetActionStateBoolean",(void *)klxr_GetActionStateBoolean},
         {"xrGetActionStateFloat",  (void *)klxr_GetActionStateFloat},
+        {"xrGetActionStateVector2f",(void *)klxr_GetActionStateVector2f},
         {"xrGetActionStatePose",   (void *)klxr_GetActionStatePose},
+        {"xrEnumerateBoundSourcesForAction",
+                                   (void *)klxr_EnumerateBoundSourcesForAction},
+        {"xrGetInputSourceLocalizedName",
+                                   (void *)klxr_GetInputSourceLocalizedName},
         {"xrApplyHapticFeedback",  (void *)klxr_ApplyHapticFeedback},
         {"xrStopHapticFeedback",   (void *)klxr_StopHapticFeedback},
         // swapchains — the eye images, and the P5 seam
@@ -3661,6 +4038,7 @@ static void klxr_st_boot(void) {
     memset(g_action_sets, 0, sizeof g_action_sets);
     memset(g_spaces, 0, sizeof g_spaces);
     memset(&g_xr_input, 0, sizeof g_xr_input);
+    g_active_profile[0] = 0;
     g_instance.magic = KLXR_MAGIC_INSTANCE;
     g_session.magic = KLXR_MAGIC_SESSION;
     g_session.instance = &g_instance;
@@ -3999,6 +4377,165 @@ int kl_openxr_input_selftest(FILE *f) {
     XrHapticBaseHeader junk = { 999999, NULL };
     ok &= klxr_st_ok(f, "an unknown feedback type is ignored, not cast",
                      klxr_ApplyHapticFeedback(&g_session, &hi, &junk) == KLXR_SUCCESS);
+
+    // ---- the Steam Frame profile (VRChat) ----------------------------------
+    //
+    // This is the section that made the active profile dynamic. VRChat is the
+    // guest that did: it suggests ONLY /interaction_profiles/valve/\n    // frame_controller_valve (48 bindings), NEVER Touch, so with Touch
+    // hardcoded as active every one of its suggestions decoded "inactive
+    // profile" and the guest's controllers were dead. The map below is that
+    // guest's own, transcribed from a real run and trimmed to the controls
+    // that matter; the assertions are the ones that have to hold for VRChat to
+    // have input at all, and none of them could be made against the Touch-only
+    // section above because a Valve-bound action never decodes there.
+    klxr_st_boot();   // fresh state: this guest has no other profile
+    {
+        XrActionSetCreateInfo vsi; memset(&vsi, 0, sizeof vsi);
+        vsi.type = XR_TYPE_ACTION_SET_CREATE_INFO;
+        snprintf(vsi.actionSetName, sizeof vsi.actionSetName, "%s",
+                 "steamframecontroller");
+        void *vset = NULL;
+        klxr_CreateActionSet(&g_instance, &vsi, &vset);
+
+        void *vstick = klxr_st_action(vset, "thumbstick", KLXR_ACTION_TYPE_VECTOR2F);
+        void *vtop   = klxr_st_action(vset, "facebuttontop", KLXR_ACTION_TYPE_BOOLEAN);
+        void *vbot   = klxr_st_action(vset, "facebuttonbottom", KLXR_ACTION_TYPE_BOOLEAN);
+        void *vgrip  = klxr_st_action(vset, "grippressed", KLXR_ACTION_TYPE_BOOLEAN);
+        void *vmenu  = klxr_st_action(vset, "menu", KLXR_ACTION_TYPE_BOOLEAN);
+        void *vtrig  = klxr_st_action(vset, "triggerpressed", KLXR_ACTION_TYPE_FLOAT);
+        void *vpose  = klxr_st_action(vset, "devicepose", KLXR_ACTION_TYPE_POSE);
+
+        const XrActionSuggestedBinding valve_map[] = {
+            klxr_st_sb(vstick, "/user/hand/left/input/thumbstick"),
+            klxr_st_sb(vstick, "/user/hand/right/input/thumbstick"),
+            klxr_st_sb(vtrig,  "/user/hand/left/input/trigger/value"),
+            klxr_st_sb(vtrig,  "/user/hand/right/input/trigger/value"),
+            klxr_st_sb(vmenu,  "/user/hand/right/input/menu/click"),
+            klxr_st_sb(vmenu,  "/user/hand/left/input/view/click"),
+            klxr_st_sb(vgrip,  "/user/hand/left/input/squeeze/click"),
+            klxr_st_sb(vgrip,  "/user/hand/right/input/squeeze/click"),
+            klxr_st_sb(vtop,   "/user/hand/right/input/y/click"),
+            klxr_st_sb(vtop,   "/user/hand/left/input/dpad_up/click"),
+            klxr_st_sb(vbot,   "/user/hand/right/input/a/click"),
+            klxr_st_sb(vbot,   "/user/hand/left/input/dpad_down/click"),
+            klxr_st_sb(vpose,  "/user/hand/left/input/grip/pose"),
+            klxr_st_sb(vpose,  "/user/hand/right/input/grip/pose"),
+        };
+        klxr_st_bind_all(KLXR_VALVE_PROFILE,
+                         valve_map, sizeof valve_map / sizeof valve_map[0]);
+
+        // The whole reason the active profile is not a constant: a guest that
+        // suggests ONLY the Valve frame still gets a live map, right down to
+        // the face-button collapse the user agreed to (right y aliases onto
+        // the right controller's B, left dpad_up onto its Y).
+        ok &= klxr_st_ok(f, "Valve: bindings are taken for a profile-only guest",
+                         ((klxr_action *)vtop)->kind[1] == KLXR_SRC_BUTTON &&
+                         ((klxr_action *)vtop)->bit[1] == KL_OVRP_RAW_B &&
+                         ((klxr_action *)vtop)->kind[0] == KLXR_SRC_BUTTON &&
+                         ((klxr_action *)vtop)->bit[0] == KL_OVRP_RAW_Y);
+        ok &= klxr_st_ok(f, "Valve: facebuttonbottom is right A / left dpad_down",
+                         ((klxr_action *)vbot)->bit[1] == KL_OVRP_RAW_A &&
+                         ((klxr_action *)vbot)->bit[0] == KL_OVRP_RAW_X);
+        ok &= klxr_st_ok(f, "Valve: view/click is the BACK bit, menu the START bit",
+                         ((klxr_action *)vmenu)->kind[0] == KLXR_SRC_BUTTON &&
+                         ((klxr_action *)vmenu)->bit[0] == KL_OVRP_RAW_BACK &&
+                         ((klxr_action *)vmenu)->kind[1] == KLXR_SRC_BUTTON &&
+                         ((klxr_action *)vmenu)->bit[1] == KL_OVRP_RAW_START);
+        ok &= klxr_st_ok(f, "Valve: squeeze/click is the hand-trigger threshold",
+                         ((klxr_action *)vgrip)->kind[0] == KLXR_SRC_BUTTON &&
+                         ((klxr_action *)vgrip)->bit[0] == KL_OVRP_RAW_LHAND_TRIGGER &&
+                         ((klxr_action *)vgrip)->kind[1] == KLXR_SRC_BUTTON &&
+                         ((klxr_action *)vgrip)->bit[1] == KL_OVRP_RAW_RHAND_TRIGGER);
+        // The whole-stick path decodes to a NEW kind that only the Vector2f
+        // getter reads — this is the guest's locomotion input, and it used to
+        // be entirely unreachable because neither the kind nor the getter
+        // existed.
+        ok &= klxr_st_ok(f, "Valve: /input/thumbstick is a Vector2f source",
+                         ((klxr_action *)vstick)->kind[0] == KLXR_SRC_STICK_VEC &&
+                         ((klxr_action *)vstick)->kind[1] == KLXR_SRC_STICK_VEC);
+
+        // And the profile is REPORTED as the Valve frame, not hardcoded Touch
+        // — the two are not the same controller and the guest keys off this.
+        XrPath left = 0;
+        klxr_StringToPath(&g_instance, "/user/hand/left", &left);
+        XrInteractionProfileState ips;
+        memset(&ips, 0, sizeof ips);
+        klxr_GetCurrentInteractionProfile(&g_session, left, &ips);
+        ok &= klxr_st_ok(f, "Valve: the profile reported is the Valve frame",
+                         ips.interactionProfile != 0 &&
+                         strcmp(klxr_path_str(ips.interactionProfile),
+                                KLXR_VALVE_PROFILE) == 0);
+
+        // End to end: a stick pushed on the right hand must read back through
+        // xrGetActionStateVector2f — the entry point that did not exist. The
+        // vector is captured at sync from the same snapshot every other action
+        // reads, so this is not two methods of one seam disagreeing.
+        kl_ovrp_set_hand_pose(1, 0.2f, 1.0f, -0.3f, 0, 0, 0, 1);
+        kl_ovrp_set_controller_input(1, 0, 0, 0, 0, -0.5f, 0.25f);
+        kl_ovrp_frame_latch();
+        klxr_st_sync();
+        XrActionStateVector2f vv;
+        memset(&vv, 0, sizeof vv);
+        XrActionStateGetInfo vgi;
+        memset(&vgi, 0, sizeof vgi);
+        vgi.type = XR_TYPE_ACTION_STATE_GET_INFO;
+        vgi.action = vstick;
+        klxr_StringToPath(&g_instance, "/user/hand/right", &vgi.subactionPath);
+        XrResult vrr = klxr_GetActionStateVector2f(&g_session, &vgi, &vv);
+        ok &= klxr_st_ok(f, "Valve: the stick reads through xrGetActionStateVector2f",
+                         vrr == KLXR_SUCCESS && vv.isActive &&
+                         fabsf(vv.currentState.x + 0.5f) < 1e-4f &&
+                         fabsf(vv.currentState.y - 0.25f) < 1e-4f);
+        // The combine rule is the FLOAT rule (larger magnitude), and it must
+        // hold for vectors too: movement is the hand pushing hardest. Publish
+        // the LEFT hand pushing harder and read both — the answer must be the
+        // left vector, not a sum (-1.3) and not first-hand-wins.
+        kl_ovrp_set_hand_pose(0, -0.2f, 1.0f, -0.3f, 0, 0, 0, 1);
+        kl_ovrp_set_controller_input(0, 0, 0, 0, 0, -0.8f, 0.1f);
+        kl_ovrp_frame_latch();
+        klxr_st_sync();
+        memset(&vv, 0, sizeof vv);
+        vgi.subactionPath = 0;
+        klxr_GetActionStateVector2f(&g_session, &vgi, &vv);
+        ok &= klxr_st_ok(f, "Valve: combined read takes the larger push, not a sum",
+                         vv.isActive && fabsf(vv.currentState.x + 0.8f) < 1e-4f &&
+                         fabsf(vv.currentState.y - 0.1f) < 1e-4f);
+
+        // Bound-source enumeration: the stick action is bound on both hands,
+        // and the two-call shape (0 capacity -> count) is the only shape a
+        // guest is allowed to rely on.
+        XrBoundSourcesForActionEnumerateInfo ei;
+        memset(&ei, 0, sizeof ei);
+        ei.type = XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO;
+        ei.action = vstick;
+        uint32_t cnt = 0;
+        ok &= klxr_st_ok(f, "Valve: bound sources enumerate (count first)",
+                         klxr_EnumerateBoundSourcesForAction(&g_session, &ei, 0,
+                                                             &cnt, NULL) ==
+                             KLXR_SUCCESS && cnt == 2);
+        XrPath srcs[2] = {0, 0};
+        ok &= klxr_st_ok(f, "Valve: ...and fill on the second call",
+                         cnt == 2 &&
+                         klxr_EnumerateBoundSourcesForAction(&g_session, &ei, 2,
+                                                             &cnt, srcs) ==
+                             KLXR_SUCCESS && srcs[0] != 0 && srcs[1] != 0);
+
+        // Localized names: requested only ever for display, but a source path
+        // must never refuse one — Unity's input catalogue calls this to build
+        // its bindings UI, and VRChat's was the first guest that asked.
+        char nb[64];
+        uint32_t nneed = 0;
+        XrInputSourceLocalizedNameGetInfo lni;
+        memset(&lni, 0, sizeof lni);
+        lni.type = XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO;
+        klxr_StringToPath(&g_instance, "/user/hand/right/input/thumbstick",
+                          &lni.sourcePath);
+        XrResult lr = klxr_GetInputSourceLocalizedName(&g_session, &lni,
+                                                       sizeof nb, &nneed, nb);
+        ok &= klxr_st_ok(f, "Valve: a source path has a display name",
+                         lr == KLXR_SUCCESS &&
+                         strstr(nb, "Right Controller") != NULL);
+    }
 
     memset(&g_session, 0, sizeof g_session);
     memset(&g_instance, 0, sizeof g_instance);

@@ -58,6 +58,9 @@
 #define KL_VIEW_EYE_HEIGHT       1.6f      // standing eye height, metres
 #define KL_VIEW_WIN_W            920       // half of 1832x1920, roughly one eye
 #define KL_VIEW_WIN_H            960
+// The smallest guest panel worth resizing the window to. Below this it is a
+// placeholder surface rather than a picture — see the mono transition.
+#define KL_VIEW_MONO_MIN         64
 
 // The double-buffered frame store, collapsed to the latest frame: the sink
 // overwrites it under the mutex and sets the flag, the SDL loop consumes and
@@ -345,11 +348,19 @@ int kl_view_main(const char *libdir, int hw) {
             if (mono) {
                 // Match the window to the guest's panel so its picture is shown
                 // 1:1 rather than letterboxed into a VR-shaped window.
+                // ...but only for a panel a person could look at. A Unity XR
+                // guest brings up a placeholder surface before the XR display
+                // starts — VRChat's is 16x16 — and matching the window to it
+                // leaves a window too small to see, which reads as "the viewer
+                // is broken" rather than "the guest has not started XR yet".
                 int mw = 0, mh = 0;
                 kl_present_mono_size(&mw, &mh);
-                if (mw > 0 && mh > 0) {
+                if (mw >= KL_VIEW_MONO_MIN && mh >= KL_VIEW_MONO_MIN) {
                     SDL_SetWindowSize(win, mw, mh);
                     SDL_SetWindowTitle(win, "Klepton — 2D guest");
+                } else if (mw > 0 && mh > 0) {
+                    fprintf(stderr, "view: the guest's panel is %dx%d — too small "
+                                    "to be a picture; keeping the window\n", mw, mh);
                 }
                 fprintf(stderr, "view: guest is MONO %dx%d — flat window, no pose\n",
                         mw, mh);
@@ -362,6 +373,11 @@ int kl_view_main(const char *libdir, int hw) {
                 (void)kl_mono_input_available();
                 t_mono = t_now;
             } else if (m == KL_PRESENT_STEREO) {
+                // Symmetric with the mono branch, and it had no counterpart:
+                // a guest that goes mono and THEN stereo (every Unity OpenXR
+                // title — the placeholder surface comes first) was left in a
+                // window sized for the panel it has stopped drawing.
+                SDL_SetWindowSize(win, KL_VIEW_WIN_W, KL_VIEW_WIN_H);
                 SDL_SetWindowTitle(win, "Klepton — VR guest (one eye)");
                 fprintf(stderr, "view: guest is STEREO — driving pose and hands\n");
             }

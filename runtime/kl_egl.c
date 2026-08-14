@@ -1550,6 +1550,7 @@ void kl_egl_report(FILE *f) {
     // A run that dies of memory wants this in the report, not only every Nth
     // swap: the last census before the abort is the one that names the class.
     kl_glfb_gl_census(f);
+    kl_glfb_draw_census(f);
     unsigned called = 0;
     for (unsigned i = 0; i < g_ngl; i++) if (g_gl[i].calls) called++;
     // `calls` counts the NULL driver's own stubs. Under KL_GLFB=1 the guest gets

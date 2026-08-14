@@ -1397,7 +1397,13 @@ void *klb_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     int df = kl_mmap_flags(flags);
     if (df & MAP_ANON) fd = -1;                  // Darwin insists on -1 for anonymous
     if (klb_refuse_exec("mmap", (df & MAP_ANON) != 0, prot)) return MAP_FAILED;
-    return mmap(addr, len, prot, df, fd, off);   // PROT_* values match on both sides
+    void *p = mmap(addr, len, prot, df, fd, off); // PROT_* match on both sides
+    // __builtin_return_address(0) is the GUEST here: mmap is not variadic, so
+    // nothing of ours sits between this frame and the caller's.
+    if (kl_file_watch && p != MAP_FAILED && fd >= 0)
+        kl_file_watch("mmap", NULL, fd, p, len, (long long)off,
+                      __builtin_return_address(0));
+    return p;
 }
 
 // ...and the other half, which is how a JIT usually asks: map RW, write, then
@@ -1749,4 +1755,7 @@ int klb_madvise(void *a, size_t n, int advice) {
 void kl_fs_trace_open(const char *path, int flags, int fd) {
     (void)flags;
     kl_fs_trace("open", path, NULL, fd < 0);
+    if (kl_file_watch && fd >= 0) kl_file_watch("open", path, fd, NULL, 0, 0, NULL);
 }
+
+kl_file_watch_fn kl_file_watch;

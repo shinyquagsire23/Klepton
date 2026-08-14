@@ -28,10 +28,13 @@
 #include "../runtime/kl_opensl.h"
 #include "../runtime/kl_ovrp.h"
 #include "../runtime/kl_ovrplat.h"
+#include "../runtime/kl_openxr.h"
 #include "../runtime/kl_view.h"
 #include "../runtime/kl_sample.h"
 #include "../runtime/kl_mprobe.h"
+#include "../runtime/kl_metadump.h"
 #include "../runtime/kl_il2cpp.h"
+#include "../runtime/kl_guestpoke.h"
 #include "../runtime/kl_fault.h"
 #include "../runtime/kl_target.h"
 #include "../tests/t_mtl_provider.h"
@@ -63,6 +66,10 @@ static int fail(const char *msg) { fprintf(stderr, "FAIL: %s\n", msg); return 1;
 static void install_fault_reporter(void) {
     kl_fault_add_reporter(kl_sample_stop_report);
     kl_fault_install();
+    // After kl_fault_install, deliberately: the watch chains to whatever it
+    // finds on SIGSEGV/SIGBUS, so a real crash still reaches the reporter.
+    kl_fault_add_reporter(kl_metadump_watch_report);
+    kl_metadump_watch_install();
 }
 
 // The entitlement refusal in kl_ovrplat.c is a policy guard, and Beat Saber does
@@ -202,218 +209,21 @@ static int check_drm_guard(void) {
 // RETURNS instead of _exit(0) — the guest is a spawned thread in that mode and
 // the reports belong to the main thread after the join.
 static volatile int g_view_quit;
-// ---------------------------------------------------------------------------
-// Guest-shape probes.
-//
-// Anything derived by reverse engineering ONE libunity build has to say which
-// build it was derived from, or it silently becomes a wild pointer against the
-// next one. Beat Saber 1.6.0 (Unity 2018.4.4f1) is 15.7 MB where the 2019.4
-// build is 17 MB, so every measured offset in this file moved -- the
-// texture-unit cap poke below read a garbage pointer and took the whole
-// lifecycle down with SIGSEGV in OUR code, which reads like a shim bug rather
-// than like a constant that expired.
-
-// Matches 20NN.N[N].N[N]<a|b|f|p>N... at b+i, and returns the length of the
-// match, or 0. `want_rev` additionally requires the '_<revision>' suffix that
-// makes a stamp the build's own rather than a version merely mentioned.
-static size_t unity_version_at(const char *b, size_t n, size_t i, int want_rev) {
-    if (i + 10 >= n) return 0;
-    if (b[i] != '2' || b[i + 1] != '0') return 0;
-    size_t j = i + 2;
-    if (!isdigit((unsigned char)b[j]) || !isdigit((unsigned char)b[j + 1])) return 0;
-    j += 2;
-    if (j >= n || b[j] != '.') return 0;
-    j++;
-    size_t d0 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
-    if (j == d0 || j >= n || b[j] != '.') return 0;
-    j++;
-    size_t d1 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
-    if (j == d1 || j >= n) return 0;
-    if (b[j] != 'f' && b[j] != 'p' && b[j] != 'a' && b[j] != 'b') return 0;
-    j++;
-    size_t d2 = j; while (j < n && isdigit((unsigned char)b[j])) j++;
-    if (j == d2 || j >= n) return 0;
-    size_t vlen = j - i;                       // the version, without any suffix
-    if (!want_rev) return b[j] == '\0' ? vlen : 0;
-    // The build stamp: '_' then hex revision digits, then the NUL.
-    if (b[j] != '_') return 0;
-    j++;
-    size_t r0 = j;
-    while (j < n && isxdigit((unsigned char)b[j])) j++;
-    if (j - r0 < 8 || j >= n || b[j] != '\0') return 0;
-    return vlen;
-}
-
-// Unity stamps its own version into libunity as a plain NUL-terminated string.
-// libunity is stripped of everything useful -- 292 dynamic symbols and not one
-// GfxDevice among them -- so scanning for the stamp is the only version signal
-// available without a symbol table. One linear pass over the mapped image, once,
-// at pump start.
-//
-// **A bare version string is not necessarily this build's version.** Beat Saber
-// 1.40's libunity is Unity 2022.3.33f1 and also contains the literal
-// "2018.3.0a1" at a LOWER address, so taking the first match reported the guest
-// as an eight-year-old alpha. That is a wrong answer that looks like a right one,
-// and everything keyed on the version inherits it.
-//
-// So the canonical BUILD STAMP is preferred: Unity writes the version with its
-// source revision attached ("2022.3.33f1_b2c853adf198"), and a version that
-// carries a revision is one this binary was built from rather than one it merely
-// mentions. The bare-string scan stays as the fallback, so a guest whose libunity
-// has no stamped revision behaves exactly as it did before.
-static const char *unity_version(void) {
-    static char ver[32];
-    static int done;
-    if (done) return ver[0] ? ver : NULL;
-    done = 1;
-    kl_image *u = kl_find_image("libunity.so");
-    if (!u) return NULL;
-    const char *b = (const char *)kl_base(u);
-    size_t n = kl_span(u);
-    for (int want_rev = 1; want_rev >= 0; want_rev--) {
-        for (size_t i = 0; i + 10 < n; i++) {
-            size_t len = unity_version_at(b, n, i, want_rev);
-            if (!len || len >= sizeof ver) continue;
-            memcpy(ver, b + i, len);
-            ver[len] = 0;
-            return ver;
-        }
-    }
-    return NULL;
-}
-
-// Is [p, p+len) actually mapped? mincore reports ENOMEM for a range that is
-// not, which is the cheapest honest test that does not need Mach. Used to stop
-// a stale measured offset from being dereferenced rather than to prove it is
-// the RIGHT object -- that is what the version gate is for.
-static int addr_mapped(const void *p, size_t len) {
-    if (!p) return 0;
-    long pg = sysconf(_SC_PAGESIZE);
-    if (pg <= 0) return 0;
-    uintptr_t a   = (uintptr_t)p & ~((uintptr_t)pg - 1);
-    uintptr_t end = ((uintptr_t)p + len + (uintptr_t)pg - 1) & ~((uintptr_t)pg - 1);
-    size_t pages  = (size_t)((end - a) / (uintptr_t)pg);
-    char vec[16];
-    if (pages == 0 || pages > sizeof vec) return 0;
-    return mincore((void *)a, (size_t)(end - a), vec) == 0;
-}
-
-// libunity's texture-unit cap, direct from the horse's mouth: a singleton getter
-// returns *(base + <singleton>), and GfxDeviceGLES's SetTexture rejects units
-// >= *(singleton + <field>) with "OpenGL Error: Invalid texture unit!".
-// Unity defaults it to 32 without ever querying GL, while its HLSLCC-baked
-// sampler bindings reach unit 35 on the post passes -- so the reject preempted
-// the binds and the samplers read stale unit-0 textures.
-//
-// **How to measure a new row**, because it is the same four commands every time
-// and each one is checkable:
-//   1. `strings -a -t x libunity.so | grep 'Invalid texture unit'`  -> the string
-//   2. `tools/gxref.py libunity.so --to=<that offset>`              -> who builds it
-//   3. disassemble backwards from there to the guard: `bl <getter> / ldr wN,
-//      [x0, #<field>] / cmp / b.ls <the string's block>`            -> the FIELD
-//   4. disassemble <getter>: `adrp x8, <page> / ldr x0, [x8, #<lo>]`-> the SINGLETON
-// Both numbers are then vaddrs in that library and nothing else has to be taken
-// on faith.
-//
-// BOTH offsets are per-Unity-build and meaningless against any other, so the
-// version is a GATE and not a comment. A title whose version is not listed is
-// left alone and told so by name: skipping costs at worst the stale-texture
-// artifact this works around, while poking costs a 4-byte store through a
-// garbage pointer, which is unrecoverable and lands nowhere near the cause.
-//
-// TODO: DELETE THIS. It is a store into a reverse-engineered field of a private
-// engine object, and it cannot be made to generalise -- there is no symbol to
-// find it by (libunity is stripped) and the offset moves with every Unity
-// build, so the version table can only ever grow one painful measurement at a
-// time. It exists to work around Unity capping texture units at 32 without
-// asking GL, while its own baked sampler bindings reach unit 35. The real fixes
-// are upstream of it and either one retires this outright:
-//   - have the guest ask, and answer honestly: find why libunity never queries
-//     GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS here and make the query happen, or
-//   - handle it where the reject is observed: GfxDeviceGLES refuses the bind
-//     and logs "Invalid texture unit!", which kl_glfb can see -- remapping the
-//     out-of-range unit at bind time needs no offset into anything.
-// Until then it is OFF for every guest but the ones it was measured on, which is
-// the only honest state for a constant nobody can verify.
-//
-// One row per measured (Unity version prefix, singleton vaddr, cap field offset).
-struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; };
-static const struct poke_cap_row k_poke_caps[] = {
-    // Unity 2019.4 — Beat Saber 1.28/1.6.0, the long-standing reference build.
-    // Getter 0x313710 serves *(base + 0x122e340); cap at +0xe8.
-    { "2019.4", 0x122e340, 0xe8 },
-    // Unity 2022.3 — Beat Saber 1.40 (2026-08-12). Measured by the recipe above:
-    //   0x14b20b  "OpenGL Error: Invalid texture unit!"
-    //   0xbd29b8  bl 0x6420f0            ; the singleton getter
-    //   0xbd29bc  ldr w8, [x0, #0xec]    ; the cap
-    //   0xbd29c0  cmp w8, w22 / b.ls     ; reject units >= cap
-    //   0x6420f0  adrp x8, 0x13d7000 / ldr x0, [x8, #0xcc0]
-    // The version string is why this row is keyed on 2022.3 and not on the
-    // "2018.3.0a1" an earlier reading reported: see unity_version() — that
-    // literal is present in this same libunity and is not its version.
-    { "2022.3", 0x13d7cc0, 0xec },
-};
-#define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])
-
-static void poke_texture_unit_cap(void) {
-    const char *pv = getenv("KL_POKE_CAP");
-    int poke_n = pv ? atoi(pv) : 64;        // matches the vendored ANGLE rebuild
-    if (poke_n <= 1) return;
-
-    const char *ver = unity_version();
-    const struct poke_cap_row *row = NULL;
-    for (size_t i = 0; ver && i < POKE_NROWS; i++)
-        if (strncmp(ver, k_poke_caps[i].ver, strlen(k_poke_caps[i].ver)) == 0) {
-            row = &k_poke_caps[i];
-            break;
-        }
-    // KL_POKE_CAP is also the override for an unlisted version: asking for it
-    // explicitly is a statement that the offsets have been re-measured. It then
-    // runs against the FIRST row's offsets, and the shape checks below are what
-    // stop that from being a blind store.
-    if (!row && !pv) {
-        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — no measured offsets "
-                        "for Unity %s.\n"
-                        "         Measure libunity's GfxDeviceGLES singleton/cap for "
-                        "it (the recipe is above poke_texture_unit_cap), or set "
-                        "KL_POKE_CAP=<n> to force.\n",
-                ver ? ver : "an unknown version");
-        return;
-    }
-    if (!row) row = &k_poke_caps[0];
-    const uint32_t POKE_SINGLETON = row->singleton;
-    const uint32_t POKE_FIELD     = row->field;
-
-    kl_image *u = kl_find_image("libunity.so");
-    if (!u) return;
-    uint8_t *ub = (uint8_t *)kl_base(u);
-    if ((size_t)POKE_SINGLETON + sizeof(void *) > kl_span(u)) {
-        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — libunity is %zu bytes, "
-                        "shorter than the %#x offset.\n", kl_span(u), POKE_SINGLETON);
-        return;
-    }
-    uint8_t *singleton = *(uint8_t **)(ub + POKE_SINGLETON);
-    // Cheap shape checks behind the version gate: an aligned, mapped pointer
-    // whose field reads as a plausible unit count. Any of these failing means
-    // the offset no longer names what it used to, whatever the version says.
-    if (!singleton || ((uintptr_t)singleton & 7) ||
-        !addr_mapped(singleton + POKE_FIELD, sizeof(int32_t))) {
-        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — libunity+%#x holds %p, "
-                        "which is not a mapped aligned object.\n",
-                POKE_SINGLETON, (void *)singleton);
-        return;
-    }
-    int32_t cur = *(int32_t *)(singleton + POKE_FIELD);
-    if (cur <= 0 || cur > 4096) {
-        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — +%#x reads %d, which is "
-                        "not a texture-unit count.\n", POKE_FIELD, cur);
-        return;
-    }
-    if (cur < poke_n) {
-        fprintf(stderr, "  [poke] texture-unit cap@+%#x %d -> %d\n",
-                POKE_FIELD, cur, poke_n);
-        *(int32_t *)(singleton + POKE_FIELD) = poke_n;
-    }
+// Where this target's `global-metadata.dat` is on disk. Two instruments want it
+// — the sampler, to name managed frames, and the metadata dump, to compare what
+// is in memory against what was loaded — and they must not derive it
+// differently: a sampler resolving against one file while the dump measures
+// another is two answers about one guest.
+static const char *metadata_path(char *buf, size_t n) {
+    const char *menv = getenv("KL_IL2CPP_METADATA");
+    if (menv) { snprintf(buf, n, "%s", menv); return buf; }
+    // <apk>/lib/arm64-v8a -> <apk>/assets/bin/Data/Managed/...
+    snprintf(buf, n, "%s", LIBDIR);
+    char *tail = strstr(buf, "/lib/");
+    if (tail) *tail = 0;
+    snprintf(buf + strlen(buf), n - strlen(buf),
+             "/assets/bin/Data/Managed/Metadata/global-metadata.dat");
+    return buf;
 }
 
 static int recon_run(int view_pump) {
@@ -551,12 +361,23 @@ static int recon_run(int view_pump) {
         unsigned frames = fenv ? (unsigned)strtoul(fenv, NULL, 10) : 0;
         if (frames || view_pump) {
             void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
-            // Default is poke 64, matching the vendored ANGLE rebuild
-            // (kMaxShaderSamplers=32, combined 64); KL_POKE_CAP=<n> overrides
-            // and forces it on an unlisted Unity version, KL_POKE_CAP_OFF=1
-            // leaves it alone entirely.
-            if (getenv("KL_POKE_CAP") || !getenv("KL_POKE_CAP_OFF"))
-                poke_texture_unit_cap();
+            kl_guest_poke_texture_unit_cap();
+            // Here rather than earlier because it wants il2cpp_init to have
+            // decrypted the tables, and it is a scan of live memory — the guest
+            // is between frames at this point, which is the quietest the heap
+            // gets. It does nothing unless KL_DUMP_METADATA names a file.
+            //
+            // KL_DUMP_METADATA_AT=end moves it to after the pump instead, for a
+            // loader that decrypts LAZILY: at init only whatever
+            // MetadataCache::Initialize touched is plaintext, and the tables the
+            // game reaches for while it runs are not. `init` stays the default
+            // because a guest that dies in the pump still gets a dump.
+            const char *mdat = getenv("KL_DUMP_METADATA_AT");
+            int md_late = mdat && !strcmp(mdat, "end");
+            if (!md_late) {
+                char meta[1024];
+                kl_metadump_run(metadata_path(meta, sizeof meta));
+            }
             if (view_pump)
                 printf("\n=== recon: pumping frames until the viewer closes ===\n");
             else
@@ -573,19 +394,8 @@ static int recon_run(int view_pump) {
             int sampling = 0;
             if (senv) {
                 char meta[1024];
-                const char *menv = getenv("KL_IL2CPP_METADATA");
-                if (menv) {
-                    snprintf(meta, sizeof meta, "%s", menv);
-                } else {
-                    // <apk>/lib/arm64-v8a -> <apk>/assets/bin/Data/Managed/...
-                    snprintf(meta, sizeof meta, "%s", LIBDIR);
-                    char *tail = strstr(meta, "/lib/");
-                    if (tail) *tail = 0;
-                    snprintf(meta + strlen(meta), sizeof meta - strlen(meta),
-                             "/assets/bin/Data/Managed/Metadata/global-metadata.dat");
-                }
-                sampling = kl_sample_start(
-                    (unsigned)strtoul(senv, NULL, 10), meta);
+                sampling = kl_sample_start((unsigned)strtoul(senv, NULL, 10),
+                                           metadata_path(meta, sizeof meta));
             }
             const long frame_ns = 1000000000L / 72;
             unsigned haptic_pulses = 0;
@@ -651,6 +461,10 @@ static int recon_run(int view_pump) {
             alarm(0);
             if (sampling) kl_sample_stop_report(stdout);
             printf("  pumped %u frames\n", i);
+            if (md_late) {
+                char meta[1024];
+                kl_metadump_run(metadata_path(meta, sizeof meta));
+            }
             if (haptic_pulses)
                 printf("  haptic pulses drained: %u (nothing to play them on "
                        "here — see kl_ovrp.h)\n", haptic_pulses);
@@ -717,6 +531,8 @@ static int recon_run(int view_pump) {
     kl_opensl_report(stdout);
     kl_ovrp_report(stdout);
     kl_ovrplat_report(stdout);
+    kl_openxr_report(stdout);
+    kl_metadump_watch_report(stdout);
     kl_madv_report();
     kl_mem_report();
     fflush(NULL);   // _exit does not flush stdio, and the report is the point
@@ -806,6 +622,8 @@ static int view_run(void) {
     kl_opensl_report(stdout);
     kl_ovrp_report(stdout);
     kl_ovrplat_report(stdout);
+    kl_openxr_report(stdout);
+    kl_metadump_watch_report(stdout);
     kl_madv_report();
     kl_mem_report();
     return rc;

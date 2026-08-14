@@ -83,6 +83,13 @@ void kl_glfb_report_formats(void);
 // loads. A no-op unless KL_GL_CENSUS is set; safe to call at any time.
 void kl_glfb_gl_census(FILE *f);
 
+// Where the guest's draws actually landed: one row per (framebuffer, thread),
+// with the colour attachment the framebuffer last carried. Always collected,
+// and the first thing to read when a picture is missing — "the eye texture is
+// black" and "the guest never drew into the eye texture" are the same symptom
+// and completely different work.
+void kl_glfb_draw_census(FILE *f);
+
 // The eye-texture seam, texture identity out. kl_ovrp's SetupEyeTexture2 calls
 // this with the GL texture name Unity handed down; the capture finds "the
 // framebuffer with the picture" by looking for the FBO whose color attachment
@@ -238,6 +245,32 @@ void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice);
 // frees.
 void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
                                   int w, int h);
+
+// Copy one array LAYER of a guest-owned texture into a provider-backed 2D eye
+// texture, and return 1 if (eye, stage) now holds that picture.
+//
+// This is the ARRAY swapchain's way onto the compositor, and it exists because
+// the zero-copy route cannot serve one. `kl_glfb_bind_eye_mtl_texture` re-points
+// the guest's own GL name at an MTLTexture, which needs the name to be a
+// GL_TEXTURE_2D: ANGLE's Metal backend reduces every EGLImage sibling to a slice
+// view (`TextureImageSiblingMtl::initImpl`), so an EGLImage is always 2D and a
+// GL_TEXTURE_2D_ARRAY has nothing to bind to. A Unity OpenXR guest asks for a
+// 2-slice swapchain and renders BOTH eyes into it — so on that path the choice
+// is a copy or a black display, and it was a black display (notes/VRCHAT.md §7).
+//
+// The copy is one blit per eye per frame into storage the compositor already
+// owns, so nothing about the compositor, the reprojection pass or the frame
+// record changes: the destination is the same provider slice `SetupEyeTexture2`
+// would have handed a Unity/OVRPlugin guest. `stage` should be the swapchain
+// image the guest just presented, so that the destinations rotate exactly as the
+// guest's own images do — a single destination would be blitted into while the
+// compositor is sampling it.
+//
+// `src_layer` is -1 for a plain 2D source. Returns 0 with a named reason if
+// there is no provider, no interop, or the blit failed; the caller then has an
+// eye the compositor cannot sample, which is the state this replaces.
+int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer,
+                             int w, int h, uint32_t internal_fmt);
 
 // Which way up is the picture in (eye, stage)? 1 = row 0 is the TOP of the
 // image, 0 = row 0 is the bottom.

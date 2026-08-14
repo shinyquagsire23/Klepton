@@ -1712,7 +1712,17 @@ static const kl_entry g_shim[] = {
     E("__klepton_unresolved", kl_unresolved),
 };
 
+// Tier 0: a diagnostic's own answer, consulted before everything else and NULL
+// unless something host-only installs one. It exists because an instrument that
+// has to see a libc call the guest makes has no other door — the generated table
+// forwards `read` straight to Darwin's, and adding a permanent wrapper to the
+// shim for the sake of one investigation is how a diagnostic becomes a tax on
+// every guest. A lookup is not on any hot path; a call through the answer is
+// the diagnostic's own business.
+void *(*kl_shim_override)(const char *name);
+
 void *kl_shim_lookup(const char *name) {
+    if (kl_shim_override) { void *o = kl_shim_override(name); if (o) return o; }
     for (size_t i = 0; i < sizeof g_shim / sizeof g_shim[0]; i++)
         if (strcmp(g_shim[i].name, name) == 0) return g_shim[i].fn;
     // Tier 4: the NDK surface (M3) lives in its own table — it is a different

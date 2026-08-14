@@ -1591,6 +1591,12 @@ static uint8_t klj_GetStaticBooleanField(void *e, void *c, void *f){ (void)e; re
 static uint8_t klj_GetBooleanField(void *e, void *o, void *f)      { (void)e; return (uint8_t)klj_field_value(o, f, 'Z').j; }
 static float   klj_GetStaticFloatField(void *e, void *c, void *f)  { (void)e; return (float)klj_field_value(c, f, 'F').d; }
 static float   klj_GetFloatField(void *e, void *o, void *f)        { (void)e; return (float)klj_field_value(o, f, 'F').d; }
+// The long pair. SetLongField has been here since the Handler work and its
+// reader was missing, which is the asymmetry that gets found by a guest writing
+// a handle into its own Java object and reading it back — VRChat does, 35
+// frames in.
+static int64_t klj_GetStaticLongField(void *e, void *c, void *f)   { (void)e; return (int64_t)klj_field_value(c, f, 'J').j; }
+static int64_t klj_GetLongField(void *e, void *o, void *f)         { (void)e; return (int64_t)klj_field_value(o, f, 'J').j; }
 
 // Documented Android platform constants — fixed values, not choices.
 #define KLJ_FSTR(c, n, v)     {.cls = c, .name = n, .sig = "Ljava/lang/String;", .sval = v}
@@ -5559,6 +5565,39 @@ static klj_val klj_Sentry_close(void *env, void *self, const klj_val *a, int n) 
     return (klj_val){0};
 }
 
+// ---- JavaBroadcastReceiver: a subscription to a bus with no publisher ----
+//
+// Unity's helper builds an IntentFilter out of the action names it is given,
+// calls Context.registerReceiver with itself, and remembers the interface to
+// forward to. Its own onReceive is only ever called BY THE SYSTEM — nothing in
+// the guest or in this shim can deliver a broadcast, because there is no
+// Android framework here sending them.
+//
+// So this accepts and does nothing observable, and that is the honest answer
+// rather than a stub: a registration whose delivery path does not exist has no
+// effect to model. What it must not do is fail, because the caller treats
+// registration as unconditional. The actions are NAMED once, because that list
+// is the only statement of what the guest expected to hear about — if a title
+// ever depends on one arriving, this line is where the work starts.
+static klj_val klj_JavaBroadcastReceiver_setReceiver(void *env, void *self,
+                                                     const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n >= 3) {
+        klj_array *acts = klj_arr(a[2].l);
+        char buf[256]; buf[0] = 0;
+        if (acts && acts->kind == 'L')
+            for (int i = 0; i < acts->len; i++) {
+                const char *s = klj_str(((void **)acts->data)[i]);
+                if (!s) continue;
+                if (buf[0]) strlcat(buf, " ", sizeof buf);
+                strlcat(buf, s, sizeof buf);
+            }
+        KLJ_LOG("JavaBroadcastReceiver.setReceiver: registered for [%s] — nothing "
+                "here broadcasts, so no onReceive can ever arrive", buf);
+    }
+    return (klj_val){0};
+}
+
 // ---- HFPStatus: the Bluetooth hands-free profile, which is not here ----
 //
 // com/unity3d/player/HFPStatus manages a Bluetooth SCO link so a headset's
@@ -8226,6 +8265,9 @@ static const klj_binding g_bindings[] = {
     {"android/hardware/SensorManager", "getDefaultSensor",
      "(I)Landroid/hardware/Sensor;",              klj_SensorManager_getDefaultSensor},
     {"io/sentry/Sentry", "close", "()V", klj_Sentry_close},
+    {"com/unity3d/player/JavaBroadcastReceiver", "setReceiver",
+     "(Landroid/content/Context;Lcom/unity3d/player/JavaBroadcastReceiverInterface;"
+     "[Ljava/lang/String;)V", klj_JavaBroadcastReceiver_setReceiver},
     {"com/unity3d/player/HFPStatus", "clearHFPStat",   "()V",  klj_HFP_clear},
     {"com/unity3d/player/HFPStatus", "getHFPStat",     "()Z",  klj_HFP_get},
     {"com/unity3d/player/HFPStatus", "requestHFPStat", "()V",  klj_HFP_request},
@@ -8816,6 +8858,8 @@ static void klj_build_tables(void) {
     ENV(GetBooleanField,       klj_GetBooleanField);
     ENV(GetStaticFloatField,   klj_GetStaticFloatField);
     ENV(GetFloatField,         klj_GetFloatField);
+    ENV(GetStaticLongField,    klj_GetStaticLongField);
+    ENV(GetLongField,          klj_GetLongField);
     ENV(SetObjectField,        klj_SetObjectField);
     ENV(SetIntField,           klj_SetIntField);
     ENV(SetLongField,          klj_SetLongField);

@@ -101,7 +101,11 @@ answers GL and kl_glfb never initializes.
 - `KL_GLFB_TRACE_TEX=1` — log every `glTexParameteri`/`glTexStorage*`/
   `glTexSubImage2D` call with arguments and a sequence number.
 - `KL_GLFB_TRACE_FBO=1` — log the FBO lifecycle (`glGenFramebuffers`,
-  `glBindFramebuffer`, `glFramebufferTexture2D`) with thread ids.
+  `glBindFramebuffer`, `glFramebufferTexture2D`, `glFramebufferTextureLayer`)
+  with thread ids, the attached texture's size and format, and — for binds —
+  **the guest's own call site** as `<image>+0x<off>`. That last part is what
+  separates two binds issued by one helper from two issued by two, which the
+  arguments alone cannot say.
 - `KL_GL_CENSUS=<swaps>` — the GL object census, printed every N
   `eglSwapBuffers`, at every eye-swapchain rebuild, and once in the exit
   report. Per class (textures, framebuffers, renderbuffers, buffers, vertex
@@ -134,7 +138,41 @@ answers GL and kl_glfb never initializes.
   after each `glBlitFramebuffer`, and put `glClear`/`glClearColor`/
   `glInvalidateFramebuffer`/renderbuffer-storage on the same timeline as the
   draws (one line each, FBO/program/viewport/texture named). The instrument
-  that answered "draws lit, blit reads black".
+  that answered "draws lit, blit reads black". Each `glClear` also reports the
+  five pieces of state that make a clear write nothing without raising
+  anything — framebuffer completeness, scissor box, colour write mask,
+  rasterizer discard and `DRAW_BUFFER0` — plus the clear value as GL holds it.
+- `KL_GLFB_CLEAR_PROBE_N=<n>` — which `glClear` (under `KL_GLFB_BLIT_PROBE`)
+  gets read straight back, default 200. **Not the first**: a run's first clear
+  happens before the guest has ever called `glClearColor`, so it reports GL's
+  own `(0,0,0,1)` and an opaque black that is entirely correct.
+- `KL_GLFB_CLEAR_CONTROL=1` — **destructive**, and that is the point: at the
+  same clear, clear the guest's framebuffer to magenta ourselves and read it
+  straight back. If ours reads back and the guest's does not, the readback path
+  is sound and the guest's clear is being lost; if neither does, the instrument
+  is the liar. Costs one corrupted frame.
+- `KL_GLFB_PROBE_TEX=<name>` — read texture `<name>` back at array layers 0
+  AND 1 at every `glBlitFramebuffer` (needs `KL_GLFB_BLIT_PROBE`). A guest that
+  renders into its own target and copies from it has two failures with one
+  symptom — "nothing was drawn" and "the copy read the wrong source" — and
+  probing only the blit's own source cannot separate them, because the source
+  is whatever the guest bound. This is what found VRChat's eye array lit while
+  every blit read black. Layer 1 of a non-array texture answers `incomplete`.
+- `KL_GLFB_READ_ATTACH_FIX=0` — the A/B for the eye-copy repair, ON by default.
+  VRChat's Unity attaches its blit source with
+  `glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, …)` while the read
+  framebuffer is 0, which is `GL_INVALID_OPERATION` (the default framebuffer
+  cannot take an attachment) — so the attach is dropped, the blit reads the
+  window, and the eye receives black. The attach STATES its source completely,
+  so the same attachment is carried on a framebuffer of ours and bound as READ;
+  the guest's next read bind takes it away. `=0` restores the failing
+  configuration. See notes/VRCHAT.md §4.
+- `KL_GLFB_BLIT_READ_FIX=1` — an earlier EXPERIMENT, off by default, kept
+  because it is the measurement that pointed at the read binding at all: it
+  substitutes the framebuffer the guest was drawing into immediately before.
+  `KL_GLFB_READ_ATTACH_FIX` supersedes it and is the one to use — this
+  substitutes a framebuffer WE chose, that one carries the attachment the
+  GUEST named.
 - `KL_GLFB_NO_INVALIDATE=1` — don't forward `glInvalidateFramebuffer`.
   ANGLE/Metal actually discards (memoryless attachments), so this tests
   whether an invalidate is the eraser. Diagnostic only.
@@ -320,6 +358,31 @@ Built for the loading-pace investigation; all default off.
 - `KL_TRACE_IMAGES=1` — per-image base/span; needed to turn a guest pc into a
   file offset (`pc - image base`, e.g. the connect-NULL site at
   libunity+0x966964).
+
+## Guest patches (`runtime/kl_guestpatch.c`)
+
+Measured one-instruction rewrites of a guest image, applied at load while it is
+still writable. There are two, both VRChat's, and both are named in the log
+every time they fire — see `notes/VRCHAT.md` §Session 8 for how each was found
+and why nothing outside the binary could answer it.
+
+- `KL_GUEST_PATCH=0` — apply none of them. The A/B for every row: with it VRChat
+  stops on its "Under Construction" screen exactly as it did before.
+- `KL_GUEST_PATCH_OFF=<name>[,<name>]` — turn off one by name. The names are
+  `vrchat-under-construction` and `vrchat-min-client-version`; the second is
+  the one to reach for, because it is a real version check against VRChat's own
+  API (the tree's APK is build 1862 and the service asks for 1865) and the
+  honest fix for it is a newer APK, not a patch.
+- `KL_TRACE_PATCH=1` — print each word: address, the value that was there, the
+  value written, and what the new instruction is. Also prints the rows that were
+  considered and left alone because the address is past the end of the image,
+  which is the ordinary answer for every other guest's `libil2cpp.so`.
+
+A row is skipped, loudly and by name, when the word at its address is not the
+word it was measured against — that is a build fingerprint, so these cannot
+corrupt an APK they were not measured on. **Not yet wired for device**: a
+klepton-ld dylib's text is signed and cannot be written at run time, so a device
+run currently behaves as `KL_GUEST_PATCH=0`.
 
 ## Memory: decommit, budget and pressure (`runtime/kl_libc.c`)
 
@@ -610,6 +673,103 @@ behind "no controllers render". Diagnostic only, off unless asked for.
 pointer id −1 (the mouse), while this title's `VRInputModule` uses its own id.
 It is a blind detector, not evidence that the ray misses.
 
+## IL2CPP metadata dump (`runtime/kl_metadump.c`)
+
+Writes the guest's **decrypted** `global-metadata.dat` out of its own memory
+after `il2cpp_init`. Built for VRChat, whose file is protected — it begins
+`0xad6b5f05` instead of IL2CPP's `0xFAB11BAF`, the string table is plaintext and
+the index tables are not — and whose embedding API is name-mangled, so
+`kl_mprobe` cannot attach either. Diagnostic only, host-only, does nothing
+unless asked.
+
+- `KL_DUMP_METADATA=<path>` — turn it on and name the output file. Scans this
+  process for the blob and writes the first candidate. Three searches, and the
+  reason there are three is that each one alone can be defeated:
+  - **IL2CPP's own magic** `0xFAB11BAF`, validated by *measuring* the header —
+    the first table's offset is the header's length and therefore the pair
+    count, every non-empty table must lie inside the blob, and the furthest
+    reach is the total. A bare four-byte match in a multi-gigabyte process is a
+    coincidence waiting to be written out as a dump.
+  - **the guest's own on-disk magic**, whose header cannot be measured (the
+    pairs are ciphertext), so the file's length is the extent and
+    `klmd_compare_disk` supplies the evidence: a copy BYTE-IDENTICAL to the file
+    is the ciphertext where it was read, not a decrypted one, and it says so.
+  - **the header's SHAPE with no magic at all**, for a loader that decrypted the
+    tables without putting the sanity value back. Accepted only if the tables
+    reach **exactly** the file's length. The weaker version of this test was
+    tried and measured: accepting any pair-structured header whose version word
+    reads 16..40 produced **more than thirty** hits in one VRChat run and wrote
+    116 MB of something else out as the answer. Pair-structured data is common;
+    the length equality is the only discriminator that holds.
+- `KL_DUMP_METADATA_AT=init|end` — when to scan (default `init`, just before the
+  frame pump). `end` scans after the pump instead, for a loader that decrypts
+  **lazily**: at init only what `MetadataCache::Initialize` touched is plaintext.
+  `init` is the default because a guest that dies in the pump still gets a dump.
+- `KL_DUMP_METADATA_RO=1` — also scan read-only regions. Off by default because
+  a decrypted blob is written, so it is in writable memory, and the default
+  keeps the scan off every library mapping.
+- `KL_DUMP_METADATA_SRC=<path>` — the on-disk `global-metadata.dat` to compare
+  against, overriding the target's own.
+
+The scan only ever touches **resident** pages (`mincore`, cached per page) and
+skips to the next page rather than the next word when one is cold. That is not
+an optimisation: a word read out of a cold anonymous page faults it in, so a
+naive walk of a reserved range does not merely take forever, it allocates it —
+an instrument whose cost is the guest's own footprint.
+
+**Measured on VRChat and recorded so it is not re-run**: after 250 frames, over
+**6.8 GB** of resident memory, read and write, there is no `0xFAB11BAF`
+anywhere, no header shape reaching the file's length, and exactly two copies of
+the blob — both **byte-identical to the file**. This title never materialises a
+plaintext metadata image, so the plan of "dump it after init and feed
+Il2CppDumper" does not work here. The instrument stays because it is general and
+the answer for the next target is one run.
+
+**And the conclusion drawn from that was wrong in an interesting way.** "No
+plaintext image" is true; "so it must be decrypted per access" is not. VRChat
+decrypts the file exactly once, into **eight separate heap buffers**, so no
+contiguous copy of it ever exists and there is nothing for a scan to find. The
+scheme itself is now reversed and lives in `tools/vrc_metadata.py` — read its
+header comment before touching any of this.
+
+### `KL_META_WATCH` — who READS the metadata
+
+The instrument that found it, and the general one: `KL_DUMP_METADATA` answers
+"is there a plaintext image?", and when the answer is no the only thing left is
+the code that does the decrypting. On this target that code cannot be found
+statically at all — `libil2cpp.so`'s runtime `.text` makes **zero** direct PLT
+calls (every import is reached indirectly) and its exported entry points are
+trampolines through a table filled at load, so neither a string xref nor a call
+graph from `open`/`mmap` has anything to walk from.
+
+It can be found dynamically, because the mapping is ours. This takes the pages
+away with `mprotect(PROT_NONE)` and lets the readers announce themselves as
+faults; the handler names the site, opens the region, and a watchdog thread
+closes it again, so one run yields a census rather than a single hit.
+
+- `KL_META_WATCH=1` — arm it. Reports the fd `global-metadata.dat` was opened
+  on, **every file-backed mmap by path** (asked of the fd with `F_GETPATH`, not
+  matched against the open trace — this guest maps the file on a *second*
+  descriptor that the open trace never sees), a stack **x-ray** at the mapping,
+  and then one line per distinct reader as `<image>+0x<off>` with the metadata
+  offset it first touched.
+- `KL_META_WATCH_MS=<ms>` — how often the watchdog re-closes the pages
+  (default 50). Smaller finds more sites and costs more faults.
+- `KL_META_WATCH_FRAMES=<n>` — how many of the early `read()`s print their
+  frames (default 3).
+
+The stack x-ray is the part worth keeping: `kl_fault_print_frames` walks x29 and
+this guest keeps no frame chain, so the ordinary instrument stops at the first
+frame — and WHO asked for the metadata is the entire question. A conservative
+scan of the stack for words pointing into a guest image prints the chain with
+some stale words mixed in, which is a checkable answer rather than no answer.
+
+Two supporting hooks exist for it and are NULL unless it installs them:
+`kl_file_watch` (guest file operations, in `kl_libc.c`) and `kl_shim_override`
+(a diagnostic's answer for a shim symbol, consulted by `kl_shim_lookup` before
+any tier — it is how the watch wraps `read` without a permanent wrapper in the
+shim). Both cost one null check on a path that is not hot.
+
 ## XR runtime / controllers (`runtime/kl_ovrp.c`)
 
 Poses live in the space the guest asked for with `ovrp_SetTrackingOriginType`.
@@ -895,12 +1055,44 @@ that reports what came due since the frontend last asked. Platform-independent
   searching for an FBO by texture name — the search read the eye at the
   window's size and produced the window, and a GL name is a slot rather than
   an identity anyway (trap 31).
+- `KL_XR_EYE_MIRROR=0` — stop copying an ARRAY eye swapchain into storage the
+  compositor can sample (`runtime/kl_openxr.c` →
+  `kl_glfb_mirror_eye_layer`), which restores the configuration in which the
+  visionOS immersive space is BLACK for a Unity OpenXR guest.
+  Every Unity OpenXR guest asks for one 2-slice swapchain and renders both eyes
+  into it, and that shape cannot be re-pointed at an MTLTexture at all:
+  `glEGLImageTargetTexture2DOES` takes only a `GL_TEXTURE_2D`, and ANGLE's Metal
+  backend reduces every EGLImage sibling to a slice view
+  (`TextureImageSiblingMtl::initImpl`), so an EGLImage is always 2D. The copy is
+  one `glBlitFramebuffer` per eye per frame, from the layer the guest presented
+  into the provider slice a Unity/OVRPlugin guest would have been handed
+  directly — so nothing downstream of the eye table changes. On by default;
+  this is the A/B for anything that costs per frame on the XR path.
+  **Foveation is refused while it is in use** and says so once: a rate map only
+  pays when the GUEST's rasterizer writes fewer fragments, and here the guest
+  renders into a swapchain of its own that carries no map, so the map could only
+  attach to the copy — squeezing a full-resolution picture on the way in and
+  stretching it back out. Measured, on the first run that composited: 2,839,242
+  lit of 5,496,000, which is the foveation ratio exactly; with the map dropped,
+  5,496,000.
 - `KL_XR_REFRESH_EXT=0` — stop advertising `XR_FB_display_refresh_rate`
   (`runtime/kl_openxr.c`), putting the runtime back to before SL-11. The A/B
   for anything that changes when the client can answer the host's rate
   question at all: without the extension the client publishes an EMPTY rate
   list, and a host told the client can present at no rate never starts sending
   video.
+- `KL_XR_EXTRA_EXTENSIONS="<name> [<name> ...]"` — append names to the
+  extension list `xrEnumerateInstanceExtensionProperties` advertises
+  (`runtime/kl_openxr.c`). **Scouting only, and a lie by construction**: an
+  extension named here has no entry points behind it, so a guest that takes us
+  up on it resolves NULL or aborts by name. It exists so that "what does this
+  guest do differently if the runtime claims X?" costs a run instead of a
+  rebuild. Each name is announced once at startup. The motivating case is
+  VRChat, which requests exactly one feature extension —
+  `XR_VALVE_frame_controller_interaction`, out of Valve's Steam Frame OpenXR
+  package — and is told by Unity's own startup diagnostic that the runtime does
+  not support it; that made it the only thing in the whole boot the guest asked
+  for and did not get, and therefore the only cheap suspect for a gate.
 
 ## Reprojection (`runtime/kl_reproject.c`)
 
@@ -1009,7 +1201,12 @@ The composite/timewarp pass — one file, compiled by both compositors
   whole eye, tone-map it, memcpy it to the sink, row-flip it, upload it.
   Measured 23.5 fps against the hardware compositor's 54.7 on the same scene,
   and it needs no Metal interop — which is what makes it the A/B when the
-  compositor shows the wrong picture.
+  compositor shows the wrong picture. **Required, not optional, for a guest
+  whose OpenXR eye swapchain is an ARRAY** (VRChat): the hardware compositor
+  samples the eye as an MTLTexture and ANGLE's Metal EGLImage is always 2D, so
+  `klxr_back_eye_images` refuses the swapchain by name and there is nothing to
+  composite. The readback path states the layer instead
+  (`kl_glfb_set_live_eye_image`) and works. See notes/VRCHAT.md §4.
 - `KL_VIEW_EYE=1` — composite the **right** eye instead of the left. The window
   shows one eye, and which one is not a detail: a guest under Oculus symmetric
   projection renders the two eyes into different sub-rects of one texture

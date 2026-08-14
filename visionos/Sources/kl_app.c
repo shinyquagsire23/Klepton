@@ -21,6 +21,7 @@
 #include "kl_mono.h"      // the flat guest's window seam — frame out, pointer in
 #include "kl_glfb.h"      // kl_glfb_release_current — the handoff hands the context on
 #include "kl_x18.h"       // trap 11 — claim TSD slot 300 before anything else can
+#include "kl_guestpoke.h" // libunity's texture-unit cap, raised before frame 1
 #include "kl_env.h"
 
 // --- Which guest ------------------------------------------------------------
@@ -879,6 +880,12 @@ int kl_app_lifecycle_begin(void) {
     }
 
     g_render = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
+    // The same place m_boot does it: the graphics device exists by now and no
+    // frame has been drawn yet. This driver did not do it at all until
+    // 2026-08-14, so on a headset libunity kept its own un-queried cap of 32,
+    // refused every bind past it, and the samplers read stale unit-0 textures —
+    // every glyph a solid block, on device only. See kl_guestpoke.c.
+    kl_guest_poke_texture_unit_cap();
     g_phase = "frame pump";
     return 0;
 }
