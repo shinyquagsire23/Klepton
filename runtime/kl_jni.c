@@ -86,6 +86,16 @@ typedef struct klj_object {
                         // PopLocalFrame must not recycle it while > 0
     const char *cls;    // interned class name
     void       *data;   // java/lang/String -> char*; java/lang/Class -> klj_class*
+    // What to do with `data` when the slot is recycled. Recorded HERE, by
+    // whoever allocated the payload, rather than switched on `cls` at recycle
+    // time — because the payload is genuinely shared in places (a Looper object
+    // and its thread's Looper are one klj_looper; see klj_myLooper), and a
+    // class-keyed destructor would double-free exactly those. An object with no
+    // destructor leaks its payload, which is what every object except a String
+    // did before this existed: the recycle freed `data` for java/lang/String
+    // and dropped everything else on the floor — a leaked byte[] is its whole
+    // length, a leaked InputStream is a whole file's contents.
+    void      (*destroy)(void *data);
 } klj_object;
 
 // The two object kinds the *host* constructs rather than merely hands back: a
@@ -159,7 +169,7 @@ static unsigned   g_nobjects;
 static unsigned g_retired[KLJ_MAX_OBJECTS];
 static unsigned g_retired_head, g_retired_tail;   // ring; head = oldest
 static unsigned g_retired_n;
-static uint64_t g_stat_alloc, g_stat_delete, g_stat_pop_freed;
+static uint64_t g_stat_alloc, g_stat_delete, g_stat_pop_freed, g_stat_freed;
 
 typedef struct klj_frame {
     struct klj_frame *parent;
@@ -183,6 +193,8 @@ static void klj_frame_record(klj_object *o) {
 // without this, that frame's pop retires the NEW occupant. Local refs are
 // thread-local in JNI, so the current thread's chain is the only place the
 // object can be listed.
+static void klj_forget_writes(void *obj);
+
 static void klj_frame_forget(klj_object *o) {
     for (klj_frame *f = t_frame; f; f = f->parent)
         for (unsigned i = 0; i < f->n; i++)
@@ -221,11 +233,12 @@ static klj_object *klj_alloc_object_locked(const char *cls, void *data) {
     if (!o) {
         if (g_nobjects == KLJ_MAX_OBJECTS) { KLJ_LOG("object pool exhausted"); kl_fatal_prepare(); abort(); }
         o = &g_objects[g_nobjects++];
-    } else if (strcmp(o->cls, KLJ_CLASS_STRING) == 0) {
+    } else {
         // The old payload dies here, after the quarantine, not at retire.
-        free(o->data);
+        if (o->destroy) { o->destroy(o->data); g_stat_freed++; }
+        klj_forget_writes(o);
     }
-    *o = (klj_object){KLJ_OBJ_MAGIC, 0, cls, data};
+    *o = (klj_object){KLJ_OBJ_MAGIC, 0, cls, data, NULL};
     g_stat_alloc++;
     klj_frame_record(o);
     return o;
@@ -234,6 +247,16 @@ static klj_object *klj_alloc_object_locked(const char *cls, void *data) {
 static klj_object *klj_as_object(void *p) {
     klj_object *o = p;
     return (o && o->magic == KLJ_OBJ_MAGIC) ? o : NULL;
+}
+
+// "This object owns its payload, and here is how to release it." Returns the
+// object so it can wrap a constructor call. Only set it where ownership is
+// unambiguous: an object with no destructor leaks its payload, which is a cost;
+// an object that shares one and claims to own it is a double free.
+static void *klj_own(void *obj, void (*destroy)(void *)) {
+    klj_object *o = klj_as_object(obj);
+    if (o) o->destroy = destroy;
+    return obj;
 }
 
 typedef struct {
@@ -319,6 +342,7 @@ void *kl_jni_new_string(const char *utf8) {
     pthread_once(&g_init_once, klj_init);
     pthread_mutex_lock(&g_lock);
     klj_object *o = klj_alloc_object_locked(KLJ_CLASS_STRING, utf8 ? strdup(utf8) : NULL);
+    o->destroy = free;
     pthread_mutex_unlock(&g_lock);
     return o;
 }
@@ -339,6 +363,29 @@ void *kl_jni_native(const char *cls, const char *name, const char *sig) {
             (!sig || strcmp(g_natives[i].sig, sig) == 0))
             return g_natives[i].fn;
     return NULL;
+}
+
+// The low-memory signal. On Android the framework calls Activity.onTrimMemory /
+// onLowMemory, which reach libunity through UnityPlayer.nativeLowMemory, and
+// Unity fires Application.lowMemory — where a title runs
+// Resources.UnloadUnusedAssets() and drops its caches. Nothing here ever called
+// it, so every cache a Quest build releases under pressure was held forever, and
+// the process could only ever climb.
+//
+// The class is looked up rather than assumed: nativeLowMemory is registered
+// through RegisterNatives like the other 45, and which class declares it is the
+// natives table's answer to give. Returns 1 if the guest was told.
+int kl_jni_low_memory(void) {
+    const klj_native *n = NULL;
+    pthread_mutex_lock(&g_lock);
+    for (unsigned i = 0; i < g_nnatives; i++)
+        if (strcmp(g_natives[i].name, "nativeLowMemory") == 0) { n = &g_natives[i]; break; }
+    pthread_mutex_unlock(&g_lock);
+    if (!n) return 0;
+    // A static native is called with its declaring class as the second
+    // argument. The guest may keep it, so it is the interned jclass, not NULL.
+    ((void (*)(void *, void *))n->fn)(kl_jni_env(), kl_jni_class(n->cls));
+    return 1;
 }
 
 void kl_jni_report(FILE *out) {
@@ -911,13 +958,84 @@ static int klj_decode_args_a(const char *sig, const klj_jvalue *args, klj_val *a
 // IsInstanceOf uses, then falls back to Object. Without this, every inherited
 // method would need re-declaring against every subclass that calls it, and the
 // duplicates would be the thing that drifts.
+// Two signatures name the same method when their ARGUMENT lists agree — Java
+// has no return-type overloading, so "(...)" is the whole of a method's
+// identity within a class and the return type is redundant for dispatch.
+//
+// This is not a relaxation for its own sake. C# spells an object return
+// `Ljava/lang/Object;` whatever the method actually declares, because
+// AndroidJavaObject.Call<AndroidJavaObject>(...) builds the signature from its
+// GENERIC argument — so managed code and native code ask for the identical
+// method with different strings, and a binding table keyed on the full
+// signature answers one and refuses the other. VRChat asks for
+// getApplicationContext, getCacheDir and TimeZone.getDefault that way; the
+// alternative is a second entry per method, forever, discovered one abort at a
+// time.
+//
+// Only the return differs — the argument lists must still match exactly, so an
+// overload is never taken for its sibling. And BOTH returns must be reference
+// types: `()I` and `()Ljava/lang/Object;` have identical argument lists, and
+// matching those would marshal an int back as a jobject. The generic spelling
+// this exists for is only ever a reference, so requiring that costs nothing and
+// keeps the relaxation to exactly the case it was built for.
+//
+// Class names inside a signature are compared with '.' equal to '/' for the
+// same reason: C# builds a signature out of a .NET type name and leaves the
+// DOTS in it, so the guest asks for `(Landroid.content.Context;)V` where the
+// table declares `(Landroid/content/Context;)V`. A JNI signature never
+// legitimately contains a dot inside a class name — the format is slashes —
+// so treating them as one character is unambiguous rather than lenient.
+// VRChat asks this way for UnityPermissions.hasUserAuthorizedPermission,
+// DateFormat.is24HourFormat, ActivityManager.getMemoryInfo and its own
+// Info.setContext; each was a separate abort, and each was the same fact.
+static int klj_sig_eq_n(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        char x = a[i], y = b[i];
+        if (x == '.') x = '/';
+        if (y == '.') y = '/';
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
+static int klj_sig_eq(const char *a, const char *b) {
+    size_t la = strlen(a);
+    return la == strlen(b) && klj_sig_eq_n(a, b, la);
+}
+
+static int klj_same_args(const char *a, const char *b) {
+    const char *ea = strchr(a, ')'), *eb = strchr(b, ')');
+    if (!ea || !eb) return 0;
+    if ((ea[1] != 'L' && ea[1] != '[') || (eb[1] != 'L' && eb[1] != '[')) return 0;
+    size_t la = (size_t)(ea - a), lb = (size_t)(eb - b);
+    return la == lb && klj_sig_eq_n(a, b, la);
+}
+
 static const klj_binding *klj_find_binding(const char *cls, const char *name,
                                            const char *sig) {
-    for (const klj_binding *b = g_bindings; b->cls; b++)
-        if (strcmp(b->cls, cls) == 0 && strcmp(b->name, name) == 0 &&
-            strcmp(b->sig, sig) == 0)
-            return b;
-    return NULL;
+    const klj_binding *loose = NULL;
+    for (const klj_binding *b = g_bindings; b->cls; b++) {
+        if (strcmp(b->cls, cls) != 0 || strcmp(b->name, name) != 0) continue;
+        if (klj_sig_eq(b->sig, sig)) return b;             // exact wins outright
+        if (!loose && klj_same_args(b->sig, sig)) loose = b;
+    }
+    // Named, once per (method, signature). A loose match is the right answer
+    // for the generic-return case it exists for and a SILENT wrong answer for
+    // anything else — the call succeeds, returns something plausible and lands
+    // far away — so every one of them is on the record rather than inferred
+    // from a table nobody prints.
+    if (loose) {
+        static const char *seen[64];
+        static unsigned nseen;
+        unsigned i = 0;
+        for (; i < nseen; i++) if (seen[i] == loose->sig) break;
+        if (i == nseen && nseen < 64) {
+            seen[nseen++] = loose->sig;
+            KLJ_LOG("binding %s.%s matched on ARGUMENTS: guest asked %s, table has %s",
+                    cls, name, sig, loose->sig);
+        }
+    }
+    return loose;
 }
 
 static const klj_binding *klj_resolve_binding(const char *cls, const char *name,
@@ -1133,6 +1251,13 @@ static size_t klj_prim_size(char kind) {
     }
 }
 
+static void klj_array_free(void *p) {
+    klj_array *arr = p;
+    if (!arr) return;
+    free(arr->data);
+    free(arr);
+}
+
 static void *klj_new_array(char kind, const char *elem_cls, int len) {
     if (len < 0) len = 0;
     klj_array *arr = calloc(1, sizeof *arr);
@@ -1149,7 +1274,11 @@ static void *klj_new_array(char kind, const char *elem_cls, int len) {
     else             snprintf(cls, sizeof cls, "[%c", kind);
     void *obj = kl_jni_new_object(cls);
     klj_as_object(obj)->data = arr;
-    return obj;
+    // The element buffer is this array's, and it is the biggest single payload
+    // in the pool: a leaked byte[] is its whole length, and the guest allocates
+    // them per frame. Object arrays own only the buffer — the jobjects in it
+    // belong to the pool and are retired by their own frames.
+    return klj_own(obj, klj_array_free);
 }
 
 static klj_array *klj_arr(void *a) {
@@ -1360,6 +1489,18 @@ static klj_val klj_porterduff_clear(void);
 #define KLJ_MAX_FIELD_WRITES 128
 static struct { void *obj, *fid; klj_val v; } g_field_writes[KLJ_MAX_FIELD_WRITES];
 static unsigned g_nfield_writes;
+
+// Drop every write recorded against an object, called when its slot is
+// recycled. Two reasons, and the second is not a leak: the table is keyed on
+// the object POINTER, and a pointer is a slot rather than an identity, so
+// without this the next occupant of the slot inherits the previous one's field
+// values — a Message reading someone else's `what`. It also stops the table
+// filling, which is an abort rather than a leak (128 entries).
+static void klj_forget_writes(void *obj) {
+    for (unsigned i = 0; i < g_nfield_writes; )
+        if (g_field_writes[i].obj == obj) g_field_writes[i] = g_field_writes[--g_nfield_writes];
+        else i++;
+}
 
 static klj_val *klj_find_write(void *obj, void *fid) {
     for (unsigned i = 0; i < g_nfield_writes; i++)
@@ -1941,6 +2082,235 @@ static klj_val klj_Activity_getApplicationContext(void *env, void *self, const k
     (void)env; (void)self; (void)a; (void)n;
     static void *appctx;
     return klj_singleton("android/content/Context", &appctx);
+}
+
+// ---- time zone and clock format ----
+// Mono's TimeZoneInfo asks ICU rather than reading /usr/share/zoneinfo on
+// Android, so these are the .NET time-zone database as this guest sees it.
+//
+// The host's zone is the honest answer and it is available: tzset() fills
+// `tzname`, and TZ names it when it is set. Reporting a zone we are not in
+// would put every timestamp the guest shows an hour or more out, which is the
+// kind of wrong that looks like a bug in the guest.
+//
+// getAvailableIDs answers with the host's own zone and UTC and nothing else.
+// The full IANA list is 600 names we would be inventing from a database we do
+// not carry, and the only lookups a guest can make that we could then satisfy
+// are exactly these two: its own zone, and the one every protocol falls back
+// to. A name we do not list fails as "unknown zone", which is a real answer;
+// a name we list and then describe wrongly is not.
+static const char *klj_host_tzid(void) {
+    static char id[128];
+    if (id[0]) return id;
+    const char *tz = getenv("TZ");
+    if (tz && *tz) { snprintf(id, sizeof id, "%s", tz); return id; }
+    // /etc/localtime is a symlink into the zoneinfo tree on Darwin, and its
+    // tail IS the IANA id — tzname only carries the abbreviation ("PST"),
+    // which is not an id and cannot be looked up.
+    char buf[512];
+    ssize_t k = readlink("/etc/localtime", buf, sizeof buf - 1);
+    if (k > 0) {
+        buf[k] = '\0';
+        const char *p = strstr(buf, "zoneinfo/");
+        if (p) { snprintf(id, sizeof id, "%s", p + 9); return id; }
+    }
+    snprintf(id, sizeof id, "UTC");
+    return id;
+}
+
+static klj_val klj_TimeZone_getDefault(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *tz;
+    if (!tz) {
+        tz = kl_jni_new_object("android/icu/util/TimeZone");
+        klj_as_object(tz)->pinned = 1;
+        KLJ_LOG("TimeZone.getDefault() -> %s", klj_host_tzid());
+    }
+    return (klj_val){.l = tz};
+}
+
+static klj_val klj_TimeZone_getID(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string(klj_host_tzid())};
+}
+
+// getTimeZone(id) — the lookup the list above exists to be looked up in. Java
+// answers GMT for an id it does not know rather than throwing, and that is the
+// behaviour transcribed here: a guest asking for a zone we do not carry gets a
+// real zone with a real offset, which is what its own runtime would have given
+// it. The object is the same singleton either way, because everything anyone
+// can then ask of it comes from getID.
+static klj_val klj_TimeZone_getTimeZone(void *env, void *self, const klj_val *a, int n) {
+    const char *id = n > 0 ? klj_str(a[0].l) : NULL;
+    if (id && strcmp(id, klj_host_tzid()) != 0 && strcmp(id, "UTC") != 0 &&
+        strcmp(id, "GMT") != 0)
+        KLJ_LOG("TimeZone.getTimeZone(\"%s\"): not a zone this host carries — "
+                "answering the default, as Java does", id);
+    return klj_TimeZone_getDefault(env, self, NULL, 0);
+}
+
+// The offsets. These are a GROUP answer rather than three separate ones, and
+// deliberately so: getOffset, getRawOffset and useDaylightTime have to agree
+// with each other and with getID, and a guest that computes a local time from
+// one and checks it against another would see the disagreement rather than the
+// gap. All three come from the host's own zone database through localtime_r,
+// which is the same database getID named.
+//
+// getOffset takes UTC milliseconds and returns milliseconds INCLUDING any DST
+// in force at that instant, which is exactly tm_gmtoff at that instant.
+static klj_val klj_TimeZone_getOffset(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    time_t when = n > 0 ? (time_t)((int64_t)a[0].j / 1000) : time(NULL);
+    struct tm tm;
+    if (!localtime_r(&when, &tm)) return (klj_val){.j = 0};
+    return (klj_val){.j = (uint64_t)(int64_t)(tm.tm_gmtoff * 1000)};
+}
+
+// ...and the same without DST: January and July, and the smaller one is the
+// standard offset. Asking the database twice is how you get "what is this
+// zone's base offset" out of an API that only reports a moment.
+static void klj_tz_offsets(long *raw, int *has_dst) {
+    time_t now = time(NULL);
+    struct tm tm;
+    long a_off = 0, b_off = 0;
+    time_t jan = now - 182L * 86400, jul = now + 182L * 86400;
+    if (localtime_r(&jan, &tm)) a_off = tm.tm_gmtoff;
+    if (localtime_r(&jul, &tm)) b_off = tm.tm_gmtoff;
+    *raw     = a_off < b_off ? a_off : b_off;
+    *has_dst = a_off != b_off;
+}
+
+static klj_val klj_TimeZone_getRawOffset(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    long raw; int dst;
+    klj_tz_offsets(&raw, &dst);
+    return (klj_val){.j = (uint64_t)(int64_t)(raw * 1000)};
+}
+
+static klj_val klj_TimeZone_useDaylightTime(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    long raw; int dst;
+    klj_tz_offsets(&raw, &dst);
+    return (klj_val){.j = (uint64_t)dst};
+}
+
+// getDisplayName(daylight, style). The host has abbreviations and not long
+// names: tzname[] is "PST"/"PDT" and there is no "Pacific Standard Time"
+// anywhere in libc. So SHORT gets the abbreviation and LONG gets the id, which
+// is a name the guest can round-trip through getTimeZone rather than a phrase
+// it can only print. Style is ICU's: 1 is SHORT, everything else reads as long.
+static klj_val klj_TimeZone_getDisplayName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int daylight = n > 0 ? (int)a[0].j : 0;
+    int style    = n > 1 ? (int)a[1].j : 0;
+    tzset();
+    const char *abbr = tzname[daylight && tzname[1] && tzname[1][0] ? 1 : 0];
+    return (klj_val){.l = kl_jni_new_string(style == 1 && abbr && *abbr
+                                            ? abbr : klj_host_tzid())};
+}
+
+// How much DST adds when it is in force — the difference between the two
+// samples klj_tz_offsets already takes, so it cannot disagree with
+// useDaylightTime or with getOffset in July.
+static klj_val klj_TimeZone_getDSTSavings(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    time_t now = time(NULL);
+    struct tm tm;
+    long lo = 0, hi = 0;
+    time_t jan = now - 182L * 86400, jul = now + 182L * 86400;
+    if (localtime_r(&jan, &tm)) lo = tm.tm_gmtoff;
+    if (localtime_r(&jul, &tm)) hi = tm.tm_gmtoff;
+    long d = hi > lo ? hi - lo : lo - hi;
+    return (klj_val){.j = (uint64_t)(int64_t)(d * 1000)};
+}
+
+static klj_val klj_TimeZone_getAvailableIDs(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    const char *host = klj_host_tzid();
+    int utc = strcmp(host, "UTC") == 0;
+    void *arr = klj_new_array('L', KLJ_CLASS_STRING, utc ? 1 : 2);
+    void **d = klj_arr(arr)->data;
+    d[0] = kl_jni_new_string(host);
+    if (!utc) d[1] = kl_jni_new_string("UTC");
+    KLJ_LOG("TimeZone.getAvailableIDs() -> %s%s", host, utc ? "" : " + UTC");
+    return (klj_val){.l = arr};
+}
+
+// Android reads Settings.System.TIME_12_24; there is no such setting here, so
+// it comes from the host's locale — strftime's own %X for an unambiguous hour.
+// Picking one would be a guess, and this is the same question asked of the
+// machine actually running.
+static klj_val klj_DateFormat_is24HourFormat(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int cached = -1;
+    if (cached < 0) {
+        struct tm tm = {0};
+        tm.tm_hour = 13; tm.tm_min = 0; tm.tm_mday = 1; tm.tm_year = 100;
+        char buf[64] = {0};
+        strftime(buf, sizeof buf, "%X", &tm);
+        cached = !(strstr(buf, "PM") || strstr(buf, "pm") || strchr(buf, '\xef'));
+        KLJ_LOG("DateFormat.is24HourFormat() -> %d (the host formats 13:00 as \"%s\")",
+                cached, buf);
+    }
+    return (klj_val){.j = (uint64_t)cached};
+}
+
+// ActivityManager.getMemoryInfo(MemoryInfo) — Android's other memory question,
+// and the one a title asks when it wants to size a cache or decide whether to
+// drop one. It fills the caller's object in place, so the answers go through
+// the same per-object write table an ordinary Set*Field would use and the
+// guest reads them back by the ordinary path.
+//
+// Every number comes from kl_mem_* — the SAME budget /proc/meminfo reports and
+// the same footprint the low-memory notification fires on. Two sources here
+// would be two answers to one question: a guest that reads `availMem` and then
+// polls /proc would see them disagree, and `lowMemory` would say no while the
+// notification said yes. `threshold` is the level at which Android would start
+// killing background processes, which here is exactly KL_LOWMEM_AT.
+static klj_val klj_ActivityManager_getMemoryInfo(void *env, void *self,
+                                                 const klj_val *a, int n) {
+    (void)env; (void)self;
+    void *mi = n > 0 ? a[0].l : NULL;
+    if (!mi) return (klj_val){.j = 0};
+    uint64_t total = kl_mem_budget_bytes(), avail = kl_mem_available_bytes();
+    uint64_t thresh = total / 100 * (uint64_t)(100 - kl_env_int("KL_LOWMEM_AT", 80));
+    void *cls = klj_class_object("android/app/ActivityManager$MemoryInfo");
+    klj_field_store(mi, klj_want(cls, "availMem",  "J", 'f'), (klj_val){.j = avail});
+    klj_field_store(mi, klj_want(cls, "totalMem",  "J", 'f'), (klj_val){.j = total});
+    klj_field_store(mi, klj_want(cls, "threshold", "J", 'f'), (klj_val){.j = thresh});
+    klj_field_store(mi, klj_want(cls, "lowMemory", "Z", 'f'),
+                    (klj_val){.j = avail < thresh});
+    KLJ_LOG("ActivityManager.getMemoryInfo -> avail %llu MiB of %llu, threshold %llu, low=%d",
+            (unsigned long long)(avail >> 20), (unsigned long long)(total >> 20),
+            (unsigned long long)(thresh >> 20), (int)(avail < thresh));
+    return (klj_val){.j = 0};
+}
+
+// ---- com.vrchat.android.plugin.Info ----
+// The title's own Java half, and it is entirely transcribed from
+// smali_classes2/com/vrchat/android/plugin/Info.smali rather than guessed:
+// instance() is `Class.forName(...).getConstructor().newInstance()`, i.e. a
+// plain `new Info()`; init() reads PackageInfo.versionName/versionCode off the
+// context; and the two getters hand those back. Every one of those already has
+// a real answer here (kl_jni_guest_version, through PackageManager), so this
+// class is a pass-through to the answer the guest would have got anyway — which
+// is why it is served rather than refused.
+static klj_val klj_VRCInfo_instance(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *inst;
+    return klj_singleton("com/vrchat/android/plugin/Info", &inst);
+}
+
+// Answered from the same place PackageInfo is, rather than from a field of our
+// own: `Info.init()` copies them OUT of PackageInfo, so two sources here would
+// be two answers to one question and only one of them would be the guest's.
+static klj_val klj_VRCInfo_getVersionCode(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return klj_PackageInfo_versionCode();
+}
+static klj_val klj_VRCInfo_getVersionName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return klj_PackageInfo_versionName();
 }
 
 static klj_val klj_Activity_getIntent(void *env, void *self, const klj_val *a, int n) {
@@ -3063,7 +3433,18 @@ static klj_val klj_Handler_obtainMessage(void *env, void *self, const klj_val *a
     m->what   = n > 0 ? (int32_t)a[0].j : 0;
     m->target = self;                       // sendToTarget() needs to find it back
     void *obj = klj_new_object_data("android/os/Message", m);
-    klj_as_object(obj)->pinned = 1;   // queued until delivered; outlives its frame
+    // Pinned because it is queued and outlives the frame that made it — and
+    // taken OUT of that frame for the same reason. Both halves are needed: the
+    // pin stops the frame pop retiring it early, and the frame no longer
+    // listing it is what makes klj_deliver_message's retire the only one. A
+    // frame entry that survives its object is how a pop retires whoever
+    // recycled the slot, and the creating frame is on a different thread from
+    // the delivery, so klj_frame_forget could never reach it from there.
+    pthread_mutex_lock(&g_lock);
+    klj_as_object(obj)->pinned  = 1;
+    klj_as_object(obj)->destroy = free;   // obj/target are pool jobjects, not ours
+    klj_frame_forget(klj_as_object(obj));
+    pthread_mutex_unlock(&g_lock);
 
     // Message's members are public *fields*, not getters, so the handler reads
     // msg.what with GetIntField. Publishing them through the same per-object write
@@ -3522,11 +3903,29 @@ static klj_val klj_Integer_parseInt(void *env, void *self, const klj_val *a, int
 // A java.lang.reflect.Method the guest never created. What its native invoke
 // actually reads off this is not knowable up front, so the accessors below are
 // added as the trace demands them — same rule as every other Java class here.
+// The strings are the CALLER's, and the two callers disagree about who owns
+// them — getMethodID strdups guest jstrings, klj_proxy_invoke passes borrowed
+// interned names. So the destructor is attached at the owning call site rather
+// than here, which is the whole reason ownership is recorded per object.
 static void *klj_new_method(const char *cls, const char *name, const char *sig) {
     klj_method_obj *m = calloc(1, sizeof *m);
     if (!m) return NULL;
     m->cls = cls; m->name = name; m->sig = sig;
     return klj_new_object_data(KLJ_CLASS_METHOD, m);
+}
+
+static void klj_method_free(void *p) {
+    klj_method_obj *m = p;
+    if (!m) return;
+    free((void *)m->cls); free((void *)m->name); free((void *)m->sig);
+    free(m);
+}
+
+static void klj_field_free(void *p) {
+    klj_field_obj *f = p;
+    if (!f) return;
+    free((void *)f->cls); free((void *)f->name); free((void *)f->sig);
+    free(f);
 }
 
 static klj_val klj_Method_getName(void *env, void *self, const klj_val *a, int n) {
@@ -3557,7 +3956,7 @@ static void *klj_new_field(const char *cls, const char *name, const char *sig, i
     f->name = name ? strdup(name) : NULL;
     f->sig = sig ? strdup(sig) : NULL;
     f->is_static = is_static;
-    return klj_new_object_data(KLJ_CLASS_FIELD, f);
+    return klj_own(klj_new_object_data(KLJ_CLASS_FIELD, f), klj_field_free);
 }
 
 static klj_field_obj *klj_as_field(void *obj) {
@@ -3596,11 +3995,62 @@ static klj_val klj_ReflectionHelper_getMethodID(void *env, void *self,
         return (klj_val){.l = NULL};
     }
     KLJ_LOG("ReflectionHelper.getMethodID %s.%s%s", cls, name, sig ? sig : "");
-    void *m = klj_new_method(strdup(cls), name ? strdup(name) : NULL,
-                             sig ? strdup(sig) : NULL);
+    void *m = klj_own(klj_new_method(strdup(cls), name ? strdup(name) : NULL,
+                                     sig ? strdup(sig) : NULL), klj_method_free);
     klj_object *o = klj_as_object(m);
     if (o && o->data) ((klj_method_obj *)o->data)->is_static = is_static;
     return (klj_val){.l = m};
+}
+
+// ...and the constructor half. A Constructor IS a Method here — the same record
+// with the name `<init>` — because that is exactly what it is on the JNI side:
+// FromReflectedMethod turns it into a jmethodID, and klj_call already treats a
+// method named `<init>` as returning the new object rather than the 'V' its
+// signature claims (see klj_NewObjectV). So there is no second object kind and
+// no second conversion path, which is the point.
+//
+// Unity passes the signature already built, argument types only; the class is
+// the reflected one. `is_static` is false by construction.
+static klj_val klj_ReflectionHelper_getConstructorID(void *env, void *self,
+                                                     const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *cls = n > 0 ? klj_class_name(a[0].l) : NULL;
+    const char *sig = n > 1 ? klj_str(a[1].l) : NULL;
+    if (!cls) {
+        KLJ_LOG("ReflectionHelper.getConstructorID with no class -> null");
+        return (klj_val){.l = NULL};
+    }
+    KLJ_LOG("ReflectionHelper.getConstructorID %s.<init>%s", cls, sig ? sig : "()V");
+    return (klj_val){.l = klj_own(klj_new_method(strdup(cls), strdup("<init>"),
+                                                 strdup(sig ? sig : "()V")),
+                                  klj_method_free)};
+}
+
+// Unity's own door to the same proxy JNIBridge.newInterfaceProxy builds. The
+// arguments are shaped differently — the UnityPlayer instance, the native
+// pointer, and ONE interface class rather than an array — but the object handed
+// back has to be the same kind, because klj_proxy_invoke is what dispatches
+// every callback through it and it knows exactly one representation.
+static klj_val klj_ReflectionHelper_newProxyInstance(void *env, void *clazz,
+                                                     const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    klj_proxy *p = calloc(1, sizeof *p);
+    p->native_ptr = n > 1 ? (int64_t)a[1].j : 0;
+    // Wrapped in a one-element array so the two doors' proxies are identical
+    // down to the field, rather than alike: klj_proxy_invoke and the report
+    // both read `classes` as an object array.
+    void *ifaces = klj_new_array('L', "java/lang/Class", 1);
+    if (n > 2) ((void **)klj_arr(ifaces)->data)[0] = a[2].l;
+    klj_as_object(ifaces)->pinned = 1;
+    p->classes = ifaces;
+    KLJ_LOG("ReflectionHelper.newProxyInstance: implements %s (native 0x%llx)",
+            n > 2 ? klj_class_name(a[2].l) : "(none)",
+            (unsigned long long)p->native_ptr);
+
+    void *obj = kl_jni_new_object(KLJ_CLASS_PROXY);
+    klj_as_object(obj)->data = p;
+    klj_as_object(obj)->pinned = 1;   // guest-held long-term via native_ptr
+    return (klj_val){.l = obj};
 }
 
 static klj_val klj_ReflectionHelper_getFieldSignature(void *env, void *self,
@@ -3696,7 +4146,29 @@ static void *klj_proxy_invoke(void *proxy, const char *iface,
 //
 // Anything else is named and dropped rather than silently discarded: a message
 // that goes nowhere is a notification the guest is still waiting for.
+// Delivery, and then the message dies. obtainMessage pins it because it is
+// queued and outlives the frame that made it — and a pinned object is skipped
+// by klj_retire_object_locked, so the frame pop that would have reclaimed the
+// slot did nothing and nothing else ever would: a guest that obtains messages
+// repeatedly walks the pool to "object pool exhausted", which is an abort
+// rather than an OOM and is a different bug wearing the same clothes.
+//
+// It is retired AFTER the callback, not before: retiring clears the magic, so
+// an early unpin-and-retire would hand the guest's own handleMessage a Message
+// that no longer answers klj_as_message.
+static void klj_deliver_message_1(void *message);
+
 static void klj_deliver_message(void *message) {
+    klj_deliver_message_1(message);
+    klj_object *o = klj_as_object(message);
+    if (!o) return;
+    pthread_mutex_lock(&g_lock);
+    o->pinned = 0;
+    klj_retire_object_locked(o);
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void klj_deliver_message_1(void *message) {
     klj_message *m = klj_as_message(message);
     if (!m) return;
     klj_handler *h  = klj_as_handler(m->target);
@@ -6199,6 +6671,18 @@ static void klj_stream_close(klj_stream *st) {
     if (st->f) { fclose(st->f); st->f = NULL; }
 }
 
+// A stream owns everything in it: `data` is its own slurp or its own inflate,
+// and `f` is its own handle — a window stream reopens the archive precisely so
+// two streams over one file cannot disturb each other's position. So the whole
+// record dies with the object, and a leaked one was a whole file's contents.
+static void klj_stream_free(void *p) {
+    klj_stream *st = p;
+    if (!st) return;
+    klj_stream_close(st);
+    free(st->data);
+    free(st);
+}
+
 static klj_val klj_AssetManager_open(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     const char *rel = n > 0 ? klj_str(a[0].l) : NULL;
@@ -6221,6 +6705,7 @@ static klj_val klj_AssetManager_open(void *env, void *self, const klj_val *a, in
 
     void *obj = kl_jni_new_object("java/io/InputStream");
     klj_as_object(obj)->data = st;
+    klj_own(obj, klj_stream_free);
     return (klj_val){.l = obj};
 }
 
@@ -6241,10 +6726,17 @@ static klj_val klj_Scanner_init(void *env, void *clazz, const klj_val *a, int n)
     klj_object *in = n > 0 ? klj_as_object(a[0].l) : NULL;
     klj_scanner *sc = calloc(1, sizeof *sc);
     sc->st = in ? in->data : NULL;
+    // A Scanner holds a RAW pointer into the stream's payload, so the stream
+    // must outlive it — and streams release their payload on recycle now. Pin
+    // the input rather than copy or reference-count it: the alternative is a
+    // use-after-free that only appears once the pool has turned over 8192
+    // slots. The cost is one unreclaimable slot per Scanner, and Unity makes
+    // one, for boot.config.
+    if (in) in->pinned = 1;
     snprintf(sc->delim, sizeof sc->delim, "%s", "\n");
     void *obj = kl_jni_new_object("java/util/Scanner");
     klj_as_object(obj)->data = sc;
-    return (klj_val){.l = obj};
+    return (klj_val){.l = klj_own(obj, free)};
 }
 static klj_val klj_Scanner_useDelimiter(void *env, void *self, const klj_val *a, int n) {
     (void)env;
@@ -6505,6 +6997,7 @@ static klj_val klj_ZipFile_getInputStream(void *env, void *self, const klj_val *
             ze->e->name, st->len, (unsigned long long)off);
     void *obj = kl_jni_new_object("java/io/InputStream");
     klj_as_object(obj)->data = st;
+    klj_own(obj, klj_stream_free);
     return (klj_val){.l = obj};
 }
 
@@ -7613,7 +8106,35 @@ static const klj_binding g_bindings[] = {
 
     {"com/unity3d/player/ReflectionHelper", "getFieldID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Field;", klj_ReflectionHelper_getFieldID},
     {"com/unity3d/player/ReflectionHelper", "getMethodID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Method;", klj_ReflectionHelper_getMethodID},
+    {"com/unity3d/player/ReflectionHelper", "getConstructorID", "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Constructor;", klj_ReflectionHelper_getConstructorID},
+    {"com/unity3d/player/ReflectionHelper", "newProxyInstance", "(Lcom/unity3d/player/UnityPlayer;JLjava/lang/Class;)Ljava/lang/Object;", klj_ReflectionHelper_newProxyInstance},
     {"com/unity3d/player/ReflectionHelper", "getFieldSignature", "(Ljava/lang/reflect/Field;)Ljava/lang/String;", klj_ReflectionHelper_getFieldSignature},
+    // ICU's time zones, which is where Mono's TimeZoneInfo looks on Android.
+    {"android/icu/util/TimeZone", "getDefault", "()Ljava/lang/Object;", klj_TimeZone_getDefault},
+    {"android/icu/util/TimeZone", "getID", "()Ljava/lang/String;", klj_TimeZone_getID},
+    {"android/icu/util/TimeZone", "getAvailableIDs", "()[Ljava/lang/String;", klj_TimeZone_getAvailableIDs},
+    {"android/icu/util/TimeZone", "getOffset", "(J)I", klj_TimeZone_getOffset},
+    {"android/icu/util/TimeZone", "getRawOffset", "()I", klj_TimeZone_getRawOffset},
+    {"android/icu/util/TimeZone", "useDaylightTime", "()Z", klj_TimeZone_useDaylightTime},
+    // ICU's own name for the same question. It differs from useDaylightTime()
+    // only for a zone that USED to observe DST and no longer does, which this
+    // one-zone database cannot express and the host's tm_gmtoff cannot
+    // distinguish — so they share an answer rather than one of them guessing.
+    {"android/icu/util/TimeZone", "observesDaylightTime", "()Z", klj_TimeZone_useDaylightTime},
+    {"android/icu/util/TimeZone", "getDisplayName", "(ZI)Ljava/lang/String;", klj_TimeZone_getDisplayName},
+    {"android/icu/util/TimeZone", "getDSTSavings", "()I", klj_TimeZone_getDSTSavings},
+    {"android/icu/util/TimeZone", "getTimeZone", "(Ljava/lang/String;)Ljava/lang/Object;", klj_TimeZone_getTimeZone},
+    // The class name really does carry DOTS rather than slashes — that is the
+    // guest's own string, built by C# from a type name, and a binding is
+    // matched on it exactly. Same shape as UnityPermissions below.
+    {"android/text/format/DateFormat", "is24HourFormat", "(Landroid/content/Context;)Z", klj_DateFormat_is24HourFormat},
+    {"android/app/ActivityManager", "getMemoryInfo", "(Landroid/app/ActivityManager$MemoryInfo;)V", klj_ActivityManager_getMemoryInfo},
+    // VRChat's own plugin class; see the transcription note at its implementation.
+    {"com/vrchat/android/plugin/Info", "instance", "()Ljava/lang/Object;", klj_VRCInfo_instance},
+    {"com/vrchat/android/plugin/Info", "setContext", "(Landroid/content/Context;)V", klj_void_noop},
+    {"com/vrchat/android/plugin/Info", "init", "()V", klj_void_noop},
+    {"com/vrchat/android/plugin/Info", "getVersionCode", "()I", klj_VRCInfo_getVersionCode},
+    {"com/vrchat/android/plugin/Info", "getVersionName", "()Ljava/lang/String;", klj_VRCInfo_getVersionName},
     {"java/lang/reflect/Field", "getDeclaringClass", "()Ljava/lang/Class;", klj_Field_getDeclaringClass},
     {"java/lang/reflect/Method", "getName", "()Ljava/lang/String;", klj_Method_getName},
     {"java/lang/reflect/Method", "getDeclaringClass", "()Ljava/lang/Class;", klj_Method_getDeclaringClass},

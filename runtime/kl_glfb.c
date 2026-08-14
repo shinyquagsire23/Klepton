@@ -1731,9 +1731,33 @@ void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex) {
 // The OpenXR path knows exactly which image that is (xrReleaseSwapchainImage
 // says so) and says it here, so the capture reads the presented image rather
 // than whichever one the rotation happens to be pointing at.
-void kl_glfb_set_live_eye_texture(int eye, uint32_t tex) {
+// ...and everything else the capture would otherwise have to GUESS about it.
+//
+// The name alone was not enough, twice over. (a) The size: kl_glfb learns a
+// texture's dimensions from its own glTexStorage2D thunk, and an OpenXR
+// swapchain is allocated through kl_egl_sym — the real ANGLE entry point —
+// so klfb_tex_info has never heard of it. The capture then kept the pbuffer's
+// size and read a 2290x2400 eye as 1832x1920, which comes back as the window.
+// (b) The LAYER: this guest's eye swapchain is ONE texture with two array
+// slices, so both eyes share a name and differ only by layer, and
+// glFramebufferTexture2D cannot attach a slice of a 2D array at all.
+//
+// So the OpenXR path states the whole thing — name, size, layer — because it
+// is the one place that knows it, and the capture stops searching. Trap 31 is
+// the reason this is not a search: a GL name is a slot, not an identity.
+static struct { uint32_t tex; int32_t w, h; int layer; } g_live_eye[2];
+
+void kl_glfb_set_live_eye_image(int eye, uint32_t tex, int32_t w, int32_t h, int layer) {
     if (eye < 0 || eye > 1 || !tex) return;
     g_eye_tex[eye] = tex;
+    g_live_eye[eye].tex = tex;
+    g_live_eye[eye].w = w;
+    g_live_eye[eye].h = h;
+    g_live_eye[eye].layer = layer;
+}
+
+void kl_glfb_set_live_eye_texture(int eye, uint32_t tex) {
+    kl_glfb_set_live_eye_image(eye, tex, 0, 0, -1);
 }
 
 // Which stage is the current draw target, and which was last drawn into.
@@ -4840,6 +4864,35 @@ static int klfb_write_png(const char *path, const uint8_t *px,
 //
 // Returns the framebuffer, bound as READ_FRAMEBUFFER, or 0. The caller restores
 // the previous binding.
+// Attach one LAYER of a 2D array texture. Same shape as klfb_read_from_texture
+// and deliberately separate: glFramebufferTexture2D takes a target and cannot
+// name a slice, so an array eye needs glFramebufferTextureLayer or it is not
+// readable at all — which is not a degraded picture, it is an incomplete
+// framebuffer and a black PNG.
+static uint32_t klfb_read_from_texture_layer(uint32_t tex, int layer) {
+    static void (*r_GenFramebuffers)(int32_t, uint32_t *);
+    static void (*r_BindFramebuffer)(uint32_t, uint32_t);
+    static void (*r_FramebufferTextureLayer)(uint32_t, uint32_t, uint32_t, int32_t, int32_t);
+    static uint32_t (*r_CheckFramebufferStatus)(uint32_t);
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        r_GenFramebuffers = asym("glGenFramebuffers");
+        r_BindFramebuffer = asym("glBindFramebuffer");
+        r_FramebufferTextureLayer = asym("glFramebufferTextureLayer");
+        r_CheckFramebufferStatus = asym("glCheckFramebufferStatus");
+    }
+    if (!tex || !r_GenFramebuffers || !r_BindFramebuffer ||
+        !r_FramebufferTextureLayer || !r_CheckFramebufferStatus) return 0;
+    static uint32_t layer_fb;
+    if (!layer_fb) r_GenFramebuffers(1, &layer_fb);
+    if (!layer_fb) return 0;
+    r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, layer_fb);
+    r_FramebufferTextureLayer(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */, tex, 0, layer);
+    if (r_CheckFramebufferStatus(0x8CA8) != 0x8CD5) return 0;
+    return layer_fb;
+}
+
 static uint32_t klfb_read_from_texture(uint32_t tex) {
     static void (*r_GenFramebuffers)(int32_t, uint32_t *);
     static void (*r_BindFramebuffer)(uint32_t, uint32_t);
@@ -4930,9 +4983,24 @@ static unsigned glfb_capture_now(const char *dir) {
     int32_t src_w = g_w, src_h = g_h;
     if ((g_eye_tex[0] || g_eye_tex[1]) && a_BindFramebuffer &&
         a_GetFbAttachmentParam && a_glCheckFramebufferStatus) {
-        // The guest's own answer first (g_last_eye_fbo): the scan matches on
+        // A STATED image beats every search. kl_glfb_set_live_eye_image is the
+        // OpenXR path saying which swapchain image the guest just presented,
+        // with its size and array layer — none of which can be recovered here,
+        // because the swapchain is allocated through the real ANGLE entry
+        // points and both eyes are layers of one texture. Everything below is
+        // the search for a guest that never states it (Unity through OVRPlugin).
+        int cap_eye = kl_env_int("KL_XR_CAPTURE_EYE", 0);
+        if (cap_eye < 0 || cap_eye > 1) cap_eye = 0;
+        const typeof(g_live_eye[0]) *le = &g_live_eye[cap_eye];
+        if (!le->tex && g_live_eye[cap_eye ^ 1].tex) le = &g_live_eye[cap_eye ^ 1];
+        if (le->tex && le->w > 0 && le->h > 0) {
+            src_fb = le->layer >= 0 ? klfb_read_from_texture_layer(le->tex, le->layer)
+                                    : klfb_read_from_texture(le->tex);
+            if (src_fb) { src_w = le->w; src_h = le->h; }
+        }
+        // The guest's own answer next (g_last_eye_fbo): the scan matches on
         // texture NAME, and a name outlives the object it was issued for.
-        uint32_t hint = __atomic_load_n(&g_last_eye_fbo, __ATOMIC_RELAXED);
+        uint32_t hint = src_fb ? 0 : __atomic_load_n(&g_last_eye_fbo, __ATOMIC_RELAXED);
         if (hint) src_fb = klfb_eye_fbo_take(hint, &src_w, &src_h);
         for (uint32_t i = 1; i <= g_fbomax && !src_fb; i++)
             src_fb = klfb_eye_fbo_take(i, &src_w, &src_h);

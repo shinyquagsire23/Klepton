@@ -193,9 +193,48 @@ int kl_can_dlopen(const char *path) {
            kl_openxr_claims(path) || kl_can_load(path);
 }
 
+// KL_DLOPEN_REFUSE=<substr>[,<substr>...] — refuse these by name, as if the
+// file were not there. A comma-separated list matched against the whole path,
+// so "phonon" catches libphonon and libaudioplugin_phonon both.
+//
+// This is not a way to hide gaps: a guest that dlopens an optional plugin
+// ALREADY has a path for the library being absent — VRChat logs
+// `DllNotFoundException` for AudioPluginOculusSpatializer and carries on — and
+// a NULL here is exactly what a device gives it. What the knob buys is
+// isolation: libphonon (Steam Audio) aborts its own worker pool after a failed
+// HRTF init, intermittently, which stops the run before anything downstream of
+// it can be measured at all. `KL_DLOPEN_REFUSE=phonon` takes that library out
+// and makes the rest of the arc reachable, and the A/B is one run.
+//
+// Nothing defaults to being refused, and a refusal is always named.
+static int kl_dlopen_refused(const char *path) {
+    static const char *list;
+    static int inited;
+    if (!inited) { inited = 1; list = kl_env_str("KL_DLOPEN_REFUSE", NULL); }
+    if (!list || !*list || !path) return 0;
+    for (const char *p = list; *p; ) {
+        const char *comma = strchr(p, ',');
+        size_t n = comma ? (size_t)(comma - p) : strlen(p);
+        if (n) {
+            char want[256];
+            if (n >= sizeof want) n = sizeof want - 1;
+            memcpy(want, p, n); want[n] = '\0';
+            if (strstr(path, want)) {
+                fprintf(stderr, "  [klepton] guest dlopen(\"%s\") REFUSED by "
+                                "KL_DLOPEN_REFUSE=\"%s\" — the guest sees this as "
+                                "a library that is not installed\n", path, want);
+                return 1;
+            }
+        }
+        p = comma ? comma + 1 : p + strlen(p);
+    }
+    return 0;
+}
+
 void *klb_dlopen(const char *path, int flags) {
     (void)flags;
     if (!path) return (void *)-1;                    // RTLD_DEFAULT-ish: whole process
+    if (kl_dlopen_refused(path)) return NULL;
     // GL libraries have no file to open — they are served by kl_egl.c. This has
     // to come first: falling through would look for libGLESv2.so on disk, fail,
     // and hand the guest a NULL it goes on to call.

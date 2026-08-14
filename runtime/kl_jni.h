@@ -44,6 +44,12 @@ void kl_jni_set_permissive(int on);
 // Natives the guest registered, by (class, name, signature). NULL if absent.
 void *kl_jni_native(const char *cls, const char *name, const char *sig);
 
+// Deliver Android's low-memory notification — UnityPlayer.nativeLowMemory,
+// which is where a title runs Resources.UnloadUnusedAssets(). The declaring
+// class comes from the natives table rather than being assumed. Returns 0 if
+// the guest never registered it. Driven from kl_mem_pressure_* (klepton.h).
+int kl_jni_low_memory(void);
+
 // Construct the jobjects the host passes *into* guest natives. Every jobject the
 // guest holds must come from here — they carry a type tag, which is what lets
 // GetObjectClass answer truthfully instead of guessing.

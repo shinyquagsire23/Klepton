@@ -141,6 +141,28 @@ const char *kl_guest_path(const char *path, char *buf, size_t cap);
 // (split assets). See the implementation comment in kl_libc.c.
 void kl_guest_path_map(const char *apk, const char *unpacked_dir);
 
+// How much memory the guest asked us to decommit, and how we served it. Zero
+// bytes here on a Unity guest means its VirtualMemory layer's decommit is doing
+// nothing and the footprint is a high-water mark (see klb_madvise).
+void kl_madv_report(void);
+
+// Memory pressure. The guest is told the room ran out through
+// UnityPlayer.nativeLowMemory, which is where a title drops its caches; nothing
+// delivered it before, so every cache a Quest build releases under pressure was
+// held here forever. _init subscribes to the OS's own signal, _poll checks our
+// footprint against the reported budget (cheap enough for once a frame), and
+// _fire is the on-demand knob — the way to A/B this without a headset.
+void kl_mem_pressure_init(void);
+void kl_mem_pressure_poll(void);
+void kl_mem_pressure_fire(const char *why);
+void kl_mem_report(void);
+
+// The budget and what is left of it, for the other doors a guest asks the same
+// question through — ActivityManager.getMemoryInfo is /proc/meminfo asked in
+// Java, and the two must not answer differently.
+uint64_t kl_mem_budget_bytes(void);
+uint64_t kl_mem_available_bytes(void);
+
 // errno numbering diverges above 34 between Linux and Darwin, and guest code
 // compares against Linux's values (see kl_libc.c).
 int kl_errno_to_linux(int e);

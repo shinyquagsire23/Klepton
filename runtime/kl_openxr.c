@@ -3149,7 +3149,17 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             // rotation moves every frame; the registration below is once.
             if ((int)li == cap_layer && sc->last_released >= 0 &&
                 sc->last_released < sc->count) {
-                kl_glfb_set_live_eye_texture((int)v, sc->tex[sc->last_released]);
+                // The whole description, not just the name: the swapchain's
+                // size is not in kl_glfb's allocation table (it is created
+                // through kl_egl_sym, i.e. the real ANGLE entry points), and an
+                // ARRAY swapchain gives both eyes ONE texture that differ only
+                // by layer. Without either, the capture read the eye at the
+                // window's size and produced the window.
+                kl_glfb_set_live_eye_image((int)v, sc->tex[sc->last_released],
+                                           (int32_t)sc->width, (int32_t)sc->height,
+                                           sc->array_size > 1
+                                               ? (int)proj->views[v].subImage.imageArrayIndex
+                                               : -1);
                 // The stage the frame record is filed under. Taken from eye 0,
                 // because both eyes' swapchains are acquired and released once
                 // per frame and therefore rotate together — and taken from the

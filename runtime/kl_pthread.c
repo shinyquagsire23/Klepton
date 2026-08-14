@@ -16,6 +16,7 @@
 // Strategy: the guest's own storage holds a handle to a real Darwin object that we
 // create lazily. bionic's static initialisers are all-zero, so 0 reliably means
 // "not yet created" and PTHREAD_MUTEX_INITIALIZER keeps working.
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -98,7 +99,12 @@ SYNC_TABLE(pthread_rwlock_t, g_rwl, g_rwl_n, pthread_rwlock_init(fresh, NULL))
 #define MTX_MAP_SIZE 32768          // power of two; abort past it, KL_MAX_SYNC-style
 typedef struct {
     _Atomic(uintptr_t)   key;       // guest address; 0 = empty
-    pthread_mutex_t     *m;
+    // Atomic, and published AFTER the key with release ordering — see
+    // mtx_entry_for. A plain pointer here was a publication race and it was
+    // reached: the claiming thread stored the key, and any other thread that
+    // probed the same address in that window found k == want, returned the
+    // entry and called pthread_mutex_lock(NULL).
+    _Atomic(pthread_mutex_t *) m;
     _Atomic(void *)      owner;     // owner tracking, dumped by kl_pthread_report
     _Atomic(void *)      locksite;
 } mtx_entry;
@@ -108,27 +114,58 @@ static unsigned mtx_hash(uintptr_t a) {
     return (unsigned)(((a >> 4) * 0x9E3779B97F4A7C15ULL) >> 49);
 }
 
+static pthread_mutex_t *mtx_make(void) {
+    pthread_mutex_t *fresh = malloc(sizeof *fresh);
+    if (!fresh) return NULL;
+    pthread_mutexattr_t a; pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(fresh, &a); pthread_mutexattr_destroy(&a);
+    return fresh;
+}
+
+// The host mutex behind an entry. Separate from the lookup because the entry
+// may be visible for a few instructions before its mutex is: the creator
+// publishes the key with the CAS and the mutex immediately after, so a reader
+// that arrives between the two waits rather than dereferencing NULL. Bounded by
+// a handful of instructions on the creating thread, so a yield loop is right.
+static pthread_mutex_t *mtx_host(mtx_entry *e) {
+    pthread_mutex_t *m = atomic_load(&e->m);
+    while (!m) { sched_yield(); m = atomic_load(&e->m); }
+    return m;
+}
+
 // Find-or-create the host mutex for guest address g. Linear probe.
+//
+// The mutex is constructed BEFORE the key is claimed. This is the same ordering
+// bug klb_sem_init already carries a comment about — fill the slot, then
+// publish the index, never the other way round — and here it presented as
+// libphonon's worker pool dying in pthread_mutex_lock(NULL) three frames into
+// guest code, which reads as the guest's own null-mutex bug and is not.
+// Several threads first-locking one brand-new mutex at once is exactly what a
+// thread pool coming up does, which is why it was intermittent and why it
+// picked the guest with the most thread pools.
 static mtx_entry *mtx_entry_for(void *g) {
     uintptr_t want = (uintptr_t)g;
+    pthread_mutex_t *fresh = NULL;
     for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
         uintptr_t k = atomic_load(&g_mtx_map[i].key);
-        if (k == want) return &g_mtx_map[i];
+        if (k == want) {
+            if (fresh) { pthread_mutex_destroy(fresh); free(fresh); }
+            return &g_mtx_map[i];
+        }
         if (k) continue;
-        // empty: claim it
+        // empty: build the mutex first, so claiming the key publishes a
+        // complete entry. Kept across a lost race rather than rebuilt.
+        if (!fresh) fresh = mtx_make();
         uintptr_t expect = 0;
         if (!atomic_compare_exchange_strong(&g_mtx_map[i].key, &expect, want))
             { i--; continue; }          // lost the race; re-read this slot
-        pthread_mutex_t *fresh = malloc(sizeof *fresh);
-        pthread_mutexattr_t a; pthread_mutexattr_init(&a);
-        pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-        pthread_mutex_init(fresh, &a); pthread_mutexattr_destroy(&a);
-        g_mtx_map[i].m = fresh;
+        atomic_store(&g_mtx_map[i].m, fresh);
         return &g_mtx_map[i];
     }
 }
 
-static pthread_mutex_t *mtx(void *g) { return mtx_entry_for(g)->m; }
+static pthread_mutex_t *mtx(void *g) { return mtx_host(mtx_entry_for(g)); }
 
 static mtx_entry *mtx_find(void *g) {
     uintptr_t want = (uintptr_t)g;
@@ -200,25 +237,44 @@ static void mtx_wait_leave(void) {
 // unnoticed for so long: the common failures all happened to agree.
 static inline int px(int r) { return r ? kl_errno_to_linux(r) : 0; }
 
+// A NULL mutex is the guest's bug, and it must not become ours. It also
+// collides with the map's own sentinel: `key == 0` means "empty slot", so
+// mtx_entry_for(NULL) matches the first empty slot it probes and hands back an
+// entry with no mutex in it — the crash the caller was already heading for,
+// relocated into this file and blamed on it.
+//
+// EINVAL is what POSIX says and what bionic returns, so a guest that checks
+// gets the answer it expects; one that does not is no worse off than on
+// Android. Named once, because the fact that a guest is doing this at all is
+// the finding — libphonon's HRTF failure path leaves its worker pool with an
+// uninitialised mutex, and the abort looked exactly like a runtime bug of ours.
+static int mtx_null(const char *what) {
+    static _Atomic int said;
+    if (atomic_fetch_add(&said, 1) < 4)
+        fprintf(stderr, "  [klb] pthread_mutex_%s(NULL) from the guest — refusing "
+                        "with EINVAL (its own bug; on Android this is a crash too)\n",
+                what);
+    return kl_errno_to_linux(EINVAL);
+}
+
 int klb_pthread_mutex_init(void *m, const void *a) {
     (void)a;
+    if (!m) return mtx_null("init");
     // POSIX: init of an existing mutex is UB. Fresh host object either way;
     // a stale entry's host leaks (it might be held, and freeing is worse).
     mtx_entry *e = mtx_entry_for(m);
-    pthread_mutex_t *fresh = malloc(sizeof *fresh);
-    pthread_mutexattr_t at; pthread_mutexattr_init(&at);
-    pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(fresh, &at); pthread_mutexattr_destroy(&at);
-    e->m = fresh;
+    pthread_mutex_t *fresh = mtx_make();
+    atomic_store(&e->m, fresh);
     atomic_store(&e->owner, NULL);
     atomic_store(&e->locksite, NULL);
     mtx_log("init", m, (uint32_t)(e - g_mtx_map));
     return 0;
 }
 int klb_pthread_mutex_lock(void *m) {
+    if (!m) return mtx_null("lock");
     mtx_entry *e = mtx_entry_for(m);
     mtx_wait_enter(m, __builtin_return_address(0));
-    int r = px(pthread_mutex_lock(e->m));
+    int r = px(pthread_mutex_lock(mtx_host(e)));
     mtx_wait_leave();
     if (r == 0) {
         atomic_store(&e->locksite, __builtin_return_address(0));
@@ -227,14 +283,16 @@ int klb_pthread_mutex_lock(void *m) {
     return r;
 }
 int klb_pthread_mutex_unlock(void *m)  {
+    if (!m) return mtx_null("unlock");
     mtx_entry *e = mtx_entry_for(m);
     atomic_store(&e->owner, NULL);
     atomic_store(&e->locksite, NULL);
-    return px(pthread_mutex_unlock(e->m));
+    return px(pthread_mutex_unlock(mtx_host(e)));
 }
 int klb_pthread_mutex_trylock(void *m) {
+    if (!m) return mtx_null("trylock");
     mtx_entry *e = mtx_entry_for(m);
-    int r = px(pthread_mutex_trylock(e->m));
+    int r = px(pthread_mutex_trylock(mtx_host(e)));
     if (r == 0) {
         atomic_store(&e->locksite, __builtin_return_address(0));
         atomic_store(&e->owner, (void *)pthread_self());
@@ -333,7 +391,7 @@ int klb_pthread_cond_wait(void *c, void *m) {
     // owner table or every sleeper reads as a holder.
     mtx_entry *e = mtx_entry_for(m);
     atomic_store(&e->owner, NULL);
-    int r = px(pthread_cond_wait(cnd(c), e->m));
+    int r = px(pthread_cond_wait(cnd(c), mtx_host(e)));
     atomic_store(&e->locksite, __builtin_return_address(0));
     atomic_store(&e->owner, (void *)pthread_self());
     return r;
@@ -408,7 +466,7 @@ int klb_pthread_cond_timedwait(void *c, void *m, const struct timespec *ts) {
     // owner table or every sleeper reads as a holder.
     mtx_entry *e = mtx_entry_for(m);
     atomic_store(&e->owner, NULL);
-    int r = px(pthread_cond_timedwait(cnd(c), e->m, ts));
+    int r = px(pthread_cond_timedwait(cnd(c), mtx_host(e), ts));
     atomic_store(&e->locksite, __builtin_return_address(0));
     atomic_store(&e->owner, (void *)pthread_self());
     return r;
@@ -630,19 +688,40 @@ int klb_pthread_atfork(void (*p)(void), void (*c)(void), void (*ch)(void)) {
 typedef struct {
     dispatch_semaphore_t d;
     _Atomic int          count;
+    int                  initial;   // what it was created with, for the release
+                                    // rule in klb_sem_destroy
 } kl_sem;
 static kl_sem g_sems[KL_MAX_SEMS];
 static _Atomic int g_nsems = 1;                 // index 0 means "uninitialised"
 
+// The free list. g_nsems was atomic_fetch_add-only against KL_MAX_SEMS, so the
+// table was a ONE-WAY budget for the life of the process: after 1024 sem_init
+// calls every later one returned ENOSPC forever, whatever had been destroyed in
+// between. The bytes are trivial and the failure is not — this is very likely
+// SUPERHOT's "semaphore table that leaks slots ~80 s into play", which lands at
+// about the same point in a run as the OOM and is a different bug.
+//
+// A dead slot must keep `d` NULL, because sem_of() uses a live `d` as its
+// validity test: a recycled slot holding a stale dispatch_semaphore_t would
+// answer for a semaphore the guest destroyed.
+static int      g_sem_free[KL_MAX_SEMS];
+static int      g_sem_nfree;
+static pthread_mutex_t g_sem_lock = PTHREAD_MUTEX_INITIALIZER;
+
 int klb_sem_init(int *s, int pshared, unsigned value) {
     (void)pshared;
-    int i = atomic_fetch_add(&g_nsems, 1);
+    int i = 0;
+    pthread_mutex_lock(&g_sem_lock);
+    if (g_sem_nfree) i = g_sem_free[--g_sem_nfree];
+    pthread_mutex_unlock(&g_sem_lock);
+    if (!i) i = atomic_fetch_add(&g_nsems, 1);
     if (i >= KL_MAX_SEMS) { errno = ENOSPC; return -1; }
     // Fill the slot BEFORE publishing the index. The old order bumped g_nsems
     // first, which made the range check pass while the slot was still empty — a
     // waiter on another thread then got EINVAL from a semaphore that had, as far
     // as its owner was concerned, been initialised.
     atomic_store(&g_sems[i].count, (int)value);
+    g_sems[i].initial = (int)value;
     g_sems[i].d = dispatch_semaphore_create(value);
     atomic_thread_fence(memory_order_release);
     *s = i;
@@ -659,7 +738,32 @@ static kl_sem *sem_of(int *s) {
     return NULL;
 }
 
-int klb_sem_destroy(int *s)  { *s = 0; return 0; }
+int klb_sem_destroy(int *s) {
+    int i = *s;
+    *s = 0;
+    if (i <= 0 || i >= KL_MAX_SEMS) return 0;
+    // Clear `d` before the slot is offered back, and offer it back only once —
+    // a double sem_destroy is guest UB, but it must not put the same index on
+    // the free list twice and hand two live semaphores one slot.
+    pthread_mutex_lock(&g_sem_lock);
+    dispatch_semaphore_t d = g_sems[i].d;
+    int releasable = d && atomic_load(&g_sems[i].count) >= g_sems[i].initial;
+    if (d) {
+        g_sems[i].d = NULL;
+        atomic_store(&g_sems[i].count, 0);
+        g_sems[i].initial = 0;
+        if (g_sem_nfree < KL_MAX_SEMS) g_sem_free[g_sem_nfree++] = i;
+    }
+    pthread_mutex_unlock(&g_sem_lock);
+    // GCD *aborts* if a dispatch semaphore is deallocated below the value it
+    // was created with — "Semaphore object deallocated while in use" — which is
+    // the guest destroying one that still has waiters, i.e. its bug, and not
+    // one worth turning into a crash of ours. So it is released only when the
+    // count is back where it started, and otherwise deliberately dropped: one
+    // small object leaked against a crash inside a destructor.
+    if (releasable) dispatch_release(d);
+    return 0;
+}
 
 int klb_sem_post(int *s) {
     kl_sem *k = sem_of(s);

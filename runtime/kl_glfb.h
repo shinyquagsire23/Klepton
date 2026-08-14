@@ -96,6 +96,12 @@ void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex);
 // in three and black the rest. The OpenXR path knows which image it presented
 // (xrReleaseSwapchainImage names it) and says so here.
 void kl_glfb_set_live_eye_texture(int eye, uint32_t tex);
+// ...and the full description, which is what an OpenXR guest can state and the
+// capture cannot recover: the swapchain is allocated through the real ANGLE
+// entry points (so kl_glfb never sees its size) and both eyes are LAYERS of one
+// array texture (so there is no per-eye name at all). `layer` is -1 for a plain
+// 2D texture. KL_XR_CAPTURE_EYE picks which eye the capture writes.
+void kl_glfb_set_live_eye_image(int eye, uint32_t tex, int32_t w, int32_t h, int layer);
 
 // ...and the teardown half, from ovrp_DestroyEyeTexture. Drops both references
 // that keep an eye texture's storage alive — the EGLImage and the GL texture —

@@ -20,6 +20,7 @@
 #include <sys/mount.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <dispatch/dispatch.h>
 #include <sys/utsname.h>
 // getentropy, behind klb_getrandom. <sys/random.h> is a macOS-SDK header: XROS
 // and XRSimulator (26.0, checked) do not ship it, and getentropy has no public
@@ -443,14 +444,195 @@ static void proc_put(const char *rel, const char *text) {
     fclose(f);
 }
 
+// ---------- the memory budget ----------
+// MemTotal is part of the device identity, not a measurement of this machine,
+// and it is the one place where that differs from the CPU topology above. The
+// comment there argues that cores and memory are what the engine SIZES from
+// rather than what it branches on — which is precisely the argument for
+// answering the budget we actually have here instead of the host's RAM. A
+// Vision Pro has 16 GB and a development Mac 32-128; a Quest 2 has 6, and every
+// streaming budget, pool ceiling and quality tier in these titles was chosen
+// against that number. Telling a 6 GB title it has 20x the room, and then never
+// telling it the room ran out, is how it reaches an OOM without ever dropping
+// a cache.
+//
+// KL_MEM_TOTAL_MB overrides it; it is capped at the host's real memory so a
+// small machine is never told it has more.
+static uint64_t kl_mem_total(void) {
+    static uint64_t total;
+    if (total) return total;
+    uint64_t host = 0;
+    size_t   sz   = sizeof host;
+    if (sysctlbyname("hw.memsize", &host, &sz, NULL, 0) != 0) host = 0;
+    uint64_t want = (uint64_t)kl_env_int("KL_MEM_TOTAL_MB", 6144) << 20;
+    total = (host && host < want) ? host : want;
+    return total;
+}
+
+// What we are actually using. phys_footprint is the number jetsam kills on, so
+// it is also the number the guest should be seeing pressure against — a
+// host-wide free-page count says nothing about a process that is about to be
+// killed for its own footprint.
+// The PEAK is tracked here rather than reported at the end, because the peak is
+// what jetsam kills on and the endpoint is not: a run that climbs to 5 GB and
+// settles at 2.7 is dead on a headset and looks healthy in a final report. It
+// is also the only number that separates a working decommit from a broken one —
+// pages that were committed and never touched cost nothing to release either
+// way, so the two modes agree at the end and diverge at the top.
+static _Atomic uint64_t g_mem_peak;
+
+static uint64_t kl_mem_footprint(void) {
+    task_vm_info_data_t    ti;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&ti, &cnt) != KERN_SUCCESS)
+        return 0;
+    uint64_t now = (uint64_t)ti.phys_footprint, peak = atomic_load(&g_mem_peak);
+    while (now > peak && !atomic_compare_exchange_weak(&g_mem_peak, &peak, now)) { }
+    return now;
+}
+
 static uint64_t proc_free_bytes(void) {
-    vm_size_t page = 0;
-    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return 0;
-    vm_statistics64_data_t vm;
-    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
-                          (host_info64_t)&vm, &cnt) != KERN_SUCCESS) return 0;
-    return ((uint64_t)vm.free_count + vm.inactive_count) * page;
+    uint64_t total = kl_mem_total(), used = kl_mem_footprint();
+    if (!used) {
+        // No footprint to subtract: fall back to the host's own free pages
+        // rather than claiming the whole budget is free.
+        vm_size_t page = 0;
+        if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) return 0;
+        vm_statistics64_data_t vm;
+        mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+        if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                              (host_info64_t)&vm, &cnt) != KERN_SUCCESS) return 0;
+        uint64_t free = ((uint64_t)vm.free_count + vm.inactive_count) * page;
+        return free < total ? free : total;
+    }
+    return used < total ? total - used : 0;
+}
+
+// ---------- memory pressure ----------
+// Reporting a budget is only half of it: on Android the framework also TELLS
+// the guest when the room ran out, and that notification is where a title runs
+// Resources.UnloadUnusedAssets(). Two sources drive it here.
+//
+//  1. Our own footprint against the budget above. This is the one that works on
+//     both platforms and is the one tied to the number we report, so a guest
+//     that sizes itself from MemTotal sees pressure on the same scale.
+//  2. The OS's own signal (DISPATCH_SOURCE_TYPE_MEMORYPRESSURE), which on
+//     visionOS is the only warning that arrives before jetsam does.
+//
+// KL_LOWMEM_AT is the footprint percentage that fires source 1 (default 80,
+// 0 disables). It re-arms only after the footprint falls back below
+// KL_LOWMEM_CLEAR (default 70), so a guest that cannot free anything is asked
+// once rather than every frame.
+static _Atomic int g_lowmem_armed = 1;
+static _Atomic uint64_t g_lowmem_fired;
+
+void kl_mem_pressure_fire(const char *why) {
+    if (!kl_jni_low_memory()) {
+        static _Atomic int said;
+        if (atomic_fetch_add(&said, 1) == 0)
+            fprintf(stderr, "  [mem] pressure (%s) and the guest registered no "
+                            "nativeLowMemory — nothing to notify\n", why);
+        return;
+    }
+    uint64_t n = atomic_fetch_add(&g_lowmem_fired, 1) + 1;
+    fprintf(stderr, "  [mem] low memory (%s): told the guest (%llu MiB of %llu, "
+                    "notification %llu)\n", why,
+            (unsigned long long)(kl_mem_footprint() >> 20),
+            (unsigned long long)(kl_mem_total() >> 20), (unsigned long long)n);
+}
+
+// Cheap enough for once a frame: one task_info call.
+void kl_mem_pressure_poll(void) {
+    int at = kl_env_int("KL_LOWMEM_AT", 80);
+    if (at <= 0) return;
+    int clear = kl_env_int("KL_LOWMEM_CLEAR", 70);
+    uint64_t total = kl_mem_total(), used = kl_mem_footprint();
+    if (!total || !used) return;
+    int pct = (int)((used * 100) / total);
+    if (pct >= at) {
+        if (atomic_exchange(&g_lowmem_armed, 0)) kl_mem_pressure_fire("footprint");
+    } else if (pct < clear) {
+        atomic_store(&g_lowmem_armed, 1);
+    }
+}
+
+void kl_mem_pressure_init(void) {
+    static _Atomic int done;
+    if (atomic_exchange(&done, 1)) return;
+    dispatch_source_t src = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    if (!src) return;
+    dispatch_source_set_event_handler(src, ^{
+        // The OS asked, so it is delivered whatever the hysteresis says — this
+        // source only fires when the system means it.
+        kl_mem_pressure_fire(
+            dispatch_source_get_data(src) & DISPATCH_MEMORYPRESSURE_CRITICAL
+                ? "system critical" : "system warning");
+        atomic_store(&g_lowmem_armed, 0);
+    });
+    dispatch_resume(src);   // deliberately never cancelled: it lives as long as
+                            // the process, and there is nothing to release it to
+}
+
+void kl_mem_report(void) {
+    uint64_t total = kl_mem_total(), used = kl_mem_footprint();
+    fprintf(stderr, "  memory: %llu MiB footprint (peak %llu) of a %llu MiB budget, "
+                    "%llu low-memory notifications\n",
+            (unsigned long long)(used >> 20),
+            (unsigned long long)(atomic_load(&g_mem_peak) >> 20),
+            (unsigned long long)(total >> 20),
+            (unsigned long long)atomic_load(&g_lowmem_fired));
+}
+
+uint64_t kl_mem_budget_bytes(void)    { return kl_mem_total(); }
+uint64_t kl_mem_available_bytes(void) { return proc_free_bytes(); }
+
+// meminfo, statm and status are rebuilt on every read. They were written once
+// at startup, so anything polling "how much room is left" got a constant and
+// generous answer for the life of the process — pressure the guest could not
+// see even in principle.
+static void proc_put(const char *rel, const char *text);
+
+static void proc_refresh_mem(void) {
+    uint64_t total = kl_mem_total(), used = kl_mem_footprint();
+    uint64_t avail = proc_free_bytes();
+    char buf[1024];
+    snprintf(buf, sizeof buf,
+             "MemTotal:       %8llu kB\n"
+             "MemFree:        %8llu kB\n"
+             "MemAvailable:   %8llu kB\n"
+             "Buffers:               0 kB\n"
+             "Cached:                0 kB\n"
+             "SwapTotal:             0 kB\n"
+             "SwapFree:              0 kB\n",
+             (unsigned long long)(total / 1024),
+             (unsigned long long)(avail / 1024),
+             (unsigned long long)(avail / 1024));
+    proc_put("/proc/meminfo", buf);
+
+    // statm is in PAGES, and Linux's page here is 4096 whatever ours is —
+    // the guest divides by its own constant. Fields: size resident shared
+    // text lib data dt.
+    unsigned long long pages = used / 4096;
+    snprintf(buf, sizeof buf, "%llu %llu 0 0 0 %llu 0\n", pages, pages, pages);
+    proc_put("/proc/self/statm", buf);
+
+    snprintf(buf, sizeof buf,
+             "Name:\tklepton\n"
+             "State:\tR (running)\n"
+             "VmPeak:\t%8llu kB\n"
+             "VmSize:\t%8llu kB\n"
+             "VmHWM:\t%8llu kB\n"
+             "VmRSS:\t%8llu kB\n"
+             "VmData:\t%8llu kB\n"
+             "VmStk:\t     136 kB\n"
+             "VmSwap:\t       0 kB\n",
+             (unsigned long long)(used / 1024), (unsigned long long)(used / 1024),
+             (unsigned long long)(used / 1024), (unsigned long long)(used / 1024),
+             (unsigned long long)(used / 1024));
+    proc_put("/proc/self/status", buf);
 }
 
 static void proc_build(void) {
@@ -469,11 +651,6 @@ static void proc_build(void) {
 
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu < 1) ncpu = 1;
-
-    uint64_t memtotal = 0;
-    size_t   sz = sizeof memtotal;
-    if (sysctlbyname("hw.memsize", &memtotal, &sz, NULL, 0) != 0) memtotal = 0;
-    uint64_t memfree = proc_free_bytes();
 
     // aarch64 /proc/cpuinfo, in the format Linux emits and Unity parses: one
     // stanza per core keyed on "processor", then a Hardware line. The implementer
@@ -495,20 +672,9 @@ static void proc_build(void) {
     proc_put("/proc/cpuinfo", cpuinfo);
     free(cpuinfo);
 
-    char buf[1024];
-    snprintf(buf, sizeof buf,
-             "MemTotal:       %8llu kB\n"
-             "MemFree:        %8llu kB\n"
-             "MemAvailable:   %8llu kB\n"
-             "Buffers:               0 kB\n"
-             "Cached:                0 kB\n"
-             "SwapTotal:             0 kB\n"
-             "SwapFree:              0 kB\n",
-             (unsigned long long)(memtotal / 1024),
-             (unsigned long long)(memfree / 1024),
-             (unsigned long long)(memfree / 1024));
-    proc_put("/proc/meminfo", buf);
+    proc_refresh_mem();
 
+    char buf[1024];
     // "0-N" for more than one CPU, bare "0" for one — Linux's own formatting,
     // and Unity's parser depends on it.
     if (ncpu > 1) snprintf(buf, sizeof buf, "0-%ld\n", ncpu - 1);
@@ -528,8 +694,8 @@ static void proc_build(void) {
         snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpu_capacity", i);
         proc_put(rel, "1024\n");
     }
-    fprintf(stderr, "[proc] synthetic /proc and /sys at %s (%ld cpus, %llu MB)\n",
-            g_procroot, ncpu, (unsigned long long)(memtotal >> 20));
+    fprintf(stderr, "[proc] synthetic /proc and /sys at %s (%ld cpus, %llu MB budget)\n",
+            g_procroot, ncpu, (unsigned long long)(kl_mem_total() >> 20));
 }
 
 // Rewrite a guest path into the synthetic tree when we serve it. Returns `path`
@@ -567,6 +733,13 @@ const char *kl_guest_path(const char *path, char *buf, size_t cap) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, proc_build);
     if (!g_procroot[0]) return path;
+    // The memory files are rebuilt at the moment they are named. Everything
+    // else in the tree is static configuration; these three are the only ones
+    // whose whole point is that they change, and serving a startup snapshot of
+    // them is what let the guest run to an OOM without ever seeing pressure.
+    if (strcmp(path, "/proc/meminfo") == 0 ||
+        strcmp(path, "/proc/self/statm") == 0 ||
+        strcmp(path, "/proc/self/status") == 0) proc_refresh_mem();
     snprintf(buf, cap, "%s%s", g_procroot, path);
     struct stat st;
     return stat(buf, &st) == 0 ? buf : path;
@@ -1370,9 +1543,205 @@ int kl_ioctl(int fd, unsigned long req, uintptr_t arg) {
     }
 }
 
+// ---------- madvise ----------
+// The whole advice range is translated explicitly, because forwarding an
+// untranslated number is trap 4's family and this is its worst member: the two
+// systems agree on MADV_DONTNEED == 4 and disagree on what it MEANS.
+//
+//   Linux  MADV_DONTNEED: private anonymous pages are freed immediately, the
+//                         next touch reads zeros, and the footprint drops.
+//   Darwin MADV_DONTNEED: POSIX_MADV_DONTNEED — advice only. The pages are
+//                         deactivated, NOT discarded; the next touch reads the
+//                         old contents and phys_footprint never moves.
+//
+// Unity's VirtualMemory layer decommits with exactly the Linux idiom —
+// mprotect(PROT_NONE) then madvise(..., 4) — and its inverse, mprotect(PROT_READ|
+// PROT_WRITE), is the commit. Confirmed by disassembly in every guest here
+// (BONELAB libunity.so+0x2217a0, +0xc152dc, +0xc153d0; SUPERHOT +0x4c6a18).
+// Passed through, every decommit returned nothing, so the process footprint
+// became the high-water mark of everything Unity had ever committed: BONELAB
+// OOMs after enough deaths, SUPERHOT after the first set of levels. Both are the
+// same event counted twice, and neither log line mentions memory.
+//
+// Nothing about the failure is visible from inside: madvise returns 0, every
+// later allocation succeeds, and the process dies an hour later.
+#define LX_MADV_NORMAL      0
+#define LX_MADV_RANDOM      1
+#define LX_MADV_SEQUENTIAL  2
+#define LX_MADV_WILLNEED    3
+#define LX_MADV_DONTNEED    4
+#define LX_MADV_FREE        8
+#define LX_MADV_REMOVE      9
+#define LX_MADV_DONTFORK   10
+#define LX_MADV_DOFORK     11
+#define LX_MADV_MERGEABLE  12
+#define LX_MADV_UNMERGEABLE 13
+#define LX_MADV_HUGEPAGE   14
+#define LX_MADV_NOHUGEPAGE 15
+#define LX_MADV_DONTDUMP   16
+#define LX_MADV_DODUMP     17
+#define LX_MADV_WIPEONFORK 18
+#define LX_MADV_KEEPONFORK 19
+#define LX_MADV_COLD       20
+#define LX_MADV_PAGEOUT    21
+
+// KL_MADV_DONTNEED picks how the decommit is served:
+//   remap       (default) mmap(MAP_FIXED|MAP_ANON) over the range, per region,
+//               at that region's own protection. Reproduces Linux exactly:
+//               footprint dropped AND zero on next touch.
+//   reusable    MADV_FREE_REUSABLE (7) — one call, drops phys_footprint, does
+//               NOT zero. Strictly correct only with MADV_FREE_REUSE on the
+//               recommit, which no guest here issues.
+//   zero        MADV_ZERO (11) — closest single-call match to Linux, and may
+//               answer ENOTSUP, so it falls back to reusable.
+//   passthrough the old behaviour, for the A/B.
+static int kl_madv_mode(void) {
+    static int mode = -1;   // 0 passthrough, 1 remap, 2 reusable, 3 zero
+    if (mode < 0) {
+        const char *e = kl_env_str("KL_MADV_DONTNEED", NULL);
+        if (!e)                              mode = 1;
+        else if (strcmp(e, "passthrough")==0) mode = 0;
+        else if (strcmp(e, "reusable")   ==0) mode = 2;
+        else if (strcmp(e, "zero")       ==0) mode = 3;
+        else                                  mode = 1;
+    }
+    return mode;
+}
+
+// MADV_FREE_REUSABLE, and MADV_ZERO where it exists. Both are Darwin numbers,
+// not Linux ones, so they are spelled out rather than taken from the guest.
+static int kl_madv_reusable(void *a, size_t n) {
+    return madvise(a, n, 7 /* MADV_FREE_REUSABLE */);
+}
+
+// The re-map. Walk the range region by region so a range spanning two
+// protections keeps both, and refuse anything that is not private anonymous:
+// MAP_FIXED over a file mapping would replace the file's bytes with zeros,
+// which is not what Linux does and is not recoverable. SM_PRIVATE is touched
+// private anon, SM_EMPTY is reserved-and-never-touched; a private FILE mapping
+// is SM_COW, which is exactly the case that must not be clobbered.
+//
+// Unity has already set PROT_NONE by the time we are called, so re-mapping at
+// the region's own protection preserves PROT_NONE here — correct for this
+// caller, and the reason the protection is read per region rather than assumed.
+static int kl_madv_remap(void *a, size_t n) {
+    uintptr_t want = (uintptr_t)a, end = want + n;
+    while (want < end) {
+        vm_address_t                   addr = (vm_address_t)want;
+        vm_size_t                      sz   = 0;
+        natural_t                      depth = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t         cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &addr, &sz, &depth,
+                                 (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS)
+            return -1;
+        if ((uintptr_t)addr > want) return -1;            // a hole in the range
+        if (info.is_submap) return -1;
+        if (info.share_mode != SM_PRIVATE && info.share_mode != SM_EMPTY) return -1;
+
+        uintptr_t rend = (uintptr_t)addr + (uintptr_t)sz;
+        uintptr_t hi   = rend < end ? rend : end;
+        void *p = mmap((void *)want, hi - want, (int)info.protection,
+                       MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (p == MAP_FAILED) return -1;
+        want = hi;
+    }
+    return 0;
+}
+
+// The instrument. A decommit that returns nothing is invisible from every other
+// vantage point in the process, so the bytes are counted whether or not anyone
+// is watching, and KL_TRACE_MADV=1 prints them as they accumulate.
+// kl_madv_report() is what the end-of-run reports call.
+static _Atomic uint64_t g_madv_calls, g_madv_bytes;
+
+static void kl_madv_note(size_t n, int mode) {
+    // Sample the footprint here as well as from the frame pump: a decommit is
+    // where the spike is, and a per-frame sample can walk straight past one.
+    kl_mem_footprint();
+    uint64_t total = atomic_fetch_add(&g_madv_bytes, (uint64_t)n) + n;
+    uint64_t calls = atomic_fetch_add(&g_madv_calls, 1) + 1;
+    if (!kl_env_on("KL_TRACE_MADV", 0)) return;
+    static _Atomic uint64_t next;   // first 8, then every 256 MiB
+    if (calls > 8 && total < atomic_load(&next)) return;
+    atomic_store(&next, total + (256u << 20));
+    static const char *names[] = {"passthrough", "remap", "reusable", "zero"};
+    fprintf(stderr, "  [madv] DONTNEED %zu KiB (%llu calls, %llu MiB total, mode=%s)\n",
+            n >> 10, (unsigned long long)calls,
+            (unsigned long long)(total >> 20), names[mode]);
+}
+
+void kl_madv_report(void) {
+    uint64_t calls = atomic_load(&g_madv_calls), bytes = atomic_load(&g_madv_bytes);
+    static const char *names[] = {"passthrough", "remap", "reusable", "zero"};
+    // Printed even at zero: "the guest never decommitted" is the measurement,
+    // not the absence of one. A Unity guest that reaches a level transition and
+    // still reports 0 here is saying its VirtualMemory layer is not the story.
+    fprintf(stderr, "  decommit: %llu MADV_DONTNEED calls, %llu MiB, mode=%s\n",
+            (unsigned long long)calls, (unsigned long long)(bytes >> 20),
+            names[kl_madv_mode()]);
+}
+
 int klb_madvise(void *a, size_t n, int advice) {
-    if (advice == 8) advice = MADV_FREE;         // Linux MADV_FREE
-    return madvise(a, n, advice);
+    switch (advice) {
+    case LX_MADV_NORMAL:     return madvise(a, n, MADV_NORMAL);
+    case LX_MADV_RANDOM:     return madvise(a, n, MADV_RANDOM);
+    case LX_MADV_SEQUENTIAL: return madvise(a, n, MADV_SEQUENTIAL);
+    case LX_MADV_WILLNEED:   return madvise(a, n, MADV_WILLNEED);
+
+    case LX_MADV_DONTNEED: {
+        int mode = kl_madv_mode();
+        kl_madv_note(n, mode);
+        if (!n) return 0;
+        // How much this call actually RELEASED, which is a different question
+        // from how much it was asked to release: Unity decommits ranges it
+        // committed optimistically and may never have touched, and an untouched
+        // range has no physical pages to give back under any of these modes.
+        // Measured on BONELAB, the two answers differ by three orders of
+        // magnitude — see the note in notes/MEMORYLEAK.md.
+        int trace = kl_env_on("KL_TRACE_MADV", 0);
+        uint64_t before = trace ? kl_mem_footprint() : 0;
+        int rc = 0;
+        if (mode == 0) rc = madvise(a, n, MADV_DONTNEED);
+        else if (mode == 1 && kl_madv_remap(a, n) == 0) rc = 0;
+        else if (mode == 3 && madvise(a, n, 11 /* MADV_ZERO */) == 0) rc = 0;
+        else if (kl_madv_reusable(a, n) == 0) rc = 0;
+        else rc = -2;
+        if (trace) {
+            uint64_t after = kl_mem_footprint();
+            static _Atomic int shown;
+            if (atomic_fetch_add(&shown, 1) < 24)
+                fprintf(stderr, "  [madv]   asked %zu KiB, footprint %lld KiB -> %lld "
+                                "(released %lld KiB)\n", n >> 10,
+                        (long long)(before >> 10), (long long)(after >> 10),
+                        (long long)((int64_t)before - (int64_t)after) >> 10);
+        }
+        if (rc != -2) return rc;
+        // Nothing worked. Do NOT report failure: the guest treats a failing
+        // decommit as an allocator error (BONELAB's release path checks errno
+        // for EACCES/ENOMEM), and Linux's advice is advisory to begin with.
+        return 0;
+    }
+
+    // Load-bearing: Darwin's 8 is MADV_FREE_REUSE, the OPPOSITE operation.
+    case LX_MADV_FREE:       return madvise(a, n, MADV_FREE);
+
+    // No guest here is known to issue these. They are listed so the default
+    // arm cannot forward them: Linux 11 (DOFORK) lands on Darwin's MADV_ZERO
+    // and would silently zero the guest's range, and 10 (DONTFORK) lands on
+    // MADV_PAGEOUT.
+    case LX_MADV_REMOVE:     case LX_MADV_DONTFORK:   case LX_MADV_DOFORK:
+    case LX_MADV_MERGEABLE:  case LX_MADV_UNMERGEABLE:
+    case LX_MADV_HUGEPAGE:   case LX_MADV_NOHUGEPAGE:
+    case LX_MADV_DONTDUMP:   case LX_MADV_DODUMP:
+    case LX_MADV_WIPEONFORK: case LX_MADV_KEEPONFORK:
+    case LX_MADV_COLD:       case LX_MADV_PAGEOUT:
+        return 0;                                  // no Darwin equivalent; advice
+
+    default:
+        fcntl_warn_once("madvise", advice);
+        return 0;
+    }
 }
 
 // open() lives behind a variadic thunk in kl_va_handlers.c, so its trace call

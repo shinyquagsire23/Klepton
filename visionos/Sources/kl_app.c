@@ -636,6 +636,10 @@ int kl_app_boot(void) {
 
     heartbeat_start();
     kl_fault_install();
+    // Subscribe to the OS's memory-pressure signal before the guest allocates
+    // anything. On this platform it is the only warning that arrives ahead of
+    // jetsam, and jetsam is a kill with no log line of its own.
+    kl_mem_pressure_init();
     // Strict: an unimplemented *call* is fatal, so the run stops exactly where
     // the surface genuinely ends. Lookups are not — the guest resolves plenty
     // it never calls.
@@ -913,6 +917,9 @@ int kl_app_frame(void) {
     int r = ((int8_t (*)(void *, void *))g_render)(kl_jni_env(), g_thiz);
     kl_jni_local_frame_pop();
     kl_jni_drain_ui_tasks();
+    // Android's low-memory notification. It matters more here than on the host:
+    // this is where jetsam is, and the only warning that arrives before it.
+    kl_mem_pressure_poll();
     alarm(0);
     g_frames_pumped++;
     return r;
@@ -940,6 +947,8 @@ void kl_app_lifecycle_report(void) {
     // the picture stayed associated, have never been readable from a device
     // run. That is the one report the graphics work most needs.
     kl_ovrp_report(stdout);
+    kl_madv_report();
+    kl_mem_report();
     fflush(NULL);
     snprintf(g_status, sizeof g_status, "lifecycle ran, %u frames", g_frames_pumped);
 }

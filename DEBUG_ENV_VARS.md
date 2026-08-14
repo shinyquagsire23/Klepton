@@ -307,11 +307,51 @@ Built for the loading-pace investigation; all default off.
   wakes. The loading crawl came with zero timeouts — the wake path is healthy.
 - `KL_USLEEP_CAP=<usec>` — clamp every guest usleep. Proved the ~5 ms polling
   loop is a watcher, not the loading pacer.
+- `KL_DLOPEN_REFUSE=<substr>[,<substr>]` — refuse these guest libraries by name,
+  as if the file were not installed. Matched against the whole path, so
+  `phonon` catches `libphonon` and `libaudioplugin_phonon` both. Not a way to
+  hide a gap: a guest that dlopens an optional plugin already has a path for it
+  being absent, and a NULL here is what a device gives it. What it buys is
+  **isolation** — `KL_DLOPEN_REFUSE=phonon` takes Steam Audio out of a VRChat
+  run, which is the difference between reaching the frame loop and not (see
+  `notes/VRCHAT.md`). Nothing is refused by default and every refusal is named.
 - `KL_X18_MAP=<file>` — append "veneer_addr site_addr" per patched x18 site,
   so a guest pc captured in a shim maps back to its call site.
 - `KL_TRACE_IMAGES=1` — per-image base/span; needed to turn a guest pc into a
   file offset (`pc - image base`, e.g. the connect-NULL site at
   libunity+0x966964).
+
+## Memory: decommit, budget and pressure (`runtime/kl_libc.c`)
+
+The guest's own memory management, and the three seams that used to disable it.
+See `notes/MEMORYLEAK.md` for the measurements behind each default.
+
+- `KL_MADV_DONTNEED=remap|reusable|zero|passthrough` — how a guest
+  `madvise(MADV_DONTNEED)` is served. Default `remap`. **`MADV_DONTNEED` is 4 on
+  Linux and Darwin and means different things**: Linux frees the pages, Darwin
+  merely deactivates them, so Unity's `mprotect(PROT_NONE)` + `madvise(4)`
+  decommit returned *nothing* and the footprint became a high-water mark.
+  `passthrough` is the old behaviour and the A/B.
+- `KL_TRACE_MADV=1` — every decommit, and **what it actually released** measured
+  against `phys_footprint` either side of the call. That second number is the
+  one that matters: "asked 16384 KiB" and "released 0 KiB" is the bug, and
+  `passthrough` prints exactly that on every call while `remap` prints the full
+  amount. Rate-limited to the first 8 calls, then every 256 MiB.
+- `KL_MEM_TOTAL_MB=<n>` — what `/proc/meminfo` reports as `MemTotal`, capped at
+  the host's real memory. Default **6144**, the Quest 2's RAM: this is part of
+  the device identity we already present, and a 6 GB title sizes its streaming
+  budgets and pool ceilings from it. It used to report the host's — 16 GB on a
+  Vision Pro, 32–128 on a development Mac. `MemFree`/`MemAvailable` are now
+  recomputed on every read against our own footprint (they were a startup
+  snapshot), and `/proc/self/statm` and `/proc/self/status` are served at all.
+- `KL_LOWMEM_AT=<percent>` — footprint at which the guest is told memory is
+  short, through `UnityPlayer.nativeLowMemory` (where a title runs
+  `Resources.UnloadUnusedAssets()`). Default 80; **0 disables**, which is the
+  A/B. Nothing delivered this notification before, so every cache a Quest build
+  drops under pressure was held here forever.
+- `KL_LOWMEM_CLEAR=<percent>` — re-arm threshold, default 70. A guest that
+  cannot free anything is asked once, not once a frame. The OS's own
+  memory-pressure signal ignores both and always fires.
 
 ## Guest storage (`runtime/kl_jni.c`)
 
@@ -847,6 +887,14 @@ that reports what came due since the frontend last asked. Platform-independent
   moves the capture without a rebuild. That matters because a streaming run
   costs a fresh Steam pairing to repeat. The `[xr] layer N eye M <- swapchain`
   lines say what each one is, and mark the captured one.
+- `KL_XR_CAPTURE_EYE=0|1` — which eye `KL_GLFB_OUT` writes (default 0). Needed
+  because a Unity OpenXR guest's eye swapchain is ONE array texture with a
+  slice per eye, so there is no per-eye texture name to pick between. The
+  capture now takes the presented image the guest STATED
+  (`kl_glfb_set_live_eye_image`: name, size and array layer) rather than
+  searching for an FBO by texture name — the search read the eye at the
+  window's size and produced the window, and a GL name is a slot rather than
+  an identity anyway (trap 31).
 - `KL_XR_REFRESH_EXT=0` — stop advertising `XR_FB_display_refresh_rate`
   (`runtime/kl_openxr.c`), putting the runtime back to before SL-11. The A/B
   for anything that changes when the client can answer the host's rate

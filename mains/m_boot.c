@@ -418,6 +418,7 @@ static void poke_texture_unit_cap(void) {
 
 static int recon_run(int view_pump) {
     install_fault_reporter();
+    kl_mem_pressure_init();
     // Strict: an unimplemented *call* is fatal. Lookups are not, so this
     // stops only where the surface genuinely ends. KL_PERMISSIVE=1 flips it
     // to a zero return, which collects a whole batch in one run when pushing
@@ -616,6 +617,10 @@ static int recon_run(int view_pump) {
                 ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2);
                 kl_jni_local_frame_pop();
                 kl_jni_drain_ui_tasks();
+                // Android's low-memory notification, which nothing delivered
+                // before this: one task_info call, and the guest drops its
+                // caches when the footprint crosses the reported budget.
+                kl_mem_pressure_poll();
                 // The haptics seam's host end. Nothing on macOS can vibrate, so
                 // this only drains and counts — but draining is the point: it
                 // is what makes the host a working A/B for the whole path down
@@ -712,6 +717,8 @@ static int recon_run(int view_pump) {
     kl_opensl_report(stdout);
     kl_ovrp_report(stdout);
     kl_ovrplat_report(stdout);
+    kl_madv_report();
+    kl_mem_report();
     fflush(NULL);   // _exit does not flush stdio, and the report is the point
     _exit(0);
 }
@@ -799,6 +806,8 @@ static int view_run(void) {
     kl_opensl_report(stdout);
     kl_ovrp_report(stdout);
     kl_ovrplat_report(stdout);
+    kl_madv_report();
+    kl_mem_report();
     return rc;
 }
 
