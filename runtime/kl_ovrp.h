@@ -487,6 +487,14 @@ float kl_ovrp_eye_height(void);
 // Any output pointer may be NULL. `pos`/`vel`/`ang` take 3 floats, `quat` 4
 // (x, y, z, w), all in the current tracking space.
 int kl_ovrp_hand_motion(int hand, float *pos, float *quat, float *vel, float *ang);
+
+// ...and whether `vel`/`ang` from that call are a measurement at all. A frontend
+// that publishes pose only has its motion DERIVED here (successive poses over
+// the wall clock), which covers every sample but the first after a gap; those
+// report 0 and must be passed on as OpenXR's velocityFlags == 0 rather than as a
+// velocity of zero, which asserts the thing is stationary. KL_OVRP_DERIVE_VELOCITY=0
+// turns the derivation off, and is the A/B for anything that looks velocity-shaped.
+int kl_ovrp_hand_motion_known(int hand);
 int kl_ovrp_controller_input(int hand, uint32_t *buttons, uint32_t *touches,
                              float *index_trigger, float *hand_trigger,
                              float *stick_x, float *stick_y);

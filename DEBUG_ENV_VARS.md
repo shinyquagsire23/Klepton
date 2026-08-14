@@ -392,10 +392,24 @@ and why nothing outside the binary could answer it.
 - `KL_GUEST_PATCH=0` — apply none of them. The A/B for every row: with it VRChat
   stops on its "Under Construction" screen exactly as it did before.
 - `KL_GUEST_PATCH_OFF=<name>[,<name>]` — turn off one by name. The names are
-  `vrchat-under-construction` and `vrchat-min-client-version`; the second is
-  the one to reach for, because it is a real version check against VRChat's own
-  API (the tree's APK is build 1862 and the service asks for 1865) and the
-  honest fix for it is a newer APK, not a patch.
+  `vrchat-under-construction`, `vrchat-min-client-version`, `vrchat-multipass`
+  and `vrchat-fbo-context-guard`. `vrchat-min-client-version` is the one to
+  reach for, because it is a real version check against VRChat's own API (the
+  tree's APK is build 1862 and the service asks for 1865) and the honest fix for
+  it is a newer APK, not a patch. `vrchat-fbo-context-guard` is the A/B for
+  Unity's cross-context framebuffer guard: off, VRChat binds `(GLuint)-1` as its
+  draw framebuffer and loses whole render passes to
+  `GL_INVALID_FRAMEBUFFER_OPERATION` (322 a run vs 0) — see notes/VRCHAT.md
+  Session 12, including what it does *not* fix.
+- `KL_TRACE_HRTF=1` — interpose Steam Audio's `iplHRTFCreate` and print the
+  `IPLAudioSettings` and `IPLHRTFSettings` the guest passes, plus the result.
+  Managed code resolves a P/Invoke by name through `klb_dlsym`, so a wrapper
+  handed back there sits on the seam with the real function one call away. This
+  is what showed that `size == 1` is not the frame size we supply
+  (notes/VRCHAT.md Session 12 §5).
+- `KL_TRACE_WMEMCHR=1` — print every `wmemchr`, with the haystack on a miss.
+  Steam Audio picks its HRIR length by `std::find` over an int array, which
+  lowers to `wmemchr`; a miss there has no error surface at all.
 - `KL_TRACE_PATCH=1` — print each word: address, the value that was there, the
   value written, and what the new instruction is. Also prints the rows that were
   considered and left alone because the address is past the end of the image,
@@ -801,6 +815,16 @@ standing eye height — `kl_ovrp_tracking_origin()` reports which space is in
 force, and a frontend that reports an eye-level head into a floor-level world
 puts the camera on the ground with its hands underneath it.
 
+- `KL_OVRP_DERIVE_VELOCITY=0` — stop deriving linear/angular velocity from
+  successive poses, so a frontend that publishes pose only reports its motion as
+  UNKNOWN (OpenXR `velocityFlags == 0`) instead of measured. Default on.
+  `KleptonControllers.swift` publishes real motion off the Sense controllers and
+  is unaffected either way; the macOS viewer and the parked default poses go
+  through the pose-only call and are what this derives for. What it must never
+  go back to is the third option — velocity **zero and valid**, which is not
+  silence but the assertion that a controller whose position is changing in the
+  same sample is stationary. `kl_openxr` was already careful to distinguish
+  those; the zeros defeated it from the publishing side.
 - `KL_OVRP_EYE_HEIGHT=<metres>` — standing eye height for the *default* head
   pose, i.e. what a headless run reports when no frontend has called
   `kl_ovrp_set_head_pose`. **Default 1.6**, and forced to 0 when the guest

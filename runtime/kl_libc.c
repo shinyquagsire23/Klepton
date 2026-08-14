@@ -987,6 +987,7 @@ int    klb_system(const char *cmd) { (void)cmd; warn_once("system"); return 127;
 // takes that same lock: the futex contract stores the new value before waking,
 // so a wakeup cannot slip through the gap.
 #define KL_SYS_futex 98                 // aarch64 Linux
+#define KL_SYS_getrandom 278            // ...and the other one a guest depends on
 
 enum {
     KL_FUTEX_WAIT = 0, KL_FUTEX_WAKE = 1, KL_FUTEX_WAKE_OP = 5,
@@ -1277,6 +1278,24 @@ long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
         return kl_futex((int32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3,
                         (const struct timespec *)(uintptr_t)a4,
                         (int32_t *)(uintptr_t)a5, (uint32_t)a6);
+    // getrandom, and it is FATAL to refuse rather than merely unimplemented:
+    // VRChat loads libpython3.12.so, and CPython seeds its hash randomization
+    // from this before it will run at all — a refusal here is
+    // "Fatal Python error: _Py_HashRandomization_Init: failed to get random
+    // numbers to initialize Python", thrown several layers from the syscall and
+    // naming nothing that leads back to it. Same family as the futex refusal
+    // (trap 6d): the caller has no fallback and does not treat this as optional.
+    //
+    // arc4random_buf rather than getentropy: it cannot fail, has no 256-byte
+    // limit, and is non-blocking — so both GRND_NONBLOCK and GRND_RANDOM are
+    // satisfied by construction rather than by us interpreting the flags.
+    if (n == KL_SYS_getrandom) {
+        void  *buf = (void *)(uintptr_t)a1;
+        size_t len = (size_t)a2;
+        if (!buf && len) { errno = EFAULT; return -1; }
+        if (len) arc4random_buf(buf, len);
+        return (long)len;
+    }
     syscall_warn_once(n);
     errno = ENOSYS;
     return -1;

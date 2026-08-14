@@ -1642,6 +1642,26 @@ static int64_t klj_GetLongField(void *e, void *o, void *f)         { (void)e; re
 #define KLJ_DISPLAY_REFRESH  72.0f
 #define KLJ_DISPLAY_ROTATION 0       /* Surface.ROTATION_0 */
 
+// NetworkCapabilities.TRANSPORT_* / NET_CAPABILITY_*, from android-34's
+// android.jar. Defined here rather than beside their handlers because both
+// g_fields (which hands the guest the numbers) and klj_NetworkCapabilities_*
+// (which answers questions phrased in them) have to mean the same thing by
+// them — the one bug this whole family is prone to is the two drifting apart.
+#define KLJ_NC_TRANSPORT_CELLULAR   0
+#define KLJ_NC_TRANSPORT_WIFI       1
+#define KLJ_NC_TRANSPORT_BLUETOOTH  2
+#define KLJ_NC_TRANSPORT_ETHERNET   3
+#define KLJ_NC_TRANSPORT_VPN        4
+#define KLJ_NC_CAP_NOT_METERED     11
+#define KLJ_NC_CAP_INTERNET        12
+#define KLJ_NC_CAP_NOT_RESTRICTED  13
+#define KLJ_NC_CAP_TRUSTED         14
+#define KLJ_NC_CAP_NOT_VPN         15
+#define KLJ_NC_CAP_VALIDATED       16
+#define KLJ_NC_CAP_NOT_ROAMING     18
+#define KLJ_NC_CAP_NOT_CONGESTED   20
+#define KLJ_NC_CAP_NOT_SUSPENDED   21
+
 static const klj_field g_fields[] = {
     // Audio. The PROPERTY_* values are the real Android key strings, so the
     // getProperty implementation can match on them rather than on our own names.
@@ -1672,6 +1692,15 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/content/pm/PackageManager", "PERMISSION_GRANTED", 0),
 
     KLJ_FSTR("android/content/Intent", "ACTION_MAIN", "android.intent.action.MAIN"),
+    // VRChat watches the battery. ACTION_BATTERY_CHANGED is a STICKY broadcast,
+    // so the guest's next move is registerReceiver(...) — which on Android
+    // returns the last Intent rather than null, and whose extras are the battery
+    // state. When that arrives it must read the kl_ovrp battery seam, the same
+    // source BatteryManager.isCharging/getIntProperty already answer from: two
+    // sources for one battery is a level that disagrees with its own charging
+    // flag, and nothing would report it.
+    KLJ_FSTR("android/content/Intent", "ACTION_BATTERY_CHANGED",
+             "android.intent.action.BATTERY_CHANGED"),
 
     KLJ_FSTR("android/os/Environment", "MEDIA_MOUNTED", "mounted"),
     KLJ_FFN("android/net/Uri", "EMPTY", "Landroid/net/Uri;", klj_Uri_EMPTY),
@@ -1821,6 +1850,26 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/net/ConnectivityManager", "TYPE_MOBILE",   0),
     KLJ_FINT("android/net/ConnectivityManager", "TYPE_WIFI",     1),
     KLJ_FINT("android/net/ConnectivityManager", "TYPE_ETHERNET", 9),
+
+    // ...and the same thing for the API that replaced it. A Unity 2022 title
+    // asks NetworkCapabilities instead, and reads these as fields for exactly
+    // the reason above — VRChat wants NET_CAPABILITY_NOT_METERED, i.e. "may I
+    // download freely on this link". Platform constants, so they are facts
+    // rather than answers; what we DO with them is klj_NetworkCapabilities_*.
+    KLJ_FINT("android/net/NetworkCapabilities", "TRANSPORT_CELLULAR",  KLJ_NC_TRANSPORT_CELLULAR),
+    KLJ_FINT("android/net/NetworkCapabilities", "TRANSPORT_WIFI",      KLJ_NC_TRANSPORT_WIFI),
+    KLJ_FINT("android/net/NetworkCapabilities", "TRANSPORT_BLUETOOTH", KLJ_NC_TRANSPORT_BLUETOOTH),
+    KLJ_FINT("android/net/NetworkCapabilities", "TRANSPORT_ETHERNET",  KLJ_NC_TRANSPORT_ETHERNET),
+    KLJ_FINT("android/net/NetworkCapabilities", "TRANSPORT_VPN",       KLJ_NC_TRANSPORT_VPN),
+    KLJ_FINT("android/net/NetworkCapabilities", "NET_CAPABILITY_NOT_METERED",   KLJ_NC_CAP_NOT_METERED),
+    KLJ_FINT("android/net/NetworkCapabilities", "NET_CAPABILITY_INTERNET",      KLJ_NC_CAP_INTERNET),
+    KLJ_FINT("android/net/NetworkCapabilities", "NET_CAPABILITY_NOT_RESTRICTED",KLJ_NC_CAP_NOT_RESTRICTED),
+    KLJ_FINT("android/net/NetworkCapabilities", "NET_CAPABILITY_TRUSTED",       KLJ_NC_CAP_TRUSTED),
+    KLJ_FINT("android/net/NetworkCapabilities", "NET_CAPABILITY_NOT_VPN",       KLJ_NC_CAP_NOT_VPN),
+    KLJ_FINT("android/net/NetworkCapabilities", "NET_CAPABILITY_VALIDATED",     KLJ_NC_CAP_VALIDATED),
+    KLJ_FINT("android/net/NetworkCapabilities", "NET_CAPABILITY_NOT_ROAMING",   KLJ_NC_CAP_NOT_ROAMING),
+    KLJ_FINT("android/net/NetworkCapabilities", "NET_CAPABILITY_NOT_CONGESTED", KLJ_NC_CAP_NOT_CONGESTED),
+    KLJ_FINT("android/net/NetworkCapabilities", "NET_CAPABILITY_NOT_SUSPENDED", KLJ_NC_CAP_NOT_SUSPENDED),
 
     // Unity asks the MediaRouter for the live-video route to find out whether it
     // should be presenting to an external display. Values are from android-34's
@@ -2432,6 +2481,139 @@ static klj_val klj_Intent_addCategory(void *env, void *self, const klj_val *a, i
     KLJ_LOG("Intent.addCategory(\"%s\")", c ? c : "(null)");
     return (klj_val){.l = self};
 }
+
+// ---- IntentFilter + registerReceiver: the STICKY battery query --------------
+//
+// libunity reads the battery exactly as Android documents it: build an
+// IntentFilter for ACTION_BATTERY_CHANGED, call registerReceiver with a NULL
+// receiver, and read the Intent that comes back — `level`, `scale` and
+// `status`, which are the three extras its own .text names.
+//
+// ACTION_BATTERY_CHANGED is a STICKY broadcast, and that is what makes this
+// answerable at all: the call is a QUERY, returning the value the system last
+// published, so it works with nothing ever being delivered. That is the whole
+// difference from JavaBroadcastReceiver.setReceiver further down, which
+// subscribes to a bus with no publisher and correctly models nothing — here
+// there is no delivery to model, only a current value.
+//
+// The value is the kl_ovrp battery seam, the same source
+// BatteryManager.isCharging and getIntProperty already answer from. Two sources
+// for one battery is a level that disagrees with its own charging flag, and
+// nothing anywhere would report it.
+#define KLJ_IF_MAX_ACTIONS 8
+#define KLJ_ACTION_BATTERY "android.intent.action.BATTERY_CHANGED"
+
+typedef struct { char *act[KLJ_IF_MAX_ACTIONS]; int n; } klj_intent_filter;
+
+static void klj_intent_filter_free(void *p) {
+    klj_intent_filter *f = p;
+    if (!f) return;
+    for (int i = 0; i < f->n; i++) free(f->act[i]);
+    free(f);
+}
+
+static void klj_if_add(void *self, const char *action) {
+    klj_object *o = klj_as_object(self);
+    klj_intent_filter *f = o ? o->data : NULL;
+    if (!f || !action) return;
+    if (f->n >= KLJ_IF_MAX_ACTIONS) {
+        // Bounded, and it says so: a filter that silently drops the action the
+        // caller cares about is a registration that matches nothing.
+        KLJ_LOG("IntentFilter.addAction(\"%s\") — DROPPED, filter is full (%d)",
+                action, KLJ_IF_MAX_ACTIONS);
+        return;
+    }
+    f->act[f->n++] = strdup(action);
+}
+
+// Serves both `new IntentFilter()` and `new IntentFilter(action)` — the one-arg
+// form is just the empty one with its first addAction already done.
+static klj_val klj_IntentFilter_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    void *obj = klj_new_object_data("android/content/IntentFilter",
+                                    calloc(1, sizeof(klj_intent_filter)));
+    klj_own(obj, klj_intent_filter_free);
+    if (n > 0) klj_if_add(obj, klj_str(a[0].l));
+    return (klj_val){.l = obj};
+}
+
+static klj_val klj_IntentFilter_addAction(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_if_add(self, n > 0 ? klj_str(a[0].l) : NULL);
+    return (klj_val){0};
+}
+
+static klj_val klj_Context_registerReceiver(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_object        *fo = n > 1 ? klj_as_object(a[1].l) : NULL;
+    klj_intent_filter *f  = fo ? fo->data : NULL;
+
+    int sticky_battery = 0;
+    for (int i = 0; f && i < f->n; i++)
+        if (f->act[i] && strcmp(f->act[i], KLJ_ACTION_BATTERY) == 0) sticky_battery = 1;
+
+    if (!sticky_battery) {
+        // Registration for a non-sticky filter. It must not FAIL — the caller
+        // treats registering as unconditional — and null is the correct Android
+        // answer, not a stub: there is no sticky value to return. Named once,
+        // because this list is the only statement of what the guest expected to
+        // hear about, and nothing here can ever deliver it.
+        static int said;
+        if (!said++) {
+            char buf[256]; buf[0] = 0;
+            for (int i = 0; f && i < f->n; i++) {
+                if (buf[0]) strlcat(buf, " ", sizeof buf);
+                strlcat(buf, f->act[i] ? f->act[i] : "(null)", sizeof buf);
+            }
+            KLJ_LOG("Context.registerReceiver for [%s] — accepted, but nothing "
+                    "here broadcasts, so no onReceive can ever arrive", buf);
+        }
+        return (klj_val){.l = NULL};
+    }
+
+    void *obj = kl_jni_new_object("android/content/Intent");
+    klj_as_object(obj)->data = strdup(KLJ_ACTION_BATTERY);
+    klj_own(obj, free);
+    return (klj_val){.l = obj};
+}
+
+// Intent.getIntExtra(key, default). Only the battery Intent above carries any,
+// and only the three libunity actually reads; everything else gets the caller's
+// own default, which is exactly what Android returns for an absent extra.
+static klj_val klj_Intent_getIntExtra(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_object *o      = klj_as_object(self);
+    const char *action = o ? o->data : NULL;
+    const char *key    = n > 0 ? klj_str(a[0].l) : NULL;
+    int         dflt   = n > 1 ? (int)(int32_t)a[1].j : -1;
+
+    if (!action || !key || strcmp(action, KLJ_ACTION_BATTERY) != 0)
+        return (klj_val){.j = (uint32_t)dflt};
+
+    // level/scale rather than a percentage: the caller divides one by the
+    // other, so the pair has to be internally consistent and the seam's 0..100
+    // is already a percentage — scale 100 makes level its own numerator.
+    if (strcmp(key, "level") == 0) return (klj_val){.j = (uint32_t)kl_ovrp_battery_level()};
+    if (strcmp(key, "scale") == 0) return (klj_val){.j = 100};
+    if (strcmp(key, "status") == 0) {
+        // BatteryManager.BATTERY_STATUS_*: CHARGING 2, DISCHARGING 3, FULL 5.
+        // FULL at 100% is the documented mapping, and Unity's own
+        // SystemInfo.batteryStatus distinguishes it from Charging.
+        int charging = kl_ovrp_battery_charging();
+        int level    = kl_ovrp_battery_level();
+        return (klj_val){.j = (uint32_t)(charging ? (level >= 100 ? 5 : 2) : 3)};
+    }
+    KLJ_LOG("Intent.getIntExtra(\"%s\") on the battery Intent — not one of "
+            "level/scale/status, answering the caller's default %d", key, dflt);
+    return (klj_val){.j = (uint32_t)dflt};
+}
+
+static klj_val klj_Intent_getAction(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    const char *action = o ? o->data : NULL;
+    return (klj_val){.l = action ? kl_jni_new_string(action) : NULL};
+}
 // ---- WebView, and what it honestly is here ----------------------------------
 //
 // The VR client's in-headset UI is an Android WebView rendered to a texture:
@@ -2763,6 +2945,67 @@ static klj_val klj_NetworkInfo_getType(void *env, void *self,
     (void)env; (void)self; (void)a; (void)n;
     KLJ_LOG("NetworkInfo.getType() -> TYPE_WIFI");
     return (klj_val){.j = KLJ_CONNECTIVITY_TYPE_WIFI};
+}
+
+// ---- NetworkCapabilities: the modern spelling of the same two answers -------
+//
+// getActiveNetworkInfo (above) is the Unity-2018 way to ask; a Unity 2022 title
+// asks getNetworkCapabilities instead, and VRChat does. These MUST agree: a
+// device that is on Wi-Fi through one API and on nothing through the other is a
+// contradiction the guest is entitled to notice, and this file already answers
+// the question once — connected, and Wi-Fi, because we present a Quest 2 and a
+// Quest 2 has no cellular radio (see klj_NetworkInfo_getType for why that is a
+// policy answer rather than an invented measurement).
+//
+// So this is a group, for the reason the display panel and the audio device are
+// groups: the members cross-check each other, and answering them one at a time
+// as each is forced is how they end up disagreeing.
+static klj_val klj_ConnectivityManager_getNetworkCapabilities(void *env, void *self,
+                                                              const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *caps;
+    return klj_singleton("android/net/NetworkCapabilities", &caps);
+}
+
+static klj_val klj_NetworkCapabilities_hasTransport(void *env, void *self,
+                                                    const klj_val *a, int n) {
+    (void)env; (void)self;
+    int t   = n > 0 ? (int)(int32_t)a[0].j : -1;
+    int yes = (t == KLJ_NC_TRANSPORT_WIFI);
+    KLJ_LOG("NetworkCapabilities.hasTransport(%d) -> %s", t, yes ? "true" : "false");
+    return (klj_val){.j = (uint64_t)yes};
+}
+
+// The positive capabilities are the two that mean "this link works", and the
+// NOT_* family are negative assertions about problems this host does not have —
+// there is no metering, no roaming, no VPN and no captive portal on a desktop
+// Ethernet/Wi-Fi link, so denying them would describe a worse network than the
+// one the guest is demonstrably talking to us over. Anything outside the set is
+// NAMED once and answered false, because a blanket true here would claim
+// capabilities we have not thought about.
+static klj_val klj_NetworkCapabilities_hasCapability(void *env, void *self,
+                                                     const klj_val *a, int n) {
+    (void)env; (void)self;
+    int c = n > 0 ? (int)(int32_t)a[0].j : -1;
+    int yes;
+    switch (c) {
+    case KLJ_NC_CAP_INTERNET:      case KLJ_NC_CAP_VALIDATED:
+    case KLJ_NC_CAP_NOT_METERED:   case KLJ_NC_CAP_NOT_RESTRICTED:
+    case KLJ_NC_CAP_TRUSTED:       case KLJ_NC_CAP_NOT_VPN:
+    case KLJ_NC_CAP_NOT_ROAMING:   case KLJ_NC_CAP_NOT_CONGESTED:
+    case KLJ_NC_CAP_NOT_SUSPENDED: yes = 1; break;
+    default: {
+        static int said;
+        if (!said++)
+            KLJ_LOG("NetworkCapabilities.hasCapability(%d) — outside the set this "
+                    "host models; answering false. If a guest depends on it, "
+                    "this line is where the work starts", c);
+        yes = 0;
+        break;
+    }
+    }
+    KLJ_LOG("NetworkCapabilities.hasCapability(%d) -> %s", c, yes ? "true" : "false");
+    return (klj_val){.j = (uint64_t)yes};
 }
 
 // A WifiLock is not a claim about connectivity — it is a request to the power
@@ -6234,6 +6477,31 @@ static klj_val klj_JavaBroadcastReceiver_setReceiver(void *env, void *self,
     return (klj_val){0};
 }
 
+// updateDigest(context, key, value) — the send side of that same dead bus, and
+// transcribed rather than guessed (JavaBroadcastReceiver.smali:72). It builds
+// `new Intent("UpdateMBDMap")`, puts the pair in a Bundle, aims it at the app's
+// OWN package, and sends it; the only receiver that could ever act on it is the
+// registration above, which by construction never fires. So a no-op here is the
+// whole of the method's observable effect, not a stub of it — the pair is
+// logged once so the digest map is at least visible if it ever matters.
+//
+// Worth knowing where the guest's own version goes next: the sendBroadcast it
+// calls is `aGGhd3/aVmTv8/vt1Tu8.sendBroadcast`, i.e. the APK's Appdome layer
+// has hooked it. That layer never runs here (we execute no Java), which is why
+// this stops at Unity's method rather than inside it.
+static klj_val klj_JavaBroadcastReceiver_updateDigest(void *env, void *self,
+                                                      const klj_val *a, int n) {
+    (void)env; (void)self;
+    static int said;
+    if (n >= 3 && !said++) {
+        const char *k = klj_str(a[1].l), *v = klj_str(a[2].l);
+        KLJ_LOG("JavaBroadcastReceiver.updateDigest(\"%s\", \"%s\") — an Intent "
+                "broadcast to our own package, which nothing here delivers",
+                k ? k : "(null)", v ? v : "(null)");
+    }
+    return (klj_val){0};
+}
+
 // ---- HFPStatus: the Bluetooth hands-free profile, which is not here ----
 //
 // com/unity3d/player/HFPStatus manages a Bluetooth SCO link so a headset's
@@ -8906,6 +9174,9 @@ static const klj_binding g_bindings[] = {
     {"com/unity3d/player/JavaBroadcastReceiver", "setReceiver",
      "(Landroid/content/Context;Lcom/unity3d/player/JavaBroadcastReceiverInterface;"
      "[Ljava/lang/String;)V", klj_JavaBroadcastReceiver_setReceiver},
+    {"com/unity3d/player/JavaBroadcastReceiver", "updateDigest",
+     "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V",
+     klj_JavaBroadcastReceiver_updateDigest},
     {"com/unity3d/player/HFPStatus", "clearHFPStat",   "()V",  klj_HFP_clear},
     {"com/unity3d/player/HFPStatus", "getHFPStat",     "()Z",  klj_HFP_get},
     {"com/unity3d/player/HFPStatus", "requestHFPStat", "()V",  klj_HFP_request},
@@ -9108,6 +9379,20 @@ static const klj_binding g_bindings[] = {
     {"android/content/Intent", "getExtras",  "()Landroid/os/Bundle;",      klj_Intent_getExtras},
     {"android/content/Intent", "<init>",     "(Ljava/lang/String;)V",      klj_Intent_init},
     {"android/content/Intent", "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_addCategory},
+    {"android/content/Intent", "getIntExtra", "(Ljava/lang/String;I)I",     klj_Intent_getIntExtra},
+    {"android/content/Intent", "getAction",   "()Ljava/lang/String;",       klj_Intent_getAction},
+    {"android/content/IntentFilter", "<init>",    "()V",                     klj_IntentFilter_init},
+    {"android/content/IntentFilter", "<init>",    "(Ljava/lang/String;)V",   klj_IntentFilter_init},
+    {"android/content/IntentFilter", "addAction", "(Ljava/lang/String;)V",   klj_IntentFilter_addAction},
+    // registerReceiver is bound on Context, which every activity class here
+    // reaches through g_supers. The three-arg form takes API 26+ flags that do
+    // not change what a sticky query answers, so it shares the handler.
+    {"android/content/Context", "registerReceiver",
+     "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;)Landroid/content/Intent;",
+     klj_Context_registerReceiver},
+    {"android/content/Context", "registerReceiver",
+     "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;I)Landroid/content/Intent;",
+     klj_Context_registerReceiver},
     // The in-headset UI panel — see the WebView block above for why every one
     // of these is accepted and none of them produces a pixel.
     {"android/webkit/WebView", "<init>", "(Landroid/content/Context;)V", klj_WebView_init},
@@ -9185,6 +9470,11 @@ static const klj_binding g_bindings[] = {
     {"android/net/NetworkInfo", "isAvailable",   "()Z", klj_NetworkInfo_isConnected},
     {"android/net/NetworkInfo", "isConnectedOrConnecting", "()Z", klj_NetworkInfo_isConnected},
     {"android/net/NetworkInfo", "getType",       "()I", klj_NetworkInfo_getType},
+    {"android/net/ConnectivityManager", "getNetworkCapabilities",
+     "(Landroid/net/Network;)Landroid/net/NetworkCapabilities;",
+     klj_ConnectivityManager_getNetworkCapabilities},
+    {"android/net/NetworkCapabilities", "hasTransport",  "(I)Z", klj_NetworkCapabilities_hasTransport},
+    {"android/net/NetworkCapabilities", "hasCapability", "(I)Z", klj_NetworkCapabilities_hasCapability},
     {"android/net/wifi/WifiManager", "createWifiLock", "(ILjava/lang/String;)Landroid/net/wifi/WifiManager$WifiLock;",
      klj_WifiManager_createWifiLock},
     {"android/net/wifi/WifiManager$WifiLock", "acquire", "()V", klj_WifiLock_acquire},

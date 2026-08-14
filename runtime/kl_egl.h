@@ -37,6 +37,13 @@ void *kl_egl_sym(const char *name);        // the gateway itself
 // the swap have never fired, so this frame's completion is where they belong".
 unsigned long kl_egl_swap_count(void);
 
+// The EGLContext current on THIS thread, as the guest sees it. Diagnostic: a
+// guest that keys resource ownership on the current context (Unity keys FBO
+// ownership on it) fails in a way that names neither the context nor the
+// resource, so a GL trace has to be able to say which context a name was made
+// under. Not a GL call and not the ANGLE context — the handle the guest holds.
+void *kl_egl_current_context(void);
+
 // What the guest asked eglGetProcAddress for, and which of those it went on to
 // call. This is the M5 work list, in the order the guest wanted it.
 void kl_egl_report(FILE *f);

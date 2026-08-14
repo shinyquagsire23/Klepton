@@ -695,7 +695,25 @@ int main(int argc, char **argv) {
         else
             printf("\n  (recon child exited %d)\n", WEXITSTATUS(st));
         printf("  (see the JNI surface report above)\n");
-        return fail("guest init did not complete: an unimplemented JNI call was reached");
+        // Say what was OBSERVED, not what is usually true. This used to report
+        // every non-zero child as "an unimplemented JNI call was reached", which
+        // is right only for the abort-by-name path — and it named a JNI stop for
+        // a run whose actual cause was CPython dying on a refused getrandom,
+        // sending the search to the JNI surface report, where there was nothing
+        // to find. A diagnostic that asserts a cause it has not established is
+        // worse than one that only reports the exit.
+        if (WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT)
+            return fail("guest init did not complete: aborted — an unimplemented "
+                        "JNI call or unresolved import (the report names it)");
+        if (WIFSIGNALED(st) && WTERMSIG(st) == SIGALRM)
+            return fail("guest init did not complete: the watchdog fired — the "
+                        "guest blocked (KL_ALARM widens it)");
+        if (WIFSIGNALED(st))
+            return fail("guest init did not complete: a fault in guest code — "
+                        "read the fault line above, not the JNI report");
+        return fail("guest init did not complete: the guest EXITED on its own "
+                    "(no signal) — something in it called exit(); the reason is "
+                    "in the log above, not in the JNI report");
     }
     printf("\n=== M4 (partial): initJni completed with no unimplemented JNI calls ===\n");
     return 0;

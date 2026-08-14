@@ -20,12 +20,11 @@
 // Knobs (DEBUG_ENV_VARS.md): `KL_GUEST_PATCH=0` turns all of this off, which is
 // the A/B for every row; `KL_GUEST_PATCH_OFF=<name>[,<name>...]` turns off one.
 //
-// NOT YET WIRED FOR DEVICE: a klepton-ld dylib is signed, so its text cannot be
-// written at run time — the same table has to be applied OFFLINE, by
-// tools/klepton_ld.c, which is why the entry point takes a resolver instead of
-// a base pointer. Until that is done a device run of a patched target behaves
-// like `KL_GUEST_PATCH=0`, which is a difference between the host and the
-// headset and is called out here rather than discovered there.
+// DEVICE: a klepton-ld dylib is signed, so its text cannot be written at run
+// time — which is why the entry point takes a RESOLVER rather than a base
+// pointer, so the same table can be applied offline. tools/klepton_ld.c does
+// exactly that (see its `gp_at`), so a row here reaches the headset as well as
+// the host, and there is no host/device divergence to remember.
 #include "kl_guestpatch.h"
 #include "kl_env.h"
 
@@ -111,7 +110,51 @@ static const kl_gp_word k_vrc_minver[] = {
     { 0x6968294, 0x540005ea, 0x1400002f, "b.ge -> b  (skip VerifyMinClientVersion)" },
 };
 
-// (3) The stereo rendering mode, in libUnityOpenXR.so rather than in the
+// (3) The "Going to Error World" transition.
+//
+// The trigger that brought this row up: the APK genuinely does not ship
+// AudioPluginOculusSpatializer (notes/VRCHAT.md, Session 11 §4), so every
+// world load raises DllNotFoundException, and the managed response is:
+//
+//     E/Unity: Exception: Going to Error World
+//
+// The route to the code, since nothing here has a symbol:
+// tools/vrc_code.py --literals 'Going to Error World' finds
+// StringLiteral[13074]; --uses-literal names its one real reader,
+// VRCFlowManager::ÌÌÎÌÍÌÌÍÌÏÍÍÌÌÌÍÎÍÏÍÏÎÌ at 0x6944074 (196 bytes). That
+// method IS the error-world action, not a branch near it: it builds a
+// System.Exception with that message, hands it to the shared LogException
+// helper at 0x68acbd0 (the VRC.Core.Logger user — this is what prints the
+// E/Unity line above), then starts the coroutine stored in [this + 0x148]
+// through the generic coroutine starter at 0x6940030, and returns the
+// Coroutine to its caller, which yields on it. The starter has nine other
+// callers and is innocent; the literal's only other reader, a <>c lambda at
+// 0x6aed654, just string.Formats the message. So the whole transition is
+// exactly this one small method.
+//
+// --callers shows all six call sites live in two coroutines' MoveNext and
+// every one is a failure path ('Failed to load default world {0} times,
+// going to error world', "Couldn't validate world {0}", and their untagged
+// siblings): the method is never reached from a healthy flow, so making it
+// a no-op disables ONLY the error-driven transition. What the host loses is
+// the Error World itself — a fallback that exists to give the user somewhere
+// to stand when the real world failed, which is precisely the thrash when
+// the failure is this host's missing spatializer. The DllNotFoundException
+// is still logged by Unity; only the reaction is skipped.
+//
+// The replacement mirrors the wall row above: return before the prologue,
+// with x0 = null so the caller's `yield return <coroutine>` degenerates to
+// the benign `yield return null` (verified in the caller at 0x69701c0: the
+// returned pair is stored, never dereferenced, before MoveNext continues).
+//
+//   0x6944074  sub sp, sp, #0x30        -> mov x0, xzr  ; "no transition"
+//   0x6944078  stp x30, x21, [sp, #0x10] -> ret
+static const kl_gp_word k_vrc_errorworld[] = {
+    { 0x6944074, 0xd100c3ff, 0xaa1f03e0, "mov x0, xzr  (return null coroutine)" },
+    { 0x6944078, 0xa90157fe, 0xd65f03c0, "ret" },
+};
+
+// (4) The stereo rendering mode, in libUnityOpenXR.so rather than in the
 // managed image — the one row here that is about pixels.
 //
 // This build asks for a swapchain with `arraySize 2`, which is the Single Pass
@@ -147,6 +190,134 @@ static const kl_gp_word k_vrc_multipass[] = {
     { 0x76e0c, 0x2a0003f3, 0x52800013, "mov w19, w0 -> mov w19, #0  (MultiPass)" },
 };
 
+
+// (5) Unity's cross-context guard on every framebuffer bind.
+//
+// Framebuffer objects are container objects and are NOT shared between GL
+// contexts, so Unity records the EGLContext each binding was made under and
+// re-checks it before every bind. On a mismatch it binds `(GLuint)-1` rather
+// than a name it believes is invalid here. The idiom is inlined at 35 sites,
+// always the same three instructions, always calling GL table slot 1240:
+//
+//     cmp   x8, x20                 ; recorded context vs the live one
+//     ccmp  wN, #0, #4, ne          ; ...or the name is 0
+//     csinv w1, wN, wzr, eq         ; mismatch -> ~0
+//
+// `(GLuint)-1` is not a sentinel ANGLE invents and not a refused bind: the
+// guest passes it, ANGLE accepts it, and the result is a framebuffer with no
+// attachments — so the clear and every draw of that pass raise
+// GL_INVALID_FRAMEBUFFER_OPERATION and go nowhere. Measured on VRChat: 322 such
+// errors in a 1500-frame run, 0 with this row applied.
+//
+// Neutralising the guard is truthful about what this runtime implements, and
+// that is the whole justification: kl_glfb's default migration mode backs EVERY
+// guest EGLContext with ONE real ANGLE context (see kl_glfb_make_current), so
+// the framebuffer really is valid whichever guest context is nominally current.
+// The distinction Unity is guarding against does not exist here.
+//
+// Three things about this row that must not be forgotten:
+//
+//   * WHAT TRIGGERS THE MISMATCH IS NOT EXPLAINED. Every eglGetCurrentContext
+//     in the run answers the same context, and every framebuffer is created
+//     under it, so the recorded value must be captured somewhere this
+//     instrumentation did not see. Beat Saber never binds -1 at all; AVPro's
+//     third context was suspected and MEASURED INNOCENT (refusing it leaves two
+//     contexts and the -1 binds remain).
+//   * IT DOES NOT FIX THE WORLD LOAD. VRChat still fails to instantiate a
+//     scene with this applied — that is a separate cause, and the adjacency of
+//     the two in the log was a coincidence of the kind this file's history is
+//     full of. See notes/VRCHAT.md Session 12.
+//   * On device it is applied OFFLINE by tools/klepton_ld.c, like every row
+//     here, so the host and the headset agree.
+static const kl_gp_word k_vrc_fbo_ctx[] = {
+    { 0x1432f04, 0x5a9f0381, 0x2a1c03e1, "w1 = w28 unconditionally" },
+    { 0x1458650, 0x5a9f02a1, 0x2a1503e1, "w1 = w21 unconditionally" },
+    { 0x145888c, 0x5a9f03a1, 0x2a1d03e1, "w1 = w29 unconditionally" },
+    { 0x145899c, 0x5a9f0381, 0x2a1c03e1, "w1 = w28 unconditionally" },
+    { 0x1458a54, 0x5a9f0381, 0x2a1c03e1, "w1 = w28 unconditionally" },
+    { 0x1458ac4, 0x5a9f0321, 0x2a1903e1, "w1 = w25 unconditionally" },
+    { 0x1458b34, 0x5a9f0321, 0x2a1903e1, "w1 = w25 unconditionally" },
+    { 0x1458bdc, 0x5a9f0281, 0x2a1403e1, "w1 = w20 unconditionally" },
+    { 0x1458c70, 0x5a9f02a1, 0x2a1503e1, "w1 = w21 unconditionally" },
+    { 0x14590a4, 0x5a9f0141, 0x2a0a03e1, "w1 = w10 unconditionally" },
+    { 0x1459240, 0x5a9f0301, 0x2a1803e1, "w1 = w24 unconditionally" },
+    { 0x145beb8, 0x5a9f0101, 0x2a0803e1, "w1 = w8 unconditionally" },
+    { 0x14688dc, 0x5a9f0141, 0x2a0a03e1, "w1 = w10 unconditionally" },
+    { 0x1468cdc, 0x5a9f0121, 0x2a0903e1, "w1 = w9 unconditionally" },
+    { 0x1469ff8, 0x5a9f0121, 0x2a0903e1, "w1 = w9 unconditionally" },
+    { 0x146a2e0, 0x5a9f0321, 0x2a1903e1, "w1 = w25 unconditionally" },
+    { 0x146aff0, 0x5a9f0121, 0x2a0903e1, "w1 = w9 unconditionally" },
+    { 0x146b3bc, 0x5a9f0121, 0x2a0903e1, "w1 = w9 unconditionally" },
+    { 0x146bc68, 0x5a9f0381, 0x2a1c03e1, "w1 = w28 unconditionally" },
+    { 0x146c10c, 0x5a9f0341, 0x2a1a03e1, "w1 = w26 unconditionally" },
+    { 0x146c190, 0x5a9f0341, 0x2a1a03e1, "w1 = w26 unconditionally" },
+    { 0x146c24c, 0x5a9f0381, 0x2a1c03e1, "w1 = w28 unconditionally" },
+    { 0x146c2b0, 0x5a9f02e1, 0x2a1703e1, "w1 = w23 unconditionally" },
+    { 0x146c328, 0x5a9f0381, 0x2a1c03e1, "w1 = w28 unconditionally" },
+    { 0x146c51c, 0x5a9f0381, 0x2a1c03e1, "w1 = w28 unconditionally" },
+    { 0x146c84c, 0x5a9f02c1, 0x2a1603e1, "w1 = w22 unconditionally" },
+    { 0x146c94c, 0x5a9f02c1, 0x2a1603e1, "w1 = w22 unconditionally" },
+    { 0x146ca9c, 0x5a9f0161, 0x2a0b03e1, "w1 = w11 unconditionally" },
+    { 0x146cc24, 0x5a9f02c1, 0x2a1603e1, "w1 = w22 unconditionally" },
+    { 0x146ccd8, 0x5a9f0301, 0x2a1803e1, "w1 = w24 unconditionally" },
+    { 0x146cd4c, 0x5a9f0381, 0x2a1c03e1, "w1 = w28 unconditionally" },
+    { 0x146d260, 0x5a9f02e1, 0x2a1703e1, "w1 = w23 unconditionally" },
+    { 0x146d61c, 0x5a9f02e1, 0x2a1703e1, "w1 = w23 unconditionally" },
+    { 0x146d6bc, 0x5a9f0301, 0x2a1803e1, "w1 = w24 unconditionally" },
+    { 0x146d7ec, 0x5a9f02c1, 0x2a1603e1, "w1 = w22 unconditionally" },
+};
+
+
+// (6) The AudioPluginOculusSpatializer per-frame exception storm.
+//
+// The Steam Frame APK ships the Oculus spatializer's MANAGED code but not its
+// native module, so every P/Invoke into it throws DllNotFoundException — on
+// real hardware too, not just here. Measured: ~1 throw per frame, every frame
+// (587-609 in 600-frame headless runs), and each one costs a full IL2CPP
+// exception raise (our dlopen miss is cached; the throw is not). The call
+// site evaded four static hunts (notes/VRCHAT.md Session 12 §6) because the
+// module name lives only in P/Invoke metadata and the resolver is reached
+// indirectly.
+//
+// The route that worked: `vrc_code.py --type '^OculusSpatializerUnity$'`
+// lists the component's 27 methods; the small ones (124-136 bytes, no
+// metadata usages) are IL2CPP's P/Invoke thunks, and each embeds its
+// resolver data in plain sight — an adrp+add pair naming the module string
+// ('AudioPluginOculusSpatializer', 28 chars) and another naming the native
+// entry point. Reading those strings out of the binary attributes every
+// thunk: OSP_Unity_AssignRaycastCallback (two variants), SetDynamicRoom*,
+// UpdateRoomModel, GetRoomDimensions, GetRaycastHits.
+//
+// The per-frame caller is OculusSpatializerUnity::Update (0x67a0c80). Its
+// prologue reads a bool at [this+0x38]: if set it builds a delegate and
+// calls the marshaling AssignRaycastCallback variant (0x679dab4) at
+// 0x67a0d88; either way the paths merge at 0x67a0e50 and call the plain
+// AssignRaycastCallback thunk (0x679f1e0) at 0x67a0e68, followed by the
+// SetDynamicRoom* chain. The FIRST of these to run throws, and exactly one
+// throw per frame says the exception unwinds clean out of Update — so on
+// real hardware everything in Update after that call is dead code, every
+// frame, forever.
+//
+// The patch therefore does by branch what hardware does by exception: at
+// each of the two throwing call sites, jump to Update's own epilogue
+// (0x67a13e8, the register-restore ladder ending in ret at 0x67a1414). No
+// managed side effect is skipped that hardware would have performed — on
+// hardware the throw unwinds past the same instructions. The spatializer's
+// dynamic-room feature is off either way; what changes is only the cost and
+// the log. One-time throws from Start (same thunks, other call sites) are
+// left alone: they are once, not per frame.
+//
+//   0x67a0d88  bl 0x679dab4  -> b 0x67a13e8   ; [this+0x38] path
+//   0x67a0e68  bl 0x679f1e0  -> b 0x67a13e8   ; merged per-frame path
+//
+// Measured: objdump + a raw PT_LOAD read agree on both expect words; the
+// epilogue at 0x67a13e8 begins `ldp x20, x19, [sp, #0xa0]` (0xa94a4ff4),
+// matching the prologue's stores at 0x67a0ca0.
+static const kl_gp_word k_vrc_ospstorm[] = {
+    { 0x67a0d88, 0x97fff34b, 0x14000198, "bl AssignRaycastCallback(marshaled) -> b Update.epilogue" },
+    { 0x67a0e68, 0x97fff8de, 0x14000160, "bl AssignRaycastCallback -> b Update.epilogue" },
+};
+
 static const kl_gp_patch k_patches[] = {
     { "vrchat-multipass", "libUnityOpenXR.so",
       "the stereo rendering mode is MultiPass, because there is no multiview",
@@ -154,9 +325,18 @@ static const kl_gp_patch k_patches[] = {
     { "vrchat-under-construction", "libil2cpp.so",
       "the VRCFlowManager wall coroutine completes instead of hanging",
       k_vrc_wall, sizeof k_vrc_wall / sizeof *k_vrc_wall },
+    { "vrchat-fbo-context-guard", "libunity.so",
+      "EXPERIMENT: framebuffer binds ignore Unity's cross-context guard",
+      k_vrc_fbo_ctx, sizeof k_vrc_fbo_ctx / sizeof *k_vrc_fbo_ctx },
     { "vrchat-min-client-version", "libil2cpp.so",
       "the client build number always compares new enough",
       k_vrc_minver, sizeof k_vrc_minver / sizeof *k_vrc_minver },
+    { "vrchat-error-world", "libil2cpp.so",
+      "the exception-driven Error World transition does not start",
+      k_vrc_errorworld, sizeof k_vrc_errorworld / sizeof *k_vrc_errorworld },
+    { "vrchat-spatializer-storm", "libil2cpp.so",
+      "the absent Oculus spatializer is skipped, not thrown on, per frame",
+      k_vrc_ospstorm, sizeof k_vrc_ospstorm / sizeof *k_vrc_ospstorm },
 };
 #define KL_GP_N (sizeof k_patches / sizeof k_patches[0])
 

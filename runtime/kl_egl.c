@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <zlib.h>
 #include "klepton.h"
 #include "kl_env.h"
@@ -111,8 +112,30 @@ typedef struct { int client_version; } kl_egl_context;
 static kl_egl_surface g_surfaces[8];
 static kl_egl_context g_contexts[8];
 static unsigned g_nsurf, g_nctx;
-static EGLSurface g_draw, g_read;
-static EGLContext g_current;
+// EGL's "current" state is PER THREAD — eglMakeCurrent binds a context to the
+// calling thread, and eglGetCurrentContext/Display/Surface answer for that
+// thread alone. These were process-wide globals, so the last thread to call
+// eglMakeCurrent decided what EVERY thread saw. Two threads ping-ponging one
+// context (which is exactly how Unity drives GL: release on one, take on the
+// next) meant a thread that had released still reported one as current.
+//
+// It matters because a guest may key resource ownership on the answer. Unity
+// records the EGLContext each framebuffer object was bound under — framebuffer
+// objects are container objects and are NOT shared between contexts, even
+// within a share group — and re-checks it before every bind, binding
+// (GLuint)-1 on a mismatch. On VRChat, which creates three contexts where Beat
+// Saber creates two, that guard was firing: measured 140 -> 73
+// GL_INVALID_FRAMEBUFFER_OPERATIONs over the same span of log with this fixed.
+//
+// It did NOT take them to zero, so do not read this as the whole of that bug —
+// see notes/VRCHAT.md Session 12 for what is and is not established about it,
+// including that AVPro's third context was suspected and measured innocent.
+// This change stands on being what the spec says, not on that measurement.
+//
+// Nothing else in the tree reads these; the ANGLE context that actually backs
+// them migrates separately, through kl_glfb_make_current/_release_current.
+static __thread EGLSurface g_draw, g_read;
+static __thread EGLContext g_current;
 static int g_error = EGL_SUCCESS;
 static unsigned long g_frames;
 
@@ -1019,6 +1042,10 @@ static int gl_is_void(const char *name) {
 //
 // Off by default; it is a census, not a diagnostic, so it prints the call and
 // its interesting arguments and nothing about what we decided.
+static uint64_t klegl_tid(void) {
+    uint64_t t = 0; pthread_threadid_np(NULL, &t); return t;
+}
+
 static int klegl_tracing(void) {
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_EGL_TRACE", 0);
@@ -1277,7 +1304,8 @@ static EGLContext klegl_CreateContext(EGLDisplay dpy, EGLConfig cfg,
     c->client_version = 2;
     for (const int32_t *a = attribs; a && *a != EGL_NONE; a += 2)
         if (a[0] == 0x3098 /* EGL_CONTEXT_CLIENT_VERSION */) c->client_version = a[1];
-    fprintf(stderr, "  [egl] context, GLES %d\n", c->client_version);
+    fprintf(stderr, "  [egl] context %u = %p, GLES %d (created on t%llu)\n",
+            g_nctx - 1, (void *)c, c->client_version, klegl_tid());
     return (EGLContext)c;
 }
 
@@ -1326,12 +1354,22 @@ static unsigned klegl_QueryContext(EGLDisplay dpy, EGLContext ctx,
 
 static unsigned klegl_DestroyContext(EGLDisplay dpy, EGLContext c) {
     KLEGL_TRACE("eglDestroyContext");
+    // Only this thread's binding can be cleared here: a context current on
+    // ANOTHER thread stays current until that thread releases it, which is what
+    // EGL's deferred destruction says too.
     (void)dpy; if (c == g_current) g_current = NULL; return EGL_TRUE;
 }
 
 static unsigned klegl_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
                                   EGLSurface read, EGLContext ctx) {
     KLEGL_TRACE("eglMakeCurrent");
+    // Which context is current on which thread is a fact a GL trace cannot
+    // recover afterwards, and a guest that keys FBO ownership on it (Unity does)
+    // fails in a way that names neither. Rare enough to report unconditionally:
+    // a handful of contexts and one line per change, per thread.
+    if (ctx != g_current)
+        fprintf(stderr, "  [egl] t%llu current context %p -> %p\n",
+                klegl_tid(), (void *)g_current, (void *)ctx);
     (void)dpy; g_draw = draw; g_read = read; g_current = ctx;
     // Whichever thread this is, it is the one that will now issue GL — or, when
     // the guest releases the context (NULL), the one giving it up; migration
@@ -1344,7 +1382,31 @@ static unsigned klegl_MakeCurrent(EGLDisplay dpy, EGLSurface draw,
 }
 
 static EGLContext klegl_GetCurrentContext(void) {
-    KLEGL_TRACE("eglGetCurrentContext"); return g_current; }
+    KLEGL_TRACE("eglGetCurrentContext");
+    // A NULL answer is the interesting one and it is not an error: it means the
+    // asking thread holds no context. Unity latches this into the "active
+    // context" it keys framebuffer-object ownership on, and two of its three
+    // writers store the answer UNCONDITIONALLY — a NULL there becomes a sentinel
+    // that never matches any framebuffer again. Named by call site, once each,
+    // because a count says nothing about which caller latched it.
+    {
+        static struct { const void *ret; const void *ctx; } said[16];
+        static unsigned nsaid;
+        const void *ret = __builtin_return_address(0);
+        unsigned n = nsaid;
+        for (unsigned i = 0; i < n && i < 16; i++)
+            if (said[i].ret == ret && said[i].ctx == g_current) return g_current;
+        if (n < 16) {
+            said[n].ret = ret; said[n].ctx = g_current; nsaid = n + 1;
+            size_t off = 0; const char *img = kl_addr_image((void *)ret, &off);
+            fprintf(stderr, "  [egl] t%llu eglGetCurrentContext -> %p <- %s+0x%zx\n",
+                    klegl_tid(), (void *)g_current, img ? img : "?", off);
+        }
+    }
+    return g_current;
+}
+
+void *kl_egl_current_context(void) { return (void *)g_current; }
 static EGLDisplay klegl_GetCurrentDisplay(void) {
     KLEGL_TRACE("eglGetCurrentDisplay");
     // The EGL 1.5 companion to the two above: the display for the current

@@ -1192,9 +1192,17 @@ typedef struct {
     float px, py, pz, qx, qy, qz, qw;
     float vx, vy, vz;        // linear velocity, m/s, tracking space
     float avx, avy, avz;     // angular velocity, rad/s, tracking-space axes
+    // ...and whether those six mean anything. A frontend that publishes a pose
+    // and no motion used to leave them zero, which is not "unknown" — it is the
+    // assertion that the thing is STATIONARY, made about a controller whose
+    // position is visibly changing. OpenXR has a field for exactly this
+    // distinction (XrSpaceVelocity.velocityFlags) and kl_openxr was careful to
+    // use it; the zeros defeated that care from the publishing side.
+    int   motion_valid;
 } klovrp_pose;
 static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+    0,   // motion_valid: nothing has been published, so there is nothing to know
 };
 static int g_head_set;              // has a frontend ever written a head pose?
 // The two hands, published by the same frontend in the same breath. Declared
@@ -1243,6 +1251,87 @@ static klovrp_pose klovrp_pose_read(const klovrp_pose *src) {
 // thread (the compositor's render loop, the viewer's UI thread) and pushes them
 // through here. A second writer thread would need a real lock, so if one ever
 // appears, this is the comment it invalidates.
+// --- Deriving motion a frontend did not measure ------------------------------
+//
+// Two of the three publishers here report real velocity (KleptonControllers
+// reads it off the Sense controllers); the macOS viewer and the parked default
+// poses do not. Rather than tell the guest "unknown" for those, we DIFFERENTIATE
+// the poses we are given — a real measurement of the same motion, one sample
+// late, and better than either alternative: unknown makes a guest fall back to
+// estimating anyway, and zero actively contradicts the positions we hand it in
+// the same breath.
+//
+// The history is separate from the published pose because a pose-only publisher
+// and a motion publisher must share one notion of "the previous sample" — if
+// they did not, switching between them (the viewer's parked hands becoming live
+// ones) would derive a velocity across a gap that is not motion.
+//
+// Single-writer, like the seqlock below and for the same reason: one frontend
+// thread per process publishes these. A second writer needs a real lock, and
+// this is the second comment it invalidates.
+typedef struct {
+    int    have;
+    double t;
+    float  px, py, pz, qx, qy, qz, qw;
+} klovrp_motion_hist;
+static klovrp_motion_hist g_head_hist, g_hand_hist[2];
+
+static double klovrp_mono_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void klovrp_hist_note(klovrp_motion_hist *h, const klovrp_pose *v) {
+    h->have = 1;   h->t  = klovrp_mono_now();
+    h->px = v->px; h->py = v->py; h->pz = v->pz;
+    h->qx = v->qx; h->qy = v->qy; h->qz = v->qz; h->qw = v->qw;
+}
+
+// Fill v's velocity from the difference against `h`, then advance `h`.
+static void klovrp_derive_motion(klovrp_pose *v, klovrp_motion_hist *h) {
+    static int derive = -1;
+    if (derive < 0) derive = kl_env_on("KL_OVRP_DERIVE_VELOCITY", 1);
+
+    double now = klovrp_mono_now();
+    double dt  = h->have ? now - h->t : 0.0;
+
+    v->vx = v->vy = v->vz = v->avx = v->avy = v->avz = 0;
+    v->motion_valid = 0;
+
+    // A plausible frame's worth of time, and outside it the difference is not a
+    // velocity: below the floor it is float noise divided by nearly zero, and
+    // above the ceiling the two samples are not consecutive motion at all (a
+    // paused guest, a first sample, a frontend that stopped publishing). Both
+    // cases report UNKNOWN rather than a number, which is the whole point.
+    if (derive && h->have && dt >= 1e-4 && dt <= 0.5) {
+        float idt = (float)(1.0 / dt);
+        v->vx = (v->px - h->px) * idt;
+        v->vy = (v->py - h->py) * idt;
+        v->vz = (v->pz - h->pz) * idt;
+
+        // Angular velocity from the rotation BETWEEN the samples: q_d =
+        // q_now * conj(q_prev), then axis-angle over dt. Negating a q_d with
+        // w < 0 takes the short way round — quaternions double-cover, so
+        // without it a small rotation can read as a nearly-2pi one.
+        float cx = -h->qx, cy = -h->qy, cz = -h->qz, cw = h->qw;
+        float dw = v->qw*cw - v->qx*cx - v->qy*cy - v->qz*cz;
+        float dx = v->qw*cx + v->qx*cw + v->qy*cz - v->qz*cy;
+        float dy = v->qw*cy - v->qx*cz + v->qy*cw + v->qz*cx;
+        float dz = v->qw*cz + v->qx*cy - v->qy*cx + v->qz*cw;
+        if (dw < 0) { dw = -dw; dx = -dx; dy = -dy; dz = -dz; }
+        float s = sqrtf(dx*dx + dy*dy + dz*dz);
+        if (s > 1e-8f) {
+            // atan2 rather than acos: acos loses all its precision exactly
+            // where this spends its time, at the small angles of one frame.
+            float k = 2.0f * atan2f(s, dw) * idt / s;
+            v->avx = dx * k; v->avy = dy * k; v->avz = dz * k;
+        }
+        v->motion_valid = 1;
+    }
+    klovrp_hist_note(h, v);
+}
+
 static void klovrp_pose_write(klovrp_pose *dst, const klovrp_pose *v) {
     uint32_t s = __atomic_load_n(&g_pose_seq, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pose_seq, s + 1, __ATOMIC_RELAXED);
@@ -1462,9 +1551,14 @@ void kl_ovrp_get_guest_head_pose(float *px, float *py, float *pz,
 
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
-    // No velocity: DeviceAnchor does not report one, and the head's motion is
-    // not a field the guest reads for node 9 anyway.
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0 };
+    // DeviceAnchor does not report a velocity, so this derives one. The old
+    // note here said the head's motion "is not a field the guest reads for
+    // node 9 anyway" — true of an OVRPlugin guest, and node 9 is still served
+    // from the same sample. It stopped being the whole story when an OpenXR
+    // guest arrived: velocity there is a chained output struct on any space,
+    // and zeros in it are an assertion rather than a silence.
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_derive_motion(&v, &g_head_hist);
     klovrp_pose_write(&g_head_pose, &v);
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
 }
@@ -2218,14 +2312,32 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float vx, float vy, float vz,
                              float avx, float avy, float avz) {
     if ((unsigned)hand > 1) return;
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1 };
+    // A measured velocity is authoritative — nothing is derived here. The
+    // history still advances, so a publisher that later drops to the pose-only
+    // call differentiates against the right previous sample instead of a gap.
+    klovrp_hist_note(&g_hand_hist[hand], &v);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
 }
 
+// ...and the pose-only form, which is what the macOS viewer publishes. It used
+// to hand this straight to the call above with six zeros, i.e. "this controller
+// is stationary" about one that is moving. It differentiates now.
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
-    kl_ovrp_set_hand_motion(hand, px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0);
+    if ((unsigned)hand > 1) return;
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_derive_motion(&v, &g_hand_hist[hand]);
+    klovrp_pose_write(&g_hand_pose[hand], &v);
+    __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
+}
+
+// Is the velocity in the latched hand sample a measurement, or is it the
+// "we do not know" that OpenXR spells velocityFlags == 0?
+int kl_ovrp_hand_motion_known(int hand) {
+    if ((unsigned)hand > 1) return 0;
+    return g_hand_pose[hand].motion_valid;
 }
 
 void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,

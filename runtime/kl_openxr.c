@@ -1744,10 +1744,15 @@ static void klxr_pose_corrections(XrPosef *p, int is_aim) {
     if (is_aim) klxr_pitch_about_x(p, aim_pitch);
 }
 
+// `motion_known` reports whether lin/ang are a measurement — a frontend that
+// publishes pose only has them derived (kl_ovrp), and the first sample after a
+// gap has no basis at all. That case must reach the guest as velocityFlags == 0
+// and not as a velocity of zero, which asserts the controller is stationary.
 static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
-                                  float *lin, float *ang) {
+                                  float *lin, float *ang, int *motion_known) {
     XrPosef base = { {0, 0, 0, 1}, {0, 0, 0} };   // STAGE, and the tracking space
     if (tracked) *tracked = 1;
+    if (motion_known) *motion_known = 0;
     if (!sp) return base;
     if (sp->reference_type == KLXR_REF_SPACE_VIEW) {
         kl_ovrp_get_guest_head_pose(&base.position.x, &base.position.y,
@@ -1772,6 +1777,7 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
         klxr_pose_corrections(&base, is_aim);
         if (lin) memcpy(lin, v, sizeof v);
         if (ang) memcpy(ang, a, sizeof a);
+        if (motion_known) *motion_known = kl_ovrp_hand_motion_known(hand);
     }
 
     // ...and the pose the guest asked its space to sit at within that reference
@@ -1791,7 +1797,7 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
 // The pose alone, for every caller that only ever asks about a reference space
 // — xrLocateViews and the self-test — where "tracked" is not a question.
 static XrPosef klxr_space_pose(const klxr_space *sp) {
-    return klxr_space_pose_ex(sp, NULL, NULL, NULL);
+    return klxr_space_pose_ex(sp, NULL, NULL, NULL, NULL);
 }
 
 // The three reference spaces klxr_space_pose can place, and no others —
@@ -3706,8 +3712,9 @@ static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
 
     int sp_tracked = 1, bs_tracked = 1;
     float lin[3], ang[3];
-    XrPosef sp_pose = klxr_space_pose_ex(sp, &sp_tracked, lin, ang);
-    XrPosef bs_pose = klxr_space_pose_ex(bs, &bs_tracked, NULL, NULL);
+    int sp_motion_known = 0;
+    XrPosef sp_pose = klxr_space_pose_ex(sp, &sp_tracked, lin, ang, &sp_motion_known);
+    XrPosef bs_pose = klxr_space_pose_ex(bs, &bs_tracked, NULL, NULL, NULL);
 
     // The census key distinguishes the two hands, because a left action space
     // and a right one are different questions with different answers and
@@ -3753,7 +3760,10 @@ static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
     // client's basis for pose prediction (SL-13).
     int base_static = bs->reference_type == KLXR_REF_SPACE_LOCAL ||
                       bs->reference_type == KLXR_REF_SPACE_STAGE;
-    int have_motion = sp->reference_type == 0 && base_static;
+    // ...and only if it is a measurement. Without this the derived-velocity
+    // seam would report zeros as valid for exactly the samples that have no
+    // basis, which is the lie this whole path exists to avoid.
+    int have_motion = sp->reference_type == 0 && base_static && sp_motion_known;
     klxr_fill_space_velocity(location->next, have_motion ? lin : NULL,
                                              have_motion ? ang : NULL);
     if (say)

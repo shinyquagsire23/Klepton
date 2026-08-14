@@ -210,6 +210,20 @@ static const struct poke_cap_row k_poke_caps[] = {
 #define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])
 
 void kl_guest_poke_texture_unit_cap(void) {
+    // Callable repeatedly, and the pump does exactly that. Unity does not treat
+    // this field as immutable: it is set when the GfxDevice is built, so a
+    // device rebuilt after we poked (an XR subsystem start, a graphics reset)
+    // comes back at the default and the one-shot poke has silently expired.
+    // That is invisible from outside, because the symptom is the ORIGINAL one —
+    // "Invalid texture unit!" and samplers reading stale unit-0 textures —
+    // arriving much later than boot, i.e. exactly when new content loads.
+    //
+    // The store itself is already idempotent (it re-reads the singleton, re-runs
+    // the shape checks, and only writes when the field is BELOW what we want),
+    // so all a re-check costs is a few loads. What had to change is the noise:
+    // the SKIPPED paths describe a permanent condition and are said once.
+    static int calls;
+    const int first = (++calls == 1);
     const char *pv = getenv("KL_POKE_CAP");
     // The knobs are read HERE rather than at the call sites, because there are
     // two of them now and a gate that lives in one driver is a difference
@@ -233,7 +247,7 @@ void kl_guest_poke_texture_unit_cap(void) {
     // runs against the FIRST row's offsets, and the shape checks below are what
     // stop that from being a blind store.
     if (!row && !pv) {
-        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — no measured offsets "
+        if (first) fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — no measured offsets "
                         "for Unity %s.\n"
                         "         Measure libunity's GfxDeviceGLES singleton/cap for "
                         "it (the recipe is above kl_guest_poke_texture_unit_cap), or set "
@@ -249,7 +263,7 @@ void kl_guest_poke_texture_unit_cap(void) {
     if (!u) return;
     uint8_t *ub = (uint8_t *)kl_base(u);
     if ((size_t)POKE_SINGLETON + sizeof(void *) > kl_span(u)) {
-        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — libunity is %zu bytes, "
+        if (first) fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — libunity is %zu bytes, "
                         "shorter than the %#x offset.\n", kl_span(u), POKE_SINGLETON);
         return;
     }
@@ -259,20 +273,25 @@ void kl_guest_poke_texture_unit_cap(void) {
     // the offset no longer names what it used to, whatever the version says.
     if (!singleton || ((uintptr_t)singleton & 7) ||
         !addr_mapped(singleton + POKE_FIELD, sizeof(int32_t))) {
-        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — libunity+%#x holds %p, "
+        if (first) fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — libunity+%#x holds %p, "
                         "which is not a mapped aligned object.\n",
                 POKE_SINGLETON, (void *)singleton);
         return;
     }
     int32_t cur = *(int32_t *)(singleton + POKE_FIELD);
     if (cur <= 0 || cur > 4096) {
-        fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — +%#x reads %d, which is "
+        if (first) fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — +%#x reads %d, which is "
                         "not a texture-unit count.\n", POKE_FIELD, cur);
         return;
     }
     if (cur < poke_n) {
-        fprintf(stderr, "  [poke] texture-unit cap@+%#x %d -> %d\n",
-                POKE_FIELD, cur, poke_n);
+        // A poke after the first is not a second helping of the same fix — it
+        // is the report that the guest RESET the field, which is a different
+        // fact and the one worth reading.
+        fprintf(stderr, "  [poke] texture-unit cap@+%#x %d -> %d%s\n",
+                POKE_FIELD, cur, poke_n,
+                first ? "" : "  (RESET by the guest since the last check —"
+                             " the one-shot poke had expired)");
         *(int32_t *)(singleton + POKE_FIELD) = poke_n;
     }
 }
