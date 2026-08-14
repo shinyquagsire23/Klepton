@@ -327,6 +327,29 @@ gamelift region probes failed EINVAL in a retry storm.
   throw then aborts in `_Unwind_RaiseException` instead of being caught;
   this is the A/B for trap 8.
 
+## TLS trust store (`runtime/kl_cacerts.c`)
+
+The guest's HTTPS stack (unitytls, under both UnityWebRequest and Mono) builds
+its CA bundle from the Android system trust store over JNI:
+`TrustManagerFactory` → `X509TrustManager.getAcceptedIssuers()` →
+`Certificate.getEncoded()`. We serve the host's own root anchors there, baked
+into `runtime/kl_cacert_table.h` by `make cacerts`.
+
+Baked rather than read live because `SecTrustCopyAnchorCertificates` is
+`__IPHONE_NA`: macOS can enumerate its trust store and visionOS cannot, so
+reading it where it exists would leave the device trusting a different set of
+roots from the host. Validation itself is untouched — libunity asks for
+`getAcceptedIssuers` and never `checkServerTrusted`, so the guest takes a trust
+*set* from us and reaches its own verdict. A trust-all manager is refused, by
+the same rule as the DRM guard.
+
+- `KL_CA_ANCHORS=0` — present an EMPTY trust store, which is what this runtime
+  did before the table existed. Every guest TLS chain then fails as
+  `UNITYTLS_X509VERIFY_FLAG_NOT_TRUSTED` (VRChat: `Curl error 60`,
+  `Connection to API Failed: SSL CA certificate error`, and login cannot
+  complete). The A/B for "is the trust store what is blocking this?", and it
+  restores the failing configuration exactly.
+
 ## Loader diagnostics (`runtime/kl_shim.c`, `runtime/kl_libc.c`)
 
 Built for the loading-pace investigation; all default off.

@@ -38,7 +38,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_mono.c \
            runtime/kl_il2cpp.c runtime/kl_fault.c runtime/kl_guestpatch.c \
-           runtime/kl_guestpoke.c
+           runtime/kl_guestpoke.c runtime/kl_cacerts.c
 RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c runtime/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
@@ -456,6 +456,19 @@ jnislots:
 targets:
 	python3 visionos/targets.py --c-table > runtime/kl_target_table.h
 	@echo "runtime/kl_target_table.h: $$(python3 visionos/targets.py --list | tr '\n' ' ')"
+
+# ...and kl_cacert_table.h, the root CA anchors the guest's TLS validates
+# against. Checked in for a reason the other generated tables do not have:
+# SecTrustCopyAnchorCertificates is __IPHONE_NA, so the visionOS build COULD not
+# read the store even if it were willing to depend on Python. One table,
+# generated on a Mac, compiled into host and device alike.
+#
+# Roots expire and get withdrawn, so this one goes stale on a clock rather than
+# on a code change. Regenerate deliberately and read the diff.
+.PHONY: cacerts
+cacerts:
+	python3 tools/gen_cacerts.py > runtime/kl_cacert_table.h
+	@grep -E '^// (source|dated|anchors):' runtime/kl_cacert_table.h
 
 build/t_il2cpp: tests/t_il2cpp.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build

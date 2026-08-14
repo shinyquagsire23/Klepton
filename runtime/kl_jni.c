@@ -7,6 +7,7 @@
 // what keeps this immune to the off-by-one class of bug.
 #include <ctype.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,6 +28,7 @@
 #include "kl_fault.h"
 #include "kl_target.h"   // the default target's userdata key
 #include "kl_env.h"
+#include "kl_cacerts.h"  // the root anchors behind javax.net.ssl, below
 #include "kl_ovrp.h"
 #include "kl_egl.h"
 #include "kl_ndk.h"
@@ -626,6 +628,14 @@ static const struct { const char *cls, *super; } g_supers[] = {
     {"android/app/Activity",                   "android/view/ContextThemeWrapper"},
     {"android/view/ContextThemeWrapper",       "android/content/ContextWrapper"},
     {"android/content/ContextWrapper",         "android/content/Context"},
+    // The trust store hands back X509Certificate[] (that is what
+    // getAcceptedIssuers is declared to return), but getEncoded() is declared
+    // on the BASE class, and libunity resolves it there: the only cert class
+    // name in the whole library is "java/security/cert/Certificate". So the
+    // binding lives on the base and this edge carries it to the subclass the
+    // objects actually are — which is also what makes IsInstanceOf answer
+    // correctly for a guest that checks.
+    {"java/security/cert/X509Certificate",     "java/security/cert/Certificate"},
     {NULL, NULL},
 };
 
@@ -5002,16 +5012,34 @@ static klj_val klj_Activity_requestPermissions(void *env, void *self, const klj_
 }
 
 // ---- javax.net.ssl ----
-// The game's HTTPS stack (unitytls) resolves TrustManagerFactory during boot.
-// On Android these calls hand back the *system* trust store, which does not
-// exist here — and nothing in this runtime can throw, so a failed validation
-// could not be reported the Java way anyway. The honest surface is: the
-// documented algorithm name, a real factory object, and zero trust managers.
-// unitytls reads "no trust managers" as UNITYTLS_X509VERIFY_FLAG_NOT_TRUSTED
-// and the game takes its own Curl-error path (observed under KL_PERMISSIVE:
-// "Curl error 51" and boot continues). Returning a trust-all manager instead
-// would silently weaken the guest's TLS validation — refused by the same rule
-// as the DRM guard: don't invent answers the guest trusts.
+// The guest's HTTPS stack (unitytls, under both UnityWebRequest and Mono's
+// MobileAuthenticatedStream) builds its CA bundle from the Android *system*
+// trust store, over this chain:
+//
+//   TrustManagerFactory.getInstance(getDefaultAlgorithm()).init(null)
+//     .getTrustManagers()[0]        -> javax/net/ssl/X509TrustManager
+//     .getAcceptedIssuers()         -> [Ljava/security/cert/X509Certificate;
+//       .getEncoded()               -> [B, one DER blob per anchor
+//
+// All three names are in libunity.so and `checkServerTrusted` is NOT, so the
+// guest takes a trust SET from us and reaches its own verdict natively. That is
+// what makes answering safe: we say which roots exist, which is precisely what
+// the Android call means, and unitytls still validates the whole chain.
+//
+// This used to answer zero trust managers, on the reasoning that the system
+// store is absent and a trust-all manager would silently weaken validation.
+// The second half stands — a trust-all manager is refused by the same rule as
+// the DRM guard, and stays refused. The first half was wrong about the cost:
+// unitytls reads an empty store as UNITYTLS_X509VERIFY_FLAG_NOT_TRUSTED, so
+// every HTTPS request failed its chain, and VRChat's login could not complete
+// ("Curl error 60 ... UnityTls error code: 7", "Connection to API Failed: SSL
+// CA certificate error"). "No roots exist" is not a more conservative answer
+// than the truth; it is a different false answer, and it disables TLS rather
+// than hardening it.
+//
+// The anchors are the host's own, baked at build time — see kl_cacerts.c for
+// why they cannot be read live on visionOS. KL_CA_ANCHORS=0 restores the empty
+// store exactly.
 static klj_val klj_TMF_getDefaultAlgorithm(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     // Android's documented default since API 24 (we present SDK 29).
@@ -5025,11 +5053,50 @@ static klj_val klj_TMF_getInstance(void *env, void *self, const klj_val *a, int 
 }
 static klj_val klj_TMF_init(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){0};             // init(NULL): "system default store" — absent here
+    // init(NULL) means "the system default store", which is the only store we
+    // have; a non-NULL KeyStore would be the guest supplying its own, and
+    // nothing in any guest here does. Nothing to configure either way.
+    return (klj_val){0};
 }
 static klj_val klj_TMF_getTrustManagers(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.l = klj_new_array('L', "javax/net/ssl/TrustManager", 0)};
+    void *arr = klj_new_array('L', "javax/net/ssl/TrustManager", 1);
+    ((void **)klj_arr(arr)->data)[0] =
+        klj_new_object_data("javax/net/ssl/X509TrustManager", NULL);
+    return (klj_val){.l = arr};
+}
+
+// The anchors themselves. Each certificate object carries its index into the
+// table as its payload, biased by one so it is never the NULL that
+// klj_new_object_data uses for "no payload".
+static klj_val klj_X509TM_getAcceptedIssuers(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    int   count = kl_cacert_count();
+    void *arr   = klj_new_array('L', "java/security/cert/X509Certificate", count);
+    void **slot = klj_arr(arr)->data;
+    for (int i = 0; i < count; i++)
+        slot[i] = klj_new_object_data("java/security/cert/X509Certificate",
+                                      (void *)(intptr_t)(i + 1));
+    KLJ_LOG("X509TrustManager.getAcceptedIssuers() -> %d anchor(s)", count);
+    return (klj_val){.l = arr};
+}
+
+// Certificate.getEncoded() -> the DER. Bound against the BASE class, because
+// that is where Java declares it and where libunity looks it up (see g_supers).
+// Built fresh on every call rather than cached: the guest copies the bytes out
+// and drops the array, and a cached one would be retired by the guest's own
+// correct DeleteLocalRef (trap 16c).
+static klj_val klj_X509Cert_getEncoded(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    int         i = o ? (int)(intptr_t)o->data - 1 : -1;
+    size_t      len = 0;
+    const unsigned char *der = kl_cacert_at(i, &len);
+    if (!der)
+        KLJ_LOG("X509Certificate.getEncoded(): no anchor %d — returning empty", i);
+    void *out = klj_new_array('B', NULL, (int)len);
+    if (der && len) memcpy(klj_arr(out)->data, der, len);
+    return (klj_val){.l = out};
 }
 
 
@@ -8234,6 +8301,8 @@ static const klj_binding g_bindings[] = {
     {"javax/net/ssl/TrustManagerFactory", "getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;", klj_TMF_getInstance},
     {"javax/net/ssl/TrustManagerFactory", "init", "(Ljava/security/KeyStore;)V", klj_TMF_init},
     {"javax/net/ssl/TrustManagerFactory", "getTrustManagers", "()[Ljavax/net/ssl/TrustManager;", klj_TMF_getTrustManagers},
+    {"javax/net/ssl/X509TrustManager", "getAcceptedIssuers", "()[Ljava/security/cert/X509Certificate;", klj_X509TM_getAcceptedIssuers},
+    {"java/security/cert/Certificate", "getEncoded", "()[B", klj_X509Cert_getEncoded},
 
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},
