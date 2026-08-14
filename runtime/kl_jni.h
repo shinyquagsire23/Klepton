@@ -164,6 +164,42 @@ unsigned kl_jni_pending_ui_tasks(void);
 // host pumps it. Returns how many ran.
 unsigned kl_jni_drain_ui_tasks(void);
 
+// --- the on-screen keyboard, frontend side ----------------------------------
+//
+// A guest that wants text calls UnityPlayer.showSoftInput and then waits: on
+// Android the platform puts up a keyboard and reports what was typed. There is
+// no platform keyboard here, so a FRONTEND is that keyboard — the viewer's SDL
+// window, the visionOS app — and these four calls are the whole of it. The
+// reports run on the pump thread (kl_jni_drain_ui_tasks), so a frontend may
+// call them from its own thread.
+//
+// A frontend that implements none of this is not broken, it is a guest whose
+// text field never fills in; the login screen it is holding is the measure of
+// what that costs.
+int  kl_jni_soft_input_active(void);
+
+// The text the field holds now, and whether it is a PASSWORD — a frontend must
+// not echo or log a secure field. Returns the same thing as _active().
+int  kl_jni_soft_input_get(char *buf, size_t cap, int *secure);
+
+// Replace the text. The frontend owns the editing (it has the real keyboard);
+// this reports the result, clamped to the character limit the guest asked for.
+void kl_jni_soft_input_set(const char *utf8);
+
+// Done, or dismissed. `canceled` is the difference between the guest reading
+// the text back and the guest being told the user walked away — it is a
+// different managed status, and committing a cancelled field is worse than
+// dropping a committed one.
+void kl_jni_soft_input_close(int canceled);
+
+// The offline gate for all of the above — `make softinput`, in `make check`.
+// Needs no guest, no window and no headset: it registers its own natives
+// through the real RegisterNatives and drives the real bindings, and asserts
+// the sequence the guest's own Java would have produced. Returns non-zero on
+// pass. See the implementation's comment for why a runtime failure here is
+// invisible from everywhere else.
+int  kl_jni_soft_input_selftest(FILE *out);
+
 // Fire the pending Choreographer frame callback, if the guest posted one. There is
 // no vsync source here, so the host's frame pump defines what a frame is. One-shot,
 // matching Android: doFrame re-posts if it wants the next one.

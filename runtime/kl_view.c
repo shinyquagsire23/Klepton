@@ -189,6 +189,63 @@ static void view_mono_key(int down, SDL_Scancode sc) {
     kl_mono_key(down, view_mono_keycode(sc));
 }
 
+// ---- the guest's text fields ------------------------------------------------
+//
+// When a guest opens a soft input (kl_jni.h) this window IS the keyboard, and
+// while it is open every key belongs to the field: WASD is a word, not a step,
+// and Escape dismisses the field rather than the mouse capture. So the editor
+// runs BEFORE both event branches and swallows what it takes — a keystroke that
+// reached the camera as well would be exactly the "keypress the guest acts on"
+// that view_mono_keycode refuses to guess at.
+//
+// The buffer lives in kl_jni, not here: the guest can set the text too
+// (TouchScreenKeyboard.text = "..."), and two copies of one string is a field
+// that reverts as soon as the guest touches it.
+static int view_soft_input_edit(SDL_Event *ev) {
+    if (!kl_jni_soft_input_active()) return 0;
+    char text[1024];
+    int  secure = 0;
+    kl_jni_soft_input_get(text, sizeof text, &secure);
+    size_t len = strlen(text);
+
+    switch (ev->type) {
+    case SDL_EVENT_TEXT_INPUT: {
+        const char *in = ev->text.text;
+        if (!in) return 1;
+        size_t add = strlen(in);
+        if (len + add < sizeof text) {
+            memcpy(text + len, in, add + 1);
+            kl_jni_soft_input_set(text);
+        }
+        return 1;
+    }
+    case SDL_EVENT_KEY_DOWN:
+        switch (ev->key.key) {
+        case SDLK_BACKSPACE:
+            // One UTF-8 CHARACTER, not one byte: backspacing half of a
+            // multi-byte sequence leaves a string the guest cannot decode.
+            while (len > 0 && (text[len - 1] & 0xc0) == 0x80) len--;
+            if (len > 0) len--;
+            text[len] = '\0';
+            kl_jni_soft_input_set(text);
+            return 1;
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER:
+            kl_jni_soft_input_close(0);
+            fprintf(stderr, "view: soft input committed\n");
+            return 1;
+        case SDLK_ESCAPE:
+            kl_jni_soft_input_close(1);
+            fprintf(stderr, "view: soft input dismissed\n");
+            return 1;
+        }
+        return 1;                 // every other key is the field's, taken silently
+    case SDL_EVENT_KEY_UP:
+        return 1;
+    }
+    return 0;
+}
+
 // ---- the readback path's display (KL_VIEW_CPU=1) ----------------------------
 // Everything in here is what the hardware path does not do: a row flip of the
 // whole eye, an upload of the whole eye, and upstream of both a glReadPixels
@@ -327,6 +384,7 @@ int kl_view_main(const char *libdir, int hw) {
     // position for an app that has no head.
     unsigned pres_gen = ~0u;
     int mono = 0;
+    int soft_input_on = 0;         // SDL text input follows the guest's field
 
     int done = 0;
     uint64_t t_prev = SDL_GetTicks();
@@ -383,8 +441,33 @@ int kl_view_main(const char *libdir, int hw) {
             }
         }
 
+        // SDL only delivers SDL_EVENT_TEXT_INPUT while text input is started,
+        // and starting it is also what tells the OS to route dead keys and IME
+        // composition here. Follow the guest's field rather than starting it
+        // once: with it on, a plain SDL_EVENT_KEY_DOWN still arrives, so
+        // nothing else in the loop changes.
+        if (kl_jni_soft_input_active() != soft_input_on) {
+            soft_input_on = !soft_input_on;
+            if (soft_input_on) {
+                char text[1024];
+                int  secure = 0;
+                kl_jni_soft_input_get(text, sizeof text, &secure);
+                SDL_StartTextInput(win);
+                fprintf(stderr, "view: the guest opened a %stext field — type here, "
+                                "Enter commits, Esc dismisses\n",
+                        secure ? "PASSWORD " : "");
+            } else {
+                SDL_StopTextInput(win);
+            }
+        }
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            // A text field owns the keyboard while it is open — see
+            // view_soft_input_edit. QUIT is deliberately still handled below:
+            // Cmd-Q is not typing.
+            if (ev.type != SDL_EVENT_QUIT && view_soft_input_edit(&ev))
+                continue;
             // Mono and stereo want OPPOSITE things from the same events. A VR
             // guest wants the mouse captured and read as relative turn; a flat
             // one wants an ordinary absolute pointer it can click a button
@@ -466,6 +549,13 @@ int kl_view_main(const char *libdir, int hw) {
         // right is (cos yaw, 0, −sin yaw) under the convention above. R/Space
         // rise, F/Shift sink — vertical is not yaw-relative, it is +y itself.
         const bool *keys = SDL_GetKeyboardState(NULL);
+        // ...and while a text field owns the keyboard, nothing that polls key
+        // STATE may see it. Swallowing the EVENTS is not enough: the movement
+        // below and the controller buttons further down both read this array
+        // directly, so typing "was" would walk the camera and hold a face
+        // button down. One substitution covers every reader there is.
+        static const bool no_keys[SDL_SCANCODE_COUNT];
+        if (soft_input_on) keys = no_keys;
         float sy = sinf(yaw), cy = cosf(yaw);
         float mx = 0, mz = 0;
         if (keys[SDL_SCANCODE_W]) { mx -= sy; mz -= cy; }
