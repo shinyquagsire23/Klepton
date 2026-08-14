@@ -182,6 +182,11 @@ static void     (*a_glReadPixels)(int32_t, int32_t, int32_t, int32_t, uint32_t,
                                   uint32_t, void *);
 static void     (*a_glFinish)(void);
 static void     (*a_glGetIntegerv)(uint32_t, int32_t *);
+// ERRSCAN's framebuffer report (below): what GL itself thinks of the target a
+// draw just failed against.
+static uint32_t (*a_glCheckFramebufferStatus)(uint32_t);
+static void     (*a_glGetFramebufferAttachmentParameteriv)(uint32_t, uint32_t,
+                                                           uint32_t, int32_t *);
 static const uint8_t *(*a_glGetString)(uint32_t);
 static unsigned (*a_eglMakeCurrent)(void *, void *, void *, void *);
 
@@ -284,6 +289,9 @@ int kl_glfb_init(void) {
     a_glReadPixels = asym("glReadPixels");
     a_glFinish     = asym("glFinish");
     a_glGetIntegerv = asym("glGetIntegerv");
+    a_glCheckFramebufferStatus = asym("glCheckFramebufferStatus");
+    a_glGetFramebufferAttachmentParameteriv =
+        asym("glGetFramebufferAttachmentParameteriv");
     a_glGetString  = asym("glGetString");
     g_ready = 1;
 
@@ -1372,10 +1380,25 @@ static void klfb_DeleteFramebuffers(int32_t n, const uint32_t *ids) {
 // signature is safe (unlike glTexSubImage3D above).
 static void (*g_real_TexImage2D)(uint32_t, int32_t, int32_t, int32_t, int32_t,
                                  int32_t, uint32_t, uint32_t, const void *);
+// Defined in the ABI-thunks block below; the texture-allocation thunks feed it.
+static void klfb_note_tex_storage(uint32_t name, uint32_t fmt, int32_t w,
+                                  int32_t h);
+
 static void klfb_TexImage2D(uint32_t target, int32_t level, int32_t ifmt,
                             int32_t w, int32_t h, int32_t border, uint32_t fmt,
                             uint32_t type, const void *pixels) {
     if (level == 0) g_census_teximage++;
+    // A MUTABLE allocation is an allocation: only glTexStorage2D/3D used to be
+    // recorded, so a render target created this way was invisible to every
+    // readback path — the same blindness as a full table, arriving by a
+    // different door.
+    if (level == 0 && w > 0 && h > 0 && a_glGetIntegerv) {
+        int32_t bound = -1;
+        a_glGetIntegerv(target == 0x8C1A /* TEXTURE_2D_ARRAY */ ? 0x8C1D
+                                                                : 0x8069,
+                        &bound);
+        if (bound > 0) klfb_note_tex_storage((uint32_t)bound, (uint32_t)ifmt, w, h);
+    }
     if (g_real_TexImage2D)
         g_real_TexImage2D(target, level, ifmt, w, h, border, fmt, type, pixels);
 }
@@ -1504,9 +1527,17 @@ static void klfb_GenFramebuffers(int32_t n, uint32_t *ids) {
     if (ids)
         for (int32_t i = 0; i < n; i++)
             if (ids[i] > g_fbomax) g_fbomax = ids[i];
-    if (klfb_trace_fbo() && ids)
-        fprintf(stderr, "  [glfb] t%llu glGenFramebuffers(%d) -> %u\n",
-                (unsigned long long)klfb_tid(), n, ids[0]);
+    // The context is part of a framebuffer's identity, not decoration: FBOs are
+    // container objects and are NOT shared between GL contexts, so a guest that
+    // records the context it created one under (Unity does) will refuse to bind
+    // it under any other. Reported unconditionally — a handful of lines a run,
+    // and without them "which context was this name made under?" is unanswerable
+    // after the fact.
+    if (ids)
+        for (int32_t i = 0; i < n; i++)
+            fprintf(stderr, "  [glfb] t%llu glGenFramebuffers -> %u (ctx %p)\n",
+                    (unsigned long long)klfb_tid(), ids[i],
+                    kl_egl_current_context());
 }
 // The stage observation, defined with the eye-texture table further down.
 static int  klfb_stage_of_tex(uint32_t tex);
@@ -1519,6 +1550,9 @@ static uint32_t g_draw_fb;
 // was drawing into when it binds another one to blit INTO. See the read-binding
 // experiment in klfb_BlitFramebuffer.
 static uint32_t g_prev_draw_fb;
+// ...and the framebuffer the last draw CALL targeted, which is a different
+// question from the last binding — see klfb_note_draw.
+static uint32_t g_last_draw_fb;
 // How many blits the guest issued, and how many of them read the DEFAULT
 // framebuffer. The second number is the one worth having: a blit whose source
 // is 0 is legal, error-free and silent, and it is how a whole frame goes
@@ -1558,11 +1592,39 @@ static const char *klfb_caller(void *ret) {
     return buf;
 }
 
+// The last few binds, kept unconditionally and cheaply, because the question
+// "which name did the guest ASK for?" can only be answered after the fact — by
+// the time GL reports an incomplete framebuffer the bind is thousands of calls
+// back, and turning on the full FBO trace to catch it buries the answer in a
+// firehose. Deliberately lock-free and racy: a torn entry is still a name, and
+// this is read only by a diagnostic that is already reporting a broken state.
+#define KLFB_BINDLOG 12
+static struct { uint32_t target, fb; uint64_t tid; const char *site; void *ctx; } g_bindlog[KLFB_BINDLOG];
+static unsigned g_bindlog_n;
+// Whether the REAL glBindFramebuffer produced an error, i.e. whether GL took the
+// name. This is the whole of candidate (b): a refused bind leaves the previous
+// binding in place and says nothing anywhere.
+static uint32_t g_bindlog_err[KLFB_BINDLOG];
+static __thread unsigned g_bindlog_slot;
+static int glfb_errscan(void);
+
 static void klfb_BindFramebuffer(uint32_t target, uint32_t fb) {
     if (klfb_trace_fbo())
         fprintf(stderr, "  [glfb] t%llu glBindFramebuffer(0x%x, %u) <- %s\n",
                 (unsigned long long)klfb_tid(), target, fb,
                 klfb_caller(__builtin_return_address(0)));
+    {
+        unsigned i = __atomic_fetch_add(&g_bindlog_n, 1, __ATOMIC_RELAXED) % KLFB_BINDLOG;
+        g_bindlog[i].target = target;
+        g_bindlog[i].fb     = fb;
+        g_bindlog[i].tid    = klfb_tid();
+        // klfb_caller's buffer is per-thread and reused, so it cannot be stored;
+        // the raw return address can, and kl_addr_image resolves it at print time.
+        g_bindlog[i].site   = (const char *)__builtin_return_address(0);
+        g_bindlog[i].ctx    = kl_egl_current_context();
+        g_bindlog_err[i]    = 0xffffffffu;   // "not asked"
+        g_bindlog_slot      = i;
+    }
     if (klfb_is_read_target(target)) g_read_fb = fb;
     if (klfb_is_draw_target(target)) {
         if (fb != g_draw_fb) g_prev_draw_fb = g_draw_fb;
@@ -1573,6 +1635,13 @@ static void klfb_BindFramebuffer(uint32_t target, uint32_t fb) {
         klfb_note_render_stage(klfb_stage_of_fbo(fb));
     }
     if (g_real_BindFramebuffer) g_real_BindFramebuffer(target, fb);
+    // Did GL take the name? Only asked when ERRSCAN is already draining the
+    // error queue every call — otherwise this would eat exactly the errors the
+    // guest's own glGetError is looking for (trap 41).
+    if (glfb_errscan() && a_glGetError) {
+        unsigned i = g_bindlog_slot % KLFB_BINDLOG;
+        g_bindlog_err[i] = a_glGetError();
+    }
 }
 static void klfb_FramebufferTexture2D(uint32_t target, uint32_t attachment,
                                       uint32_t textarget, uint32_t texture,
@@ -1822,7 +1891,13 @@ void kl_glfb_report_formats(void) {
 // format and size — has to come from watching the allocation. Cold path, and
 // appends are serialised with the compile lock because the eye-texture setup
 // arrives on a different thread than some of the guest's own storage calls.
-#define KLFB_MAX_TEX 512
+// 4096 rather than 512 because VRChat allocates over 1400 textures and the
+// eye render targets are among the LAST — a table that fills up drops exactly
+// the entries the readback path is about, and every consumer then reads
+// "never heard of it", which klfb_probe_fbo used to turn into a silent 0 lit.
+// It still has a ceiling, so it says by name when it reaches one: a full table
+// is a diagnostic going quiet, and going quiet is what made this expensive.
+#define KLFB_MAX_TEX 4096
 static struct { uint32_t name, fmt; int32_t w, h; } g_tex[KLFB_MAX_TEX];
 static unsigned g_ntex;
 
@@ -1839,6 +1914,14 @@ static void klfb_note_tex_storage(uint32_t name, uint32_t fmt, int32_t w,
         g_tex[g_ntex].name = name; g_tex[g_ntex].fmt = fmt;
         g_tex[g_ntex].w = w; g_tex[g_ntex].h = h;
         g_ntex++;
+    } else {
+        static int said_full;
+        if (!said_full++)
+            fprintf(stderr, "  [glfb] the texture allocation table is full at %d "
+                            "entries — every texture from here on (tex %u is the "
+                            "first) is unknown to the readback paths, which will "
+                            "report the size rather than guess\n",
+                    KLFB_MAX_TEX, name);
     }
     pthread_mutex_unlock(&g_compile_lock);
 }
@@ -3036,9 +3119,12 @@ static void klfb_errprobe(const char *what, const char *detail);
 // Defined with the capture below; the blit probe uses it. dump/dw/dh are an
 // optional pixel out: when dump is non-NULL the probe tone-maps the readback
 // into it (g_w*g_h*4 bytes, bottom-up rows) and reports the clipped size.
+// hint_w/hint_h are the size to read when the attachment's own size is not
+// known — see the definition; 0,0 means "no hint".
 static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
                                     char *note, size_t note_n,
-                                    uint8_t *dump, int32_t *dw, int32_t *dh);
+                                    uint8_t *dump, int32_t *dw, int32_t *dh,
+                                    int32_t hint_w, int32_t hint_h);
 static uint32_t klfb_read_from_texture_layer(uint32_t tex, int layer);
 
 // glInvalidateFramebuffer matters here because ANGLE's Metal backend actually
@@ -3180,7 +3266,7 @@ static void klfb_Clear(uint32_t mask) {
                 a_glGetIntegerv(0x8CAA, &keep);
                 char n[160] = "";
                 unsigned long l = klfb_probe_fbo((uint32_t)dfb, cf, cb, n, sizeof n,
-                                                 NULL, NULL, NULL);
+                                                 NULL, NULL, NULL, vp[2], vp[3]);
                 fprintf(stderr, "  [glfb]   read straight back: %lu lit (%s)\n", l, n);
                 // ...and four raw bytes, because "0 lit" is a summary and the
                 // question at this point is whether ANY value came back.
@@ -3378,8 +3464,12 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
         a_glGetIntegerv(0x8CAA, &rfb);
         if (pfb && pbb && bp_bind) {
             char ns[160] = "";
+            // The blit NAMES its source rectangle, so the source's size never
+            // has to be looked up: this is the one reader that always knows.
+            int32_t srw = sx1 > sx0 ? sx1 - sx0 : sx0 - sx1;
+            int32_t srh = sy1 > sy0 ? sy1 - sy0 : sy0 - sy1;
             unsigned long ls = klfb_probe_fbo((uint32_t)rfb, pfb, pbb, ns, sizeof ns,
-                                              NULL, NULL, NULL);
+                                              NULL, NULL, NULL, srw, srh);
             fprintf(stderr, "  [glfb] BLIT_PROBE before: read_fb=%d %lu lit (%s)\n",
                     rfb, ls, ns);
             // KL_GLFB_PROBE_TEX=<name>: read a NAMED texture back, both array
@@ -3400,10 +3490,24 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
                     unsigned long lt = 0;
                     uint32_t tfb = klfb_read_from_texture_layer((uint32_t)probe_tex, L);
                     if (tfb) lt = klfb_probe_fbo(tfb, pfb, pbb, nt, sizeof nt,
-                                                 NULL, NULL, NULL);
+                                                 NULL, NULL, NULL, srw, srh);
                     fprintf(stderr, "  [glfb] PROBE_TEX tex=%d layer=%d: %lu lit (%s)\n",
                             probe_tex, L, lt, nt);
                 }
+            }
+            // ...and the framebuffer the guest was drawing into immediately
+            // before, measured in the SAME instant. "The source is empty" and
+            // "the scene went somewhere else" are different bugs, and telling
+            // them apart by correlating two runs' framebuffer numbers does not
+            // work — the guest's FBO-to-texture mapping is not stable between
+            // runs. One line, both answers, no correlation.
+            if (g_last_draw_fb && (int32_t)g_last_draw_fb != rfb) {
+                char np[160] = "";
+                unsigned long lp = klfb_probe_fbo(g_last_draw_fb, pfb, pbb,
+                                                  np, sizeof np, NULL, NULL, NULL,
+                                                  srw, srh);
+                fprintf(stderr, "  [glfb] BLIT_PROBE last draw target: fb=%u %lu lit"
+                                " (%s)\n", g_last_draw_fb, lp, np);
             }
             bp_bind(0x8CA8, (uint32_t)rfb);
             bp_bind(0x8CA9, (uint32_t)dfb);
@@ -3433,8 +3537,10 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
     }
     if (blit_probe && pfb && pbb && bp_bind) {
         char nd[160] = "";
+        int32_t drw = dx1 > dx0 ? dx1 - dx0 : dx0 - dx1;
+        int32_t drh = dy1 > dy0 ? dy1 - dy0 : dy0 - dy1;
         unsigned long ld = klfb_probe_fbo((uint32_t)dfb, pfb, pbb, nd, sizeof nd,
-                                          NULL, NULL, NULL);
+                                          NULL, NULL, NULL, drw, drh);
         fprintf(stderr, "  [glfb] BLIT_PROBE after: draw_fb=%d %lu lit (%s)\n",
                 dfb, ld, nd);
         bp_bind(0x8CA8, (uint32_t)rfb);          // restore the guest's bindings
@@ -3596,6 +3702,11 @@ static unsigned g_ndraw_fbs;
 static void klfb_note_draw(void) {
     int32_t fb = -1;
     if (a_glGetIntegerv) a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
+    // The framebuffer the last DRAW CALL went to. g_prev_draw_fb is a different
+    // thing — the binding before the current one — and at a blit the two are
+    // usually equal, which silently hid the comparison that matters: this guest
+    // draws into one framebuffer and blits out of another.
+    if (fb > 0) g_last_draw_fb = (uint32_t)fb;
     // The same timeline the blit probe reads: order the draws against the
     // clears/invalidates/blits, because "black at blit time" is meaningless
     // without knowing whether a draw came after the last clear. Program,
@@ -3721,12 +3832,18 @@ static void klfb_errprobe(const char *what, const char *detail);
 // direct RGBA/UNSIGNED_BYTE readback cannot see (that was the first version
 // of this probe, and its err 0x500 lines).
 static void klfb_draw_probe(int verts) {
-    static int on = -1, said, quota;
+    static int on = -1, said, quota, skip, seen;
     if (on < 0) {
         on = kl_env_on("KL_GLFB_DRAW_PROBE", 0);
         // KL_GLFB_DRAW_PROBE_N overrides the 12-line default; scene frames
         // burn the quota on early frames otherwise. 0 means unlimited.
         quota = kl_env_int("KL_GLFB_DRAW_PROBE_N", 12);
+        // ...and KL_GLFB_DRAW_PROBE_SKIP is the other end of that problem: a
+        // guest whose STARTUP renders and whose steady state does not can only
+        // be caught after the transition, and "unlimited from draw 0" is a
+        // readback per draw for the whole run. Skip the first N eligible draws
+        // and spend the quota where the question is.
+        skip = kl_env_int("KL_GLFB_DRAW_PROBE_SKIP", 0);
     }
     if (!on || (quota && said >= quota) || !a_glReadPixels) return;
     // KL_GLFB_DRAW_PROBE_MIN lowers the 32-vert floor — the frame's last few
@@ -3736,6 +3853,7 @@ static void klfb_draw_probe(int verts) {
         minv = kl_env_int("KL_GLFB_DRAW_PROBE_MIN", 12);
     }
     if (verts < minv) return;
+    if (seen++ < skip) return;
     int32_t fb = -1, rfb = -1;
     if (a_glGetIntegerv) {
         a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
@@ -3753,9 +3871,13 @@ static void klfb_draw_probe(int verts) {
     }
     char note[160] = "";
     unsigned long lit = 0;
+    // The viewport is the size the draw itself was aimed at, which is the best
+    // available answer for a target the allocation table never saw.
+    int32_t dvp[4] = {0, 0, 0, 0};
+    if (a_glGetIntegerv) a_glGetIntegerv(0x0BA2 /* VIEWPORT */, dvp);
     if (pfb && pbb)
         lit = klfb_probe_fbo((uint32_t)fb, pfb, pbb, note, sizeof note,
-                             NULL, NULL, NULL);
+                             NULL, NULL, NULL, dvp[2], dvp[3]);
     if (dp_bind) dp_bind(0x8CA8, (uint32_t)(rfb >= 0 ? rfb : 0));
     fprintf(stderr, "  [glfb] DRAW_PROBE fb=%d: %lu lit (%s)\n", fb, lit, note);
 }
@@ -5013,6 +5135,82 @@ static int glfb_errscan(void) {
     return on;
 }
 
+// GL_INVALID_FRAMEBUFFER_OPERATION says a command ran against a framebuffer GL
+// considers incomplete, and names neither the framebuffer nor the reason. Both
+// are askable, and without them the error is only ever "something, somewhere":
+// VRChat's world load dies right after one of these, and which attachment is
+// wrong is the whole question.
+//
+// Everything here is a QUERY — no state is set — and the error queue is drained
+// afterwards so this cannot become the thing the next scan reports (trap 41's
+// rule: an instrument that perturbs what it measures is worse than none).
+static const char *glfb_fb_status_name(uint32_t s) {
+    switch (s) {
+    case 0x8CD5: return "COMPLETE";
+    case 0x8CD6: return "INCOMPLETE_ATTACHMENT";
+    case 0x8CD7: return "INCOMPLETE_MISSING_ATTACHMENT";
+    case 0x8CD9: return "INCOMPLETE_DIMENSIONS";
+    case 0x8CDD: return "UNSUPPORTED";
+    case 0x8D56: return "INCOMPLETE_MULTISAMPLE";
+    case 0x8219: return "UNDEFINED";
+    case 0x9317: return "INCOMPLETE_LAYER_TARGETS";
+    default:     return "?";
+    }
+}
+
+static void glfb_report_incomplete_fb(const char *what) {
+    if (!a_glCheckFramebufferStatus || !a_glGetIntegerv) return;
+    int32_t draw = 0, read = 0;
+    a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &draw);
+    a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &read);
+    uint32_t st = a_glCheckFramebufferStatus(0x8CA9 /* DRAW_FRAMEBUFFER */);
+    fprintf(stderr, "  [glfb] ...%s drew into draw_fb=%d (read_fb=%d): "
+                    "status 0x%x %s\n",
+            what, draw, read, st, glfb_fb_status_name(st));
+
+    if (a_glGetFramebufferAttachmentParameteriv) {
+        static const struct { uint32_t p; const char *n; } att[] = {
+            { 0x8CE0, "COLOR0" }, { 0x8CE1, "COLOR1" },
+            { 0x8D00, "DEPTH"  }, { 0x8D20, "STENCIL" },
+        };
+        for (size_t i = 0; i < sizeof att / sizeof att[0]; i++) {
+            int32_t type = 0, obj = 0, layered = 0;
+            a_glGetFramebufferAttachmentParameteriv(
+                0x8CA9, att[i].p, 0x8CD0 /* OBJECT_TYPE */, &type);
+            if (type == 0) continue;                    // GL_NONE: not attached
+            a_glGetFramebufferAttachmentParameteriv(
+                0x8CA9, att[i].p, 0x8CD1 /* OBJECT_NAME */, &obj);
+            a_glGetFramebufferAttachmentParameteriv(
+                0x8CA9, att[i].p, 0x8210 /* COMPONENT_TYPE */, &layered);
+            fprintf(stderr, "  [glfb]      %-8s type=0x%x name=%d componentType=0x%x\n",
+                    att[i].n, type, obj, layered);
+        }
+    }
+
+    // ...and what the GUEST asked for, which is the other half of the question.
+    // GL reporting a binding the guest never named means the bind was refused
+    // (candidate b) or ANGLE is reporting a sentinel (candidate a); the two need
+    // different fixes and are indistinguishable from the query alone.
+    fprintf(stderr, "  [glfb]      guest shadow: draw_fb=%u read_fb=%u\n",
+            g_draw_fb, g_read_fb);
+    unsigned n = __atomic_load_n(&g_bindlog_n, __ATOMIC_RELAXED);
+    unsigned first = n > KLFB_BINDLOG ? n - KLFB_BINDLOG : 0;
+    for (unsigned k = first; k < n; k++) {
+        unsigned i = k % KLFB_BINDLOG;
+        size_t off = 0;
+        const char *img = kl_addr_image((void *)g_bindlog[i].site, &off);
+        char err[32];
+        if (g_bindlog_err[i] == 0xffffffffu) snprintf(err, sizeof err, "err=?");
+        else if (g_bindlog_err[i] == 0)      snprintf(err, sizeof err, "ok");
+        else snprintf(err, sizeof err, "REFUSED 0x%x", g_bindlog_err[i]);
+        fprintf(stderr, "  [glfb]      bind#%u t%llu (0x%x, %u) %s ctx=%p <- %s+0x%zx\n",
+                k, (unsigned long long)g_bindlog[i].tid,
+                g_bindlog[i].target, g_bindlog[i].fb, err, g_bindlog[i].ctx,
+                img ? img : "?", off);
+    }
+    while (a_glGetError && a_glGetError()) {}
+}
+
 void kl_gl_trace_log(const char *name) {
     unsigned n = __atomic_fetch_add(&g_trace_calls, 1, __ATOMIC_RELAXED);
     if (glfb_errscan() && a_glGetError) {
@@ -5025,6 +5223,9 @@ void kl_gl_trace_log(const char *name) {
                     "(before #%u %s)\n",
                     e, g_err_prev ? g_err_prev : "(nothing yet)", n, name);
             while (a_glGetError()) {}          // drain the rest of the queue
+            // ...and for the one error that is ABOUT a framebuffer, say which.
+            if (e == 0x506)
+                glfb_report_incomplete_fb(g_err_prev ? g_err_prev : "a call");
         }
         g_err_prev = name;
     }
@@ -5189,7 +5390,8 @@ static uint8_t klfb_dbg_tone(float c);   // defined with the capture below
 
 static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
                                     char *note, size_t note_n,
-                                    uint8_t *dump, int32_t *dw, int32_t *dh) {
+                                    uint8_t *dump, int32_t *dw, int32_t *dh,
+                                    int32_t hint_w, int32_t hint_h) {
     static void (*r_BindFramebuffer)(uint32_t, uint32_t);
     static uint32_t (*r_CheckFramebufferStatus)(uint32_t);
     static void (*r_GetFramebufferAttachmentParameteriv)(uint32_t, uint32_t,
@@ -5212,6 +5414,12 @@ static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
         snprintf(note, note_n, "no GL entry points");
         return 0;
     }
+    // Finish first, for every caller. The draw probe used to do this and the
+    // blit probe did not, and the two then disagreed about the same texture in
+    // the same run — which is a difference between the INSTRUMENTS being read
+    // as a difference in the pipeline. A debug readback can afford the stall;
+    // being unable to trust it costs whole sessions.
+    if (a_glFinish) a_glFinish();
     r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, fb);
     if (r_CheckFramebufferStatus(0x8CA8) != 0x8CD5) {
         snprintf(note, note_n, "incomplete");
@@ -5231,11 +5439,24 @@ static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
     // format for R11F (0x1907/0x8c3b) is one glReadPixels rejects outright.
     // Both are float->float blits, the legal path.
     uint32_t stage_want = 0;
+    int hinted = 0;
     if (otype == 0x1702 /* TEXTURE */) {
         uint32_t ufmt = 0;
         klfb_tex_info((uint32_t)oname, &ufmt, &aw, &ah);
         fmt = (int32_t)ufmt;
         if (ufmt == 0x8C3A /* R11F_G11F_B10F */) stage_want = 0x881A;
+        // The allocation table is a WATCH, not an oracle: a texture created
+        // through a path it does not see (glTexImage2D, or any allocation once
+        // the table is full) leaves aw/ah at 0, and the read below then bails
+        // out and returns 0 lit — an instrument reporting "black" for a
+        // framebuffer it never looked at. That is exactly the reading that made
+        // VRChat's eye copy look like a guest drawing nothing. Where the caller
+        // knows a size from the call it is bracketing — a blit names its own
+        // source and destination rectangles — take it, and SAY the size is a
+        // hint so the two are never confused in the log.
+        if ((aw <= 0 || ah <= 0) && hint_w > 0 && hint_h > 0) {
+            aw = hint_w; ah = hint_h; hinted = 1;
+        }
     } else if (otype == 0x8D41 /* RENDERBUFFER */ && r_BindRenderbuffer &&
                r_GetRenderbufferParameteriv) {
         int32_t save_rb = 0;
@@ -5336,13 +5557,21 @@ static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
     // an identification: both eyes of an OpenXR guest are slices of one name,
     // so "tex=29" reads identically for a lit eye and an empty one, and the two
     // readings differ only here.
-    int32_t alayer = 0;
-    if (otype == 0x1702)
+    int32_t alayer = 0, alevel = 0;
+    if (otype == 0x1702) {
         r_GetFramebufferAttachmentParameteriv(0x8CA8, 0x8CE0,
                                               0x8CD4 /* TEXTURE_LAYER */, &alayer);
-    snprintf(note, note_n, "%s=%d layer=%d fmt=0x%x %dx%d read=0x%x/0x%x",
+        // The LEVEL, for the same reason as the layer: a name plus a layer is
+        // still not an identification while a mip level can differ, and two
+        // framebuffers on one texture reading differently is exactly what that
+        // looks like.
+        r_GetFramebufferAttachmentParameteriv(0x8CA8, 0x8CE0,
+                                              0x8CD2 /* TEXTURE_LEVEL */, &alevel);
+    }
+    snprintf(note, note_n, "%s=%d layer=%d level=%d fmt=0x%x %dx%d%s read=0x%x/0x%x",
              otype == 0x1702 ? "tex" : otype == 0x8D41 ? "rb" : "type?",
-             oname, alayer, fmt, aw, ah, rfmt, rtype);
+             oname, alayer, alevel, fmt, aw, ah,
+             hinted ? " (size from the caller)" : "", rfmt, rtype);
     if (resolved_via) {
         size_t l = strlen(note);
         snprintf(note + l, note_n - l, " %s resolved-via-fb%u%s%x",
@@ -5354,7 +5583,14 @@ static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
     // overflowing.
     if (aw > g_w) aw = g_w;
     if (ah > g_h) ah = g_h;
-    if (aw <= 0 || ah <= 0) return 0;
+    if (aw <= 0 || ah <= 0) {
+        // Nothing was read. Returning a bare 0 here reads identically to a
+        // framebuffer measured and found black, which is the more serious of
+        // the two answers — so say which one this is.
+        size_t l = strlen(note);
+        snprintf(note + l, note_n - l, " — SIZE UNKNOWN, not read");
+        return 0;
+    }
     if (dw) *dw = aw;
     if (dh) *dh = ah;
 
@@ -5387,6 +5623,27 @@ static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
         snprintf(note + l, note_n - l, " [guest pack: buf=%d align=%d row=%d "
                  "skip=%d,%d — neutralised]", pack_buf, pack_align, pack_rowlen,
                  pack_skip_p, pack_skip_r);
+    }
+    // ...and READ_BUFFER, which is the same class again and the one this probe
+    // was still blind to: it is PER-FRAMEBUFFER state, and it selects WHICH
+    // colour attachment glReadPixels takes. The probe identifies COLOR
+    // ATTACHMENT0 and then reads whatever this framebuffer's read buffer names,
+    // so an MRT framebuffer pointed at attachment 1 reports attachment 0's
+    // texture and attachment 1's pixels — with no error, which is how two
+    // framebuffers on ONE texture can read differently and look impossible.
+    static void (*r_ReadBuffer)(uint32_t);
+    if (!r_ReadBuffer) r_ReadBuffer = asym("glReadBuffer");
+    int32_t read_buf = 0x8CE0;
+    a_glGetIntegerv(0x0C02 /* READ_BUFFER */, &read_buf);
+    int read_buf_changed = 0;
+    if (fb != 0 && read_buf != 0x8CE0 && r_ReadBuffer) {
+        r_ReadBuffer(0x8CE0 /* COLOR_ATTACHMENT0 */);
+        read_buf_changed = 1;
+    }
+    if (read_buf != 0x8CE0) {
+        size_t l = strlen(note);
+        snprintf(note + l, note_n - l, " [read buffer was 0x%x%s]", read_buf,
+                 read_buf_changed ? " — neutralised to COLOR_ATTACHMENT0" : "");
     }
     if (a_glGetError) while (a_glGetError()) {}        // drain guest leftovers
     unsigned long lit = 0, sentinel = 0;
@@ -5447,6 +5704,7 @@ static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
         if (pack_skip_p)      r_PixelStorei(0x0D04, pack_skip_p);
         if (pack_skip_r)      r_PixelStorei(0x0D03, pack_skip_r);
     }
+    if (read_buf_changed && r_ReadBuffer) r_ReadBuffer((uint32_t)read_buf);
     if (err) {
         size_t l = strlen(note);
         snprintf(note + l, note_n - l, " readerr=0x%x", err);
@@ -5554,8 +5812,23 @@ static uint32_t klfb_read_from_texture_layer(uint32_t tex, int layer) {
     if (!layer_fb) return 0;
     r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, layer_fb);
     r_FramebufferTextureLayer(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */, tex, 0, layer);
-    if (r_CheckFramebufferStatus(0x8CA8) != 0x8CD5) return 0;
-    return layer_fb;
+    if (r_CheckFramebufferStatus(0x8CA8) == 0x8CD5) return layer_fb;
+    // A layered attach only works on an ARRAY or 3D texture, and this guest's
+    // eye targets stopped being arrays the moment it asked for one swapchain
+    // per eye — so the probe built for the array case answered "no framebuffer"
+    // for every plain 2D texture, which reads as "nothing to see" rather than
+    // as "wrong attach call". Layer 0 of a 2D texture is the texture.
+    if (layer == 0) {
+        static void (*r_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t,
+                                              uint32_t, int32_t);
+        if (!r_FramebufferTexture2D)
+            r_FramebufferTexture2D = asym("glFramebufferTexture2D");
+        if (r_FramebufferTexture2D) {
+            r_FramebufferTexture2D(0x8CA8, 0x8CE0, 0x0DE1 /* TEXTURE_2D */, tex, 0);
+            if (r_CheckFramebufferStatus(0x8CA8) == 0x8CD5) return layer_fb;
+        }
+    }
+    return 0;
 }
 
 static uint32_t klfb_read_from_texture(uint32_t tex) {
@@ -5910,9 +6183,15 @@ static unsigned glfb_capture_now(const char *dir) {
                 for (uint32_t i = 1; i <= g_fbomax; i++) {
                     char note[160] = "";
                     int32_t dw = 0, dh = 0;
+                    // No hint here on purpose: this is a SWEEP over every FBO,
+                    // and a size borrowed from elsewhere would read past a
+                    // small attachment into undefined pixels — a census that
+                    // invents lit counts is worse than one that says it could
+                    // not look. The targeted probes (blit, draw, clear) each
+                    // know a real size and pass it.
                     unsigned long flit = klfb_probe_fbo(i, fbuf, bbuf,
                                                         note, sizeof note,
-                                                        dbuf, &dw, &dh);
+                                                        dbuf, &dw, &dh, 0, 0);
                     if (!strcmp(note, "incomplete")) continue;
                     fprintf(stderr, "  [glfb] census fbo%u: %lu lit — %s\n",
                             i, flit, note);

@@ -134,6 +134,11 @@ answers GL and kl_glfb never initializes.
   luma. `KL_GLFB_DRAW_PROBE_N` overrides the quota (0 = unlimited),
   `KL_GLFB_DRAW_PROBE_MIN` lowers the vert floor (the frame's last draws are
   small, and one of them may be the one you're hunting).
+- `KL_GLFB_DRAW_PROBE_SKIP=<n>` — skip the first `n` eligible draws before
+  spending the quota. The other end of `_N`'s problem: a guest whose STARTUP
+  renders and whose steady state does not can only be caught after the
+  transition, and "unlimited from draw 0" is a full readback per draw for the
+  whole run. Calibrate against the run's own `draws per framebuffer` totals.
 - `KL_GLFB_BLIT_PROBE=1` — read back the source before and the destination
   after each `glBlitFramebuffer`, and put `glClear`/`glClearColor`/
   `glInvalidateFramebuffer`/renderbuffer-storage on the same timeline as the
@@ -151,6 +156,17 @@ answers GL and kl_glfb never initializes.
   straight back. If ours reads back and the guest's does not, the readback path
   is sound and the guest's clear is being lost; if neither does, the instrument
   is the liar. Costs one corrupted frame.
+  Every readback here goes through one function, and three things it does are
+  worth knowing because each of them used to make it report a working pipeline
+  as a black one: it `glFinish`es for **every** caller (the draw probe did and
+  the blit probe did not, and the two then disagreed about the same texture in
+  the same run); it names the attachment's **level** as well as its layer, and
+  reports and neutralises the framebuffer's **READ_BUFFER**, because a name
+  alone is not an identification; and when it cannot establish the attachment's
+  SIZE it now says `SIZE UNKNOWN, not read` instead of returning 0 lit. Callers
+  that know a size from the call they are bracketing pass it — a blit names its
+  own source and destination rectangles — and the note then says
+  `(size from the caller)`.
 - `KL_GLFB_PROBE_TEX=<name>` — read texture `<name>` back at array layers 0
   AND 1 at every `glBlitFramebuffer` (needs `KL_GLFB_BLIT_PROBE`). A guest that
   renders into its own target and copies from it has two failures with one
