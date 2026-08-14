@@ -38,7 +38,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_mono.c \
            runtime/kl_il2cpp.c runtime/kl_fault.c runtime/kl_guestpatch.c \
-           runtime/kl_guestpoke.c runtime/kl_cacerts.c
+           runtime/kl_guestpoke.c runtime/kl_cacerts.c runtime/kl_phonon_hrtf.S
 RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c runtime/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
@@ -54,7 +54,10 @@ RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 # the whole of `make check` then passed against the PREVIOUS binary. Over-
 # triggering costs a 20-second recompile; under-triggering costs a green gate
 # that measured a build nobody has.
-RUNTIME_HDRS := $(wildcard runtime/*.h) $(wildcard tests/*.h)
+# kl_phonon_hrtf.S .incbins the SOFA blob, so the data file is a prerequisite
+# of everything too — same missed-FAILURE argument as the generated tables.
+RUNTIME_HDRS := $(wildcard runtime/*.h) $(wildcard tests/*.h) \
+                runtime/data/phonon_hrtf_cipic_124.sofa
 
 .PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
 all: build/t_opus
@@ -469,6 +472,17 @@ targets:
 cacerts:
 	python3 tools/gen_cacerts.py > runtime/kl_cacert_table.h
 	@grep -E '^// (source|dated|anchors):' runtime/kl_cacert_table.h
+
+# The substitute default HRTF: CIPIC subject 124, byte-identical to
+# core/data/hrtf/cipic_124.sofa in ValveSoftware/steam-audio (Apache-2.0).
+# kl_phonon_hrtf.S .incbins it and kl_dl.c hands it to iplHRTFCreate when the
+# guest asks for type=DEFAULT — VRChat's libphonon ships only a 40-byte stub
+# there. Refetch deliberately; the shasum is the pin.
+.PHONY: phonon-hrtf
+phonon-hrtf:
+	curl -L -o runtime/data/phonon_hrtf_cipic_124.sofa \
+	    https://raw.githubusercontent.com/ValveSoftware/steam-audio/master/core/data/hrtf/cipic_124.sofa
+	echo "c28ff4a874ac889ec0c5885ca524762a70d56984232ff7aadcd9c15d32e1cfb6  runtime/data/phonon_hrtf_cipic_124.sofa" | shasum -a 256 -c
 
 build/t_il2cpp: tests/t_il2cpp.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build

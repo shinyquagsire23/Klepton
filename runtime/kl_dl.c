@@ -6,6 +6,9 @@
 #include <pthread.h>
 #include <unistd.h>
 #include "klepton.h"
+#include "kl_env.h"
+#include "kl_fault.h"
+#include <wchar.h>
 #include "kl_egl.h"
 #include "kl_opensl.h"
 #include "kl_ovrp.h"
@@ -231,10 +234,51 @@ static int kl_dlopen_refused(const char *path) {
     return 0;
 }
 
+// Sonames that were looked for and are not here. A guest may ask for the same
+// absent library thousands of times a second and get the same answer every time:
+// IL2CPP resolves a P/Invoke by dlopen on EVERY call once it has failed, so
+// VRChat's `AudioPluginOculusSpatializer` — a plugin its own APK does not ship —
+// costs six failed open() calls and six log lines per call, hundreds of times a
+// second, which is enough on its own to stop the app making progress.
+//
+// This changes no answer. The library is still absent and dlopen still returns
+// NULL with the same dlerror; what stops is re-deriving it. Nothing here stages
+// a library into the guest tree after boot, so "absent" does not become "present"
+// — and if that ever changes, this cache is the thing that has to know.
+#define KL_DL_MISS_MAX 64
+static const char *g_miss[KL_DL_MISS_MAX];
+static unsigned g_nmiss;
+
+static int kl_dlopen_missed(const char *path) {
+    for (unsigned i = 0; i < g_nmiss; i++)
+        if (strcmp(g_miss[i], path) == 0) return 1;
+    return 0;
+}
+
+static void kl_dlopen_note_miss(const char *path) {
+    if (g_nmiss >= KL_DL_MISS_MAX) return;
+    char *c = strdup(path);
+    if (c) g_miss[g_nmiss++] = c;
+}
+
+static void kl_dl_trace_shims(void);
+
 void *klb_dlopen(const char *path, int flags) {
     (void)flags;
+    { static int once; if (!once) { once = 1; kl_dl_trace_shims(); } }
     if (!path) return (void *)-1;                    // RTLD_DEFAULT-ish: whole process
     if (kl_dlopen_refused(path)) return NULL;
+    // Asked before, and it was not here. The dlerror the guest reads next is set
+    // to the same text the first attempt produced, so a caller that reports it
+    // cannot tell the two apart.
+    pthread_mutex_lock(&g_lock);
+    int missed = kl_dlopen_missed(path);
+    pthread_mutex_unlock(&g_lock);
+    if (missed) {
+        snprintf(g_dlerr, sizeof g_dlerr, "klepton: cannot load %s: %s",
+                 path, "No such file or directory");
+        return NULL;
+    }
     // GL libraries have no file to open — they are served by kl_egl.c. This has
     // to come first: falling through would look for libGLESv2.so on disk, fail,
     // and hand the guest a NULL it goes on to call.
@@ -280,11 +324,42 @@ void *klb_dlopen(const char *path, int flags) {
     if (!img) {
         snprintf(g_dlerr, sizeof g_dlerr, "klepton: cannot load %s: %s", full, kl_error());
         fprintf(stderr, "  [klepton] guest dlopen(\"%s\") FAILED: %s\n", path, kl_error());
+        // KL_TRACE_DLOPEN_FRAMES=1 — who asked. A P/Invoke that cannot resolve
+        // throws from IL2CPP's resolver, and the managed method that declared it
+        // is named nowhere in the exception; but the resolver runs on the guest's
+        // own stack, so the frame walk here reaches the generated wrapper and
+        // tools/vrc_code.py --whois turns that address into a method.
+        if (kl_env_on("KL_TRACE_DLOPEN_FRAMES", 0)) {
+            kl_fault_print_frames(stderr, NULL);
+            // ...and the conservative version, because this guest's obfuscated
+            // .text keeps no frame chain, so the x29 walk stops before it
+            // reaches the managed wrapper. Every saved return address is a stack
+            // word pointing into an image, so printing all of them prints the
+            // chain with stale words mixed in — a wrong entry here is junk to
+            // disassemble, not a misleading claim.
+            uintptr_t here;
+            uintptr_t *w = (uintptr_t *)(((uintptr_t)&here) & ~(uintptr_t)7);
+            fprintf(stderr, "    stack x-ray (conservative):\n");
+            for (size_t i = 0, shown = 0; i < 8192 && shown < 40; i++) {
+                uintptr_t v = w[i];
+                if (v < 0x1000) continue;
+                size_t off = 0;
+                const char *img = kl_addr_image((void *)v, &off);
+                if (!img) continue;
+                fprintf(stderr, "      [sp+0x%04zx] %s+0x%zx\n", i * 8, img, off);
+                shown++;
+            }
+        }
+        pthread_mutex_lock(&g_lock);
+        if (!kl_dlopen_missed(path)) kl_dlopen_note_miss(path);
+        pthread_mutex_unlock(&g_lock);
         return NULL;
     }
     fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> %p\n", path, (void *)img);
     return img;
 }
+
+static void *kl_dl_interpose(const char *name, void *real);
 
 void *klb_dlsym(void *handle, const char *name) {
     if (kl_egl_is_handle(handle)) return kl_egl_sym(name);
@@ -307,7 +382,123 @@ void *klb_dlsym(void *handle, const char *name) {
     }
     void *v = kl_sym((kl_image *)handle, name);
     if (!v) snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
+    if (v) { void *w = kl_dl_interpose(name, v); if (w) return w; }
     return v;
+}
+
+// ---------------------------------------------------------------------------
+// Interposing a GUEST export, for the questions that only the arguments answer.
+//
+// A guest-to-guest call is invisible from here — but a P/Invoke is not: managed
+// code resolves it by name through klb_dlsym, so a wrapper handed back at THAT
+// moment sits on the seam with the real function one call away.
+//
+// `iplHRTFCreate` gets one permanently, because VRChat's libphonon.so cannot
+// answer its own DEFAULT: the shipped `gDefaultHrtfData` is a 40-byte stub
+// ("HRTF" magic, version 2, one direction, one sampling rate, a 1-sample
+// HRIR of [1.0, 1.0]), and Steam Audio's real ~1 MiB default is simply not in
+// the binary. type=DEFAULT therefore yields numSamples == 1, PFFFT refuses it
+// (`Unable to create PFFFT setup (size == 1)`), and the managed side throws
+// its way into the Error World. This is the APK's own defect — a real Steam
+// Frame fails identically — so repairing it with real data is not a host lie.
+//
+// The repair rides the SOFA path, which IS complete in this binary (a full
+// embedded libmysofa; `mysofa_open_data_no_norm` resamples to whatever rate
+// the guest asks for): rewrite the settings to type=SOFA with sofa_data
+// pointing at CIPIC subject 124, vendored from Valve's open-source
+// steam-audio tree and baked in by kl_phonon_hrtf.S. KL_PHONON_HRTF=0 A/Bs
+// the substitution off; KL_TRACE_HRTF=1 still prints the arguments either way.
+typedef struct { int32_t sampling_rate, frame_size; } kl_ipl_audio_settings;
+// IPLHRTFSettings, from Steam Audio's public phonon.h.
+typedef struct {
+    int32_t     type;            // 0 = IPL_HRTFTYPE_DEFAULT, 1 = ..._SOFA
+    const char *sofa_file_name;
+    const void *sofa_data;
+    int32_t     sofa_data_size;
+    float       volume;
+    int32_t     norm_type;
+} kl_ipl_hrtf_settings;
+static int32_t (*g_real_iplHRTFCreate)(void *, kl_ipl_audio_settings *, void *, void *);
+
+// kl_phonon_hrtf.S (.incbin of runtime/data/phonon_hrtf_cipic_124.sofa).
+extern const uint8_t kl_phonon_hrtf_sofa[] __asm__("_kl_phonon_hrtf_sofa");
+extern const uint8_t kl_phonon_hrtf_sofa_end[] __asm__("_kl_phonon_hrtf_sofa_end");
+
+static int32_t kl_trace_iplHRTFCreate(void *ctx, kl_ipl_audio_settings *as,
+                                      void *hs, void *out) {
+    const kl_ipl_hrtf_settings *h = (const kl_ipl_hrtf_settings *)hs;
+    int trace = kl_env_on("KL_TRACE_HRTF", 0);
+    if (trace)
+        fprintf(stderr, "  [phonon] iplHRTFCreate(samplingRate=%d, frameSize=%d) "
+                        "hrtf{type=%d sofaFile=%s sofaData=%p size=%d volume=%.3f}\n",
+                as ? as->sampling_rate : -1, as ? as->frame_size : -1,
+                h ? h->type : -1,
+                h && h->sofa_file_name ? h->sofa_file_name : "(null)",
+                h ? h->sofa_data : NULL, h ? h->sofa_data_size : -1,
+                h ? (double)h->volume : 0.0);
+    int injected = kl_env_on("KL_PHONON_HRTF", 1) && h && h->type == 0 &&
+                   !h->sofa_file_name && !h->sofa_data;
+    kl_ipl_hrtf_settings fix;
+    if (injected) {
+        fix = *h;
+        fix.type = 1;                                   // IPL_HRTFTYPE_SOFA
+        fix.sofa_data = kl_phonon_hrtf_sofa;
+        fix.sofa_data_size = (int32_t)(kl_phonon_hrtf_sofa_end - kl_phonon_hrtf_sofa);
+        fprintf(stderr, "  [phonon] DEFAULT HRTF is a 1-sample stub; substituting "
+                        "CIPIC 124 SOFA (%d bytes)\n", fix.sofa_data_size);
+        hs = &fix;
+    }
+    int32_t r = g_real_iplHRTFCreate(ctx, as, hs, out);
+    if (trace || injected)
+        fprintf(stderr, "  [phonon] iplHRTFCreate -> %d\n", r);
+    return r;
+}
+
+
+// KL_TRACE_WMEMCHR=1 — Steam Audio picks its HRIR length by searching a table of
+// supported sampling rates with std::find over an int array, which the compiler
+// lowers to `wmemchr` (wchar_t is 32-bit on both sides). A miss there is not an
+// error anywhere: the search returns the END pointer, the index equals the
+// count, and the length that falls out is 1 — which is what libphonon then
+// reports as `Unable to create PFFFT setup (size == 1)`, several frames and two
+// call levels away from the lookup that actually failed.
+//
+// So the lookup is worth being able to SEE. Installed through kl_shim_override,
+// which is consulted before any shim tier, and it forwards unchanged.
+static wchar_t *(*g_real_wmemchr)(const wchar_t *, wchar_t, size_t);
+
+static wchar_t *kl_trace_wmemchr(const wchar_t *s, wchar_t c, size_t n) {
+    wchar_t *r = g_real_wmemchr(s, c, n);
+    fprintf(stderr, "  [wmemchr] find %d in %zu entr%s ->%s", (int)c, n,
+            n == 1 ? "y" : "ies", r ? " HIT at " : " MISS  [");
+    if (r) fprintf(stderr, "%zu\n", (size_t)(r - s));
+    else {
+        for (size_t i = 0; i < n && i < 16; i++)
+            fprintf(stderr, "%s%d", i ? ", " : "", (int)s[i]);
+        fprintf(stderr, "]\n");
+    }
+    return r;
+}
+
+static void *kl_dl_shim_override(const char *name) {
+    if (strcmp(name, "wmemchr") == 0 && g_real_wmemchr)
+        return (void *)kl_trace_wmemchr;
+    return NULL;
+}
+
+static void kl_dl_trace_shims(void) {
+    if (!kl_env_on("KL_TRACE_WMEMCHR", 0)) return;
+    g_real_wmemchr = wmemchr;
+    kl_shim_override = kl_dl_shim_override;
+}
+
+static void *kl_dl_interpose(const char *name, void *real) {
+    if (strcmp(name, "iplHRTFCreate") == 0) {
+        g_real_iplHRTFCreate = (int32_t (*)(void *, kl_ipl_audio_settings *,
+                                            void *, void *))real;
+        return (void *)kl_trace_iplHRTFCreate;
+    }
+    return NULL;
 }
 
 int klb_dlclose(void *handle) { (void)handle; return 0; }   // images are never unloaded
