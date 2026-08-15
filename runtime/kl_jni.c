@@ -3915,6 +3915,28 @@ static klj_val klj_SDLAM_audioSetThreadPriority(void *env, void *self, const klj
     return (klj_val){0};
 }
 
+// SDLAudioManager.unregisterAudioDeviceCallback() — drop the AudioDeviceCallback
+// SDL registered so it can hear devices appear and disappear.
+//
+// A no-op, and the smali is what says so: the body does nothing but hand the
+// callback back to AudioManager.unregisterAudioDeviceCallback and return. There
+// is nothing to drop — `AudioManager.getDevices()` is answered EMPTY here (host
+// devices are deliberately not enumerated), so the set SDL was watching never
+// had a member and never changed. Same reasoning, and the same shape, as
+// DisplayManager.registerDisplayListener: the thing being subscribed to cannot
+// vary, so nothing is owed a callback and nothing is lost by forgetting one.
+//
+// Reached on TEARDOWN, which is why it took until a run got far enough to shut
+// down cleanly to find it — SL-2's gate ends with the app's own "no streaming
+// host" message box and then exits.
+static klj_val klj_SDLAM_unregisterAudioDeviceCallback(void *env, void *self,
+                                                       const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("SDLAudioManager.unregisterAudioDeviceCallback() — no devices were "
+            "enumerated, so nothing was subscribed");
+    return (klj_val){0};
+}
+
 static klj_val klj_Process_myTid(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     uint64_t tid = 0;
@@ -9400,6 +9422,8 @@ static const klj_binding g_bindings[] = {
     {"android/widget/CompoundButton", "setOnCheckedChangeListener",
      "(Landroid/widget/CompoundButton$OnCheckedChangeListener;)V", klj_View_void},
 
+    {"org/libsdl/app/SDLAudioManager", "unregisterAudioDeviceCallback", "()V",
+     klj_SDLAM_unregisterAudioDeviceCallback},
     {"org/libsdl/app/SDLAudioManager", "audioSetThreadPriority", "(ZI)V",
      klj_SDLAM_audioSetThreadPriority},
     {"android/os/Process", "setThreadPriority", "(II)V", klj_Process_setThreadPriority},

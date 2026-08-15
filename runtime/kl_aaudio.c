@@ -92,6 +92,12 @@ typedef struct {
 typedef struct klaa_stream {
     int32_t rate, channels, format, burst;
     int32_t buffer_size;         // the guest's requested size, <= capacity
+    // Carried from the builder so the getters can answer what was ADOPTED
+    // rather than what was asked for. openStream substitutes for anything left
+    // unspecified, and the substitution is the value in force — a getter that
+    // replayed the builder's AAUDIO_UNSPECIFIED would describe a stream that
+    // does not exist.
+    int32_t direction, sharing_mode, performance_mode, input_preset, device_id;
     klaa_data_cb  data_cb;   void *data_user;
     klaa_error_cb error_cb;  void *error_user;
 
@@ -306,6 +312,14 @@ static aaudio_result_t klaa_openStream(klaa_builder *b, klaa_stream **out) {
     s->buffer_size = b->buffer_capacity > s->burst ? b->buffer_capacity : s->burst;
     s->data_cb = b->data_cb;   s->data_user = b->data_user;
     s->error_cb = b->error_cb; s->error_user = b->error_user;
+    // The modes, resolved. Only OUTPUT is served (capture is refused by design,
+    // above), so direction is not copied but ASSERTED — a stream that exists is
+    // an output stream, whatever the builder said.
+    s->direction        = AAUDIO_DIRECTION_OUTPUT;
+    s->sharing_mode     = b->sharing_mode;
+    s->performance_mode = b->performance_mode;
+    s->input_preset     = b->input_preset;
+    s->device_id        = b->device_id;
     s->state = AAUDIO_STREAM_STATE_OPEN;
 
     s->scratch_bytes = (size_t)s->burst * (size_t)klaa_bytes_per_frame(s);
@@ -383,6 +397,73 @@ static aaudio_result_t klaa_close(klaa_stream *s) {
 static int32_t klaa_getFramesPerBurst(klaa_stream *s) {
     return s ? s->burst : 0;
 }
+
+// ...and the read side of setFramesPerDataCallback above. Answered with the
+// SAME number, which is the whole point of that setter's comment: the feeder
+// passes s->burst frames to every data callback, so that is how many frames a
+// callback actually gets — whether the guest named it or let us choose.
+//
+// AAUDIO_UNSPECIFIED (0) is the other defensible reading — the ABI describes
+// this as "the value set on the builder" — and it is the dangerous one here. A
+// guest that asked for nothing and is told 0 learns only that we did not
+// promise; a guest that sizes a mixer block from it computes it from something
+// other than the number it will be handed. Reporting the value actually in
+// force is the same rule the buffer-size trio below is written to, and for the
+// same reason.
+static int32_t klaa_getFramesPerDataCallback(klaa_stream *s) {
+    return s ? s->burst : 0;
+}
+
+// The property readbacks — one per builder setter, and they exist as a GROUP
+// for the reason the display panel and the GLES capability set do: the guest
+// configures a stream and then reads the configuration back, and answers that
+// disagree with each other describe a device that cannot exist. FMOD does
+// exactly this — it sets a rate and a channel count, opens, and then sizes its
+// mixer from what it is told it got.
+//
+// Every one of these reports what openStream ADOPTED, never what the builder
+// requested. Those differ whenever the guest left something unspecified, which
+// is the common case, and the adopted value is the only one that describes the
+// stream the guest now holds.
+static int32_t klaa_getSampleRate(klaa_stream *s)      { return s ? s->rate : 0; }
+static int32_t klaa_getChannelCount(klaa_stream *s)    { return s ? s->channels : 0; }
+static int32_t klaa_getFormat(klaa_stream *s)          { return s ? s->format : 0; }
+static int32_t klaa_getDirection(klaa_stream *s)       { return s ? s->direction : AAUDIO_DIRECTION_OUTPUT; }
+static int32_t klaa_getSharingMode(klaa_stream *s)     { return s ? s->sharing_mode : 0; }
+static int32_t klaa_getPerformanceMode(klaa_stream *s) { return s ? s->performance_mode : 0; }
+static int32_t klaa_getInputPreset(klaa_stream *s)     { return s ? s->input_preset : 0; }
+
+// getSamplesPerFrame is the OLD NAME for the channel count, not a second
+// quantity — the two must never be allowed to drift apart, so it is the same
+// function rather than a copy of its body.
+#define klaa_getSamplesPerFrame klaa_getChannelCount
+
+static int32_t klaa_getState(klaa_stream *s) {
+    if (!s) return AAUDIO_STREAM_STATE_UNINITIALIZED;
+    int32_t st;
+    pthread_mutex_lock(&s->lock);
+    st = s->state;
+    pthread_mutex_unlock(&s->lock);
+    return st;
+}
+
+// Frames written, which for an output stream is what the feeder has consumed
+// from the guest. Read under the lock for the same reason the state is: the
+// feeder thread advances it.
+//
+// int64 return, and that matters — these two are the only entry points here
+// that are not int32, and truncating a frame counter is a fault that appears
+// only after ~13 hours at 48 kHz.
+static int64_t klaa_getFramesWritten(klaa_stream *s) {
+    if (!s) return 0;
+    int64_t n;
+    pthread_mutex_lock(&s->lock);
+    n = (int64_t)s->frames;
+    pthread_mutex_unlock(&s->lock);
+    return n;
+}
+// An output stream reads nothing. 0 is the count, not a refusal.
+static int64_t klaa_getFramesRead(klaa_stream *s) { (void)s; return 0; }
 
 // The buffer-size trio. FMOD tunes latency with these — it reads the capacity,
 // sets a size inside it, and reads back what it actually got. Answering the
@@ -490,6 +571,18 @@ static const klaa_entry g_aaudio[] = {
     A("AAudioStream_requestStop",                  klaa_requestStop),
     A("AAudioStream_close",                        klaa_close),
     A("AAudioStream_getFramesPerBurst",            klaa_getFramesPerBurst),
+    A("AAudioStream_getFramesPerDataCallback",     klaa_getFramesPerDataCallback),
+    A("AAudioStream_getSampleRate",                klaa_getSampleRate),
+    A("AAudioStream_getChannelCount",              klaa_getChannelCount),
+    A("AAudioStream_getSamplesPerFrame",           klaa_getSamplesPerFrame),
+    A("AAudioStream_getFormat",                    klaa_getFormat),
+    A("AAudioStream_getDirection",                 klaa_getDirection),
+    A("AAudioStream_getSharingMode",               klaa_getSharingMode),
+    A("AAudioStream_getPerformanceMode",           klaa_getPerformanceMode),
+    A("AAudioStream_getInputPreset",               klaa_getInputPreset),
+    A("AAudioStream_getState",                     klaa_getState),
+    A("AAudioStream_getFramesWritten",             klaa_getFramesWritten),
+    A("AAudioStream_getFramesRead",                klaa_getFramesRead),
     A("AAudioStreamBuilder_setFramesPerDataCallback", klaa_setFramesPerDataCallback),
     A("AAudioStreamBuilder_setDeviceId",           klaa_setDeviceId),
     A("AAudioStream_waitForStateChange",           klaa_waitForStateChange),
