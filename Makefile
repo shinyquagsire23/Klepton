@@ -11,7 +11,7 @@ CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC)
 # RUNTIME_SHIP — everything that links the runtime needs them.
 LDLIBS  := -lz -framework AudioToolbox \
            -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
-           -framework CoreFoundation
+           -framework CoreFoundation -framework AVFoundation -framework Foundation
 # The host/ship split is a source-list boundary, not a runtime getenv (§12.2).
 #
 # RUNTIME_SHIP is everything that goes into the visionOS app bundle. It is the
@@ -31,7 +31,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c runtime/kl_target.c \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
-           runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_vtdec.c \
+           runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_vtdec.c runtime/kl_avdec.m \
            runtime/kl_vulkan.c \
            runtime/kl_nativeactivity.c runtime/kl_slink.c runtime/kl_ue4.c \
            runtime/kl_aaudio.c \
@@ -730,7 +730,7 @@ build/xros/libklepton.a: $(RUNTIME_SHIP) $(wildcard runtime/*.h)
 	@mkdir -p build/xros
 	@rm -f $@
 	@for s in $(RUNTIME_SHIP); do \
-	  o=build/xros/$$(basename $$s | sed 's/\.[cS]$$/.o/'); \
+	  o=build/xros/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
 	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) \
 	    -c $$s -o $$o || exit 1; done
 	@ar rcs $@ build/xros/*.o
@@ -739,7 +739,7 @@ build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(wildcard runtime/*.h)
 	@mkdir -p build/xrsim
 	@rm -f $@
 	@for s in $(RUNTIME_SHIP); do \
-	  o=build/xrsim/$$(basename $$s | sed 's/\.[cS]$$/.o/'); \
+	  o=build/xrsim/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
 	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) \
 	    -c $$s -o $$o || exit 1; done
 	@ar rcs $@ build/xrsim/*.o
@@ -751,14 +751,14 @@ build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
 	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
-	   -framework CoreFoundation \
+	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
 	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
 	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
-	   -framework CoreFoundation \
+	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
 	   -install_name @rpath/libklepton.dylib
 
 xros-device: build/xros/libklepton.dylib

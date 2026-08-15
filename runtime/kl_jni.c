@@ -30,6 +30,7 @@
 #include "kl_env.h"
 #include "kl_cacerts.h"  // the root anchors behind javax.net.ssl, below
 #include "kl_ovrp.h"
+#include "kl_avdec.h"
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_jni_slots.h"
@@ -9593,6 +9594,348 @@ static klj_val klj_MsgBox_show(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.j = 0};
 }
 
+// ---- Unreal Engine 4: com.epicgames.ue4.MediaPlayer14 ----------------------
+//
+// UE4's Java media player, and the thing standing between RE4 and its opening
+// cutscene: `AVR4CutscenePlayerPawn::StreamLoadTheatreBox` streams a level
+// whose actor's BeginPlay runs `UMediaPlayer::OpenSourceLatent`, which reaches
+// `FAndroidMediaPlayer` -> `FJavaAndroidMediaPlayer(bool,bool,bool)` -> `new
+// MediaPlayer14(ZZZ)`. The whole surface is 33 methods, read out of that
+// constructor's own GetClassMethod calls rather than from a version of UE4's
+// sources — it resolves every id up front, so the ctor IS the contract.
+//
+// The media is real and it is ours to decode: `main.203.com.Armature.VR4.obb`
+// carries four H.265 MP4s, `Stored` (so a plain byte range), the big one being
+// `VR4/Content/Movies/Andy/bio4_opening_h265.mp4`. Everything else in Movies/
+// is `.bk2` and goes through the guest's own Bink libraries, which is why only
+// this handful ever arrives here. kl_avdec is the decoder; this file is the
+// contract and knows nothing about how a frame is produced.
+//
+// The three constructor booleans are `swizzlePixels`, `vulkanRenderer` and
+// `needTrackInfo`, and the second one decides the whole output path: a Vulkan
+// guest reads frames through `getVideoLastFrameData()Ljava/nio/Buffer;` — a
+// direct ByteBuffer of packed pixels — rather than through the GLES external
+// texture `getExternalTextureId` names. RE4 is Vulkan, so that is the path
+// implemented; `getExternalTextureId` answers 0, which is "no external texture"
+// rather than a name that would be sampled and would be someone else's.
+typedef struct {
+    int        swizzle, vulkan, need_track_info;
+    char       source[1024];     // what the guest asked for, verbatim
+    kl_avdec  *dec;
+    int        video_enabled, audio_enabled;
+    float      volume;
+    int        looping;
+    int        started;          // start() seen; distinct from the decoder running
+    void      *buffer;           // the java.nio.Buffer handed out, cached
+    unsigned long long buf_serial;
+    int        last_w, last_h;   // for didResolutionChange
+    int        res_changed;
+} klj_media;
+
+static klj_media *klj_media_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return (o && strcmp(o->cls, "com/epicgames/ue4/MediaPlayer14") == 0) ? o->data : NULL;
+}
+
+// Resolve what the guest named to a host file plus a byte range.
+//
+// Three of the four setDataSource forms carry an explicit (offset, length) into
+// a container, because on Android the movie lives inside the OBB; the URL form
+// carries a path on its own. Both end up here so there is one place that
+// decides what file is opened — two would be two chances to disagree about
+// which container an offset is into.
+static void klj_media_open(klj_media *m, const char *what, long long off,
+                           long long len) {
+    if (!m) return;
+    if (m->dec) { kl_avdec_close(m->dec); m->dec = NULL; }
+    snprintf(m->source, sizeof m->source, "%s", what ? what : "");
+
+    // `file://` and a bare path are the same thing to us; UE4 hands over both
+    // depending on which MediaSource built the URL.
+    const char *p = m->source;
+    if (strncmp(p, "file://", 7) == 0) p += 7;
+    m->dec = kl_avdec_open(p, off, len);
+    if (!m->dec)
+        KLJ_LOG("MediaPlayer14: could not open %s (offset %lld, %lld bytes) — "
+                "setDataSource answers false and the guest's own no-media path "
+                "runs", p, off, len);
+}
+
+static klj_val klj_MP14_ctor(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_media *m = calloc(1, sizeof *m);
+    if (!m) return (klj_val){.l = NULL};
+    m->swizzle         = n > 0 && a[0].j != 0;
+    m->vulkan          = n > 1 && a[1].j != 0;
+    m->need_track_info = n > 2 && a[2].j != 0;
+    m->video_enabled = m->audio_enabled = 1;
+    m->volume = 1.0f;
+    // Printed once per player and worth it: `vulkan` selects between two
+    // completely different ways of handing frames back, and getting it wrong
+    // is a black movie with every call succeeding.
+    KLJ_LOG("MediaPlayer14(swizzlePixels=%d, vulkanRenderer=%d, needTrackInfo=%d)",
+            m->swizzle, m->vulkan, m->need_track_info);
+    return (klj_val){.l = klj_new_object_data("com/epicgames/ue4/MediaPlayer14", m)};
+}
+
+// The four data sources. Each answers Z — true only if a decoder really opened.
+static klj_val klj_MP14_setDataSourceURL(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_media *m = klj_media_of(self);
+    klj_media_open(m, n > 0 ? klj_str(a[0].l) : NULL, 0, 0);
+    return (klj_val){.j = m && m->dec ? 1 : 0};
+}
+// (String path, long offset, long size) — the OBB form with the container named.
+static klj_val klj_MP14_setDataSourceRange(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_media *m = klj_media_of(self);
+    klj_media_open(m, n > 0 ? klj_str(a[0].l) : NULL,
+                   n > 1 ? (long long)a[1].j : 0, n > 2 ? (long long)a[2].j : 0);
+    return (klj_val){.j = m && m->dec ? 1 : 0};
+}
+// (AssetManager, String name, long offset, long size) — the same, addressed
+// through the asset manager. The AssetManager argument is dropped deliberately:
+// kl_jni resolves an asset name against the unpacked tree already, and a second
+// resolution here would be a second answer to "where do assets live".
+static klj_val klj_MP14_setDataSourceAsset(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_media *m = klj_media_of(self);
+    const char *name = n > 1 ? klj_str(a[1].l) : NULL;
+    char path[1024];
+    if (name && name[0] != '/') {
+        snprintf(path, sizeof path, "%s/%s", g_assets_dir, name);
+        name = path;
+    }
+    klj_media_open(m, name, n > 2 ? (long long)a[2].j : 0,
+                   n > 3 ? (long long)a[3].j : 0);
+    return (klj_val){.j = m && m->dec ? 1 : 0};
+}
+// (long, long) — a range in an archive the guest already has open, handed over
+// as raw numbers with no container named at all. There is nothing here to
+// resolve them against, so it is refused BY NAME rather than guessed at: an
+// offset into an unknown file is the one input that cannot be honoured.
+static klj_val klj_MP14_setDataSourceArchive(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("MediaPlayer14.setDataSourceArchive(%lld, %lld) — refused: the guest "
+            "names an offset and a length with no container, and this shim has "
+            "no handle on the archive it means",
+            n > 0 ? (long long)a[0].j : 0, n > 1 ? (long long)a[1].j : 0);
+    return (klj_val){.j = 0};
+}
+
+static klj_val klj_MP14_prepare(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n; (void)self;
+    return (klj_val){.j = 0};      // the open already did the work
+}
+static klj_val klj_MP14_start(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    if (m) { m->started = 1; kl_avdec_play(m->dec, 1); }
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MP14_pause(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    if (m) kl_avdec_play(m->dec, 0);
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MP14_stop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    if (m) { m->started = 0; kl_avdec_play(m->dec, 0); kl_avdec_seek(m->dec, 0); }
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MP14_reset(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    if (m && m->dec) { kl_avdec_close(m->dec); m->dec = NULL; m->started = 0; }
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MP14_release(void *env, void *self, const klj_val *a, int n) {
+    return klj_MP14_reset(env, self, a, n);
+}
+static klj_val klj_MP14_seekTo(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_media *m = klj_media_of(self);
+    if (m) kl_avdec_seek(m->dec, n > 0 ? (int32_t)a[0].j : 0);
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MP14_setLooping(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_media *m = klj_media_of(self);
+    if (m) { m->looping = n > 0 && a[0].j != 0; kl_avdec_set_looping(m->dec, m->looping); }
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MP14_isLooping(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    return (klj_val){.j = m && m->looping};
+}
+static klj_val klj_MP14_isPlaying(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    return (klj_val){.j = m && kl_avdec_playing(m->dec)};
+}
+// "Prepared" is "a decoder is open on real media", which is the same condition
+// setDataSource answered — there is no asynchronous preparation here because
+// kl_avdec_open has already read the asset by the time it returns.
+static klj_val klj_MP14_isPrepared(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    return (klj_val){.j = m && m->dec != NULL};
+}
+static klj_val klj_MP14_didComplete(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    return (klj_val){.j = m && kl_avdec_complete(m->dec)};
+}
+static klj_val klj_MP14_getDuration(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    return (klj_val){.j = (uint64_t)(uint32_t)(m ? kl_avdec_duration_ms(m->dec) : 0)};
+}
+static klj_val klj_MP14_getCurrentPosition(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    return (klj_val){.j = (uint64_t)(uint32_t)(m ? kl_avdec_position_ms(m->dec) : 0)};
+}
+static klj_val klj_MP14_getVideoWidth(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    return (klj_val){.j = (uint64_t)(uint32_t)(m ? kl_avdec_width(m->dec) : 0)};
+}
+static klj_val klj_MP14_getVideoHeight(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    return (klj_val){.j = (uint64_t)(uint32_t)(m ? kl_avdec_height(m->dec) : 0)};
+}
+static klj_val klj_MP14_setVideoEnabled(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_media *m = klj_media_of(self);
+    if (m) m->video_enabled = n > 0 && a[0].j != 0;
+    return (klj_val){.j = 0};
+}
+// Recorded rather than applied: nothing here decodes the audio track yet, so
+// honouring the volume would be describing a mix that does not exist. Said
+// once, so a silent cutscene is a known gap rather than a mystery.
+static klj_val klj_MP14_setAudioEnabled(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_media *m = klj_media_of(self);
+    if (m) m->audio_enabled = n > 0 && a[0].j != 0;
+    static int said;
+    if (m && m->audio_enabled && !said) {
+        said = 1;
+        KLJ_LOG("MediaPlayer14: audio is enabled by the guest and this player "
+                "decodes VIDEO only — the cutscene will be silent");
+    }
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MP14_setAudioVolume(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_media *m = klj_media_of(self);
+    if (m && n > 0) memcpy(&m->volume, &a[0].j, sizeof m->volume);
+    return (klj_val){.j = 0};
+}
+
+// The frame, as a direct ByteBuffer over the decoder's own storage.
+//
+// The buffer object is cached per player: UE4 calls this every frame it wants a
+// picture, and a fresh jobject per call is garbage the guest's local frame has
+// to retire. The ADDRESS behind it is stable for the life of the decoder — the
+// frame buffer is reallocated only when the dimensions change, which is why the
+// cache is dropped when they do.
+static klj_val klj_MP14_getVideoLastFrameData(void *env, void *self,
+                                              const klj_val *a, int n) {
+    (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    if (!m || !m->dec) return (klj_val){.l = NULL};
+    int w = 0, h = 0;
+    size_t bytes = 0;
+    unsigned long long serial = 0;
+    const void *px = kl_avdec_frame(m->dec, &w, &h, &bytes, &serial);
+    if (!px || !bytes) return (klj_val){.l = NULL};
+    if (w != m->last_w || h != m->last_h) {
+        m->res_changed = 1;
+        m->last_w = w; m->last_h = h;
+        m->buffer = NULL;
+    }
+    if (!m->buffer)
+        m->buffer = klj_own(klj_NewDirectByteBuffer(env, (void *)px, (int64_t)bytes),
+                            NULL);
+    m->buf_serial = serial;
+    return (klj_val){.l = m->buffer};
+}
+
+// (int) -> Z: "is there a frame at all". The int is the external texture the
+// GLES path would have rendered into and is not one here.
+static klj_val klj_MP14_getVideoLastFrame(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    if (!m || !m->dec) return (klj_val){.j = 0};
+    unsigned long long serial = 0;
+    const void *px = kl_avdec_frame(m->dec, NULL, NULL, NULL, &serial);
+    return (klj_val){.j = px != NULL && serial != 0};
+}
+
+// Latched and cleared by the read, which is what "did it change" means — a
+// flag that stayed set would make UE4 rebuild its texture every frame.
+static klj_val klj_MP14_didResolutionChange(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    if (!m) return (klj_val){.j = 0};
+    int c = m->res_changed;
+    m->res_changed = 0;
+    return (klj_val){.j = c != 0};
+}
+
+// 0 = there is no external texture. The GLES path binds this name and samples
+// it; answering anything else would name a texture belonging to the guest's own
+// renderer, which is worse than having none.
+static klj_val klj_MP14_getExternalTextureId(void *env, void *self,
+                                             const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// NULL = "nothing new this tick", which is the answer the GLES path is built to
+// handle. It is reached only by a guest that took the external-texture route,
+// and RE4 does not.
+static klj_val klj_MP14_updateVideoFrame(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said) {
+        said = 1;
+        KLJ_LOG("MediaPlayer14.updateVideoFrame — the GLES external-texture path, "
+                "which this player does not implement (frames come out of "
+                "getVideoLastFrameData). Answering null.");
+    }
+    return (klj_val){.l = NULL};
+}
+
+// Empty track lists. `needTrackInfo` is the ctor's third bool and UE4 only asks
+// when it is set; an empty array is "this player reports no selectable tracks",
+// which is true — nothing here exposes alternates — and is distinguishable from
+// the refusal an absent binding would be.
+static klj_val klj_MP14_tracks_audio(void *env, void *self, const klj_val *a, int n) {
+    (void)self; (void)a; (void)n;
+    return (klj_val){.l = klj_new_array('L',
+        "com/epicgames/ue4/MediaPlayer14$AudioTrackInfo", 0)};
+}
+static klj_val klj_MP14_tracks_caption(void *env, void *self, const klj_val *a, int n) {
+    (void)self; (void)a; (void)n;
+    return (klj_val){.l = klj_new_array('L',
+        "com/epicgames/ue4/MediaPlayer14$CaptionTrackInfo", 0)};
+}
+static klj_val klj_MP14_tracks_video(void *env, void *self, const klj_val *a, int n) {
+    (void)self; (void)a; (void)n;
+    return (klj_val){.l = klj_new_array('L',
+        "com/epicgames/ue4/MediaPlayer14$VideoTrackInfo", 0)};
+}
+static klj_val klj_MP14_selectTrack(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
 static const klj_binding g_bindings[] = {
     {KLJ_SDLA, "getContext", "()Landroid/app/Activity;", klj_SDLA_getContext},
     {KLJ_SDLA, "getManifestEnvironmentVariables", "()Z", klj_SDLA_getManifestEnv},
@@ -10314,6 +10657,58 @@ static const klj_binding g_bindings[] = {
     // They are on `com/epicgames/ue4/GameActivity` and not on a superclass
     // because the guest looks the class up by that name (kl_ue4.c sets it as
     // the activity class for the same reason).
+    // com.epicgames.ue4.MediaPlayer14 — UE4's Java media player. The names and
+    // signatures are FJavaAndroidMediaPlayer's own GetClassMethod calls, in the
+    // order that constructor resolves them.
+    {"com/epicgames/ue4/MediaPlayer14", "<init>", "(ZZZ)V", klj_MP14_ctor},
+    {"com/epicgames/ue4/MediaPlayer14", "getDuration", "()I", klj_MP14_getDuration},
+    {"com/epicgames/ue4/MediaPlayer14", "reset", "()V", klj_MP14_reset},
+    {"com/epicgames/ue4/MediaPlayer14", "stop", "()V", klj_MP14_stop},
+    {"com/epicgames/ue4/MediaPlayer14", "getCurrentPosition", "()I",
+     klj_MP14_getCurrentPosition},
+    {"com/epicgames/ue4/MediaPlayer14", "isLooping", "()Z", klj_MP14_isLooping},
+    {"com/epicgames/ue4/MediaPlayer14", "isPlaying", "()Z", klj_MP14_isPlaying},
+    {"com/epicgames/ue4/MediaPlayer14", "isPrepared", "()Z", klj_MP14_isPrepared},
+    {"com/epicgames/ue4/MediaPlayer14", "didComplete", "()Z", klj_MP14_didComplete},
+    {"com/epicgames/ue4/MediaPlayer14", "setDataSourceURL",
+     "(Ljava/lang/String;)Z", klj_MP14_setDataSourceURL},
+    {"com/epicgames/ue4/MediaPlayer14", "setDataSourceArchive", "(JJ)Z",
+     klj_MP14_setDataSourceArchive},
+    {"com/epicgames/ue4/MediaPlayer14", "setDataSource", "(Ljava/lang/String;JJ)Z",
+     klj_MP14_setDataSourceRange},
+    {"com/epicgames/ue4/MediaPlayer14", "setDataSource",
+     "(Landroid/content/res/AssetManager;Ljava/lang/String;JJ)Z",
+     klj_MP14_setDataSourceAsset},
+    {"com/epicgames/ue4/MediaPlayer14", "prepare", "()V", klj_MP14_prepare},
+    {"com/epicgames/ue4/MediaPlayer14", "prepareAsync", "()V", klj_MP14_prepare},
+    {"com/epicgames/ue4/MediaPlayer14", "seekTo", "(I)V", klj_MP14_seekTo},
+    {"com/epicgames/ue4/MediaPlayer14", "setLooping", "(Z)V", klj_MP14_setLooping},
+    {"com/epicgames/ue4/MediaPlayer14", "release", "()V", klj_MP14_release},
+    {"com/epicgames/ue4/MediaPlayer14", "getVideoHeight", "()I", klj_MP14_getVideoHeight},
+    {"com/epicgames/ue4/MediaPlayer14", "getVideoWidth", "()I", klj_MP14_getVideoWidth},
+    {"com/epicgames/ue4/MediaPlayer14", "setVideoEnabled", "(Z)V", klj_MP14_setVideoEnabled},
+    {"com/epicgames/ue4/MediaPlayer14", "setAudioEnabled", "(Z)V", klj_MP14_setAudioEnabled},
+    {"com/epicgames/ue4/MediaPlayer14", "setAudioVolume", "(F)V", klj_MP14_setAudioVolume},
+    {"com/epicgames/ue4/MediaPlayer14", "getVideoLastFrameData", "()Ljava/nio/Buffer;",
+     klj_MP14_getVideoLastFrameData},
+    {"com/epicgames/ue4/MediaPlayer14", "start", "()V", klj_MP14_start},
+    {"com/epicgames/ue4/MediaPlayer14", "pause", "()V", klj_MP14_pause},
+    {"com/epicgames/ue4/MediaPlayer14", "getVideoLastFrame", "(I)Z",
+     klj_MP14_getVideoLastFrame},
+    {"com/epicgames/ue4/MediaPlayer14", "GetAudioTracks",
+     "()[Lcom/epicgames/ue4/MediaPlayer14$AudioTrackInfo;", klj_MP14_tracks_audio},
+    {"com/epicgames/ue4/MediaPlayer14", "GetCaptionTracks",
+     "()[Lcom/epicgames/ue4/MediaPlayer14$CaptionTrackInfo;", klj_MP14_tracks_caption},
+    {"com/epicgames/ue4/MediaPlayer14", "GetVideoTracks",
+     "()[Lcom/epicgames/ue4/MediaPlayer14$VideoTrackInfo;", klj_MP14_tracks_video},
+    {"com/epicgames/ue4/MediaPlayer14", "didResolutionChange", "()Z",
+     klj_MP14_didResolutionChange},
+    {"com/epicgames/ue4/MediaPlayer14", "getExternalTextureId", "()I",
+     klj_MP14_getExternalTextureId},
+    {"com/epicgames/ue4/MediaPlayer14", "updateVideoFrame",
+     "(I)Lcom/epicgames/ue4/MediaPlayer14$FrameUpdateInfo;", klj_MP14_updateVideoFrame},
+    {"com/epicgames/ue4/MediaPlayer14", "selectTrack", "(I)V", klj_MP14_selectTrack},
+
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetAssetManager",
      "()Landroid/content/res/AssetManager;", klj_Context_getAssets},
     // Shows a dialog the engine asked to be DEFERRED earlier. The Java's whole

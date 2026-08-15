@@ -2315,6 +2315,9 @@ static uint64_t klovrp_EndFrame(int guest_frame_index) {
 // disagreements). The observation is authoritative either way — the same run
 // reports 0 frames drawn into no stage, 0 into several and 0 off-thread — so the
 // counter is only ever the fallback for runs with no GL observation at all.
+// The guest's submitted-frame counter — see KL_OVRP_POKE and kl_vulkan_capture_eyes.
+static unsigned g_vk_frame;
+
 static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submits,
                                  int layer_submit_count, void *sync) {
     ovrp_hit("ovrp_EndFrame4");
@@ -2338,13 +2341,20 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
     // finished drawing the eye textures, so it is where they can be read back
     // and where a compositor is told the picture is ready.
     //
+    // g_vk_frame is defined down with KL_OVRP_POKE, which reads it: a poke
+    // aimed at `f9900` and the capture named `vk_f09900_*.png` have to be the
+    // same frame.
+    //
     // The stage comes out of the submit rather than from
     // kl_ovrp_last_complete_stage(), and that is not a shortcut — the latter is
     // derived from GL draw observation (kl_glfb_render_stages), which sees
     // nothing at all on a Vulkan guest.
     if (kl_vulkan_guest_active()) {
-        static unsigned vk_frame;
-        kl_vulkan_capture_eyes(vk_frame++, named < 0 ? 0 : named);
+        // File-scope rather than a static in here, because KL_OVRP_POKE's
+        // frame form is timed against THIS number: a poke aimed at `f9900`
+        // has to mean the same frame as `vk_f09900_*.png`, or a script written
+        // by looking at the captures presses at some other screen.
+        kl_vulkan_capture_eyes(g_vk_frame++, named < 0 ? 0 : named);
         // After the capture, not before: the capture's own submit is work on
         // the same queue, and a compositor let loose between the two would race
         // it. Ordinary runs write no captures at all, so this is the only
@@ -2515,10 +2525,11 @@ static int g_hand_set[2];
 // metadata (Button: One=1 Two=2 Start=0x100 PrimaryIndexTrigger=0x2000
 // PrimaryHandTrigger=0x4000 PrimaryThumbstick=0x8000 ..., and the Secondary*
 // block at <<20-ish for the other hand — the frontend hands us final bits).
-static struct {
+typedef struct {
     uint32_t buttons, touches, neartouches;
     float    index_trigger, hand_trigger, stick_x, stick_y;
-} g_input[2];
+} klovrp_input_state;
+static klovrp_input_state g_input[2];
 
 void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
@@ -2566,6 +2577,162 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
     g_input[hand].stick_y = stick_y;
 }
 
+// --- KL_OVRP_POKE: a scripted controller sequence ---------------------------
+//
+// `KL_OVRP_POKE="12:A,15:A,17:DOWN,18:A"` — at 12 s press A, and so on. What it
+// buys is a run that drives ITSELF past a title screen and into a menu, which is
+// the difference between a bug being reproducible on this machine and only being
+// reachable by a person wearing a headset.
+//
+// Merged at the point the guest READS its controller state rather than written
+// into g_input, for two reasons: a frontend publishing every frame would
+// otherwise overwrite it between the press and the read, and applied here it
+// works with **no frontend at all** — a headless `./build/m_boot re4` gets the
+// same presses as the viewer. That is KL_VIEW_POKE's reasoning (driven from the
+// pump, not from a window) in the seam this guest's input actually arrives
+// through: RE4 reads OVRPlugin, not the NDK input queue.
+//
+// The clock starts at the guest's FIRST read of controller state, not at
+// process start. Startup here is dominated by the engine's one-time shader
+// optimization, which is minutes and is not the same length twice, so wall
+// clock from exec would aim every press at a different screen.
+// `f9900:A` presses at the guest's 9900th submitted frame instead, and that
+// form is the one to write scripts in: it is the SAME number `KL_VK_OUT` puts
+// in `vk_f09900_*.png`, so a sequence worked out by looking at the captures
+// lands on the screens they show. Seconds cannot do that here — startup is
+// dominated by the engine's one-time shader optimization, which is minutes and
+// is not the same length twice.
+#define KLOVRP_POKE_MAX 32
+static struct klovrp_poke {
+    double   t;                       // seconds after the first read
+    long     frame;                   // ...or the guest frame, when >= 0
+    uint32_t b[2];                    // raw button bits, per hand
+    float    idx[2], grip[2];         // triggers, per hand
+    float    sx, sy;                  // right thumbstick
+    int      fired;
+} g_poke[KLOVRP_POKE_MAX];
+static int    g_poke_n = -1;          // -1 = not parsed yet
+static double g_poke_hold = 0.25;     // seconds a press is held
+static double g_poke_t0;
+
+// One name to one control. Right hand unless the name says otherwise, which is
+// OVRPlugin's own convention: A/B are the right controller's face buttons and
+// X/Y the left's, so a table keyed on the name cannot put them on one hand.
+static int klovrp_poke_name(const char *n, size_t len, struct klovrp_poke *p) {
+    struct { const char *n; int hand; uint32_t bit; float idx, grip, sx, sy; } t[] = {
+        { "A",     1, KL_OVRP_RAW_A,     0, 0, 0, 0 },
+        { "B",     1, KL_OVRP_RAW_B,     0, 0, 0, 0 },
+        { "X",     0, KL_OVRP_RAW_X,     0, 0, 0, 0 },
+        { "Y",     0, KL_OVRP_RAW_Y,     0, 0, 0, 0 },
+        { "START", 1, KL_OVRP_RAW_START, 0, 0, 0, 0 },
+        { "BACK",  1, KL_OVRP_RAW_BACK,  0, 0, 0, 0 },
+        { "RTRIG", 1, KL_OVRP_RAW_RINDEX_TRIGGER, 1, 0, 0, 0 },
+        { "LTRIG", 0, KL_OVRP_RAW_LINDEX_TRIGGER, 1, 0, 0, 0 },
+        { "RGRIP", 1, KL_OVRP_RAW_RHAND_TRIGGER,  0, 1, 0, 0 },
+        { "LGRIP", 0, KL_OVRP_RAW_LHAND_TRIGGER,  0, 1, 0, 0 },
+        { "UP",    1, KL_OVRP_RAW_RTHUMBSTICK_UP,    0, 0,  0,  1 },
+        { "DOWN",  1, KL_OVRP_RAW_RTHUMBSTICK_DOWN,  0, 0,  0, -1 },
+        { "LEFT",  1, KL_OVRP_RAW_RTHUMBSTICK_LEFT,  0, 0, -1,  0 },
+        { "RIGHT", 1, KL_OVRP_RAW_RTHUMBSTICK_RIGHT, 0, 0,  1,  0 },
+    };
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+        if (strlen(t[i].n) != len || strncasecmp(t[i].n, n, len) != 0) continue;
+        p->b[t[i].hand] |= t[i].bit;
+        if (t[i].idx)  p->idx[t[i].hand]  = 1.0f;
+        if (t[i].grip) p->grip[t[i].hand] = 1.0f;
+        if (t[i].sx)   p->sx = t[i].sx;
+        if (t[i].sy)   p->sy = t[i].sy;
+        return 1;
+    }
+    return 0;
+}
+
+static void klovrp_poke_parse(void) {
+    g_poke_n = 0;
+    const char *s = getenv("KL_OVRP_POKE");
+    if (!s || !*s) return;
+    g_poke_hold = kl_env_int("KL_OVRP_POKE_HOLD_MS", 250) / 1000.0;
+    while (*s && g_poke_n < KLOVRP_POKE_MAX) {
+        while (*s == ',' || *s == ' ') s++;
+        if (!*s) break;
+        int by_frame = (*s == 'f' || *s == 'F');
+        if (by_frame) s++;
+        char *end = NULL;
+        double t = strtod(s, &end);
+        if (end == s || *end != ':') {
+            fprintf(stderr, "  [ovrp] KL_OVRP_POKE: expected <seconds>:<BUTTON> or "
+                            "f<frame>:<BUTTON> at \"%s\" — the rest of the script "
+                            "is ignored\n", s);
+            return;
+        }
+        struct klovrp_poke p;
+        memset(&p, 0, sizeof p);
+        p.t = by_frame ? 0 : t;
+        p.frame = by_frame ? (long)t : -1;
+        s = end + 1;
+        int ok = 1;
+        for (;;) {
+            const char *w = s;
+            while (*s && *s != ',' && *s != '+' && *s != ' ') s++;
+            // Named, not skipped: a misspelt button is a press that never
+            // happens, and a script that silently does less than it says
+            // reads as the guest ignoring input.
+            if (!klovrp_poke_name(w, (size_t)(s - w), &p)) {
+                fprintf(stderr, "  [ovrp] KL_OVRP_POKE: no button named \"%.*s\" — "
+                                "A B X Y START BACK RTRIG LTRIG RGRIP LGRIP UP "
+                                "DOWN LEFT RIGHT\n", (int)(s - w), w);
+                ok = 0;
+            }
+            if (*s != '+') break;
+            s++;
+        }
+        if (ok) g_poke[g_poke_n++] = p;
+    }
+    if (g_poke_n)
+        fprintf(stderr, "  [ovrp] KL_OVRP_POKE: %d press(es) scripted, %.0f ms each, "
+                        "timed from the guest's first controller read\n",
+                g_poke_n, g_poke_hold * 1000.0);
+}
+
+// This hand's state as the guest should see it: what a frontend published, plus
+// whatever the script is holding down right now.
+static klovrp_input_state klovrp_input(int hand) {
+    klovrp_input_state v = g_input[hand];
+    if (g_poke_n < 0) klovrp_poke_parse();
+    if (g_poke_n == 0) return v;
+    double now = klovrp_mono_now();
+    if (g_poke_t0 == 0.0) g_poke_t0 = now;
+    double t = now - g_poke_t0;
+    unsigned frame = __atomic_load_n(&g_vk_frame, __ATOMIC_RELAXED);
+    for (int i = 0; i < g_poke_n; i++) {
+        struct klovrp_poke *p = &g_poke[i];
+        if (p->frame >= 0) {
+            // A hold in FRAMES for a press timed in frames: the frame rate here
+            // is whatever the host manages, so a press held for a quarter of a
+            // second could be one frame or forty.
+            long held = (long)(g_poke_hold * 90.0);
+            if ((long)frame < p->frame || (long)frame > p->frame + held) continue;
+        } else if (t < p->t || t > p->t + g_poke_hold) {
+            continue;
+        }
+        if (!p->fired) {
+            p->fired = 1;
+            fprintf(stderr, "  [ovrp] KL_OVRP_POKE at %.1f s / frame %u: "
+                            "buttons L=%#x R=%#x\n", t, frame, p->b[0], p->b[1]);
+        }
+        v.buttons    |= p->b[hand];
+        v.touches    |= p->b[hand];
+        v.neartouches |= p->b[hand];
+        if (p->idx[hand] > v.index_trigger) v.index_trigger = p->idx[hand];
+        if (p->grip[hand] > v.hand_trigger) v.hand_trigger = p->grip[hand];
+        if (hand == 1) {
+            if (p->sx != 0) v.stick_x = p->sx;
+            if (p->sy != 0) v.stick_y = p->sy;
+        }
+    }
+    return v;
+}
+
 // --- ...and the read side, for kl_openxr.c (kl_ovrp.h documents the contract)
 //
 // The pose comes from klovrp_hand(), which is the PINNED one — the same value
@@ -2586,12 +2753,13 @@ int kl_ovrp_controller_input(int hand, uint32_t *buttons, uint32_t *touches,
                              float *index_trigger, float *hand_trigger,
                              float *stick_x, float *stick_y) {
     if ((unsigned)hand > 1) return 0;
-    if (buttons)       *buttons = g_input[hand].buttons;
-    if (touches)       *touches = g_input[hand].touches;
-    if (index_trigger) *index_trigger = g_input[hand].index_trigger;
-    if (hand_trigger)  *hand_trigger = g_input[hand].hand_trigger;
-    if (stick_x)       *stick_x = g_input[hand].stick_x;
-    if (stick_y)       *stick_y = g_input[hand].stick_y;
+    klovrp_input_state in = klovrp_input(hand);
+    if (buttons)       *buttons = in.buttons;
+    if (touches)       *touches = in.touches;
+    if (index_trigger) *index_trigger = in.index_trigger;
+    if (hand_trigger)  *hand_trigger = in.hand_trigger;
+    if (stick_x)       *stick_x = in.stick_x;
+    if (stick_y)       *stick_y = in.stick_y;
     // Presence is the pose seam's, not this one's: a frontend that publishes a
     // hand publishes both in the same breath, and there is no separate "the
     // buttons are meaningful" signal here. A hand-tracked hand therefore reads
@@ -2916,25 +3084,30 @@ static void fill_controller_state(int mask, void *out, int version) {
     uint8_t *b = out;
     uint32_t *w = (uint32_t *)out;
     float *f = (float *)out;
+    // Through klovrp_input, so a KL_OVRP_POKE script reaches the OVRPlugin
+    // guest and the OpenXR one identically. Read once per hand per call: the
+    // script is timed, so two reads inside one fill could straddle a press's
+    // end and hand the guest a button that is down in Buttons and up in Touches.
+    klovrp_input_state in[2] = { klovrp_input(0), klovrp_input(1) };
     w[0] = conn;                                        // ConnectedControllers
     if (conn & OVRP_CTRL_LTOUCH) {
-        w[1] |= g_input[0].buttons;                     // Buttons
-        w[2] |= g_input[0].touches;                     // Touches
-        w[3] |= g_input[0].neartouches;                 // NearTouches
-        f[4] = g_input[0].index_trigger;                // LIndexTrigger
-        f[6] = g_input[0].hand_trigger;                 // LHandTrigger
-        f[8] = g_input[0].stick_x; f[9] = g_input[0].stick_y;
-        if (version >= 2) { f[12] = g_input[0].stick_x; f[13] = g_input[0].stick_y; }
+        w[1] |= in[0].buttons;                          // Buttons
+        w[2] |= in[0].touches;                          // Touches
+        w[3] |= in[0].neartouches;                      // NearTouches
+        f[4] = in[0].index_trigger;                     // LIndexTrigger
+        f[6] = in[0].hand_trigger;                      // LHandTrigger
+        f[8] = in[0].stick_x; f[9] = in[0].stick_y;
+        if (version >= 2) { f[12] = in[0].stick_x; f[13] = in[0].stick_y; }
         if (version >= 4) b[0x40] = 100;                // LBatteryPercentRemaining
     }
     if (conn & OVRP_CTRL_RTOUCH) {
-        w[1] |= g_input[1].buttons;
-        w[2] |= g_input[1].touches;
-        w[3] |= g_input[1].neartouches;
-        f[5] = g_input[1].index_trigger;                // RIndexTrigger
-        f[7] = g_input[1].hand_trigger;                 // RHandTrigger
-        f[10] = g_input[1].stick_x; f[11] = g_input[1].stick_y;
-        if (version >= 2) { f[14] = g_input[1].stick_x; f[15] = g_input[1].stick_y; }
+        w[1] |= in[1].buttons;
+        w[2] |= in[1].touches;
+        w[3] |= in[1].neartouches;
+        f[5] = in[1].index_trigger;                     // RIndexTrigger
+        f[7] = in[1].hand_trigger;                      // RHandTrigger
+        f[10] = in[1].stick_x; f[11] = in[1].stick_y;
+        if (version >= 2) { f[14] = in[1].stick_x; f[15] = in[1].stick_y; }
         if (version >= 4) b[0x41] = 100;                // RBatteryPercentRemaining
     }
     w[1] |= fake;                                       // Buttons

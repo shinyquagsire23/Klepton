@@ -865,6 +865,25 @@ puts the camera on the ground with its hands underneath it.
   real hands. The offset was absolute tracking-space coordinates until the
   FloorLevel origin was measured, which parked them below the floor and out
   of frustum — the knob meant to prove the controllers render was hiding them.
+- `KL_OVRP_POKE="<when>:<BUTTON>[+<BUTTON>],..."` — a scripted controller
+  sequence, so a run can drive **itself** past a title screen and into a menu.
+  `<when>` is either seconds (`12:A`) or, better, a guest frame (`f9900:A`) —
+  the same number `KL_VK_OUT` puts in `vk_f09900_*.png`, so a script worked out
+  by looking at the captures lands on the screens they show. Seconds cannot do
+  that on a UE4 guest: startup is dominated by the engine's one-time shader
+  optimization, which is minutes and is not the same length twice (the seconds
+  clock starts at the guest's first controller read, not at exec, for the same
+  reason). Names: `A B X Y START BACK RTRIG LTRIG RGRIP LGRIP UP DOWN LEFT
+  RIGHT`, right hand unless the name says otherwise (X/Y and the L* pair are
+  the left controller, which is OVRPlugin's own convention). A misspelt name is
+  NAMED, not skipped — a press that never happens reads as the guest ignoring
+  input. `KL_OVRP_POKE_HOLD_MS` (250) is how long each press is held.
+  Merged where the guest **reads** its controller state rather than written
+  into the published input, so it survives a frontend publishing every frame
+  and works with **no frontend at all**: a headless `./build/m_boot re4` gets
+  the same presses as the viewer, and both OVRPlugin and OpenXR guests see
+  them. KL_VIEW_POKE's reasoning, in the seam a VR guest's input arrives
+  through.
 - `KL_OVRP_FAKE_BUTTONS=<hex>` — OR this mask into both hands' `Buttons` and
   `Touches` on a duty cycle (~256 polls on, 256 off), so `GetDown`/`GetUp`
   edges actually occur; a bit held from boot never reads as a press. Which
@@ -1330,18 +1349,22 @@ The composite/timewarp pass — one file, compiled by both compositors
   pass, against the pose the guest *actually rendered it with* (`kl_ovrp`'s
   stage-keyed record) instead of the current one — mouse-look motion between
   the guest's frame and the composite is corrected here exactly as head motion
-  is on device. Default off: the plain blit is the path that reached gameplay,
-  and it is the A/B. Prints the delta in degrees every 120 composites — 0.00
+  is on device. **Default ON since 2026-08-15**, and `=0` is the A/B back to the
+  plain blit. Prints the delta in degrees every 120 composites — 0.00
   means the guest is keeping up and the pass is a blit, which is a proven
   identity (`make reproject`).
-  **Being off is why the viewer is not a stand-in for the device composite.**
+  **Being off was why the viewer was not a stand-in for the device composite.**
   The visionOS compositor has no blit path — it is always the reprojection pass
   — so everything that lives only in that pass (the unwarp grid, the foveation
-  correction, the render-viewport crop, `visible`, the sRGB decode) is
-  unexercised by a default viewer run. "It looks right in the viewer" is
-  therefore not evidence about any of them; turn this on before comparing the
-  two, and the picture the viewer shows is then the picture the device's pass
-  computes.
+  correction, the render-viewport crop, `visible`, the sRGB decode) was
+  unexercised by a default viewer run, and "it looks right in the viewer" was
+  not evidence about any of them. The overlay pass is the case that forced the
+  default over: `g_pipe_ov` was built inside this knob's branch, so RE4's splash
+  and menus composited on device and not in the viewer, with neither of
+  klvm_draw_overlays' two diagnostics reached. The overlay pipeline is built
+  unconditionally now; with this off the eye picture is flat and the overlay is
+  posed, so they disagree as the head moves — which the viewer says once rather
+  than leaving it to look like a placement bug.
 
 ## Audio (`runtime/kl_audio.c`)
 
