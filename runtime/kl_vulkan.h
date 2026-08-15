@@ -104,6 +104,17 @@ unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, un
 unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
                                          unsigned w, unsigned h, int srgb, int layers);
 
+// ...and the MTLTexture behind one of those, for a compositor that has to draw
+// the layer. The eye layer is deliberately NOT reachable here: its textures go
+// through kl_glfb's eye table, where every consumer already looks, and a second
+// door onto the same storage is how two answers start to differ.
+//
+// A layer allocated for eye 0 alone — the common case, one texture with a
+// per-eye ViewportRect selecting the part — answers eye 1 from it rather than
+// with nothing. NULL when the layer has no storage for that stage.
+void *kl_vulkan_layer_mtl_texture(int layer_key, int stage, int eye,
+                                  int *w, int *h);
+
 // Write both eyes of a stage out as PNGs. Called at frame submission, which on
 // this path is ovrp_EndFrame4 — the guest's own assertion that it has finished
 // drawing them.

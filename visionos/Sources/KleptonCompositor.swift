@@ -238,6 +238,9 @@ final class KleptonCompositor {
     // Read them in order: the FIRST rung that shows something is the answer,
     // and every rung above it is then known-good.
     private let probe = Int(ProcessInfo.processInfo.environment["KL_CP_PROBE"] ?? "") ?? 0
+    /// The overlay pass — a guest's non-eye layers. nil when it failed to
+    /// build, which is named at construction rather than per frame.
+    private var overlayPipeline: MTLRenderPipelineState?
     private var probePipeline: MTLRenderPipelineState?
     /// Red, green, blue — one second each, off the wall clock. Deliberately
     /// full-intensity primaries: whatever tone mapping or colour management sits
@@ -607,6 +610,35 @@ final class KleptonCompositor {
             dsd.depthCompareFunction = .greater
             dsd.isDepthWriteEnabled = true
             depthState = device.makeDepthStencilState(descriptor: dsd)
+
+            // The overlay pass — the guest's non-eye layers, which are the whole
+            // of an Unreal title's UI. See encodeOverlays.
+            //
+            // The one pipeline here that BLENDS, and the eye pass must not: a
+            // guest leaves the eye texture's alpha at 0 because that layer is
+            // composited opaque (trap 33), so a blending eye pass hands the
+            // display a transparent frame over a correct picture. A UI quad's
+            // alpha is authored and is the point of it.
+            let odesc = MTLRenderPipelineDescriptor()
+            let olib = try device.makeLibrary(source: String(cString: kl_reproject_overlay_msl()),
+                                              options: nil)
+            odesc.vertexFunction   = olib.makeFunction(name: "kl_ov_v")
+            odesc.fragmentFunction = olib.makeFunction(name: "kl_ov_f")
+            odesc.colorAttachments[0].pixelFormat = color
+            odesc.depthAttachmentPixelFormat = .depth32Float
+            odesc.maxVertexAmplificationCount = amplification
+            odesc.colorAttachments[0].isBlendingEnabled = true
+            odesc.colorAttachments[0].rgbBlendOperation = .add
+            odesc.colorAttachments[0].alphaBlendOperation = .add
+            odesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            odesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            odesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            odesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            overlayPipeline = try? device.makeRenderPipelineState(descriptor: odesc)
+            if overlayPipeline == nil {
+                NSLog("[cp] the overlay pipeline failed to build — a guest's non-eye "
+                      + "layers will not be composited (on Unreal that is its whole UI)")
+            }
 
             // KL_CP_PROBE: swap ONE thing about the pass and see if the black
             // moves. Each rung isolates a different link in the chain, so a
@@ -1914,9 +1946,82 @@ final class KleptonCompositor {
         // has to undo. See unwarpGrid and kl_reproject.h.
         enc.setVertexBuffer(gridBuf, offset: 0, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
+        encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
+                       originFromDevice: originFromDevice)
         enc.endEncoding()
         return visible
     }
+
+    /// The layers that are NOT the eye, drawn on top of it in the same encoder.
+    ///
+    /// `ovrp_EndFrame4` is handed a list and every reader of it here used to walk
+    /// past anything but the eye layer. That is right for the frame record and it
+    /// silently dropped everything else. Unity's only other layer is a 1x1 nothing
+    /// renders into; **Unreal draws its UI this way**, so on RE4 it dropped the
+    /// studio splash, the loading screens and the menus while the world
+    /// composited perfectly.
+    ///
+    /// No depth ordering is needed: the eye quad sits at `KL_REPROJECT_DEPTH`
+    /// (500 m) and an overlay is a few metres away, so it is in front by geometry.
+    /// `KL_OVERLAYS_LAYER=0` is the A/B.
+    private func encodeOverlays(_ enc: MTLRenderCommandEncoder,
+                                viewIndices: [Int],
+                                drawable: LayerRenderer.Drawable,
+                                originFromDevice: simd_float4x4) {
+        guard overlaysEnabled, let pipe = overlayPipeline else { return }
+        let n = Int(kl_ovrp_overlay_count())
+        if n == 0 { return }
+        for i in 0..<n {
+            var ov = kl_ovrp_overlay()
+            guard kl_ovrp_overlay_get(Int32(i), &ov) != 0 else { continue }
+            // One uniform per amplified view, exactly as the eye pass does — the
+            // array is indexed by [[amplification_id]] and a view with no
+            // placement says so with `visible = 0` rather than by not drawing,
+            // because with amplification there is one draw for both.
+            var uniforms: [kl_overlay_uniforms] = []
+            var texture: MTLTexture? = nil
+            for vi in viewIndices {
+                var w: Int32 = 0, h: Int32 = 0
+                let t = kl_vulkan_layer_mtl_texture(ov.layer_id, ov.stage, Int32(vi), &w, &h)
+                if texture == nil, let t { texture = Unmanaged<MTLTexture>
+                    .fromOpaque(t).takeUnretainedValue() }
+                var u = kl_overlay_build(&ov, Int32(vi), originFromDevice,
+                                         drawable.views[vi].transform,
+                                         drawable.computeProjection(viewIndex: vi))
+                if t == nil { u.visible = 0 }
+                uniforms.append(u)
+            }
+            guard let texture, uniforms.contains(where: { $0.visible != 0 }) else {
+                // Named once per layer: "the guest submitted a layer we cannot
+                // reach" and "the guest submitted none" are the same picture.
+                if !loggedOverlayMiss.contains(ov.layer_id) {
+                    loggedOverlayMiss.insert(ov.layer_id)
+                    NSLog("[cp] overlay layer \(ov.layer_id) (shape \(ov.shape), stage "
+                          + "\(ov.stage), \(ov.size.0)x\(ov.size.1) m) has no placement "
+                          + "or no MTLTexture — not composited")
+                }
+                continue
+            }
+            enc.setRenderPipelineState(pipe)
+            enc.setFragmentTexture(texture, index: 0)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            uniforms.withUnsafeBytes { buf in
+                enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+                enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+            }
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            if !loggedOverlayDraw.contains(ov.layer_id) {
+                loggedOverlayDraw.insert(ov.layer_id)
+                NSLog("[cp] compositing overlay layer \(ov.layer_id): "
+                      + "\(ov.size.0)x\(ov.size.1) m at (\(ov.pose.4), \(ov.pose.5), "
+                      + "\(ov.pose.6))"
+                      + (ov.head_locked != 0 ? ", HEAD-LOCKED" : ""))
+            }
+        }
+    }
+    private let overlaysEnabled = klEnvOn("KL_OVERLAYS", default: true)
+    private var loggedOverlayMiss = Set<Int32>()
+    private var loggedOverlayDraw = Set<Int32>()
     private var loggedSplitEyes = false
     /// Said once: what the two texture slots resolved to, and whether the eyes
     /// share one texture or arrive as one swapchain each. Two guests of

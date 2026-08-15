@@ -39,6 +39,7 @@ static id<MTLDevice>              g_dev;
 static id<MTLCommandQueue>        g_queue;
 static id<MTLRenderPipelineState> g_pipe;      // the plain blit
 static id<MTLRenderPipelineState> g_pipe_rp;   // the reprojection pass, KL_VIEW_TIMEWARP
+static id<MTLRenderPipelineState> g_pipe_ov;   // the overlay layers, blended, KL_OVERLAYS
 static int                        g_timewarp;
 static id<MTLSamplerState>        g_samp;
 static id<MTLSharedEvent>         g_event;
@@ -52,8 +53,9 @@ static unsigned long             g_lit;   // atomics below: written on a Metal c
 // Build one pipeline from one of kl_reproject.c's two shaders. Both are shared
 // with the visionOS compositor; the only thing this file decides is which one
 // runs and what it draws into.
-static id<MTLRenderPipelineState> klvm_pipeline(const char *msl, const char *vfn,
-                                                const char *ffn, const char *what) {
+static id<MTLRenderPipelineState> klvm_pipeline_blend(const char *msl, const char *vfn,
+                                                      const char *ffn, const char *what,
+                                                      int blend) {
     NSError *err = nil;
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
                                              options:nil error:&err];
@@ -72,12 +74,31 @@ static id<MTLRenderPipelineState> klvm_pipeline(const char *msl, const char *vfn
     // per channel per pixel — 15 million calls a frame at 2198x2304, which is
     // why it needed a 64K-entry LUT to be affordable at all.
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+    // Only the OVERLAY pass blends. The eye passes force alpha to 1.0 and must
+    // (trap 33: a guest leaves the eye texture's alpha at 0 because the layer is
+    // composited opaque, so a blending eye pass hands the window server a
+    // transparent frame over a correct picture). A UI quad's alpha is authored
+    // and is the whole reason it is a separate layer.
+    if (blend) {
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        pd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    }
     id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithDescriptor:pd
                                                                         error:&err];
     if (!p)
         fprintf(stderr, "  [vmtl] %s pipeline failed: %s\n", what,
                 err.localizedDescription.UTF8String ?: "?");
     return p;
+}
+
+static id<MTLRenderPipelineState> klvm_pipeline(const char *msl, const char *vfn,
+                                                const char *ffn, const char *what) {
+    return klvm_pipeline_blend(msl, vfn, ffn, what, 0);
 }
 
 // The uniforms for this composite, in the viewer's degenerate case of it: one
@@ -265,6 +286,100 @@ static id<MTLTexture> klvm_array_view(id<MTLTexture> src) {
     return v ?: src;
 }
 
+// One overlay's uniforms, for the eye this window is showing.
+//
+// The head pose here is the FULL one, translation included, where the eye pass
+// deliberately drops it: an overlay is a thing at a place, and the delta between
+// the head and that place is the whole geometry. `device_from_view` is identity
+// because this viewer has no eye offset of its own — it renders one eye's
+// picture into a flat window (see klvm_eye).
+static kl_overlay_uniforms klvm_overlay_uniforms(const kl_ovrp_overlay *ov, int eye) {
+    float px, py, pz, qx, qy, qz, qw;
+    kl_ovrp_get_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
+    simd_float4x4 device = simd_matrix4x4(simd_quaternion(qx, qy, qz, qw));
+    device.columns[3] = simd_make_float4(px, py, pz, 1.0f);
+
+    // The same projection the eye picture is placed with, so the overlay lands
+    // at the angular size the eye pass would have given it. Read from the frame
+    // record for the same reason klvm_uniforms does — the tangents are what the
+    // guest was told to render with.
+    int stage = kl_ovrp_last_complete_stage();
+    if (stage < 0) stage = 0;
+    kl_ovrp_render_pose r;
+    int have = kl_ovrp_stage_render_pose(stage, &r);
+    const float *t = have ? r.tangents[eye] : (const float[]){1, 1, 1, 1};
+    simd_float4x4 proj = kl_reproject_projection(t[0], t[1], t[2], t[3], 0.03f);
+    return kl_overlay_build(ov, eye, device, matrix_identity_float4x4, proj);
+}
+
+// The layers that are NOT the eye — a guest's splash screens, loading screens
+// and UI, which on an Unreal title is everything that is not the world.
+//
+// Drawn after the eye pass, in the same encoder and against the same depth: the
+// eye quad sits at KL_REPROJECT_DEPTH (500 m by default) and an overlay at a few
+// metres is in front of it, so ordering falls out of the geometry rather than
+// out of the draw order. `KL_OVERLAYS=0` is the A/B.
+static void klvm_draw_overlays(id<MTLRenderCommandEncoder> enc, int eye, int stage) {
+    (void)stage;
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OVERLAYS", 1);
+    if (!on || !g_pipe_ov) return;
+    int n = kl_ovrp_overlay_count();
+    for (int i = 0; i < n; i++) {
+        kl_ovrp_overlay ov;
+        if (!kl_ovrp_overlay_get(i, &ov)) continue;
+        int tw = 0, th = 0;
+        void *texp = kl_vulkan_layer_mtl_texture(ov.layer_id, ov.stage, eye, &tw, &th);
+        // Named once per layer, because "the guest submitted a layer we cannot
+        // reach" and "the guest submitted no layers" are the same picture. The
+        // GL path has no layer storage of its own — a GLES guest's overlays
+        // would come through kl_glfb, which nothing has needed yet — so this
+        // also says which half is missing.
+        if (!texp) {
+            static int said[8];
+            int k = ov.layer_id & 7;
+            if (!said[k]) {
+                said[k] = 1;
+                fprintf(stderr, "  [vmtl] overlay layer %d (shape %d, stage %d) has no "
+                                "MTLTexture — not composited%s\n",
+                        ov.layer_id, ov.shape, ov.stage,
+                        kl_vulkan_guest_active() ? ""
+                            : " (this guest is not on Vulkan; only that path "
+                              "backs a non-eye layer today)");
+            }
+            continue;
+        }
+        kl_overlay_uniforms u = klvm_overlay_uniforms(&ov, eye);
+        if (!u.visible) {
+            static int said[8];
+            int k = ov.layer_id & 7;
+            if (!said[k]) {
+                said[k] = 1;
+                fprintf(stderr, "  [vmtl] overlay layer %d: shape %d %.2fx%.2f m — "
+                                "REFUSED rather than drawn as a quad\n",
+                        ov.layer_id, ov.shape, ov.size[0], ov.size[1]);
+            }
+            continue;
+        }
+        id<MTLTexture> t = (__bridge id<MTLTexture>)texp;
+        [enc setRenderPipelineState:g_pipe_ov];
+        [enc setVertexBytes:&u length:sizeof u atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+        [enc setFragmentTexture:t atIndex:0];
+        [enc setFragmentSamplerState:g_samp atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [vmtl] compositing overlay layer %d: %.2fx%.2f m at "
+                            "(%.2f %.2f %.2f), %dx%d texture%s\n",
+                    ov.layer_id, ov.size[0], ov.size[1],
+                    ov.pose[4], ov.pose[5], ov.pose[6], tw, th,
+                    ov.head_locked ? ", HEAD-LOCKED" : "");
+        }
+    }
+}
+
 static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice, int flip_y) {
     kl_ovrp_render_pose r;
     int have = kl_ovrp_stage_render_pose(stage, &r);
@@ -362,7 +477,9 @@ int kl_viewmtl_start(void *metal_layer) {
 
     g_timewarp = kl_env_on("KL_VIEW_TIMEWARP", 0);
     if (g_timewarp) {
-        g_pipe_rp = klvm_pipeline(kl_reproject_msl(), "kl_reproject_v",
+        g_pipe_ov = klvm_pipeline_blend(kl_reproject_overlay_msl(), "kl_ov_v", "kl_ov_f",
+                                    "overlay", 1);
+    g_pipe_rp = klvm_pipeline(kl_reproject_msl(), "kl_reproject_v",
                                   "kl_reproject_f", "reprojection");
         if (!g_pipe_rp) return 0;
     }
@@ -619,6 +736,7 @@ int kl_viewmtl_present(int win_w, int win_h) {
         [enc setFragmentBytes:&bu length:sizeof bu atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
+    klvm_draw_overlays(enc, eye, stage);
     [enc endEncoding];
 
     // The liveness downsample, same source, same shader, 64x64. It is a second

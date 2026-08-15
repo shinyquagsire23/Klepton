@@ -2094,6 +2094,8 @@ static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[
 static int klovrp_submit_stage(const void *layer_submits, int count);
 // ...and the census of the whole list, for the same forward-declaration reason.
 static void klovrp_census_submits(const void *layer_submits, int count);
+// ...and the overlay list a compositor draws on top of the eye picture.
+static void klovrp_record_overlays(const void *layer_submits, int count);
 
 // `viewports` is that pair, or NULL where a caller cannot know — ovrp_EndFrame
 // (1.28's legacy VRDevice, which has no layers at all) and every non-Unity
@@ -2319,6 +2321,9 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
     (void)sync;
     if (!layer_submits && layer_submit_count) return OVRP_FAIL_INVALID_PARAM;
     klovrp_census_submits(layer_submits, layer_submit_count);
+    // The list of everything that is NOT the eye layer, for the compositors.
+    // Before this, all of it was dropped here.
+    klovrp_record_overlays(layer_submits, layer_submit_count);
     int vp[8], of[2] = { 0, 0 };
     int have = klovrp_submit_viewports(layer_submits, layer_submit_count, vp, of);
     // The guest's own answer to "which stage did I just draw?", at submit+0x04.
@@ -4037,6 +4042,81 @@ static void klovrp_census_submits(const void *layer_submits, int count) {
                 l ? l->desc.texture_size.w : 0, l ? l->desc.texture_size.h : 0);
         if (l && !l->is_eye) klovrp_probe_submit_tail(s);
     }
+}
+
+// The non-eye layers of the current frame — see kl_ovrp.h.
+//
+// Replaced whole under g_frames.mu at each ovrp_EndFrame4, so a compositor
+// reading it concurrently sees the previous frame's list rather than half of
+// two. Sized like g_layers, because a submit names a layer and there cannot be
+// more of those than exist.
+static struct {
+    kl_ovrp_overlay v[KLOVRP_MAX_LAYERS];
+    int             n;
+} g_overlays;
+
+// ovrpLayerSubmitFlag_HeadLocked. The value is the guest's own: this is bit 1
+// in every OVRPlugin the corpus carries (bit 0 is NoDepth), and RE4's splash
+// submits flags = 0, i.e. WORLD-locked, which is the case the composite
+// implements. A head-locked layer is reported by name rather than placed with
+// the world-locked math, because the two differ by the whole head pose and a
+// wrong placement has no error surface at all.
+#define KLOVRP_SUBMIT_HEAD_LOCKED 0x2
+
+static void klovrp_record_overlays(const void *layer_submits, int count) {
+    const ovrp_layer_submit *const *list = layer_submits;
+    kl_ovrp_overlay tmp[KLOVRP_MAX_LAYERS];
+    int n = 0;
+    for (int i = 0; list && i < count && n < KLOVRP_MAX_LAYERS; i++) {
+        const ovrp_layer_submit *s = list[i];
+        if (!s) continue;
+        struct klovrp_layer *l = klovrp_layer(s->layer_id);
+        if (!l || l->is_eye) continue;
+        kl_ovrp_overlay *o = &tmp[n++];
+        memset(o, 0, sizeof *o);
+        o->layer_id = s->layer_id;
+        o->shape    = l->desc.shape;
+        o->stage    = s->texture_stage;
+        o->tex_w    = l->desc.texture_size.w;
+        o->tex_h    = l->desc.texture_size.h;
+        for (int e = 0; e < 2; e++) {
+            o->viewport[e][0] = s->viewport[e].x;
+            o->viewport[e][1] = s->viewport[e].y;
+            o->viewport[e][2] = s->viewport[e].w;
+            o->viewport[e][3] = s->viewport[e].h;
+        }
+        memcpy(o->pose, s->pose, sizeof o->pose);
+        o->flags       = s->submit_flags;
+        o->head_locked = (s->submit_flags & KLOVRP_SUBMIT_HEAD_LOCKED) != 0;
+        // The quad's world size, out of the union's own arm. The OFFSET is read
+        // from Compositor::ImportLayerSubmit rather than from our struct's end
+        // — see klovrp_probe_submit_tail, which is where that measurement lives.
+        if (o->shape == 0) {
+            const float *q = (const float *)((const unsigned char *)s + 0xb0);
+            o->size[0] = q[0];
+            o->size[1] = q[1];
+        }
+    }
+    pthread_mutex_lock(&g_frames.mu);
+    memcpy(g_overlays.v, tmp, sizeof tmp);
+    g_overlays.n = n;
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
+int kl_ovrp_overlay_count(void) {
+    pthread_mutex_lock(&g_frames.mu);
+    int n = g_overlays.n;
+    pthread_mutex_unlock(&g_frames.mu);
+    return n;
+}
+
+int kl_ovrp_overlay_get(int i, kl_ovrp_overlay *out) {
+    if (!out || i < 0) return 0;
+    pthread_mutex_lock(&g_frames.mu);
+    int ok = i < g_overlays.n;
+    if (ok) *out = g_overlays.v[i];
+    pthread_mutex_unlock(&g_frames.mu);
+    return ok;
 }
 
 static int klovrp_submit_stage(const void *layer_submits, int count) {

@@ -343,8 +343,70 @@ static const char kl_msl_blit[] =
 "    return float4(tex.sample(samp, uv, u.slice).rgb, 1.0);\n"
 "}\n";
 
+// The OVERLAY pass — see kl_reproject.h.
+//
+// Deliberately not a variant of the reprojection shader above. That one places
+// an EYE-CENTRED quad at a chosen depth and corrects only rotation, because a
+// flat picture with no per-pixel depth cannot be moved. An overlay is somewhere:
+// it has a position in the guest's tracking space, a real size in metres, and
+// its parallax between the two eyes is the whole point of it being a layer
+// rather than pixels. So the geometry is built in world units and the model-view
+// keeps its translation.
+//
+// It also BLENDS, which the eye pass never does — the caller sets that on the
+// pipeline, and the alpha here is the guest's own rather than the forced 1.0
+// two doors down: a UI quad's transparency is authored, unlike an eye texture's
+// (see kl_msl_blit for why that one is forced).
+static const char kl_msl_overlay[] =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct VOut { float4 pos [[position]]; float2 uv; };\n"
+// Matches kl_overlay_uniforms in kl_reproject.h.
+"struct KLOv {\n"
+"    float4x4 projection;\n"
+"    float4x4 model_view;\n"
+"    float2   half_size;\n"
+"    float4   uv_rect;\n"      // x, y, w, h — the eye's ViewportRect as a fraction
+"    uint     slice;\n"
+"    uint     flip_y;\n"
+"    uint     srgb_decode;\n"
+"    uint     visible;\n"
+"};\n"
+"vertex VOut kl_ov_v(uint vid [[vertex_id]],\n"
+"                    constant KLOv *us [[buffer(0)]],\n"
+"                    ushort amp [[amplification_id]]) {\n"
+"    constant KLOv &u = us[amp];\n"
+"    VOut o;\n"
+"    if (u.visible == 0u) { o.pos = float4(2.0, 2.0, 2.0, 1.0); o.uv = float2(0); return o; }\n"
+// A triangle strip in the quad's own plane, facing -Z, which is the convention
+// ovrpLayerSubmit's Pose states its orientation in.
+"    float2 c = float2((vid & 1) ? 1.0 : -1.0, (vid & 2) ? -1.0 : 1.0);\n"
+"    float4 p = float4(c * u.half_size, 0.0, 1.0);\n"
+"    o.pos = u.projection * (u.model_view * p);\n"
+"    float2 t = float2((c.x + 1.0) * 0.5, (1.0 - c.y) * 0.5);\n"
+"    if (u.flip_y != 0u) t.y = 1.0 - t.y;\n"
+"    o.uv = u.uv_rect.xy + t * u.uv_rect.zw;\n"
+"    return o;\n"
+"}\n"
+"fragment float4 kl_ov_f(VOut in [[stage_in]],\n"
+"                        texture2d<float> tex [[texture(0)]],\n"
+"                        sampler samp [[sampler(0)]],\n"
+"                        constant KLOv *us [[buffer(0)]],\n"
+"                        ushort amp [[amplification_id]]) {\n"
+"    constant KLOv &u = us[amp];\n"
+"    float4 c = tex.sample(samp, in.uv);\n"
+"    if (u.srgb_decode != 0u) {\n"
+"        float3 lo = c.rgb / 12.92;\n"
+"        float3 hi = pow((c.rgb + 0.055) / 1.055, float3(2.4));\n"
+"        c.rgb = select(hi, lo, c.rgb <= float3(0.04045));\n"
+"    }\n"
+"    return c;\n"
+"}\n";
+
 const char *kl_reproject_msl(void)      { return kl_msl_reproject; }
 const char *kl_reproject_blit_msl(void) { return kl_msl_blit; }
+const char *kl_reproject_overlay_msl(void) { return kl_msl_overlay; }
+
 
 // The unwarp grid. See kl_reproject.h for the layout and for why the unwarp
 // lives here — at grid vertices, precomputed — rather than in the fragment
@@ -454,6 +516,16 @@ static simd_float4x4 klr_rotation_of_quat(float x, float y, float z, float w) {
     float n = x * x + y * y + z * z + w * w;
     if (!(n > 1e-6f)) return matrix_identity_float4x4;
     return simd_matrix4x4(simd_quaternion(x, y, z, w));
+}
+
+// A full rigid transform from an ovrpPosef laid out as {qx,qy,qz,qw,px,py,pz}.
+// Unlike klr_rotation_of_quat above this KEEPS the translation, which is the
+// whole difference between an eye quad and an overlay: one is a picture placed
+// in front of the eye, the other is an object somewhere in the room.
+static simd_float4x4 klr_pose_matrix(const float p[7]) {
+    simd_float4x4 m = klr_rotation_of_quat(p[0], p[1], p[2], p[3]);
+    m.columns[3] = simd_make_float4(p[4], p[5], p[6], 1.0f);
+    return m;
 }
 
 kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, int eye,
@@ -577,6 +649,57 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     simd_float4x4 chain = simd_mul(simd_mul(simd_inverse(render_rot), device_rot),
                                    view_rot);
     u.model_view = simd_inverse(chain);
+    return u;
+}
+
+kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
+                                     simd_float4x4 origin_from_device,
+                                     simd_float4x4 device_from_view,
+                                     simd_float4x4 projection) {
+    kl_overlay_uniforms u;
+    memset(&u, 0, sizeof u);
+    u.projection = projection;
+    u.model_view = matrix_identity_float4x4;
+    u.uv_rect    = simd_make_float4(0, 0, 1, 1);
+    u.slice      = 0;
+    u.visible    = 0;
+    if (!ov) return u;
+
+    // Only the Quad is implemented, and an unimplemented shape is REFUSED
+    // rather than drawn as a quad: a cylinder or an equirect placed as a flat
+    // rectangle is a wrong picture with no error surface, where an absent one
+    // is the failure that is already happening and is at least honest. The
+    // caller names it (see kl_reproject.h).
+    if (ov->shape != 0) return u;
+    if (!(ov->size[0] > 0.0f) || !(ov->size[1] > 0.0f)) return u;
+
+    u.half_size = simd_make_float2(ov->size[0] * 0.5f, ov->size[1] * 0.5f);
+
+    // Which part of the layer texture this eye reads. The guest states it in
+    // PIXELS of its own texture, so it is carried as a fraction for the reason
+    // kl_ovrp_render_pose.viewport_of exists: the texture a compositor is
+    // holding and the rect the guest filed can be one generation apart, and a
+    // fraction is right for either.
+    const int *r = ov->viewport[(unsigned)eye > 1 ? 0 : eye];
+    if (ov->tex_w > 0 && ov->tex_h > 0 && r[2] > 0 && r[3] > 0)
+        u.uv_rect = simd_make_float4((float)r[0] / (float)ov->tex_w,
+                                     (float)r[1] / (float)ov->tex_h,
+                                     (float)r[2] / (float)ov->tex_w,
+                                     (float)r[3] / (float)ov->tex_h);
+
+    // world <- quad, then view <- world. Unlike the eye pass NOTHING is dropped
+    // here: the layer has a position and the display's eye offset is what gives
+    // it the stereo disparity a quad at 7 m is supposed to have.
+    simd_float4x4 world_from_quad = klr_pose_matrix(ov->pose);
+    if (ov->head_locked)
+        // Stated, not silently treated as world-locked: the two differ by the
+        // whole head pose. Nothing in the corpus submits one yet, so this arm
+        // has never run against a guest.
+        world_from_quad = simd_mul(origin_from_device, world_from_quad);
+    simd_float4x4 world_from_view = simd_mul(origin_from_device, device_from_view);
+    u.model_view = simd_mul(simd_inverse(world_from_view), world_from_quad);
+    u.srgb_decode = (uint32_t)kl_reproject_srgb_decode();
+    u.visible = 1;
     return u;
 }
 

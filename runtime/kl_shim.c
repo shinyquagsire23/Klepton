@@ -1302,8 +1302,35 @@ static int kl_getsockname(int fd, struct sockaddr *sa, socklen_t *len) {
     return r;
 }
 // Same throughput meter as kl_fread, for the raw-read path. KL_TRACE_IO=1.
-static ssize_t kl_read(int fd, void *buf, size_t n) {
+//
+// **It completes a short read of a REGULAR FILE**, for the reason
+// klb_pread_full gives: a signal delivered mid-transfer truncates the read
+// rather than failing it, Linux effectively never does that for a regular file,
+// and a guest built against bionic therefore does not check. See there for what
+// this did and did not explain — it is a real hazard closed, not a diagnosis.
+//
+// Regular files ONLY, and that is the whole care in it: on a pipe, a socket or
+// a terminal a short read is the answer rather than an accident, and looping
+// there would turn a non-blocking reader into a blocked one. The test is the
+// fd's own type, so nothing has to be assumed about who is calling.
+static int kl_fd_is_regular(int fd) {
+    struct stat st;
+    return fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+ssize_t kl_shim_read(int fd, void *buf, size_t n) {
     ssize_t r = read(fd, buf, n);
+    if (r >= 0 && (size_t)r < n && r != 0 && kl_fd_is_regular(fd)) {
+        size_t done = (size_t)r;
+        while (done < n) {
+            ssize_t k = read(fd, (char *)buf + done, n - done);
+            if (k > 0) { done += (size_t)k; continue; }
+            if (k == 0) break;                     // EOF: short is the truth
+            if (errno == EINTR) continue;
+            break;                                 // report what did move
+        }
+        r = (ssize_t)done;
+    }
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_TRACE_IO", 0);
     if (on && r > 0) {
@@ -1475,7 +1502,7 @@ X(klb_epoll_create) X(klb_epoll_create1) X(klb_epoll_ctl) X(klb_epoll_wait)
 X(klb_openat) X(klb___open_2)
 X(klb___memmove_chk) X(klb___strncpy_chk) X(klb___strncpy_chk2) X(klb___strcat_chk)
 X(klb___read_chk) X(klb___vsprintf_chk)
-X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk)
+X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk) X(klb_pread64)
 X(klb___strncat_chk) X(klb_ftruncate64)
 X(klb_sincosf) X(klb_sincos) X(klb_putchar) X(klb_getchar) X(klb_fdatasync)
 X(klb___cmsg_nxthdr) X(klb___cxa_thread_atexit_impl)
@@ -1518,7 +1545,7 @@ static const kl_entry g_shim[] = {
     E("__android_log_print", klv_android_log_print),
     E("open", klv_open), E("fcntl", klv_fcntl), E("ioctl", klv_ioctl),
     E("setsockopt", kl_setsockopt), E("getsockopt", kl_getsockopt),
-    E("read", kl_read), E("usleep", kl_usleep),
+    E("read", kl_shim_read), E("usleep", kl_usleep),
     E("getaddrinfo", kl_getaddrinfo), E("connect", kl_connect),
     E("socket", kl_socket),
     E("bind", kl_bind), E("sendto", kl_sendto), E("accept", kl_accept),
@@ -1597,6 +1624,11 @@ static const kl_entry g_shim[] = {
     // UE4 reads its OBB through pread64 from several threads, and FORTIFY
     // rewrites every one of those calls to the _chk form.
     E("__pread64_chk", klb___pread64_chk), E("__pwrite64_chk", klb___pwrite64_chk),
+    // ...and the un-fortified name, which nothing in the table can serve:
+    // Darwin does not declare pread64 (it has one 64-bit pread), so the
+    // generator drops it. Only a FORTIFY build reaches the _chk form, so a guest
+    // built without it would otherwise find this unresolved.
+    E("pread64", klb_pread64),
     E("__strrchr_chk", klb___strrchr_chk), E("__strncat_chk", klb___strncat_chk),
     E("ftruncate64", klb_ftruncate64),
     E("__sched_cpucount", klb___sched_cpucount),

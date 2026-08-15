@@ -266,6 +266,48 @@ int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out);
 // a caller has any business passing to the call above.
 int kl_ovrp_last_complete_stage(void);
 
+// ---------------------------------------------------------------------------
+// The OTHER layers — what a compositor has to draw ON TOP of the eye picture
+//
+// `ovrp_EndFrame4` is handed a LIST, and until 2026-08-15 every reader of it
+// walked past anything that was not the eye layer. That is right for the frame
+// record — only the eye layer describes the picture being reprojected — and it
+// silently dropped everything else, so a guest submitting overlays looked from
+// every log here exactly like one submitting none.
+//
+// Unity's only other layer is a 1x1 nothing renders into, which is why it never
+// mattered. **Unreal draws its UI this way**: OculusHMD's FSplash and its
+// IStereoLayers quads are how RE4 shows its studio logo, its loading screens
+// and its menus, so on that engine "the layer is dropped" means the game's
+// entire non-world presentation is invisible while the world composites
+// perfectly.
+//
+// The pose is in the guest's tracking space — the same space the frontend
+// publishes the head pose into — so a compositor places it with its own current
+// head pose and gets world-locking for free. Unlike the eye quad, which is
+// eye-centred and rotation-corrected on purpose (see kl_reproject.h), this one
+// keeps its translation: it IS somewhere.
+typedef struct {
+    int   layer_id;      // as ovrp_SetupLayer handed it out
+    int   shape;         // ovrpShape: 0 Quad, 1 Cylinder, 2 Cubemap, 5 Equirect
+    int   stage;         // the texture stage the guest named in its submit
+    int   tex_w, tex_h;  // the layer's texture size, for the viewport fraction
+    int   viewport[2][4];// per-eye {x, y, w, h} within that texture
+    float pose[7];       // orientation xyzw then position xyz, tracking space
+    float size[2];       // Quad: width and height in METRES
+    int   flags;         // ovrpLayerSubmitFlags, as submitted
+    int   head_locked;   // the flag above, decoded — see kl_ovrp.c
+} kl_ovrp_overlay;
+
+// How many non-eye layers the guest submitted with its most recent frame, and
+// what they were. The list is replaced whole at each ovrp_EndFrame4 under the
+// frame lock, so a compositor reading it mid-update gets the previous frame's
+// list rather than half of two — which for a static splash is the same list.
+//
+// Returns 0 and leaves *out untouched for an index that is not there.
+int kl_ovrp_overlay_count(void);
+int kl_ovrp_overlay_get(int i, kl_ovrp_overlay *out);
+
 // ...and the two calls that FILE those records for a guest that does not speak
 // OVRPlugin at all.
 //

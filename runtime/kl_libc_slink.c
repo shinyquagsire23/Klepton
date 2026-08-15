@@ -45,6 +45,7 @@
 
 FILE *kl_host_file(void *guest);            // kl_shim.c
 int   kl_open_flags(int linux_flags);       // kl_libc.c
+ssize_t kl_shim_read(int fd, void *buf, size_t n);  // kl_shim.c
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
 void  kl_fatal_prepare(void);
 
@@ -460,17 +461,59 @@ char *klb___strcat_chk(char *d, const char *s, size_t cap) {
     if (n > cap) chk_fail("__strcat_chk", n, cap);
     return strcat(d, s);
 }
+// The FORTIFY form goes through the same completion the plain one does — see
+// kl_shim.c's kl_read. Calling that rather than `read` is the point: a guest
+// built with FORTIFY reaches only this name, so serving it with a bare read
+// would leave exactly the guest that needs the fix without it.
 ssize_t klb___read_chk(int fd, void *buf, size_t n, size_t cap) {
     if (n > cap) chk_fail("__read_chk", n, cap);
-    return read(fd, buf, n);
+    return kl_shim_read(fd, buf, n);
 }
 // The positional pair. UE4's Android file layer reads everything through
 // pread64 — its OBB is a zip it holds open and seeks around inside from several
 // threads, so an offset argument is not an optimisation there, it is the only
 // safe way to do it — and FORTIFY rewrites those calls to these.
+//
+// **It LOOPS**, and that is a correctness fix rather than tidiness: a single
+// `pread` may return fewer bytes than asked for — a signal delivered after some
+// bytes have moved truncates the transfer rather than failing it — while on
+// Linux a read of a regular file effectively never does, so a guest built
+// against bionic has no reason to check, and RE4 does not. It hands the buffer
+// straight to Oodle.
+//
+// Looping is right for a POSITIONAL read specifically: the offset is an
+// argument, so a partial transfer resumes exactly.
+//
+// **It did NOT settle RE4's Oodle corruption under the viewer, and the honest
+// record of that is worth more than the fix.** The symptom is
+// `LZ corruption : DecodeOneQuantum fail` followed by a fault inside Oodle on a
+// worker thread; the guest's own numbers looked like short reads
+// (`OodleLZ_Decompress failed (524288 != 1048576)`, then `(262144 != ...)` —
+// exact fractions of the expected megabyte) and the run right after this change
+// had none of them, which read as a fix and was a coincidence: it is
+// nondeterministic, and it came back. What IS established: both OBBs verify
+// clean with `unzip -t`, the fault reproduces at `cef7842` (before any of this
+// arc), and a headless run of the same build is clean. So it is a race that the
+// viewer's extra threads and signals make likely, and it is not this.
+static ssize_t klb_pread_full(int fd, void *buf, size_t n, off_t off) {
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = pread(fd, (char *)buf + done, n - done, off + (off_t)done);
+        if (r > 0) { done += (size_t)r; continue; }
+        if (r == 0) break;                       // EOF: a short read is the truth
+        if (errno == EINTR) continue;
+        return done ? (ssize_t)done : -1;        // report the bytes that did move
+    }
+    return (ssize_t)done;
+}
+
+ssize_t klb_pread64(int fd, void *buf, size_t n, off_t off) {
+    return klb_pread_full(fd, buf, n, off);
+}
+
 ssize_t klb___pread64_chk(int fd, void *buf, size_t n, off_t off, size_t cap) {
     if (n > cap) chk_fail("__pread64_chk", n, cap);
-    return pread(fd, buf, n, off);
+    return klb_pread_full(fd, buf, n, off);
 }
 ssize_t klb___pwrite64_chk(int fd, const void *buf, size_t n, off_t off, size_t cap) {
     if (n > cap) chk_fail("__pwrite64_chk", n, cap);

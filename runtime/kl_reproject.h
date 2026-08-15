@@ -150,6 +150,62 @@ typedef struct {
     uint32_t flip_y;   // as above — 1 for a picture with a top-left origin
 } kl_blit_uniforms;
 
+// ---------------------------------------------------------------------------
+// The OVERLAY pass — the layers that are not the eye
+//
+// A guest can submit more than the eye layer, and until 2026-08-15 every reader
+// of `ovrp_EndFrame4`'s list here walked past the rest. Unity's only other
+// layer is a 1x1 nothing renders into; **Unreal draws its UI this way**, so on
+// RE4 that dropped the studio splash, the loading screens and the menus while
+// the world composited perfectly (notes/RE4.md).
+//
+// It is a separate pass from the reprojection above rather than a mode of it,
+// because the two want opposite things. The eye quad is EYE-CENTRED and
+// rotation-corrected on purpose: it is a flat picture with no per-pixel depth,
+// so it may not be translated, and its distance is chosen for what the display's
+// own reprojection needs. An overlay IS somewhere — it has a position in the
+// guest's tracking space and a size in metres, and the disparity between the two
+// eyes is the entire reason it is a layer instead of pixels the guest drew
+// itself. So this one keeps every translation, including the display's eye
+// offset.
+//
+// It also BLENDS. The caller configures that on the pipeline; the fragment
+// stage passes the guest's own alpha through, where the eye passes force 1.0
+// (see kl_msl_blit for why they must).
+typedef struct {
+    simd_float4x4 projection;   // the drawable's projection for this eye
+    simd_float4x4 model_view;   // quad space -> display eye space, WITH translation
+    simd_float2   half_size;    // metres, half the quad's width and height
+    // Which part of the layer's texture this eye reads, as a FRACTION.
+    // The guest states it in pixels of its own texture; a fraction is what
+    // survives the texture and the record being one generation apart, which is
+    // the same argument kl_ovrp_render_pose.viewport_of makes at length.
+    simd_float4   uv_rect;      // x, y, w, h
+    uint32_t      slice;
+    uint32_t      flip_y;
+    uint32_t      srgb_decode;
+    // 0 = draw nothing. Set for a layer whose SHAPE is not implemented, or
+    // whose size is absent. A cylinder drawn as a flat rectangle is a wrong
+    // picture with no error surface; an absent one is the failure that is
+    // already happening and is at least honest.
+    uint32_t      visible;
+} kl_overlay_uniforms;
+
+// The overlay shader — `kl_ov_v` / `kl_ov_f`, a 4-vertex triangle strip with no
+// vertex buffer, buffer(0) an array indexed by [[amplification_id]] exactly as
+// the reprojection pass's is.
+const char *kl_reproject_overlay_msl(void);
+
+// Build one view's uniforms for one overlay. `origin_from_device` and
+// `device_from_view` are the same two matrices kl_reproject_build takes, and
+// mean the same things.
+//
+// A layer this cannot place answers `visible = 0` rather than approximating it.
+kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
+                                     simd_float4x4 origin_from_device,
+                                     simd_float4x4 device_from_view,
+                                     simd_float4x4 projection);
+
 // Whether the composite should decode its sample from sRGB (above). Pushed
 // rather than queried so this file stays linkable on its own — `make reproject`
 // builds it against nothing but kl_env — and so both compositors get the same

@@ -70,6 +70,9 @@ unsigned long long kl_vulkan_layer_image(int k, int s, int e, unsigned w, unsign
                                          int srgb, int layers) {
     (void)k; (void)s; (void)e; (void)w; (void)h; (void)srgb; (void)layers; return 0;
 }
+void *kl_vulkan_layer_mtl_texture(int k, int s, int e, int *w, int *h) {
+    (void)k; (void)s; (void)e; if (w) *w = 0; if (h) *h = 0; return NULL;
+}
 void  kl_vulkan_capture_eyes(unsigned f, int s) { (void)f; (void)s; }
 void  kl_vulkan_frame_done(int s) { (void)s; }
 unsigned long long kl_vulkan_frame_serial(void) { return 0; }
@@ -1346,6 +1349,31 @@ unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
 unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,
                                               int srgb, int layers) {
     return kl_vulkan_layer_image(KLVK_EYE_LAYER, stage, eye, w, h, srgb, layers);
+}
+
+void *kl_vulkan_layer_mtl_texture(int layer_key, int stage, int eye,
+                                  int *w, int *h) {
+    if (w) *w = 0;
+    if (h) *h = 0;
+    if (!kl_vulkan_guest_active()) return NULL;
+    if (stage < 0 || stage >= KLVK_EYE_STAGES || eye < 0 || eye > 1) return NULL;
+    // Never the eye table: those go to a compositor through kl_glfb's eye table,
+    // which is where every consumer already looks. This is only the OTHER
+    // layers, which have no such table because nothing sampled them before.
+    if (layer_key == KLVK_EYE_LAYER) return NULL;
+    klvk_img_slot *slots = NULL;
+    for (int i = 0; i < KLVK_MAX_LAYERS; i++)
+        if (g_layer_img[i].key == layer_key) { slots = &g_layer_img[i].s[0][0]; break; }
+    if (!slots) return NULL;
+    klvk_img_slot *slot = &slots[stage * 2 + eye];
+    // A layer allocated for eye 0 only (the common case: one texture serving
+    // both eyes, with the per-eye ViewportRect selecting the part) answers eye 1
+    // from slot 0 rather than with nothing.
+    if (!slot->img && eye == 1) slot = &slots[stage * 2];
+    if (!slot->img) return NULL;
+    if (w) *w = (int)slot->w;
+    if (h) *h = (int)slot->h;
+    return eye_mtl_texture(g_devs[0], slot->img);
 }
 
 unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned h,
