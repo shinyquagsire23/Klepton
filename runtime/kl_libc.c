@@ -508,6 +508,70 @@ static uint64_t proc_free_bytes(void) {
     return used < total ? total - used : 0;
 }
 
+// sysinfo(2) — Linux's own memory-and-uptime call, and a THIRD door onto the
+// budget above. Darwin has no such function, so it is hand-written here.
+//
+// Unreal Engine 4 is the first guest to ask: FGenericPlatformMemory's Android
+// implementation calls it directly rather than reading /proc/meminfo, which is
+// the door every Unity title uses. Both have to answer from kl_mem_total() and
+// proc_free_bytes() or the guest can measure the disagreement — this is the
+// display-panel group answer again, and a title that sizes a pool from
+// sysinfo() and then checks pressure against /proc/meminfo would see the room
+// change size underneath it.
+//
+// The struct is bionic's, transcribed rather than included: on LP64 every field
+// is 64-bit, `procs` is a u16 followed by 2 bytes of padding and then 4 more
+// before the next 8-aligned member, and `_f` is empty. 112 bytes total, checked
+// below — a layout that is silently short here is a write into the guest's
+// stack past what it reserved.
+struct bionic_sysinfo {
+    int64_t  uptime;
+    uint64_t loads[3];
+    uint64_t totalram;
+    uint64_t freeram;
+    uint64_t sharedram;
+    uint64_t bufferram;
+    uint64_t totalswap;
+    uint64_t freeswap;
+    uint16_t procs;
+    uint16_t pad;
+    uint64_t totalhigh;
+    uint64_t freehigh;
+    uint32_t mem_unit;
+};
+_Static_assert(sizeof(struct bionic_sysinfo) == 112,
+               "bionic's struct sysinfo is 112 bytes on LP64");
+
+int klb_sysinfo(void *out) {
+    if (!out) { errno = EFAULT; return -1; }
+    struct bionic_sysinfo *si = (struct bionic_sysinfo *)out;
+    memset(si, 0, sizeof *si);
+
+    // mem_unit 1, so the ram fields are bytes and nothing has to agree with us
+    // about a scale factor. Linux uses a page-sized unit only when the totals
+    // would overflow 32 bits, which cannot happen here.
+    si->mem_unit  = 1;
+    si->totalram  = kl_mem_total();
+    si->freeram   = proc_free_bytes();
+    // No swap, truthfully: nothing here pages the guest out, and a nonzero
+    // total would invite a title to size against room that does not exist.
+    si->totalswap = 0;
+    si->freeswap  = 0;
+    // High memory is a 32-bit-kernel concept and is zero on every arm64 device.
+    si->totalhigh = 0;
+    si->freehigh  = 0;
+
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) si->uptime = ts.tv_sec;
+    // loads[] is left at zero and procs at 1. Both are host-wide facts about a
+    // multi-tasking Linux system, and this process is the only thing running as
+    // far as the guest is concerned — inventing a load average would be a
+    // measurement of the developer's Mac, which is exactly what the CPU
+    // topology note above refuses to report.
+    si->procs = 1;
+    return 0;
+}
+
 // ---------- memory pressure ----------
 // Reporting a budget is only half of it: on Android the framework also TELLS
 // the guest when the room ran out, and that notification is where a title runs

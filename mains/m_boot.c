@@ -38,6 +38,7 @@
 #include "../runtime/kl_guestpoke.h"
 #include "../runtime/kl_fault.h"
 #include "../runtime/kl_target.h"
+#include "../runtime/kl_ue4.h"
 #include "../tests/t_mtl_provider.h"
 
 // Which guest, and where its libraries are. Both come from the target table
@@ -227,9 +228,62 @@ static const char *metadata_path(char *buf, size_t n) {
     return buf;
 }
 
+// The Unreal Engine 4 door. A different ENTRY, not a different lifecycle: the
+// guest is started through ANativeActivity_onCreate and then runs its own game
+// thread, so this drives it by delivering lifecycle and pumping the looper
+// rather than by calling a render native the way the Unity path below does.
+//
+// Everything before the door is shared — the fault reporter, the permissive
+// flag, the texture dump — and everything under it is shared too, which is the
+// point of adding a non-Unity engine at all.
+static int ue4_run(void) {
+    // The guest's threads need x18 and the TLS veneer's slot before any guest
+    // code runs (trap 1). The Unity path gets this from kl_app_boot; nothing
+    // was calling it here, and libUE4 has stack protectors.
+    kl_thread_init();
+
+    if (kl_ue4_configure(LIBDIR, stdout) != 0) return fail(kl_ue4_error());
+    if (kl_ue4_load(stdout) != 0) return fail(kl_ue4_error());
+
+    // The work list, before anything is driven. For a brand-new target this is
+    // the most valuable thing a run produces, and it is worth having even when
+    // the boot below dies immediately: KL_GAP_ONLY stops here.
+    printf("\n=== the shim gap ===\n");
+    kl_ue4_gap(stdout);
+    if (getenv("KL_GAP_ONLY")) { fflush(NULL); return 0; }
+
+    printf("\n=== ANativeActivity_onCreate ===\n");
+    fflush(NULL);
+    const char *aenv = getenv("KL_ALARM");
+    alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : 20);
+    if (kl_ue4_create(stdout) != 0) { alarm(0); return fail(kl_ue4_error()); }
+    kl_ue4_start(stdout);
+    alarm(0);
+
+    // Seconds, not frames: a NativeActivity guest owns its own frame loop, so
+    // there is no render call here to count. KL_UE4_WAIT is the budget.
+    const char *wenv = getenv("KL_UE4_WAIT");
+    double want = wenv ? strtod(wenv, NULL) : 5.0;
+    printf("\n=== pumping the looper for %.1f s ===\n", want);
+    fflush(NULL);
+    alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : (unsigned)(want + 30));
+    double spent = kl_ue4_pump(want, NULL);
+    alarm(0);
+    printf("  pumped %.2f s\n", spent);
+
+    printf("\n=== reports ===\n");
+    kl_ue4_report(stdout);
+    fflush(NULL);
+    return 0;
+}
+
 static int recon_run(int view_pump) {
     install_fault_reporter();
     kl_mem_pressure_init();
+    // Which door this target takes. The Unity sequence below is not a default
+    // that happens to fit every guest — it names libmain, NativeLoader and
+    // UnityPlayer.initJni — so a UE4 target has to branch before any of it.
+    if (TARGET && TARGET->kind == KL_GUEST_UE4) return ue4_run();
     // Strict: an unimplemented *call* is fatal. Lookups are not, so this
     // stops only where the surface genuinely ends. KL_PERMISSIVE=1 flips it
     // to a zero return, which collects a whole batch in one run when pushing
@@ -745,6 +799,14 @@ int main(int argc, char **argv) {
                     "(no signal) — something in it called exit(); the reason is "
                     "in the log above, not in the JNI report");
     }
-    printf("\n=== M4 (partial): initJni completed with no unimplemented JNI calls ===\n");
+    // Named for the door this run actually took. `initJni` is UnityPlayer's and
+    // means nothing on a NativeActivity guest — printing it after a UE4 run is
+    // a diagnostic asserting something it never established, which is the habit
+    // this tree keeps having to unlearn (the getrandom stop that reported
+    // itself as "an unimplemented JNI call" is the same shape).
+    printf("\n=== M4 (partial): %s ===\n",
+           TARGET && TARGET->kind == KL_GUEST_UE4
+               ? "the NativeActivity lifecycle ran with no unimplemented JNI calls"
+               : "initJni completed with no unimplemented JNI calls");
     return 0;
 }

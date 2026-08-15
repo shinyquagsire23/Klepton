@@ -1443,7 +1443,7 @@ X(klh_android_log_print)
 X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_system) X(klb_syscall) X(klb_swprintf)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
 X(klb_getrandom) X(klb_isnan)
-X(klb_mmap) X(klb_mprotect) X(klb_madvise)
+X(klb_mmap) X(klb_mprotect) X(klb_madvise) X(klb_sysinfo)
 X(klb_pthread_mutex_init) X(klb_pthread_mutex_lock) X(klb_pthread_mutex_unlock)
 X(klb_pthread_mutex_trylock) X(klb_pthread_mutex_destroy)
 X(klb_pthread_mutexattr_init) X(klb_pthread_mutexattr_destroy) X(klb_pthread_mutexattr_settype)
@@ -1559,6 +1559,9 @@ static const kl_entry g_shim[] = {
     // Darwin, so there is no symbol to forward. Both in kl_libc.c.
     E("getrandom", klb_getrandom), E("isnan", klb_isnan),
     E("mmap", klb_mmap), E("mprotect", klb_mprotect), E("madvise", klb_madvise),
+    // Linux-only, and the third door onto the memory budget — UE4 asks here
+    // where every Unity title reads /proc/meminfo. See klb_sysinfo.
+    E("sysinfo", klb_sysinfo),
     E("sched_getaffinity", klb_sched_getaffinity), E("sched_setaffinity", klb_sched_setaffinity),
     E("__system_property_find", klb_sysprop_find),
     E("__system_property_get", klb_sysprop_get),
@@ -1796,5 +1799,30 @@ void *kl_shim_lookup(const char *name) {
     // before the miss falls through to the unresolved report.
     if (name[0] == 'v' && name[1] == 'k' && name[2] >= 'A' && name[2] <= 'Z')
         return kl_vulkan_lookup(name);
+
+    // Tier 11: the Oculus Platform SDK (RE4). libovrplatformloader.so is
+    // REPLACED like the three above it, and until now every guest reached it
+    // the way Unity does — dlopen, then dlsym, which kl_ovrplat_sym has always
+    // answered. **Unreal Engine 4 LINKS it**: libovrplatformloader is in
+    // libUE4's DT_NEEDED and its hundred-odd `ovr_*` calls are bound at
+    // RELOCATION time, so without this tier every one of them is an unresolved
+    // import — the platform surface present and unreachable, aborting by name
+    // on the first achievement or entitlement call.
+    //
+    // Same door as tiers 7-10, and the same discipline: kl_ovrplat_sym returns
+    // NULL for a name it does not know, so a platform call we do not serve
+    // still reaches the unresolved report rather than being swallowed.
+    //
+    // **This does not widen the DRM line by one name.** kl_ovrplat_sym is the
+    // same function dlsym goes through, and it classifies before it dispatches
+    // — the entitlement/IAP/delivery family still aborts unconditionally and
+    // still ignores KL_PERMISSIVE. What changes is only WHERE the guest was
+    // standing when it asked.
+    //
+    // `ovrp_` is OVRPlugin's prefix and a different library (kl_ovrp), so the
+    // fourth character is checked: `ovr_` and `ovrID` are the platform's, and
+    // `ovrp_` must not be claimed here.
+    if (!strncmp(name, "ovr_", 4) || !strncmp(name, "ovrID", 5))
+        return kl_ovrplat_sym(name);
     return NULL;
 }

@@ -5668,6 +5668,45 @@ static klj_val klj_Thread_start(void *env, void *self, const klj_val *a, int n) 
     return (klj_val){.j = 0};
 }
 
+// Thread.currentThread() / Thread.setName(String) — UE4 resolves the pair in
+// one block and uses them for exactly one thing: naming its own threads. The
+// engine spawns its game, render and audio threads with pthread_create and then
+// calls up into Java to label them, because on Android that is what shows up in
+// a trace.
+//
+// The object is per-thread and it MUST be, because that is the whole meaning of
+// the call: a single shared "the current thread" object would let one thread's
+// setName land on another's. It is a plain klj_object with no state of its own
+// — the identity is what carries the meaning, and the only thing ever done with
+// it here is setName below.
+static klj_val klj_Thread_currentThread(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static _Thread_local void *me;
+    if (!me) me = klj_new_object_data("java/lang/Thread", NULL);
+    return (klj_val){.l = me};
+}
+
+// ...and the name is APPLIED, not recorded. pthread_setname_np on Darwin names
+// the CALLING thread, which is the same thread Java's setName would be naming
+// here, so the labels reach `sample` and the debugger — and a 172 MB engine
+// with a dozen threads is exactly the case where a stack of "Thread 7" is the
+// difference between a readable fault report and an unreadable one.
+//
+// Darwin caps the name at 64 bytes including the terminator and fails the whole
+// call if it is longer, where Java simply keeps a long string. Truncating is
+// the behaviour that preserves the guest's intent; refusing would drop the
+// label entirely for the threads with the most descriptive names.
+static klj_val klj_Thread_setName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *name = (n >= 1) ? klj_str(a[0].l) : NULL;
+    if (name && *name) {
+        char buf[64];
+        snprintf(buf, sizeof buf, "%s", name);
+        pthread_setname_np(buf);
+    }
+    return (klj_val){.j = 0};
+}
+
 // A void method whose effect is on state we do not model. Shared, but only ever
 // bound to methods that genuinely return void — the arguments are ignored, so
 // binding it to something with a return value would hand the guest a zero it
@@ -6868,6 +6907,16 @@ static void klj_locale_parts(char *lang, size_t lang_sz, char *country, size_t c
     if (*buf) snprintf(lang, lang_sz, "%s", buf);
 }
 
+// ...and the same two strings for the NDK's AConfiguration, which is the OTHER
+// door onto this one fact. Exposed rather than duplicated: a guest that reads
+// its locale through java.util.Locale and its resource configuration through
+// AConfiguration must not be told two different things, and Unreal Engine 4
+// reads BOTH — java.util.Locale for FInternationalization and
+// AConfiguration_getLanguage out of native_app_glue.
+void kl_jni_locale_parts(char *lang, size_t lang_sz, char *country, size_t country_sz) {
+    klj_locale_parts(lang, lang_sz, country, country_sz);
+}
+
 static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *locale;
@@ -7492,6 +7541,34 @@ static klj_val klj_ActivityThread_getApplication(void *env, void *self, const kl
 
 // Our storage is a plain writable directory, so "mounted" is the honest state.
 // Any other value sends Unity down a read-only or unavailable-storage path.
+// ---- Unreal Engine 4's GameActivity ----
+//
+// UE4's Java side is one big class of `AndroidThunkJava_*` methods that the
+// engine resolves in a block during JNI_OnLoad and then calls as it needs them
+// (78 method ids on RE4 before the first call). They are transcribed from the
+// APK's own GameActivity.smali, like every other binding here.
+//
+// The font directory is the first one any UE4 title reaches, because Slate
+// wants a typeface before it has a window. The guest's own implementation is a
+// three-entry search — /system/fonts, /system/font, /data/fonts — returning the
+// first that File.exists(), and then appending "/" to whatever it found. Note
+// what it does when it finds NOTHING: `v3` stays null, StringBuilder.append
+// spells that "null", and the method returns the literal string "null/". That
+// is not a case worth reproducing; it is what a device without fonts would say,
+// and we are presenting a Quest, which has /system/fonts like any other
+// Android device.
+//
+// So the answer is the Quest's, and the path is MAPPED rather than invented —
+// kl_guest_path already redirects the guest's absolute paths, and a font
+// directory that answers a name and then has no files in it is the shape of
+// trap 45: a read that silently finds nothing, where the guest is entitled to
+// assume the directory it was handed exists. Whether the engine actually loads
+// from here is the next run's question; until it does, this is a name.
+static klj_val klj_UE4_GetFontDirectory(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("/system/fonts/")};
+}
+
 static klj_val klj_Environment_getExternalStorageState(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.l = kl_jni_new_string("mounted")};
@@ -9552,6 +9629,9 @@ static const klj_binding g_bindings[] = {
     {"android/os/HandlerThread", "start", "()V", klj_HandlerThread_start},
     {"android/os/HandlerThread", "getLooper", "()Landroid/os/Looper;", klj_HandlerThread_getLooper},
     {"java/lang/Thread", "start", "()V", klj_Thread_start},
+    // UE4 names its own threads through Java — see klj_Thread_currentThread.
+    {"java/lang/Thread", "currentThread", "()Ljava/lang/Thread;", klj_Thread_currentThread},
+    {"java/lang/Thread", "setName", "(Ljava/lang/String;)V", klj_Thread_setName},
     {"android/os/Handler", "<init>", "()V",                        klj_Handler_init},
     {"android/os/Handler", "<init>", "(Landroid/os/Looper;)V",     klj_Handler_init},
     // The Callback form. The callback handles Messages sent through this Handler,
@@ -9740,6 +9820,9 @@ static const klj_binding g_bindings[] = {
     // Same singleton the Context hands out — there is one application here.
     {"android/content/pm/PackageManager", "getApplicationInfo",
      "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;", klj_Context_getApplicationInfo},
+    // Unreal Engine 4's GameActivity — see klj_UE4_GetFontDirectory.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetFontDirectory",
+     "()Ljava/lang/String;", klj_UE4_GetFontDirectory},
     {"android/os/Environment", "getExternalStorageState", "()Ljava/lang/String;", klj_Environment_getExternalStorageState},
     {"android/os/Environment", "getExternalStorageDirectory", "()Ljava/io/File;", klj_Environment_getExternalStorageDirectory},
     {"android/os/Environment", "isExternalStorageManager", "()Z", klj_Environment_isExternalStorageManager},

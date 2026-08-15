@@ -33,7 +33,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
            runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_vtdec.c \
            runtime/kl_vulkan.c \
-           runtime/kl_slink.c \
+           runtime/kl_nativeactivity.c runtime/kl_slink.c runtime/kl_ue4.c \
            runtime/kl_aaudio.c \
            runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
            runtime/kl_mono.c \

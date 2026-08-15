@@ -203,6 +203,76 @@ TARGETS = {
         "product": "KleptonOpenBrush",
         "display": "Klepton Open Brush",
     },
+    "re4": {
+        # Resident Evil 4 VR — and the SEVENTH target, which is the first one
+        # here that is not a Unity game and not Steam Link. It is **UNREAL
+        # ENGINE 4.25.3** (branch ++VR4+VR4), a Quest exclusive, package
+        # com.Armature.VR4.
+        #
+        # That is the whole reason to add it. Every engine-shaped thing this
+        # project knows was learned from Unity: five of the six targets are
+        # Unity + IL2CPP, and the sixth (Steam Link) is not a game engine at
+        # all. So a whole half of the shim has only ever been exercised in one
+        # dialect, and the parts that are genuinely Android rather than Unity
+        # have never been asked a second opinion.
+        #
+        # Three things differ at the door, all measured from the APK:
+        #
+        #   - **the entry is a NativeActivity.** libUE4.so exports
+        #     ANativeActivity_onCreate, android_main AND JNI_OnLoad; the
+        #     manifest names com.epicgames.ue4.GameActivity with
+        #     `android.app.lib_name = UE4`. So the guest is STARTED through the
+        #     NDK's activity door and driven by callbacks it fills in, where a
+        #     Unity guest is started through libmain's JNI_OnLoad and driven by
+        #     calling natives it registered. Only Steam Link's VR door has ever
+        #     used this path, and that is one non-Unity library rather than an
+        #     engine.
+        #   - **input arrives as an AInputQueue.** AInputEvent / AKeyEvent /
+        #     AMotionEvent are in the unresolved set, and CLAUDE.md's "Facts
+        #     worth not rediscovering" records that Beat Saber uses none of
+        #     them: Unity takes its input over JNI. This is the NDK surface
+        #     nothing has needed yet.
+        #   - **assets come through AAssetManager**, not over JNI —
+        #     AAsset_getBuffer and AAsset_openFileDescriptor are both
+        #     unresolved. The same note records that Unity reads its assets
+        #     through Context.getAssets() and a Java InputStream instead.
+        #
+        # A split application binary with TWO obbs, BONELAB's shape: main.203
+        # and patch.203, 8.5 GB together, staged wholesale.
+        #
+        # XR is VrApi/OVRPlugin — both libraries ship — and NEITHER is in
+        # libUE4's DT_NEEDED, so both are dlopen'd and kl_ovrp claims them the
+        # way it always has. `bSupportsVulkan` is true in the manifest and
+        # there is no libvulkan in the link either, so which graphics API this
+        # takes is a question for the first run rather than the table.
+        #
+        # THE APK CARRIES AN INJECTED PAYLOAD AND IT IS NOT LOADED. libfrda.so
+        # is a Frida gadget and libscript.so is its script; libfrda.config.so
+        # is plain JSON and says what it is for — `patch_ovrplatformloader`,
+        # `patch_vrapi`, `patch_libc`, `hijack_responses`, i.e. an Oculus Store
+        # entitlement bypass. None of it is part of the game. It is excluded by
+        # the Makefile's GUEST_EXCLUDED rather than here (`libs: None` asks the
+        # Makefile, which is the one place those rules live), and it would be
+        # INERT regardless: the three libraries it patches are the three this
+        # project REPLACES, so there is nothing of the guest's for it to reach.
+        # The DRM line is unchanged and is kl_ovrplat's — the app's own
+        # entitlement is answered on the premise the user owns the title, and
+        # everything that delivers content still refuses.
+        "libs":    None,
+        "srcdir":  "re4/lib/arm64-v8a",
+        "tree":    "re4",
+        "apk":     "re4.apk",
+        "assets":  "re4/assets",
+        "qtplugins": "",
+        # The library the chain starts at, and the one whose translation being
+        # in the bundle proves THIS guest was embedded. There is no libmain
+        # here: UE4 links its engine, its game and its plugins into one 172 MB
+        # object and the manifest names it by `android.app.lib_name`.
+        "entry":   "libUE4",
+        "kind":    "ue4",
+        "product": "KleptonRE4",
+        "display": "Klepton RE4",
+    },
     "steamlink-vr": {
         # BOTH front doors, because the app runs both: the 2D shell pairs in a
         # WindowGroup and hands off to the OpenXR half in an ImmersiveSpace, in

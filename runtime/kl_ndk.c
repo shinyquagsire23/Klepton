@@ -18,6 +18,9 @@
 #include <time.h>
 #include <unistd.h>
 #include "kl_ndk.h"
+// For kl_jni_locale_parts — AConfiguration and java.util.Locale are two doors
+// onto one fact and must not answer differently.
+#include "kl_jni.h"
 
 // ================================================================== ALooper
 enum {
@@ -542,6 +545,40 @@ static void  kl_AConfiguration_fromAssetManager(void *c, void *mgr) {
     if (c) memset(c, 0, KL_ACONFIG_BYTES);
 }
 
+// ...and the getters, which the note above predicted would arrive one day and
+// stop a run BY NAME. **Unreal Engine 4 is that day**: native_app_glue's
+// android_main reads the locale straight out of the configuration, and RE4 dies
+// in ANativeActivity_onCreate without them.
+//
+// The answer is kl_jni's, not a second opinion — java.util.Locale and
+// AConfiguration are two doors onto one fact, and UE4 reads both (Locale for
+// FInternationalization, this for its resource configuration). See
+// kl_jni_locale_parts.
+//
+// THE OUTPUT IS NOT A C STRING. `AConfiguration_getLanguage` fills exactly two
+// characters and writes no terminator — the NDK header's own wording is "the
+// two-character array", and callers pass a `char[2]` on the stack. Writing a
+// third byte is a stack smash in the guest, and it would be silent on the
+// happy path and lethal on an unlucky frame layout. Zero-filled when there is
+// no language, which is what Android does and what every ACONFIGURATION_*_ANY
+// default already says.
+static void kl_AConfiguration_getLanguage(void *c, char *out) {
+    (void)c;
+    if (!out) return;
+    char lang[16], country[16];
+    kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);
+    out[0] = lang[0] ? lang[0] : 0;
+    out[1] = lang[0] && lang[1] ? lang[1] : 0;
+}
+static void kl_AConfiguration_getCountry(void *c, char *out) {
+    (void)c;
+    if (!out) return;
+    char lang[16], country[16];
+    kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);
+    out[0] = country[0] ? country[0] : 0;
+    out[1] = country[0] && country[1] ? country[1] : 0;
+}
+
 // ========================================================== ANativeActivity
 // The two calls the guest makes back INTO the activity. Both are requests to
 // the framework, not queries, so there is nothing to answer — but neither is a
@@ -550,6 +587,29 @@ static void kl_ANativeActivity_finish(void *act) {
     (void)act;
     fprintf(stderr, "  [ndk] ANativeActivity_finish() — the guest is asking to "
                     "close the activity\n");
+}
+// The window's pixel format, asked for before the window exists. UE4 calls this
+// from its glue as the first thing after onStart, with one of the
+// WINDOW_FORMAT_* constants (RGBA_8888 = 1, RGBX_8888 = 2, RGB_565 = 4).
+//
+// Recorded rather than applied, and that is not a shrug: the surface the guest
+// actually renders into here is ANGLE's, whose format is settled by the EGL
+// config the guest itself chooses through eglChooseConfig — so honouring this
+// would mean overriding a later, more specific request with an earlier, vaguer
+// one. Android's own behaviour is close to that: setWindowFormat is a HINT to
+// the window manager and the EGL config still wins for what gets drawn.
+//
+// Named on the way through, because a format we ignore is exactly the thing to
+// know about if a guest's colours ever come out wrong.
+static void kl_ANativeActivity_setWindowFormat(void *act, int format) {
+    (void)act;
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [ndk] ANativeActivity_setWindowFormat(%d) — recorded, "
+                        "not applied: the EGL config the guest chooses decides "
+                        "the surface format here\n", format);
+    }
 }
 static void kl_ANativeActivity_showSoftInput(void *act, unsigned flags) {
     (void)act;
@@ -611,8 +671,11 @@ static const struct { const char *name; void *fn; } g_ndk[] = {
     N("AConfiguration_new",              kl_AConfiguration_new),
     N("AConfiguration_delete",           kl_AConfiguration_delete),
     N("AConfiguration_fromAssetManager", kl_AConfiguration_fromAssetManager),
+    N("AConfiguration_getLanguage",      kl_AConfiguration_getLanguage),
+    N("AConfiguration_getCountry",       kl_AConfiguration_getCountry),
 
     N("ANativeActivity_finish",        kl_ANativeActivity_finish),
+    N("ANativeActivity_setWindowFormat", kl_ANativeActivity_setWindowFormat),
     N("ANativeActivity_showSoftInput", kl_ANativeActivity_showSoftInput),
 #undef N
 };

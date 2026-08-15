@@ -12,6 +12,7 @@
 #include "kl_slink.h"
 #include "kl_jni.h"
 #include "kl_ndk.h"
+#include "kl_nativeactivity.h"
 #include "kl_glfb.h"
 #include "kl_mono.h"
 #include "kl_egl.h"
@@ -611,124 +612,25 @@ double kl_slink_sdl_pump(double seconds, const volatile int *quit) {
 }
 
 // ------------------------------------------------------------- VR front door --
-// ANativeActivity, transcribed from <android/native_activity.h>. It is ABI, not
-// an interface we get to design: the guest's glue reads these fields by offset
-// out of the pointer we hand ANativeActivity_onCreate, and it writes the
-// callbacks table back through the first one.
-//
-// `clazz` is the NDK's own misnomer — it is the activity INSTANCE object, not a
-// jclass, and the guest calls getIntent()/getPackageName() on it. Ours is the
-// jobject kl_jni hands out for the activity, so those land on g_bindings and
-// fail by name like every other M4 gap.
-typedef struct kl_ANativeActivity kl_ANativeActivity;
-typedef struct {
-    void (*onStart)(kl_ANativeActivity *);
-    void (*onResume)(kl_ANativeActivity *);
-    void *(*onSaveInstanceState)(kl_ANativeActivity *, size_t *);
-    void (*onPause)(kl_ANativeActivity *);
-    void (*onStop)(kl_ANativeActivity *);
-    void (*onDestroy)(kl_ANativeActivity *);
-    void (*onWindowFocusChanged)(kl_ANativeActivity *, int);
-    void (*onNativeWindowCreated)(kl_ANativeActivity *, void *);
-    void (*onNativeWindowResized)(kl_ANativeActivity *, void *);
-    void (*onNativeWindowRedrawNeeded)(kl_ANativeActivity *, void *);
-    void (*onNativeWindowDestroyed)(kl_ANativeActivity *, void *);
-    void (*onInputQueueCreated)(kl_ANativeActivity *, void *);
-    void (*onInputQueueDestroyed)(kl_ANativeActivity *, void *);
-    void (*onContentRectChanged)(kl_ANativeActivity *, const void *);
-    void (*onConfigurationChanged)(kl_ANativeActivity *);
-    void (*onLowMemory)(kl_ANativeActivity *);
-} kl_ANativeActivityCallbacks;
-struct kl_ANativeActivity {
-    kl_ANativeActivityCallbacks *callbacks;
-    void       *vm;
-    void       *env;
-    void       *clazz;
-    const char *internalDataPath;
-    const char *externalDataPath;
-    int32_t     sdkVersion;
-    void       *instance;
-    void       *assetManager;
-    const char *obbPath;
-};
-
-typedef void (*anativeactivity_oncreate_fn)(kl_ANativeActivity *, void *, size_t);
-
-static kl_ANativeActivityCallbacks g_cbs;
-static kl_ANativeActivity g_act;
-
-// One call per lifecycle hook, named, so a NULL callback is distinguishable
-// from one that ran. Android calls these from the UI thread; so do we.
-#define VR_CB(out, name, ...)                                                  \
-    do {                                                                       \
-        if (g_cbs.name) {                                                      \
-            if (out) { fprintf(out, "  [vr] %s\n", #name); fflush(out); }      \
-            kl_jni_local_frame_push();                                         \
-            g_cbs.name(&g_act, ##__VA_ARGS__);                                 \
-            kl_jni_local_frame_pop();                                          \
-        } else if (out) fprintf(out, "  [vr] %s — not registered\n", #name);   \
-    } while (0)
-
+// The ANativeActivity ABI and the sequence that drives it moved to
+// kl_nativeactivity.c when Unreal Engine 4 (RE4) became the second guest
+// through this door. Nothing about the behaviour changed — that file is this
+// code, lifted — and the reason for the move is that the struct is ABI: the
+// guest reads it by offset, so two copies is one added field away from a wild
+// pointer with no error surface. What stays here is the part that is Steam
+// Link's: WHICH library, and what to do if it is not loaded.
 int kl_slink_vr_create(FILE *out) {
     char path[1024];
     snprintf(path, sizeof path, "%s/%s", g_libdir, SL_VR_LIB);
     kl_image *scene = kl_find_image(path);
     if (!scene) return slink_fail("libvrlink_scene.so is not in the registry");
-
-    anativeactivity_oncreate_fn onCreate =
-        (anativeactivity_oncreate_fn)kl_sym(scene, SL_VR_FN);
-    if (!onCreate) return slink_fail("libvrlink_scene.so exports no "
-                                     SL_VR_FN);
-
-    // This thread is the app's UI thread, and on Android that means it has a
-    // looper before any activity is created. The guest takes it with
-    // ALooper_forThread() inside onCreate and does not check for NULL.
-    kl_ndk_prepare_looper();
-
-    g_act.callbacks        = &g_cbs;
-    g_act.vm               = kl_jni_vm();
-    g_act.env              = kl_jni_env();
-    g_act.clazz            = kl_jni_activity();
-    g_act.internalDataPath = kl_jni_files_dir();
-    g_act.externalDataPath = kl_jni_files_dir();
-    // 29, the same Quest-2 answer Build.SDK_INT gives. Two numbers describing
-    // one device have to agree — this is the display-panel group answer again.
-    g_act.sdkVersion       = 29;
-    g_act.assetManager     = kl_ndk_asset_manager();
-    g_act.obbPath          = kl_jni_files_dir();
-
-    if (out) {
-        fprintf(out, "  activity: clazz=%p env=%p assets=%p sdk=%d dataPath=%s\n",
-                g_act.clazz, g_act.env, g_act.assetManager, g_act.sdkVersion,
-                g_act.internalDataPath ? g_act.internalDataPath : "(null)");
-        fflush(out);
-    }
-
-    kl_jni_local_frame_push();
-    onCreate(&g_act, NULL, 0);
-    kl_jni_local_frame_pop();
-    // How many hooks it installed is the cheapest confirmation that onCreate
-    // did its job: a glue that returned early leaves the table empty, and that
-    // reads identically to "it worked" without this line.
-    int nhooks = 0;
-    void **slot = (void **)&g_cbs;
-    for (size_t i = 0; i < sizeof g_cbs / sizeof(void *); i++) nhooks += slot[i] != NULL;
-    if (out) {
-        fprintf(out, "  onCreate returned; %d of %zu callbacks registered\n",
-                nhooks, sizeof g_cbs / sizeof(void *));
-        fflush(out);
-    }
+    if (kl_na_create(scene, SL_VR_FN, out) != 0)
+        return slink_fail("libvrlink_scene.so exports no " SL_VR_FN);
     return 0;
 }
 
 void kl_slink_vr_start(FILE *out) {
-    // The rest of what Android's NativeActivity does, in its order. onCreate
-    // itself only spawns the guest's thread and returns — nothing renders until
-    // the window arrives, and the glue's own loop blocks until it does.
-    VR_CB(out, onStart);
-    VR_CB(out, onResume);
-    VR_CB(out, onNativeWindowCreated, kl_ndk_window());
-    VR_CB(out, onWindowFocusChanged, 1);
+    kl_na_start(out);
 }
 
 double kl_slink_vr_pump(double seconds, const volatile int *quit) {

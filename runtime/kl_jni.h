@@ -129,6 +129,13 @@ const char *kl_userdata_dir(const char *guest);
 // ...read back, absolute. ANativeActivity carries internalDataPath/obbPath as
 // plain char*, so a NativeActivity guest gets them here rather than over JNI.
 const char *kl_jni_files_dir(void);
+
+// The host's locale, as the two parts Android reports separately ("en", "US").
+// Here rather than private to kl_jni.c because there are TWO doors onto it —
+// java.util.Locale and the NDK's AConfiguration — and a guest that reads one
+// for its language and the other for its resource selection must not be told
+// two different things. Unreal Engine 4 reads both.
+void kl_jni_locale_parts(char *lang, size_t lang_sz, char *country, size_t country_sz);
 // The APK, which Unity opens as a zip via getPackageCodePath(). Default "beatsaber.apk".
 void kl_jni_set_apk_path(const char *path);
 // The native library directory: what ApplicationInfo.nativeLibraryDir reports and

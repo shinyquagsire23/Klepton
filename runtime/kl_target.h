@@ -28,6 +28,13 @@
 typedef enum {
     KL_GUEST_UNITY = 0,   // libmain -> NativeLoader.load -> libunity -> lifecycle
     KL_GUEST_STEAMLINK,   // kl_slink's shell / OpenXR doors
+    // Unreal Engine 4 — kl_ue4's NativeActivity door. A different ENTRY, not a
+    // different lifecycle: UE4's GameActivity is a NativeActivity, so the guest
+    // is started through ANativeActivity_onCreate and then driven by the
+    // callbacks it fills in, where a Unity guest is started through libmain's
+    // JNI_OnLoad and driven by calling natives it registered. Everything after
+    // the door — the looper, the Choreographer, EGL, the XR seam — is shared.
+    KL_GUEST_UE4,
 } kl_guest_kind;
 
 typedef struct {

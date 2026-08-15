@@ -216,6 +216,7 @@ dup2 mprotect
 vsprintf
 __google_potentially_blocking_region_begin __google_potentially_blocking_region_end
 getrandom isnan
+mmap madvise sysinfo
 """.split())
 
 # Excluded from the table but NOT hand-written anywhere: names we deliberately
