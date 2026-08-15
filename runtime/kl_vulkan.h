@@ -88,6 +88,22 @@ unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned 
 unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,
                                               int srgb, int layers);
 
+// ...and the general form, which is what `ovrp_GetLayerTexture2` actually asks:
+// storage for ONE LAYER's stage/eye.
+//
+// The two above are this with `layer_key = KLVK_EYE_LAYER`, and until 2026-08-15
+// they were the only form — so every layer the guest set up was handed the eye
+// layer's images. A Unity guest never noticed (its one other layer is a 1x1
+// dummy nothing renders into); an Unreal guest draws its splash and its stereo
+// UI quads into real ones, and they landed in the corner of the eye texture.
+//
+// Only the eye layer is published into kl_glfb's eye table, because that table
+// is what every compositor samples. A size that differs from the cached one
+// re-allocates rather than answering with storage of the wrong shape.
+#define KLVK_EYE_LAYER (-1)
+unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
+                                         unsigned w, unsigned h, int srgb, int layers);
+
 // Write both eyes of a stage out as PNGs. Called at frame submission, which on
 // this path is ovrp_EndFrame4 — the guest's own assertion that it has finished
 // drawing them.

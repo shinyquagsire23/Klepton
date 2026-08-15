@@ -429,10 +429,16 @@ struct BootView: View {
             // open-ended because the media/audio/XR/GL report is written at the
             // END of the pump, and that is the report a working run has no other
             // way of producing.
+            //
+            // The Unreal guest is the Steam Link arm's shape for the Steam Link
+            // arm's reasons: its budget is KL_UE4_WAIT in seconds (a frame count
+            // means nothing to a guest that owns its frame loop), and its report
+            // is written at the END of the pump, so stopping at the chain would
+            // mean the default launch loads the guest and then does nothing.
             let env = ProcessInfo.processInfo.environment
-            let steamlink = kl_app_target_is_steamlink() != 0
+            let ownsLoop = kl_app_target_owns_frame_loop() != 0
             if result == 0, !Immersive.wanted,
-               steamlink || env["KL_FRAMES"] != nil {
+               ownsLoop || env["KL_FRAMES"] != nil {
                 result = kl_app_lifecycle(UInt32(env["KL_FRAMES"] ?? "") ?? 1)
             }
             poll.invalidate()

@@ -3367,15 +3367,26 @@ static void klj_obb_census(const char *dir) {
             dir, first_other, code, code);
 }
 
-static const char *klj_obb_dir(void) {
+// Where the OBB is, as the TARGET states it — not "<files>/obb" spelled here.
+//
+// Unity asks Java for this (Context.getObbDirs()), so for five of the seven
+// guests the two are the same string and always were. UE4 does not ask anyone:
+// it builds Android's own <external>/Android/obb/<package>/ path itself, so a
+// literal here would have been right for the guests that call this function and
+// silently wrong for the one that never does — including for the census, which
+// is the only instrument that says whether the game data is present at all.
+const char *kl_jni_obb_dir(void) {
     static char path[1024];
     if (!*path) {
-        snprintf(path, sizeof path, "%s/obb", kl_jni_files_dir());
+        const kl_target *t = kl_target_resolve(NULL);
+        const char *rel = t && t->obb && *t->obb ? t->obb : "obb";
+        snprintf(path, sizeof path, "%s/%s", kl_jni_files_dir(), rel);
         klj_mkdir_p(path);
         klj_obb_census(path);
     }
     return path;
 }
+static const char *klj_obb_dir(void) { return kl_jni_obb_dir(); }
 static klj_val klj_Context_getObbDirs(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *dirs;

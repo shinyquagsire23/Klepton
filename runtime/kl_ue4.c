@@ -88,6 +88,13 @@ int kl_ue4_configure(const char *libdir, FILE *out) {
     if (out) {
         fprintf(out, "  [ue4] activity: %s\n", UE4_ACTIVITY);
         fprintf(out, "  [ue4] userdata: %s\n", kl_jni_files_dir());
+        // Named and CENSUSED here, because nothing else on this door will.
+        // A Unity guest asks Java where its OBB is and the census rides along
+        // on the answer; UE4 builds Android's own path itself and asks nobody,
+        // so a completely unstaged 8.5 GB produced no line anywhere — and the
+        // engine reports a missing OBB the way it reports a missing .uproject,
+        // by carrying on.
+        fprintf(out, "  [ue4] obb:      %s\n", kl_jni_obb_dir());
         fflush(out);
     }
     return 0;

@@ -6,18 +6,18 @@
 // cannot disagree about which tree, which APK or which boot sequence a
 // target means. See runtime/kl_target.h for the struct these expand into.
 
-// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, kind)
+// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, obb, kind)
 #ifndef KL_TARGET_ROW
 #error "include this through runtime/kl_target.c"
 #endif
 
-KL_TARGET_ROW("beatsaber", "beatsaber", "beatsaber.apk", "beatsaber/assets", "beatsaber/lib/arm64-v8a", "libmain", KL_GUEST_UNITY)
-KL_TARGET_ROW("bonelab", "bonelab", "bonelab.apk", "bonelab/assets", "bonelab/lib/arm64-v8a", "libmain", KL_GUEST_UNITY)
-KL_TARGET_ROW("openbrush", "openbrush", "openbrush.apk", "openbrush/assets", "openbrush/lib/arm64-v8a", "libmain", KL_GUEST_UNITY)
-KL_TARGET_ROW("re4", "re4", "re4.apk", "re4/assets", "re4/lib/arm64-v8a", "libUE4", KL_GUEST_UE4)
-KL_TARGET_ROW("steamlink-vr", "steamlink-vr", "steamlink-vr.apk", "steamlink-vr/assets", "steamlink-vr/lib/arm64-v8a", "libvrlink_scene", KL_GUEST_STEAMLINK)
-KL_TARGET_ROW("superhot", "superhot", "superhot.apk", "superhot/assets", "superhot/lib/arm64-v8a", "libmain", KL_GUEST_UNITY)
-KL_TARGET_ROW("vrchat", "vrchat", "vrchat.apk", "vrchat/assets", "vrchat/lib/arm64-v8a", "libmain", KL_GUEST_UNITY)
+KL_TARGET_ROW("beatsaber", "beatsaber", "beatsaber.apk", "beatsaber/assets", "beatsaber/lib/arm64-v8a", "libmain", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("bonelab", "bonelab", "bonelab.apk", "bonelab/assets", "bonelab/lib/arm64-v8a", "libmain", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("openbrush", "openbrush", "openbrush.apk", "openbrush/assets", "openbrush/lib/arm64-v8a", "libmain", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("re4", "re4", "re4.apk", "re4/assets", "re4/lib/arm64-v8a", "libUE4", "Android/obb/com.Armature.VR4", KL_GUEST_UE4)
+KL_TARGET_ROW("steamlink-vr", "steamlink-vr", "steamlink-vr.apk", "steamlink-vr/assets", "steamlink-vr/lib/arm64-v8a", "libvrlink_scene", "obb", KL_GUEST_STEAMLINK)
+KL_TARGET_ROW("superhot", "superhot", "superhot.apk", "superhot/assets", "superhot/lib/arm64-v8a", "libmain", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("vrchat", "vrchat", "vrchat.apk", "vrchat/assets", "vrchat/lib/arm64-v8a", "libmain", "obb", KL_GUEST_UNITY)
 
 #define KL_TARGET_DEFAULT_NAME "beatsaber"
 

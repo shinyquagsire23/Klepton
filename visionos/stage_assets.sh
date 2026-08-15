@@ -44,8 +44,21 @@ TREE="$KLT_TREE"
 # which is what kl_app.c hands kl_jni_set_files_dir. KL_OBB_DIR points elsewhere;
 # KL_SKIP_OBB=1 leaves it alone, which is what you want on the second upload of
 # a 1.3 GB file that has not changed.
-OBB="${KL_OBB_DIR:-$HOME/Library/Application Support/Klepton/userdata/$KLT_NAME/obb}"
+#
+# **The layout is the TARGET's, not a constant.** `KLT_OBB` is the path relative
+# to the external-storage root that this guest looks in, and it is not one
+# answer: a Unity guest asks Java (Context.getObbDirs() -> <files>/obb) and an
+# Unreal guest builds Android's own <external>/Android/obb/<package>/ itself.
+# Staging RE4 the Unity way put 8.5 GB somewhere libUE4 never looks, and both
+# engines report a missing OBB by carrying on — so it is silent at both ends.
+# The same relative path is used for the SOURCE under userdata, so a host run
+# and a device run read the file from the same place.
+OBB_REL="${KLT_OBB:-obb}"
+OBB="${KL_OBB_DIR:-$HOME/Library/Application Support/Klepton/userdata/$KLT_NAME/$OBB_REL}"
 if [ "${KL_SKIP_OBB:-0}" = 1 ] || ! compgen -G "$OBB/*.obb" > /dev/null 2>&1; then
+  # Say WHICH directory was empty. "no OBB" is correct for four of the seven
+  # targets and a staging mistake for the other three, and they looked the same.
+  [ "${KL_SKIP_OBB:-0}" = 1 ] || echo "[stage] no *.obb in $OBB — staging none"
   OBB=""
 fi
 
@@ -110,9 +123,9 @@ if [ -z "$TARGET" ]; then
   cp "$APK" "$DEST/$KLT_APK"
   [ ${#META[@]} -gt 0 ] && cp "${META[@]}" "$DEST/$TREE/"
   if [ -n "$OBB" ]; then
-    rm -rf "$DEST/android-files/obb"
-    mkdir -p "$DEST/android-files"
-    cp -R "$OBB" "$DEST/android-files/obb"
+    rm -rf "$DEST/android-files/$OBB_REL"
+    mkdir -p "$DEST/android-files/$(dirname "$OBB_REL")"
+    cp -RL "$OBB" "$DEST/android-files/$OBB_REL"
   fi
   if [ -n "$KLT_QTPLUGINS" ]; then
     rm -rf "$DEST/$TREE/qtplugins"
@@ -165,8 +178,10 @@ copy_meta
 if [ -n "$OBB" ]; then
   for f in "$OBB"/*.obb; do
     [ -e "$f" ] || continue          # a dangling link on THIS machine too
+    echo "[stage] device $TARGET, $KLT_NAME $f"
     real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$f")
-    copy "$real" "Documents/android-files/obb/$(basename "$f")"
+    copy "$real" "Documents/android-files/$OBB_REL/$(basename "$f")"
+    echo "[stage] done $f"
   done
 fi
 # The Qt plugin .so files, when the target asks for them. They are DATA, not a

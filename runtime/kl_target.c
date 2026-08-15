@@ -9,8 +9,8 @@
 #include "kl_jni.h"
 #include "kl_target.h"
 
-#define KL_TARGET_ROW(name, tree, apk, assets, libdir, entry, kind) \
-    { name, tree, apk, assets, libdir, entry, name, kind },
+#define KL_TARGET_ROW(name, tree, apk, assets, libdir, entry, obb, kind) \
+    { name, tree, apk, assets, libdir, entry, name, obb, kind },
 static const kl_target TARGETS[] = {
 #include "kl_target_table.h"
 };
@@ -69,6 +69,11 @@ static const kl_target *synthesize(const char *tree, const char *libdir) {
     t = (kl_target){ .name = s_tree, .tree = s_tree, .apk = s_apk,
                      .assets = s_assets, .libdir = s_libdir,
                      .entry_lib = "libmain", .userdata = s_key,
+                     // The version-swap trees are all Beat Saber, i.e. Unity, so
+                     // the OBB layout is the one getObbDirs() answers. Stated
+                     // rather than left NULL: every reader of this field builds
+                     // a path out of it.
+                     .obb = "obb",
                      .kind = KL_GUEST_UNITY };
     return &t;
 }

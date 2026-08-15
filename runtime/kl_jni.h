@@ -158,6 +158,15 @@ void kl_jni_set_apk_path(const char *path);
 // GameActivity's own Java needs to read it back.
 const char *kl_jni_apk_path(void);
 
+// Where this guest's OBB is, built from the target row's own layout, created if
+// absent, and CENSUSED the first time it is asked for — which is the only thing
+// in the tree that says whether the game data is actually there.
+//
+// A Unity guest reaches it through Context.getObbDirs() and never needs this.
+// UE4 builds Android's path itself and asks nobody, so on that target the
+// census had no caller at all and a completely unstaged 8.5 GB was silent.
+const char *kl_jni_obb_dir(void);
+
 // One `<meta-data>` value from the guest's own AndroidManifest.xml, or NULL if
 // the key is not declared. This is the same table `ApplicationInfo.metaData`
 // serves the guest over JNI, read through the front door rather than a second

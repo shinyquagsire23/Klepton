@@ -45,6 +45,14 @@ typedef struct {
     const char *libdir;     // <tree>/lib/arm64-v8a, relative to the repo root
     const char *entry_lib;  // the library the chain starts at ("libmain")
     const char *userdata;   // the userdata KEY — see kl_target_resolve()
+    // Where this guest looks for its OBB, RELATIVE to the external-storage
+    // root — <userdata>/<obb> on the host, <container>/android-files/<obb> in
+    // the app. It is in the table because it is not one layout: a Unity guest
+    // asks Java (Context.getObbDirs() -> <files>/obb) and an Unreal guest
+    // builds Android's own path itself (Android/obb/<package>/), so staging a
+    // UE4 target the Unity way puts gigabytes somewhere the engine never looks
+    // — and both engines report a missing OBB by carrying on.
+    const char *obb;
     kl_guest_kind kind;
 } kl_target;
 

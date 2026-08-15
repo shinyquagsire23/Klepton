@@ -915,6 +915,15 @@ puts the camera on the ground with its hands underneath it.
   measurement was taken against, and its tearing; each extra stage costs a
   full-size RGBA16F two-slice eye texture (~160 MB at map resolution). The
   A/B in both directions (PLANNING §12.19).
+- `KL_OVRP_LAYERS=1` — census the whole `ovrp_EndFrame4` submit list: one line
+  per distinct `(layer, shape, stage, viewport, pose, flags)`, printed when it
+  first appears and when it changes, plus the union's per-shape tail. Every
+  other reader of that array walks past anything that is not the eye layer, so
+  a guest submitting OVERLAY layers looked from every log here exactly like one
+  submitting none — RE4 draws its intro logos as an `ovrpShape_Quad` splash and
+  the run said nothing about them. A title that submits one eye layer forever
+  pays one line for the run, so this is cheap to leave on. (notes/RE4.md carries
+  what it measured and where the quad's world size lives.)
 - `KL_OVRP_LATCH=0` — restore the live per-call pose read instead of latching
   head+hands once per frame at `ovrp_Update2` (the guest's real per-step latch
   point). The A/B if the pinning is ever suspected of costing latency;

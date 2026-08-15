@@ -18,6 +18,7 @@
 #include "kl_ovrp.h"      // kl_ovrp_frame_latch — one pose per guest frame
 #include "kl_openxr.h"    // kl_openxr_set_pacer — the OpenXR guest's frame clock
 #include "kl_slink.h"
+#include "kl_ue4.h"       // the NativeActivity door for an Unreal guest
 #include "kl_mono.h"      // the flat guest's window seam — frame out, pointer in
 #include "kl_glfb.h"      // kl_glfb_release_current — the handoff hands the context on
 #include "kl_x18.h"       // trap 11 — claim TSD slot 300 before anything else can
@@ -67,6 +68,12 @@ static volatile int  g_guest_quit;
 const char *kl_app_target_name(void) { return g_target ? g_target->name : "(unconfigured)"; }
 int kl_app_target_is_steamlink(void) {
     return g_target && g_target->kind == KL_GUEST_STEAMLINK;
+}
+static int target_is_ue4(void) {
+    return g_target && g_target->kind == KL_GUEST_UE4;
+}
+int kl_app_target_owns_frame_loop(void) {
+    return kl_app_target_is_steamlink() || target_is_ue4();
 }
 
 static char g_libdir[1024];
@@ -603,6 +610,35 @@ static int boot_steamlink(void) {
     return 0;
 }
 
+// The Unreal door, which is a different ENTRY rather than a different
+// lifecycle. There is no libmain and no NativeLoader here: UE4 links its
+// engine, its game and its plugins into one object and the manifest names it
+// with `android.app.lib_name`, so the chain is loaded whole and the guest is
+// started through ANativeActivity_onCreate afterwards (kl_app_lifecycle_begin).
+//
+// Shared verbatim with `build/m_boot`, for kl_slink's reason: a guest described
+// differently by two drivers is a bug with no error surface.
+static int boot_ue4(void) {
+    g_phase = "ue4 configure";
+    if (kl_ue4_configure(g_libdir, stdout) != 0) return fail(kl_ue4_error());
+    g_phase = "ue4 chain";
+    if (kl_ue4_load(stdout) != 0) return fail(kl_ue4_error());
+
+    // The work list, before anything is driven — the most valuable thing a run
+    // of a new target produces, and worth having even when what follows dies.
+    printf("\n=== the shim gap ===\n");
+    kl_ue4_gap(stdout);
+
+    printf("\n=== EXIT CRITERION MET: the Unreal chain is bound and "
+           "initialised on visionOS ===\n");
+    g_phase = "boot report";
+    kl_jni_report(stdout);
+    fflush(NULL);
+    g_phase = "boot done";
+    snprintf(g_status, sizeof g_status, "the Unreal chain initialised");
+    return 0;
+}
+
 int kl_app_boot(void) {
     // Once, and never concurrently. The Boot button invites a second press,
     // and the second entry is not merely redundant: the runtime's JNI tables
@@ -671,6 +707,7 @@ int kl_app_boot(void) {
     fflush(NULL);
 
     if (kl_app_target_is_steamlink()) return boot_steamlink();
+    if (target_is_ue4())              return boot_ue4();
 
     char path[1200];
     snprintf(path, sizeof path, "%s/libmain.so", g_libdir);
@@ -828,6 +865,26 @@ int kl_app_lifecycle_begin(void) {
         return steamlink_vr_begin();
     }
 
+    // The Unreal guest's lifecycle is Android's NativeActivity one, and it has
+    // Steam Link's constraint for Steam Link's reason: onCreate takes
+    // ALooper_forThread() and the engine hangs its own callbacks off exactly
+    // that looper, so create and pump must be the same thread.
+    if (target_is_ue4()) {
+        g_phase = "proc";
+        report_proc();
+        g_alarm_secs = kl_env_int("KL_ALARM", 120);
+
+        g_phase = "ANativeActivity_onCreate";
+        printf("\n=== ANativeActivity_onCreate ===\n");
+        fflush(NULL);
+        alarm(g_alarm_secs);
+        if (kl_ue4_create(stdout) != 0) { alarm(0); return fail(kl_ue4_error()); }
+        kl_ue4_start(stdout);
+        alarm(0);
+        g_phase = "looper pump";
+        return 0;
+    }
+
     void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
     if (!thiz) return fail("kl_app_boot must run first");
     g_thiz = thiz;
@@ -905,7 +962,11 @@ int kl_app_frame(void) {
     // a call per display frame. Pacing happens where OpenXR puts it — xrWaitFrame
     // blocks on the compositor's published pose (kl_openxr_set_pacer) — so a
     // caller that pumped here as well would be a second, disagreeing clock.
-    if (kl_app_target_is_steamlink()) return -1;
+    //
+    // The Unreal guest is the same answer for the same reason: a NativeActivity
+    // spawns its own game thread inside android_main and runs its frame loop
+    // there, so what our thread owes it is a turning looper.
+    if (kl_app_target_owns_frame_loop()) return -1;
     if (!g_render || !g_thiz) return -1;
     alarm(g_alarm_secs);
     // Pin this frame's poses before anything in the frame can ask. The
@@ -942,6 +1003,17 @@ void kl_app_lifecycle_report(void) {
         kl_slink_report(stdout);
         snprintf(g_status, sizeof g_status, "Steam Link %s run ended",
                  kl_slink_door_name());
+        return;
+    }
+    if (target_is_ue4()) {
+        // Same argument as the arm above, and one more of its own: a run that
+        // produced no frames at all looks exactly like one that produced them
+        // until this is read, because there is no return value from a render
+        // call to say otherwise (notes/RE4.md).
+        printf("\n=== the Unreal run ===\n");
+        kl_ue4_report(stdout);
+        fflush(NULL);
+        snprintf(g_status, sizeof g_status, "the Unreal run ended");
         return;
     }
     printf("  pumped %u frames\n", g_frames_pumped);
@@ -991,6 +1063,20 @@ int kl_app_lifecycle(unsigned frames) {
                      ? kl_slink_sdl_pump(secs, &g_guest_quit)
                      : kl_slink_vr_pump(secs, &g_guest_quit);
         printf("  pumped for %.1fs\n", spent);
+        kl_app_lifecycle_report();
+        return 0;
+    }
+
+    // ...and the same for Unreal, in the same unit and for the same reason:
+    // seconds of looper pump, because a frame budget is meaningless to a guest
+    // that owns its own frame loop. KL_UE4_WAIT is the budget on the command
+    // line too, and RE4 needs 300 of them — the first minute is the engine's
+    // own one-time shader optimization (notes/RE4.md).
+    if (target_is_ue4()) {
+        double secs = kl_env_str("KL_UE4_WAIT", NULL) ? strtod(getenv("KL_UE4_WAIT"), NULL) : 5.0;
+        printf("\n=== pumping the looper for %.1f s ===\n", secs);
+        fflush(NULL);
+        printf("  pumped %.2f s\n", kl_ue4_pump(secs, &g_guest_quit));
         kl_app_lifecycle_report();
         return 0;
     }
@@ -1104,10 +1190,15 @@ static void *guest_thread(void *unused) {
     // is a turning looper and nothing else. Pacing is not lost by that: it moves
     // to where OpenXR puts it, xrWaitFrame, which blocks on the same published
     // pose through kl_openxr_set_pacer. One clock either way.
-    if (kl_app_target_is_steamlink()) {
+    // ...and RE4 brought its own too — a NativeActivity spawns the engine's
+    // game thread inside android_main. Unbounded here, unlike the window path:
+    // the immersive space's own dismissal is what ends the run, through
+    // g_guest_quit.
+    if (kl_app_target_owns_frame_loop()) {
         printf("\n=== guest thread pumping the activity's looper ===\n");
         fflush(NULL);
-        double secs = kl_slink_vr_pump(-1.0, &g_guest_quit);
+        double secs = target_is_ue4() ? kl_ue4_pump(-1.0, &g_guest_quit)
+                                      : kl_slink_vr_pump(-1.0, &g_guest_quit);
         printf("[guest] pumped for %.1fs\n", secs);
         fflush(NULL);
         kl_app_lifecycle_report();
@@ -1169,6 +1260,12 @@ int kl_app_guest_start(void) {
     // publish. Installing it here also closes the window in which the guest could
     // reach its first xrWaitFrame unpaced, because the guest does not exist yet.
     if (kl_app_target_is_steamlink()) kl_openxr_set_frame_pacer(guest_pace_wait);
+    // ...and the same clock on the OVRPlugin side, for the other guest that
+    // owns its loop. ovrp_WaitToBeginFrame is this API's xrWaitFrame. It is
+    // installed ONLY here: every Unity guest reaches that call from inside a
+    // frame this driver already initiated, so a pacer there would be the
+    // compositor waiting on itself.
+    if (target_is_ue4()) kl_ovrp_set_frame_pacer(guest_pace_wait);
 
     // User-interactive, because this thread is now the one producing frames.
     // A plain pthread gets an unspecified QoS, and a guest demoted below the

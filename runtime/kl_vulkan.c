@@ -66,6 +66,10 @@ unsigned long long kl_vulkan_eye_image_layers(int s, int e, unsigned w, unsigned
                                              int srgb, int layers) {
     (void)s; (void)e; (void)w; (void)h; (void)srgb; (void)layers; return 0;
 }
+unsigned long long kl_vulkan_layer_image(int k, int s, int e, unsigned w, unsigned h,
+                                         int srgb, int layers) {
+    (void)k; (void)s; (void)e; (void)w; (void)h; (void)srgb; (void)layers; return 0;
+}
 void  kl_vulkan_capture_eyes(unsigned f, int s) { (void)f; (void)s; }
 void  kl_vulkan_frame_done(int s) { (void)s; }
 unsigned long long kl_vulkan_frame_serial(void) { return 0; }
@@ -1018,13 +1022,34 @@ static void cap_frame(klvk_swapchain *sc, VkQueue q, uint32_t idx,
 // slot for eye 1 is left empty under Array so nothing can hand out a second
 // image that does not exist.
 #define KLVK_EYE_STAGES 4
-static struct {
+typedef struct {
     VkImage        img;
     VkDeviceMemory mem;
     uint32_t       w, h;
     uint32_t       layers;
     VkFormat       fmt;
-} g_eye[KLVK_EYE_STAGES][2];
+} klvk_img_slot;
+
+static klvk_img_slot g_eye[KLVK_EYE_STAGES][2];
+
+// ...and the OTHER layers, which until now shared the table above.
+//
+// `ovrp_GetLayerTexture2` names a LAYER, and the storage was keyed on (stage,
+// eye) alone — so every layer the guest set up was handed the eye layer's
+// images. For a Unity guest that was invisible, because its only other layer is
+// a 1x1 dummy nothing renders into. An Unreal guest has real ones: OculusHMD's
+// FSplash and its IStereoLayers quads are how RE4 draws its intro logos, and
+// they were being rendered straight into the corner of the eye image — a small
+// logo in the top-left of an otherwise black eye, which reads as a broken
+// projection rather than as a layer with no storage of its own.
+//
+// Small and fixed: a guest that runs out says so by name rather than silently
+// aliasing again, which is the failure this replaces.
+#define KLVK_MAX_LAYERS 8
+static struct {
+    int           key;                       // the guest's layer id; 0 = free
+    klvk_img_slot s[KLVK_EYE_STAGES][2];
+} g_layer_img[KLVK_MAX_LAYERS];
 
 int kl_vulkan_guest_active(void) { return g_avail && g_ndev > 0; }
 
@@ -1173,10 +1198,24 @@ static VkImage klvk_image_alloc(klvk_device *d, VkFormat fmt,
     return img;
 }
 
-unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,
-                                              int srgb, int layers) {
+// A non-eye layer's slot table, found or claimed by the guest's layer id.
+// NULL when the table is full, which is named by the caller.
+static klvk_img_slot *layer_slots_for(int key) {
+    for (int i = 0; i < KLVK_MAX_LAYERS; i++)
+        if (g_layer_img[i].key == key) return &g_layer_img[i].s[0][0];
+    for (int i = 0; i < KLVK_MAX_LAYERS; i++)
+        if (!g_layer_img[i].key) {
+            g_layer_img[i].key = key;
+            return &g_layer_img[i].s[0][0];
+        }
+    return NULL;
+}
+
+unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
+                                         unsigned w, unsigned h, int srgb, int layers) {
     if (!kl_vulkan_guest_active()) return 0;
     if (stage < 0 || stage >= KLVK_EYE_STAGES || eye < 0 || eye > 1) return 0;
+    if (!w || !h) return 0;
     if (layers < 1) layers = 1;
     if (layers > 2) layers = 2;
     // Under the Array layout there is one image for the stage and both eyes get
@@ -1184,9 +1223,39 @@ unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, un
     // second allocation here.
     if (layers > 1) eye = 0;
     klvk_device *d = g_devs[0];
-    if (g_eye[stage][eye].img) return (uint64_t)(uintptr_t)g_eye[stage][eye].img;
+
+    int is_eye = layer_key == KLVK_EYE_LAYER;
+    klvk_img_slot *slots = is_eye ? &g_eye[0][0] : layer_slots_for(layer_key);
+    if (!slots) {
+        VKI("layer %d: all %d layer image slots are taken — refusing rather than "
+            "handing back another layer's storage\n", layer_key, KLVK_MAX_LAYERS);
+        return 0;
+    }
+    klvk_img_slot *slot = is_eye ? &g_eye[stage][eye] : &slots[stage * 2 + eye];
 
     VkFormat fmt = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    // A cached image is only the right answer if it is the image that was
+    // ASKED for. RE4 sets up its eye layer twice — 2290x2400, then 2748x2880
+    // once UE4 applies its own pixel density — and the size was not consulted,
+    // so the second layer was handed the first one's storage and the engine
+    // rendered a 2748x2880 frame into a 2290x2400 image.
+    //
+    // The old image is NOT destroyed. It is the GL path's rule for the GL path's
+    // reason: a compositor or a capture may be sampling it on another thread this
+    // instant, and freeing storage under them is a worse failure than holding a
+    // few images that no longer describe anything. This happens at startup, once
+    // per stage.
+    if (slot->img && (slot->w != w || slot->h != h ||
+                      slot->layers != (uint32_t)layers || slot->fmt != fmt)) {
+        VKI("layer %d stage %d %s: was %ux%u (%u layer(s)), now %ux%u (%d) — "
+            "allocating fresh; the old image is kept, not freed\n",
+            layer_key, stage, eye ? "eye 1" : "eye 0",
+            slot->w, slot->h, slot->layers, w, h, layers);
+        slot->img = VK_NULL_HANDLE;
+        slot->mem = VK_NULL_HANDLE;
+    }
+    if (slot->img) return (uint64_t)(uintptr_t)slot->img;
+
     // The guest renders into it, samples it for its own post chain, and we copy
     // out of it. TRANSFER_DST is there because Unity clears some targets with
     // vkCmdClearColorImage rather than a load op.
@@ -1255,18 +1324,28 @@ unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, un
                        : (eye ? "eye 1 BLUE" : "eye 0 GREEN"));
     }
 
-    g_eye[stage][eye].img = img;
-    g_eye[stage][eye].mem = mem;
-    g_eye[stage][eye].w = w;
-    g_eye[stage][eye].h = h;
-    g_eye[stage][eye].layers = (uint32_t)layers;
-    g_eye[stage][eye].fmt = fmt;
-    eye_publish_mtl(stage, eye, layers);
-    VKI("eye image stage %d %s = VkImage %p (%ux%u %s)\n", stage,
+    slot->img = img;
+    slot->mem = mem;
+    slot->w = w;
+    slot->h = h;
+    slot->layers = (uint32_t)layers;
+    slot->fmt = fmt;
+    // Only the EYE layer is published into kl_glfb's eye table. That table is
+    // what every compositor and every readback samples, so a splash quad
+    // announcing itself there would replace the eye on screen with a logo.
+    if (is_eye) eye_publish_mtl(stage, eye, layers);
+    VKI("%s stage %d %s = VkImage %p (%ux%u %s)\n",
+        is_eye ? "eye image" : "layer image",
+        stage,
         layers > 1 ? "both eyes (2 array layers)" :
                      (eye ? "eye 1" : "eye 0"),
         (void *)img, w, h, srgb ? "R8G8B8A8_SRGB" : "R8G8B8A8_UNORM");
     return (uint64_t)(uintptr_t)img;
+}
+
+unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,
+                                              int srgb, int layers) {
+    return kl_vulkan_layer_image(KLVK_EYE_LAYER, stage, eye, w, h, srgb, layers);
 }
 
 unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned h,

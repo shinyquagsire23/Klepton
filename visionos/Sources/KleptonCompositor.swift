@@ -318,12 +318,13 @@ final class KleptonCompositor {
     // this thread, inside the submission window. That is the clock P5.4's
     // device numbers were measured against, so it stays reachable — and it is
     // the A/B for anything that looks like a pacing problem after §12.12.
-    // ...and it is not offered for the Steam Link guest, because there is no
-    // inline frame to make: that guest brought its own OpenXR loop on a thread
-    // of its own, `kl_app_frame()` returns -1 for it by design, and taking this
-    // arm would present black forever while looking like a pacing choice.
+    // ...and it is not offered for a guest that brought its own frame loop —
+    // Steam Link's OpenXR thread, or an Unreal guest's game thread — because
+    // there is no inline frame to make: `kl_app_frame()` returns -1 for both by
+    // design, and taking this arm would present black forever while looking
+    // like a pacing choice.
     private let syncGuest = klEnvOn("KL_SYNC_GUEST", default: false)
-                            && kl_app_target_is_steamlink() == 0
+                            && kl_app_target_owns_frame_loop() == 0
 
     // How many drawables went out before the guest had a picture to put in
     // them. Counted rather than logged per frame, because on device it is

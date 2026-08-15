@@ -69,6 +69,27 @@ void kl_ovrp_get_head_pose(float *px, float *py, float *pz,
 // KL_OVRP_LATCH=0 disables it and restores the live read.
 void kl_ovrp_frame_latch(void);
 
+// The frame clock, for a guest that owns its own frame loop — kl_openxr's
+// pacer, on the OVRPlugin side of the same question.
+//
+// `ovrp_WaitToBeginFrame` is where the plugin is specified to block until the
+// app should start its next frame; it is this API's `xrWaitFrame`. For every
+// Unity guest here that call happens INSIDE a frame the driver already
+// initiated, so it must not block and does not — the driver is the clock. A
+// NativeActivity guest (RE4) is the other shape: the engine runs its own game
+// thread, nothing of ours calls a render function, and this is the only point
+// at which the compositor can say "not yet".
+//
+// So it is installed rather than compiled in, and by the driver that knows it
+// has a display AND that the guest owns the loop. NULL is the default and must
+// stay so: a host run has no compositor and a pacer there would block forever.
+// The callback must return on its own if no pose arrives — a stalled display
+// should make the guest render against the last pose, not wedge it.
+//
+// The latch is taken here too, so the pose the frame is drawn from is pinned at
+// the same moment the frame is admitted (see kl_ovrp_frame_latch).
+void kl_ovrp_set_frame_pacer(void (*wait)(void));
+
 // M7 — the rest of the pose-in seam: the two Touch controllers. `hand` is
 // 0 = left (node 3), 1 = right (node 4). Poses live in the same tracking
 // space as the head. Buttons/touches are ovrpButton/ovrpTouch bit values as

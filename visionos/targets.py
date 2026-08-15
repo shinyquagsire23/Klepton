@@ -56,6 +56,11 @@ TARGETS = {
         # Nothing in this guest reads a library as a FILE, so no ELF goes into
         # the container at all. See steamlink-vr's `qtplugins`.
         "qtplugins": "",
+        # Where this guest looks for its OBB, relative to the external-storage
+        # root (kl_jni_files_dir()). Unity asks Java for it —
+        # Context.getObbDirs() answers <files>/obb — so every Unity target here
+        # shares one layout and only the version code in the NAME differs.
+        "obb":     "obb",
         # The library the chain STARTS at — libmain's JNI_OnLoad is the whole
         # entry point for a Unity title (CLAUDE.md, "Facts worth not
         # rediscovering") — and, on device, the one whose translation being
@@ -84,6 +89,11 @@ TARGETS = {
         "apk":     "superhot.apk",
         "assets":  "superhot/assets",
         "qtplugins": "",
+        # Where this guest looks for its OBB, relative to the external-storage
+        # root (kl_jni_files_dir()). Unity asks Java for it —
+        # Context.getObbDirs() answers <files>/obb — so every Unity target here
+        # shares one layout and only the version code in the NAME differs.
+        "obb":     "obb",
         "entry":   "libmain",
         "kind":    "unity",
         "product": "KleptonSuperhot",
@@ -118,6 +128,11 @@ TARGETS = {
         "apk":     "bonelab.apk",
         "assets":  "bonelab/assets",
         "qtplugins": "",
+        # Where this guest looks for its OBB, relative to the external-storage
+        # root (kl_jni_files_dir()). Unity asks Java for it —
+        # Context.getObbDirs() answers <files>/obb — so every Unity target here
+        # shares one layout and only the version code in the NAME differs.
+        "obb":     "obb",
         "entry":   "libmain",
         "kind":    "unity",
         "product": "KleptonBonelab",
@@ -153,6 +168,11 @@ TARGETS = {
         "apk":     "vrchat.apk",
         "assets":  "vrchat/assets",
         "qtplugins": "",
+        # Where this guest looks for its OBB, relative to the external-storage
+        # root (kl_jni_files_dir()). Unity asks Java for it —
+        # Context.getObbDirs() answers <files>/obb — so every Unity target here
+        # shares one layout and only the version code in the NAME differs.
+        "obb":     "obb",
         "entry":   "libmain",
         "kind":    "unity",
         "product": "KleptonVRChat",
@@ -198,6 +218,11 @@ TARGETS = {
         "apk":     "openbrush.apk",
         "assets":  "openbrush/assets",
         "qtplugins": "",
+        # Where this guest looks for its OBB, relative to the external-storage
+        # root (kl_jni_files_dir()). Unity asks Java for it —
+        # Context.getObbDirs() answers <files>/obb — so every Unity target here
+        # shares one layout and only the version code in the NAME differs.
+        "obb":     "obb",
         "entry":   "libmain",
         "kind":    "unity",
         "product": "KleptonOpenBrush",
@@ -264,6 +289,14 @@ TARGETS = {
         "apk":     "re4.apk",
         "assets":  "re4/assets",
         "qtplugins": "",
+        # Where this guest looks for its OBB, relative to the external-storage
+        # root. **UE4 builds the path ITSELF** and it is ANDROID's layout, not
+        # the flat one the Unity guests use: <external>/Android/obb/<package>/
+        # main.<versionCode>.<package>.obb. Nothing here calls getObbDirs(), so
+        # staging into <files>/obb/ puts 8.5 GB somewhere the engine never looks
+        # — and it fails SILENTLY, because a UE4 build reports a missing OBB the
+        # same way it reports a missing .uproject: it carries on.
+        "obb":     "Android/obb/com.Armature.VR4",
         # The library the chain starts at, and the one whose translation being
         # in the bundle proves THIS guest was embedded. There is no libmain
         # here: UE4 links its engine, its game and its plugins into one 172 MB
@@ -324,6 +357,11 @@ TARGETS = {
         # The VR door's library. The shell's fourteen load on top of it in the
         # same process; this is the one whose translation being in the bundle
         # says the Steam Link guest was embedded.
+        # Where this guest looks for its OBB, relative to the external-storage
+        # root (kl_jni_files_dir()). Unity asks Java for it —
+        # Context.getObbDirs() answers <files>/obb — so every Unity target here
+        # shares one layout and only the version code in the NAME differs.
+        "obb":     "obb",
         "entry":   "libvrlink_scene",
         "kind":    "steamlink",
         "product": "KleptonSteamLink",
@@ -436,7 +474,7 @@ def c_table():
         "// cannot disagree about which tree, which APK or which boot sequence a",
         "// target means. See runtime/kl_target.h for the struct these expand into.",
         "",
-        "// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, kind)",
+        "// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, obb, kind)",
         "#ifndef KL_TARGET_ROW",
         "#error \"include this through runtime/kl_target.c\"",
         "#endif",
@@ -445,9 +483,9 @@ def c_table():
     for name in sorted(TARGETS):
         t = TARGETS[name]
         kind = "KL_GUEST_" + t["kind"].upper()
-        out.append('KL_TARGET_ROW("%s", "%s", "%s", "%s", "%s", "%s", %s)'
+        out.append('KL_TARGET_ROW("%s", "%s", "%s", "%s", "%s", "%s", "%s", %s)'
                    % (name, t["tree"], t["apk"], t["assets"], t["srcdir"],
-                      t["entry"], kind))
+                      t["entry"], t["obb"], kind))
     out += ["", '#define KL_TARGET_DEFAULT_NAME "%s"' % DEFAULT, ""]
     return "\n".join(out)
 

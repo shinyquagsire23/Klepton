@@ -1270,6 +1270,11 @@ static uint64_t klovrp_GetNodeFrustum2(int node, void *out) {
     return OVRP_SUCCESS;
 }
 
+static uint64_t klovrp_GetTiledMultiResLevel(int* out) {
+    if (out) *out = 0; // TiledMultiResLevel.Off
+    return OVRP_TRUE;                       // ovrpBool
+}
+
 // ovrpTrackingOrigin: EyeLevel=0, FloorLevel=1, Stage=2. This decides what
 // space every pose we report is *in*, so it cannot stay a discarded argument
 // on the generic yes-stub: under FloorLevel/Stage the guest expects the head
@@ -2087,6 +2092,8 @@ static int klovrp_submit_viewports(const void *layer_submits, int count, int vp[
 // declared for the same reason as the line above: ovrpLayerSubmit's layout is
 // stated further down, next to the DWARF it was read out of.
 static int klovrp_submit_stage(const void *layer_submits, int count);
+// ...and the census of the whole list, for the same forward-declaration reason.
+static void klovrp_census_submits(const void *layer_submits, int count);
 
 // `viewports` is that pair, or NULL where a caller cannot know — ovrp_EndFrame
 // (1.28's legacy VRDevice, which has no layers at all) and every non-Unity
@@ -2311,6 +2318,7 @@ static uint64_t klovrp_EndFrame4(int guest_frame_index, const void *layer_submit
     ovrp_hit("ovrp_EndFrame4");
     (void)sync;
     if (!layer_submits && layer_submit_count) return OVRP_FAIL_INVALID_PARAM;
+    klovrp_census_submits(layer_submits, layer_submit_count);
     int vp[8], of[2] = { 0, 0 };
     int have = klovrp_submit_viewports(layer_submits, layer_submit_count, vp, of);
     // The guest's own answer to "which stage did I just draw?", at submit+0x04.
@@ -2786,10 +2794,28 @@ static uint64_t klovrp_GetNodePoseState3(int a, int b, int c, void *out) {
 // NEXT frame id, which the guest feeds to klovrp_BeginFrame, where it is
 // threaded to g_frames.pending_index — the guest's own frame counter, which
 // the record ring is sized to multiplex (see KLOVRP_STAGES_DEFAULT). Nobody
-// actually waits here: with one swapchain there is nothing to block on, and a
-// real wait would only be this call delaying the caller.
+// actually waits here BY DEFAULT: for a Unity guest this call happens inside a
+// frame the driver already initiated, so the driver is the clock and a wait
+// here would only be this call delaying its own caller.
+//
+// A guest that owns its frame loop is the other shape, and then this is the
+// only point at which a display can say "not yet" — kl_ovrp_set_frame_pacer is
+// that, and it is the OVRPlugin half of kl_openxr's pacer. Unset everywhere
+// else, so nothing about the Unity path changes.
+static void (*g_frame_pacer)(void);
+void kl_ovrp_set_frame_pacer(void (*wait)(void)) { g_frame_pacer = wait; }
+
 static uint64_t klovrp_WaitToBeginFrame(void) {
     ovrp_hit("ovrp_WaitToBeginFrame");
+    if (g_frame_pacer) {
+        g_frame_pacer();
+        // Here rather than at BeginFrame, and for the reason kl_ovrp_frame_latch
+        // gives: the pose has to be pinned before ANYTHING in the frame can ask
+        // for one, and this call is the frame's first instruction. A guest that
+        // asks between the two would see the compositor's newer pose and draw
+        // from a pose the record does not carry.
+        kl_ovrp_frame_latch();
+    }
     static uint64_t next;   // first issued id is 1 — the caller's 0 is identity
     return next++;
 }
@@ -3903,6 +3929,116 @@ _Static_assert(sizeof(ovrp_recti) == 0x10, "recti");
 // caller that cannot tell them apart files every unnamed frame against stage 0
 // and the picture is one stage stale forever. Both callers make the distinction
 // explicitly.
+// What a non-eye submit carries PAST the common header, which is the one thing
+// a compositor for overlay layers still needs and nothing here has ever read.
+//
+// The array the guest hands ovrp_EndFrame4 is of `ovrpLayerSubmit*`, but the
+// objects behind those pointers are `ovrpLayerSubmitUnion` — the real plugin's
+// own signature says so: `CompositorVRAPI::EndFrame(int, std::vector<
+// ovrpLayerSubmitUnion>&, bool, void*)`. And the union's Quad/Cylinder arms add
+// an `ovrpVector3f` after the header, which is the layer's WORLD SIZE in
+// metres: `Compositor::EnqueueSubmitLayer(..., ovrpPosef, ovrpVector3f, ...)`
+// passes exactly that pair, and `CompositorVRAPI::calculateTexCoordsMatrix(
+// const ovrpPosef&, ..., const ovrpVector3f&, ...)` consumes it.
+//
+// The OFFSET is read out of `Compositor::ImportLayerSubmit(const
+// ovrpLayerSubmit*, ovrpLayerSubmitUnion*)` (0x3c9cc in RE4's copy) rather than
+// guessed, and it is 0xb0, not the 0xbc our header struct ends at:
+//
+//   shape 0 (Quad)     ldr x8,[x20+0xb0] ; str x8,[x19+0xb0]   — EIGHT bytes
+//   shape 1 (Cylinder) three words at +0xb0, +0xb4, +0xb8
+//   shape 3 (EyeFov)   its own block from +0xf0 on
+//
+// so the common header this plugin was built with ends at 0xb0 and everything
+// past it is the union's per-shape arm. (Each of those has an alternate source
+// offset — +0x48, +0x4c, +0x50 — selected by a flag: that is the LEGACY submit
+// whose header stopped at 0x44, before ColorScale existed. Our struct's
+// `has_blend_factors`/`src`/`dst` names at 0xb0..0xbc come from libOculusXRPlugin's
+// DWARF, i.e. from a NEWER OVRPlugin, and nothing has ever read them — they are
+// the Cylinder arm here.)
+//
+// `sizeof(ovrpLayerSubmitUnion)` is 0x130, from ovrp_EndFrame4's own
+// `mov w8,#0x130 / mul` when it allocates the vector — so reading +0xb0 on a
+// submit the guest built as a union is in bounds. Printed rather than acted on:
+// nothing composites overlay layers yet, and a pose without a size cannot place
+// a quad, so this is what the next step is built from.
+static void klovrp_probe_submit_tail(const ovrp_layer_submit *s) {
+    const float *q = (const float *)((const unsigned char *)s + 0xb0);
+    fprintf(stderr, "          union +0xb0: %.4f %.4f  "
+                    "(ovrpLayerSubmitQuad.Size, metres)\n", q[0], q[1]);
+}
+
+// ovrpShape, from the guest's own enum. The names are in libOculusXRPlugin's
+// string table in this order; UE4's OculusHMD uses Quad for splash screens and
+// for IStereoLayers, Cylinder and Equirect for the rest.
+static const char *klovrp_shape_name(int shape) {
+    static const char *const N[] = { "Quad", "Cylinder", "Cubemap", "EyeFov",
+                                     "OffcenterCubemap", "Equirect", "ReconstructionPassthrough",
+                                     "SurfaceProjectedPassthrough", "Fisheye",
+                                     "KeyboardHandsPassthrough", "KeyboardMaskedHandsPassthrough" };
+    return (unsigned)shape < sizeof N / sizeof *N ? N[shape] : "?";
+}
+
+// The whole submit list, which nothing here has ever printed.
+//
+// Every other reader of this array walks past anything that is not the eye
+// layer — deliberately, because only the eye layer describes the picture the
+// compositor reprojects. The consequence is that a guest submitting OVERLAY
+// layers looks, from every log this project produces, exactly like one that
+// submits none: RE4 submits its intro logos that way and the run said nothing
+// at all about them.
+//
+// So this is a census rather than a per-frame trace: one line per distinct
+// (layer, shape, stage, viewport, pose, flags) combination, printed when it
+// first appears and when it changes. A title that submits one eye layer forever
+// pays one line for the run.
+static void klovrp_census_submits(const void *layer_submits, int count) {
+    if (!kl_env_on("KL_OVRP_LAYERS", 0)) return;
+    const ovrp_layer_submit *const *list = layer_submits;
+    if (!list || count <= 0) return;
+    // Keyed on the layer id, so an overlay that moves says so and one that is
+    // static says it once.
+    static struct { int id, live; ovrp_layer_submit last; } seen[KLOVRP_MAX_LAYERS * 2];
+    for (int i = 0; i < count; i++) {
+        const ovrp_layer_submit *s = list[i];
+        if (!s) continue;
+        int slot = -1;
+        for (unsigned k = 0; k < sizeof seen / sizeof *seen; k++) {
+            if (seen[k].live && seen[k].id == s->layer_id) { slot = (int)k; break; }
+            if (!seen[k].live && slot < 0) slot = (int)k;
+        }
+        if (slot < 0) continue;
+        int fresh = !seen[slot].live || seen[slot].id != s->layer_id;
+        if (!fresh && memcmp(&seen[slot].last, s, sizeof *s) == 0) continue;
+        seen[slot].live = 1;
+        seen[slot].id = s->layer_id;
+        seen[slot].last = *s;
+
+        struct klovrp_layer *l = klovrp_layer(s->layer_id);
+        fprintf(stderr, "  [ovrp] submit %d/%d: layer %d (%s%s) stage %d "
+                        "vp0 %d,%d %dx%d vp1 %d,%d %dx%d flags=%#x\n",
+                i + 1, count, s->layer_id,
+                l ? klovrp_shape_name(l->desc.shape) : "unknown layer",
+                l && l->is_eye ? ", EYE" : "",
+                s->texture_stage,
+                s->viewport[0].x, s->viewport[0].y, s->viewport[0].w, s->viewport[0].h,
+                s->viewport[1].x, s->viewport[1].y, s->viewport[1].w, s->viewport[1].h,
+                (unsigned)s->submit_flags);
+        // The pose is what says whether an overlay is head-locked, world-locked
+        // or identity — the difference the user of a composite actually sees, and
+        // the one thing no other line here carries.
+        fprintf(stderr, "          pose q=(%.3f %.3f %.3f %.3f) p=(%.3f %.3f %.3f)%s"
+                        "  size %dx%d\n",
+                s->pose[0], s->pose[1], s->pose[2], s->pose[3],
+                s->pose[4], s->pose[5], s->pose[6],
+                (s->pose[0] == 0 && s->pose[1] == 0 && s->pose[2] == 0 &&
+                 s->pose[3] == 1 && s->pose[4] == 0 && s->pose[5] == 0 &&
+                 s->pose[6] == 0) ? "  [identity]" : "",
+                l ? l->desc.texture_size.w : 0, l ? l->desc.texture_size.h : 0);
+        if (l && !l->is_eye) klovrp_probe_submit_tail(s);
+    }
+}
+
 static int klovrp_submit_stage(const void *layer_submits, int count) {
     const ovrp_layer_submit *const *list = layer_submits;
     if (!list || count <= 0) return -1;
@@ -4065,38 +4201,66 @@ static uint64_t klovrp_CalculateEyeLayerDesc2(int layout, int mip_levels,
 // ovrp_CalculateLayerDesc(shape, layout, textureSize, mipLevels, sampleCount,
 //                         format, layerFlags, desc*)
 //
-// The non-eye sibling, used here for one thing only: the 1x1 dummy layer
-// CreateLayer makes on GLES after the eye layer. Its two failure paths are
-// non-fatal in the guest ("Unable to CalculateLayerDesc/SetupLayer for dummy
-// layer" and it carries on), but it is on the path, so it gets a real answer.
+// The non-eye sibling: every layer that is not the eye layer goes through it —
+// Unity's 1x1 dummy, and an Unreal guest's SPLASH and stereo-layer quads, which
+// is where its size stopped being ignorable.
 //
-// textureSize is an ovrpSizei by value in x2 (the real 0x16e440 does `mov x3,x2`
-// — 64-bit, not `mov w3,w2`). This guest passes the ADDRESS of a `{1,1}`
-// constant in its own rodata there rather than the value, i.e. its header and
-// the shipped library disagree about by-value vs by-pointer; on a real Quest
-// that yields a nonsense size for a layer whose size is never used. We take the
-// size we can justify — the dummy layer's own 1x1 — and say so rather than
-// decoding whichever reading happens to look plausible.
-static uint64_t klovrp_CalculateLayerDesc(int shape, int layout, uint64_t texture_size,
+// **textureSize is a POINTER, and this answered 1x1 for the whole project.**
+// The old note here read the guest's address argument as the guest's bug ("its
+// header and the shipped library disagree about by-value vs by-pointer") and
+// answered a size we invented. It is the other way round, and the library says
+// so twice over. The mangled name of the function this forwards to is
+// `...CalculateLayerDescE9ovrpShape10ovrpLayout RK9ovrpSizei ii...` — `RK` is
+// `const&`. And its body (0x3ccdc in RE4's copy) dereferences it three times:
+// `ldr w9,[x21]` for the width, `ldr w10,[x21,#4]` for the height, and then
+// `ldr x8,[x21] / str x8,[x26,#8]` copying both into desc.TextureSize.
+//
+// Trap 10b's family, argument half — and unlike the others in it, the wrong
+// answer was not a stack slot left unwritten but a SIZE, which the guest then
+// built a layer out of. For Unity it cost nothing visible: its only non-eye
+// layer really is a 1x1 it never renders into. For RE4 it is the intro logos —
+// a splash quad told it was 1x1.
+//
+// mipLevels 0 means "the full chain", and the real body computes it the same
+// way for both axes and takes the smaller: floor(log2(n)) + 1.
+//
+// What it does NOT fill is as measured as what it does: the memset covers +0x08
+// onward and only shape/layout/size/mips/samples/format/flags are written
+// after, so VisibleRect and MaxViewportSize stay ZERO. Filling them with
+// something reasonable would be inventing an answer the guest can tell apart
+// from a real plugin's.
+static int klovrp_mip_chain(int n) {
+    int c = 1;
+    if (n >= 2) do { c++; } while ((n >>= 1) > 3);
+    return c;
+}
+
+static uint64_t klovrp_CalculateLayerDesc(int shape, int layout,
+                                          const ovrp_sizei *texture_size,
                                           int mip_levels, int sample_count, int format,
                                           int layer_flags,
                                           ovrp_layer_desc_eyefov *out) {
     ovrp_hit("ovrp_CalculateLayerDesc");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
+    // The real body reads the pointer with no NULL check of its own, so a NULL
+    // here would be a fault inside the plugin. Refusing is the one deviation,
+    // because a fault in our address space is reported as ours.
+    if (!texture_size) return OVRP_FAIL_INVALID_PARAM;
+    ovrp_sizei sz = *texture_size;
     memset(out, 0, sizeof *out);
     out->shape        = shape;
     out->layout       = layout;
-    out->texture_size = (ovrp_sizei){ 1, 1 };
-    out->mip_levels   = mip_levels > 0 ? mip_levels : 1;
-    out->sample_count = sample_count > 0 ? sample_count : 1;
+    out->texture_size = sz;
+    out->mip_levels   = mip_levels > 0 ? mip_levels
+                      : (klovrp_mip_chain(sz.w) < klovrp_mip_chain(sz.h)
+                         ? klovrp_mip_chain(sz.w) : klovrp_mip_chain(sz.h));
+    out->sample_count = sample_count;
     out->format       = format;
     out->layer_flags  = layer_flags;
-    for (int eye = 0; eye < 2; eye++)
-        out->visible_rect[eye] = (ovrp_rectf){ 0.0f, 0.0f, 1.0f, 1.0f };
-    out->max_viewport_size = out->texture_size;
-    fprintf(stderr, "  [ovrp] CalculateLayerDesc: shape=%d layout=%d 1x1 "
-                    "(the guest passed size as %#llx — an address, see the note)\n",
-            shape, layout, (unsigned long long)texture_size);
+    fprintf(stderr, "  [ovrp] CalculateLayerDesc: shape=%d layout=%d %dx%d "
+                    "mips=%d samples=%d fmt=%d flags=%#x\n",
+            shape, layout, sz.w, sz.h, out->mip_levels, sample_count,
+            format, (unsigned)layer_flags);
     return OVRP_SUCCESS;
 }
 
@@ -4176,9 +4340,14 @@ static uint64_t klovrp_SetupLayer(void *device, const ovrp_layer_desc_eyefov *de
     l->is_eye = is_eye;
     l->used   = 1;
     *layer_id = l->id;
+    // Named by its SHAPE rather than as "dummy". Unity's one non-eye layer
+    // really is a placeholder, and calling every other guest's overlays that
+    // read as a spare: RE4's splash is a 900x900 Quad and the line said
+    // "dummy, 1x1" (the size because ovrp_CalculateLayerDesc answered one it
+    // invented — see there).
     fprintf(stderr, "  [ovrp] SetupLayer(device=%p) -> layer %d, %s, %dx%d "
                     "layout=%d fmt=%d samples=%d%s\n",
-            device, l->id, is_eye ? "EYE" : "dummy",
+            device, l->id, is_eye ? "EYE" : klovrp_shape_name(desc->shape),
             desc->texture_size.w, desc->texture_size.h, desc->layout,
             desc->format, desc->sample_count,
             reused ? " (reusing the previous layer's textures)" : "");
@@ -4292,18 +4461,26 @@ static uint64_t klovrp_GetLayerTexture2(int layer_id, int stage, int eye,
         // renderParams[].textureArraySlice, which is the provider's business
         // and not ours.
         int layers = (l->desc.layout == KLOVRP_LAYOUT_ARRAY) ? 2 : 1;
+        // Keyed on the LAYER as well as the stage and eye. It was not, and every
+        // layer the guest set up was handed the eye layer's images — invisible
+        // for Unity, whose only other layer is a 1x1 dummy nothing renders into,
+        // and the whole of RE4's broken intro logos, which are OculusHMD FSplash
+        // quads that were being drawn into the corner of the eye texture.
         unsigned long long img =
-            kl_vulkan_eye_image_layers(stage, eye, (unsigned)w, (unsigned)h, srgb, layers);
+            kl_vulkan_layer_image(l->is_eye ? KLVK_EYE_LAYER : layer_id,
+                                  stage, eye, (unsigned)w, (unsigned)h, srgb, layers);
         if (!img) {
             fprintf(stderr, "  [ovrp] GetLayerTexture2(layer %d stage %d eye %d): "
-                            "no VkImage — the guest is on Vulkan and the eye "
+                            "no VkImage — the guest is on Vulkan and the layer "
                             "storage could not be allocated\n",
                     layer_id, stage, eye);
             return OVRP_FAIL_NOT_INITIALIZED;
         }
         *color = img;
-        fprintf(stderr, "  [ovrp] GetLayerTexture2: eye %d stage %d = VkImage %#llx "
-                        "(%dx%d %s%s)\n", eye, stage, img, w, h,
+        if (l->is_eye) { g_eye_storage_w = w; g_eye_storage_h = h; }
+        fprintf(stderr, "  [ovrp] GetLayerTexture2: %s%d eye %d stage %d = VkImage %#llx "
+                        "(%dx%d %s%s)\n",
+                l->is_eye ? "eye layer " : "layer ", layer_id, eye, stage, img, w, h,
                 fname ? fname : "?",
                 layers > 1 ? ", array slice — both eyes share this image" : "");
         return OVRP_SUCCESS;
@@ -4911,6 +5088,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetEyeTextureSize", (void *)klovrp_GetEyeTextureSize},
     {"ovrp_GetEyeTextureStageCount", (void *)klovrp_GetEyeTextureStageCount},
     {"ovrp_GetDesiredEyeTextureFormat", (void *)klovrp_GetDesiredEyeTextureFormat},
+    {"ovrp_GetTiledMultiResLevel", (void *)klovrp_GetTiledMultiResLevel},
     {"ovrp_SetTrackingOriginType", (void *)klovrp_SetTrackingOriginType},
     {"ovrp_SetTrackingOriginType2", (void *)klovrp_SetTrackingOriginType2},
     {"ovrp_GetTrackingOriginType", (void *)klovrp_GetTrackingOriginType},

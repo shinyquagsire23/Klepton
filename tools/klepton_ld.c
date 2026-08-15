@@ -232,8 +232,13 @@ int main(int argc, char **argv) {
     // before the layout is chosen. TLS first, then count — the same order the
     // runtime loader uses, and it matters: `mrs x18, tpidr_el0` is itself an x18
     // site, and rewriting it changes the word the decoder then sees.
+    // ...and the SPAN of the executable sections, because it is what decides
+    // where the veneer pool can go. See the placement below.
+    uint64_t text_lo = UINT64_MAX, text_hi = 0;
     for (int i = 0; i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
+        if (sh[i].sh_addr < text_lo) text_lo = sh[i].sh_addr;
+        if (sh[i].sh_addr + sh[i].sh_size > text_hi) text_hi = sh[i].sh_addr + sh[i].sh_size;
         uint64_t cursor = sh[i].sh_addr, cva;
         size_t csz;
         while (kl_x18_next_code(sh[i].sh_addr, (size_t)sh[i].sh_size,
@@ -243,6 +248,7 @@ int main(int argc, char **argv) {
             x18_sites    += kl_x18_count(p, csz);
         }
     }
+    if (text_lo == UINT64_MAX) text_lo = text_hi = 0;
 
     // ---- lay out the Mach-O ----
     // The veneer pool lives *before* the guest image, inside __TEXT, which is
@@ -308,6 +314,80 @@ int main(int argc, char **argv) {
         if (ok) { image_shift = s; break; }
     }
 
+    // ---- the segment layout, which the pool placement below needs -----------
+    // Depends on nothing but `image_shift` and the PT_LOAD groups, so it is
+    // computed here rather than after the rewrites: a pool that goes ABOVE the
+    // image has to know where the image ends before the veneers are emitted,
+    // because every veneer's address is baked into the branch that reaches it.
+    uint64_t seg_vm[10], seg_vmend[10], seg_foff[10], seg_fsize[10];
+    for (int g = 0; g < ngrp; g++) {
+        uint64_t want = image_shift + grp[g].vlo;
+        seg_vm[g] = (g == 0) ? 0 : align_down(want, PAGE);
+        if (g && seg_vm[g] < seg_vmend[g - 1])
+            // The shift above places a page boundary at the FIRST writable
+            // group, which settles every library in this corpus. A third group
+            // that needs one too cannot have it — one shift, one boundary — so
+            // say which gap is too narrow rather than blaming the shift.
+            die("segment %d starts %#llx after the previous one ends, which is "
+                "less than the %#llx host page: no image shift can put a page "
+                "boundary between them", g,
+                (unsigned long long)(grp[g].vlo - grp[g - 1].vhi_mem),
+                (unsigned long long)PAGE);
+        seg_vmend[g] = align_up(image_shift + grp[g].vhi_mem, PAGE);
+    }
+    // Make them gapless: each segment runs up to the next one's start.
+    for (int g = 0; g + 1 < ngrp; g++) seg_vmend[g] = seg_vm[g + 1];
+
+    for (int g = 0; g < ngrp; g++) {
+        seg_foff[g]  = (g == 0) ? 0 : seg_foff[g - 1] + seg_fsize[g - 1];
+        seg_foff[g]  = align_up(seg_foff[g], PAGE);
+        // File content stops at the end of initialised data; the rest is .bss,
+        // which dyld supplies as zero pages beyond filesize.
+        seg_fsize[g] = (image_shift + grp[g].vhi_file) - seg_vm[g];
+        if (g == 0) seg_fsize[g] = seg_vmend[0];   // __TEXT: file covers the whole segment
+    }
+
+    // ---- WHERE the pool goes, which is decided by REACH ---------------------
+    // The patch at each site is a single `b` — it has to be, because the veneer
+    // pass preserves instruction count — and `b` spans +/-128 MB. So the pool
+    // must be within 128 MB of every site, and the only two places that do not
+    // disturb the guest's own layout are below the image and above it. (Nothing
+    // may go BETWEEN: a `b` could be re-encoded but an `adrp` in the guest's own
+    // text could not, so the text-to-data delta is fixed.)
+    //
+    // Below was the only choice until 2026-08-15, under "the largest guest
+    // library here is libil2cpp at 57 MB". **libUE4.so is 172 MB**, its `.text`
+    // runs from 0x54ce000 to 0x9c53900, and every one of its 8038 x18 sites is
+    // in a 5.2 MB band at the very top — 151 MB above a pool at 0x4000. So all
+    // 8038 were refused, silently as far as any gate here was concerned, and RE4
+    // ran on the HOST (where kl_image.c places its pool next to the code) and
+    // could not boot on a headset, where a klepton-ld dylib is the only path.
+    // Trap 0 with the veneers switched off is not a crash at a named place: it
+    // is a guest reading Darwin's reserved x18.
+    //
+    // The reach is measured against the executable sections' span rather than
+    // against the sites, because it has to hold for a site anywhere in them.
+    #define BR_REACH (1ull << 27)                 // +/-128 MB, `b`'s imm26 << 2
+    uint64_t last_end = seg_vmend[ngrp - 1];
+    int pool_high = 0;
+    if (pool_cap) {
+        // Below: the furthest site is the top of .text, reaching down to the
+        // pool's first byte.
+        uint64_t down = (image_shift + text_hi) - HDR_RESERVE;
+        // Above: the pool sits past the last segment, and the furthest site is
+        // the BOTTOM of .text reaching up to the pool's last byte.
+        uint64_t up = align_up(last_end, PAGE) + pool_cap - (image_shift + text_lo);
+        if (down >= BR_REACH && up < BR_REACH) pool_high = 1;
+        else if (down >= BR_REACH)
+            die("%s: .text spans %#llx..%#llx (%.1f MB) and no single veneer pool "
+                "is within `b`'s +/-128 MB of all of it — %.1f MB below, %.1f MB "
+                "above. The pool would have to be split per region.",
+                in, (unsigned long long)text_lo, (unsigned long long)text_hi,
+                (double)(text_hi - text_lo) / (1 << 20),
+                (double)down / (1 << 20), (double)up / (1 << 20));
+    }
+    if (pool_high) pool_va = align_up(last_end, PAGE);
+
     uint8_t *pool = NULL;
     if (pool_cap) { pool = calloc(1, (size_t)pool_cap); if (!pool) die("out of memory"); }
 
@@ -370,35 +450,19 @@ int main(int argc, char **argv) {
     unsigned patched = kl_guest_patch_apply(in, gp_at, &gpc);
     (void)patched;
 
-    uint64_t seg_vm[10], seg_vmend[10], seg_foff[10], seg_fsize[10];
-    for (int g = 0; g < ngrp; g++) {
-        uint64_t want = image_shift + grp[g].vlo;
-        seg_vm[g] = (g == 0) ? 0 : align_down(want, PAGE);
-        if (g && seg_vm[g] < seg_vmend[g - 1])
-            // The shift above places a page boundary at the FIRST writable
-            // group, which settles every library in this corpus. A third group
-            // that needs one too cannot have it — one shift, one boundary — so
-            // say which gap is too narrow rather than blaming the shift.
-            die("segment %d starts %#llx after the previous one ends, which is "
-                "less than the %#llx host page: no image shift can put a page "
-                "boundary between them", g,
-                (unsigned long long)(grp[g].vlo - grp[g - 1].vhi_mem),
-                (unsigned long long)PAGE);
-        seg_vmend[g] = align_up(image_shift + grp[g].vhi_mem, PAGE);
+    // Where the pool's bytes live in the FILE, and where __LINKEDIT then starts.
+    // With the pool below the image both are what they always were: __TEXT
+    // starts at vmaddr 0 and fileoff 0, so the pool's file offset is its address.
+    uint64_t pool_foff = seg_foff[0] + pool_va;
+    uint64_t after_vm  = seg_vmend[ngrp - 1];
+    uint64_t after_foff = align_up(seg_foff[ngrp - 1] + seg_fsize[ngrp - 1], PAGE);
+    if (pool_high && pool_off) {
+        pool_foff  = after_foff;
+        after_vm   = align_up(pool_va + pool_off, PAGE);
+        after_foff = align_up(pool_foff + pool_off, PAGE);
     }
-    // Make them gapless: each segment runs up to the next one's start.
-    for (int g = 0; g + 1 < ngrp; g++) seg_vmend[g] = seg_vm[g + 1];
-
-    for (int g = 0; g < ngrp; g++) {
-        seg_foff[g]  = (g == 0) ? 0 : seg_foff[g - 1] + seg_fsize[g - 1];
-        seg_foff[g]  = align_up(seg_foff[g], PAGE);
-        // File content stops at the end of initialised data; the rest is .bss,
-        // which dyld supplies as zero pages beyond filesize.
-        seg_fsize[g] = (image_shift + grp[g].vhi_file) - seg_vm[g];
-        if (g == 0) seg_fsize[g] = seg_vmend[0];   // __TEXT: file covers the whole segment
-    }
-    uint64_t linkedit_vm   = seg_vmend[ngrp - 1];
-    uint64_t linkedit_foff = align_up(seg_foff[ngrp - 1] + seg_fsize[ngrp - 1], PAGE);
+    uint64_t linkedit_vm   = after_vm;
+    uint64_t linkedit_foff = after_foff;
 
     // ---- load commands ----
     char iname[512];
@@ -412,9 +476,18 @@ int main(int argc, char **argv) {
     // __TEXT carries the guest image (__klelf), the veneer pool (__klx18, absent
     // when the library has no x18 sites), and a small record of what this
     // translation did (__klstat) parked at the top of the header reserve.
-    uint32_t nsect_text = 2 + (pool_off ? 1 : 0);
+    //
+    // ...unless the pool had to go ABOVE the image to be in `b`'s reach (see the
+    // placement), in which case it is a segment of its own — __KLX18, r-x, after
+    // __DATA. A third segment rather than an extension of __TEXT because the
+    // guest's own text-to-data delta is fixed by its `adrp`s: nothing of ours
+    // may be inserted between them.
+    uint32_t nsect_text = 2 + ((pool_off && !pool_high) ? 1 : 0);
+    int      have_x18_seg = pool_off && pool_high;
     uint64_t stat_va = HDR_RESERVE - 64;
     uint32_t sz_text = sizeof(struct segment_command_64) + nsect_text * sizeof(struct section_64);
+    uint32_t sz_x18  = have_x18_seg
+                     ? sizeof(struct segment_command_64) + sizeof(struct section_64) : 0;
     uint32_t sz_data = sizeof(struct segment_command_64) + sizeof(struct section_64);
     uint32_t sz_link = sizeof(struct segment_command_64);
     uint32_t sz_id   = (uint32_t)align_up(sizeof(struct dylib_command) + strlen(iname) + 1, 8);
@@ -428,7 +501,8 @@ int main(int argc, char **argv) {
                      1 /* build version */ + 1 /* symtab */ + 1 /* dysymtab */ + 1 /* uuid */;
     // __DATA is only present if the library has a writable group.
     if (ngrp < 2) { ncmds--; sz_data = 0; }
-    uint32_t sizeofcmds = sz_text + sz_data + sz_link + sz_id + sz_ld + sz_bv +
+    if (have_x18_seg) ncmds++;
+    uint32_t sizeofcmds = sz_text + sz_x18 + sz_data + sz_link + sz_id + sz_ld + sz_bv +
                           sz_st + sz_dst + sz_uuid;
     if (sizeof(struct mach_header_64) + sizeofcmds > HDR_RESERVE)
         die("load commands (%u bytes) do not fit below the image shift %#llx",
@@ -475,7 +549,7 @@ int main(int argc, char **argv) {
         sec->flags  = S_REGULAR;
         sec++;
 
-        if (pool_off) {
+        if (pool_off && !pool_high) {
             strncpy(sec->sectname, "__klx18", 16);
             strncpy(sec->segname,  "__TEXT",  16);
             sec->addr   = pool_va;
@@ -519,6 +593,27 @@ int main(int argc, char **argv) {
         sec->align = 4;
         sec->flags = S_REGULAR;
         lc += sz_data;
+    }
+    // __KLX18 — the veneer pool, when it had to go above the image to be within
+    // `b`'s reach of the code. Executable and read-only, like __TEXT: these are
+    // real instructions the guest branches into and returns from.
+    if (have_x18_seg) {
+        struct segment_command_64 *s = (struct segment_command_64 *)lc;
+        s->cmd = LC_SEGMENT_64; s->cmdsize = sz_x18;
+        strncpy(s->segname, "__KLX18", 16);
+        s->vmaddr = pool_va; s->vmsize = align_up(pool_off, PAGE);
+        s->fileoff = pool_foff; s->filesize = pool_off;
+        s->maxprot = s->initprot = VM_PROT_READ | VM_PROT_EXECUTE;
+        s->nsects = 1; s->flags = 0;
+        struct section_64 *sec = (struct section_64 *)(s + 1);
+        strncpy(sec->sectname, "__klx18", 16);
+        strncpy(sec->segname,  "__KLX18", 16);
+        sec->addr   = pool_va;
+        sec->size   = pool_off;
+        sec->offset = (uint32_t)pool_foff;
+        sec->align  = 2;
+        sec->flags  = S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
+        lc += sz_x18;
     }
     // __LINKEDIT
     {
@@ -592,7 +687,7 @@ int main(int argc, char **argv) {
     // ---- the veneer pool and the translation record ----
     // Both live in __TEXT below the image, so seg_foff[0] + vmaddr is the file
     // offset (segment 0 starts at vmaddr 0 and fileoff 0).
-    if (pool_off) memcpy(o + seg_foff[0] + pool_va, pool, (size_t)pool_off);
+    if (pool_off) memcpy(o + pool_foff, pool, (size_t)pool_off);
     {
         // The reserve the record is parked in (see stat_va) is 64 bytes and the
         // record has grown once already; a silent overrun here would write into
@@ -644,9 +739,11 @@ int main(int argc, char **argv) {
                    (unsigned long long)(grp[1].vlo - grp[0].vlo),
                    (unsigned long long)((image_shift + grp[1].vlo) - (image_shift + grp[0].vlo)));
         printf("  TLS rewrites  %u   refused %u\n", tls_rewrites, tls_refused);
-        printf("  x18 sites     %u   veneered %u   refused %u   (pool %#llx bytes at %#llx)\n",
+        printf("  x18 sites     %u   veneered %u   refused %u   "
+               "(pool %#llx bytes at %#llx, %s the image)\n",
                x18st.sites, x18st.patched, x18st.refused,
-               (unsigned long long)pool_off, (unsigned long long)pool_va);
+               (unsigned long long)pool_off, (unsigned long long)pool_va,
+               pool_high ? "__KLX18 ABOVE" : "in __TEXT below");
         printf("  CTR_EL0 reads %u   veneered %u   refused %u   (answering %#llx)\n",
                x18st.ctr_sites, x18st.ctr_patched, x18st.ctr_refused,
                (unsigned long long)kl_x18_ctr_value());
