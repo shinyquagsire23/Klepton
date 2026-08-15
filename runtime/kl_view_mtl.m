@@ -540,7 +540,15 @@ int kl_viewmtl_present(int win_w, int win_h) {
     enc.label = @"klepton viewer composite";
     [enc setViewport:(MTLViewport){ (win_w - dw) * 0.5, (win_h - dh) * 0.5,
                                     dw, dh, 0.0, 1.0 }];
+    // Slot 1 is the SECOND eye's texture, for a guest whose two eyes are two
+    // unrelated MTLTextures rather than two slices of one (kl_reproject.c,
+    // `src`). This viewer composites ONE eye at a time — KL_VIEW_EYE picks it
+    // — so the same texture goes into both slots and the shader's branch is a
+    // no-op here. It is bound rather than left dangling because a fragment
+    // function that DECLARES a texture and is given none samples undefined
+    // storage, and the blit pipeline that ignores slot 1 costs nothing for it.
     [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
     [enc setFragmentSamplerState:g_samp atIndex:0];
     kl_blit_uniforms bu = { (uint32_t)slice, (uint32_t)(flip ? 1 : 0) };
     if (g_pipe_rp) {
@@ -626,6 +634,7 @@ int kl_viewmtl_present(int win_w, int win_h) {
         se.label = @"klepton viewer liveness";
         [se setRenderPipelineState:g_pipe];
         [se setFragmentTexture:src atIndex:0];
+        [se setFragmentTexture:src atIndex:1];
         [se setFragmentSamplerState:g_samp atIndex:0];
         [se setFragmentBytes:&bu length:sizeof bu atIndex:0];
         [se drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];

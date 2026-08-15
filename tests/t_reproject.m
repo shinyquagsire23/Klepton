@@ -270,6 +270,7 @@ static void check_pixels(void) {
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
     [enc setRenderPipelineState:ps];
     [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
     [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:0];
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
@@ -320,6 +321,7 @@ static void check_pixels(void) {
     enc = [cmd renderCommandEncoderWithDescriptor:rp];
     [enc setRenderPipelineState:ps];
     [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
     [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:0];
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
@@ -358,6 +360,7 @@ static void check_pixels(void) {
             enc = [cmd renderCommandEncoderWithDescriptor:rp];
             [enc setRenderPipelineState:bps];
             [enc setFragmentTexture:src atIndex:0];
+            [enc setFragmentTexture:src atIndex:1];
             [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
             [enc setFragmentBytes:&bu length:sizeof bu atIndex:0];
             // Three vertices, no grid: the blit is a full-screen triangle.
@@ -379,6 +382,7 @@ static void check_pixels(void) {
     enc = [cmd renderCommandEncoderWithDescriptor:rp];
     [enc setRenderPipelineState:ps];
     [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
     [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:0];
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
@@ -412,6 +416,7 @@ static void check_pixels(void) {
         enc = [cmd renderCommandEncoderWithDescriptor:rp];
         [enc setRenderPipelineState:ps];
         [enc setFragmentTexture:src atIndex:0];
+        [enc setFragmentTexture:src atIndex:1];
         [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
@@ -445,6 +450,7 @@ static void check_pixels(void) {
     enc = [cmd renderCommandEncoderWithDescriptor:rp];
     [enc setRenderPipelineState:ps];
     [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
     [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:0];
     klr_draw(enc);
@@ -557,6 +563,7 @@ static void check_crop_pixels(void) {
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
     [enc setRenderPipelineState:ps];
     [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
     [enc setFragmentSamplerState:samp atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:0];
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
@@ -597,6 +604,7 @@ static void check_crop_pixels(void) {
     enc = [cmd renderCommandEncoderWithDescriptor:rp];
     [enc setRenderPipelineState:ps];
     [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
     [enc setFragmentSamplerState:samp atIndex:0];
     [enc setVertexBytes:&u length:sizeof u atIndex:0];
     [enc setFragmentBytes:&u length:sizeof u atIndex:0];
@@ -712,6 +720,7 @@ static void check_split_crop_pixels(void) {
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
         [enc setRenderPipelineState:ps];
         [enc setFragmentTexture:src atIndex:0];
+        [enc setFragmentTexture:src atIndex:1];
         [enc setFragmentSamplerState:samp atIndex:0];
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
@@ -737,6 +746,157 @@ static void check_split_crop_pixels(void) {
     // picture, or the assertions above would pass with the indexing removed.
     ok(memcmp(got[0], got[1], 16) != 0,
        "...and reading one block for both eyes really is a different picture");
+}
+
+// Two eyes that are two TEXTURES, not two slices of one.
+//
+// Every other case in this file composites from a single 2-slice array, because
+// until Open Brush that is all anything produced: the eye provider allocates
+// exactly that by construction, and a Vulkan guest whose eye IS the layer hands
+// over the same shape. An OpenXR guest on Vulkan gets ONE SWAPCHAIN PER EYE, so
+// the two eyes are two unrelated MTLTextures — and the composite bound one
+// texture and dropped any view that did not match it, which took the right eye
+// out of the picture for the whole run.
+//
+// That failure has no error surface at all. Every call succeeds, the counters
+// stay healthy, the left eye is perfect, and the only instrument that can see it
+// is a person wearing the headset. So it is gated here, in the shape
+// KleptonCompositor really encodes: two views, ONE draw, per-view render-target
+// slices, and the source texture selected by [[amplification_id]].
+//
+// The sources are FLAT colours on purpose. Every other case in this file is
+// about where a texel lands; this one is only ever about WHICH TEXTURE was
+// read, and a flat source means a wrong answer cannot hide in a flip or a
+// crop.
+static void check_two_textures(void) {
+    printf("=== two eyes, two TEXTURES, one amplified pass ===\n");
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    if (!dev || !q) { printf("  no Metal device — skipped\n"); return; }
+    if (![dev supportsVertexAmplificationCount:2]) {
+        printf("  no vertex amplification on this device — skipped\n");
+        return;
+    }
+
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:
+                              [NSString stringWithUTF8String:kl_reproject_msl()]
+                                           options:nil error:&err];
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"kl_reproject_v"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"kl_reproject_f"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    // The whole point of the pass: both eyes in one draw.
+    pd.maxVertexAmplificationCount = 2;
+    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd
+                                                                       error:&err];
+    if (!ps) { ok(0, "pipeline for the two-texture check"); return; }
+
+    // One 2x2 array texture per eye, one layer each — which is exactly what
+    // MoltenVK hands back for a per-eye Vulkan swapchain image, once
+    // klvm_array_view has made an array view of it.
+    MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+    td.textureType = MTLTextureType2DArray;
+    td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    td.width = 2; td.height = 2; td.arrayLength = 1;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> eye0 = [dev newTextureWithDescriptor:td];
+    id<MTLTexture> eye1 = [dev newTextureWithDescriptor:td];
+    uint8_t red[16], green[16];
+    for (int i = 0; i < 4; i++) {
+        red[i*4+0] = 255; red[i*4+1] = 0;   red[i*4+2] = 0; red[i*4+3] = 255;
+        green[i*4+0] = 0; green[i*4+1] = 255; green[i*4+2] = 0; green[i*4+3] = 255;
+    }
+    [eye0 replaceRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0 slice:0
+              withBytes:red bytesPerRow:8 bytesPerImage:16];
+    [eye1 replaceRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0 slice:0
+              withBytes:green bytesPerRow:8 bytesPerImage:16];
+
+    // The destination is the drawable: one texture, one layer per view.
+    MTLTextureDescriptor *rd = [MTLTextureDescriptor new];
+    rd.textureType = MTLTextureType2DArray;
+    rd.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    rd.width = 2; rd.height = 2; rd.arrayLength = 2;
+    rd.usage = MTLTextureUsageRenderTarget;
+    rd.storageMode = MTLStorageModeShared;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:rd];
+
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.minFilter = MTLSamplerMinMagFilterNearest;
+    sd.magFilter = MTLSamplerMinMagFilterNearest;
+    sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    id<MTLSamplerState> samp = [dev newSamplerStateWithDescriptor:sd];
+
+    kl_ovrp_render_pose r = {0};
+    r.serial = 1; r.qw = 1;
+    for (int e = 0; e < 2; e++)
+        for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
+    simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
+    // One uniform per amplified view, in the pass's own order — the array the
+    // vertex shader indexes with [[amplification_id]]. Slice 0 for both, which
+    // is the point: with a texture each there is no slice left to tell them
+    // apart, and that is precisely what the old pass had no way to express.
+    kl_reproject_uniforms u[2];
+    for (int e = 0; e < 2; e++)
+        u[e] = kl_reproject_build(&r, e, matrix_identity_float4x4,
+                                  matrix_identity_float4x4, P, 0, 0, 0);
+
+    // Bound in the order the views were amplified: slot 0 is view 0's, slot 1 is
+    // view 1's. `swap` reruns the whole pass with ONE texture in both slots,
+    // which is what every guest before Open Brush looks like — and it is also
+    // the failing direction for the assertions below.
+    uint8_t got[2][2][16];
+    for (int swap = 0; swap < 2; swap++) {
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = dst;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
+        // The array LENGTH, not a slice — this is what lets amplification reach
+        // layer 1 at all (KleptonCompositor.encodeViews).
+        rp.renderTargetArrayLength = 2;
+        id<MTLCommandBuffer> cmd = [q commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:ps];
+        [enc setViewport:(MTLViewport){ 0, 0, 2, 2, 0, 1 }];
+        // One viewport, so both views index it; the render-target slice is what
+        // differs. The shipping compositor gives each view its own viewport out
+        // of the drawable's textureMap, which is a different number and the same
+        // mechanism.
+        MTLVertexAmplificationViewMapping maps[2] = {
+            { .viewportArrayIndexOffset = 0, .renderTargetArrayIndexOffset = 0 },
+            { .viewportArrayIndexOffset = 0, .renderTargetArrayIndexOffset = 1 },
+        };
+        [enc setVertexAmplificationCount:2 viewMappings:maps];
+        [enc setFragmentTexture:eye0 atIndex:0];
+        [enc setFragmentTexture:(swap ? eye0 : eye1) atIndex:1];
+        [enc setFragmentSamplerState:samp atIndex:0];
+        [enc setVertexBytes:u length:sizeof u atIndex:0];
+        klr_draw(enc);
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        for (int layer = 0; layer < 2; layer++)
+            [dst getBytes:got[swap][layer] bytesPerRow:8 bytesPerImage:16
+               fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0 slice:layer];
+    }
+
+    ok(memcmp(got[0][0], red, 16) == 0,
+       "view 0 samples texture slot 0");
+    ok(memcmp(got[0][1], green, 16) == 0,
+       "view 1 samples slot 1 — the right eye is its OWN texture, not eye 0's");
+    if (memcmp(got[0][1], green, 16) != 0)
+        printf("    eye 1 came out %u,%u,%u — %s\n",
+               got[0][1][0], got[0][1][1], got[0][1][2],
+               got[0][1][2] == 255 ? "the CLEAR, so the view was dropped"
+                                   : "eye 0's picture");
+    // The failing direction, which is also every earlier guest: one texture in
+    // both slots really does put eye 0's picture in both eyes. Without this the
+    // assertion above would pass just as well with the second binding removed
+    // and the shader reading slot 0 unconditionally.
+    ok(memcmp(got[1][1], red, 16) == 0,
+       "...and binding one texture to both slots puts eye 0 in both, as it did before");
 }
 
 // A stand-in rate map: screen -> physical, halving everything. Linear, so the
@@ -814,6 +974,7 @@ int main(void) {
         check_pixels();
         check_crop_pixels();
         check_split_crop_pixels();
+        check_two_textures();
     }
     printf(g_fail ? "\n=== t_reproject FAILED ===\n"
                   : "\n=== t_reproject: the composite pass is a blit when nothing "

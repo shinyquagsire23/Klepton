@@ -146,8 +146,30 @@ static const char kl_msl_reproject[] =
 // `srgbDecode` rides along for the same reason `slice` does: it comes out of
 // the per-view uniform, and with both eyes in one amplified pass the fragment
 // stage cannot index the array it would have to read.
+// `src` is the third, and it is there because the two eyes are not always two
+// SLICES of one texture. They are for every guest that goes through the eye
+// provider (it allocates one 2-slice array by construction) and for a Vulkan
+// guest whose eye IS the layer (BONELAB). They are NOT for an OpenXR guest on
+// Vulkan, which has one swapchain per eye and therefore two unrelated
+// MTLTextures — Open Brush is the first, and there is no view, no slice and no
+// binding that can make one texture argument reach both. So the pass binds up
+// to two and each view says which is its own; when they really do share one,
+// the same texture is bound twice and this reduces to exactly what it was.
 "struct VOut { float4 pos [[position]]; float2 uv; uint slice [[flat]];\n"
-"              uint srgb [[flat]]; };\n"
+"              uint srgb [[flat]]; uint src [[flat]]; };\n"
+"\n"
+// One place, so a rung of the probe ladder cannot disagree with the real pass
+// about which eye it is looking at — which is the failure this whole file keeps
+// paying for (trap 43: an instrument answering confidently about the wrong
+// subject). A texture argument cannot be selected into a variable in MSL, so
+// this is a branch and not an index.
+"static float4 kl_eye_sample2(texture2d_array<float> t0,\n"
+"                             texture2d_array<float> t1, sampler samp,\n"
+"                             float2 uv, uint slice, uint srgbDecode, uint src)\n"
+"{\n"
+"    return src == 0u ? kl_eye_sample(t0, samp, uv, slice, srgbDecode)\n"
+"                     : kl_eye_sample(t1, samp, uv, slice, srgbDecode);\n"
+"}\n"
 "\n"
 // Off-screen on every axis (x, y and z all exceed w), so the clipper drops the
 // primitive whole. This is how an eye with no texture yet is expressed now that
@@ -199,6 +221,10 @@ static const char kl_msl_reproject[] =
 "    VOut o;\n"
 "    o.slice = u.slice;\n"
 "    o.srgb = u.srgbDecode;\n"
+"    // The amplification index IS the texture slot: the caller binds the views'\n"
+"    // textures in the order it amplified them. A single-view pass amplifies\n"
+"    // once, lands on 0, and binds one texture.\n"
+"    o.src = uint(amp);\n"
 "    o.pos = u.visible == 0u ? kl_offscreen\n"
 "                            : u.projection * u.modelView * float4(x, y, -d, 1.0);\n"
 "    // Same mapping as the plain blit below, and for the same reason. Derived\n"
@@ -231,9 +257,10 @@ static const char kl_msl_reproject[] =
 "\n"
 "fragment float4 kl_reproject_f(VOut in [[stage_in]],\n"
 "                               texture2d_array<float> tex [[texture(0)]],\n"
+"                               texture2d_array<float> tex1 [[texture(1)]],\n"
 "                               sampler samp [[sampler(0)]])\n"
 "{\n"
-"    return kl_eye_sample(tex, samp, in.uv, in.slice, in.srgb);\n"
+"    return kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
 "}\n"
 "\n"
 // The probe ladder (KL_CP_PROBE). Same library, same vertex function, so each
@@ -248,9 +275,10 @@ static const char kl_msl_reproject[] =
 // is not, the guest's picture is arriving with alpha 0 and the fix is here.
 "fragment float4 kl_probe_opaque_f(VOut in [[stage_in]],\n"
 "                                  texture2d_array<float> tex [[texture(0)]],\n"
+"                                  texture2d_array<float> tex1 [[texture(1)]],\n"
 "                                  sampler samp [[sampler(0)]])\n"
 "{\n"
-"    return kl_eye_sample(tex, samp, in.uv, in.slice, in.srgb);\n"
+"    return kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
 "}\n"
 "\n"
 // The eye texture over the whole viewport, ignoring the quad, the poses and the
@@ -265,6 +293,7 @@ static const char kl_msl_reproject[] =
 "    VOut o;\n"
 "    o.slice = ua[amp].slice;\n"
 "    o.srgb = ua[amp].srgbDecode;\n"
+"    o.src = uint(amp);\n"
 "    o.pos = ua[amp].visible == 0u ? kl_offscreen\n"
 "                                  : float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
 "    o.uv  = float2(p.x, ua[amp].flipY != 0u ? 1.0 - p.y : p.y);\n"
@@ -273,9 +302,10 @@ static const char kl_msl_reproject[] =
 "\n"
 "fragment float4 kl_probe_full_f(VOut in [[stage_in]],\n"
 "                                texture2d_array<float> tex [[texture(0)]],\n"
+"                                texture2d_array<float> tex1 [[texture(1)]],\n"
 "                                sampler samp [[sampler(0)]])\n"
 "{\n"
-"    return kl_eye_sample(tex, samp, in.uv, in.slice, in.srgb);\n"
+"    return kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
 "}\n";
 
 // The pass that existed before reprojection: a full-screen triangle, three

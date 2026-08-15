@@ -1693,7 +1693,11 @@ final class KleptonCompositor {
         // mappings are given — the vertex shader indexes this array by
         // [[amplification_id]].
         var uniforms: [kl_reproject_uniforms] = []
-        var source: MTLTexture?
+        // Which texture each view samples, in the PASS's own order — index n
+        // here is the [[amplification_id]] the vertex shader reads, so it is
+        // parallel to `uniforms` and must be appended to on every path through
+        // the loop, including the ones that skip a view.
+        var sources: [MTLTexture?] = []
         var visible = 0
         for vi in viewIndices {
             let view = drawable.views[vi]
@@ -1726,32 +1730,61 @@ final class KleptonCompositor {
             if let only = Self.onlyEye, only != vi {
                 u.visible = 0
                 uniforms.append(u)
+                sources.append(nil)
                 continue
             }
-            if let alloc {
-                if source == nil { source = alloc.texture }
-                // Both eyes are meant to share one 2-slice array texture — the
-                // provider allocates them that way, and one binding for the
-                // whole amplified pass depends on it. If that ever stops being
-                // true, say so and drop the odd one out rather than show it the
-                // other eye's picture.
-                if alloc.texture === source {
-                    u.visible = 1
-                    visible += 1
-                } else {
-                    u.visible = 0
-                    if !loggedSplitEyes {
-                        loggedSplitEyes = true
-                        NSLog("[cp] eyes do not share one array texture at stage "
-                              + "\(stage) — view \(vi) dropped from the composite")
-                    }
-                }
-            } else {
-                u.visible = 0
-            }
+            u.visible = alloc == nil ? 0 : 1
             uniforms.append(u)
+            sources.append(alloc?.texture)
         }
-        guard let source, visible > 0 else { enc.endEncoding(); return 0 }
+
+        // The two texture slots the shader has, and which view reaches which.
+        //
+        // This used to bind ONE texture and drop any view whose eye was not
+        // identical to it, on the reasoning that both eyes share a single
+        // 2-slice array. They do for every guest that goes through the eye
+        // provider, which allocates exactly that, and for a Vulkan guest whose
+        // eye IS the layer. They do NOT for an OpenXR guest on Vulkan: one
+        // swapchain per eye means two unrelated MTLTextures, and the right eye
+        // was dropped from the composite for the whole run — the log said so
+        // and nothing joined it to a person seeing one eye go dark. Open Brush
+        // is the first guest of that shape.
+        //
+        // So the shader takes two textures and each view says which is its own
+        // (kl_reproject.c, `src`). View 0 samples slot 0 and every other view
+        // samples slot 1, which is the two eyes; when they really do share one
+        // texture it is bound twice and this reduces to what it was, bit for
+        // bit, for every guest that has run here.
+        let bind0 = sources.first.flatMap { $0 } ?? sources.compactMap { $0 }.first
+        let bind1 = (sources.count > 1 ? sources[1] : nil) ?? bind0
+        guard let bind0, let bind1 else { enc.endEncoding(); return 0 }
+        for n in uniforms.indices where uniforms[n].visible != 0 {
+            // What the fragment stage will actually sample for this view. A
+            // third distinct texture cannot be named — there are two slots —
+            // so it is dropped rather than shown another eye's picture, which
+            // is the one thing the old gate got right.
+            if sources[n] === (n == 0 ? bind0 : bind1) {
+                visible += 1
+            } else {
+                uniforms[n].visible = 0
+                if !loggedSplitEyes {
+                    loggedSplitEyes = true
+                    NSLog("[cp] view \(viewIndices[n]) samples a third distinct "
+                          + "eye texture at stage \(stage) — dropped from the "
+                          + "composite (the shader binds two)")
+                }
+            }
+        }
+        guard visible > 0 else { enc.endEncoding(); return 0 }
+        if !loggedEyeTextures {
+            loggedEyeTextures = true
+            NSLog("[cp] eye textures: slot0 \(bind0.width)x\(bind0.height) "
+                  + "type \(bind0.textureType.rawValue), slot1 "
+                  + (bind1 === bind0 ? "= slot0 (the eyes share one texture)"
+                                     : "\(bind1.width)x\(bind1.height) "
+                                       + "type \(bind1.textureType.rawValue) "
+                                       + "(one swapchain per eye)"))
+        }
 
         // What each eye is ACTUALLY being placed with, said once per pass shape.
         //
@@ -1832,8 +1865,12 @@ final class KleptonCompositor {
                                   + "against the [ovrp] render viewport line" : ""))
             }
         }
+        // Built from slot 0. The grid is a function of the eye texture's SIZE
+        // and its rate map, and the two eyes agree on both — a guest that
+        // rendered them at different sizes would already be failing the
+        // viewport arithmetic below.
         let (gridBuf, gridVerts, gridPerEye) =
-            unwarpGrid(source, viewport0: vp0, viewport1: vp1, viewportOf: vpOf)
+            unwarpGrid(bind0, viewport0: vp0, viewport1: vp1, viewportOf: vpOf)
         // ...and which block each view reads. Assigned here rather than passed
         // to kl_reproject_build above because the decision needs the eye
         // texture, which is not known until the loop that builds the uniforms
@@ -1862,7 +1899,8 @@ final class KleptonCompositor {
         }
         enc.setRenderPipelineState(probePipeline ?? pipeline)
         if let depthState { enc.setDepthStencilState(depthState) }
-        enc.setFragmentTexture(source, index: 0)
+        enc.setFragmentTexture(bind0, index: 0)
+        enc.setFragmentTexture(bind1, index: 1)
         enc.setFragmentSamplerState(sampler, index: 0)
         uniforms.withUnsafeBytes { buf in
             // Vertex only: the fragment stage has no amplification_id to index
@@ -1879,6 +1917,11 @@ final class KleptonCompositor {
         return visible
     }
     private var loggedSplitEyes = false
+    /// Said once: what the two texture slots resolved to, and whether the eyes
+    /// share one texture or arrive as one swapchain each. Two guests of
+    /// different shapes composite through this one pass and nothing else says
+    /// which shape a run is.
+    private var loggedEyeTextures = false
     /// The last per-eye placement described by `[cp] eye placement`, so the line
     /// is printed when it CHANGES rather than only on the first frame.
     private var lastEyeShape = ""
