@@ -134,15 +134,15 @@ static AVAssetTrack *first_video_track(AVAsset *asset) {
                  completionHandler:^(NSArray<AVAssetTrack *> *tracks, NSError *err) {
         (void)err;
         // Retained across the semaphore: the array the completion handler is
-        // given is released when it returns, and this file is compiled without
-        // ARC — a plain assignment would leave a dangling track by the time the
-        // waiter reads it, which is the kind of bug that only shows under load.
-        track = [tracks.firstObject retain];
+        // given is released when it returns. This file is compiled WITH ARC
+        // (m_boot and m_slink pass -fobjc-arc over the whole set), so the
+        // __block strong reference is what does the retaining — writing it by
+        // hand does not compile at all.
+        track = tracks.firstObject;
         dispatch_semaphore_signal(sem);
     }];
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-    dispatch_release(sem);
-    return [track autorelease];
+    return track;
 }
 
 static double now_seconds(void) {

@@ -53,9 +53,13 @@ def main():
     libdir = sys.argv[3] if len(sys.argv) > 3 else None
 
     # `  libfoo.so   @0x104f41000   1.27 MB ...` — phase 1's report_image line.
+    # Anything may precede the soname on the line: kl_ue4.c's chain report says
+    # `  mapped libUE4.so  @0x... 172.69 MB`, and a tool that only knew one
+    # driver's exact column layout would refuse the log it was handed rather
+    # than say what it could not find.
     images = []          # (base, span, soname, path)
     log = open(log_file, "rb").read().decode("utf-8", "replace")
-    for m in re.finditer(r"^\s+(\S+\.so)\s+@0x([0-9a-f]+)\s+([\d.]+) MB", log, re.M):
+    for m in re.finditer(r"^.*?(\S+\.so)\s+@0x([0-9a-f]+)\s+([\d.]+) MB", log, re.M):
         soname, base, mb = m.group(1), int(m.group(2), 16), float(m.group(3))
         images.append([base, int(mb * 1048576) + 65536, soname, None])
     if not images:

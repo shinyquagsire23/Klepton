@@ -1,6 +1,7 @@
 // The Unreal Engine 4 target. See kl_ue4.h for why it is its own file.
 #include "kl_ue4.h"
 
+#include <dirent.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +75,64 @@ static int ue4_fail(const char *why) {
 
 const char *kl_ue4_error(void) { return g_err; }
 
+// The engine's command-line OVERRIDE file, named and printed.
+//
+// UE4's `InitCommandLine` reads `<external>/UE4Game/<project>/UE4CommandLine.txt`
+// before anything else, and whatever is in it configures the whole engine —
+// threading model, RHI, log verbosity. It is a file in the guest's USERDATA
+// directory, which outlives `make clean`, outlives a rebuild, and is not part
+// of the tree, so a line left in it by one debugging session silently
+// configures every run after it.
+//
+// That is not hypothetical: `-onethread`, added to test whether a stall was
+// threading (it was not — it was the condvar table), stayed behind and made
+// every later host run single-threaded. Under it this title's main menu renders
+// an all-zero eye, so the run reads as "the guest goes black after the title
+// screen" — a rendering bug with no rendering cause, and the file that caused
+// it appears nowhere in any log.
+//
+// Both places are looked at because the base the engine builds this path from
+// is not ours to restate; naming what is THERE is honest where reimplementing
+// the search would be a second, drifting copy of it.
+static void ue4_report_command_line(FILE *out) {
+    if (!out) return;
+    const char *files = kl_jni_files_dir();
+    if (!files || !*files) return;
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s/UE4Game", files);
+
+    const char *names[8];
+    char        held[8][1024];
+    size_t      n = 0;
+    snprintf(held[n], sizeof held[n], "%s/UE4CommandLine.txt", dir);
+    names[n] = held[n]; n++;
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) && n < sizeof names / sizeof *names) {
+            if (e->d_name[0] == '.') continue;
+            snprintf(held[n], sizeof held[n], "%s/%s/UE4CommandLine.txt",
+                     dir, e->d_name);
+            names[n] = held[n]; n++;
+        }
+        closedir(d);
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        FILE *f = fopen(names[i], "rb");
+        if (!f) continue;
+        char buf[512];
+        size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[got] = 0;
+        for (char *p = buf; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
+        fprintf(out, "  [ue4] command line: %s\n", buf);
+        fprintf(out, "  [ue4]   from %s — the ENGINE reads this, and it is in "
+                     "userdata rather than in the tree\n", names[i]);
+    }
+    fflush(out);
+}
+
 int kl_ue4_configure(const char *libdir, FILE *out) {
     if (!libdir || !*libdir) return ue4_fail("no library directory");
     snprintf(g_libdir, sizeof g_libdir, "%s", libdir);
@@ -96,6 +155,7 @@ int kl_ue4_configure(const char *libdir, FILE *out) {
         // by carrying on.
         fprintf(out, "  [ue4] obb:      %s\n", kl_jni_obb_dir());
         fflush(out);
+        ue4_report_command_line(out);
     }
     return 0;
 }
@@ -121,7 +181,19 @@ int kl_ue4_load(FILE *out) {
         }
         kl_register_image(UE4_CHAIN[i], img);
         if (!strcmp(UE4_CHAIN[i], UE4_LIB)) g_ue4 = img;
-        if (out) { fprintf(out, "  mapped %s\n", UE4_CHAIN[i]); fflush(out); }
+        // The LOAD ADDRESS is printed, in the shape tools/symbolize_sample.py
+        // parses (`<soname> @0x... N.NN MB`). `sample <pid>` is the diagnostic
+        // that keeps paying off here — a UE4 guest owns its own frame loop, so
+        // "what is the game thread doing" is a question no return value answers
+        // — and it reports every guest frame as `??? (in <unknown binary>)`
+        // until something joins the two. m_slink has printed this since SL-1;
+        // this door never did, which made the sampler useless on the one target
+        // that needs it most.
+        if (out) {
+            fprintf(out, "  mapped %-22s @%p %7.2f MB\n", UE4_CHAIN[i],
+                    kl_base(img), kl_span(img) / 1048576.0);
+            fflush(out);
+        }
     }
     if (!g_ue4) return ue4_fail(UE4_LIB " is not in the chain");
 
