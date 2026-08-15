@@ -1779,6 +1779,15 @@ except its own control vars (next section). See PLANNING §12.
   is opaque so passthrough shows through nowhere it matters, and seeing the
   room makes scale and IPD easier to judge. The scene manifest declares
   `UIImmersionStyleMixed` to match; keep the two in step.
+- `KL_GUEST_OVERLAYS=0` — stop compositing the GUEST's own non-eye layers.
+  **Not the same thing as `KL_OVERLAYS` below, which is a system setting**; the
+  two are one word apart and were briefly one name, which would have made each
+  one's A/B silently move the other. This one is the guest's `ovrp_EndFrame4`
+  submit list: an Unreal title draws its splash, its loading screens and its
+  menus as `ovrpShape_Quad` stereo layers, so with this off RE4 shows the world
+  and nothing else. Every guest before it submitted only a 1x1 dummy, so it
+  costs them nothing either way. Both compositors read it. Pair it with
+  `KL_OVRP_LAYERS=1`, which says what the guest actually submitted.
 - `KL_OVERLAYS=1` — put the system's persistent overlays back. Both immersive
   spaces pass `.persistentSystemOverlays(.hidden)` by default: the Home
   indicator and the hand-gesture affordance beneath it are drawn by the system

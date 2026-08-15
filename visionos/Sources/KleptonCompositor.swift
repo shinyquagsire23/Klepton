@@ -1963,7 +1963,10 @@ final class KleptonCompositor {
     ///
     /// No depth ordering is needed: the eye quad sits at `KL_REPROJECT_DEPTH`
     /// (500 m) and an overlay is a few metres away, so it is in front by geometry.
-    /// `KL_OVERLAYS_LAYER=0` is the A/B.
+    /// `KL_GUEST_OVERLAYS=0` is the A/B. Deliberately not `KL_OVERLAYS`, which is
+    /// already the SYSTEM overlays (the Home indicator, KleptonApp.swift) — two
+    /// knobs one letter apart, fighting over one name, is a bug with no error
+    /// surface at all.
     private func encodeOverlays(_ enc: MTLRenderCommandEncoder,
                                 viewIndices: [Int],
                                 drawable: LayerRenderer.Drawable,
@@ -2019,7 +2022,7 @@ final class KleptonCompositor {
             }
         }
     }
-    private let overlaysEnabled = klEnvOn("KL_OVERLAYS", default: true)
+    private let overlaysEnabled = klEnvOn("KL_GUEST_OVERLAYS", default: true)
     private var loggedOverlayMiss = Set<Int32>()
     private var loggedOverlayDraw = Set<Int32>()
     private var loggedSplitEyes = false

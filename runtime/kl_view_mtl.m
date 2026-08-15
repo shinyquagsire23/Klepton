@@ -39,7 +39,7 @@ static id<MTLDevice>              g_dev;
 static id<MTLCommandQueue>        g_queue;
 static id<MTLRenderPipelineState> g_pipe;      // the plain blit
 static id<MTLRenderPipelineState> g_pipe_rp;   // the reprojection pass, KL_VIEW_TIMEWARP
-static id<MTLRenderPipelineState> g_pipe_ov;   // the overlay layers, blended, KL_OVERLAYS
+static id<MTLRenderPipelineState> g_pipe_ov;   // the GUEST's layers, blended, KL_GUEST_OVERLAYS
 static int                        g_timewarp;
 static id<MTLSamplerState>        g_samp;
 static id<MTLSharedEvent>         g_event;
@@ -318,11 +318,13 @@ static kl_overlay_uniforms klvm_overlay_uniforms(const kl_ovrp_overlay *ov, int 
 // Drawn after the eye pass, in the same encoder and against the same depth: the
 // eye quad sits at KL_REPROJECT_DEPTH (500 m by default) and an overlay at a few
 // metres is in front of it, so ordering falls out of the geometry rather than
-// out of the draw order. `KL_OVERLAYS=0` is the A/B.
+// out of the draw order. `KL_GUEST_OVERLAYS=0` is the A/B — NOT `KL_OVERLAYS`,
+// which is the visionOS SYSTEM overlays (the Home indicator) and a different
+// question with a confusingly similar name.
 static void klvm_draw_overlays(id<MTLRenderCommandEncoder> enc, int eye, int stage) {
     (void)stage;
     static int on = -1;
-    if (on < 0) on = kl_env_on("KL_OVERLAYS", 1);
+    if (on < 0) on = kl_env_on("KL_GUEST_OVERLAYS", 1);
     if (!on || !g_pipe_ov) return;
     int n = kl_ovrp_overlay_count();
     for (int i = 0; i < n; i++) {
