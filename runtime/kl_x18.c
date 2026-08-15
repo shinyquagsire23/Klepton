@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <mach/mach.h>
 #include "kl_x18.h"
 #include "kl_env.h"
 
@@ -635,6 +636,15 @@ static void pick_scratch(uint32_t used, unsigned *a, unsigned *b) {
     *b = got[1];
 }
 
+// The site-to-veneer distance, as its own question. A refusal for reach is a
+// property of the POOL and so of the whole library; a refusal for encoding is a
+// property of one instruction. Telling them apart is the difference between
+// "move the pool" and "teach the decoder", and they were one counter.
+static int out_of_reach(uint64_t site, uint64_t pool) {
+    int64_t d = (int64_t)pool - (int64_t)site;
+    return d < -(1LL << 27) || d >= (1LL << 27);
+}
+
 static void note_refusal(uint32_t word) {
     g_refused_total++;
     for (unsigned i = 0; i < g_nrefused_kinds; i++)
@@ -799,7 +809,11 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
             body[k++] = enc_mrs_tpidrro(18);
             body[k++] = enc_ldr(18, 18, (unsigned)KLX_TSD_SLOT * 8);
             body[k++] = word;                  // br x18, against the loaded value
-            if (!enc_b(spc, vpc, &patch)) { note_refusal(word); st->refused++; continue; }
+            if (!enc_b(spc, vpc, &patch)) {
+                note_refusal(word); st->refused++;
+                if (out_of_reach(spc, vpc)) st->far_refused++;
+                continue;
+            }
             memcpy(out, body, k * 4);
             out += k;
             w[i] = patch;
@@ -848,7 +862,11 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
 
         uint32_t patch;
         ok &= enc_b(spc, vpc, &patch);
-        if (!ok) { note_refusal(word); st->refused++; continue; }
+        if (!ok) {
+            note_refusal(word); st->refused++;
+            if (out_of_reach(spc, vpc)) st->far_refused++;
+            continue;
+        }
 
         // KL_X18_MAP=<file>: "pool_addr site_addr" per site, so a guest return
         // address caught in a shim (always a veneer address) can be mapped back
@@ -870,10 +888,95 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
     return 0;
 }
 
+// ------------------------------- pool placement -------------------------------
+//
+// The patch at a site is a single `b`, so the pool has to be within +/-128 MB of
+// every site in the chunk — and this used to be one `mmap` with a hint just past
+// the code, on the reasoning that a hint lands where you ask.
+//
+// **It does not, and RE4 is where that cost a session.** A hint is only a
+// starting point: Darwin returns the first free hole at or ABOVE it, and the
+// address right after a guest image is not free — the image's own RW segments
+// are there, and under the viewer so are ANGLE, Metal and SDL. Measured on
+// libUE4 (172 MB, all 8038 of its x18 sites in a 5 MB band at the top): the
+// pool landed **240 MB** above the code and `enc_b` refused every single site.
+//
+// The failure had no error surface at all. A refused site keeps the ORIGINAL
+// instruction, so the library runs against Darwin's reserved x18 — which is
+// zero after any exception return — and the guest crashes somewhere else
+// entirely, intermittently, in whatever code happens to use x18 (here Oodle's
+// decompressor, four calls and one thread from the load). Headless runs veneered
+// fine because the space above the image was free, which is exactly why this
+// read as "the viewer adds a race".
+//
+// This is the FALLBACK. The real placement is a reservation made with the image
+// (kl_image.c), because for a big enough library in a crowded enough process no
+// search can succeed — there is simply no free hole in the window. What is left
+// here serves callers that reserved nothing, and it is still strictly better
+// than the single hint it replaced: it checks its answer.
+static uint8_t *klx_place_pool(void *code, size_t size, size_t cap) {
+    const uint64_t REACH = 1ULL << 27;                  // +/-128 MB, enc_b's span
+    uintptr_t lo = (uintptr_t)code, hi = lo + size;
+    // Every veneer must reach every site and back, so the whole pool has to sit
+    // inside the window both ends can see. A margin keeps the arithmetic off the
+    // exact boundary, where a rounding error is 8038 silent refusals.
+    const uint64_t MARGIN = 1u << 20;
+    uintptr_t win_lo = (hi + cap + MARGIN > REACH) ? hi + cap + MARGIN - REACH : 0;
+    uintptr_t win_hi = lo + REACH - cap - MARGIN;
+    if (win_lo >= win_hi) return NULL;                  // chunk wider than 256 MB
+
+    // vm_allocate with VM_FLAGS_FIXED, NOT mmap with a hint, and that is the
+    // whole repair. mmap's hint is a place to start SEARCHING: hand it an
+    // occupied address and it walks upward past everything in the way — past
+    // the guest image itself, which is the one thing guaranteed to be sitting
+    // next to the code — and answers hundreds of megabytes out. The first
+    // version of this search stepped the hint and still failed for exactly that
+    // reason (measured: every candidate skipped to -495 MB).
+    //
+    // VM_FLAGS_FIXED answers the question actually being asked — "is THIS range
+    // free?" — with KERN_NO_SPACE when it is not. It is also the only safe
+    // spelling: mmap(MAP_FIXED) would silently REPLACE whatever is there, and
+    // what is there is another mapping of ours.
+    //
+    // Stepped a page-cluster at a time from the code outward in both
+    // directions, nearest first, so the pool stays as close to the chunk as the
+    // address space allows.
+    const uintptr_t STEP = 0x10000;
+    for (uintptr_t up = (hi + STEP - 1) & ~(STEP - 1), down = (lo - cap) & ~(STEP - 1);
+         up <= win_hi || down >= win_lo; ) {
+        uintptr_t cand = 0;
+        // Alternate up/down so neither direction starves the other, and prefer
+        // the nearer of the two.
+        if (up <= win_hi && (down < win_lo || up - hi <= lo - down)) {
+            cand = up; up += STEP;
+        } else if (down >= win_lo && down <= win_hi) {
+            cand = down; down -= STEP;
+        } else if (up <= win_hi) {
+            cand = up; up += STEP;
+        } else break;
+        vm_address_t a = (vm_address_t)cand;
+        if (vm_allocate(mach_task_self(), &a, cap, VM_FLAGS_FIXED) != KERN_SUCCESS)
+            continue;
+        if (mprotect((void *)a, cap, PROT_READ | PROT_WRITE) != 0) {
+            vm_deallocate(mach_task_self(), a, cap);
+            continue;
+        }
+        return (uint8_t *)a;
+    }
+    // Nothing in range. Fall back to wherever the kernel will have us so the
+    // chunk's ctr veneers (trap 26, which need no reach — they are emitted the
+    // same way but a refusal there is a SIGILL) still get a home, and let the
+    // per-site refusal count and kl_image.c's report say what was lost.
+    uint8_t *p = mmap(NULL, cap, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
 // The load-time path: allocate a pool next to the code and emit into it. Here
 // the executing addresses *are* the buffer addresses, which is the degenerate
 // case of kl_x18_emit.
-int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
+int kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
+                 size_t *arena_used, kl_x18_stats *st) {
     memset(st, 0, sizeof *st);
 
     // Same reason as in kl_x18_emit: the data-word tally has to survive the
@@ -888,17 +991,24 @@ int kl_x18_patch(void *code, size_t size, kl_x18_stats *st) {
     // SIGILL because of a register the code in question never names.
     if (want && veneer_enabled() && g_slot < 0 && kl_x18_init() != 0) return -1;
 
-    // The pool goes immediately after the code so that `b` reaches it from
-    // anywhere in the range. mmap treats the address as a hint, so the result
-    // is range-checked per site rather than assumed.
     size_t   cap  = ((size_t)veneers * VEN_MAX_INSN * 4 + 0xFFFF) & ~(size_t)0xFFFF;
-    uint8_t *hint = (uint8_t *)(((uintptr_t)code + size + 0xFFFF) & ~(uintptr_t)0xFFFF);
-    uint8_t *base = mmap(hint, cap, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (base == MAP_FAILED) return -1;
+    uint8_t *base = NULL;
+    // The caller's reservation first: it is the only placement that is adjacent
+    // to the image by CONSTRUCTION rather than by luck. Searching is the
+    // fallback, and for a big image in a crowded process it can fail outright —
+    // see klx_place_pool.
+    if (arena && arena_used && *arena_used + cap <= arena_size) {
+        base = (uint8_t *)arena + *arena_used;
+        *arena_used += cap;
+        if (mprotect(base, cap, PROT_READ | PROT_WRITE) != 0) base = NULL;
+    }
+    if (!base) base = klx_place_pool(code, size, cap);
+    if (!base) return -1;
 
     int rc = kl_x18_emit(code, size, (uint64_t)(uintptr_t)code,
                          base, cap, (uint64_t)(uintptr_t)base, st, NULL);
+    st->pool_va    = (uint64_t)(uintptr_t)base;
+    st->pool_bytes = cap;
 
     mprotect(base, cap, PROT_READ | PROT_EXEC);
     sys_icache_invalidate(base, cap);

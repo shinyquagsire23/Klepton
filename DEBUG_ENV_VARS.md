@@ -442,6 +442,16 @@ run currently behaves as `KL_GUEST_PATCH=0`.
 The guest's own memory management, and the three seams that used to disable it.
 See `notes/MEMORYLEAK.md` for the measurements behind each default.
 
+- `KL_CPUS=<n>` — how many CPUs the guest is told it has. Default is this
+  machine's real count, and it is answered through **one** function so the two
+  doors that ask cannot disagree: `sysconf(_SC_NPROCESSORS_ONLN/_CONF)` and the
+  synthetic `/proc/cpuinfo` + `/sys/devices/system/cpu/possible`. An engine
+  sizes its worker pool from one and its affinity masks from the other.
+  This is the cheapest A/B for "is this a race?", because it changes the
+  GUEST's own concurrency without touching the guest: UE4 sizes `GThreadPool`
+  from the core count, so `KL_CPUS=1` collapses the pak-decompression fan-out.
+  It earned its keep by **exonerating** one — RE4's Oodle crash reproduced
+  identically at 1 and at 32, which is what moved the search off concurrency.
 - `KL_MADV_DONTNEED=remap|reusable|zero|passthrough` — how a guest
   `madvise(MADV_DONTNEED)` is served. Default `remap`. **`MADV_DONTNEED` is 4 on
   Linux and Darwin and means different things**: Linux frees the pages, Darwin
@@ -1412,6 +1422,15 @@ reads no knobs). See PLANNING §12.18.
   **Baked in at translation time**, so changing it means re-translating
   (`make dylibs`, `visionos/mkguest.sh`); `make ctr` prints the value in force
   and `klepton-ld` prints it per library that has a site.
+- **There is no knob for where the veneer POOL goes, and that is deliberate.**
+  It is reserved on the end of the guest image's own mapping (`kl_image.c`), so
+  it is within `b`'s ±128 MB of the code by construction. It used to place
+  itself with an `mmap` hint just past the code — which is only a hint, and the
+  address right after an image is the one guaranteed to be taken. For libUE4
+  (172 MB) under a viewer run the nearest hole measured **240 MB** away and all
+  8038 veneers were refused, silently. A refusal is now printed by name at load
+  with the pool's distance; if you ever see that line, the library is running
+  against Darwin's reserved x18 and any crash in it is trap 0.
 - `KL_HWCAP=<hex>` — override the measured `getauxval(AT_HWCAP)` outright
   (`kl_libc_slink.c`). An A/B, not a tuning knob: the bits select whole
   hand-written assembly implementations, so `KL_HWCAP=0x3` (FP|ASIMD only)

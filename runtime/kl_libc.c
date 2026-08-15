@@ -420,10 +420,37 @@ static const struct { int guest, host; const char *name; } g_sysconf[] = {
     {0x0079, _SC_SYMLOOP_MAX,        "_SC_SYMLOOP_MAX"},
 };
 
+// How many CPUs the guest is told it has, in ONE place because it is asked
+// through two doors that must not disagree: sysconf(_SC_NPROCESSORS_*) and the
+// synthetic /proc/cpuinfo + /sys/devices/system/cpu/possible. An engine sizes
+// its worker pool from one and its affinity masks from the other, and a guest
+// told 10 by one and 1 by the other is a configuration no real device has.
+//
+// KL_CPUS=<n> is the A/B for every "is this a race?" question in the project.
+// It is the cheapest way to change a guest's own concurrency without touching
+// the guest: UE4 sizes GThreadPool from the core count, so KL_CPUS=1 collapses
+// the pak decompression fan-out that RE4's Oodle crash lives in. Default is the
+// host's real count, which is what CLAUDE.md's "deliberately the host's" means.
+long kl_cpu_count(void) {
+    static long n;
+    if (!n) {
+        long host = sysconf(_SC_NPROCESSORS_ONLN);
+        if (host < 1) host = 1;
+        n = (long)kl_env_int("KL_CPUS", (int)host);
+        if (n < 1) n = 1;
+        if (n != host)
+            fprintf(stderr, "  [proc] KL_CPUS=%ld — the guest is told %ld cpus, "
+                            "not this machine's %ld\n", n, n, host);
+    }
+    return n;
+}
+
 long klb_sysconf(int guest_name) {
     for (unsigned i = 0; i < sizeof g_sysconf / sizeof g_sysconf[0]; i++)
         if (g_sysconf[i].guest == guest_name) {
-            long v = sysconf(g_sysconf[i].host);
+            long v = (g_sysconf[i].host == _SC_NPROCESSORS_ONLN ||
+                      g_sysconf[i].host == _SC_NPROCESSORS_CONF)
+                         ? kl_cpu_count() : sysconf(g_sysconf[i].host);
             if (kl_env_on("KL_TRACE_SYSCONF", 0))
                 fprintf(stderr, "  [libc] sysconf(%s) -> %ld\n", g_sysconf[i].name, v);
             return v;
@@ -733,8 +760,7 @@ static void proc_build(void) {
     if (!mkdtemp(tmpl)) return;
     snprintf(g_procroot, sizeof g_procroot, "%s", tmpl);
 
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    if (ncpu < 1) ncpu = 1;
+    long ncpu = kl_cpu_count();
 
     // aarch64 /proc/cpuinfo, in the format Linux emits and Unity parses: one
     // stanza per core keyed on "processor", then a Hardware line. The implementer
@@ -1128,6 +1154,7 @@ int    klb_system(const char *cmd) { (void)cmd; warn_once("system"); return 127;
 // so a wakeup cannot slip through the gap.
 #define KL_SYS_futex 98                 // aarch64 Linux
 #define KL_SYS_getrandom 278            // ...and the other one a guest depends on
+#define KL_SYS_gettid 178               // ...and the third, via libc++'s guards
 
 enum {
     KL_FUTEX_WAIT = 0, KL_FUTEX_WAKE = 1, KL_FUTEX_WAKE_OP = 5,
@@ -1403,11 +1430,21 @@ static long kl_futex_impl(int32_t *uaddr, int op, uint32_t val, const struct tim
     }
 }
 
-static void syscall_warn_once(long n) {
+// ...and WHO asked. A refused syscall is a wrong answer the caller does not
+// check, so the name of the number is never enough: `syscall(178)` sat in these
+// logs for the whole RE4 arc reading as harmless, and it was libc++'s
+// __cxa_guard_acquire losing its thread identity (see KL_SYS_gettid below).
+// The return address symbolises against the guest images, which is the
+// difference between "some library wants gettid" and "libc++_shared.so does".
+static void syscall_warn_once(long n, void *ra) {
     static long seen[32]; static int nseen;
     for (int i = 0; i < nseen; i++) if (seen[i] == n) return;
     if (nseen < 32) seen[nseen++] = n;
-    fprintf(stderr, "  [klepton] guest raw syscall(%ld) — refusing (logged once)\n", n);
+    size_t off = 0;
+    const char *img = kl_addr_image(ra, &off);
+    fprintf(stderr, "  [klepton] guest raw syscall(%ld) from %s%s0x%zx — refusing "
+                    "(logged once); the caller does NOT check this\n",
+            n, img ? img : "", img ? "+" : "pc ", img ? off : (size_t)(uintptr_t)ra);
 }
 
 long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
@@ -1436,7 +1473,29 @@ long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
         if (len) arc4random_buf(buf, len);
         return (long)len;
     }
-    syscall_warn_once(n);
+    // gettid, and refusing it is NOT the harmless "the guest carries on" case
+    // that most of this list is.
+    //
+    // libc++'s __cxa_guard_acquire — the guard around every function-local
+    // `static` — gets its thread identity from exactly this call, and it uses it
+    // to tell "another thread is initializing, block" from "*I* am initializing,
+    // this is recursion". Refused, every thread reports the same -1, so the
+    // second thread to reach any such static decides it is re-entering its own
+    // initializer and calls abort():
+    //
+    //     __cxa_guard_acquire detected recursive initialization
+    //
+    // Measured on RE4: two render task threads inside IsVertexLit()'s CVar
+    // static, aborting the process during level load. Nothing in that report
+    // mentions a syscall, a thread id, or gettid.
+    //
+    // Answered through klb_gettid so the raw door and the libc `gettid` door
+    // give one thread ONE identity. Two answers here is the same bug wearing a
+    // different hat: the guard would then compare an id from one door against an
+    // id from the other and call every acquisition recursive.
+    if (n == KL_SYS_gettid) return klb_gettid();
+
+    syscall_warn_once(n, __builtin_return_address(0));
     errno = ENOSYS;
     return -1;
 }

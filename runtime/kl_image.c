@@ -79,6 +79,9 @@ struct kl_image {
     // finer than the host page — see choose_bias(). munmap needs both, since
     // base is then not the address mmap returned.
     size_t     map_off, map_size;
+    // The x18 veneer pool, reserved on the end of the same mapping so it is
+    // within `b`'s reach of the code by construction. munmap frees both.
+    size_t     x18_arena_size;
     Elf64_Sym *symtab;
     size_t     nsyms;       // from DT_HASH's nchain; 0 if the image had none
     const char *strtab;
@@ -882,7 +885,41 @@ kl_image *kl_load(const char *path) {
     const uintptr_t pg = (uintptr_t)getpagesize();
     img->map_off  = choose_bias(eh, ph, sh, lo, img->span, pg);
     img->map_size = (img->span + img->map_off + pg - 1) & ~((size_t)pg - 1);
-    uint8_t *map = mmap(NULL, img->map_size, PROT_READ | PROT_WRITE,
+
+    // ...and the x18 veneer pool is reserved WITH the image, on the end of the
+    // same mapping.
+    //
+    // It used to allocate itself, with an mmap hint just past the code, and that
+    // is only ever a hint: Darwin returns the first free hole at or above it,
+    // and the address after a guest image is exactly the one guaranteed to be
+    // taken. For libUE4 (172 MB, and every one of its 8038 x18 sites in a 5 MB
+    // band at the top) under a viewer run — ANGLE, Metal and SDL already mapped
+    // — the nearest hole measured **240 MB** away, past `b`'s +/-128 MB, so
+    // every veneer was refused and the library ran against Darwin's reserved
+    // x18. Searching harder does not fix it: there is no free hole in the window
+    // at all. Only a reservation made at the same moment as the image is
+    // guaranteed to be within reach of it.
+    //
+    // Sized by counting the sites in the FILE's executable sections, which is
+    // exact enough to be tight: relocations never touch guest text (§2), so the
+    // words counted here are the words the rewrite pass will see. The count is
+    // an over-estimate only in that it includes data words the pass will refuse.
+    size_t x18_arena = 0;
+    for (int i = 0; sh && i < eh->e_shnum; i++) {
+        if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
+        if (sh[i].sh_offset + sh[i].sh_size > (uint64_t)sb.st_size) continue;
+        x18_arena += (size_t)kl_x18_count(file + sh[i].sh_offset, (size_t)sh[i].sh_size);
+    }
+    if (x18_arena) {
+        // Per-chunk pools each round up to 64 KB and one section can be several
+        // chunks (the data ranges of trap 0b split it), so the reservation
+        // carries slack for that rounding rather than exactly the veneer bytes.
+        x18_arena = x18_arena * KLX_VEN_MAX_INSN * 4 + (64u << 10) * 64;
+        x18_arena = (x18_arena + pg - 1) & ~((size_t)pg - 1);
+    }
+    img->x18_arena_size = x18_arena;
+
+    uint8_t *map = mmap(NULL, img->map_size + x18_arena, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (map == MAP_FAILED) { err("mmap image: %s", strerror(errno));
                              free(img); munmap(file, sb.st_size); return NULL; }
@@ -957,6 +994,14 @@ kl_image *kl_load(const char *path) {
                         "%llu bytes — left alone\n",
                 path, nskip, (unsigned long long)bytes);
     }
+    // The reservation made with the mapping above, carved across every chunk of
+    // every executable section. Running out is not silent: kl_x18_patch falls
+    // back to searching for a hole, and a search that fails leaves the refusals
+    // that the report below names.
+    uint8_t *x18_arena_base = img->x18_arena_size
+                            ? img->base - img->map_off + img->map_size : NULL;
+    size_t   x18_arena_used = 0;
+
     for (int i = 0; sh && i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_PROGBITS || !(sh[i].sh_flags & SHF_EXECINSTR)) continue;
         uint64_t cursor = sh[i].sh_addr, cva;
@@ -967,10 +1012,34 @@ kl_image *kl_load(const char *path) {
             rewrite_tls(p, csz, cva, path, &img->stats);
             if (!veneer) continue;
             kl_x18_stats xs;
-            if (kl_x18_patch(p, csz, &xs) != 0) {
+            if (kl_x18_patch(p, csz, x18_arena_base, img->x18_arena_size,
+                             &x18_arena_used, &xs) != 0) {
                 fprintf(stderr, "  [klepton] %s: x18 veneering failed to start\n", path);
                 veneer = 0;
                 continue;
+            }
+            // A REFUSED x18 site is trap 0 live, and it had no error surface at
+            // all: the counters were accumulated here and printed by nobody
+            // (kl_x18_report has never had a caller), so a library whose every
+            // veneer was refused loaded, ran, and read Darwin's reserved x18 —
+            // which is zero after any exception return. RE4's libUE4 is where
+            // that cost a session: 8038 sites, all refused for REACH, surfacing
+            // as an intermittent SIGSEGV inside Oodle's decompressor on a pak
+            // worker thread, hours from the load that caused it.
+            //
+            // So it is printed unconditionally when it is non-zero, with the
+            // pool's own distance beside it, because the two refusal kinds want
+            // different fixes and only one of them is about the decoder.
+            if (xs.refused) {
+                int64_t d = (int64_t)xs.pool_va - (int64_t)(uintptr_t)p;
+                fprintf(stderr,
+                        "  [klepton] %s: x18 REFUSED %u of %u sites (%u for REACH"
+                        " — pool at %#llx, %+lld MB from the code at %p). Those "
+                        "sites run against Darwin's reserved x18 and it is zero "
+                        "after any exception return — see trap 0.\n",
+                        path, xs.refused, xs.sites, xs.far_refused,
+                        (unsigned long long)xs.pool_va,
+                        (long long)(d / (1024 * 1024)), (void *)p);
             }
             img->stats.x18_sites   += xs.sites;
             img->stats.x18_patched += xs.patched;
@@ -1046,7 +1115,8 @@ void *kl_sym(kl_image *img, const char *name) {
 void kl_unload(kl_image *img) {
     if (!img) return;
     if (img->dl_handle) dlclose(img->dl_handle);   // M1b: dyld owns the mapping
-    else                munmap(img->base - img->map_off, img->map_size);
+    else                munmap(img->base - img->map_off,
+                               img->map_size + img->x18_arena_size);
     free(img);
 }
 

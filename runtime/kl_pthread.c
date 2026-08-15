@@ -149,6 +149,16 @@ static pthread_mutex_t *mtx_make(void) {
 typedef struct {
     _Atomic(uintptr_t)       key;
     _Atomic(pthread_cond_t *) c;
+    // The HOST mutex this cond was last waited on with — §3's regression guard,
+    // and it lives here because that is the only place it can mean anything.
+    // It used to be indexed by a slot read out of the guest's own storage
+    // (`g_cnd_mutex[*(uint32_t *)c]`), which was right while conds were
+    // slot-allocated and became a read of bionic's private cond state the day
+    // they moved to address keys: a number with no relation to this condvar,
+    // so the one check that can recognise the aliasing bug was answering about
+    // an unrelated entry. A diagnostic that survives the design it was keyed on
+    // is worse than none — it is confidently wrong exactly when it is consulted.
+    _Atomic(void *)          last_mutex;
 } cnd_entry;
 static cnd_entry g_cnd_map[MTX_MAP_SIZE];
 
@@ -158,16 +168,16 @@ static pthread_cond_t *cnd_make(void) {
     return fresh;
 }
 
-static pthread_cond_t *cnd(void *g) {
+// The map ENTRY, for callers that need more than the host cond (the §3 guard
+// wants last_mutex). cnd() is this and one field.
+static cnd_entry *cnd_entry_for(void *g) {
     uintptr_t want = (uintptr_t)g;
     pthread_cond_t *fresh = NULL;
     for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
         uintptr_t k = atomic_load(&g_cnd_map[i].key);
         if (k == want) {
             if (fresh) { pthread_cond_destroy(fresh); free(fresh); }
-            pthread_cond_t *c = atomic_load(&g_cnd_map[i].c);
-            while (!c) { sched_yield(); c = atomic_load(&g_cnd_map[i].c); }
-            return c;
+            return &g_cnd_map[i];
         }
         if (k) continue;
         if (!fresh) fresh = cnd_make();
@@ -175,9 +185,19 @@ static pthread_cond_t *cnd(void *g) {
         if (!atomic_compare_exchange_strong(&g_cnd_map[i].key, &expect, want))
             { i--; continue; }
         atomic_store(&g_cnd_map[i].c, fresh);
-        return fresh;
+        return &g_cnd_map[i];
     }
 }
+
+// The host cond behind an entry, with the mutex map's publication wait: the key
+// is claimed before the cond is stored, so a reader that arrives between the
+// two waits rather than dereferencing NULL (trap 38).
+static pthread_cond_t *cnd_host(cnd_entry *e) {
+    pthread_cond_t *c = atomic_load(&e->c);
+    while (!c) { sched_yield(); c = atomic_load(&e->c); }
+    return c;
+}
+static pthread_cond_t *cnd(void *g) { return cnd_host(cnd_entry_for(g)); }
 
 // The host mutex behind an entry. Separate from the lookup because the entry
 // may be visible for a few instructions before its mutex is: the creator
@@ -276,17 +296,11 @@ static void cnd_sleep_enter(void *c, void *guest, void *ra) {
 // thread that appears to be sleeping and is in fact spinning, which starves
 // whoever is trying to signal it and reads as a deadlock somewhere else
 // entirely. Named once per (error, site).
-// Which mutex each host cond was last waited on with, indexed by the guest
-// cond's own slot. Darwin latches the mutex into the condvar and refuses a
-// second one with EINVAL; Linux does not, so a guest that reuses one condvar
-// with two mutexes is legal there and fatal here, and this is what tells the
-// two cases apart.
-static _Atomic(void *) g_cnd_mutex[KL_MAX_SYNC];
-
-static _Atomic(void *) *cnd_mutex_slot(void *c) {
-    uint32_t idx = atomic_load((_Atomic uint32_t *)c);
-    return (idx && idx < KL_MAX_SYNC) ? &g_cnd_mutex[idx] : NULL;
-}
+// Which mutex each host cond was last waited on with lives in the cond map's
+// own entry (cnd_entry.last_mutex). Darwin latches the mutex into the condvar
+// and refuses a second one with EINVAL; Linux does not, so a guest that reuses
+// one condvar with two mutexes is legal there and fatal here, and this is what
+// tells the two cases apart.
 
 static void cnd_wait_failed(int err, void *c, void *m, void *ra, void *was) {
     if (!err) return;
@@ -559,11 +573,9 @@ int klb_pthread_cond_wait(void *c, void *m) {
     mtx_entry *e = mtx_entry_for(m);
     atomic_store(&e->owner, NULL);
     cnd_sleep_enter(c, m, __builtin_return_address(0));
-    void *prev_mtx = NULL;
-    { _Atomic(void *) *sl = cnd_mutex_slot(c);
-      if (sl) prev_mtx = atomic_exchange(sl, (void *)mtx_host(e));
-      }
-    int raw = pthread_cond_wait(cnd(c), mtx_host(e));
+    cnd_entry *ce = cnd_entry_for(c);
+    void *prev_mtx = atomic_exchange(&ce->last_mutex, (void *)mtx_host(e));
+    int raw = pthread_cond_wait(cnd_host(ce), mtx_host(e));
     cnd_sleep_leave();
     cnd_wait_failed(raw, c, m, __builtin_return_address(0), prev_mtx);
     int r = px(raw);

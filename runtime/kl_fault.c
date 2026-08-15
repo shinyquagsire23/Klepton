@@ -21,6 +21,7 @@
 #include "kl_mediandk.h"
 #include "kl_aaudio.h"
 #include "kl_il2cpp.h"
+#include "kl_x18.h"
 
 static void (*g_extra[KL_FAULT_MAX_REPORTERS])(FILE *);
 static unsigned g_extra_n;
@@ -145,6 +146,64 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                                "the mapping before it" : "",
                          info.reserved ? " (reserved)" : "");
         if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+    }
+
+    // THE REGISTER FILE, and the guest's logical x18 beside it.
+    //
+    // A guest fault's whole diagnosis is usually "which operand was wrong", and
+    // the frame chain cannot say — it names the callers of a function whose
+    // arguments are long gone. `ldrh w22, [x9]` faulting at 0 is a different bug
+    // depending on whether x9 came out of the veneer or out of the guest's own
+    // arithmetic, and that is one word of state.
+    //
+    // x18 is printed SEPARATELY and from the TSD slot rather than from the
+    // context, because the architectural x18 carries nothing here: every guest
+    // access to it is veneered to tsd[KLX_TSD_SLOT] (kl_x18.c), so the register
+    // in the ucontext is Darwin's reserved value and the slot is the guest's.
+    // Reading the register instead reports the platform's business as the
+    // guest's — the exact confusion trap 0 exists to prevent.
+    if (uc) {
+        const uint64_t *x = (const uint64_t *)uc->uc_mcontext->__ss.__x;
+        for (int i = 0; i < 29; i += 4) {
+            int m = snprintf(buf, sizeof buf,
+                             "    x%-2d %016llx  x%-2d %016llx  x%-2d %016llx  "
+                             "x%-2d %016llx\n",
+                             i, (unsigned long long)x[i],
+                             i + 1, (unsigned long long)x[i + 1],
+                             i + 2, (unsigned long long)x[i + 2],
+                             i + 3, (unsigned long long)x[i + 3]);
+            if (m > 0) { ssize_t w = write(2, buf, (size_t)m); (void)w; }
+        }
+        int m = snprintf(buf, sizeof buf,
+                         "    fp  %016llx  lr  %016llx  sp  %016llx  "
+                         "x18 %016llx (the GUEST's, from tsd[%d])\n",
+                         (unsigned long long)uc->uc_mcontext->__ss.__fp,
+                         (unsigned long long)uc->uc_mcontext->__ss.__lr,
+                         (unsigned long long)uc->uc_mcontext->__ss.__sp,
+                         (unsigned long long)(uintptr_t)
+                             pthread_getspecific(KLX_TSD_SLOT),
+                         KLX_TSD_SLOT);
+        if (m > 0) { ssize_t w = write(2, buf, (size_t)m); (void)w; }
+    }
+
+    // THE INSTRUCTION WORD AT THE PC, and its two neighbours.
+    //
+    // "pc libUE4.so+0x975710c" identifies a site in the FILE, and the file is
+    // not what is executing: kl_image.c rewrites TLS reads and replaces every
+    // x18 site with a branch to a veneer, so an offset that disassembles as
+    // `ldrh w22, [x18]` in the .so may be a `b` in memory. Reading the offset
+    // back out of the image and reasoning about the original word is how a
+    // whole session gets spent on trap 0 when the veneer is working.
+    //
+    // Four words, because the interesting question is usually whether the pc is
+    // inside a veneer body (a `stp`/`mrs`/`ldr` prologue is unmistakable) or in
+    // the guest's own code.
+    if (pc) {
+        const uint32_t *w = (const uint32_t *)((uintptr_t)pc & ~(uintptr_t)3);
+        int m = snprintf(buf, sizeof buf,
+                         "    insn at pc: %08x  [-1] %08x  [+1] %08x  [+2] %08x\n",
+                         w[0], w[-1], w[1], w[2]);
+        if (m > 0) { ssize_t x = write(2, buf, (size_t)m); (void)x; }
     }
 
     // Walk the frame chain. The faulting pc is usually in libsystem — memmove

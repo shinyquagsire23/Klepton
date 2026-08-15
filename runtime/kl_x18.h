@@ -184,6 +184,14 @@ typedef struct {
     unsigned sites;     // instructions found naming x18
     unsigned patched;   // veneers installed
     unsigned refused;   // sites left alone — still broken, and reported by name
+    // ...and how many of those refusals were REACH rather than encoding: the
+    // patch at a site is a single `b`, so a pool further than +/-128 MB from it
+    // refuses every site it cannot reach. Counted apart because the two have
+    // nothing in common — an unteachable encoding is one instruction and a pool
+    // out of range is the whole library, and only the second is fixable by
+    // moving something. pool_va/pool_bytes are what say WHERE it landed.
+    unsigned far_refused;
+    uint64_t pool_va, pool_bytes;
     unsigned data_words; // words that decode as an x18 site but sit in data
                          // (trap 0b's second detector — NOT refusals: these
                          // were never instructions, and patching them is the
@@ -218,7 +226,20 @@ int  kl_x18_emit(void *code, size_t size, uint64_t code_va,
 // Patch every x18 site in an executable range, which must still be writable.
 // `code` is where it is mapped now. Idempotent per range only in the sense that
 // it should be called once, before the segment is made read-execute.
-int  kl_x18_patch(void *code, size_t size, kl_x18_stats *st);
+// `arena`/`arena_size` is the caller's own reservation for the veneer pool, and
+// passing one is how a big library gets veneered at all. The patch at a site is
+// a single `b`, so the pool has to sit within +/-128 MB of it — and for a 172 MB
+// image with 232 MB of other mappings stacked above it (which is what an ANGLE +
+// SDL process looks like) there is NO free hole in that window to find. The only
+// address guaranteed to be adjacent to an image is one reserved WITH it, so
+// kl_image.c extends its own mapping and hands the tail in here.
+//
+// `*arena_used` carries the running offset across the chunks of one image, so
+// several chunks share one reservation. Pass arena = NULL to fall back to
+// searching for a hole, which is right for a caller that has not reserved one
+// and is still correct for every library small enough to find one.
+int  kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
+                  size_t *arena_used, kl_x18_stats *st);
 
 // Trap 0d's second detector, exposed so tests/t_x18.c reports the same verdict
 // the loader acts on. `index` is a WORD index into `code`; the window is
