@@ -17,6 +17,7 @@
 // reader_dispatch for why calling the listener inline would deadlock.
 #include "kl_mediandk.h"
 
+#include <fcntl.h>          // F_GETPATH, to name the fd a demux was asked for
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -35,8 +36,20 @@ void kl_unresolved_named(const char *name);     // kl_shim.c
 // The ABI's own numbers. Transcribed from <media/NdkMediaError.h>,
 // <media/NdkMediaCodec.h> and <media/NdkImage.h> — the guest tests these
 // exactly, so they are contract, not preference.
-enum { AMEDIA_OK = 0, AMEDIA_ERROR_UNKNOWN = -10000,
-       AMEDIA_ERROR_INVALID_PARAMETER = -10003 };
+// The whole ladder, spelled out, because it is derived arithmetic in the header
+// (`AMEDIA_ERROR_BASE - n`) and INVALID_PARAMETER was transcribed one step short
+// — it was -10003, which is INVALID_OBJECT, a DIFFERENT named error in the same
+// enum. Checked against the NDK's own <media/NdkMediaError.h>. No guest is known
+// to distinguish the two (Steam Link's decoder path tests against AMEDIA_OK),
+// but that is an absence of evidence rather than a proof, which is exactly why
+// the comment above calls these contract rather than preference: a value that is
+// wrong and never load-bearing is the kind that stays wrong until it is.
+enum { AMEDIA_OK = 0,
+       AMEDIA_ERROR_UNKNOWN           = -10000,
+       AMEDIA_ERROR_MALFORMED         = -10001,
+       AMEDIA_ERROR_UNSUPPORTED       = -10002,
+       AMEDIA_ERROR_INVALID_OBJECT    = -10003,
+       AMEDIA_ERROR_INVALID_PARAMETER = -10004 };
 enum { AMEDIACODEC_INFO_TRY_AGAIN_LATER    = -1,
        AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED = -2,
        AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED = -3 };
@@ -115,6 +128,43 @@ static const char *klm_fmt_string(klm_format *f, const char *key) {
     return NULL;
 }
 
+// The getters. `false` means "this format does not carry that key", and the NDK
+// contract is that the out parameter is then LEFT ALONE — the caller keeps its
+// own default. Writing a zero on the false path is trap 10b's shape: a value
+// the caller never asked for, indistinguishable from a measurement.
+//
+// Nothing here ever carries a key today (see the extractor below: it publishes
+// no tracks, so no track format is ever built), which makes every one of these
+// a truthful "no" rather than a stub. They exist because a format whose owner
+// cannot fill it must still be ASKABLE — a guest querying an empty format is
+// doing the right thing and must get an answer, not an abort.
+static bool klm_AMediaFormat_getInt32(void *fmt, const char *key, int32_t *out) {
+    klm_format *f = fmt;
+    if (!f || !key || !out) return false;
+    for (int i = 0; i < f->n; i++)
+        if (!strcmp(f->kv[i].key, key) && !f->kv[i].is_str) { *out = f->kv[i].ival; return true; }
+    return false;
+}
+static bool klm_AMediaFormat_getInt64(void *fmt, const char *key, int64_t *out) {
+    int32_t v;
+    if (!out || !klm_AMediaFormat_getInt32(fmt, key, &v)) return false;
+    *out = v;
+    return true;
+}
+static bool klm_AMediaFormat_getFloat(void *fmt, const char *key, float *out) {
+    int32_t v;
+    if (!out || !klm_AMediaFormat_getInt32(fmt, key, &v)) return false;
+    *out = (float)v;
+    return true;
+}
+static bool klm_AMediaFormat_getString(void *fmt, const char *key, const char **out) {
+    if (!out) return false;
+    const char *s = klm_fmt_string(fmt, key);
+    if (!s) return false;
+    *out = s;
+    return true;
+}
+
 // The format-key constants. These are DATA symbols in the NDK
 // (`extern const char *AMEDIAFORMAT_KEY_MIME;`), so the shim exports the
 // ADDRESS of each pointer and the guest loads through it — get this wrong and
@@ -131,6 +181,139 @@ static const char *g_key_color_range     = "color-range";
 static const char *g_key_color_format    = "color-format";
 static const char *g_key_priority        = "priority";
 static const char *g_key_operating_rate  = "operating-rate";
+// ...and the ones only a DEMUXING guest names. Unity's VideoPlayer READS a
+// track's format rather than describing one, so these arrive through the
+// getters below rather than the setters above.
+// Only the ones libunity imports STRONGLY. It imports rotation-degrees,
+// slice-height and encoder-delay weakly, i.e. it is written to run on an
+// Android version that does not define them and checks for NULL first — so
+// defining them here would not be completeness, it would be turning on a code
+// path the guest asked to be able to skip.
+static const char *g_key_duration        = "durationUs";
+static const char *g_key_frame_rate      = "frame-rate";
+static const char *g_key_language        = "language";
+static const char *g_key_channel_count   = "channel-count";
+static const char *g_key_sample_rate     = "sample-rate";
+static const char *g_key_stride          = "stride";
+
+// ---------------------------------------------------------------------------
+// AMediaExtractor — the DEMUXER, and the one part of this file that refuses.
+//
+// Unity's VideoPlayer on Android is extractor + codec: AMediaExtractor pulls
+// compressed samples out of a container and hands them to AMediaCodec, which
+// this file already serves over VideoToolbox. The codec half exists because
+// Steam Link needed it (SL-10) and it arrives an elementary stream, already
+// demuxed by the guest's own network protocol. Nothing here has ever opened a
+// CONTAINER, and that is the whole gap: an .mp4 is a box structure that must be
+// parsed to find where each sample begins.
+//
+// Open Brush is the first guest to reach it. It ships `animated-logo.mp4` and
+// SEEDS it into its Media Library on first run, so its VideoCatalog scan
+// prepares a VideoPlayer during startup whether or not the user ever opens the
+// reference panel. Before this, that call was `AMediaExtractor_new` as an
+// unresolved import, i.e. an abort — which is correct for something nobody has
+// asked for yet, and wrong for something on the startup path of a working
+// guest.
+//
+// So this is a REFUSAL, not a stub, and the difference is that a refusal is a
+// legal answer the guest is already written to handle. A file it cannot demux
+// is an ordinary condition for a media player — a corrupt download, a codec the
+// device lacks — so VideoPlayer has an error path, reports through
+// `errorReceived`, and Open Brush's ReferenceVideo simply leaves
+// m_VideoInitialized false. The refusal is stated twice, at both points a
+// caller might check: setDataSource returns UNSUPPORTED, and if the caller
+// carries on regardless, the extractor then honestly has no tracks. Those two
+// have to agree — an extractor that failed to open and then claims a track is a
+// worse answer than either.
+//
+// What it would take to make real, recorded so the next person does not have to
+// derive it: AVAssetReader over an AVURLAsset, with nil output settings so the
+// samples come out still compressed, feeding the AMediaCodec path that is
+// already here. That is the same split kl_vtdec/kl_mediandk already uses. It is
+// a session of its own and it would land Unity's VideoPlayer for EVERY target
+// (Beat Saber imports the same 41 symbols), which is why it is written down
+// rather than half-started.
+#define KLM_EXTRACTOR_MAGIC 0x4b4c4d58u   /* 'KLMX' */
+typedef struct {
+    uint32_t magic;
+    char    *source;        // for the report: what it was asked to open
+} klm_extractor;
+
+static klm_extractor *klm_ex(void *ex) {
+    klm_extractor *x = ex;
+    return (x && x->magic == KLM_EXTRACTOR_MAGIC) ? x : NULL;
+}
+
+// Counted so the end-of-run report can say a video was wanted and refused,
+// rather than leaving "no picture" to be discovered by looking at the screen.
+// The name outlives the extractor, which the guest deletes as soon as it gives
+// up — so it is copied here rather than read back off an object at report time.
+static unsigned g_ex_refused;
+static char    *g_ex_last;
+
+static void *klm_AMediaExtractor_new(void) {
+    klm_extractor *x = calloc(1, sizeof *x);
+    if (x) x->magic = KLM_EXTRACTOR_MAGIC;
+    return x;
+}
+
+static int klm_AMediaExtractor_delete(void *ex) {
+    klm_extractor *x = klm_ex(ex);
+    if (!x) return AMEDIA_ERROR_INVALID_OBJECT;
+    free(x->source);
+    x->magic = 0;
+    free(x);
+    return AMEDIA_OK;
+}
+
+static int klm_extractor_refuse(klm_extractor *x, const char *what) {
+    free(x->source);
+    x->source = what ? strdup(what) : NULL;
+    free(g_ex_last);
+    g_ex_last = what ? strdup(what) : NULL;
+    if (!g_ex_refused++)
+        fprintf(stderr, "  [media] AMediaExtractor: no container demuxer here — "
+                        "refusing \"%s\". The guest's own no-video path runs from "
+                        "here (see the note in kl_mediandk.c).\n",
+                what ? what : "(fd)");
+    return AMEDIA_ERROR_UNSUPPORTED;
+}
+
+static int klm_AMediaExtractor_setDataSource(void *ex, const char *location) {
+    klm_extractor *x = klm_ex(ex);
+    if (!x) return AMEDIA_ERROR_INVALID_OBJECT;
+    return klm_extractor_refuse(x, location);
+}
+
+static int klm_AMediaExtractor_setDataSourceFd(void *ex, int fd, int64_t offset, int64_t length) {
+    (void)offset; (void)length;
+    klm_extractor *x = klm_ex(ex);
+    if (!x) return AMEDIA_ERROR_INVALID_OBJECT;
+    // The fd's own path if the kernel will give it — a refusal that names the
+    // file is worth more in a log than one that names a descriptor number.
+    char path[1024];
+    int named = fd >= 0 && fcntl(fd, F_GETPATH, path) == 0;
+    return klm_extractor_refuse(x, named ? path : NULL);
+}
+
+// Everything past the refusal describes an extractor with nothing in it. These
+// are the values the NDK defines for "no more samples" / "no such track", not
+// invented ones, so a guest that ignored the setDataSource status still walks a
+// consistent empty stream rather than reading uninitialised memory.
+static size_t  klm_AMediaExtractor_getTrackCount(void *ex)      { (void)ex; return 0; }
+static void   *klm_AMediaExtractor_getTrackFormat(void *ex, size_t i) { (void)ex; (void)i; return NULL; }
+static int     klm_AMediaExtractor_selectTrack(void *ex, size_t i) {
+    (void)ex; (void)i; return AMEDIA_ERROR_INVALID_PARAMETER;
+}
+static ssize_t klm_AMediaExtractor_readSampleData(void *ex, uint8_t *buf, size_t cap) {
+    (void)ex; (void)buf; (void)cap; return -1;      // -1 is end of stream
+}
+static int     klm_AMediaExtractor_getSampleTrackIndex(void *ex) { (void)ex; return -1; }
+static int64_t klm_AMediaExtractor_getSampleTime(void *ex)       { (void)ex; return -1; }
+static bool    klm_AMediaExtractor_advance(void *ex)             { (void)ex; return false; }
+static int     klm_AMediaExtractor_seekTo(void *ex, int64_t us, int mode) {
+    (void)ex; (void)us; (void)mode; return AMEDIA_ERROR_UNSUPPORTED;
+}
 
 // ---------------------------------------------------------------------------
 // AHardwareBuffer — a refcounted handle on one CVPixelBuffer.
@@ -487,6 +670,12 @@ typedef struct {
     struct { uint8_t *data; int in_use; } in[KLM_IN_BUFFERS];
     struct { void *pb; int64_t pts_us; int in_use; } out[KLM_OUT_SLOTS];
 
+    // The decoded size, learned from the first frame rather than from
+    // configure(): the bitstream's own parameter sets are more authoritative
+    // than anything the guest can say, and until a frame exists there is
+    // nothing to report. AMediaCodec_getOutputFormat reads these.
+    int      out_w, out_h;
+
     unsigned n_in, n_out, n_rendered;
 } klm_codec;
 
@@ -629,6 +818,51 @@ static uint8_t *klm_AMediaCodec_getInputBuffer(void *codec, size_t idx,
     return p;
 }
 
+// The OUTPUT side's two, and both answers follow from this codec being
+// surface-configured rather than from anything missing.
+//
+// getOutputBuffer is NULL because a codec configured with a surface has no
+// client-visible output buffers at all — the frames go to the surface, which
+// here is the AImageReader above. That is Android's own answer for the same
+// configuration, not a gap: a guest that gets NULL here is being told to read
+// the surface, which is exactly what Unity does.
+static uint8_t *klm_AMediaCodec_getOutputBuffer(void *codec, size_t idx, size_t *out_size) {
+    klm_codec *c = codec;
+    (void)idx;
+    if (out_size) *out_size = 0;
+    if (!c || c->magic != KLM_CODEC_MAGIC) return NULL;
+    KLM_FIRST(said_outbuf, "AMediaCodec_getOutputBuffer on a surface-configured "
+                           "codec — NULL, as on Android; the frames are on the "
+                           "reader\n");
+    return NULL;
+}
+
+// getOutputFormat hands back a NEW format the caller owns and deletes. What it
+// can honestly carry is what the DECODER measured, not what the guest asked for
+// — so the size is the first decoded frame's, and BEFORE that first frame the
+// format carries no size at all. That is not a gap: MediaCodec's own output
+// format is only meaningful once the codec has reported
+// INFO_OUTPUT_FORMAT_CHANGED, and the getters answer "absent" by leaving the
+// caller's own default in place rather than by writing a zero over it.
+static void *klm_AMediaCodec_getOutputFormat(void *codec) {
+    klm_codec *c = codec;
+    if (!c || c->magic != KLM_CODEC_MAGIC) return NULL;
+    klm_format *f = klm_AMediaFormat_new();
+    if (!f) return NULL;
+    klm_AMediaFormat_setString(f, g_key_mime, c->mime);
+    pthread_mutex_lock(&c->lock);
+    int w = c->out_w, h = c->out_h;
+    pthread_mutex_unlock(&c->lock);
+    if (w && h) {
+        klm_AMediaFormat_setInt32(f, g_key_width,  w);
+        klm_AMediaFormat_setInt32(f, g_key_height, h);
+    }
+    // Not the stride: the frames never pass through a linear buffer here (see
+    // getOutputBuffer), so there is no row pitch to report and reporting one
+    // would describe memory the guest cannot reach.
+    return f;
+}
+
 static int klm_AMediaCodec_queueInputBuffer(void *codec, size_t idx, off_t offset,
                                             size_t size, uint64_t time_us,
                                             uint32_t flags) {
@@ -671,6 +905,8 @@ static ssize_t klm_AMediaCodec_dequeueOutputBuffer(void *codec,
                     c->out[i].in_use = 1;
                     c->out[i].pb = (void *)pb;
                     c->out[i].pts_us = pts;
+                    c->out_w = (int)CVPixelBufferGetWidth(pb);
+                    c->out_h = (int)CVPixelBufferGetHeight(pb);
                     c->n_out++;
                     pthread_mutex_unlock(&c->lock);
                     KLM_FIRST(said_out, "first decoded frame dequeued (slot %d, "
@@ -741,8 +977,18 @@ void kl_mediandk_report(FILE *f) {
     // the guest?" is the question this run exists to answer, and a report that
     // prints nothing is indistinguishable from a report that never ran — which
     // is exactly how it read the first time (trap 6d, in the reporting path).
-    if (!g_ever_created) return;
+    // ...and the demuxer's refusals count as "media-shaped", because a guest
+    // that asked for a video and was refused is the case most likely to be
+    // investigated as a rendering problem. `g_ever_created` is false on that
+    // path — no codec is ever built — so it has to be tested separately or the
+    // refusal is invisible in exactly the run that needs it.
+    if (!g_ever_created && !g_ex_refused) return;
     fprintf(f, "\n=== media (AMediaCodec / AImageReader) ===\n");
+    if (g_ex_refused)
+        fprintf(f, "  extractor: %u source(s) REFUSED — there is no container "
+                   "demuxer here%s%s. The guest's own no-video path ran.\n",
+                g_ex_refused, g_ex_last ? ", last: " : "", g_ex_last ? g_ex_last : "");
+    if (!g_ever_created) return;
     fprintf(f, "  codec \"%s\": %u buffers queued, %u frames dequeued, %u rendered%s\n",
             g_codec ? g_codec->mime : "video/hevc", in, out, rendered,
             g_codec ? "" : "  (codec deleted; totals are for the whole run)");
@@ -761,6 +1007,10 @@ static const struct { const char *name; void *fn; } g_media[] = {
     M("AMediaFormat_delete",    klm_AMediaFormat_delete),
     M("AMediaFormat_setInt32",  klm_AMediaFormat_setInt32),
     M("AMediaFormat_setString", klm_AMediaFormat_setString),
+    M("AMediaFormat_getInt32",  klm_AMediaFormat_getInt32),
+    M("AMediaFormat_getInt64",  klm_AMediaFormat_getInt64),
+    M("AMediaFormat_getFloat",  klm_AMediaFormat_getFloat),
+    M("AMediaFormat_getString", klm_AMediaFormat_getString),
 
     // Data symbols, not functions — see the note by the definitions.
     M("AMEDIAFORMAT_KEY_MIME",           &g_key_mime),
@@ -774,6 +1024,12 @@ static const struct { const char *name; void *fn; } g_media[] = {
     M("AMEDIAFORMAT_KEY_COLOR_FORMAT",   &g_key_color_format),
     M("AMEDIAFORMAT_KEY_PRIORITY",       &g_key_priority),
     M("AMEDIAFORMAT_KEY_OPERATING_RATE", &g_key_operating_rate),
+    M("AMEDIAFORMAT_KEY_DURATION",       &g_key_duration),
+    M("AMEDIAFORMAT_KEY_FRAME_RATE",     &g_key_frame_rate),
+    M("AMEDIAFORMAT_KEY_LANGUAGE",       &g_key_language),
+    M("AMEDIAFORMAT_KEY_CHANNEL_COUNT",  &g_key_channel_count),
+    M("AMEDIAFORMAT_KEY_SAMPLE_RATE",    &g_key_sample_rate),
+    M("AMEDIAFORMAT_KEY_STRIDE",         &g_key_stride),
 
     M("AMediaCodec_createDecoderByType",  klm_AMediaCodec_createDecoderByType),
     M("AMediaCodec_configure",            klm_AMediaCodec_configure),
@@ -786,6 +1042,22 @@ static const struct { const char *name; void *fn; } g_media[] = {
     M("AMediaCodec_queueInputBuffer",     klm_AMediaCodec_queueInputBuffer),
     M("AMediaCodec_dequeueOutputBuffer",  klm_AMediaCodec_dequeueOutputBuffer),
     M("AMediaCodec_releaseOutputBuffer",  klm_AMediaCodec_releaseOutputBuffer),
+    M("AMediaCodec_getOutputBuffer",      klm_AMediaCodec_getOutputBuffer),
+    M("AMediaCodec_getOutputFormat",      klm_AMediaCodec_getOutputFormat),
+
+    // The demuxer, which REFUSES — see the long note by the implementation.
+    M("AMediaExtractor_new",                 klm_AMediaExtractor_new),
+    M("AMediaExtractor_delete",              klm_AMediaExtractor_delete),
+    M("AMediaExtractor_setDataSource",       klm_AMediaExtractor_setDataSource),
+    M("AMediaExtractor_setDataSourceFd",     klm_AMediaExtractor_setDataSourceFd),
+    M("AMediaExtractor_getTrackCount",       klm_AMediaExtractor_getTrackCount),
+    M("AMediaExtractor_getTrackFormat",      klm_AMediaExtractor_getTrackFormat),
+    M("AMediaExtractor_selectTrack",         klm_AMediaExtractor_selectTrack),
+    M("AMediaExtractor_readSampleData",      klm_AMediaExtractor_readSampleData),
+    M("AMediaExtractor_getSampleTrackIndex", klm_AMediaExtractor_getSampleTrackIndex),
+    M("AMediaExtractor_getSampleTime",       klm_AMediaExtractor_getSampleTime),
+    M("AMediaExtractor_advance",             klm_AMediaExtractor_advance),
+    M("AMediaExtractor_seekTo",              klm_AMediaExtractor_seekTo),
 
     M("AImageReader_newWithUsage",       klm_AImageReader_newWithUsage),
     M("AImageReader_setImageListener",   klm_AImageReader_setImageListener),

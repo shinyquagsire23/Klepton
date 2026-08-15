@@ -140,6 +140,11 @@ const char *kl_guest_path(const char *path, char *buf, size_t cap);
 // Register the APK -> unpacked-tree mapping for raw "<apk>/assets/..." opens
 // (split assets). See the implementation comment in kl_libc.c.
 void kl_guest_path_map(const char *apk, const char *unpacked_dir);
+// ...and the guest's public external storage ("/sdcard" and its aliases), for a
+// guest that writes there by literal path instead of asking Java. `dir` must be
+// what Environment.getExternalStorageDirectory() answers, or the two doors onto
+// one directory disagree. See the implementation comment in kl_libc.c.
+void kl_guest_extstorage_map(const char *dir);
 
 // How much memory the guest asked us to decommit, and how we served it. Zero
 // bytes here on a Unity guest means its VirtualMemory layer's decommit is doing

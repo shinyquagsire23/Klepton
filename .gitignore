@@ -10,6 +10,10 @@
 /bonelab_obb/*
 /vrchat/*
 /openbrush/*
+/re4/*
+# ...and its game data, for bonelab's reason: RE4 ships a main AND a patch OBB,
+# 8.5 GB between them.
+/re4_obb/*
 *.apk
 
 # claude — CLAUDE.md and its notes/ satellites are local working notes

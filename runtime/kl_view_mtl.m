@@ -221,6 +221,50 @@ static id<MTLBuffer> klvm_grid_buffer(id<MTLTexture> src, const float *vp,
     return g_grid_buf;
 }
 
+// Every shader in kl_reproject.c samples a `texture2d_array<float>`, and until
+// Open Brush every eye texture that reached them was one: the GL provider
+// allocates 2D arrays by construction (KleptonCompositor's `.type2DArray`), and
+// BONELAB's Vulkan eye image carries two array layers because the eye IS the
+// layer there. An OpenXR guest on Vulkan with one swapchain per eye produces a
+// plain MTLTextureType2D, and binding that to an array-typed slot does not
+// fail — it samples nothing useful, which composites as a FLAT COLOUR over a
+// texture that is provably full of picture.
+//
+// A texture VIEW rather than a second pipeline: the type is the only thing
+// wrong, the pixel format and the storage are already right, and one shader
+// that every path shares is worth more than two that can drift. Cached, because
+// a view per frame is an allocation per frame — there are at most eyes x stages
+// of them.
+//
+// It can legitimately fail (a view needs the source's usage to permit it), and
+// then it says so and returns the original, which composites exactly as badly
+// as before but names the reason instead of leaving a flat colour to be read as
+// a dead guest.
+#define KLVM_VIEWS 8
+static struct { void *src; id<MTLTexture> view; } g_views[KLVM_VIEWS];
+
+static id<MTLTexture> klvm_array_view(id<MTLTexture> src) {
+    if (!src || src.textureType == MTLTextureType2DArray) return src;
+    void *key = (__bridge void *)src;
+    for (int i = 0; i < KLVM_VIEWS; i++)
+        if (g_views[i].src == key) return g_views[i].view ?: src;
+    id<MTLTexture> v = [src newTextureViewWithPixelFormat:src.pixelFormat
+                                              textureType:MTLTextureType2DArray
+                                                   levels:NSMakeRange(0, src.mipmapLevelCount)
+                                                   slices:NSMakeRange(0, 1)];
+    static int said;
+    if (!v && !said) {
+        said = 1;
+        fprintf(stderr, "  [vmtl] the eye texture is MTLTextureType %u and an "
+                        "array VIEW of it could not be made — the shaders sample "
+                        "texture2d_array, so this composites as a flat colour\n",
+                (unsigned)src.textureType);
+    }
+    for (int i = 0; i < KLVM_VIEWS; i++)
+        if (!g_views[i].src) { g_views[i].src = key; g_views[i].view = v; break; }
+    return v ?: src;
+}
+
 static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice, int flip_y) {
     kl_ovrp_render_pose r;
     int have = kl_ovrp_stage_render_pose(stage, &r);
@@ -430,6 +474,28 @@ int kl_viewmtl_present(int win_w, int win_h) {
     void *texp = kl_glfb_eye_mtl_texture(eye, stage, &slice);
     if (!texp) return 0;
     id<MTLTexture> src = (__bridge id<MTLTexture>)texp;
+    // Every shader in kl_reproject.c samples a `texture2d_array<float>`, so a
+    // source that is NOT an array is a bound type the shader cannot read — and
+    // Metal does not refuse it, it returns nothing useful, which composites as a
+    // flat colour over a texture that is provably full of picture. Named once,
+    // because the two failures ("the guest drew nothing" and "we cannot sample
+    // what it drew") are identical on screen.
+    {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [vmtl] eye source is MTLTexture type %u, %ux%u, "
+                            "%lu array layer(s)%s\n",
+                    (unsigned)src.textureType, (unsigned)src.width,
+                    (unsigned)src.height, (unsigned long)src.arrayLength,
+                    src.textureType == MTLTextureType2DArray
+                        ? "" : "  <- NOT an array; sampled through an array view");
+        }
+    }
+    // ...and this is that view. Dimensions, format and device are unchanged, so
+    // everything below — the letterbox, the grid, the viewport guard — reads the
+    // same numbers it always did.
+    src = klvm_array_view(src);
     // Which way up the guest drew it, recorded with the texture — see
     // kl_reproject.h. Read per (eye, stage) rather than decided once, because
     // it is a property of the storage and not of this compositor.
@@ -586,6 +652,9 @@ void kl_viewmtl_stop(void) {
     g_started = 0;
     g_pipe = nil; g_samp = nil; g_stat = nil; g_queue = nil;
     g_event = nil; g_layer = nil; g_dev = nil;
+    // The array views hold their source textures alive, and a restart would
+    // otherwise match a stale key against a texture from the previous device.
+    for (int i = 0; i < KLVM_VIEWS; i++) { g_views[i].src = NULL; g_views[i].view = nil; }
 }
 
 unsigned kl_viewmtl_frames(void) { return g_frames; }

@@ -26,6 +26,7 @@
 #include "../runtime/kl_jni.h"
 #include "../runtime/kl_egl.h"
 #include "../runtime/kl_opensl.h"
+#include "../runtime/kl_mediandk.h"
 #include "../runtime/kl_ovrp.h"
 #include "../runtime/kl_ovrplat.h"
 #include "../runtime/kl_openxr.h"
@@ -495,23 +496,42 @@ static int recon_run(int view_pump) {
                 else
                     printf("  reference (glReadPixels, kl_glfb): %lu lit\n",
                            kl_glfb_last_frame_lit());
+                // EVERY stage, not stage 0. This used to read and dump stage 0
+                // alone while the compositors show
+                // kl_ovrp_last_complete_stage() — so on a guest whose swapchain
+                // has more than one image the PNG and the screen are DIFFERENT
+                // PICTURES, and the readback can report a perfect frame for
+                // something nobody is looking at. That is trap 43's family: an
+                // instrument answering confidently about the wrong subject.
+                // Open Brush is where it bit (3 OpenXR swapchain images).
+                int shown = kl_ovrp_last_complete_stage();
+                int stages = kl_ovrp_stage_count();
+                if (stages < 1) stages = 1;
+                printf("  the compositors show stage %d (kl_ovrp_last_complete_stage)"
+                       "%s\n", shown,
+                       shown < 0 ? " — nothing filed, so they fall back to stage 0" : "");
                 for (int eye = 0; eye < 2; eye++) {
-                    int w = 0, h = 0;
-                    unsigned long lit = kl_mtl_count_lit(eye, 0, &w, &h);
-                    unsigned long n = w && h ? ((unsigned long)((w + 7) / 8)
-                                              * (unsigned long)((h + 7) / 8)) : 0;
-                    printf("  eye %d MTLTexture %dx%d: %lu/%lu lit, mean luma %u%s\n",
-                           eye, w, h, lit, n, kl_mtl_mean_luma(),
-                           lit ? "" : "  <<< BLACK");
-                    // A picture, not just a count: KL_GLFB_OUT already holds the
-                    // reference frames, so writing the interop eyes beside them
-                    // is what makes "does it render the same" answerable.
-                    const char *out = getenv("KL_GLFB_OUT");
-                    if (out) {
-                        char p[1200];
-                        snprintf(p, sizeof p, "%s/mtl_eye%d.png", out, eye);
-                        printf("  eye %d -> %s%s\n", eye, p,
-                               kl_mtl_dump_png(eye, 0, p) ? "" : "  (write FAILED)");
+                    for (int st = 0; st < stages; st++) {
+                        int w = 0, h = 0;
+                        if (!kl_glfb_eye_mtl_texture(eye, st, NULL)) continue;
+                        unsigned long lit = kl_mtl_count_lit(eye, st, &w, &h);
+                        unsigned long n = w && h ? ((unsigned long)((w + 7) / 8)
+                                                  * (unsigned long)((h + 7) / 8)) : 0;
+                        printf("  eye %d stage %d MTLTexture %dx%d: %lu/%lu lit, "
+                               "mean luma %u%s%s\n",
+                               eye, st, w, h, lit, n, kl_mtl_mean_luma(),
+                               lit ? "" : "  <<< BLACK",
+                               st == shown ? "   <- ON SCREEN" : "");
+                        // A picture, not just a count: KL_GLFB_OUT already holds the
+                        // reference frames, so writing the interop eyes beside them
+                        // is what makes "does it render the same" answerable.
+                        const char *out = getenv("KL_GLFB_OUT");
+                        if (out) {
+                            char p[1200];
+                            snprintf(p, sizeof p, "%s/mtl_eye%d_s%d.png", out, eye, st);
+                            printf("    -> %s%s\n", p,
+                                   kl_mtl_dump_png(eye, st, p) ? "" : "  (write FAILED)");
+                        }
                     }
                 }
             }
@@ -529,6 +549,11 @@ static int recon_run(int view_pump) {
     kl_jni_report(stdout);
     kl_egl_report(stdout);
     kl_opensl_report(stdout);
+    // A Unity guest can reach the video path too — Open Brush seeds a video
+    // into its own media library at startup — and this driver had never asked
+    // it anything. The report was wired into the Steam Link driver and the
+    // fault path only, so on a CLEAN Unity run a refused demux said nothing.
+    kl_mediandk_report(stdout);
     kl_ovrp_report(stdout);
     kl_ovrplat_report(stdout);
     kl_openxr_report(stdout);
@@ -620,6 +645,11 @@ static int view_run(void) {
     kl_jni_report(stdout);
     kl_egl_report(stdout);
     kl_opensl_report(stdout);
+    // A Unity guest can reach the video path too — Open Brush seeds a video
+    // into its own media library at startup — and this driver had never asked
+    // it anything. The report was wired into the Steam Link driver and the
+    // fault path only, so on a CLEAN Unity run a refused demux said nothing.
+    kl_mediandk_report(stdout);
     kl_ovrp_report(stdout);
     kl_ovrplat_report(stdout);
     kl_openxr_report(stdout);

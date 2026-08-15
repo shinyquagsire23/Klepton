@@ -2614,6 +2614,61 @@ static klj_val klj_Intent_getAction(void *env, void *self, const klj_val *a, int
     const char *action = o ? o->data : NULL;
     return (klj_val){.l = action ? kl_jni_new_string(action) : NULL};
 }
+
+// The other two extra getters, and the answer is the same one getIntExtra gives
+// for a key it does not carry: the caller's own default, and null for a String.
+// That is not a shrug — the LAUNCH Intent here genuinely carries no extras.
+// Extras arrive from a launcher shortcut, from another app, or from `adb
+// shell am start -e`, and this process was started by none of those; there is
+// no Android launcher in it to attach any.
+//
+// Open Brush reads three (Config.cs, the UNITY_ANDROID arm): EnableMonoscopicMode
+// and DisableXrMode, both defaulting false, and OpenBrushArgs, a command line.
+// Answering the defaults is what selects the ordinary stereo XR path — inventing
+// either boolean would silently turn the headset off, and inventing an argument
+// string would hand the guest a command line nobody typed.
+static klj_val klj_Intent_getBooleanExtra(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return (klj_val){.j = n > 1 ? (a[1].j & 1) : 0};
+}
+static klj_val klj_Intent_getStringExtra(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = NULL};
+}
+
+// Intent.getComponent() — for the launch Intent, the activity that was started.
+// Non-null, because this activity was started EXPLICITLY: the manifest names one
+// launcher activity and kl_jni_activity() instantiates that exact class, so
+// there is a component and we know its name. Null is Android's answer for an
+// IMPLICIT intent resolved by action, which this is not.
+//
+// It is read to detect an activity-ALIAS launch: Open Brush declares
+// MonoscopicModeActivity and DisableXrModeActivity as aliases onto the same
+// activity, and a launch through one of those is how a user asks for flat mode.
+// getComponent() returning the alias is the only way that choice is visible,
+// which is precisely why answering the real class is the right answer here —
+// nobody picked an alias, and the guest's own suffix test then says so.
+static klj_val klj_Intent_getComponent(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *component;
+    return klj_singleton("android/content/ComponentName", &component);
+}
+// ComponentName.getClassName() is the DOTTED binary name, like Class.getName().
+static const char *klj_activity_class(void);   // defined with g_activity_class below
+static klj_val klj_ComponentName_getClassName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    char dotted[256];
+    const char *internal = klj_activity_class();
+    size_t i = 0;
+    for (; internal[i] && i < sizeof dotted - 1; i++)
+        dotted[i] = internal[i] == '/' ? '.' : internal[i];
+    dotted[i] = 0;
+    return (klj_val){.l = kl_jni_new_string(dotted)};
+}
+static klj_val klj_ComponentName_getPackageName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string(klj_guest_package())};
+}
 // ---- WebView, and what it honestly is here ----------------------------------
 //
 // The VR client's in-headset UI is an Android WebView rendered to a texture:
@@ -6362,6 +6417,7 @@ static klj_val klj_Uri_decode(void *env, void *self, const klj_val *a, int n) {
 // before the first kl_jni_activity()).
 static const char *g_activity_class = "com/unity3d/player/UnityPlayerActivity";
 void kl_jni_set_activity_class(const char *cls) { if (cls) g_activity_class = cls; }
+static const char *klj_activity_class(void) { return g_activity_class; }
 
 void *kl_jni_activity(void) {
     static void *activity;
@@ -7443,6 +7499,54 @@ static klj_val klj_Environment_getExternalStorageState(void *env, void *self, co
 static klj_val klj_Environment_getExternalStorageDirectory(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.l = klj_new_file(kl_jni_files_dir())};
+}
+
+// MANAGE_EXTERNAL_STORAGE — "does this app hold unrestricted access to shared
+// storage?" — and the answer here is yes, because there is nothing to restrict.
+// The permission exists on Android to separate one app's files in shared
+// storage from every OTHER app's. There are no other apps in this process, and
+// the whole of the guest's external storage is the one directory we hand it
+// (kl_guest_extstorage_map, from getExternalStorageDirectory above), which it
+// may read and write in full. So the permission's purpose is satisfied
+// vacuously rather than granted generously.
+//
+// It is NOT a free answer, and Open Brush is why. LoadingScene.cs Start():
+//
+//     if (!UserHasManageExternalStoragePermission()) {
+//         m_WaitingForPermission = true;
+//         AskForManageStoragePermission();
+//         while (!UserHasManageExternalStoragePermission())
+//             yield return new WaitForEndOfFrame();
+//     }
+//
+// That loop is BEFORE `SceneManager.LoadSceneAsync("Main")`, so answering false
+// parks the app forever on its GvrOverlay — a uniform grey field, every counter
+// healthy, stereo layers submitted every frame, nothing in any log. It is the
+// exact shape of a graphics failure and it is a permission.
+//
+// False would also cost more than it saved: the only way OUT of that loop
+// without this call is for AskForManageStoragePermission() to THROW, which is
+// how the guest recognises a device with no all-files-access settings screen
+// (`m_FolderPermissionOverride = true`). Serving that arm means an
+// ActivityNotFoundException we cannot raise — our JNI has no exception state
+// (klj_ExceptionCheck is 0 forever) — plus Uri.fromParts, an
+// Intent(String, Uri) constructor, addCategory and startActivity, i.e. four
+// fabricated answers about a Settings activity that does not exist here.
+// Answering the question we CAN answer truthfully forces none of them.
+//
+// The honest tension, recorded rather than hidden: we present SDK_INT = 29 and
+// this method arrived in API 30, so a real device answering our own Build
+// fields would refuse the call rather than answer it. A guest that gates on
+// `SDK_INT >= 30` therefore never reaches this handler at all and gets legacy
+// external storage — which the /sdcard mapping now serves — so the two stay
+// consistent for the common shape. Open Brush is the other shape: it simply
+// tries the call and catches the failure, and for it there is no version to be
+// consistent with, only a directory that is or is not writable.
+static klj_val klj_Environment_isExternalStorageManager(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("Environment.isExternalStorageManager() -> true "
+            "(external storage here is one directory the guest owns outright)");
+    return (klj_val){.j = 1};
 }
 
 // There is no ARCore here and there never will be — Vision Pro's world sensing
@@ -9462,6 +9566,15 @@ static const klj_binding g_bindings[] = {
     {"android/content/Intent", "<init>",     "(Ljava/lang/String;)V",      klj_Intent_init},
     {"android/content/Intent", "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_addCategory},
     {"android/content/Intent", "getIntExtra", "(Ljava/lang/String;I)I",     klj_Intent_getIntExtra},
+    {"android/content/Intent", "getBooleanExtra", "(Ljava/lang/String;Z)Z", klj_Intent_getBooleanExtra},
+    {"android/content/Intent", "getStringExtra",  "(Ljava/lang/String;)Ljava/lang/String;",
+     klj_Intent_getStringExtra},
+    {"android/content/Intent", "getComponent",    "()Landroid/content/ComponentName;",
+     klj_Intent_getComponent},
+    {"android/content/ComponentName", "getClassName",   "()Ljava/lang/String;",
+     klj_ComponentName_getClassName},
+    {"android/content/ComponentName", "getPackageName", "()Ljava/lang/String;",
+     klj_ComponentName_getPackageName},
     {"android/content/Intent", "getAction",   "()Ljava/lang/String;",       klj_Intent_getAction},
     {"android/content/IntentFilter", "<init>",    "()V",                     klj_IntentFilter_init},
     {"android/content/IntentFilter", "<init>",    "(Ljava/lang/String;)V",   klj_IntentFilter_init},
@@ -9629,6 +9742,7 @@ static const klj_binding g_bindings[] = {
      "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;", klj_Context_getApplicationInfo},
     {"android/os/Environment", "getExternalStorageState", "()Ljava/lang/String;", klj_Environment_getExternalStorageState},
     {"android/os/Environment", "getExternalStorageDirectory", "()Ljava/io/File;", klj_Environment_getExternalStorageDirectory},
+    {"android/os/Environment", "isExternalStorageManager", "()Z", klj_Environment_isExternalStorageManager},
     {"java/io/File", "getAbsolutePath", "()Ljava/lang/String;", klj_File_getPath},
     {"java/io/File", "getPath",         "()Ljava/lang/String;", klj_File_getPath},
     {"java/io/File", "getCanonicalPath","()Ljava/lang/String;", klj_File_getPath},
@@ -9740,6 +9854,12 @@ static void klj_init(void) {
         if (slash && strcmp(slash, "/assets") == 0) *slash = 0;
         kl_guest_path_map(g_apk_path, root);
     }
+    // "/sdcard" and its aliases resolve to the same directory
+    // Environment.getExternalStorageDirectory() answers with, which is what
+    // stops a guest that asks Java and a guest that hardcodes the path from
+    // keeping two user trees. Registered HERE, beside that mapping and from the
+    // same source, so neither can be changed without the other.
+    kl_guest_extstorage_map(kl_jni_files_dir());
     klj_build_tables();
 }
 

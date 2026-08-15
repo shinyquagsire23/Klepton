@@ -717,6 +717,38 @@ void kl_guest_path_map(const char *apk, const char *unpacked_dir) {
     snprintf(g_apk_target, sizeof g_apk_target, "%s", unpacked_dir);
 }
 
+// ...and the guest's PUBLIC EXTERNAL STORAGE, which a guest is entitled to name
+// by literal path rather than by asking Java where it is. Open Brush does
+// exactly that — App.cs's InitUserPath has `case RuntimePlatform.Android:
+// m_UserPath = "/sdcard/"` — and then builds its whole user tree under it:
+// Sketches, Snapshots, Exports, Media Library, the .cfg. Nothing in that path
+// goes near JNI, so Environment.getExternalStorageDirectory() answering
+// correctly (it does) buys none of it.
+//
+// The target is kl_jni_files_dir(), registered from kl_jni.c — the SAME
+// directory getExternalStorageDirectory() hands back, deliberately. There are
+// two doors onto external storage and they must not resolve to different
+// places, or a guest that asks Java where to write and then writes by literal
+// path quietly keeps two trees.
+//
+// UNCONDITIONAL, which is the one way this differs from the APK prefix above.
+// That one stat()s its rewrite and falls through on a miss, which is right for
+// reads of files that are supposed to already exist. Here the whole point is
+// paths that do NOT exist yet: an unmapped /sdcard makes the guest's first act
+// a mkdir into the host's root — EACCES on macOS, refused outright by the
+// visionOS sandbox — and Open Brush surfaces that as a modal error rather than
+// as anything mentioning a path.
+static char g_ext_target[1024];
+
+void kl_guest_extstorage_map(const char *dir) {
+    snprintf(g_ext_target, sizeof g_ext_target, "%s", dir);
+}
+
+// The spellings Android itself uses for that one directory: /sdcard and
+// /mnt/sdcard are symlinks to /storage/emulated/0 on a real device, so a guest
+// picking any of them means the same place and has to land in the same place.
+static const char *const g_ext_prefix[] = { "/sdcard", "/storage/emulated/0", "/mnt/sdcard" };
+
 const char *kl_guest_path(const char *path, char *buf, size_t cap) {
     if (!path || path[0] != '/') return path;
     size_t alen = strlen(g_apk_prefix);
@@ -727,6 +759,17 @@ const char *kl_guest_path(const char *path, char *buf, size_t cap) {
         // Not in the unpacked tree: fall through to the raw path, which will
         // fail the same way it always did — no invented successes.
         return path;
+    }
+    if (g_ext_target[0]) {
+        for (size_t i = 0; i < sizeof g_ext_prefix / sizeof *g_ext_prefix; i++) {
+            size_t n = strlen(g_ext_prefix[i]);
+            if (strncmp(path, g_ext_prefix[i], n) != 0) continue;
+            // A prefix match is not a path match: /sdcardiskette is neither
+            // /sdcard nor under it.
+            if (path[n] != '/' && path[n] != '\0') continue;
+            snprintf(buf, cap, "%s%s", g_ext_target, path + n);
+            return buf;
+        }
     }
     if (strncmp(path, "/proc/", 6) != 0 &&
         strncmp(path, "/sys/devices/system/cpu", 23) != 0) return path;
@@ -807,18 +850,31 @@ int klb_access(const char *path, int mode) {
     kl_fs_trace("access", path, NULL, r != 0);
     return r;
 }
+// These four existed to TRACE, and were never given the path rewrite — which
+// could not show while the only mapping was a read-only APK prefix and a
+// synthetic /proc, since nothing creates, renames or unlinks in either. An
+// external storage tree the guest OWNS is the first mapping where the write
+// half matters, and a mkdir that misses the map is the whole difference between
+// a user directory and an EACCES.
 int klb_mkdir(const char *path, mode_t mode) {
-    int r = mkdir(path, mode);
+    KL_GUEST_PATH(path);
+    int r = mkdir(_p, mode);
     kl_fs_trace("mkdir", path, NULL, r != 0);
     return r;
 }
 int klb_unlink(const char *path) {
-    int r = unlink(path);
+    KL_GUEST_PATH(path);
+    int r = unlink(_p);
     kl_fs_trace("unlink", path, NULL, r != 0);
     return r;
 }
 int klb_rename(const char *a, const char *b) {
-    int r = rename(a, b);
+    // Two paths, so two buffers: KL_GUEST_PATH names one pair and a rename
+    // whose halves land in different trees is worse than one that fails.
+    char ka[1024], kb[1024];
+    const char *pa = kl_guest_path(a, ka, sizeof ka);
+    const char *pb = kl_guest_path(b, kb, sizeof kb);
+    int r = rename(pa, pb);
     kl_fs_trace("rename", a, b, r != 0);
     return r;
 }
@@ -827,7 +883,7 @@ int klb_rename(const char *a, const char *b) {
 typedef struct { uint64_t d_ino; int64_t d_off; uint16_t d_reclen;
                  uint8_t d_type; char d_name[256]; } bionic_dirent;
 
-void *klb_opendir(const char *p) { return opendir(p); }
+void *klb_opendir(const char *p) { KL_GUEST_PATH(p); return opendir(_p); }
 int   klb_closedir(void *d)      { return closedir((DIR *)d); }
 void *klb_readdir(void *d) {
     static _Thread_local bionic_dirent out;    // matches readdir's per-stream lifetime

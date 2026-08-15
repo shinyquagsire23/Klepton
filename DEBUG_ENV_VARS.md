@@ -1650,6 +1650,11 @@ vendored the whole path refuses by name and none of these do anything.
   (`vk_f<frame>_s<stage>_eye<n>.png`), written at `ovrp_EndFrame4`; on a flat
   Vulkan guest it is the swapchain image at `vkQueuePresentKHR`. Unset means no
   capture and no readback cost.
+  **It captures NOTHING for an OpenXR guest on Vulkan (Open Brush)** — that
+  guest submits through `xrEndFrame` and never presents, so neither hook fires,
+  and an empty output directory there is the wrong instrument rather than an
+  empty frame. Use `KL_GLFB_OUT=<dir>`, which makes m_boot's end-of-run P5
+  readback write `mtl_eye0.png` / `mtl_eye1.png` from the same storage.
 - `KL_VK_OUT_EVERY=N` — capture every Nth frame (default 1). A full eye pair is
   ~21 MB of readback, so 1 is only for short runs.
 - `KL_VK_EYE_TINT=1` — pre-clear every eye image before the guest ever sees it:

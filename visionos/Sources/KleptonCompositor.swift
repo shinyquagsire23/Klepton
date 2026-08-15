@@ -1182,12 +1182,50 @@ final class KleptonCompositor {
         var slice: Int32 = 0
         if let t = kl_glfb_eye_mtl_texture(Int32(eye), Int32(stage), &slice) {
             let tex = Unmanaged<MTLTexture>.fromOpaque(t).takeUnretainedValue() as MTLTexture
-            return EyeAllocation(texture: tex, slice: Int(slice),
+            return EyeAllocation(texture: arrayView(tex), slice: Int(slice),
                                  flipY: kl_glfb_eye_mtl_origin_top_left(Int32(eye),
                                                                         Int32(stage)) != 0)
         }
         eyesLock.lock(); let a = eyes[Self.key(eye, stage)]; eyesLock.unlock()
         return a
+    }
+
+    /// Every shader in kl_reproject.c samples a `texture2d_array<float>`, and
+    /// binding a non-array texture to that slot does not fail — it samples
+    /// nothing useful, which composites as a FLAT COLOUR over storage that is
+    /// full of picture. Until Open Brush nothing here could produce one: the
+    /// provider below allocates `.type2DArray` explicitly, and BONELAB's Vulkan
+    /// eye image carries two array layers because the eye IS the layer there. An
+    /// OpenXR guest on Vulkan has one swapchain per eye, so MoltenVK hands back a
+    /// plain `.type2D` and the assumption breaks.
+    ///
+    /// A view rather than a second pipeline: only the type is wrong, and one
+    /// shader shared by both compositors is worth more than two that can drift.
+    /// Cached, because a view per frame is an allocation per frame. If the view
+    /// cannot be made it says so once and returns the original — which
+    /// composites exactly as badly as before, but names the reason rather than
+    /// leaving a flat colour to be read as a guest that drew nothing.
+    private var arrayViews: [ObjectIdentifier: MTLTexture] = [:]
+    private var saidNoArrayView = false
+
+    private func arrayView(_ tex: MTLTexture) -> MTLTexture {
+        if tex.textureType == .type2DArray { return tex }
+        let key = ObjectIdentifier(tex)
+        if let v = arrayViews[key] { return v }
+        guard let v = tex.makeTextureView(pixelFormat: tex.pixelFormat,
+                                          textureType: .type2DArray,
+                                          levels: 0..<tex.mipmapLevelCount,
+                                          slices: 0..<1) else {
+            if !saidNoArrayView {
+                saidNoArrayView = true
+                NSLog("[cp] the eye texture is textureType \(tex.textureType.rawValue) "
+                      + "and an array VIEW of it could not be made — the shaders "
+                      + "sample texture2d_array, so this composites as a flat colour")
+            }
+            return tex
+        }
+        arrayViews[key] = v
+        return v
     }
 
     private func stageSummary() -> String {
