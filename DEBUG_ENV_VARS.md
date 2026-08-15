@@ -1017,6 +1017,28 @@ puts the camera on the ground with its hands underneath it.
   of the curve (`kl_reproject.h`). Same "ignored on device when the display's
   curve was sampled" caveat — there the count comes from the drawable map's
   physical granularity.
+- `KL_OVRP_MSAA=<n>` — how many samples `ovrp_GetSystemRecommendedMSAALevel2`
+  reports the device recommends for the eye render target, default **4** (what a
+  Quest 2 answers, for the reason `Build.MODEL` says Quest 2). It is a
+  *recommendation*, not a constraint — a guest consults it only when its project
+  asks for the device default, and the sample count the eye layer is actually
+  built with still arrives in `ovrp_CalculateEyeLayerDesc2` from the guest — so
+  measured on RE4 the layer comes out `samples=1` either way. Set it to 1 if a
+  multisampled eye layer ever turns out to be a problem; that is a measurement,
+  not a redefinition of the headset. UE4 is the first guest here to ask.
+- `KL_UE4_VULKAN=0` — present no Vulkan feature to a UE4 guest, i.e. answer
+  `GetMetaDataInt("android.hardware.vulkan.version")` with 0. **This is where
+  the graphics API is decided for an Unreal guest** — not in the RHI. RE4 is
+  packaged Vulkan-only and says so itself when refused ("This device does not
+  support Vulkan but the app was not packaged with ES 3.1 support", out of its
+  own message box), so this restores that refusal exactly and is the A/B for
+  anything that suspects the API choice.
+- `KL_UE4_WAIT=<seconds>` — the pump budget for a NativeActivity guest, default
+  5. There is no frame count on this door: the guest owns its own game thread
+  and its own frame loop, so seconds are the only unit. **RE4 needs 300** — its
+  one-time shader optimization takes about a minute of host wall clock and the
+  eye reads `91/86100 lit` while it runs, which is a real frame that looks like
+  a broken pipeline.
 - `KL_OVRP_EYE_SCALE=<x>` — scale the per-eye render target size the guest is
   told to use (`ovrp_GetEyeTextureSize`), default 1.0, accepted in 0.05..4.0.
   Applies to whatever the frontend measured off the display

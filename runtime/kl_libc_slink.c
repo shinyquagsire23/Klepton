@@ -401,7 +401,9 @@ int klb_epoll_wait(int epfd, void *events, int maxevents, int timeout_ms) {
 // file mapping of fd -1.
 int klb_openat(int dirfd, const char *path, int flags, int mode) {
     GUEST_PATH(path);
-    return openat(dirfd, _p, kl_open_flags(flags), (mode_t)mode);
+    int fd = openat(dirfd, _p, kl_open_flags(flags), (mode_t)mode);
+    kl_fs_trace_open(_p, flags, fd);
+    return fd;
 }
 
 // bionic's __open_2 is FORTIFY's non-variadic open: it exists precisely to
@@ -409,7 +411,15 @@ int klb_openat(int dirfd, const char *path, int flags, int mode) {
 // something to handle.
 int klb___open_2(const char *path, int flags) {
     GUEST_PATH(path);
-    return open(_p, kl_open_flags(flags));
+    int fd = open(_p, kl_open_flags(flags));
+    // Traced here for the same reason the plain open() is: KL_TRACE_FS is the
+    // instrument every "which file did it want?" question runs through, and a
+    // door it cannot see reports a file the guest opened as a file it never
+    // asked for. FORTIFY rewrites a two-argument open() to this one, so on a
+    // guest built with it — UE4 is — this is the ONLY open door, and the trace
+    // was blind to all of it (trap 43's family: the instrument that cannot look).
+    kl_fs_trace_open(_p, flags, fd);
+    return fd;
 }
 
 // --------------------------------------------------------------- FORTIFY
@@ -454,6 +464,34 @@ ssize_t klb___read_chk(int fd, void *buf, size_t n, size_t cap) {
     if (n > cap) chk_fail("__read_chk", n, cap);
     return read(fd, buf, n);
 }
+// The positional pair. UE4's Android file layer reads everything through
+// pread64 — its OBB is a zip it holds open and seeks around inside from several
+// threads, so an offset argument is not an optimisation there, it is the only
+// safe way to do it — and FORTIFY rewrites those calls to these.
+ssize_t klb___pread64_chk(int fd, void *buf, size_t n, off_t off, size_t cap) {
+    if (n > cap) chk_fail("__pread64_chk", n, cap);
+    return pread(fd, buf, n, off);
+}
+ssize_t klb___pwrite64_chk(int fd, const void *buf, size_t n, off_t off, size_t cap) {
+    if (n > cap) chk_fail("__pwrite64_chk", n, cap);
+    return pwrite(fd, buf, n, off);
+}
+// The search half of the string family. Like __strchr_chk, the size is only
+// used to prove the object is as long as the caller said — the traversal itself
+// is the unchecked function's.
+char *klb___strrchr_chk(const char *s, int ch, size_t cap) {
+    if (strnlen(s, cap) >= cap) chk_fail("__strrchr_chk", cap, cap);
+    return strrchr(s, ch);
+}
+char *klb___strncat_chk(char *d, const char *s, size_t n, size_t cap) {
+    size_t have = strlen(d);
+    if (have + strnlen(s, n) + 1 > cap) chk_fail("__strncat_chk", have + n + 1, cap);
+    return strncat(d, s, n);
+}
+
+// Linux's 64-bit spelling of a call Darwin has only one of, because off_t is
+// already 64-bit here. Same family as lseek64.
+int klb_ftruncate64(int fd, off_t len) { return ftruncate(fd, len); }
 
 // __vsprintf_chk takes an already-materialised va_list, which on AAPCS64 is a
 // 32-byte descriptor passed *by reference* — so a kl_va* parameter receives it

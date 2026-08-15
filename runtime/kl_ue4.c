@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -59,6 +60,13 @@ static char g_libdir[1024];
 static char g_err[512] = "no error";
 static kl_image *g_ue4;
 
+// A native of the guest's, by exported symbol. Registered with the JNI surface
+// so `AndroidThunkJava_*` handlers can make the call GameActivity.java would
+// have made; see kl_jni.h's kl_jni_set_guest_native_resolver.
+static void *ue4_native_symbol(const char *symbol) {
+    return (g_ue4 && symbol) ? kl_sym(g_ue4, symbol) : NULL;
+}
+
 static int ue4_fail(const char *why) {
     snprintf(g_err, sizeof g_err, "%s", why);
     return 1;
@@ -73,6 +81,10 @@ int kl_ue4_configure(const char *libdir, FILE *out) {
     // set from the target row by kl_target_apply_host(). Restating any of it
     // here is how two descriptions of one guest start to drift.
     kl_jni_set_activity_class(UE4_ACTIVITY);
+    // ...and the way back. UE4's Java front end calls natives on itself, so a
+    // driver standing in for that Java has to be able to make those calls; the
+    // JNI surface does not know which image is the guest, and this file does.
+    kl_jni_set_guest_native_resolver(ue4_native_symbol);
     if (out) {
         fprintf(out, "  [ue4] activity: %s\n", UE4_ACTIVITY);
         fprintf(out, "  [ue4] userdata: %s\n", kl_jni_files_dir());
@@ -162,14 +174,206 @@ unsigned kl_ue4_gap(FILE *out) {
     return n;
 }
 
+// ---- GameActivity.java's own half of the boot ----
+//
+// The NativeActivity door is only half of how a UE4 guest starts, and the half
+// that is missing is invisible: `ANativeActivity_onCreate` spawns the game
+// thread through the NDK's app glue, and that thread's FIRST act inside
+// `android_main` is to spin waiting for `GResumeMainInit`, which nothing native
+// ever sets. It is set by `nativeResumeMainInit`, one of twenty-eight natives
+// GameActivity.java calls on itself — so on Android the engine is configured
+// from JAVA, by the activity, and released by the activity.
+//
+// That is a genuinely different shape from every guest here so far. A Unity
+// guest's Java front end hands libunity a few objects and then libunity drives
+// itself; UE4's hands the engine its file paths, its device strings, its window
+// geometry and its OBB identity as ARGUMENTS, and until they arrive the engine
+// has not started. Nothing about it is optional and nothing about it fails by
+// name: the guest simply sits, forever, with every counter healthy — which is
+// exactly what the first runs of this target looked like.
+//
+// So this is a transcription of `GameActivity.onCreate` and `onResume` from
+// THIS APK's smali, in their order, calling the natives libUE4 exports by
+// symbol. The values are read from the same places the Java reads them — the
+// manifest <meta-data> block, the files directory, the package name and version
+// — rather than being restated here, because a constant transcribed twice is a
+// constant that goes stale on a guest swap.
+//
+// The natives are static exports (`Java_com_epicgames_ue4_GameActivity_native*`)
+// rather than `RegisterNatives` bindings, which is why the JNI surface reports
+// zero natives registered on this target and is not a gap.
+typedef unsigned char ue4_jboolean;
+
+// One typedef per shape, named after the Java signature it is a transcription
+// of. A function-pointer type cannot be a macro argument (its commas are the
+// macro's), and naming them after the descriptor keeps the call sites checkable
+// against the smali line above each one.
+typedef void (*ue4_fn_v)(void *, void *);
+typedef void (*ue4_fn_ZI)(void *, void *, ue4_jboolean, int);
+typedef void (*ue4_fn_Z)(void *, void *, ue4_jboolean);
+typedef void (*ue4_fn_ZZssZsZ)(void *, void *, ue4_jboolean, ue4_jboolean,
+                               void *, void *, ue4_jboolean, void *, ue4_jboolean);
+typedef void (*ue4_fn_sssss)(void *, void *, void *, void *, void *, void *, void *);
+typedef void (*ue4_fn_ssIIs)(void *, void *, void *, void *, int, int, void *);
+
+#define UE4_NATIVE_PREFIX "Java_com_epicgames_ue4_GameActivity_"
+
+static void *ue4_native(const char *name) {
+    if (!g_ue4) return NULL;
+    char sym[256];
+    snprintf(sym, sizeof sym, UE4_NATIVE_PREFIX "%s", name);
+    return kl_sym(g_ue4, sym);
+}
+
+// A missing native is reported and skipped rather than fatal: this table is a
+// transcription of one build's Java, and a build that dropped a setter is a
+// different shape rather than a broken one. What must not happen silently is
+// the opposite — a setter present and never called — so every one of these is
+// named either way.
+#define UE4_CALL(out, name, type, ...)                                          \
+    do {                                                                         \
+        type fn__ = (type)ue4_native(name);                                       \
+        if (!fn__) {                                                              \
+            if (out) fprintf(out, "  [ue4] %s — not exported, skipped\n", name);   \
+        } else {                                                                  \
+            if (out) { fprintf(out, "  [ue4] %s\n", name); fflush(out); }          \
+            fn__(env, thiz, ##__VA_ARGS__);                                        \
+        }                                                                          \
+    } while (0)
+
+// `<meta-data android:value="true"/>` as the Java reads it: Bundle.getBoolean
+// answers false for anything that is not the literal "true", including an
+// absent key.
+static ue4_jboolean ue4_meta_bool(const char *key) {
+    const char *v = kl_jni_manifest_meta(key);
+    return (ue4_jboolean)(v && strcmp(v, "true") == 0);
+}
+
+static int ue4_meta_int(const char *key, int dflt) {
+    const char *v = kl_jni_manifest_meta(key);
+    return v ? (int)strtol(v, NULL, 10) : dflt;
+}
+
+static const char *ue4_meta_str(const char *key) {
+    const char *v = kl_jni_manifest_meta(key);
+    return v ? v : "";
+}
+
+// Portrait or landscape, as `Configuration.orientation == ORIENTATION_PORTRAIT`.
+// A headset is landscape, and it is the same answer the display panel gives
+// everywhere else in this project.
+#define UE4_PORTRAIT 0
+
+static void kl_ue4_java_create(FILE *out) {
+    void *env  = kl_jni_env();
+    void *thiz = kl_jni_activity();
+    if (!env || !thiz) return;
+
+    if (out) { fprintf(out, "=== GameActivity.onCreate (the Java half) ===\n"); fflush(out); }
+
+    // nativeSetGlobalActivity(bUseExternalFilesDir, bPublicLogFiles,
+    //                         internalFilePath, externalFilePath,
+    //                         bOBBinAPK, APKPath, bIsNotDebuggable)
+    //
+    // Both file paths are the guest's userdata directory here. On Android they
+    // are `getFilesDir()` and `getExternalFilesDir(null)`, two directories the
+    // app owns; here there is one, and handing over two names for it is what
+    // makes `bUseExternalFilesDir` a choice with no consequence rather than a
+    // fork into a tree that does not exist (trap 45's shape — a resource with
+    // two doors has to resolve to one place by construction).
+    const char *files = kl_jni_files_dir();
+    void *jinternal = kl_jni_new_string(files);
+    void *jexternal = kl_jni_new_string(files);
+    void *japk      = kl_jni_new_string(kl_jni_apk_path());
+    UE4_CALL(out, "nativeSetGlobalActivity", ue4_fn_ZZssZsZ,
+             ue4_meta_bool("com.epicgames.ue4.GameActivity.bUseExternalFilesDir"),
+             ue4_meta_bool("com.epicgames.ue4.GameActivity.bPublicLogFiles"),
+             jinternal, jexternal,
+             ue4_meta_bool("com.epicgames.ue4.GameActivity.bPackageDataInsideApk"),
+             japk,
+             // The Java's last argument is `(ApplicationInfo.flags &
+             // FLAG_DEBUGGABLE) == 0`. A release APK unpacked from a device is
+             // not debuggable.
+             (ue4_jboolean)1);
+
+    // nativeSetWindowInfo(bIsPortrait, DepthBufferPreference)
+    UE4_CALL(out, "nativeSetWindowInfo", ue4_fn_ZI,
+             (ue4_jboolean)UE4_PORTRAIT,
+             ue4_meta_int("com.epicgames.ue4.GameActivity.DepthBufferPreference", 0));
+
+    // nativeSetAndroidStartupState(bDebuggerAttached)
+    UE4_CALL(out, "nativeSetAndroidStartupState", ue4_fn_Z,
+             (ue4_jboolean)0);
+
+    // nativeSetAndroidVersionInformation(Build.VERSION.RELEASE, Build.MANUFACTURER,
+    //                                    Build.MODEL, Build.DISPLAY, locale)
+    // Read through kl_jni's Build table, so this guest is told the same device
+    // the JNI surface describes to every other one.
+    char lang[16] = "en", country[16] = "US";
+    kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);
+    char locale[40];
+    snprintf(locale, sizeof locale, "%s_%s", lang, country);
+    void *jrel   = kl_jni_new_string(kl_jni_build_string("VERSION.RELEASE"));
+    void *jmake  = kl_jni_new_string(kl_jni_build_string("MANUFACTURER"));
+    void *jmodel = kl_jni_new_string(kl_jni_build_string("MODEL"));
+    void *jbuild = kl_jni_new_string(kl_jni_build_string("DISPLAY"));
+    void *jloc   = kl_jni_new_string(locale);
+    UE4_CALL(out, "nativeSetAndroidVersionInformation", ue4_fn_sssss,
+             jrel, jmake, jmodel, jbuild, jloc);
+
+    // nativeSetObbInfo(ProjectName, PackageName, Version, PatchVersion, AppType)
+    // The Java passes `PackageInfo.versionCode` for Version and a literal 0 for
+    // PatchVersion — this is what the engine builds `main.<version>.<package>.obb`
+    // out of, so it is the same fact klj_obb_census checks the staged files
+    // against and it comes from the same place (apktool.yml, via kl_jni).
+    long version = 0;
+    kl_jni_guest_version(&version, NULL);
+    void *jproj = kl_jni_new_string(ue4_meta_str("com.epicgames.ue4.GameActivity.ProjectName"));
+    void *jpkg  = kl_jni_new_string(kl_jni_guest_package());
+    void *jtype = kl_jni_new_string(ue4_meta_str("com.epicgames.ue4.GameActivity.AppType"));
+    UE4_CALL(out, "nativeSetObbInfo", ue4_fn_ssIIs,
+             jproj, jpkg, (int)version, 0, jtype);
+}
+
+// ...and onResume's half, which is the one that starts the engine: the game
+// thread has been spinning on GResumeMainInit since ANativeActivity_onCreate
+// returned. GameActivity.onResume re-states the window geometry first (the
+// orientation can have changed while the activity was away) and then releases
+// it, in that order, so the engine's first look at the window is at a value
+// somebody set.
+static void kl_ue4_java_resume(FILE *out) {
+    void *env  = kl_jni_env();
+    void *thiz = kl_jni_activity();
+    if (!env || !thiz) return;
+
+    if (out) { fprintf(out, "=== GameActivity.onResume (the Java half) ===\n"); fflush(out); }
+
+    UE4_CALL(out, "nativeSetWindowInfo", ue4_fn_ZI,
+             (ue4_jboolean)UE4_PORTRAIT,
+             ue4_meta_int("com.epicgames.ue4.GameActivity.DepthBufferPreference", 0));
+
+    // The other arm of the Java's `if` is nativeOnInitialDownloadStarted, i.e.
+    // "the OBB is not here, go and fetch it". There is no downloader here and
+    // the OBB is staged, so this is the arm a device with its data present
+    // takes.
+    UE4_CALL(out, "nativeResumeMainInit", ue4_fn_v);
+}
+
 int kl_ue4_create(FILE *out) {
     if (!g_ue4) return ue4_fail(UE4_LIB " was never loaded");
     if (kl_na_create(g_ue4, "ANativeActivity_onCreate", out) != 0)
         return ue4_fail(UE4_LIB " exports no ANativeActivity_onCreate");
+    // After the super call, exactly as GameActivity.onCreate does it: the
+    // activity's own body runs on the UI thread while the game thread it just
+    // spawned is already spinning.
+    kl_ue4_java_create(out);
     return 0;
 }
 
-void kl_ue4_start(FILE *out) { kl_na_start(out); }
+void kl_ue4_start(FILE *out) {
+    kl_na_start(out);
+    kl_ue4_java_resume(out);
+}
 void kl_ue4_stop(FILE *out)  { kl_na_stop(out); }
 
 double kl_ue4_pump(double seconds, const volatile int *quit) {
@@ -194,6 +398,13 @@ double kl_ue4_pump(double seconds, const volatile int *quit) {
 
 void kl_ue4_report(FILE *out) {
     if (!out) return;
+    // Who is blocked on what, first — this guest owns its own threads and its
+    // own frame loop, so unlike the Unity path there is no return value that
+    // says "the engine stopped". A UE4 run that produced no frames looks
+    // exactly like one that produced frames until the reports are read, and
+    // the mutex owner map is the one instrument that separates "still working"
+    // from "two of its threads are waiting on each other".
+    kl_pthread_report(out);
     kl_egl_report(out);
     kl_opensl_report(out);
     kl_aaudio_report(out);

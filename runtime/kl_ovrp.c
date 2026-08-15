@@ -238,6 +238,200 @@ static uint64_t klovrp_no(const char *name) {
 }
 
 // ---------------------------------------------------------------------------
+// Has the guest initialised the plugin yet?
+//
+// This is STATE, not a capability, and it is the one predicate in this file
+// whose right answer changes during a run. It used to sit in g_ovrp_bool_yes
+// under "we answered ovrp_Initialize5 with success and stand behind it", which
+// is true of every moment AFTER the guest calls Initialize — and Unity always
+// does call it first (measured: libOculusXRPlugin issues ovrp_Initialize7
+// seventh and ovrp_GetInitialized twelfth), so for four targets the constant
+// and the state were the same number.
+//
+// UE4 asks in the opposite order, and it is not a poll — it is the GATE:
+//
+//     bool FOculusHMD::InitDevice()
+//     {
+//         if (ovrp_GetInitialized())
+//             return true;              // "already created and present"
+//         ...
+//         LoadFromSettings();
+//         if (!InitializeSession()) ...   // <- ovrp_Initialize5 lives in here
+//         ...                             // <- and so does the whole eye layer
+//     }
+//
+// (`libUE4.so+0x5c343f0`: `blr x8; cbz w0, +0x50; mov w20, #1` — the yes arm
+// returns straight out.) So a constant yes told RE4 the HMD was already up,
+// InitDevice returned success having built nothing, ovrp_Initialize5 was never
+// called at all, and the engine walked on to ask that HMD for its eye render
+// target — where `FOculusHMD::AllocateRenderTargetTexture` reads
+// `EyeLayer_RenderThread->GetSwapChain()` with no null check and takes a
+// SIGSEGV at 0x270 on a guest worker thread, four function calls and one
+// thread from the answer that caused it.
+//
+// The state costs nothing to keep and is what the real plugin reports, so it is
+// kept. Set by Initialize5/7, cleared by the Shutdown pair.
+static int g_ovrp_initialized;
+
+static uint64_t klovrp_GetInitialized(void) {
+    ovrp_hit("ovrp_GetInitialized");
+    return g_ovrp_initialized ? OVRP_TRUE : 0;
+}
+
+// Bring-up, and the decision recorded in PLANNING M6: we answer success and
+// stand behind it rather than reporting a failure the guest would be right to
+// believe. Both numbered forms exist because trap 10's whole shape is a
+// numbered variant answering something different under a familiar name —
+// Initialize7 is the ABI revision 1.40's libOculusXRPlugin actually calls (it
+// resolves 5, 6 and 7 and uses the highest by construction), and RE4's UE4
+// plugin calls 5. Same answer either way; the only thing that changed is that
+// the answer is now RECORDED, so ovrp_GetInitialized can tell the truth.
+static uint64_t klovrp_Initialize(const char *name) {
+    ovrp_hit(name);
+    g_ovrp_initialized = 1;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_Initialize5(void) { return klovrp_Initialize("ovrp_Initialize5"); }
+static uint64_t klovrp_Initialize7(void) { return klovrp_Initialize("ovrp_Initialize7"); }
+
+// ...and the other end: the guest saying the plugin is down. ovrp_Shutdown is
+// the ovrpBool wrapper (`!(result < 0)`) and answered yes before this change,
+// so the answer is unchanged and only the record is new — a GetInitialized that
+// still said yes afterwards would send a guest that re-enters InitDevice
+// straight back into the fault above. ovrp_Shutdown2, the ovrpResult form, is
+// deliberately NOT implemented here: nothing has ever called it, and an
+// abort-by-name is how this project finds out that something does.
+static uint64_t klovrp_Shutdown(void) {
+    ovrp_hit("ovrp_Shutdown");
+    g_ovrp_initialized = 0;
+    return OVRP_TRUE;
+}
+
+// Who is driving. UE4's OculusHMD calls this immediately after Initialize5,
+// with "UnrealEngine" and the engine version, and it is the first thing in this
+// project ever to say which ENGINE a guest is — worth printing once rather than
+// dropping, because a version string read off the running guest is a fact no
+// unpacked tree states in one place.
+//
+// Recorded, not applied: there is nothing on this host that behaves differently
+// for one engine than another. The shape is read out of RE4's own
+// libOVRPlugin.so (+0x2fb7c) rather than inferred: ovrpResult, **-1001 if
+// EITHER string is NULL** (two `cbz`es against a pre-loaded w19), -1002 with no
+// singleton, and the third argument an ovrpBool the body passes straight
+// through. The unsuffixed sibling at +0x36990 is the usual ovrpBool wrapper
+// (`lsr w8, w0, #31; eor w0, w8, #1`) — trap 10's pair shape, so it gets its own
+// handler rather than sharing this one.
+static int64_t klovrp_engine_info(const char *name, const char *version,
+                                  uint64_t is_editor) {
+    if (!name || !version) return -1001;
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [ovrp] engine: %s %s%s\n", name, version,
+                (is_editor & 1) ? " (editor)" : "");
+    }
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_SetAppEngineInfo2(const char *name, const char *version,
+                                         uint64_t is_editor) {
+    ovrp_hit("ovrp_SetAppEngineInfo2");
+    return (uint64_t)klovrp_engine_info(name, version, is_editor);
+}
+static uint64_t klovrp_SetAppEngineInfo(const char *name, const char *version,
+                                        uint64_t is_editor) {
+    ovrp_hit("ovrp_SetAppEngineInfo");
+    return klovrp_engine_info(name, version, is_editor) < 0 ? 0 : OVRP_TRUE;
+}
+
+// The two per-frame "should the app tear itself down?" predicates, in their
+// ovrpResult + out-param form. Their un-suffixed siblings already answer NO
+// through g_ovrp_bool_no ("events that must never fire on a healthy run"), and
+// this is the same answer through the other ABI: the real bodies (+0x2f924 and
+// +0x2f9dc) NULL-check the pointer for -1001, take -1002 with no singleton, and
+// otherwise store `result & 1` and return 0. Nothing here asks the app to quit
+// and nothing recreates a distortion window, so both are 0 — and the out-param
+// is what the caller reads, so a scalar-return implementation of these would be
+// trap 10b: a `tbnz` on whatever was in the caller's stack slot.
+static uint64_t klovrp_GetAppShouldQuit2(int *out) {
+    ovrp_hit("ovrp_GetAppShouldQuit2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = 0;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_GetAppShouldRecreateDistortionWindow2(int *out) {
+    ovrp_hit("ovrp_GetAppShouldRecreateDistortionWindow2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = 0;
+    return OVRP_SUCCESS;
+}
+
+// How many samples the DEVICE recommends for the eye render target. Same shape
+// (+0x317f8: -1001 on NULL, -1002 with no singleton, else store and return 0),
+// and the value is the Quest 2's, for the reason Build.MODEL says Quest 2 and
+// ovrp_GetSystemHeadsetType2 answers 9: this is a property of the device we
+// present, and answering something else here while claiming that device
+// everywhere else is the display-panel group answer disagreeing with itself.
+//
+// It is a RECOMMENDATION, not a constraint — UE4 consults it only when the
+// project asks for the device default — so the sample count the eye layer is
+// actually built with still arrives in ovrp_CalculateEyeLayerDesc2 and is the
+// guest's own number. KL_OVRP_MSAA overrides it, because the first thing to try
+// if a multisampled eye layer turns out to be a problem is 1, and that is a
+// measurement rather than a redefinition of the headset.
+static uint64_t klovrp_GetSystemRecommendedMSAALevel2(int *out) {
+    ovrp_hit("ovrp_GetSystemRecommendedMSAALevel2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = (int)kl_env_int("KL_OVRP_MSAA", 4);
+    return OVRP_SUCCESS;
+}
+
+// How long the GPU took on the last frame, in seconds. We do not measure it,
+// and the failure is the honest answer: this is fed to adaptive resolution, so
+// a fabricated 0 reads as "the GPU is idle" and is an instruction to render
+// more. The real plugin (+0x31a84) returns the backend's own negative here when
+// there is no timer, so a failing return is a path the guest already has.
+//
+// The out-param IS written, which the real one's failure path does not do, and
+// that is deliberate: on a Quest this call succeeds, so a caller that reads the
+// float without checking the result is a bug no real device would ever expose
+// (trap 10b, from the other side). Zero is what such a caller gets instead of
+// whatever was in its stack slot; a caller that checks never sees it.
+static uint64_t klovrp_GetGPUFrameTime(float *out) {
+    ovrp_hit("ovrp_GetGPUFrameTime");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    *out = 0.0f;
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+// Mixed-reality capture, refused. `ovrp_GetMixedRealityInitialized` beside this
+// has always answered false, and the two have to agree: the real plugin's
+// GetMixedRealityInitialized (+0x34b38) is a plain read of the byte
+// InitializeMixedReality sets, so answering success here and false there
+// describes a plugin that initialised MRC and then forgot. There is no capture
+// camera on this host and no composite path behind it.
+static uint64_t klovrp_InitializeMixedReality(void) {
+    ovrp_hit("ovrp_InitializeMixedReality");
+    return OVRP_FAIL_UNSUPPORTED;
+}
+
+// Chromatic-aberration correction. Both halves are `return GetInitialized()`
+// stubs in the real plugin — the correction moved compositor-side and the entry
+// points survive for ABI only — so they read the same flag rather than a
+// constant, which is the real library's own body. The setter IGNORES its
+// argument; that is the real one's behaviour too (SUPERHOT's libOVRPlugin.so
+// +0x29f4c is `bl ovrp_GetInitialized; cmp w0, #0; cset w0, ne; ret`), and
+// answering ovrpResult's 0 here would read to the caller as false, i.e. trap 10.
+static uint64_t klovrp_GetAppChromaticCorrection(void) {
+    ovrp_hit("ovrp_GetAppChromaticCorrection");
+    return g_ovrp_initialized ? OVRP_TRUE : 0;
+}
+static uint64_t klovrp_SetAppChromaticCorrection(uint64_t on) {
+    (void)on;
+    ovrp_hit("ovrp_SetAppChromaticCorrection");
+    return g_ovrp_initialized ? OVRP_TRUE : 0;
+}
+
+// ---------------------------------------------------------------------------
 // The synthetic headset
 //
 // One coherent device description, for the reason the display group in kl_jni.c
@@ -489,10 +683,16 @@ static uint64_t klovrp_GetNodeOrientationTracked2(int node, int *out) {
 // return is only safely handled if the guest happens to tolerate it, and a
 // plausible static nominal is harmless telemetry either way (leaving *out
 // untouched would read as 0 C, a value nobody sent).
+//
+// The nominal is a seam rather than a literal for the same reason the level is:
+// UE4's BatteryReceiver dispatches a temperature alongside the level and the
+// charging status, so two constants would be two temperatures for one battery.
+int kl_ovrp_battery_temperature(void) { return 20; }
+
 static uint64_t klovrp_GetSystemBatteryTemperature2(int *out) {
     ovrp_hit("ovrp_GetSystemBatteryTemperature2");
     if (!out) return -1001;
-    *out = 20;   // nominal °C — no temperature sensor is presented
+    *out = kl_ovrp_battery_temperature();   // nominal °C — no sensor is presented
     return OVRP_SUCCESS;
 }
 
@@ -3138,9 +3338,7 @@ static uint64_t klovrp_SetControllerHapticsPcm(int controller, const void *vib) 
 // selector between two fixed Touch motor rates; a Sense controller's second
 // axis is CoreHaptics *sharpness*, which is not the same quantity, and there is
 // no measurement here that would justify a mapping between them.
-static uint64_t klovrp_SetControllerVibration(int mask, float frequency,
-                                              float amplitude) {
-    ovrp_hit("ovrp_SetControllerVibration");
+static void klovrp_vibration(int mask, float frequency, float amplitude) {
     int hands = klovrp_hap_hands(mask);
     static float lapse = -1.0f;
     if (lapse < 0.0f) lapse = kl_env_float("KL_HAPTICS_VIB_LAPSE", 2.0f);
@@ -3165,7 +3363,24 @@ static uint64_t klovrp_SetControllerVibration(int mask, float frequency,
                     hand, a > 0.0f ? "on" : "off",
                     (double)frequency, (double)a);
     }
-    return 1;
+}
+
+// ...and the two ABIs over it. The un-suffixed form answers ovrpBool and the
+// ...2 form (real body +0x2f164) answers ovrpResult — trap 10's whole shape, so
+// they are two wrappers rather than one table entry listed twice. The ARGUMENTS
+// are identical: +0x2f164 forwards only w0 and leaves s0/s1 exactly where the
+// caller put them, so the frequency and amplitude reach the backend untouched.
+static uint64_t klovrp_SetControllerVibration(int mask, float frequency,
+                                              float amplitude) {
+    ovrp_hit("ovrp_SetControllerVibration");
+    klovrp_vibration(mask, frequency, amplitude);
+    return OVRP_TRUE;
+}
+static uint64_t klovrp_SetControllerVibration2(int mask, float frequency,
+                                               float amplitude) {
+    ovrp_hit("ovrp_SetControllerVibration2");
+    klovrp_vibration(mask, frequency, amplitude);
+    return OVRP_SUCCESS;
 }
 
 // ovrpHapticsState is { int SamplesAvailable; int SamplesQueued; } — 8 bytes,
@@ -3173,8 +3388,7 @@ static uint64_t klovrp_SetControllerVibration(int mask, float frequency,
 // sit in the answer-zero list, which reads as "no room, nothing queued": the
 // managed side clamps what it sends to SamplesAvailable, so zero room meant it
 // never sent anything at all.
-static uint64_t klovrp_GetControllerHapticsState(int mask) {
-    ovrp_hit("ovrp_GetControllerHapticsState");
+static uint64_t klovrp_hap_state_packed(int mask) {
     int hands = klovrp_hap_hands(mask);
     int hand = (hands & 1) ? 0 : 1;          // one hand per call, left first
     struct klovrp_haptics *h = &g_hap[hand];
@@ -3192,11 +3406,14 @@ static uint64_t klovrp_GetControllerHapticsState(int mask) {
     return (uint64_t)lo | ((uint64_t)hi << 32);
 }
 
+static uint64_t klovrp_GetControllerHapticsState(int mask) {
+    ovrp_hit("ovrp_GetControllerHapticsState");
+    return klovrp_hap_state_packed(mask);
+}
+
 // 24-byte ovrpHapticsDesc by value via x8. See the block comment above for why
 // every field of this matters and why zeroing it silenced the whole path.
-uint64_t klovrp_GetControllerHapticsDesc_impl(int mask, void *out) {
-    ovrp_hit("ovrp_GetControllerHapticsDesc");
-    (void)mask;                                  // one controller model, both hands
+static void klovrp_hap_desc_fill(void *out) {
     int32_t *d = out;
     d[0] = KLOVRP_HAP_RATE;                      // SampleRateHz
     d[1] = 1;                                    // SampleSizeInBytes
@@ -3204,6 +3421,43 @@ uint64_t klovrp_GetControllerHapticsDesc_impl(int mask, void *out) {
     d[3] = KLOVRP_HAP_MINBUF;                    // MinimumBufferSamplesCount
     d[4] = KLOVRP_HAP_OPTIMAL;                   // OptimalBufferSamplesCount
     d[5] = KLOVRP_HAP_MAX;                       // MaximumBufferSamplesCount
+}
+
+uint64_t klovrp_GetControllerHapticsDesc_impl(int mask, void *out) {
+    ovrp_hit("ovrp_GetControllerHapticsDesc");
+    (void)mask;                                  // one controller model, both hands
+    klovrp_hap_desc_fill(out);
+    return OVRP_SUCCESS;
+}
+
+// ...and the ...2 forms of both, which UE4 is the first guest here to call.
+// Same questions, different ABI, and the difference is exactly trap 10b: where
+// the un-suffixed pair return the struct (the desc through x8, the 8-byte state
+// in x0), these take an OUT POINTER and return ovrpResult. Read out of RE4's
+// own libOVRPlugin.so (+0x2f1a8 and +0x2f1e8): both `cbz` the pointer for
+// -1001, take -1002 with no singleton, and otherwise TAIL-CALL the same backend
+// method the un-suffixed form reaches — so the values are the same values, and
+// answering them from anywhere but the shared body would be two descriptions of
+// one controller.
+//
+// A struct-returning implementation under these names would have left the
+// caller's buffer untouched and answered a success code, which is the shape
+// that cost `ovrp_GetVersion2` a session: a strlen of a stack slot nobody
+// wrote, naming nothing.
+static uint64_t klovrp_GetControllerHapticsDesc2(int mask, void *out) {
+    ovrp_hit("ovrp_GetControllerHapticsDesc2");
+    (void)mask;                                  // one controller model, both hands
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    klovrp_hap_desc_fill(out);
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_GetControllerHapticsState2(int mask, void *out) {
+    ovrp_hit("ovrp_GetControllerHapticsState2");
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    uint64_t packed = klovrp_hap_state_packed(mask);
+    int32_t *s = out;
+    s[0] = (int32_t)(uint32_t)packed;            // SamplesAvailable
+    s[1] = (int32_t)(uint32_t)(packed >> 32);    // SamplesQueued
     return OVRP_SUCCESS;
 }
 
@@ -4609,6 +4863,22 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetMesh",  (void *)klovrp_hand_unsupported},
     {"ovrp_GetInstanceExtensionsVk", (void *)klovrp_GetInstanceExtensionsVk},
     {"ovrp_GetDeviceExtensionsVk",   (void *)klovrp_GetDeviceExtensionsVk},
+    // The init state and everything that reads it. See klovrp_GetInitialized.
+    {"ovrp_Initialize5",   (void *)klovrp_Initialize5},
+    {"ovrp_Initialize7",   (void *)klovrp_Initialize7},
+    {"ovrp_GetInitialized", (void *)klovrp_GetInitialized},
+    {"ovrp_Shutdown",      (void *)klovrp_Shutdown},
+    {"ovrp_GetAppChromaticCorrection", (void *)klovrp_GetAppChromaticCorrection},
+    {"ovrp_SetAppChromaticCorrection", (void *)klovrp_SetAppChromaticCorrection},
+    {"ovrp_SetAppEngineInfo",  (void *)klovrp_SetAppEngineInfo},
+    {"ovrp_SetAppEngineInfo2", (void *)klovrp_SetAppEngineInfo2},
+    {"ovrp_GetAppShouldQuit2", (void *)klovrp_GetAppShouldQuit2},
+    {"ovrp_GetAppShouldRecreateDistortionWindow2",
+     (void *)klovrp_GetAppShouldRecreateDistortionWindow2},
+    {"ovrp_GetSystemRecommendedMSAALevel2", (void *)klovrp_GetSystemRecommendedMSAALevel2},
+    {"ovrp_GetGPUFrameTime",   (void *)klovrp_GetGPUFrameTime},
+    {"ovrp_InitializeMixedReality", (void *)klovrp_InitializeMixedReality},
+    {"ovrp_SetControllerVibration2", (void *)klovrp_SetControllerVibration2},
     {"ovrp_GetVersion",   (void *)klovrp_GetVersion},
     {"ovrp_GetVersion2",   (void *)klovrp_GetVersion2},
     {"ovrp_GetNativeSDKVersion",  (void *)klovrp_GetNativeSDKVersion},
@@ -4706,6 +4976,8 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     // the guest's buffer, the state paces it, and only then does it ever call
     // the setter. See the block comment above klovrp_SetControllerHaptics.
     {"ovrp_GetControllerHapticsState", (void *)klovrp_GetControllerHapticsState},
+    {"ovrp_GetControllerHapticsDesc2", (void *)klovrp_GetControllerHapticsDesc2},
+    {"ovrp_GetControllerHapticsState2", (void *)klovrp_GetControllerHapticsState2},
     {"ovrp_SetControllerHaptics", (void *)klovrp_SetControllerHaptics},
     {"ovrp_SetControllerVibration", (void *)klovrp_SetControllerVibration},
     // ...and 1.40's own pair, which libhaptics_sdk resolves directly. Both, or
@@ -4747,12 +5019,10 @@ static const char *const g_ovrp_result_ok[] = {
     // THIS host this is always the first call). Numbered variants are listed
     // rather than matched by prefix — trap 10's whole shape is a numbered
     // variant that returns something DIFFERENT under a familiar name.
-    "ovrp_PreInitialize", "ovrp_PreInitialize3", "ovrp_Initialize5",
-    // ovrp_Initialize7 is the ABI revision 1.40's libOculusXRPlugin actually
-    // calls (it resolves 5, 6 and 7 and uses the highest by construction — its
-    // own real library is a relay that stacks more args onto a common impl).
-    // Same answer as Initialize5: success, standing behind it.
-    "ovrp_Initialize7",
+    // ovrp_Initialize5 and ovrp_Initialize7 answer the same success and have
+    // moved to real implementations, because the answer has to be RECORDED —
+    // see klovrp_GetInitialized.
+    "ovrp_PreInitialize", "ovrp_PreInitialize3",
     // Configuration the guest sets and never reads back.
     "ovrp_SetAppAsymmetricFov",
     // Called with an out-pointer (void**) it may write; libunity pre-zeroes
@@ -4771,6 +5041,22 @@ static const char *const g_ovrp_result_ok[] = {
     // Thread-scheduling hints from PlayerSettings, set once at init; void
     // configuration like the setters above.
     "ovrp_AutoThreadScheduling", "ovrp_SetThreadPerformance",
+    // ...and UE4's, which pushes one more of them (ovrp_SetAppCPUPriority2)
+    // beside the CPU/GPU levels the Unity guests set. Same class: a hint, and
+    // there is nothing on this host that acts on it.
+    "ovrp_SetAppCPUPriority2",
+    // Fixed-foveation level and its dynamic flag. We answer
+    // ovrp_GetTiledMultiResSupported false and mean it — the foveation on this
+    // host is the compositor's MTLRasterizationRateMap, which is not the thing
+    // this switch controls — but a setter that REFUSES is a different statement
+    // from an unsupported capability, and UE4 pushes both unconditionally
+    // during InitializeSession. Recorded, like every other setter here. The
+    // real bodies (+0x31918, +0x319a8) are the standard -1002-or-backend shape.
+    "ovrp_SetTiledMultiResLevel", "ovrp_SetTiledMultiResDynamic",
+    // Whether recentring the controller also recentres the head. Nothing here
+    // recentres either, so this is recorded state with nothing behind it — and
+    // its getter already answers through the same silence.
+    "ovrp_SetReorientHMDOnControllerRecenter",
     // Called even with texture-array support answered 0 — recorded state,
     // like the other setters.
     "ovrp_SetEyeTextureArrayEnabled",
@@ -4846,10 +5132,10 @@ static const char *const g_ovrp_bool_yes[] = {
     // from the game's own C# (not libunity's node loop) landed on the
     // unimplemented trampoline and aborted the run.
     "ovrp_GetNodePositionTracked", "ovrp_GetNodeOrientationTracked",
-    // We answered ovrp_Initialize5 with success and stand behind it.
-    // NOT ovrp_GetAppHasInputFocus — that one is ovrpResult + out-param, see
-    // klovrp_GetAppHasInputFocus below.
-    "ovrp_GetInitialized",
+    // ovrp_GetInitialized is NOT here any more — it is STATE, and it moved to a
+    // real implementation for the reason klovrp_GetInitialized records. (Nor is
+    // ovrp_GetAppHasInputFocus, for a different reason: that one is ovrpResult +
+    // out-param, see klovrp_GetAppHasInputFocus below.)
     // Agrees with ovrp_Media_Initialize's success above.
     "ovrp_Media_GetInitialized",
     // The tracking-capability block, which OVRManager reads while it builds a
@@ -4867,28 +5153,13 @@ static const char *const g_ovrp_bool_yes[] = {
     "ovrp_GetTrackingIPDEnabled",
     "ovrp_SetTrackingPositionEnabled",   "ovrp_SetTrackingOrientationEnabled",
     "ovrp_SetTrackingIPDEnabled",
-    // Chromatic-aberration correction. Both halves are `return GetInitialized()`
-    // stubs in the real plugin (the correction moved compositor-side and the
-    // entry points survive for ABI only), so the bool-yes is the real library's
-    // own answer rather than an invention — and ignoring the coefficients is
-    // safe because the real stub ignores them too.
-    "ovrp_GetAppChromaticCorrection",
     // Recorded state, like the setters above: there is no boundary here to show
     // or hide, but refusing the call would desync the guest from the coherent
     // "no guardian" story the getters tell.
     "ovrp_SetBoundaryVisible",
-    // The quit path's answer that we initialised fine (bool: `!(result < 0)`).
-    "ovrp_Shutdown",
-    // A setter that answers ovrpBOOL, which is not what a setter next to it
-    // does — ovrp_SetAppAsymmetricFov two hundred bytes away in the same real
-    // library returns ovrpResult 0. Read out of SUPERHOT's own libOVRPlugin.so
-    // (+0x29f4c) rather than inferred from the name: the whole body is
-    // `bl ovrp_GetInitialized; cmp w0, #0; cset w0, ne; ret`. It IGNORES its
-    // argument — there is no per-app chromatic correction to set on this
-    // hardware — and answers whether the plugin came up, so with
-    // ovrp_Initialize5 answered success this is 1. Answering ovrpResult's 0
-    // here would read to the caller as false, which is trap 10 exactly.
-    "ovrp_SetAppChromaticCorrection",
+    // ovrp_Shutdown and the chromatic-correction pair have moved to real
+    // implementations too — all three are `GetInitialized()` in the real
+    // library, which is now a variable rather than a constant here.
 };
 
 static const char *const g_ovrp_bool_no[] = {

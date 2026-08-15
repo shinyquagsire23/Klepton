@@ -633,8 +633,16 @@ static const char *const g_plat_request_prefix[] = {
 //   ovr_Log_NewEvent(name, ovrKeyValuePair *, count) — analytics. Telemetry
 //     with no service behind it goes nowhere, and a headset that is not
 //     attached to an Oculus account has nowhere to send it anyway.
+//   ovr_Voip_SetMicrophoneMuted(ovrVoipMuteState) — the local mic gate for
+//     in-game voice chat. RE4's OculusPlatform module pushes it during startup.
+//     Nothing here captures audio at all — kl_aaudio refuses capture streams by
+//     design and no microphone is presented — so there is no stream to mute and
+//     nothing the guest can learn from the call. It is deliberately NOT filed
+//     with the enumeration-answers-none group: those state an absence, and this
+//     one is a command with no reply.
 static const char *const g_plat_drop[] = {
     "ovr_Log_NewEvent",
+    "ovr_Voip_SetMicrophoneMuted",
 };
 
 static int plat_is_drop(const char *name) {
@@ -744,6 +752,27 @@ static int plat_is_request(const char *name) {
     return 0;
 }
 
+// Who is signed in — the C SDK's synchronous accessor, not a request. It
+// returns an `ovrID`, and 0 is that type's own "no such user": the managed side
+// spells the same thing `User == null`, and every caller of it null-checks,
+// because a user really can be absent on a real headset (offline, or before the
+// platform has initialized).
+//
+// Not an ownership question and not a request, so neither classifier is right
+// for it: `ovr_User_GetLoggedInUser` beside them is the ASYNC form and correctly
+// answers "the request could not be made", while this one is asked and answered
+// on the spot. RE4 asks during engine init.
+static uint64_t klplat_GetLoggedInUserID(void) {
+    plat_hit("ovr_GetLoggedInUserID");
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [plat] ovr_GetLoggedInUserID -> 0 (no platform user; "
+                        "there is no service here to be signed in to)\n");
+    }
+    return 0;
+}
+
 // The real libovrplatformloader exports JNI_OnLoad and caches the JavaVM out of
 // it. Ours has no JNI surface to set up, so the whole body is the version
 // number Android checks for.
@@ -766,6 +795,7 @@ static uint64_t klplat_JNI_OnLoad(void *vm, void *reserved) {
 static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"JNI_OnLoad",                (void *)klplat_JNI_OnLoad},
     {"ovr_IsPlatformInitialized", (void *)klplat_IsPlatformInitialized},
+    {"ovr_GetLoggedInUserID",     (void *)klplat_GetLoggedInUserID},
     {"ovr_UnityInitWrapper",      (void *)klplat_UnityInitWrapper},
     {"ovr_PopMessage",            (void *)klplat_PopMessage},
     {"ovr_FreeMessage",           (void *)klplat_FreeMessage},

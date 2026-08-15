@@ -368,6 +368,12 @@ void kl_ovrp_set_battery_level(int level);     // 0..100, clamped
 int  kl_ovrp_battery_level(void);
 void kl_ovrp_set_battery_charging(int charging);
 int  kl_ovrp_battery_charging(void);
+// ...and the third field of the same telemetry, in whole degrees Celsius. There
+// is no sensor here, so it is a nominal — but it is read through a getter for
+// the reason above: UE4's BatteryReceiver dispatches status, level and
+// temperature in one call, so a literal restated there would be a second
+// battery.
+int  kl_ovrp_battery_temperature(void);
 
 // The predicted display time (seconds) the guest is told the next frame will
 // be shown. It drives timewarp — the guest predicts the head pose at the time

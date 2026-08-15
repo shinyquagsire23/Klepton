@@ -82,7 +82,6 @@
         if (nf < KL_MAX_SYNC) tab##_free[nf] = idx;                              \
     }
 
-SYNC_TABLE(pthread_cond_t,   g_cnd, g_cnd_n, pthread_cond_init(fresh, NULL))
 SYNC_TABLE(pthread_rwlock_t, g_rwl, g_rwl_n, pthread_rwlock_init(fresh, NULL))
 
 // ---------- mutexes: address-keyed map ----------
@@ -107,6 +106,12 @@ typedef struct {
     _Atomic(pthread_mutex_t *) m;
     _Atomic(void *)      owner;     // owner tracking, dumped by kl_pthread_report
     _Atomic(void *)      locksite;
+    // How deep the current owner is in. Our host mutexes are RECURSIVE, and a
+    // recursive mutex held more than once cannot be handed to
+    // pthread_cond_wait: Darwin's droplock refuses and the wait returns EINVAL
+    // without sleeping, which the guest reads as a spurious wake and retries
+    // forever. Counting is the only way to see that from here.
+    _Atomic(int)         depth;
 } mtx_entry;
 static mtx_entry g_mtx_map[MTX_MAP_SIZE];
 
@@ -121,6 +126,57 @@ static pthread_mutex_t *mtx_make(void) {
     pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(fresh, &a); pthread_mutexattr_destroy(&a);
     return fresh;
+}
+
+// ---------- condition variables: address-keyed, for the mutex map's reason ----
+// Conds used to live in the slot-in-guest-storage table above, and that design
+// aliases two logical objects onto one host object whenever a guest address
+// carries a stale or copied slot index. For mutexes that produced a
+// manufactured deadlock and was fixed by keying on the guest ADDRESS; conds
+// were left behind, and RE4 is where it cost.
+//
+// The failure is worse than a mutex's, because Darwin latches the mutex a
+// condvar is waited on with: two guest condvars sharing one host condvar are
+// waited on with two different host mutexes, the second `pthread_cond_wait`
+// returns EINVAL **without sleeping**, and the guest's `do { wait } while
+// (!triggered)` loop spins forever — starving the thread trying to signal it.
+// It presents as a hang three subsystems away, with the spinning thread
+// reported as asleep. Linux never sees it: NPTL does not latch the mutex.
+//
+// Same shape as the mutex map: create-on-demand, destroy leaks (a host cond is
+// small, and freeing one a guest might still signal is worse), and guest
+// storage is never read or written.
+typedef struct {
+    _Atomic(uintptr_t)       key;
+    _Atomic(pthread_cond_t *) c;
+} cnd_entry;
+static cnd_entry g_cnd_map[MTX_MAP_SIZE];
+
+static pthread_cond_t *cnd_make(void) {
+    pthread_cond_t *fresh = malloc(sizeof *fresh);
+    if (fresh) pthread_cond_init(fresh, NULL);
+    return fresh;
+}
+
+static pthread_cond_t *cnd(void *g) {
+    uintptr_t want = (uintptr_t)g;
+    pthread_cond_t *fresh = NULL;
+    for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {
+        uintptr_t k = atomic_load(&g_cnd_map[i].key);
+        if (k == want) {
+            if (fresh) { pthread_cond_destroy(fresh); free(fresh); }
+            pthread_cond_t *c = atomic_load(&g_cnd_map[i].c);
+            while (!c) { sched_yield(); c = atomic_load(&g_cnd_map[i].c); }
+            return c;
+        }
+        if (k) continue;
+        if (!fresh) fresh = cnd_make();
+        uintptr_t expect = 0;
+        if (!atomic_compare_exchange_strong(&g_cnd_map[i].key, &expect, want))
+            { i--; continue; }
+        atomic_store(&g_cnd_map[i].c, fresh);
+        return fresh;
+    }
 }
 
 // The host mutex behind an entry. Separate from the lookup because the entry
@@ -176,7 +232,6 @@ static mtx_entry *mtx_find(void *g) {
     }
 }
 
-static pthread_cond_t   *cnd(void *g) { return g_cnd_get(g); }
 static pthread_rwlock_t *rwl(void *g) { return g_rwl_get(g); }
 
 // KL_TRACE_MUTEX=1: lifecycle of translated mutexes — init, destroy, and
@@ -195,6 +250,69 @@ static void mtx_log(const char *what, void *g, uint32_t idx) {
 
 // ---------- mutex ----------
 static struct { _Atomic(void *) tid, guest, ra; } g_mtx_waiters[64];
+
+// ...and the same census for threads asleep in a CONDITION wait. They appear
+// nowhere else: a cond wait releases its mutex, so such a thread is neither a
+// holder nor a waiter, and the report could name every blocked thread except
+// the one they were all blocked behind. RE4's engine boot is where that cost
+// real time — two threads named, and the third, the one actually holding the
+// boot open, invisible.
+static struct { _Atomic(void *) tid, cond, guest, ra; } g_cnd_sleepers[64];
+
+static void cnd_sleep_enter(void *c, void *guest, void *ra) {
+    void *self = (void *)pthread_self();
+    for (int i = 0; i < 64; i++) {
+        void *expect = NULL;
+        if (atomic_compare_exchange_strong(&g_cnd_sleepers[i].tid, &expect, self)) {
+            atomic_store(&g_cnd_sleepers[i].cond, c);
+            atomic_store(&g_cnd_sleepers[i].guest, guest);
+            atomic_store(&g_cnd_sleepers[i].ra, ra);
+            return;
+        }
+    }
+}
+// A cond wait that FAILS is always a bug and is otherwise perfectly silent: the
+// guest sees a non-zero return, loops, and waits again — so the symptom is a
+// thread that appears to be sleeping and is in fact spinning, which starves
+// whoever is trying to signal it and reads as a deadlock somewhere else
+// entirely. Named once per (error, site).
+// Which mutex each host cond was last waited on with, indexed by the guest
+// cond's own slot. Darwin latches the mutex into the condvar and refuses a
+// second one with EINVAL; Linux does not, so a guest that reuses one condvar
+// with two mutexes is legal there and fatal here, and this is what tells the
+// two cases apart.
+static _Atomic(void *) g_cnd_mutex[KL_MAX_SYNC];
+
+static _Atomic(void *) *cnd_mutex_slot(void *c) {
+    uint32_t idx = atomic_load((_Atomic uint32_t *)c);
+    return (idx && idx < KL_MAX_SYNC) ? &g_cnd_mutex[idx] : NULL;
+}
+
+static void cnd_wait_failed(int err, void *c, void *m, void *ra, void *was) {
+    if (!err) return;
+    static _Atomic int said;
+    if (atomic_fetch_add(&said, 1) >= 8) return;
+    size_t off = 0;
+    const char *img = kl_addr_image(ra, &off);
+    fprintf(stderr, "  [klb] pthread_cond_wait FAILED: %s (%d) on guest cond %p "
+                    "mutex %p, from ", strerror(err), err, c, m);
+    if (img) fprintf(stderr, "%s+0x%zx", img, off); else fprintf(stderr, "%p", ra);
+    fprintf(stderr, " [held %d deep]", atomic_load(&mtx_entry_for(m)->depth));
+    void *now = (void *)mtx_host(mtx_entry_for(m));
+    if (was && was != now)
+        fprintf(stderr, " — this condvar was last waited on with HOST mutex %p "
+                        "and is now given %p; Darwin refuses a second one", was, now);
+    fprintf(stderr, "\n");
+}
+
+static void cnd_sleep_leave(void) {
+    void *self = (void *)pthread_self();
+    for (int i = 0; i < 64; i++) {
+        void *expect = self;
+        if (atomic_compare_exchange_strong(&g_cnd_sleepers[i].tid, &expect, NULL))
+            return;
+    }
+}
 
 static void mtx_wait_enter(void *guest, void *ra) {
     void *self = (void *)pthread_self();
@@ -260,13 +378,28 @@ static int mtx_null(const char *what) {
 int klb_pthread_mutex_init(void *m, const void *a) {
     (void)a;
     if (!m) return mtx_null("init");
-    // POSIX: init of an existing mutex is UB. Fresh host object either way;
-    // a stale entry's host leaks (it might be held, and freeing is worse).
+    // Re-init of an address we already have a host mutex for KEEPS that mutex.
+    //
+    // It used to install a fresh one, on the reasoning that POSIX calls
+    // re-initialising a live mutex undefined. That is true of the guest's
+    // object and false of ours: a condition variable latches the mutex it is
+    // waited on with, and on Darwin — unlike Linux — presenting a second one
+    // is EINVAL. So swapping the host mutex under a live condvar makes every
+    // later `pthread_cond_wait` fail INSTANTLY without sleeping, which the
+    // guest reads as a spurious wake and retries forever: a thread that looks
+    // asleep, is spinning, and starves the thread trying to signal it.
+    //
+    // RE4 is where it was found. UE4 pools its `FPThreadEvent`s and re-inits
+    // the mutex of a recycled one without re-initing its condvar, so the engine
+    // boot wedged in `FEngineLoop::PreInitPreStartupScreen` with the shader
+    // library's read task waiting on an event nothing could ever trigger.
+    // Keeping the object is also what the address-keyed map already says
+    // everywhere else: a recycled address is the same mutex.
     mtx_entry *e = mtx_entry_for(m);
-    pthread_mutex_t *fresh = mtx_make();
-    atomic_store(&e->m, fresh);
+    if (!atomic_load(&e->m)) atomic_store(&e->m, mtx_make());
     atomic_store(&e->owner, NULL);
     atomic_store(&e->locksite, NULL);
+    atomic_store(&e->depth, 0);
     mtx_log("init", m, (uint32_t)(e - g_mtx_map));
     return 0;
 }
@@ -276,6 +409,7 @@ int klb_pthread_mutex_lock(void *m) {
     mtx_wait_enter(m, __builtin_return_address(0));
     int r = px(pthread_mutex_lock(mtx_host(e)));
     mtx_wait_leave();
+    if (r == 0) atomic_fetch_add(&e->depth, 1);
     if (r == 0) {
         atomic_store(&e->locksite, __builtin_return_address(0));
         atomic_store(&e->owner, (void *)pthread_self());
@@ -285,6 +419,7 @@ int klb_pthread_mutex_lock(void *m) {
 int klb_pthread_mutex_unlock(void *m)  {
     if (!m) return mtx_null("unlock");
     mtx_entry *e = mtx_entry_for(m);
+    atomic_fetch_sub(&e->depth, 1);
     atomic_store(&e->owner, NULL);
     atomic_store(&e->locksite, NULL);
     return px(pthread_mutex_unlock(mtx_host(e)));
@@ -293,6 +428,7 @@ int klb_pthread_mutex_trylock(void *m) {
     if (!m) return mtx_null("trylock");
     mtx_entry *e = mtx_entry_for(m);
     int r = px(pthread_mutex_trylock(mtx_host(e)));
+    if (r == 0) atomic_fetch_add(&e->depth, 1);
     if (r == 0) {
         atomic_store(&e->locksite, __builtin_return_address(0));
         atomic_store(&e->owner, (void *)pthread_self());
@@ -370,10 +506,37 @@ void kl_pthread_report(FILE *out) {
         void *tid = atomic_load(&g_mtx_waiters[i].tid);
         if (!tid) continue;
         const char *nm = thread_name_of(tid);
-        fprintf(out, "  waiter tid %p%s%s%s wants guest %p (from %p)\n", tid,
-                nm ? " [" : "", nm ? nm : "", nm ? "]" : "",
-                atomic_load(&g_mtx_waiters[i].guest),
-                atomic_load(&g_mtx_waiters[i].ra));
+        // The call site, and then the whole stack. A holder without a waiter is
+        // a lock that is merely held; the pair is what says a run is STUCK, and
+        // until both ends were symbolized this report could name the holder's
+        // frames and left the waiter as a bare address in an image the reader
+        // then had to find the load base of by hand.
+        void *ra = atomic_load(&g_mtx_waiters[i].ra);
+        size_t off = 0;
+        const char *img = kl_addr_image(ra, &off);
+        if (img)
+            fprintf(out, "  waiter tid %p%s%s%s wants guest %p (from %s+0x%zx)\n",
+                    tid, nm ? " [" : "", nm ? nm : "", nm ? "]" : "",
+                    atomic_load(&g_mtx_waiters[i].guest), img, off);
+        else
+            fprintf(out, "  waiter tid %p%s%s%s wants guest %p (from %p)\n", tid,
+                    nm ? " [" : "", nm ? nm : "", nm ? "]" : "",
+                    atomic_load(&g_mtx_waiters[i].guest), ra);
+        dump_thread_stack(out, tid);
+    }
+    for (int i = 0; i < 64; i++) {
+        void *tid = atomic_load(&g_cnd_sleepers[i].tid);
+        if (!tid) continue;
+        const char *nm = thread_name_of(tid);
+        void *ra = atomic_load(&g_cnd_sleepers[i].ra);
+        size_t off = 0;
+        const char *img = kl_addr_image(ra, &off);
+        fprintf(out, "  sleeper tid %p%s%s%s in a cond wait on guest cond %p "
+                "(mutex %p) from ", tid, nm ? " [" : "", nm ? nm : "",
+                nm ? "]" : "", atomic_load(&g_cnd_sleepers[i].cond),
+                atomic_load(&g_cnd_sleepers[i].guest));
+        if (img) fprintf(out, "%s+0x%zx\n", img, off); else fprintf(out, "%p\n", ra);
+        dump_thread_stack(out, tid);
     }
 }
 // bionic pthread_mutexattr_t is a plain int holding the type.
@@ -382,8 +545,12 @@ int klb_pthread_mutexattr_destroy(int *a)         { (void)a; return 0; }
 int klb_pthread_mutexattr_settype(int *a, int t)  { *a = t; return 0; }
 
 // ---------- condition variable ----------
-int klb_pthread_cond_init(void *c, const void *a)  { (void)a; g_cnd_recycle(c); cnd(c); return 0; }
-int klb_pthread_cond_destroy(void *p) { g_cnd_recycle(p); return 0; }
+// Init KEEPS an existing host cond for the same address, exactly as
+// klb_pthread_mutex_init does and for the same reason: a guest that re-inits a
+// pooled object must not have the host object swapped under a thread that is
+// already waiting on it.
+int klb_pthread_cond_init(void *c, const void *a)  { (void)a; cnd(c); return 0; }
+int klb_pthread_cond_destroy(void *p) { (void)p; return 0; }
 int klb_pthread_cond_signal(void *c)    { return px(pthread_cond_signal(cnd(c))); }
 int klb_pthread_cond_broadcast(void *c) { return px(pthread_cond_broadcast(cnd(c))); }
 int klb_pthread_cond_wait(void *c, void *m) {
@@ -391,7 +558,15 @@ int klb_pthread_cond_wait(void *c, void *m) {
     // owner table or every sleeper reads as a holder.
     mtx_entry *e = mtx_entry_for(m);
     atomic_store(&e->owner, NULL);
-    int r = px(pthread_cond_wait(cnd(c), mtx_host(e)));
+    cnd_sleep_enter(c, m, __builtin_return_address(0));
+    void *prev_mtx = NULL;
+    { _Atomic(void *) *sl = cnd_mutex_slot(c);
+      if (sl) prev_mtx = atomic_exchange(sl, (void *)mtx_host(e));
+      }
+    int raw = pthread_cond_wait(cnd(c), mtx_host(e));
+    cnd_sleep_leave();
+    cnd_wait_failed(raw, c, m, __builtin_return_address(0), prev_mtx);
+    int r = px(raw);
     atomic_store(&e->locksite, __builtin_return_address(0));
     atomic_store(&e->owner, (void *)pthread_self());
     return r;
@@ -466,7 +641,11 @@ int klb_pthread_cond_timedwait(void *c, void *m, const struct timespec *ts) {
     // owner table or every sleeper reads as a holder.
     mtx_entry *e = mtx_entry_for(m);
     atomic_store(&e->owner, NULL);
-    int r = px(pthread_cond_timedwait(cnd(c), mtx_host(e), ts));
+    cnd_sleep_enter(c, m, __builtin_return_address(0));
+    int raw = pthread_cond_timedwait(cnd(c), mtx_host(e), ts);
+    cnd_sleep_leave();
+    if (raw != ETIMEDOUT) cnd_wait_failed(raw, c, m, __builtin_return_address(0), NULL);
+    int r = px(raw);
     atomic_store(&e->locksite, __builtin_return_address(0));
     atomic_store(&e->owner, (void *)pthread_self());
     return r;

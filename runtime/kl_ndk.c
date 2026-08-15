@@ -338,7 +338,7 @@ static int32_t kl_ANativeWindow_unlockAndPost(kl_native_window *w) { (void)w; re
 // Steam Link reads its assets through the NDK C API where Unity reads them
 // over JNI (see kl_ndk.h). An AAsset is a plain file under the assets root —
 // the unpacked APK tree, which the JNI side (kl_jni.c) also serves from.
-typedef struct { FILE *f; int64_t len; } kl_asset;
+typedef struct { FILE *f; int64_t len; void *buf; char path[1200]; } kl_asset;
 
 static char g_asset_root[1024] = "assets";
 void kl_ndk_set_assets_dir(const char *dir) {
@@ -370,7 +370,48 @@ static void *kl_AAssetManager_open(void *mgr, const char *fname, int mode) {
     a->len = ftello(f);
     fseeko(f, 0, SEEK_SET);
     a->f = f;
+    snprintf(a->path, sizeof a->path, "%s", path);
     return a;
+}
+
+// The whole asset as one pointer. Android can hand back a pointer into the
+// mapped APK because an uncompressed asset is contiguous there; an asset here is
+// a plain file, so this reads it once and caches the buffer on the handle.
+//
+// The lifetime is the ASSET's, in both — the buffer dies with AAsset_close and
+// the caller is not allowed to free it — so matching that exactly is what keeps
+// a leak the guest's rather than ours. UE4 reads UE4CommandLine.txt this way.
+static const void *kl_AAsset_getBuffer(kl_asset *a) {
+    if (!a || !a->f) return NULL;
+    if (a->buf) return a->buf;
+    if (a->len < 0) return NULL;
+    void *buf = malloc((size_t)a->len + 1);
+    if (!buf) return NULL;
+    off_t was = ftello(a->f);
+    fseeko(a->f, 0, SEEK_SET);
+    size_t got = fread(buf, 1, (size_t)a->len, a->f);
+    fseeko(a->f, was, SEEK_SET);
+    ((char *)buf)[got] = '\0';
+    a->buf = buf;
+    return a->buf;
+}
+
+// ...and the same asset as a file descriptor plus a window into it. Android
+// answers with a descriptor onto the APK and a non-zero offset, which is why the
+// out-parameters exist at all; here every asset is its own file, so the window
+// is the whole of it. Refused for a compressed asset on Android — nothing here
+// is compressed, so this never takes that arm.
+//
+// Both out-parameters are WRITTEN on success and left alone on failure, which is
+// trap 10b's rule: a caller that reads an out-parameter we never wrote is
+// reading its own uninitialised stack.
+static int kl_AAsset_openFileDescriptor(kl_asset *a, int64_t *out_start, int64_t *out_len) {
+    if (!a || !a->path[0]) return -1;
+    int fd = open(a->path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    if (out_start) *out_start = 0;
+    if (out_len)   *out_len   = a->len;
+    return fd;
 }
 
 static int kl_AAsset_read(kl_asset *a, void *buf, size_t count) {
@@ -385,6 +426,7 @@ static int64_t kl_AAsset_seek64(kl_asset *a, int64_t off, int whence) {
 static void kl_AAsset_close(kl_asset *a) {
     if (!a) return;
     if (a->f) fclose(a->f);
+    free(a->buf);
     free(a);
 }
 // The 32-bit spelling. Both exist in the NDK and the newer SDL3 in the VR build
@@ -647,6 +689,8 @@ static const struct { const char *name; void *fn; } g_ndk[] = {
     N("AAsset_seek64",          kl_AAsset_seek64),
     N("AAsset_close",           kl_AAsset_close),
     N("AAsset_getLength",       kl_AAsset_getLength),
+    N("AAsset_getBuffer",       kl_AAsset_getBuffer),
+    N("AAsset_openFileDescriptor", kl_AAsset_openFileDescriptor),
     N("AAssetManager_openDir",  kl_AAssetManager_openDir),
     N("AAssetDir_getNextFileName", kl_AAssetDir_getNextFileName),
     N("AAssetDir_close",        kl_AAssetDir_close),

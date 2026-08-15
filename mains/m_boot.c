@@ -228,6 +228,79 @@ static const char *metadata_path(char *buf, size_t n) {
     return buf;
 }
 
+// The guest's frame, read back through Metal — the P5 gate, and it belongs to
+// the RUN rather than to the Unity lifecycle it used to be nested inside.
+// Every non-Unity door reaches the eye textures the same way (kl_glfb's eye
+// table), so a driver that stops before this reports a working pipeline as
+// nothing at all — the same shape as m_boot never calling kl_mediandk_report.
+static void report_eye_interop(void) {
+    if (!kl_glfb_has_mtl_provider() && !kl_glfb_eye_mtl_texture(0, 0, NULL)) return;
+    printf("\n=== P5 interop: the guest's frame, read back through Metal ===\n");
+    // P5.3's gate. Not "did the interop bind" — that is reported when it
+    // happens — but "did the guest's rendering arrive in the MTLTexture".
+    // The lit count uses the same luma threshold as kl_glfb's capture, so
+    // it is directly comparable with the reference path's number: the two
+    // should agree, and a lit reference frame beside a black interop one
+    // means the binding took and the rendering went elsewhere.
+    // ...and it fires for an eye MTLTexture that arrived any way at
+    // all, not just through a registered provider. On the VULKAN path
+    // there IS no provider: MoltenVK backs the guest's eye VkImage with
+    // a texture of its own and kl_vulkan.c publishes that one
+    // (kl_glfb_note_eye_mtl_texture), so a provider test would have
+    // skipped the only guest whose compositor wiring is new.
+    // Under the viewer's hardware compositor there IS no reference:
+    // registering a GPU fence replaces the readback, so kl_glfb has
+    // counted nothing and a bare 0 here would read as a black frame.
+    if (!kl_glfb_has_mtl_provider())
+        printf("  reference: KL_VK_OUT — on the Vulkan path the eye "
+               "is read back from the VkImage, and this is the SAME "
+               "storage seen as Metal\n");
+    else if (kl_glfb_has_gpu_fence())
+        printf("  reference: none — the GPU compositor is driving, "
+               "so nothing was read back\n");
+    else
+        printf("  reference (glReadPixels, kl_glfb): %lu lit\n",
+               kl_glfb_last_frame_lit());
+    // EVERY stage, not stage 0. This used to read and dump stage 0
+    // alone while the compositors show
+    // kl_ovrp_last_complete_stage() — so on a guest whose swapchain
+    // has more than one image the PNG and the screen are DIFFERENT
+    // PICTURES, and the readback can report a perfect frame for
+    // something nobody is looking at. That is trap 43's family: an
+    // instrument answering confidently about the wrong subject.
+    // Open Brush is where it bit (3 OpenXR swapchain images).
+    int shown = kl_ovrp_last_complete_stage();
+    int stages = kl_ovrp_stage_count();
+    if (stages < 1) stages = 1;
+    printf("  the compositors show stage %d (kl_ovrp_last_complete_stage)"
+           "%s\n", shown,
+           shown < 0 ? " — nothing filed, so they fall back to stage 0" : "");
+    for (int eye = 0; eye < 2; eye++) {
+        for (int st = 0; st < stages; st++) {
+            int w = 0, h = 0;
+            if (!kl_glfb_eye_mtl_texture(eye, st, NULL)) continue;
+            unsigned long lit = kl_mtl_count_lit(eye, st, &w, &h);
+            unsigned long n = w && h ? ((unsigned long)((w + 7) / 8)
+                                      * (unsigned long)((h + 7) / 8)) : 0;
+            printf("  eye %d stage %d MTLTexture %dx%d: %lu/%lu lit, "
+                   "mean luma %u%s%s\n",
+                   eye, st, w, h, lit, n, kl_mtl_mean_luma(),
+                   lit ? "" : "  <<< BLACK",
+                   st == shown ? "   <- ON SCREEN" : "");
+            // A picture, not just a count: KL_GLFB_OUT already holds the
+            // reference frames, so writing the interop eyes beside them
+            // is what makes "does it render the same" answerable.
+            const char *out = getenv("KL_GLFB_OUT");
+            if (out) {
+                char p[1200];
+                snprintf(p, sizeof p, "%s/mtl_eye%d_s%d.png", out, eye, st);
+                printf("    -> %s%s\n", p,
+                       kl_mtl_dump_png(eye, st, p) ? "" : "  (write FAILED)");
+            }
+        }
+    }
+}
+
 // The Unreal Engine 4 door. A different ENTRY, not a different lifecycle: the
 // guest is started through ANativeActivity_onCreate and then runs its own game
 // thread, so this drives it by delivering lifecycle and pumping the looper
@@ -273,6 +346,12 @@ static int ue4_run(void) {
 
     printf("\n=== reports ===\n");
     kl_ue4_report(stdout);
+    // ...and the P5 gate, which is the only thing here that says whether the
+    // guest's rendering ARRIVED. This door reaches the eye textures exactly the
+    // way BONELAB's does — kl_vulkan publishes the MTLTexture behind each eye
+    // VkImage into kl_glfb's eye table — so leaving it to the Unity tail meant
+    // a UE4 run producing a picture and a report that never mentioned one.
+    report_eye_interop();
     fflush(NULL);
     return 0;
 }
@@ -280,20 +359,27 @@ static int ue4_run(void) {
 static int recon_run(int view_pump) {
     install_fault_reporter();
     kl_mem_pressure_init();
-    // Which door this target takes. The Unity sequence below is not a default
-    // that happens to fit every guest — it names libmain, NativeLoader and
-    // UnityPlayer.initJni — so a UE4 target has to branch before any of it.
-    if (TARGET && TARGET->kind == KL_GUEST_UE4) return ue4_run();
     // Strict: an unimplemented *call* is fatal. Lookups are not, so this
     // stops only where the surface genuinely ends. KL_PERMISSIVE=1 flips it
     // to a zero return, which collects a whole batch in one run when pushing
     // into new territory — scouting only, since the guest then carries on
     // with answers we made up.
+    //
+    // Set BEFORE the door is chosen, with the texture dump: both are properties
+    // of the run rather than of the engine, and they used to sit below the UE4
+    // branch, which silently made KL_PERMISSIVE and KL_DUMP_TEXTURES do nothing
+    // at all on a NativeActivity target — the M4 loop's batch-scouting mode,
+    // absent exactly where a brand-new target most needs it.
     kl_jni_set_permissive(getenv("KL_PERMISSIVE") != NULL);
 
     // Armed before anything runs: texture uploads happen all through init and the
     // lifecycle, not just inside the frame pump.
     kl_egl_dump_textures(getenv("KL_DUMP_TEXTURES"));
+
+    // Which door this target takes. The Unity sequence below is not a default
+    // that happens to fit every guest — it names libmain, NativeLoader and
+    // UnityPlayer.initJni — so a UE4 target has to branch before any of it.
+    if (TARGET && TARGET->kind == KL_GUEST_UE4) return ue4_run();
 
     char path[1024];
     snprintf(path, sizeof path, "%s/libmain.so", LIBDIR);
@@ -523,72 +609,7 @@ static int recon_run(int view_pump) {
             if (haptic_pulses)
                 printf("  haptic pulses drained: %u (nothing to play them on "
                        "here — see kl_ovrp.h)\n", haptic_pulses);
-            // P5.3's gate. Not "did the interop bind" — that is reported when it
-            // happens — but "did the guest's rendering arrive in the MTLTexture".
-            // The lit count uses the same luma threshold as kl_glfb's capture, so
-            // it is directly comparable with the reference path's number: the two
-            // should agree, and a lit reference frame beside a black interop one
-            // means the binding took and the rendering went elsewhere.
-            // ...and it fires for an eye MTLTexture that arrived any way at
-            // all, not just through a registered provider. On the VULKAN path
-            // there IS no provider: MoltenVK backs the guest's eye VkImage with
-            // a texture of its own and kl_vulkan.c publishes that one
-            // (kl_glfb_note_eye_mtl_texture), so a provider test would have
-            // skipped the only guest whose compositor wiring is new.
-            if (kl_glfb_has_mtl_provider() || kl_glfb_eye_mtl_texture(0, 0, NULL)) {
-                printf("\n=== P5 interop: the guest's frame, read back through Metal ===\n");
-                // Under the viewer's hardware compositor there IS no reference:
-                // registering a GPU fence replaces the readback, so kl_glfb has
-                // counted nothing and a bare 0 here would read as a black frame.
-                if (!kl_glfb_has_mtl_provider())
-                    printf("  reference: KL_VK_OUT — on the Vulkan path the eye "
-                           "is read back from the VkImage, and this is the SAME "
-                           "storage seen as Metal\n");
-                else if (kl_glfb_has_gpu_fence())
-                    printf("  reference: none — the GPU compositor is driving, "
-                           "so nothing was read back\n");
-                else
-                    printf("  reference (glReadPixels, kl_glfb): %lu lit\n",
-                           kl_glfb_last_frame_lit());
-                // EVERY stage, not stage 0. This used to read and dump stage 0
-                // alone while the compositors show
-                // kl_ovrp_last_complete_stage() — so on a guest whose swapchain
-                // has more than one image the PNG and the screen are DIFFERENT
-                // PICTURES, and the readback can report a perfect frame for
-                // something nobody is looking at. That is trap 43's family: an
-                // instrument answering confidently about the wrong subject.
-                // Open Brush is where it bit (3 OpenXR swapchain images).
-                int shown = kl_ovrp_last_complete_stage();
-                int stages = kl_ovrp_stage_count();
-                if (stages < 1) stages = 1;
-                printf("  the compositors show stage %d (kl_ovrp_last_complete_stage)"
-                       "%s\n", shown,
-                       shown < 0 ? " — nothing filed, so they fall back to stage 0" : "");
-                for (int eye = 0; eye < 2; eye++) {
-                    for (int st = 0; st < stages; st++) {
-                        int w = 0, h = 0;
-                        if (!kl_glfb_eye_mtl_texture(eye, st, NULL)) continue;
-                        unsigned long lit = kl_mtl_count_lit(eye, st, &w, &h);
-                        unsigned long n = w && h ? ((unsigned long)((w + 7) / 8)
-                                                  * (unsigned long)((h + 7) / 8)) : 0;
-                        printf("  eye %d stage %d MTLTexture %dx%d: %lu/%lu lit, "
-                               "mean luma %u%s%s\n",
-                               eye, st, w, h, lit, n, kl_mtl_mean_luma(),
-                               lit ? "" : "  <<< BLACK",
-                               st == shown ? "   <- ON SCREEN" : "");
-                        // A picture, not just a count: KL_GLFB_OUT already holds the
-                        // reference frames, so writing the interop eyes beside them
-                        // is what makes "does it render the same" answerable.
-                        const char *out = getenv("KL_GLFB_OUT");
-                        if (out) {
-                            char p[1200];
-                            snprintf(p, sizeof p, "%s/mtl_eye%d_s%d.png", out, eye, st);
-                            printf("    -> %s%s\n", p,
-                                   kl_mtl_dump_png(eye, st, p) ? "" : "  (write FAILED)");
-                        }
-                    }
-                }
-            }
+            report_eye_interop();
             const char *sd = getenv("KL_DUMP_SHADERS");
             if (sd) kl_egl_dump_shaders(sd);
             if (getenv("KL_DUMP_TEXTURES"))

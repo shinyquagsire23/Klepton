@@ -246,6 +246,26 @@ int  klb_sched_getaffinity(int p, size_t sz, void *m) {
     return 0;
 }
 int  klb_sched_setaffinity(int p, size_t sz, const void *m) { (void)p;(void)sz;(void)m; return 0; }
+// What `CPU_COUNT()` expands to on bionic — the macro is a call, so a guest that
+// counts the cores in a mask needs this symbol rather than just the mask. It is
+// a plain popcount over the set, and it has to agree with what
+// klb_sched_getaffinity handed out or the guest sizes its worker pool from one
+// answer and indexes it with the other. UE4 asks on its way to naming its task
+// threads.
+int  klb___sched_cpucount(size_t sz, const void *m) {
+    const unsigned char *p = (const unsigned char *)m;
+    int n = 0;
+    for (size_t i = 0; m && i < sz; i++) n += __builtin_popcount(p[i]);
+    return n;
+}
+// Linux reserves the first few real-time signals for the C library's own use
+// (bionic takes three: timers, and the two the pthread cancellation dance
+// needs), so the first one a guest may have is not SIGRTMIN itself. Darwin has
+// no real-time signals at all; answering bionic's own number is what keeps a
+// guest that computes `__libc_current_sigrtmin() + n` inside the range its
+// sigset was built for.
+int  klb___libc_current_sigrtmin(void) { return 35; }
+int  klb___libc_current_sigrtmax(void) { return 64; }
 
 // ---------- struct stat ----------
 // bionic/aarch64 layout (128 bytes) is unrelated to Darwin's; translate field by field.

@@ -1435,6 +1435,7 @@ X(klv_dprintf) X(klv_syslog) X(klv_android_log_print) X(klv_sscanf) X(klv_fscanf
 X(klv_open) X(klv_fcntl) X(klv_ioctl) X(klv_strtold) X(klv_wcstold) X(klv_strtold_l)
 X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_read)
 X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
+X(klb___sched_cpucount) X(klb___libc_current_sigrtmin) X(klb___libc_current_sigrtmax)
 X(klb_stat) X(klb_lstat) X(klb_fstat) X(klb_statfs) X(klb_uname) X(klb_sigaction)
 X(klb_opendir) X(klb_readdir) X(klb_closedir)
 X(klb_FD_ISSET_chk) X(klb_FD_SET_chk) X(klb_ctype_mb_cur_max) X(klb_lseek64)
@@ -1474,6 +1475,8 @@ X(klb_epoll_create) X(klb_epoll_create1) X(klb_epoll_ctl) X(klb_epoll_wait)
 X(klb_openat) X(klb___open_2)
 X(klb___memmove_chk) X(klb___strncpy_chk) X(klb___strncpy_chk2) X(klb___strcat_chk)
 X(klb___read_chk) X(klb___vsprintf_chk)
+X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk)
+X(klb___strncat_chk) X(klb_ftruncate64)
 X(klb_sincosf) X(klb_sincos) X(klb_putchar) X(klb_getchar) X(klb_fdatasync)
 X(klb___cmsg_nxthdr) X(klb___cxa_thread_atexit_impl)
 X(klb_fileno) X(klb_fgetc) X(klb_ungetc) X(klb_getwc) X(klb_fgetwc)
@@ -1591,6 +1594,14 @@ static const kl_entry g_shim[] = {
     E("__memmove_chk", klb___memmove_chk), E("__strncpy_chk", klb___strncpy_chk),
     E("__strncpy_chk2", klb___strncpy_chk2), E("__strcat_chk", klb___strcat_chk),
     E("__read_chk", klb___read_chk), E("__vsprintf_chk", klb___vsprintf_chk),
+    // UE4 reads its OBB through pread64 from several threads, and FORTIFY
+    // rewrites every one of those calls to the _chk form.
+    E("__pread64_chk", klb___pread64_chk), E("__pwrite64_chk", klb___pwrite64_chk),
+    E("__strrchr_chk", klb___strrchr_chk), E("__strncat_chk", klb___strncat_chk),
+    E("ftruncate64", klb_ftruncate64),
+    E("__sched_cpucount", klb___sched_cpucount),
+    E("__libc_current_sigrtmin", klb___libc_current_sigrtmin),
+    E("__libc_current_sigrtmax", klb___libc_current_sigrtmax),
     E("sincosf", klb_sincosf), E("sincos", klb_sincos),
     E("putchar", klb_putchar), E("getchar", klb_getchar),
     E("fdatasync", klb_fdatasync),

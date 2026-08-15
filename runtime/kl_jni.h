@@ -100,6 +100,20 @@ void *kl_jni_new_string_array(const char *const *items, int n);
 // instant this returns).
 void kl_jni_set_vrlink_handoff(void (*fn)(const char *sargs));
 
+// How the JNI surface calls BACK into the guest, by exported symbol name.
+//
+// The Unity guests never need this: their Java front end hands objects to
+// libunity and libunity drives itself. UE4's does the opposite in several
+// places — `AndroidThunkJava_InitHMDs` posts a Runnable whose whole body is
+// `nativeInitHMDs()`, and the virtual-keyboard and sensor surfaces are the same
+// shape — so standing in for that Java means being able to make the call the
+// Java would have made. The natives are static exports, so a name is enough.
+//
+// Installed by whoever knows which image is the guest (kl_ue4.c); with none
+// installed every one of those thunks reports that it could not call back,
+// which is a stated refusal rather than a silent no-op.
+void kl_jni_set_guest_native_resolver(void *(*resolve)(const char *symbol));
+
 // Root for Context.getAssets()/AssetManager.open(). Defaults to "beatsaber/assets".
 // With no AAssetManager_* import, this JNI path is how assets reach Unity.
 void kl_jni_set_assets_dir(const char *dir);
@@ -138,6 +152,19 @@ const char *kl_jni_files_dir(void);
 void kl_jni_locale_parts(char *lang, size_t lang_sz, char *country, size_t country_sz);
 // The APK, which Unity opens as a zip via getPackageCodePath(). Default "beatsaber.apk".
 void kl_jni_set_apk_path(const char *path);
+// ...and what it resolved to, absolute. This is `getPackageResourcePath()` — the
+// same string, under the other of Android's two names for it — and a UE4 guest
+// is handed it directly rather than asking for it, so a driver acting out
+// GameActivity's own Java needs to read it back.
+const char *kl_jni_apk_path(void);
+
+// One `<meta-data>` value from the guest's own AndroidManifest.xml, or NULL if
+// the key is not declared. This is the same table `ApplicationInfo.metaData`
+// serves the guest over JNI, read through the front door rather than a second
+// copy: a UE4 guest never asks for these itself — GameActivity.java reads them
+// in Java and passes the ANSWERS to native setters — so a driver standing in
+// for that Java has to read them the same way the guest would have.
+const char *kl_jni_manifest_meta(const char *key);
 // The native library directory: what ApplicationInfo.nativeLibraryDir reports and
 // what ClassLoader.findLibrary() builds paths in. Defaults to the *relative*
 // "beatsaber/lib/arm64-v8a" resolved against the working directory, which is the
