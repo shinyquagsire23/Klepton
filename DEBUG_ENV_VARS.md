@@ -1144,6 +1144,15 @@ that reports what came due since the frontend last asked. Platform-independent
   question at all: without the extension the client publishes an EMPTY rate
   list, and a host told the client can present at no rate never starts sending
   video.
+- `KL_XR_VULKAN=0` — stop advertising `XR_KHR_vulkan_enable`
+  (`runtime/kl_openxr.c`), putting the runtime back to before the OpenXR↔Vulkan
+  bridge. The A/B for Open Brush, and it restores the original failure
+  **exactly**: the guest's `xrCreateInstance` returns
+  `XR_ERROR_EXTENSION_NOT_PRESENT`, its own startup diagnostic prints
+  `XR_KHR_vulkan_enable (MISSING)`, and XR shuts down before a swapchain exists.
+  Left at 1 (the default), the extension is still withheld on a checkout with no
+  MoltenVK vendored — the gate is `kl_vulkan_xr_supported()`, so a build that
+  cannot back the promise never makes it.
 - `KL_XR_EXTRA_EXTENSIONS="<name> [<name> ...]"` — append names to the
   extension list `xrEnumerateInstanceExtensionProperties` advertises
   (`runtime/kl_openxr.c`). **Scouting only, and a lie by construction**: an

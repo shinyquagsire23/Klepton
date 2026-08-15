@@ -109,4 +109,72 @@ unsigned long long kl_vulkan_frame_serial(void);
 // captures is a different bug from one that never presented.
 void  kl_vulkan_stats(unsigned *presented, unsigned *captured);
 
+// ---------------------------------------------------------------------------
+// The OpenXR seam, for kl_openxr.c — XR_KHR_vulkan_enable
+// ---------------------------------------------------------------------------
+//
+// Open Brush is the first guest at the junction of this project's two graphics
+// halves: it speaks OPENXR (kl_openxr.c, which until now had only ever carried
+// GLES guests) and its renderer is VULKAN (this file, which until now had only
+// ever been reached through OVRPlugin). Neither half needed the other, so
+// neither knew about it.
+//
+// The split below is the same one kl_openxr already keeps with kl_glfb: the XR
+// file states WHAT it needs in OpenXR's vocabulary and this file answers it in
+// Vulkan's, so kl_openxr.c includes no Vulkan header and stays linkable in a
+// build with no MoltenVK vendored. Every Vulkan handle crossing this boundary is
+// a `void *` because a dispatchable Vulkan handle IS a pointer on LP64 — the
+// same measured property that makes the forwarding table upstairs possible.
+//
+// **Under XR_KHR_vulkan_enable the APP creates the VkInstance and VkDevice**,
+// not the runtime (that inverts in `_enable2`), and it creates them through the
+// synthetic loader in this file. So by the time the graphics binding arrives, a
+// guest's device is already one klvk_CreateDevice interposed on — which is what
+// makes the two extension lists below honestly empty.
+
+// Is there a Vulkan device the OpenXR half could bind a session to? This gates
+// whether XR_KHR_vulkan_enable is ADVERTISED at all: naming an extension we
+// cannot back is the one thing the extension table upstairs refuses to do, and
+// a checkout with no MoltenVK must fail the guest's xrCreateInstance rather
+// than fail later, deeper, on a NULL entry point.
+int kl_vulkan_xr_supported(void);
+
+// The VkInstance / VkDevice extensions an app MUST enable for its Vulkan
+// objects to be usable by this runtime, space-delimited as the spec wants them.
+//
+// Both are EMPTY, and that is a true answer rather than an unimplemented one:
+// the only extension this runtime needs on the device is VK_EXT_metal_objects
+// (how an eye VkImage's MTLTexture reaches the compositor), and klvk_CreateDevice
+// already adds it to every device the guest creates. Requiring it of the app as
+// well would be asking for something we have already taken.
+const char *kl_vulkan_xr_instance_extensions(void);
+const char *kl_vulkan_xr_device_extensions(void);
+
+// The VkPhysicalDevice this runtime requires the app to render with, chosen
+// from the app's OWN VkInstance (which is the handle the spec passes, and not
+// necessarily one this file has seen). NULL when it cannot be answered.
+void *kl_vulkan_xr_physical_device(void *vk_instance);
+
+// The Vulkan API version range a session may be created against, as major/minor
+// pairs. Answered from the physical device rather than asserted — MoltenVK's
+// instance-level and device-level versions differ, and the one that governs an
+// app's device is the device's.
+void kl_vulkan_xr_api_range(unsigned *min_major, unsigned *min_minor,
+                            unsigned *max_major, unsigned *max_minor);
+
+// One OpenXR swapchain image, as a VkImage handle widened to 64 bits — which is
+// exactly what XrSwapchainImageVulkanKHR carries. `vk_format` is a VkFormat, not
+// a GL internal format: the two lists are different vocabularies for the same
+// question and kl_openxr keeps one per graphics API. 0 on failure.
+//
+// Unlike kl_vulkan_eye_image this is not keyed on (stage, eye), because at
+// xrCreateSwapchain time nothing knows which swapchain is an eye — see the
+// implementation.
+unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned layers,
+                                      unsigned mips, long long vk_format, int depth);
+
+// ...and the MTLTexture behind one, for the compositor seam. NULL when it cannot
+// be exported.
+void *kl_vulkan_xr_image_mtl(unsigned long long image);
+
 #endif

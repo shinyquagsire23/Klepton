@@ -44,6 +44,11 @@
 #include "kl_egl.h"
 #include "kl_glfb.h"
 #include "kl_env.h"
+// XR_KHR_vulkan_enable. Only kl_vulkan.h — never a Vulkan header: every Vulkan
+// handle in this file is a void *, which is what keeps it compiling on a
+// checkout with no MoltenVK vendored (the stub half of kl_vulkan.c answers
+// "not supported" and the extension is then never advertised).
+#include "kl_vulkan.h"
 #include "klepton.h"
 
 // ------------------------------------------------------- transcribed from the spec
@@ -126,6 +131,11 @@ enum {
     XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW = 48,
     XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR = 1000024001,
     XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR = 1000024003,
+    // XR_KHR_vulkan_enable is extension 25, so its three structures sit in the
+    // block above GLES's. Open Brush is the guest that needs them.
+    XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR      = 1000025000,
+    XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR       = 1000025001,
+    XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR = 1000025002,
 };
 
 // The session states, and the order is the state machine: a runtime walks an
@@ -187,6 +197,23 @@ typedef struct { int32_t type; const void *next;
 typedef struct { int32_t type; const void *next;
                  void *display, *config, *context;
                } XrGraphicsBindingOpenGLESAndroidKHR;
+
+// XR_KHR_vulkan_enable's binding and requirements. Every Vulkan handle here is
+// a `void *` on purpose: a dispatchable Vulkan handle is a pointer on LP64, so
+// this file needs no Vulkan header and stays linkable in a build with no
+// MoltenVK — kl_vulkan.c owns everything that has to know what they point at.
+//
+// The two uint32s are NOT padding to be skipped: queueFamilyIndex and
+// queueIndex say which queue the app will submit its rendering on, and a
+// runtime that ignores them cannot order anything against the app's work.
+typedef struct { int32_t type; const void *next;
+                 void *instance, *physicalDevice, *device;
+                 uint32_t queueFamilyIndex, queueIndex;
+               } XrGraphicsBindingVulkanKHR;
+
+typedef struct { int32_t type; void *next;
+                 XrVersion minApiVersionSupported,
+                           maxApiVersionSupported; } XrGraphicsRequirementsVulkanKHR;
 
 typedef struct { int32_t type; const void *next;
                  int32_t primaryViewConfigurationType; } XrSessionBeginInfo;
@@ -314,6 +341,14 @@ typedef struct { int32_t type; const void *next;
 // checking `type`. For GLES that is one uint32 GL texture name per image.
 typedef struct { int32_t type; void *next; uint32_t image;
                } XrSwapchainImageOpenGLESKHR;
+
+// ...and for Vulkan, one VkImage per image. 64 bits wide rather than 32: a
+// VkImage is a NON-dispatchable handle, which is a full pointer on LP64 and
+// only a uint64 on 32-bit — so the GLES struct's uint32 is a texture NAME and
+// this one is an address, and writing the latter into the former's width would
+// truncate every handle above 4 GiB into a plausible-looking small one.
+typedef struct { int32_t type; void *next; uint64_t image;
+               } XrSwapchainImageVulkanKHR;
 
 typedef struct { int32_t type; const void *next; } XrSwapchainImageAcquireInfo;
 typedef struct { int32_t type; const void *next;
@@ -487,6 +522,9 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
        called the null pointer it got back. */                                 \
     X(xrInitializeLoaderKHR)                                                   \
     X(xrGetOpenGLESGraphicsRequirementsKHR)                                    \
+    X(xrGetVulkanGraphicsRequirementsKHR)                                      \
+    X(xrGetVulkanInstanceExtensionsKHR) X(xrGetVulkanDeviceExtensionsKHR)      \
+    X(xrGetVulkanGraphicsDeviceKHR)                                            \
     X(xrEnumerateDisplayRefreshRatesFB) X(xrGetDisplayRefreshRateFB)           \
     X(xrRequestDisplayRefreshRateFB)                                           \
     X(xrConvertTimespecTimeToTimeKHR) X(xrConvertTimeToTimespecTimeKHR)
@@ -668,6 +706,12 @@ typedef struct {
     char      engine_name[XR_MAX_ENGINE_NAME_SIZE];
     int       ext_opengl_es;      // did it enable XR_KHR_opengl_es_enable?
     int       gl_requirements_queried;   // ...and did it then ask for the range?
+    int       ext_vulkan;         // ...or XR_KHR_vulkan_enable? (Open Brush)
+    int       vk_requirements_queried;   // its own gate, separate from GLES's:
+                                         // the spec's requirements-call check is
+                                         // per graphics API, and one flag for
+                                         // both would let a GLES query unlock a
+                                         // Vulkan session.
 } klxr_instance;
 
 static klxr_instance g_instance;
@@ -694,9 +738,18 @@ static klxr_instance *klxr_inst(void *h) {
 // XR_KHR_android_create_instance is here because this guest IS an Android
 // activity and passes its VM and activity object through
 // XrInstanceCreateInfoAndroidKHR; we already hold both.
-static const struct { const char *name; uint32_t version; } g_extensions[] = {
-    { "XR_KHR_opengl_es_enable",       10 },
-    { "XR_KHR_android_create_instance", 3 },
+// Why each built-in may be withheld. A GATE rather than a position, because the
+// count used to be arithmetic on the array length ("the refresh-rate entry is
+// deliberately the LAST one, so hiding it is count - 1") and that made every
+// future conditional extension a trap: the second one to be added would have
+// silently hidden the first. Vulkan is exactly that second one.
+enum { KLXR_GATE_ALWAYS = 0,      // unconditional
+       KLXR_GATE_REFRESH = 1,     // ...unless KL_XR_REFRESH_EXT=0
+       KLXR_GATE_VULKAN = 2 };    // ...only when MoltenVK is actually reachable
+
+static const struct { const char *name; uint32_t version; int gate; } g_extensions[] = {
+    { "XR_KHR_opengl_es_enable",       10, KLXR_GATE_ALWAYS },
+    { "XR_KHR_android_create_instance", 3, KLXR_GATE_ALWAYS },
     // XR_KHR_convert_timespec_time is the cheapest honest claim in this table:
     // our XrTime IS CLOCK_MONOTONIC nanoseconds (klxr_now), so the conversion is
     // arithmetic and cannot be wrong. Without it the guest logs "not available
@@ -704,7 +757,7 @@ static const struct { const char *name; uint32_t version; } g_extensions[] = {
     // run, which is not just noise: it is the guest's per-frame path doing
     // formatted I/O, and it buried the six lines of the video path that the run
     // existed to produce.
-    { "XR_KHR_convert_timespec_time",   1 },
+    { "XR_KHR_convert_timespec_time",   1, KLXR_GATE_ALWAYS },
     // XR_FB_display_refresh_rate is the exception to the paragraph above, and
     // it is here because absence turned out NOT to be handled gracefully after
     // all (SL-11). The guest prints "XR_EXT_display_refresh_rate is not
@@ -722,7 +775,23 @@ static const struct { const char *name; uint32_t version; } g_extensions[] = {
     // reports, so the two XR APIs cannot disagree about the panel — SL-9's
     // rule for eye poses, in the one other place a headset property is
     // answered twice.
-    { "XR_FB_display_refresh_rate",     1 },
+    { "XR_FB_display_refresh_rate",     1, KLXR_GATE_REFRESH },
+    // XR_KHR_vulkan_enable — Open Brush, and the first guest to need this half
+    // of the runtime joined to the Vulkan half (notes/OPENBRUSH.md).
+    //
+    // GATED on MoltenVK actually being reachable, and that is the whole reason
+    // gates exist: a runtime that names this extension promises four entry
+    // points and a session that binds to a VkDevice, and on a checkout with no
+    // `make mvk` it can honour none of them. Withheld, the guest fails its own
+    // xrCreateInstance with XR_ERROR_EXTENSION_NOT_PRESENT and says so by name
+    // in its startup diagnostic — which is a legible stop. Claimed falsely, the
+    // guest creates Vulkan objects, hands them to us, and dies somewhere in
+    // MoltenVK with nothing naming the cause.
+    //
+    // Version 8 is the extension's final revision; nothing here reads it, but
+    // understating it invites an app to take a compatibility path it does not
+    // need.
+    { "XR_KHR_vulkan_enable",           8, KLXR_GATE_VULKAN },
 };
 #define KLXR_EXT_ALL ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
 
@@ -762,28 +831,79 @@ static void klxr_ext_extra_init(void) {
                         "ONLY, nothing implements it\n", t);
     }
 }
-static uint32_t klxr_ext_count(void) {
+// The advertised list, RESOLVED once: every built-in whose gate passes, then
+// the KL_XR_EXTRA_EXTENSIONS tail. Building it beats computing count and index
+// separately — those were two expressions that had to agree about which entries
+// were hidden, and the agreement was positional.
+static struct { const char *name; uint32_t version; }
+       g_ext_live[KLXR_EXT_ALL + KLXR_EXT_EXTRA_MAX];
+static uint32_t g_ext_nlive;
+
+static int klxr_ext_gate_open(int gate) {
+    switch (gate) {
+    case KLXR_GATE_REFRESH: {
+        const char *e = getenv("KL_XR_REFRESH_EXT");
+        return !(e && !strcmp(e, "0"));
+    }
+    case KLXR_GATE_VULKAN:
+        // KL_XR_VULKAN=0 withholds it even where it works, which restores the
+        // pre-bridge configuration EXACTLY: Open Brush's own xrCreateInstance
+        // fails with XR_ERROR_EXTENSION_NOT_PRESENT and its startup diagnostic
+        // prints `XR_KHR_vulkan_enable (MISSING)`. That is the A/B for "did this
+        // come from the bridge?", and it is also the only way to see the old
+        // failure again once the bridge works.
+        if (!kl_env_on("KL_XR_VULKAN", 1)) return 0;
+        // Asked once, here, so the answer cannot change between the
+        // enumeration, xrCreateInstance's check and xrGetInstanceProcAddr.
+        return kl_vulkan_xr_supported();
+    default:
+        return 1;
+    }
+}
+
+static void klxr_ext_resolve(void) {
+    static int done;
+    if (done) return;
+    done = 1;
     klxr_ext_extra_init();
-    const char *e = getenv("KL_XR_REFRESH_EXT");
-    uint32_t base = (e && !strcmp(e, "0")) ? KLXR_EXT_ALL - 1 : KLXR_EXT_ALL;
-    return base + g_ext_nextra;
+    for (uint32_t i = 0; i < KLXR_EXT_ALL; i++) {
+        if (!klxr_ext_gate_open(g_extensions[i].gate)) {
+            fprintf(stderr, "  [xr] extension withheld: %s\n", g_extensions[i].name);
+            continue;
+        }
+        g_ext_live[g_ext_nlive].name    = g_extensions[i].name;
+        g_ext_live[g_ext_nlive].version = g_extensions[i].version;
+        g_ext_nlive++;
+    }
+    for (uint32_t i = 0; i < g_ext_nextra; i++) {
+        g_ext_live[g_ext_nlive].name    = g_ext_extra[i].name;
+        g_ext_live[g_ext_nlive].version = g_ext_extra[i].version;
+        g_ext_nlive++;
+    }
+}
+
+static uint32_t klxr_ext_count(void) {
+    klxr_ext_resolve();
+    return g_ext_nlive;
 }
 #define KLXR_EXT_COUNT (klxr_ext_count())
 
-// One accessor so the three consumers cannot disagree about where the extras
-// live. Index >= the built-in count reads the KL_XR_EXTRA_EXTENSIONS tail; the
-// hidden-refresh-rate case cannot collide with it, because that entry is the
-// LAST built-in and dropping it drops the count with it.
+// One accessor so the three consumers cannot disagree about what is advertised.
 static const char *klxr_ext_at(uint32_t i, uint32_t *version_out) {
-    uint32_t base = KLXR_EXT_COUNT - g_ext_nextra;
-    const char *name;
-    uint32_t v;
-    if (i < base)      { name = g_extensions[i].name;        v = g_extensions[i].version; }
-    else if (i - base < g_ext_nextra)
-                       { name = g_ext_extra[i - base].name;  v = g_ext_extra[i - base].version; }
-    else return NULL;
-    if (version_out) *version_out = v;
-    return name;
+    klxr_ext_resolve();
+    if (i >= g_ext_nlive) return NULL;
+    if (version_out) *version_out = g_ext_live[i].version;
+    return g_ext_live[i].name;
+}
+
+// Is a name in the advertised list? xrCreateInstance validates the app's
+// requested extensions against exactly this, so asking one function keeps the
+// answer identical to what was enumerated.
+static int klxr_ext_advertised(const char *name) {
+    klxr_ext_resolve();
+    for (uint32_t i = 0; i < g_ext_nlive; i++)
+        if (!strcmp(g_ext_live[i].name, name)) return 1;
+    return 0;
 }
 
 // The two-call idiom, which every enumerate in OpenXR uses and which is easy to
@@ -1016,15 +1136,12 @@ static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **ins
             (unsigned long long)(g_instance.api_version & 0xffffffff));
     for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
         const char *name = info->enabledExtensionNames[i];
-        int known = 0;
-        for (uint32_t k = 0; k < KLXR_EXT_COUNT; k++) {
-            const char *kn = klxr_ext_at(k, NULL);
-            if (kn && strcmp(name, kn) == 0) known = 1;
-        }
+        int known = klxr_ext_advertised(name);
         fprintf(stderr, "  [xr]   extension: %-40s %s\n", name,
                 known ? "enabled" : "NOT PRESENT");
         if (!known) { g_instance.magic = 0; return KLXR_ERROR_EXTENSION_NOT_PRESENT; }
         if (strcmp(name, "XR_KHR_opengl_es_enable") == 0) g_instance.ext_opengl_es = 1;
+        if (strcmp(name, "XR_KHR_vulkan_enable") == 0)    g_instance.ext_vulkan = 1;
     }
 
     *instance = &g_instance;
@@ -1156,6 +1273,99 @@ static XrResult klxr_GetOpenGLESGraphicsRequirementsKHR(
     return KLXR_SUCCESS;
 }
 
+// ---------------------------------------------------------- XR_KHR_vulkan_enable
+//
+// The four entry points an app calls BEFORE it has a session, in this order:
+//
+//   xrGetVulkanGraphicsRequirementsKHR   which Vulkan versions may be used
+//   xrGetVulkanInstanceExtensionsKHR     what to enable on its VkInstance
+//   (the app creates its VkInstance)
+//   xrGetVulkanGraphicsDeviceKHR         which VkPhysicalDevice to use
+//   xrGetVulkanDeviceExtensionsKHR       what to enable on its VkDevice
+//   (the app creates its VkDevice, and only then calls xrCreateSession)
+//
+// All four are answered by kl_vulkan.c, which is the half that knows what a
+// VkPhysicalDevice is; this file only translates between OpenXR's spelling and
+// that. See kl_vulkan.h for why the two extension lists are legitimately empty.
+
+// The two extension queries share everything but which list they read, so they
+// share a body — the spec's buffer contract is fiddly enough (a
+// SPACE-DELIMITED single string, NUL-terminated, counted INCLUDING the
+// terminator) that having it written twice is how the two would come to differ.
+static XrResult klxr_vulkan_ext_string(void *instance, XrSystemId system_id,
+                                       const char *list,
+                                       uint32_t capacity, uint32_t *count_out,
+                                       char *buffer) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (!count_out) return KLXR_ERROR_VALIDATION_FAILURE;
+    uint32_t need = (uint32_t)strlen(list) + 1;      // the NUL is counted
+    *count_out = need;
+    if (capacity == 0) return KLXR_SUCCESS;
+    if (capacity < need) return KLXR_ERROR_SIZE_INSUFFICIENT;
+    if (!buffer) return KLXR_ERROR_VALIDATION_FAILURE;
+    memcpy(buffer, list, need);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetVulkanInstanceExtensionsKHR(
+        void *instance, XrSystemId system_id, uint32_t capacity,
+        uint32_t *count_out, char *buffer) {
+    return klxr_vulkan_ext_string(instance, system_id,
+                                  kl_vulkan_xr_instance_extensions(),
+                                  capacity, count_out, buffer);
+}
+
+static XrResult klxr_GetVulkanDeviceExtensionsKHR(
+        void *instance, XrSystemId system_id, uint32_t capacity,
+        uint32_t *count_out, char *buffer) {
+    return klxr_vulkan_ext_string(instance, system_id,
+                                  kl_vulkan_xr_device_extensions(),
+                                  capacity, count_out, buffer);
+}
+
+// Which VkPhysicalDevice the app must render with.
+//
+// The VkInstance is the APP's, passed in — this runtime does not get to assume
+// the app's instance is one it has seen, even though here it always is.
+static XrResult klxr_GetVulkanGraphicsDeviceKHR(
+        void *instance, XrSystemId system_id, void *vk_instance,
+        void **vk_physical_device) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (!vk_physical_device) return KLXR_ERROR_VALIDATION_FAILURE;
+    void *pd = kl_vulkan_xr_physical_device(vk_instance);
+    if (!pd) {
+        fprintf(stderr, "  [xr] xrGetVulkanGraphicsDeviceKHR: no physical device "
+                        "from the app's VkInstance %p\n", vk_instance);
+        return KLXR_ERROR_GRAPHICS_DEVICE_INVALID;
+    }
+    fprintf(stderr, "  [xr] xrGetVulkanGraphicsDeviceKHR -> VkPhysicalDevice %p\n", pd);
+    *vk_physical_device = pd;
+    return KLXR_SUCCESS;
+}
+
+// The version gate, and the Vulkan twin of the GLES one above: without this call
+// xrCreateSession must fail with XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING.
+// Its own flag, not the GLES one — see klxr_instance.
+static XrResult klxr_GetVulkanGraphicsRequirementsKHR(
+        void *instance, XrSystemId system_id,
+        XrGraphicsRequirementsVulkanKHR *reqs) {
+    if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
+    if (system_id != KLXR_SYSTEM_ID) return KLXR_ERROR_SYSTEM_INVALID;
+    if (!reqs) return KLXR_ERROR_VALIDATION_FAILURE;
+    klxr_log_chain("xrGetVulkanGraphicsRequirementsKHR", reqs->next);
+    unsigned lo_maj, lo_min, hi_maj, hi_min;
+    kl_vulkan_xr_api_range(&lo_maj, &lo_min, &hi_maj, &hi_min);
+    reqs->type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR;
+    reqs->minApiVersionSupported = XR_MAKE_VERSION(lo_maj, lo_min, 0);
+    reqs->maxApiVersionSupported = XR_MAKE_VERSION(hi_maj, hi_min, 0);
+    g_instance.vk_requirements_queried = 1;
+    fprintf(stderr, "  [xr] xrGetVulkanGraphicsRequirementsKHR: Vulkan %u.%u .. %u.%u\n",
+            lo_maj, lo_min, hi_maj, hi_min);
+    return KLXR_SUCCESS;
+}
+
 // ---------------------------------------------------------- the session, and
 // the state machine that is the actual content of this half.
 //
@@ -1176,11 +1386,23 @@ static XrResult klxr_GetOpenGLESGraphicsRequirementsKHR(
 enum { KLXR_MAGIC_SESSION = 0x584b4c53 /* 'XKLS' */ };
 enum { KLXR_EVENT_QUEUE = 16 };
 
+// Which graphics API a session is bound with — see `gfx` below.
+enum { KLXR_GFX_NONE = 0, KLXR_GFX_GLES = 1, KLXR_GFX_VULKAN = 2 };
+
 typedef struct {
     uint32_t magic;
     klxr_instance *instance;
     XrSystemId systemId;
+    // Which graphics API this session was bound with. Not derivable from the
+    // instance's enabled extensions: an app may enable both and bind one, and
+    // every place downstream that hands an image back has to know which
+    // spelling to use.
+    int   gfx;
     void *egl_display, *egl_config, *egl_context;   // the guest's own GL binding
+    // ...and the guest's own Vulkan binding. All four handles are the APP's —
+    // it created them, through kl_vulkan's synthetic loader.
+    void *vk_instance, *vk_phys, *vk_device;
+    uint32_t vk_queue_family, vk_queue_index;
     int   state;                  // the last state we POSTED, not the next one
     int   running;                // between xrBeginSession and xrEndSession
     int   exit_requested;
@@ -1335,32 +1557,61 @@ static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *in
     // distinct error from a bad one: a headless session (no binding at all) is
     // legal only with XR_MND_headless, which we do not offer.
     const XrGraphicsBindingOpenGLESAndroidKHR *gl = NULL;
+    const XrGraphicsBindingVulkanKHR *vk = NULL;
     for (const void *n = info->next; n; ) {
         int32_t type = *(const int32_t *)n;
         if (type == XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR)
             gl = (const XrGraphicsBindingOpenGLESAndroidKHR *)n;
+        else if (type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR)
+            vk = (const XrGraphicsBindingVulkanKHR *)n;
         else
             fprintf(stderr, "  [xr] xrCreateSession: chained struct type %d — ignored\n", type);
         n = *(const void *const *)((const char *)n + 8);
     }
-    if (!gl) {
+    // Exactly one binding. Both is not a richer request, it is a contradiction
+    // about which API the swapchain images must be handed back in, and the
+    // spec has no way to express it — so it is refused rather than resolved by
+    // precedence, which would silently pick for the guest.
+    if (gl && vk) {
+        fprintf(stderr, "  [xr] xrCreateSession: BOTH a GLES and a Vulkan binding "
+                        "chained — refusing rather than choosing\n");
+        return KLXR_ERROR_GRAPHICS_DEVICE_INVALID;
+    }
+    if (!gl && !vk) {
         fprintf(stderr, "  [xr] xrCreateSession: no graphics binding chained\n");
         return KLXR_ERROR_GRAPHICS_DEVICE_INVALID;
     }
-    if (!inst->gl_requirements_queried)
+    // The requirements gate is per graphics API, and so is the check.
+    if (gl && !inst->gl_requirements_queried)
+        return KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING;
+    if (vk && !inst->vk_requirements_queried)
         return KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING;
 
     memset(&g_session, 0, sizeof g_session);
     g_session.magic = KLXR_MAGIC_SESSION;
     g_session.instance = inst;
     g_session.systemId = info->systemId;
-    g_session.egl_display = gl->display;
-    g_session.egl_config  = gl->config;
-    g_session.egl_context = gl->context;
     g_session.state = KLXR_SESSION_STATE_UNKNOWN;
 
-    fprintf(stderr, "  [xr] xrCreateSession: EGLDisplay %p config %p context %p\n",
-            gl->display, gl->config, gl->context);
+    if (gl) {
+        g_session.gfx = KLXR_GFX_GLES;
+        g_session.egl_display = gl->display;
+        g_session.egl_config  = gl->config;
+        g_session.egl_context = gl->context;
+        fprintf(stderr, "  [xr] xrCreateSession: EGLDisplay %p config %p context %p\n",
+                gl->display, gl->config, gl->context);
+    } else {
+        g_session.gfx = KLXR_GFX_VULKAN;
+        g_session.vk_instance = vk->instance;
+        g_session.vk_phys     = vk->physicalDevice;
+        g_session.vk_device   = vk->device;
+        g_session.vk_queue_family = vk->queueFamilyIndex;
+        g_session.vk_queue_index  = vk->queueIndex;
+        fprintf(stderr, "  [xr] xrCreateSession: VkInstance %p physical %p device %p "
+                        "queue %u.%u\n",
+                vk->instance, vk->physicalDevice, vk->device,
+                vk->queueFamilyIndex, vk->queueIndex);
+    }
 
     // IDLE then READY, immediately. On a real headset READY waits until the
     // thing is on someone's head; here there is nothing to wait for, and making
@@ -2993,7 +3244,8 @@ typedef struct {
     int64_t  format;
     uint32_t width, height, array_size, mip_count;
     uint64_t usage;
-    uint32_t tex[KLXR_SWAPCHAIN_IMAGES];
+    uint32_t tex[KLXR_SWAPCHAIN_IMAGES];       // GLES: texture names
+    uint64_t vk_img[KLXR_SWAPCHAIN_IMAGES];    // Vulkan: VkImage handles
     int      count;
     int      acquired;        // index the app currently holds, -1 when none
     int      last_released;   // ...and the last one it handed BACK, which is the
@@ -3041,18 +3293,63 @@ static const int64_t g_swapchain_formats[] = {
 };
 #define KLXR_FORMAT_COUNT ((uint32_t)(sizeof g_swapchain_formats / sizeof g_swapchain_formats[0]))
 
-static int klxr_format_is_depth(int64_t f) {
+// ...and the same list in Vulkan's vocabulary, because a swapchain format is
+// stated in the vocabulary of the session's graphics API and nothing converts
+// between them. **This is what Open Brush's first Vulkan session died on**: it
+// enumerated formats, got GL internal formats (0x8C43 and friends), recognised
+// none of them as a VkFormat, and reported "Failed to create swapchain, exiting
+// session" — a correct app refusing a runtime that answered in the wrong units.
+//
+// The numbers are VkFormat enumerants, written out rather than included: this
+// file must not pull in a Vulkan header (see the include block). They are
+// checked against <vulkan/vulkan_core.h> by `make vkabi`'s sibling assertion in
+// kl_vulkan.c — a wrong number here is a silently different format, not an error.
+#define KLXR_VK_FORMAT_R8G8B8A8_SRGB       43
+#define KLXR_VK_FORMAT_R8G8B8A8_UNORM      37
+#define KLXR_VK_FORMAT_R16G16B16A16_SFLOAT 97
+#define KLXR_VK_FORMAT_D24_UNORM_S8_UINT  129
+#define KLXR_VK_FORMAT_D32_SFLOAT         126
+#define KLXR_VK_FORMAT_D16_UNORM          124
+static const int64_t g_swapchain_formats_vk[] = {
+    KLXR_VK_FORMAT_R8G8B8A8_SRGB, KLXR_VK_FORMAT_R8G8B8A8_UNORM,
+    KLXR_VK_FORMAT_R16G16B16A16_SFLOAT,
+    KLXR_VK_FORMAT_D24_UNORM_S8_UINT, KLXR_VK_FORMAT_D32_SFLOAT,
+    KLXR_VK_FORMAT_D16_UNORM,
+};
+#define KLXR_FORMAT_COUNT_VK \
+    ((uint32_t)(sizeof g_swapchain_formats_vk / sizeof g_swapchain_formats_vk[0]))
+
+// Which list a session speaks. One function, so the enumerate and the
+// create-time validation cannot disagree about what was offered — which is the
+// same failure the extension list next door was restructured to prevent.
+static const int64_t *klxr_formats_for(const klxr_session *s, uint32_t *count_out) {
+    if (s && s->gfx == KLXR_GFX_VULKAN) {
+        if (count_out) *count_out = KLXR_FORMAT_COUNT_VK;
+        return g_swapchain_formats_vk;
+    }
+    if (count_out) *count_out = KLXR_FORMAT_COUNT;
+    return g_swapchain_formats;
+}
+
+static int klxr_format_is_depth(const klxr_session *s, int64_t f) {
+    if (s && s->gfx == KLXR_GFX_VULKAN)
+        return f == KLXR_VK_FORMAT_D24_UNORM_S8_UINT ||
+               f == KLXR_VK_FORMAT_D32_SFLOAT ||
+               f == KLXR_VK_FORMAT_D16_UNORM;
     return f == KLXR_GL_DEPTH_COMPONENT24 || f == KLXR_GL_DEPTH_COMPONENT16 ||
            f == KLXR_GL_DEPTH24_STENCIL8;
 }
 
 static XrResult klxr_EnumerateSwapchainFormats(void *session, uint32_t capacity,
                                                uint32_t *count_out, int64_t *formats) {
-    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
-    XrResult r = klxr_two_call(capacity, count_out, KLXR_FORMAT_COUNT);
+    klxr_session *s = klxr_sess(session);
+    if (!s) return KLXR_ERROR_HANDLE_INVALID;
+    uint32_t have = 0;
+    const int64_t *list = klxr_formats_for(s, &have);
+    XrResult r = klxr_two_call(capacity, count_out, have);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
     if (!formats) return KLXR_ERROR_VALIDATION_FAILURE;
-    memcpy(formats, g_swapchain_formats, sizeof g_swapchain_formats);
+    memcpy(formats, list, have * sizeof *list);
     return KLXR_SUCCESS;
 }
 
@@ -3085,12 +3382,15 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
     if (info->type != XR_TYPE_SWAPCHAIN_CREATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
     klxr_log_chain("xrCreateSwapchain", info->next);
 
+    uint32_t nfmt = 0;
+    const int64_t *fmts = klxr_formats_for(s, &nfmt);
     int known = 0;
-    for (uint32_t i = 0; i < KLXR_FORMAT_COUNT; i++)
-        if (g_swapchain_formats[i] == info->format) known = 1;
+    for (uint32_t i = 0; i < nfmt; i++)
+        if (fmts[i] == info->format) known = 1;
     if (!known) {
-        fprintf(stderr, "  [xr] xrCreateSwapchain: format 0x%llx unsupported\n",
-                (unsigned long long)info->format);
+        fprintf(stderr, "  [xr] xrCreateSwapchain: format 0x%llx unsupported (%s)\n",
+                (unsigned long long)info->format,
+                s->gfx == KLXR_GFX_VULKAN ? "VkFormat" : "GL internal format");
         return KLXR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
     }
     if (info->sampleCount > 1) {
@@ -3121,6 +3421,32 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
     sc->last_released = -1;
     sc->eye = -1;
     sc->mtl_eye = -1;
+
+    if (s->gfx == KLXR_GFX_VULKAN) {
+        // The images are VkImages, allocated by kl_vulkan on the device the
+        // guest itself created. Nothing GL is touched — and it must not be:
+        // there is no EGL context on this path at all, so the GL gateway below
+        // would resolve nothing.
+        for (int i = 0; i < sc->count; i++) {
+            sc->vk_img[i] = kl_vulkan_xr_image(sc->width, sc->height,
+                                               sc->array_size, sc->mip_count,
+                                               (long long)sc->format,
+                                               klxr_format_is_depth(s, sc->format));
+            if (!sc->vk_img[i]) {
+                fprintf(stderr, "  [xr] xrCreateSwapchain: VkImage %d of %d failed\n",
+                        i, sc->count);
+                sc->magic = 0;
+                return KLXR_ERROR_RUNTIME_FAILURE;
+            }
+        }
+        fprintf(stderr, "  [xr] swapchain %ux%u VkFormat %lld array %u mips %u "
+                        "usage 0x%llx -> %d VkImage(s)%s\n",
+                sc->width, sc->height, (long long)sc->format,
+                sc->array_size, sc->mip_count, (unsigned long long)sc->usage,
+                sc->count, klxr_format_is_depth(s, sc->format) ? " [depth]" : "");
+        *swapchain = sc;
+        return KLXR_SUCCESS;
+    }
 
     klxr_gl_init();
     if (!gl_GenTextures || !gl_BindTexture) {
@@ -3159,7 +3485,7 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
             sc->width, sc->height, (unsigned long long)sc->format,
             sc->array_size, sc->mip_count, (unsigned long long)sc->usage,
             sc->count, sc->tex[0], sc->tex[1], sc->tex[2],
-            klxr_format_is_depth(sc->format) ? " [depth]" : "");
+            klxr_format_is_depth(sc->session, sc->format) ? " [depth]" : "");
     *swapchain = sc;
     return KLXR_SUCCESS;
 }
@@ -3189,9 +3515,59 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
 // validation has no immutability test and Texture::setEGLImageTargetImpl
 // orphans the previous storage. `make mtltex` checks it against real ANGLE
 // rather than against that reading.
+// The Vulkan eye seam, and it runs the OPPOSITE DIRECTION to both GL routes.
+//
+// On GL the guest rendered into storage of its own and the eye is delivered by
+// re-pointing that storage at an MTLTexture the provider owns (an import), or —
+// when the swapchain is an array and re-pointing is impossible — by copying into
+// one. Under Vulkan there is nothing to provide and nothing to copy: the image
+// was allocated through MoltenVK, which has ALREADY backed it with an
+// MTLTexture, so the texture the compositor wants exists before we ask. We
+// EXPORT it. That is BONELAB's finding (notes/BONELAB.md) reached through the
+// other API, and it is why this path needs no provider at all — which matters,
+// because a host run without a frontend has none.
+//
+// Every image of the swapchain becomes a STAGE, because the guest rotates
+// through them and the frame record names the one it drew. Publishing only the
+// released image would leave the compositor sampling a stage that was never
+// filled on the two frames either side of it.
+static void klxr_publish_eye_vulkan(klxr_swapchain *sc, int eye, int slice) {
+    if (sc->mtl_eye == eye) return;
+    if (klxr_format_is_depth(sc->session, sc->format)) return;
+    int done = 0;
+    for (int k = 0; k < sc->count; k++) {
+        void *tex = kl_vulkan_xr_image_mtl(sc->vk_img[k]);
+        if (!tex) continue;
+        kl_glfb_note_eye_mtl_texture(eye, k, tex, slice,
+                                     (int)sc->width, (int)sc->height);
+        done++;
+    }
+    if (done == sc->count) {
+        // Same rule as the GL route: exactly one swapchain owns an eye at a
+        // time, and the guest rebuilds its eye swapchains across scenes with
+        // the OLD one destroyed after the new one is asserted.
+        for (int i = 0; i < KLXR_SWAPCHAIN_MAX; i++)
+            if (&g_swapchains[i] != sc && g_swapchains[i].mtl_eye == eye)
+                g_swapchains[i].mtl_eye = -1;
+        sc->mtl_eye = eye;
+        fprintf(stderr, "  [xr] eye %d: %d Vulkan swapchain image(s) %ux%u slice %d "
+                        "exported as MTLTextures — the compositor can sample them\n",
+                eye, done, sc->width, sc->height, slice);
+    } else {
+        // Named rather than silent, and not fatal: the guest keeps rendering
+        // into images that are simply never sampled, which is a black eye with
+        // every counter healthy — the exact failure `e0=nil e1=nil` could not
+        // explain on the GL path.
+        fprintf(stderr, "  [xr] eye %d: only %d of %d Vulkan images could be exported "
+                        "(%ux%u) — no MTLTexture, so the compositor shows black "
+                        "for this eye\n",
+                eye, done, sc->count, sc->width, sc->height);
+    }
+}
+
 static void klxr_back_eye_images(klxr_swapchain *sc, int eye) {
     if (!kl_glfb_has_mtl_provider() || sc->mtl_eye == eye) return;
-    if (klxr_format_is_depth(sc->format)) return;
+    if (klxr_format_is_depth(sc->session, sc->format)) return;
     // The provider hands back a slice of a 2-slice array, one per eye, and the
     // compositor's amplified pass depends on both eyes sharing that texture. A
     // swapchain that is itself an array is a different shape — the guest renders
@@ -3266,7 +3642,7 @@ static void klxr_mirror_eye_image(klxr_swapchain *sc, int eye, int layer) {
                             "not copied, so the compositor has nothing to sample\n");
         return;
     }
-    if (klxr_format_is_depth(sc->format)) return;
+    if (klxr_format_is_depth(sc->session, sc->format)) return;
     if (sc->last_released < 0 || sc->last_released >= sc->count) return;
     if (sc->mip_count != 1) {
         static int said;
@@ -3316,12 +3692,28 @@ static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity
     // binding says. Checking `type` on the first element is how the spec has a
     // runtime confirm the app and the binding agree — writing GL names into an
     // array of Vulkan images would otherwise be silent and catastrophic.
-    XrSwapchainImageOpenGLESKHR *gl = (XrSwapchainImageOpenGLESKHR *)images;
-    if (gl[0].type != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR) {
+    // The element type is checked against the SESSION's binding rather than
+    // simply accepted, because the two ways this can be wrong are opposite: an
+    // app whose array does not match its own binding is confused, and a runtime
+    // that writes the wrong width into it is catastrophic and silent (a VkImage
+    // truncated into a uint32 is a plausible-looking GL name).
+    int32_t got = *(const int32_t *)images;
+    if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN) {
+        if (got != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR) {
+            fprintf(stderr, "  [xr] xrEnumerateSwapchainImages: image type %d is not "
+                            "XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR\n", got);
+            return KLXR_ERROR_VALIDATION_FAILURE;
+        }
+        XrSwapchainImageVulkanKHR *vk = (XrSwapchainImageVulkanKHR *)images;
+        for (int i = 0; i < sc->count; i++) vk[i].image = sc->vk_img[i];
+        return KLXR_SUCCESS;
+    }
+    if (got != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR) {
         fprintf(stderr, "  [xr] xrEnumerateSwapchainImages: image type %d is not "
-                        "XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR\n", gl[0].type);
+                        "XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR\n", got);
         return KLXR_ERROR_VALIDATION_FAILURE;
     }
+    XrSwapchainImageOpenGLESKHR *gl = (XrSwapchainImageOpenGLESKHR *)images;
     for (int i = 0; i < sc->count; i++) gl[i].image = sc->tex[i];
     return KLXR_SUCCESS;
 }
@@ -3582,7 +3974,13 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             // an MTLTexture at all, so it is copied instead — every frame,
             // rather than once.
             if ((int)li == cap_layer) {
-                if (sc->array_size > 1)
+                if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN)
+                    // One route for both shapes here: an array swapchain is a
+                    // SLICE of an already-exported texture, not a copy, so the
+                    // GL path's array-vs-2D split has no counterpart.
+                    klxr_publish_eye_vulkan(sc, (int)v,
+                                            (int)proj->views[v].subImage.imageArrayIndex);
+                else if (sc->array_size > 1)
                     klxr_mirror_eye_image(sc, (int)v,
                                           (int)proj->views[v].subImage.imageArrayIndex);
                 else
@@ -3590,12 +3988,25 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             }
             if (sc->eye == (int)v) continue;            // already this eye
             sc->eye = (int)v;
-            for (int k = 0; k < sc->count; k++)
-                kl_glfb_note_eye_texture(sc->eye, k, sc->tex[k]);
+            // The capture path is GL's, and there are no GL names on the Vulkan
+            // path to give it — the eyes reach a compositor through the
+            // MTLTextures published above instead.
+            if (!sc->session || sc->session->gfx != KLXR_GFX_VULKAN)
+                for (int k = 0; k < sc->count; k++)
+                    kl_glfb_note_eye_texture(sc->eye, k, sc->tex[k]);
             const XrRect2Di *r = &proj->views[v].subImage.imageRect;
-            fprintf(stderr, "  [xr] layer %u eye %u <- swapchain %ux%u images "
-                            "(%u %u %u) rect %dx%d+%d+%d slice %u%s\n",
-                    li, v, sc->width, sc->height, sc->tex[0], sc->tex[1], sc->tex[2],
+            char imgs[96];
+            if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN)
+                snprintf(imgs, sizeof imgs, "VkImages (%p %p %p)",
+                         (void *)(uintptr_t)sc->vk_img[0],
+                         (void *)(uintptr_t)sc->vk_img[1],
+                         (void *)(uintptr_t)sc->vk_img[2]);
+            else
+                snprintf(imgs, sizeof imgs, "images (%u %u %u)",
+                         sc->tex[0], sc->tex[1], sc->tex[2]);
+            fprintf(stderr, "  [xr] layer %u eye %u <- swapchain %ux%u %s"
+                            " rect %dx%d+%d+%d slice %u%s\n",
+                    li, v, sc->width, sc->height, imgs,
                     r->extent.width, r->extent.height, r->offset.x, r->offset.y,
                     proj->views[v].subImage.imageArrayIndex,
                     (int)li == cap_layer ? " [captured]" : "");
@@ -3611,6 +4022,22 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         kl_ovrp_frame_end_external(drawn_stage,
                                    have_layer_pose ? layer_pose : NULL,
                                    have_layer_pose ? layer_tan : NULL);
+
+    // The Vulkan frame seam, and BONELAB's trap (c) reached through the other
+    // API: a compositor's "is there a new frame?" test is a SERIAL, and on the
+    // Vulkan path that serial is kl_vulkan's. Nothing else advances it — the GL
+    // fence below is 0 forever here, because there is no ANGLE queue — so
+    // without this call every eye texture above is correctly published, the
+    // counters are all healthy, and the display never updates. That failure has
+    // no error surface at all, which is why it gets a line of its own rather
+    // than riding inside the present block.
+    //
+    // It also makes the guest's queue idle first, which is what turns "the
+    // frame was submitted" into "the picture is complete" — the eye MTLTextures
+    // are the guest's own images, so nothing of ours is in its submissions and
+    // there is no MTLSharedEvent to wait on instead.
+    if (drawn_stage >= 0 && s->gfx == KLXR_GFX_VULKAN)
+        kl_vulkan_frame_done(drawn_stage);
 
     // ...and this is the VR path's swap. kl_glfb's capture and the frontend
     // seams both hang off eglSwapBuffers, which an OpenXR guest never calls —
@@ -3852,6 +4279,14 @@ static void klxr_install(void) {
                                    (void *)klxr_EnumerateViewConfigurationViews},
         {"xrGetOpenGLESGraphicsRequirementsKHR",
                                    (void *)klxr_GetOpenGLESGraphicsRequirementsKHR},
+        {"xrGetVulkanGraphicsRequirementsKHR",
+                                   (void *)klxr_GetVulkanGraphicsRequirementsKHR},
+        {"xrGetVulkanInstanceExtensionsKHR",
+                                   (void *)klxr_GetVulkanInstanceExtensionsKHR},
+        {"xrGetVulkanDeviceExtensionsKHR",
+                                   (void *)klxr_GetVulkanDeviceExtensionsKHR},
+        {"xrGetVulkanGraphicsDeviceKHR",
+                                   (void *)klxr_GetVulkanGraphicsDeviceKHR},
         {"xrEnumerateDisplayRefreshRatesFB",
                                    (void *)klxr_EnumerateDisplayRefreshRatesFB},
         {"xrGetDisplayRefreshRateFB", (void *)klxr_GetDisplayRefreshRateFB},

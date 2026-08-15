@@ -4072,6 +4072,45 @@ static klj_val klj_UnityPlayer_skipPermissionsDialog(void *env, void *self,
     return (klj_val){.j = 0};
 }
 
+// UnityPlayer.startOrientationListener(int) — start watching the accelerometer
+// for screen rotation, and report whether that succeeded.
+//
+// Transcribed from this APK's own UnityPlayer.smali rather than decided: the
+// body constructs an OrientationEventListener, asks it `canDetectOrientation()`
+// and, when that is false, logs "Orientation Listener cannot detect
+// orientation." and returns **false**. That is the arm a headset takes — there
+// is no rotating screen here and no orientation sensor is presented — so false
+// is a transcription of the device we present rather than a refusal.
+//
+// It also has to be false rather than the more agreeable true: the true arm
+// promises the listener is ENABLED, i.e. that orientation callbacks will keep
+// arriving, and the guest is entitled to wait for one. Trap 6d's shape — a
+// silent yes is worse than an honest no.
+static klj_val klj_UnityPlayer_startOrientationListener(void *env, void *self,
+                                                        const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// UnityPlayer.startActivityIndicator(int) / .stopActivityIndicator() — show and
+// hide Android's loading spinner.
+//
+// A genuine no-op rather than an unimplemented one, and the smali is what says
+// so: both bodies do nothing but `postOnUiThread` a Runnable, and each Runnable
+// bottoms out in a ProgressBar being added to or removed from the activity's
+// view hierarchy, inside a try/catch that only logs. Neither returns a value and
+// neither calls back into native, so there is nothing the guest can observe.
+//
+// There is no Android view hierarchy here at all — the guest's frames reach a
+// compositor of ours, not a FrameLayout — so the spinner has nowhere to be
+// drawn. This is the "only implement what is forced" rule landing on its easy
+// side: the forced behaviour is to return.
+static klj_val klj_UnityPlayer_startActivityIndicator(void *env, void *self,
+                                                      const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
 // The manifest permission model; defined with the other permission entry
 // points further down, and read by three callers rather than two now.
 static int klj_permission_state(const char *p, const char **why);
@@ -6758,6 +6797,16 @@ static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, in
         char lang[16], country[16];
         klj_locale_parts(lang, sizeof lang, country, sizeof country);
         locale = kl_jni_new_object("java/util/Locale");
+        // PINNED, because the cache outlives the read — trap 16c, in a place it
+        // had not been applied. The object is handed out again on every later
+        // call, but the guest is entitled to retire the reference it was given:
+        // Open Brush calls this from inside a local frame, PopLocalFrame retires
+        // it correctly, and every subsequent getDefault() then returns a handle
+        // to a slot that has been reused. It surfaced as `GetObjectClass on an
+        // untagged pointer` four frames deep in IL2CPP's reflection path —
+        // nowhere near a locale, and hundreds of frames after the call that
+        // cached it.
+        if (locale) klj_as_object(locale)->pinned = 1;
         KLJ_LOG("Locale.getDefault() -> %s_%s (from the host LANG)", lang, country);
     }
     return (klj_val){.l = locale};
@@ -9237,6 +9286,15 @@ static const klj_binding g_bindings[] = {
     {"android/view/Display$Mode", "getRefreshRate",    "()F", klj_Mode_getRefreshRate},
     {"com/unity3d/player/UnityPlayer", "skipPermissionsDialog", "()Z",
      klj_UnityPlayer_skipPermissionsDialog},
+    {"com/unity3d/player/UnityPlayer", "startOrientationListener", "(I)Z",
+     klj_UnityPlayer_startOrientationListener},
+    // Both spinner entry points share one handler: each is a return, and giving
+    // "show" and "hide" separate empty bodies would only invite one of them to
+    // grow a meaning the other does not have.
+    {"com/unity3d/player/UnityPlayer", "startActivityIndicator", "(I)V",
+     klj_UnityPlayer_startActivityIndicator},
+    {"com/unity3d/player/UnityPlayer", "stopActivityIndicator", "()V",
+     klj_UnityPlayer_startActivityIndicator},
     {"com/unity3d/player/UnityPlayer", "requestUserAuthorization",
      "(Ljava/lang/String;)V", klj_UnityPlayer_requestUserAuthorization},
     {"android/view/Window",  "getAttributes",

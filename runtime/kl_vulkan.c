@@ -69,6 +69,24 @@ unsigned long long kl_vulkan_eye_image_layers(int s, int e, unsigned w, unsigned
 void  kl_vulkan_capture_eyes(unsigned f, int s) { (void)f; (void)s; }
 void  kl_vulkan_frame_done(int s) { (void)s; }
 unsigned long long kl_vulkan_frame_serial(void) { return 0; }
+// The OpenXR seam. Answering "not supported" here is what keeps
+// XR_KHR_vulkan_enable OUT of the advertised extension list on a checkout with
+// no MoltenVK, so a Vulkan OpenXR guest is refused at xrCreateInstance — where
+// the guest's own log names the extension — instead of somewhere further in.
+int   kl_vulkan_xr_supported(void) { return 0; }
+const char *kl_vulkan_xr_instance_extensions(void) { return ""; }
+const char *kl_vulkan_xr_device_extensions(void) { return ""; }
+void *kl_vulkan_xr_physical_device(void *vi) { (void)vi; return NULL; }
+void  kl_vulkan_xr_api_range(unsigned *mmaj, unsigned *mmin,
+                             unsigned *xmaj, unsigned *xmin) {
+    if (mmaj) *mmaj = 0; if (mmin) *mmin = 0;
+    if (xmaj) *xmaj = 0; if (xmin) *xmin = 0;
+}
+unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned l,
+                                      unsigned m, long long f, int depth) {
+    (void)w; (void)h; (void)l; (void)m; (void)f; (void)depth; return 0;
+}
+void *kl_vulkan_xr_image_mtl(unsigned long long img) { (void)img; return NULL; }
 
 #else  /* MoltenVK headers present */
 
@@ -1105,6 +1123,56 @@ static void eye_publish_mtl(int stage, int eye, int layers) {
     }
 }
 
+// Create an image and back it with device-local memory.
+//
+// Shared by the two callers that need one — the OVRPlugin eye images below and
+// the OpenXR swapchain images (kl_vulkan_xr_image) — because the sequence is
+// identical and only the description differs. Written out twice it would be two
+// copies of the memory-type fallback, which is exactly the kind of thing that
+// drifts and then differs on the path nobody ran.
+static VkImage klvk_image_alloc(klvk_device *d, VkFormat fmt,
+                                unsigned w, unsigned h, uint32_t layers,
+                                uint32_t mips, VkImageUsageFlags usage,
+                                VkDeviceMemory *mem_out) {
+    if (mem_out) *mem_out = VK_NULL_HANDLE;
+    VkImageCreateInfo ic = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = fmt,
+        .extent = { w, h, 1 },
+        .mipLevels = mips ? mips : 1,
+        .arrayLayers = layers ? layers : 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkImage img = VK_NULL_HANDLE;
+    if (d->CreateImage(d->dev, &ic, NULL, &img) != VK_SUCCESS) {
+        VKI("image %ux%u (%u layer(s)): vkCreateImage failed\n", w, h, layers);
+        return VK_NULL_HANDLE;
+    }
+    VkMemoryRequirements mr;
+    d->GetImageMemoryRequirements(d->dev, img, &mr);
+    uint32_t mt = mem_type(d, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt == UINT32_MAX) mt = mem_type(d, mr.memoryTypeBits, 0);
+    VkMemoryAllocateInfo ai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mr.size,
+        .memoryTypeIndex = mt,
+    };
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (d->AllocateMemory(d->dev, &ai, NULL, &mem) != VK_SUCCESS ||
+        d->BindImageMemory(d->dev, img, mem, 0) != VK_SUCCESS) {
+        VKI("image %ux%u: memory failed\n", w, h);
+        d->DestroyImage(d->dev, img, NULL);
+        return VK_NULL_HANDLE;
+    }
+    if (mem_out) *mem_out = mem;
+    return img;
+}
+
 unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,
                                               int srgb, int layers) {
     if (!kl_vulkan_guest_active()) return 0;
@@ -1119,43 +1187,16 @@ unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, un
     if (g_eye[stage][eye].img) return (uint64_t)(uintptr_t)g_eye[stage][eye].img;
 
     VkFormat fmt = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-    VkImageCreateInfo ic = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = fmt,
-        .extent = { w, h, 1 },
-        .mipLevels = 1,
-        .arrayLayers = (uint32_t)layers,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        // The guest renders into it, samples it for its own post chain, and we
-        // copy out of it. TRANSFER_DST is there because Unity clears some
-        // targets with vkCmdClearColorImage rather than a load op.
-        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    };
-    VkImage img = VK_NULL_HANDLE;
-    if (d->CreateImage(d->dev, &ic, NULL, &img) != VK_SUCCESS) {
-        VKI("eye image %ux%u: vkCreateImage failed\n", w, h);
-        return 0;
-    }
-    VkMemoryRequirements mr;
-    d->GetImageMemoryRequirements(d->dev, img, &mr);
-    uint32_t mt = mem_type(d, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (mt == UINT32_MAX) mt = mem_type(d, mr.memoryTypeBits, 0);
-    VkMemoryAllocateInfo ai = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = mr.size,
-        .memoryTypeIndex = mt,
-    };
+    // The guest renders into it, samples it for its own post chain, and we copy
+    // out of it. TRANSFER_DST is there because Unity clears some targets with
+    // vkCmdClearColorImage rather than a load op.
     VkDeviceMemory mem = VK_NULL_HANDLE;
-    if (d->AllocateMemory(d->dev, &ai, NULL, &mem) != VK_SUCCESS ||
-        d->BindImageMemory(d->dev, img, mem, 0) != VK_SUCCESS) {
-        VKI("eye image %ux%u: memory failed\n", w, h);
-        return 0;
-    }
+    VkImage img = klvk_image_alloc(d, fmt, w, h, (uint32_t)layers, 1,
+                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                   VK_IMAGE_USAGE_SAMPLED_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT, &mem);
+    if (img == VK_NULL_HANDLE) return 0;
     // KL_VK_EYE_TINT=1 pre-clears the image to a colour nothing in a rendered
     // scene produces, which is the A/B that separates the two ways an eye
     // texture can come back wrong. They are indistinguishable in the capture
@@ -1231,6 +1272,133 @@ unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, un
 unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned h,
                                        int srgb) {
     return kl_vulkan_eye_image_layers(stage, eye, w, h, srgb, 1);
+}
+
+// ---------------------------------------------------------------------------
+// The OpenXR seam — XR_KHR_vulkan_enable. See kl_vulkan.h for why it exists.
+// ---------------------------------------------------------------------------
+
+// Whether the extension may be advertised. Deliberately NOT kl_vulkan_guest_active():
+// that asks whether a device exists, and at xrCreateInstance time the guest has
+// not created one yet — it cannot, because the whole point of the extension is
+// that it asks US which physical device to create it on. So the question here
+// is only whether MoltenVK is reachable at all.
+int kl_vulkan_xr_supported(void) { return kl_vulkan_available(); }
+
+// Empty, and true rather than lazy — klvk_CreateDevice already adds
+// VK_EXT_metal_objects to every device the guest creates, so there is nothing
+// left to require of the app. If something is ever genuinely required here,
+// note that the spec wants a SPACE-delimited list in one buffer, not an array.
+const char *kl_vulkan_xr_instance_extensions(void) { return ""; }
+const char *kl_vulkan_xr_device_extensions(void)   { return ""; }
+
+// The physical device the app must render with.
+//
+// The VkInstance is the APP's — it created one before asking, which is the
+// ordering XR_KHR_vulkan_enable prescribes — so this enumerates on the handle it
+// passes rather than on g_instance. Those are usually the same object here (the
+// app's vkCreateInstance came through klvk_CreateInstance), but "usually" is not
+// a thing to encode: the spec names the instance as a parameter precisely
+// because the runtime is not entitled to assume it owns one.
+//
+// The FIRST device is the answer because MoltenVK exposes exactly one per Metal
+// device, and picking by index rather than by score is honest about that. A
+// machine that ever reports two would want a rule here, and would say so by
+// this log line naming a count above 1.
+void *kl_vulkan_xr_physical_device(void *vk_instance) {
+    if (!kl_vulkan_available() || !vk_instance) return NULL;
+    PFN_vkEnumeratePhysicalDevices enum_pd = (PFN_vkEnumeratePhysicalDevices)
+        real_gipa((VkInstance)vk_instance, "vkEnumeratePhysicalDevices");
+    if (!enum_pd) { VKI("xr: no vkEnumeratePhysicalDevices on the app's instance\n"); return NULL; }
+    uint32_t n = 0;
+    if (enum_pd((VkInstance)vk_instance, &n, NULL) != VK_SUCCESS || n == 0) {
+        // The trap BONELAB paid for, in the one place it can recur: without
+        // VK_KHR_portability_enumeration this answers zero devices AND
+        // VK_SUCCESS, so a bare count of 0 is not necessarily an empty machine.
+        VKI("xr: vkEnumeratePhysicalDevices reports 0 devices — if the app's "
+            "instance omitted VK_KHR_portability_enumeration, that is why\n");
+        return NULL;
+    }
+    VkPhysicalDevice pd[8];
+    if (n > 8) n = 8;
+    if (enum_pd((VkInstance)vk_instance, &n, pd) != VK_SUCCESS || n == 0) return NULL;
+    if (n > 1) VKI("xr: %u physical devices; taking the first\n", n);
+    return (void *)pd[0];
+}
+
+// One OpenXR swapchain image.
+//
+// Deliberately NOT keyed on (stage, eye) the way the OVRPlugin eye images are:
+// in OpenXR the runtime allocates a swapchain's images at xrCreateSwapchain,
+// which knows a size and a format and nothing else — WHICH swapchain is an eye
+// is only asserted later, at xrEndFrame, from the projection layer. That is
+// SL-19's finding and it is a property of the API, not of a guest.
+//
+// So this hands back a bare image and keeps no table of its own; the eye
+// association, and with it the MTLTexture publication, belongs at the assertion.
+unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned layers,
+                                      unsigned mips, long long vk_format, int depth) {
+    if (!kl_vulkan_guest_active()) return 0;
+    klvk_device *d = g_devs[0];
+    if (!d || !w || !h) return 0;
+    // A depth image is not a colour image with a different format: it needs the
+    // depth/stencil attachment usage, and asking for COLOR_ATTACHMENT on a depth
+    // format is a validation error rather than a harmless extra bit.
+    VkImageUsageFlags usage = depth
+        ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
+        : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkImage img = klvk_image_alloc(d, (VkFormat)vk_format, w, h,
+                                   layers ? layers : 1, mips ? mips : 1, usage, &mem);
+    if (img == VK_NULL_HANDLE) return 0;
+    return (uint64_t)(uintptr_t)img;
+}
+
+// The MTLTexture behind an image this file created, for the compositor seam.
+// NULL when the export is unavailable — the caller reports it, because only the
+// caller knows which eye it was about.
+void *kl_vulkan_xr_image_mtl(unsigned long long image) {
+    if (!kl_vulkan_guest_active() || !image) return NULL;
+    return eye_mtl_texture(g_devs[0], (VkImage)(uintptr_t)image);
+}
+
+// The Vulkan version range a session may be created against.
+//
+// Measured off the physical device, not asserted: MoltenVK's instance-level and
+// device-level versions differ, and the one that governs the app's device is the
+// device's. The floor is 1.0 because nothing here needs more, and overstating a
+// floor is the dangerous direction — the same reasoning, and the same trap, as
+// the GLES range next door (an app told it needs 1.2 asks for 1.2).
+void kl_vulkan_xr_api_range(unsigned *min_major, unsigned *min_minor,
+                            unsigned *max_major, unsigned *max_minor) {
+    if (min_major) *min_major = 1;
+    if (min_minor) *min_minor = 0;
+    // A conservative ceiling until a device answers, so a failure to measure
+    // cannot present as "this runtime supports nothing".
+    if (max_major) *max_major = 1;
+    if (max_minor) *max_minor = 0;
+    if (!kl_vulkan_available()) return;
+
+    VkPhysicalDevice phys = VK_NULL_HANDLE;
+    if (g_ndev > 0 && g_devs[0]) phys = g_devs[0]->phys;
+    if (phys == VK_NULL_HANDLE && g_instance) {
+        PFN_vkEnumeratePhysicalDevices enum_pd = (PFN_vkEnumeratePhysicalDevices)
+            real_gipa(g_instance, "vkEnumeratePhysicalDevices");
+        uint32_t n = 1;
+        VkPhysicalDevice one = VK_NULL_HANDLE;
+        if (enum_pd && enum_pd(g_instance, &n, &one) >= 0 && n) phys = one;
+    }
+    if (phys == VK_NULL_HANDLE) return;
+
+    PFN_vkGetPhysicalDeviceProperties props_fn = (PFN_vkGetPhysicalDeviceProperties)
+        real_gipa(g_instance, "vkGetPhysicalDeviceProperties");
+    if (!props_fn) return;
+    VkPhysicalDeviceProperties p;
+    memset(&p, 0, sizeof p);
+    props_fn(phys, &p);
+    if (max_major) *max_major = VK_VERSION_MAJOR(p.apiVersion);
+    if (max_minor) *max_minor = VK_VERSION_MINOR(p.apiVersion);
 }
 
 void kl_vulkan_capture_eyes(unsigned frame, int stage) {

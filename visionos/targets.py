@@ -158,6 +158,51 @@ TARGETS = {
         "product": "KleptonVRChat",
         "display": "Klepton VRChat",
     },
+    "openbrush": {
+        # Open Brush — Unity 2022.3.62f2 + IL2CPP, and the SIXTH target. Two
+        # things make it worth adding rather than a sixth copy of the Unity row:
+        #
+        #   - it is the **OPENXR build**, deliberately, and not the Oculus store
+        #     one. Open Brush ships both; this tree is the former, which
+        #     boot.config says in the same line VRChat's does
+        #     (`xrsdk-pre-init-library=UnityOpenXR`) and the manifest says again
+        #     in the Khronos permissions and the runtime-broker `<queries>`.
+        #     There is no libOVRPlugin, no libvrapi and no Oculus Platform
+        #     loader — so it takes the Unity + kl_openxr path VRChat opened, and
+        #     it is the SECOND guest on it, which is the point: until now that
+        #     junction had exactly one title holding it up.
+        #   - **the sources are public** (github.com/icosa-foundation/open-brush),
+        #     which no other target here has. Everything else in this project is
+        #     reverse-engineered from a stripped .so, so when this one does
+        #     something inexplicable the answer can be READ instead of derived.
+        #     Nothing in the build depends on that; it is a debugging lever.
+        #
+        # The front door is stock — com.unity3d.player.UnityPlayerActivity and
+        # libmain's JNI_OnLoad — with no obfuscated Application class of the kind
+        # VRChat carries.
+        #
+        # Not a split binary: 242 MB of APK with assets/bin/Data AND the
+        # Addressables catalogue (assets/aa) inside it, so there is no OBB to
+        # stage.
+        #
+        # UNSETTLED and the first thing a run has to answer: the manifest
+        # declares `android.hardware.vulkan.version` as REQUIRED. That is
+        # BONELAB's question, and BONELAB's recipe answers it — whether the guest
+        # dlopens libvulkan.so, and which EGL entry points it reaches
+        # (KL_EGL_TRACE=1). Unlike BONELAB's day, either answer is now a path
+        # that exists; which one this is decides whether the eye textures arrive
+        # through kl_glfb or kl_vulkan.
+        "libs":    None,
+        "srcdir":  "openbrush/lib/arm64-v8a",
+        "tree":    "openbrush",
+        "apk":     "openbrush.apk",
+        "assets":  "openbrush/assets",
+        "qtplugins": "",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonOpenBrush",
+        "display": "Klepton Open Brush",
+    },
     "steamlink-vr": {
         # BOTH front doors, because the app runs both: the 2D shell pairs in a
         # WindowGroup and hands off to the OpenXR half in an ImmersiveSpace, in

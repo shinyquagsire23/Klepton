@@ -77,6 +77,7 @@
 //   sigtimedwait                 (Darwin)
 //   sigwaitinfo                  (Darwin)
 //   splice                       (Darwin)
+//   tgkill                       (Darwin)
 //   unshare                      (Darwin)
 //   write_nal_unit               (Darwin)
 KL_FWD(_exit)
