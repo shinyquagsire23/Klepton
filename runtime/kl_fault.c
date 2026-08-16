@@ -1,5 +1,5 @@
 // See kl_fault.h. This was tests/t_boot.c's report_fault() until the visionOS
-// port needed the same reporter inside an app bundle (PLANNING §12.7); it is
+// port needed the same reporter inside an app bundle; it is
 // the same code, moved rather than copied, because a signal handler that
 // exists twice gets fixed once.
 #include <dlfcn.h>
@@ -69,8 +69,8 @@ void kl_fault_print_frames(FILE *f, void *fp_) {
 // This has to survive being called in a broken process, so it uses write(2)
 // rather than stdio and does not attempt a symbolised backtrace.
 static void report_fault(int sig, siginfo_t *si, void *uctx) {
-    // Our own handler, so this is a Darwin ucontext_t and reading it is safe —
-    // the mismatch in trap 5 is about the *guest's* handlers seeing one.
+    // Our own handler, so this is a Darwin ucontext_t and reading it is safe.
+    // The layout mismatch only bites the GUEST's handlers.
     ucontext_t *uc = uctx;
     void *pc = uc ? (void *)uc->uc_mcontext->__ss.__pc : NULL;
     uint64_t tid = 0;
@@ -161,7 +161,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // access to it is veneered to tsd[KLX_TSD_SLOT] (kl_x18.c), so the register
     // in the ucontext is Darwin's reserved value and the slot is the guest's.
     // Reading the register instead reports the platform's business as the
-    // guest's — the exact confusion trap 0 exists to prevent.
+    // guest's.
     if (uc) {
         const uint64_t *x = (const uint64_t *)uc->uc_mcontext->__ss.__x;
         for (int i = 0; i < 29; i += 4) {
@@ -193,7 +193,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // x18 site with a branch to a veneer, so an offset that disassembles as
     // `ldrh w22, [x18]` in the .so may be a `b` in memory. Reading the offset
     // back out of the image and reasoning about the original word is how a
-    // whole session gets spent on trap 0 when the veneer is working.
+    // an x18 bug gets diagnosed when the veneer is working.
     //
     // Four words, because the interesting question is usually whether the pc is
     // inside a veneer body (a `stp`/`mrs`/`ldr` prologue is unmistakable) or in
@@ -299,8 +299,8 @@ void kl_fault_install(void) {
     // Vision Pro did: it died with `App terminated due to signal 4` and a log
     // that simply stopped, which reads as a hang or an OS kill rather than as a
     // crash with a pc. An undefined instruction is exactly the failure a guest
-    // executing DATA produces (trap 0b/0d's shape), so it is the last signal
-    // that should be silent here.
+    // executing DATA produces, so it is the last signal that should be silent
+    // here.
     sigaction(SIGILL,  &sa, NULL);
     sigaction(SIGFPE,  &sa, NULL);
 }

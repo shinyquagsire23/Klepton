@@ -115,7 +115,7 @@ static void klm_AMediaFormat_setString(void *fmt, const char *key, const char *v
     int i = klm_fmt_slot(f, key);
     if (i < 0) return;
     // Copied, not pointed at: the guest builds these strings on its own stack
-    // and in its own std::string temporaries. Trap 6's lesson, again.
+    // and in its own std::string temporaries.
     free(f->kv[i].sval);
     f->kv[i].sval = v ? strdup(v) : NULL;
     f->kv[i].is_str = 1;
@@ -130,8 +130,8 @@ static const char *klm_fmt_string(klm_format *f, const char *key) {
 
 // The getters. `false` means "this format does not carry that key", and the NDK
 // contract is that the out parameter is then LEFT ALONE — the caller keeps its
-// own default. Writing a zero on the false path is trap 10b's shape: a value
-// the caller never asked for, indistinguishable from a measurement.
+// own default. Writing a zero on the false path hands back a value the caller
+// never asked for, indistinguishable from a measurement.
 //
 // Nothing here ever carries a key today (see the extractor below: it publishes
 // no tracks, so no track format is ever built), which makes every one of these
@@ -202,7 +202,7 @@ static const char *g_key_stride          = "stride";
 // Unity's VideoPlayer on Android is extractor + codec: AMediaExtractor pulls
 // compressed samples out of a container and hands them to AMediaCodec, which
 // this file already serves over VideoToolbox. The codec half exists because
-// Steam Link needed it (SL-10) and it arrives an elementary stream, already
+// Steam Link needed it and it arrives an elementary stream, already
 // demuxed by the guest's own network protocol. Nothing here has ever opened a
 // CONTAINER, and that is the whole gap: an .mp4 is a box structure that must be
 // parsed to find where each sample begins.
@@ -444,8 +444,7 @@ static int klm_AImage_getHardwareBuffer(void *image, void **out) {
 // The queue behind the reader. This guest asks for 20 images and its
 // QSVLFrameServer really does hold a deque of them, so a pool sized to a
 // plausible-looking 8 would silently drop frames at exactly the moment the
-// stream is healthiest — SL-9's swapchain-pool lesson, which cost a session
-// then. Sized above the request, and the request is reported.
+// stream is healthiest. Sized above the request, and the request is reported.
 #define KLM_READER_MAX 32
 
 typedef struct {
@@ -476,8 +475,8 @@ static klm_reader *g_reader;        // for the report; this guest makes one
 // Lifetime totals. The per-object counters die with the object, and the run
 // where "did anything decode?" matters most is the CLEAN one — where the app
 // shuts down and deletes both the codec and the reader before anything gets
-// to report. These outlive that. (SL-11: an empty media report read as "the
-// decoder was never fed" when it only meant "teardown got there first".)
+// to report. These outlive that: an empty media report otherwise reads as "the
+// decoder was never fed" when it only means "teardown got there first".
 static unsigned g_life_in, g_life_out, g_life_rendered, g_life_published, g_life_acquired;
 // ...and the one bit that says the report is worth printing at all: a codec or a
 // reader existed at some point. Counters can legitimately all be zero, and that
@@ -489,12 +488,12 @@ static int g_ever_created;
 // guest's HandleOnImageAvailable takes the same codec mutex its render loop
 // holds across AMediaCodec_releaseOutputBuffer, so calling the listener inline
 // from release would re-enter that mutex and wedge — the "a HandlerThread needs
-// a real thread" lesson from M4, in a new subsystem. One thread per reader,
+// a real thread" rule, in a new subsystem. One thread per reader,
 // woken by the queue.
 static void *reader_dispatch(void *arg) {
     klm_reader *r = arg;
-    // Guest code runs on this thread, so the S0.1/S0.5 per-thread setup has to
-    // happen before the first call into it.
+    // Guest code runs on this thread, so the per-thread TLS and veneer setup
+    // has to happen before the first call into it.
     kl_thread_init();
     pthread_mutex_lock(&r->lock);
     while (r->running) {
@@ -712,7 +711,7 @@ static int klm_AMediaCodec_configure(void *codec, const void *format,
     if (!c || c->magic != KLM_CODEC_MAGIC) return AMEDIA_ERROR_INVALID_PARAMETER;
     if (crypto) {
         // A decrypting configure is DRM, and this project does not do that
-        // (CLAUDE.md, "the DRM line"). Steam Link never passes one; refusing
+        //. Steam Link never passes one; refusing
         // rather than ignoring keeps it that way.
         fprintf(stderr, "  [media] AMediaCodec_configure with an AMediaCrypto — "
                         "refused\n");
@@ -976,7 +975,7 @@ void kl_mediandk_report(FILE *f) {
     // Never silent once anything media-shaped has happened. "Did a frame reach
     // the guest?" is the question this run exists to answer, and a report that
     // prints nothing is indistinguishable from a report that never ran — which
-    // is exactly how it read the first time (trap 6d, in the reporting path).
+    // is how a silent reporting path reads.
     // ...and the demuxer's refusals count as "media-shaped", because a guest
     // that asked for a video and was refused is the case most likely to be
     // investigated as a rendering problem. `g_ever_created` is false on that
@@ -1119,7 +1118,6 @@ void *kl_mediandk_sym(const char *name) {
     void *fn = kl_mediandk_lookup(name);
     // dlsym semantics differ from the ELF-import door's: a miss here becomes a
     // named stub, because the guest is asking at runtime and deserves to fail
-    // where it CALLS rather than where it looked up (CLAUDE.md, "lookups are
-    // measurements, calls are assertions").
+    // where it CALLS rather than where it looked up.
     return fn ? fn : kl_named_stub(name, (void *)kl_unresolved_named);
 }

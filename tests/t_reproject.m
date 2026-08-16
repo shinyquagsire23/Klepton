@@ -17,8 +17,7 @@
 //
 // `make reproject`. Deliberately not part of `make check`: it needs Metal's
 // compiler service, and the gate should not acquire a dependency on that
-// (PLANNING's AGX arc — Metal's shader compiler is an XPC service with its own
-// failure modes, and make check already re-execs around one of them).
+//  (Metal's shader compiler is an XPC service with its own failure modes, and make check already re-execs around one of them).
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <math.h>
@@ -46,7 +45,7 @@ static simd_float4 corner_ndc(kl_reproject_uniforms u, float cx, float cy) {
 static void check_math(void) {
     printf("=== reprojection matrices ===\n");
 
-    // An asymmetric frustum, because a symmetric one cannot tell left from
+// An asymmetric frustum, because a symmetric one cannot tell left from
     // right or a transposed tangent order from a correct one.
     const float L = 1.1f, R = 0.9f, T = 1.3f, B = 1.2f;
     simd_float4x4 P = kl_reproject_projection(L, R, T, B, 0.03f);
@@ -148,7 +147,7 @@ static void check_shader(void) {
                                  [NSString stringWithUTF8String:pass[i].ff]];
         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction = vf; pd.fragmentFunction = ff;
-        // The eye textures are RGBA16F and so is the visionOS layer, so this is
+    // The eye textures are RGBA16F and so is the visionOS layer, so this is
         // the format the pipeline will really be linked against.
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
         pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -162,14 +161,14 @@ static void check_shader(void) {
     }
 }
 
-// Compiling is not the same as producing the right pixels. Run the pass over a
+        // Compiling is not the same as producing the right pixels. Run the pass over a
 // 2x2 source with a distinct colour in each texel and one decoy slice, and read
 // the result back.
 //
 // This is what pins the three things that are invisible until a device shows
 // them, and that no amount of matrix checking can reach:
 //
-//   - **The uniform layout.** The C struct and the MSL struct are two
+//  - **The uniform layout.** The C struct and the MSL struct are two
 //     declarations of one thing. If they disagree, the projection reads as
 //     garbage and nothing lands on screen — on device that presents as "the
 //     composite pass does nothing", which is indistinguishable from a dozen
@@ -213,7 +212,7 @@ static void check_pixels(void) {
                                                                        error:&err];
     if (!ps) { ok(0, "pipeline for the pixel check"); return; }
 
-    // Source: 2x2, two slices. Slice 0 carries the corners we look for; slice 1
+// Source: 2x2, two slices. Slice 0 carries the corners we look for; slice 1
     // is a decoy, so sampling the wrong slice cannot pass by accident.
     MTLTextureDescriptor *td = [MTLTextureDescriptor new];
     td.textureType = MTLTextureType2DArray;
@@ -363,7 +362,7 @@ static void check_pixels(void) {
             [enc setFragmentTexture:src atIndex:1];
             [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
             [enc setFragmentBytes:&bu length:sizeof bu atIndex:0];
-            // Three vertices, no grid: the blit is a full-screen triangle.
+    // Three vertices, no grid: the blit is a full-screen triangle.
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [enc endEncoding];
             [cmd commit];
@@ -376,7 +375,7 @@ static void check_pixels(void) {
         }
     }
 
-    // The same picture through the other slice must NOT be the same picture.
+            // The same picture through the other slice must NOT be the same picture.
     u.slice = 1;
     cmd = [q commandBuffer];
     enc = [cmd renderCommandEncoderWithDescriptor:rp];
@@ -464,7 +463,7 @@ static void check_pixels(void) {
        "visible = 0 collapses the quad — the clear survives");
 }
 
-// The crop, THROUGH THE PASS — not the grid arithmetic, which check_viewport
+    // The crop, THROUGH THE PASS — not the grid arithmetic, which check_viewport
 // above already covers on the CPU.
 //
 // The two are different assertions and only this one covers the wiring: a grid
@@ -505,7 +504,7 @@ static void check_crop_pixels(void) {
     td.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> src = [dev newTextureWithDescriptor:td];
 
-    // Memory row 0 is the picture's BOTTOM, exactly as in check_pixels and for
+// Memory row 0 is the picture's BOTTOM, exactly as in check_pixels and for
     // the same reason: this texture stands in for one GL wrote through an
     // EGLImage.
     const uint8_t M[4] = { 255, 0, 255, 255 };          // magenta: never drawn
@@ -623,12 +622,12 @@ static void check_crop_pixels(void) {
                    "screen — the corner-of-the-eye bug, reproduced");
 }
 
-// TWO EYES, TWO CROPS, ONE GRID — the symmetric-projection case.
+    // TWO EYES, TWO CROPS, ONE GRID — the symmetric-projection case.
 //
 // A guest using Oculus symmetric projection renders both eyes with one union
 // frustum into one widened texture and submits a DIFFERENT sub-rect per eye
-// (measured on BONELAB: eye 0 at x=0, eye 1 at x=609, both 2271 wide of 2880 —
-// notes/BONELAB.md). The composite draws both eyes from one grid buffer, so the
+// (measured on BONELAB: eye 0 at x=0, eye 1 at x=609, both 2271 wide of 2880).
+// The composite draws both eyes from one grid buffer, so the
 // buffer carries a BLOCK PER EYE and kl_reproject_uniforms.grid_eye says which
 // one a view reads.
 //
@@ -665,7 +664,7 @@ static void check_split_crop_pixels(void) {
     td.width = 4; td.height = 2; td.arrayLength = 1;
     td.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> src = [dev newTextureWithDescriptor:td];
-    // Four columns, four colours, both rows the same — so a HORIZONTAL shift is
+// Four columns, four colours, both rows the same — so a HORIZONTAL shift is
     // the only thing this can see, which is the only thing the two rects differ
     // by.
     const uint8_t col[4][4] = { { 255,0,0,255 }, { 0,255,0,255 },
@@ -748,7 +747,7 @@ static void check_split_crop_pixels(void) {
        "...and reading one block for both eyes really is a different picture");
 }
 
-// Two eyes that are two TEXTURES, not two slices of one.
+    // Two eyes that are two TEXTURES, not two slices of one.
 //
 // Every other case in this file composites from a single 2-slice array, because
 // until Open Brush that is all anything produced: the eye provider allocates
@@ -786,7 +785,7 @@ static void check_two_textures(void) {
     pd.vertexFunction = [lib newFunctionWithName:@"kl_reproject_v"];
     pd.fragmentFunction = [lib newFunctionWithName:@"kl_reproject_f"];
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-    // The whole point of the pass: both eyes in one draw.
+// The whole point of the pass: both eyes in one draw.
     pd.maxVertexAmplificationCount = 2;
     id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd
                                                                        error:&err];
@@ -853,7 +852,7 @@ static void check_two_textures(void) {
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
-        // The array LENGTH, not a slice — this is what lets amplification reach
+    // The array LENGTH, not a slice — this is what lets amplification reach
         // layer 1 at all (KleptonCompositor.encodeViews).
         rp.renderTargetArrayLength = 2;
         id<MTLCommandBuffer> cmd = [q commandBuffer];
@@ -891,7 +890,7 @@ static void check_two_textures(void) {
                got[0][1][0], got[0][1][1], got[0][1][2],
                got[0][1][2] == 255 ? "the CLEAR, so the view was dropped"
                                    : "eye 0's picture");
-    // The failing direction, which is also every earlier guest: one texture in
+        // The failing direction, which is also every earlier guest: one texture in
     // both slots really does put eye 0's picture in both eyes. Without this the
     // assertion above would pass just as well with the second binding removed
     // and the shader reading slot 0 unconditionally.
@@ -899,7 +898,7 @@ static void check_two_textures(void) {
        "...and binding one texture to both slots puts eye 0 in both, as it did before");
 }
 
-// A stand-in rate map: screen -> physical, halving everything. Linear, so the
+    // A stand-in rate map: screen -> physical, halving everything. Linear, so the
 // grid reproduces it exactly at any cell count, which is what lets the
 // composition below be asserted to the bit rather than to a tolerance.
 static void half_s2p(void *ctx, float sx, float sy, float *px, float *py) {
@@ -921,7 +920,7 @@ static void check_viewport(void) {
     const float W = 1000, H = 800;
     simd_float2 g[kl_reproject_grid_entries(2, 2)];
 
-    // No crop, no map: the grid must be exactly what it was before any of this
+// No crop, no map: the grid must be exactly what it was before any of this
     // existed, or every unscaled title regresses.
     kl_reproject_grid_build(g, 1, 1, NULL, W, H, W, H, NULL, NULL);
     ok(g[1].x == 0 && g[1].y == 0 && g[4].x == 1 && g[4].y == 1,

@@ -1,6 +1,6 @@
-// S1.0 — do shared ANGLE contexts across threads crash Apple's Metal driver?
+// Do shared ANGLE contexts across threads crash Apple's Metal driver?
 //
-// The reference renderer (runtime/kl_glfb.c, KL_GLFB=1) captures black frames
+// The reference renderer (runtime/gfx/kl_glfb.c, KL_GLFB=1) captures black frames
 // because Unity drives GL from more than one thread and an EGL context is current
 // on exactly one. The correct fix — a context per thread, all *sharing* with the
 // first, which is what a multi-threaded GLES app does on Android — is implemented
@@ -680,7 +680,7 @@ int main(void) {
     RESOLVE(glTexStorage2D);           RESOLVE(glTexSubImage2D);
 
     // Metal by name — the default display would select ANGLE's OpenGL backend,
-    // which is a different driver stack and would not reproduce anything (S0.9).
+    // which is a different driver stack and would not reproduce anything.
     const char *want = getenv("KL_ANGLE_BACKEND");
     int use_gl = want && strcmp(want, "gl") == 0;
     const int32_t dpy_attrs[] = {
@@ -751,9 +751,9 @@ int main(void) {
     free(th);
 
     if (g_failed)
-        fprintf(stderr, "=== S1.0: threads finished, but a stage reported failure\n");
+        fprintf(stderr, "=== threads finished, but a stage reported failure\n");
     else
-        fprintf(stderr, "=== S1.0 SURVIVED: %d threads, share=%d serial=%d — no crash\n",
+        fprintf(stderr, "=== SURVIVED: %d threads, share=%d serial=%d — no crash\n",
                 g_threads, g_share, g_serial);
     return g_failed ? 1 : 0;
 }

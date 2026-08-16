@@ -5,7 +5,7 @@ import QuartzCore
 
 // Steam Link's 2D configuration shell, in a visionOS window.
 //
-// This is the other half of PLANNING §11.9's front-door pair. The VR half runs
+// The other half of the front-door pair. The VR half runs
 // in an ImmersiveSpace (KleptonCompositor) and cannot draw anything without an
 // authorized session; the shell is what *gets* one — it lists the hosts on the
 // LAN, takes the PIN, and hands off. On the host that is `kl_view.c`, SDL3 and
@@ -24,7 +24,7 @@ import QuartzCore
 // framebuffer of an EGL window surface. At 1280x800 that is 4 MB a frame — a
 // real cost, and the right one to pay for a configuration UI that exists for
 // about a minute. Giving it a zero-copy route means backing the window surface
-// with an EGLImage-bound MTLTexture, which is the same interop §12.9 already
+// with an EGLImage-bound MTLTexture, which is the same interop the compositor already
 // built for the eye textures and is worth doing when the shell is the thing
 // being optimised, not before.
 

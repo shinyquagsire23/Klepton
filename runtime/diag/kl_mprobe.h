@@ -4,8 +4,7 @@
 // boundary — what ovrp handed libunity, what libunity's joystick fill wrote.
 // That leaves the last hop unmeasured: whether any of it survives into
 // `UnityEngine.Input`, which is where this title actually reads controllers
-// (PLANNING M7 — the InputManager binds TriggerLeftHand/TriggerRightHand to
-// joystick axes 8 and 9). "Where Unity learns how many joysticks exist" was
+//  (the InputManager binds TriggerLeftHand/TriggerRightHand to joystick axes 8 and 9). "Where Unity learns how many joysticks exist" was
 // the named gap; `Input.GetJoystickNames()` answers it directly.
 //
 // libil2cpp exports the standard embedding API, so no address table or

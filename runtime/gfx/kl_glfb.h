@@ -162,8 +162,8 @@ int      kl_glfb_render_stages(uint32_t *mask, uint32_t *binds, uint64_t *tid);
 uint64_t kl_glfb_stage_draw_count(int stage);
 
 // ---------------------------------------------------------------------------
-// The Metal interop seam (P5). Proven on host and device before any of this
-// existed — `make mtltex` and device probe P13; PLANNING §12.9.
+// The Metal interop seam. Proven on host and device before any of this
+// existed — `make mtltex` and device probe P13.
 //
 // On visionOS the guest's eye textures must live in MTLTextures the compositor
 // can sample, so instead of allocating GL storage for the texture name Unity
@@ -256,7 +256,7 @@ void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
 // view (`TextureImageSiblingMtl::initImpl`), so an EGLImage is always 2D and a
 // GL_TEXTURE_2D_ARRAY has nothing to bind to. A Unity OpenXR guest asks for a
 // 2-slice swapchain and renders BOTH eyes into it — so on that path the choice
-// is a copy or a black display, and it was a black display (notes/VRCHAT.md §7).
+// is a copy or a black display, and it was a black display.
 //
 // The copy is one blit per eye per frame into storage the compositor already
 // owns, so nothing about the compositor, the reprojection pass or the frame
@@ -288,7 +288,7 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
 int kl_glfb_eye_mtl_origin_top_left(int eye, int stage);
 
 // ---------------------------------------------------------------------------
-// The decoded-video image (SL-13) — the guest's eglCreateImageKHR over an
+// The decoded-video image — the guest's eglCreateImageKHR over an
 // AHardwareBuffer, which here is a VideoToolbox CVPixelBuffer. kl_egl.c serves
 // the guest-facing entry points; the ANGLE work is here because this file owns
 // the display, the config and the entry-point resolution.
@@ -321,7 +321,7 @@ int   kl_glfb_is_image(const void *h);
 // NULL turns foveation off again.
 //
 // Two registrations, because the guest's per-eye chain has two render targets
-// and they must share ONE map (measured, PLANNING §12.22):
+// and they must share ONE map (measured):
 //
 //   * the eye texture, by identity, as each one is bound;
 //   * the guest's multisampled SCENE target, by size — ANGLE allocates that

@@ -11,7 +11,7 @@
 //                        kl_audio_write.
 //
 // The feeder is the whole design. AAudio pulls, so we are the one doing the
-// calling, and the thing we call is guest code — kl_thread_init() first (S0.1)
+// calling, and the thing we call is guest code — kl_thread_init() first
 // or the stack-protector prologue reads an empty TSD slot and the guest dies
 // far from here.
 #include "kl_aaudio.h"

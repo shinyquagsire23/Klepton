@@ -1,14 +1,13 @@
 #!/bin/bash
 # Fetch the pinned MoltenVK prebuilt release — the host side of a synthetic
-# `libvulkan.so` (notes/BONELAB.md: BONELAB boots completely and cannot render
-# because its graphics API is Vulkan).
-#
+# `libvulkan.so` (BONELAB boots completely and cannot render because its graphics API is Vulkan).
+# 
 # PREBUILT, not a source vendor, and that is a deliberate asymmetry with ANGLE.
 # ANGLE lives in vendor/ as a checkout because we PATCH it — the rate-map
 # registry in angle-patches/klepton.patch is ours, so the sources have to be
 # there. Nothing patches MoltenVK, so a 180 MB tarball buys exactly what an
 # ~18 GiB checkout and a 30-60 minute build would.
-#
+# 
 # `MoltenVK-all.tar`, NOT `MoltenVK-ios.tar`, and this is the finding that makes
 # the whole thing cheap: the release ships **native `xros-arm64` and
 # `xros-arm64_x86_64-simulator` slices**, already stamped VISIONOS /
@@ -16,10 +15,10 @@
 # iOS->visionOS platform forgery is needed or wanted here. `MoltenVK-ios.tar`
 # carries an ios-arm64 device slice and nothing else — reaching visionOS from it
 # would mean faking a platform that Khronos already builds for real.
-#
+# 
 # It still needs tools/mvk_retarget.sh afterwards, for an unrelated reason that
 # script's header explains: the version FLOOR, not the platform.
-#
+# 
 # Nothing downloaded here is committed. vendor-moltenvk/ is gitignored exactly
 # as vendor/ is; the tracked artifacts are this script and the pin below. That
 # is also why the sha256 is here — a prebuilt binary dependency with no pinned

@@ -3,7 +3,7 @@
 
 `sample <pid>` reports every guest frame as `??? (in <unknown binary>)`, because
 the guest images are mmap'd by us and dyld has never heard of them. That turns
-the one diagnostic that keeps paying off (CLAUDE.md, "three diagnostics") into a
+the one diagnostic that keeps paying off into a
 wall of hex the moment the target has fourteen libraries.
 
 The load addresses are already printed by m_slink/t_boot's phase 1 as

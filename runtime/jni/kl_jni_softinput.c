@@ -617,7 +617,7 @@ static klj_val klj_WebView_createWebMessageChannel(void *env, void *self, const 
 // WebView::UIThread_InitializeMessageChannels to the UI thread, and that
 // function (+0x14ba5c) does exactly one test before doing its work
 // unconditionally: `if (getProgress() != 100) return`. Answering 0 forever is
-// what left SL-11 parked on "Waiting for message channels to initialize...".
+// what parks the guest on "Waiting for message channels to initialize...".
 //
 // So this is not a licence to claim a document rendered. It reports the LOAD,
 // which is a fact we hold: loadUrl resolved the `file:///android_asset/` URL

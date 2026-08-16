@@ -53,8 +53,7 @@ static void warn_once(const char *what) {
 // constants. This finally bit at IL2CPP's semaphores: sem_timedwait timed out
 // legitimately, we set Darwin's ETIMEDOUT (60), IL2CPP tested for Linux's (110),
 // did not recognise it as a timeout and took its fatal path — "sem_wait failed",
-// abort, with the real cause four layers down. PLANNING listed this as a
-// silent-wrong-answer waiting to happen; this is it happening.
+// abort, with the real cause four layers down.
 //
 // Only the codes that actually differ are listed. Everything <= 34 is identical
 // on both platforms and falls through unchanged.
@@ -140,20 +139,19 @@ char ***klb_environ_ptr(void) { return &environ; }   // registered as data below
 int  klb_gettid(void) { uint64_t t = 0; pthread_threadid_np(NULL, &t); return (int)t; }
 // ---- __system_property_* ----
 //
-// This used to answer empty for everything, which is not a neutral answer. It
-// is a SECOND answer, disagreeing with the first: Build.MANUFACTURER/MODEL over
-// JNI already say "Oculus" / "Quest 2" (a settled decision — see g_fields in
-// kl_jni.c), and ro.product.manufacturer/model are the same facts asked through
-// libc. Steam Link asks both ways, so the disagreement was visible to the guest.
+// Answering empty for everything is not a neutral answer, it is a SECOND answer
+// disagreeing with the first: Build.MANUFACTURER/MODEL over JNI say "Oculus" /
+// "Quest 2" (a settled decision — see g_fields in kl_jni.c), and
+// ro.product.manufacturer/model are the same facts asked through libc. Steam
+// Link asks both ways, so the disagreement is visible to the guest.
 //
-// It was also a crash. CShellSystem::GetDeviceName() is
+// It is also a crash. CShellSystem::GetDeviceName() is
 //   mfr = get("ro.product.manufacturer"); mdl = get("ro.product.model");
 //   name = mdl.startsWith(mfr) ? mdl : mfr + " " + mdl;
-// and with both empty it faulted (SIGBUS in GetDeviceName+0x264, reached from
+// and with both empty it faults (SIGBUS in GetDeviceName+0x264, reached from
 // BIsVRHeadset <- LoadStreamingSettings <- CShellApplication::BInit <- main) —
-// the first thing the 2D shell does after Qt comes up. Trap 6d exactly: a
-// silent zero is worse than an error, because nothing near the fault mentions
-// a property.
+// the first thing the 2D shell does after Qt comes up. Nothing near the fault
+// mentions a property.
 //
 // Only ro.product.* is mapped, and each entry names the Build field it must
 // agree with rather than repeating its value. Anything else still answers
@@ -190,8 +188,7 @@ static const struct { const char *prop, *build_field; } g_sysprops[] = {
 // application" warning, then a GLES **2** context, then `Desired shader compiler
 // platform 5 is not available in shader blob`, because platform 5 is GLES20 and
 // the game ships no GLES2 shaders. Three symptoms, all graphics-shaped, none of
-// them naming a property. Trap 6d again, and the table's own comment above
-// predicted it.
+// them naming a property.
 static const char *sysprop_value(const char *n) {
     if (!n) return NULL;
     if (strcmp(n, "ro.build.version.sdk") == 0) {
@@ -207,8 +204,9 @@ static const char *sysprop_value(const char *n) {
 
 // find/read are the two-step form of the same lookup. The "handle" we hand back
 // is the table entry's own name pointer, which is a stable string constant for
-// the life of the process — trap 3 does not apply, because nothing stores this
-// in guest memory sized for a 32-bit index; bionic's prop_info* is opaque and
+// the life of the process. Guest storage alignment does not apply, because
+// nothing stores this in guest memory sized for a 32-bit index; bionic's
+// prop_info* is opaque and
 // only ever passed straight back to __system_property_read.
 const void *klb_sysprop_find(const char *n) {
     if (!n) return NULL;
@@ -315,10 +313,10 @@ int klb_fstat(int fd, bionic_stat *b)        { struct stat s; int r = fstat(fd, 
 // shape entirely (32-bit f_bsize, two embedded 1024-byte path strings). Never
 // forward it.
 //
-// This used to answer with 120 zero bytes, which does not read as "unknown" — it
-// reads as a full disk, and Unity refuses to start with "Not enough storage
-// space to install required resources." A wrong number here is not a missing
-// feature; it is a confidently false one.
+// 120 zero bytes does not read as "unknown" — it reads as a FULL DISK, and Unity
+// refuses to start with "Not enough storage space to install required
+// resources." A wrong number here is a confidently false one, not a missing
+// feature.
 typedef struct {
     uint64_t f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree;
     int32_t  f_fsid[2];
@@ -387,8 +385,8 @@ ssize_t klb_getrandom(void *buf, size_t len, unsigned int flags) {
 int klb_isnan(double x) { return __builtin_isnan(x); }
 
 // ---------- sysconf ----------
-// Trap 4 again, and it stayed hidden for a while because it fails quietly:
-// bionic's _SC_* numbers are not Darwin's. _SC_NPROCESSORS_ONLN is 0x61 on
+// Same names, different numbers, and it fails quietly: bionic's _SC_* numbers
+// are not Darwin's. _SC_NPROCESSORS_ONLN is 0x61 on
 // bionic and 58 on Darwin, so a forwarded call asks a different question and
 // gets -1 back. That is what made Unity print "SystemInfo CPU = ARM64,
 // Cores = 0, Memory = 0mb".
@@ -430,7 +428,8 @@ static const struct { int guest, host; const char *name; } g_sysconf[] = {
 // It is the cheapest way to change a guest's own concurrency without touching
 // the guest: UE4 sizes GThreadPool from the core count, so KL_CPUS=1 collapses
 // the pak decompression fan-out that RE4's Oodle crash lives in. Default is the
-// host's real count, which is what CLAUDE.md's "deliberately the host's" means.
+// host's real count: the engine sizes pools and heaps from it, deliberately
+// unlike Build.MODEL.
 long kl_cpu_count(void) {
     static long n;
     if (!n) {
@@ -795,8 +794,8 @@ static void proc_build(void) {
 
     // Every core is described identically, so the guest sees a uniform SMP
     // machine rather than a big.LITTLE one. Apple silicon does have P and E
-    // cores, but nothing here can tell them apart from userspace, and inventing
-    // a split would be worse than declaring none.
+    // cores, but nothing here can tell them apart from userspace, so no split
+    // is declared rather than an invented one.
     for (long i = 0; i < ncpu; i++) {
         char rel[256];
         snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", i);
@@ -827,7 +826,7 @@ void kl_guest_path_map(const char *apk, const char *unpacked_dir) {
     snprintf(g_apk_target, sizeof g_apk_target, "%s", unpacked_dir);
 }
 
-// ...and the guest's PUBLIC EXTERNAL STORAGE, which a guest is entitled to name
+// ...and the guest's PUBLIC EXTERNAL STORAGE, which a guest may name
 // by literal path rather than by asking Java where it is. Open Brush does
 // exactly that — App.cs's InitUserPath has `case RuntimePlatform.Android:
 // m_UserPath = "/sdcard/"` — and then builds its whole user tree under it:
@@ -843,11 +842,10 @@ void kl_guest_path_map(const char *apk, const char *unpacked_dir) {
 //
 // UNCONDITIONAL, which is the one way this differs from the APK prefix above.
 // That one stat()s its rewrite and falls through on a miss, which is right for
-// reads of files that are supposed to already exist. Here the whole point is
-// paths that do NOT exist yet: an unmapped /sdcard makes the guest's first act
-// a mkdir into the host's root — EACCES on macOS, refused outright by the
-// visionOS sandbox — and Open Brush surfaces that as a modal error rather than
-// as anything mentioning a path.
+// reads of files that are supposed to already exist. This one is for paths that
+// do NOT exist yet: an unmapped /sdcard makes the guest's first act a
+// mkdir into the host's root — EACCES on macOS, refused outright by the visionOS
+// sandbox — and Open Brush surfaces that as a modal error mentioning no path.
 static char g_ext_target[1024];
 
 void kl_guest_extstorage_map(const char *dir) {
@@ -979,8 +977,8 @@ int klb_unlink(const char *path) {
     return r;
 }
 int klb_rename(const char *a, const char *b) {
-    // Two paths, so two buffers: KL_GUEST_PATH names one pair and a rename
-    // whose halves land in different trees is worse than one that fails.
+    // Two paths, so two buffers: KL_GUEST_PATH names one pair, and a rename
+    // whose halves land in different trees must fail rather than half-succeed.
     char ka[1024], kb[1024];
     const char *pa = kl_guest_path(a, ka, sizeof ka);
     const char *pb = kl_guest_path(b, kb, sizeof kb);
@@ -1010,10 +1008,9 @@ void *klb_readdir(void *d) {
 
 // ---------- sigaction ----------
 // bionic/LP64 puts sa_flags FIRST, ahead of the handler union. That is specific
-// to __LP64__; the 32-bit layout does lead with the handler, which is what this
-// struct used to assume. The cost of getting it backwards was invisible for a
-// long time: `handler` read the flags word instead, so every guest handler was
-// installed at address 0x18000004 — which is not an address, it is Linux's
+// to __LP64__; the 32-bit layout leads with the handler instead. Getting it
+// backwards is invisible: `handler` reads the flags word, so every guest handler
+// is installed at address 0x18000004 — which is not an address, it is Linux's
 // SA_RESTART|SA_ONSTACK|SA_SIGINFO. Boehm's GC suspend handler among them.
 //
 //   bionic/LP64: { int flags; <pad>; handler; unsigned long mask; restorer; } 32B
@@ -1021,7 +1018,7 @@ void *klb_readdir(void *d) {
 typedef struct { int32_t flags; int32_t _pad; void *handler;
                  uint64_t mask; void *restorer; } bionic_sigaction;
 
-// Same names, different numbers — trap 4 again, and these are far apart.
+// Same names, different numbers, and these are far apart.
 #define KL_SA_NOCLDSTOP 0x00000001u
 #define KL_SA_NOCLDWAIT 0x00000002u
 #define KL_SA_SIGINFO   0x00000004u
@@ -1138,12 +1135,12 @@ int    klb_system(const char *cmd) { (void)cmd; warn_once("system"); return 127;
 // Note the signature: fixed arity, not `...`. AAPCS64 passes variadic arguments
 // in x0-x7, which is exactly where a fixed-arity Darwin function reads its own,
 // so up to eight arguments arrive correctly without a thunk. Declaring this
-// variadic on Darwin would send it looking on the stack instead — trap 2.
+// variadic on Darwin would send it looking on the stack instead.
 //
-// Almost every raw syscall is refused, but futex is not optional. Unity's
-// Baselib builds its locks, semaphores and events on futex directly rather than
-// through pthreads, so refusing it fails silently rather than loudly: the waiter
-// gets ENOSYS back and spins. One run refused 13,846 of them.
+// Almost every raw syscall is refused, but futex is not optional.
+// Unity's Baselib builds its locks, semaphores and events on futex directly
+// rather than through pthreads, so a refusal fails SILENTLY: the waiter gets
+// ENOSYS back and spins. One run refused 13,846 of them.
 //
 // The emulation is a bucket table of condition variables keyed on the futex
 // address. A wake broadcasts its bucket, so addresses that hash together produce
@@ -1415,7 +1412,7 @@ static long kl_futex_impl(int32_t *uaddr, int op, uint32_t val, const struct tim
         return (long)val + (futex_op_cmp(cmp, oldval, cmparg) ? (long)val2 : 0);
     }
     default: {
-        // Trap 6d, in the one place it is most expensive: a futex op we do not
+        // A silent refusal at its most expensive: a futex op we do not
         // implement is a WAKE that never arrives, and ENOSYS is returned to a
         // caller that has already decided a waiter needs waking. Nothing near
         // the hang mentions futex. Name the op, once each.
@@ -1448,9 +1445,9 @@ static void syscall_warn_once(long n, void *ra) {
 }
 
 long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
-    // futex is the only syscall here that reads past the fourth argument, and
-    // the two it reads used to be discarded — which made FUTEX_WAKE_OP
-    // impossible to implement rather than merely unimplemented.
+    // futex is the only syscall here that reads past the fourth argument, so a5
+    // and a6 must be carried through: without them FUTEX_WAKE_OP cannot be
+    // implemented at all.
     if (n == KL_SYS_futex)
         return kl_futex((int32_t *)(uintptr_t)a1, (int)a2, (uint32_t)a3,
                         (const struct timespec *)(uintptr_t)a4,
@@ -1461,7 +1458,7 @@ long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
     // "Fatal Python error: _Py_HashRandomization_Init: failed to get random
     // numbers to initialize Python", thrown several layers from the syscall and
     // naming nothing that leads back to it. Same family as the futex refusal
-    // (trap 6d): the caller has no fallback and does not treat this as optional.
+    //: the caller has no fallback and does not treat this as optional.
     //
     // arc4random_buf rather than getentropy: it cannot fail, has no 256-byte
     // limit, and is non-blocking — so both GRND_NONBLOCK and GRND_RANDOM are
@@ -1567,16 +1564,15 @@ int kl_mmap_flags(int lx) {
     if (lx & LX_MAP_NORESERVE)  d |= MAP_NORESERVE;
     return d;
 }
-// ---- executable anonymous memory: a guest JIT, and why it must fail LOUDLY --
+// ---- executable anonymous memory: a guest JIT, refused by name ------------
 //
-// Trap 12 says AMFI kills any pc not backed by a signed file. What that means
-// for a guest that generates code is worse than "the JIT does not work": the
-// mapping succeeds, the writes succeed, `__clear_cache` succeeds, and the
-// process is killed on the first BRANCH into it — `EXC_BAD_ACCESS /
-// KERN_PROTECTION_FAILURE`, termination namespace CODESIGNING, "Invalid Page".
-// That is a SIGKILL, so no handler of ours reports it and the log simply stops.
-// SL-19 spent a device run and two crash reports to find one of these
-// (PCRE2's JIT inside libQt6Core, reached through QRegularExpression).
+// AMFI kills any pc not backed by a signed file. For a guest that
+// generates code that is not "the JIT does not work" — the mapping succeeds, the
+// writes succeed, `__clear_cache` succeeds, and the process dies on the first
+// BRANCH into it with `EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE`, termination
+// namespace CODESIGNING, "Invalid Page". A SIGKILL, so no handler here reports
+// it and the log simply stops. PCRE2's JIT inside libQt6Core, reached through
+// QRegularExpression, is the one that does this.
 //
 // Refusing the request is strictly better, because a JIT that cannot get
 // executable memory is a case its authors already handle — PCRE2 falls back to
@@ -1585,9 +1581,8 @@ int kl_mmap_flags(int lx) {
 // fallback and a corpse.
 //
 // File-backed PROT_EXEC is untouched: that is a real signed image and it is how
-// dlopen works. KL_GUEST_JIT=1 restores the old behaviour for a host run, where
-// there is no AMFI and a JIT works fine — and where this would otherwise make
-// the host quietly slower than the device is honest about.
+// dlopen works. KL_GUEST_JIT=1 allows the mapping for a host run, where there is
+// no AMFI and a JIT works.
 static int guest_jit_allowed(void) {
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_GUEST_JIT", 0);
@@ -1601,7 +1596,7 @@ static int klb_refuse_exec(const char *what, int anon, int prot) {
         said = 1;
         fprintf(stderr, "  [klepton] refusing the guest's %s of anonymous "
                         "PROT_EXEC memory — this platform will not execute an "
-                        "unsigned page (trap 12), and a mapping that succeeds "
+                        "unsigned page, and a mapping that succeeds "
                         "here is a SIGKILL on the first branch into it. A JIT "
                         "that is told no takes its interpreter; one that is not "
                         "takes the process down. KL_GUEST_JIT=1 to allow it.\n",
@@ -1660,24 +1655,23 @@ int kl_open_flags(int lx) {
     if (lx & LX_O_CLOEXEC)   d |= O_CLOEXEC;
     return d;
 }
-// ---- fcntl / ioctl: trap 4, in the two calls that had been left raw ----
+// ---- fcntl / ioctl: the same flag divergence, in two more calls ----
 //
-// open() has translated its flags since M2. fcntl() did not, and it is the SAME
-// flag words: F_SETFL takes exactly what open() takes. The guest passes Linux's
-// O_NONBLOCK (0x800); on Darwin 0x800 is O_EXCL. So
+// fcntl() takes the SAME flag words open() does: F_SETFL takes exactly what open
+// takes. The guest passes Linux's O_NONBLOCK (0x800); on Darwin 0x800 is O_EXCL,
+// so untranslated
 //   fcntl(fd, F_SETFL, O_NONBLOCK)
-// SUCCEEDED, returned 0, set a meaningless bit, and left the socket BLOCKING.
+// SUCCEEDS, returns 0, sets a meaningless bit, and leaves the socket BLOCKING.
 //
-// Measured cost: Steam Link's 2D shell hung with `main` stuck in
+// Measured cost: Steam Link's 2D shell hangs with `main` stuck in
 // CDiscoverySocket::BReceive -> recvfrom, four frames under
-// CShellApplication::BInit, waiting forever for a LAN datagram that a
-// non-blocking read would have declined in a microsecond. Nothing errored, and
-// the failure looked like "the app has no UI" rather than "a flag was wrong".
-// Same shape as trap 6d and trap 16b: a wrong number that SUCCEEDS meaning
-// something else.
+// CShellApplication::BInit, waiting forever for a LAN datagram a non-blocking
+// read would decline in a microsecond. Nothing errors, and the failure presents
+// as "the app has no UI" rather than "a flag was wrong".
+// A wrong number that SUCCEEDS meaning something else.
 //
 // The reverse direction matters too — F_GETFL's RESULT is a flag word the guest
-// will read with Linux's numbering, and the read-modify-write
+// reads with Linux's numbering, and the read-modify-write
 // `fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)` is the common idiom, so
 // getting only one side right corrupts the other flags.
 // Unlike warn_once() this keys on the NUMBER, because the interesting thing
@@ -1736,8 +1730,8 @@ int kl_fcntl(int fd, int cmd, uintptr_t arg) {
     case LX_F_GETOWN:        return fcntl(fd, F_GETOWN);
     // struct flock is laid out differently on the two platforms (Linux leads
     // with l_type/l_whence, Darwin with l_start/l_len), so forwarding the
-    // pointer would silently lock a different range. Trap 7's class. Refuse by
-    // name until something actually needs it — no guest has yet.
+    // pointer would silently lock a different range. Refused by name until
+    // something needs it — no guest has yet.
     case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW:
         warn_once("fcntl file locking (struct flock layout differs) — refused");
         errno = EINVAL;
@@ -1769,8 +1763,8 @@ int kl_ioctl(int fd, unsigned long req, uintptr_t arg) {
 
 // ---------- madvise ----------
 // The whole advice range is translated explicitly, because forwarding an
-// untranslated number is trap 4's family and this is its worst member: the two
-// systems agree on MADV_DONTNEED == 4 and disagree on what it MEANS.
+// untranslated number is the worst case of a shared name: the two systems agree
+// on MADV_DONTNEED == 4 and disagree on what it MEANS.
 //
 //   Linux  MADV_DONTNEED: private anonymous pages are freed immediately, the
 //                         next touch reads zeros, and the footprint drops.
@@ -1922,7 +1916,7 @@ int klb_madvise(void *a, size_t n, int advice) {
         // committed optimistically and may never have touched, and an untouched
         // range has no physical pages to give back under any of these modes.
         // Measured on BONELAB, the two answers differ by three orders of
-        // magnitude — see the note in notes/MEMORYLEAK.md.
+        // magnitude.
         int trace = kl_env_on("KL_TRACE_MADV", 0);
         uint64_t before = trace ? kl_mem_footprint() : 0;
         int rc = 0;

@@ -1,7 +1,7 @@
 //
-//  KleptonCompositor.swift — P5b, the Compositor Services half of P5.
+//  KleptonCompositor.swift — the Compositor Services half of the eye seam.
 //
-//  PLANNING §12.1(3) and §12.9. What this file owns:
+//  What this file owns:
 //
 //    1. The eye textures. The guest asks OVRPlugin for eye storage
 //       (ovrp_SetupEyeTexture2), kl_ovrp forwards that to kl_glfb, and
@@ -14,7 +14,7 @@
 //       never added as an interim pacer: it would be a third mechanism to
 //       then remove.
 //    3. The composite pass — which is also the reprojection pass. See
-//       runtime/kl_reproject.h: the guest's picture is placed as a quad at a
+//       runtime/gfx/kl_reproject.h: the guest's picture is placed as a quad at a
 //       fixed far distance, sized by the frustum it was *rendered* with, in the
 //       space the pose it was rendered with defines, and then looked at from
 //       where the head is now through the projection this drawable wants. That
@@ -36,11 +36,11 @@
 //  which is what `drawable.deviceAnchor` is for, and why the anchor set below
 //  is the *display* one and not the render one. Setting the render pose there
 //  instead would apply our delta twice. ALVR's visionOS client splits it the
-//  same way (`ALVRClient/Renderer.swift`, PLANNING §12.8).
+//  same way (`ALVRClient/Renderer.swift`).
 //
 //  **The flip is not cosmetic.** GL renders bottom-up; Metal and the display
 //  are top-down. The first host dump of these textures came out upside down
-//  (§12.9). It is done in the shared shader, because the composite is the only
+//. It is done in the shared shader, because the composite is the only
 //  pass that reads the eye textures.
 //
 import SwiftUI
@@ -317,10 +317,10 @@ final class KleptonCompositor {
     private var reprojectFrames = 0
     private var worstDelta: Float = 0
 
-    // KL_SYNC_GUEST=1 restores P5b's shape: kl_app_frame() called inline on
-    // this thread, inside the submission window. That is the clock P5.4's
+    // KL_SYNC_GUEST=1 restores the inline shape: kl_app_frame() called on
+    // this thread, inside the submission window. That is the clock the lifecycle's
     // device numbers were measured against, so it stays reachable — and it is
-    // the A/B for anything that looks like a pacing problem after §12.12.
+    // the A/B for anything that looks like a pacing problem.
     // ...and it is not offered for a guest that brought its own frame loop —
     // Steam Link's OpenXR thread, or an Unreal guest's game thread — because
     // there is no inline frame to make: `kl_app_frame()` returns -1 for both by
@@ -511,7 +511,7 @@ final class KleptonCompositor {
         // to belong to the display's device; a texture from another device
         // creates an EGLImage that fails at bind time, and on a single-GPU Mac
         // the two happen to be the same object, so testing on the host would
-        // not catch getting this wrong (§12.9).
+        // not catch getting this wrong.
         let angle = kl_glfb_mtl_device()
         if let d = angle {
             device = Unmanaged<MTLDevice>.fromOpaque(d).takeUnretainedValue() as MTLDevice
@@ -569,7 +569,7 @@ final class KleptonCompositor {
 
     private func buildPipeline() {
         // The shader is kl_reproject.c's, shared verbatim with the macOS
-        // viewer's compositor (runtime/kl_view_mtl.m) — one copy of the flip,
+        // viewer's compositor (runtime/gfx/kl_view_mtl.m) — one copy of the flip,
         // the quad and the array-slice sampler, because having them diverge
         // means debugging the picture twice, and the viewer is where this math
         // can actually be run before a device is available. Compiled from
@@ -616,7 +616,7 @@ final class KleptonCompositor {
             //
             // The one pipeline here that BLENDS, and the eye pass must not: a
             // guest leaves the eye texture's alpha at 0 because that layer is
-            // composited opaque (trap 33), so a blending eye pass hands the
+            // composited opaque, so a blending eye pass hands the
             // display a transparent frame over a correct picture. A UI quad's
             // alpha is authored and is the point of it.
             let odesc = MTLRenderPipelineDescriptor()
@@ -816,7 +816,7 @@ final class KleptonCompositor {
     /// binds the texture as soon as this provider returns, and `FramebufferMtl`
     /// caches its render pass descriptor — a map that arrives after the first
     /// pass into a texture is silently ignored for that pass, and re-attaching
-    /// the texture is not enough to force the rebuild (notes/VISIONOS.md).
+    /// the texture is not enough to force the rebuild.
     ///
     /// Keyed on the size because Unity re-creates its eye textures mid-startup
     /// at a different one; a map built for the old screen size would foveate
@@ -883,7 +883,7 @@ final class KleptonCompositor {
     /// kl_glfb calls this when the guest asks for storage for one (eye, stage).
     ///
     /// Two things here are load-bearing and both were learned by running it
-    /// (§12.9): the texture must be allocated on ANGLE's device, and the `w`/`h`
+    ///: the texture must be allocated on ANGLE's device, and the `w`/`h`
     /// reported back must be the texture's *real* size. The EGL extension takes
     /// the size from the MTLTexture and ignores what we claim, so a wrong-sized
     /// texture binds **successfully** and the guest renders into storage it does
@@ -1084,14 +1084,14 @@ final class KleptonCompositor {
         // during the lifecycle below. See primeDisplay().
         primeDisplay()
 
-        // Bring the guest up, on its own thread — PLANNING §12.12. _begin is
+        // Bring the guest up, on its own thread. _begin is
         // once per process and does the /proc report, nativeRecreateGfxState,
         // nativeResume and the first nativeRender, and it happens over there
         // rather than here: this loop must be free to present black while the
         // guest is still starting, which can take tens of seconds on device.
         //
         // Under KL_SYNC_GUEST the old inline shape is kept instead, because
-        // P5.4's device measurement was taken against it and the device has
+        // The device measurement was taken against it and the device has
         // never been run with either. It is the A/B for anything that looks
         // like a pacing regression.
         if syncGuest {
@@ -1161,14 +1161,14 @@ final class KleptonCompositor {
         NSLog("[cp] render loop ended after \(presented) presented frames, "
               + "\(iterations) iterations, state=\(String(describing: layerRenderer.state))")
         // Ends the guest's loop and joins it, so its report — which is the
-        // P5.4 report, and belongs to the guest's end of the run rather than
+        // lifecycle report, and belongs to the guest's end of the run rather than
         // to this one — has been written before this returns.
         if syncGuest { kl_app_lifecycle_report() } else { kl_app_guest_stop() }
     }
 
     /// What each swapchain stage actually holds, per report interval.
     ///
-    /// The doubling that survived every pose fix (PLANNING §12.19) alternates
+    /// The doubling that survived every pose fix alternates
     /// with the stage count, and the only thing that differs between one stage
     /// and N is *which texture this pass samples*. So the remaining hypothesis
     /// is not two positions but two **pictures**: one stage holding a stale or
@@ -1343,10 +1343,9 @@ final class KleptonCompositor {
         //     -> wait(optimalInputTime) -> queryDrawable -> startSubmission
         //     -> encode -> encodePresent -> commit -> endSubmission
         //
-        // This used to call startSubmission here, before queryDrawable. That
-        // also makes the two bail paths below abandon a submission they had
-        // already started, which is the same shape as trap 14 from the other
-        // side.
+        // startSubmission must NOT be called before queryDrawable: the two
+        // bail paths below would then abandon a submission they had already
+        // started, which Compositor Services aborts on.
 
         // Poses first, then the frame that uses them.
         if let timing {
@@ -1354,8 +1353,8 @@ final class KleptonCompositor {
                             .timeInterval)
         }
 
-        // Offer the guest this frame's pose and carry straight on — PLANNING
-        // §12.12. The guest wakes on its own thread, ticks the Choreographer,
+        // Offer the guest this frame's pose and carry straight on. The guest
+        // wakes on its own thread, ticks the Choreographer,
         // calls nativeRender and renders into the eye textures the provider
         // handed it, and this loop does not wait for any of it. A guest that
         // keeps up finishes before the next publish and behaves exactly as the
@@ -1864,7 +1863,7 @@ final class KleptonCompositor {
         // Oculus symmetric projection, where both eyes are rendered with one
         // union frustum into a widened texture and each eye's own cone is a
         // different sub-rect of it — measured on BONELAB, eye 0 at x=0 and eye 1
-        // at x=609, both 2271 wide of 2880 (notes/BONELAB.md). Eye 1 read
+        // at x=609, both 2271 wide of 2880. Eye 1 read
         // through eye 0's crop is its picture shifted by that offset, with every
         // call on the path returning success.
         //
@@ -2106,39 +2105,27 @@ final class KleptonCompositor {
         return out
     }
 
-    /// Harvest what only a drawable can tell us, *before* the guest exists to
-    /// ask — the per-eye frustum and the display's real frame rate.
+    /// Harvest what only a drawable can tell us, before the guest exists to
+    /// ask: the per-eye frustum and the display's real frame rate.
     ///
-    /// **This exists because of an ordering problem, and the solution is
-    /// ALVR's.** Both numbers can only be read from a `cp_drawable`, and a
-    /// drawable only arrives once the frame loop is running — but the guest
-    /// reads both *once*, early, and stores them: Unity latches the frustum
-    /// when its VRDevice initializes and the display frequency straight into
-    /// its VR timing config. Answering correctly one frame later is answering a
-    /// question nobody will ask again.
-    ///
-    /// `ALVRClient/DummyMetalRenderer.swift` solves it by rendering throwaway
-    /// frames purely to harvest `views[].transform` and the tangents, setting
-    /// `haveRenderInfo`, and only then starting the real renderer — ALVR has to
-    /// do it in a whole separate ImmersiveSpace opened first
-    /// (`Entry/EntryControls.swift` opens it, waits for the flag, closes it),
-    /// because its renderer needs the info before its own layer exists. We own
-    /// this loop and the guest has not been driven yet, so the same mechanism
-    /// fits inline: prime here, then `kl_app_lifecycle_begin()`. One fewer
-    /// space, same trick.
+    /// An ordering problem. Both numbers can only be read from a `cp_drawable`,
+    /// which arrives once the frame loop is running, but the guest reads both
+    /// ONCE and early — Unity latches the frustum when its VRDevice initializes
+    /// and the display frequency into its VR timing config. Answering correctly
+    /// one frame later answers a question nobody asks again. So a throwaway
+    /// frame is rendered here purely to harvest them, before
+    /// `kl_app_lifecycle_begin()`.
     ///
     /// Tangents come from the projection matrix rather than `cp_view_tangents`,
-    /// which visionOS 2.0 deprecated — and the matrix is the more honest source
-    /// anyway, since it is what the composite pass projects with.
+    /// which visionOS 2.0 deprecated, and the matrix is what the composite pass
+    /// projects with.
     /// Tell the guest where this display's eyes actually are.
     ///
     /// `view.transform` is `device_from_view`, so its translation is the
-    /// head->eye offset in the head's own frame — which is precisely what
-    /// `kl_ovrp_set_eye_offset` wants, and precisely what the guest had no way
-    /// of knowing before. Until this existed, nodes 0 and 1 both answered the
+    /// head->eye offset in the head's own frame, which is what
+    /// `kl_ovrp_set_eye_offset` wants. Without it nodes 0 and 1 both answer the
     /// head pose: an IPD of zero, both eyes rendering from the same point, and
-    /// a world with no disparity anywhere in it (kl_ovrp.h says what that looks
-    /// like).
+    /// a world with no disparity in it.
     ///
     /// Pushed from `primeDisplay` so it is right before the guest's first
     /// frame, and again each frame because it costs two stores and the user can
@@ -2149,12 +2136,12 @@ final class KleptonCompositor {
     /// Everything else about the synthetic headset describes a Quest 2 on
     /// purpose — `Build.MODEL`, `ovrp_GetSystemHeadsetType`, the version string
     /// — because every Oculus branch in the guest is written against one. The
-    /// eye SIZE is different in kind: nothing in the guest branches on it, it is
-    /// just a resolution, and the hardcoded 2290x2400 is wrong in both axes for
-    /// the display actually underneath. So this is measured rather than claimed.
+    /// eye SIZE is different in kind: nothing branches on it, it is just a
+    /// resolution, and the Quest's 2290x2400 is wrong in both axes for the
+    /// display underneath. So it is measured rather than claimed.
     ///
-    /// **Which number.** With foveation on, the drawable's colour textures are
-    /// the PHYSICAL size — already reduced — while the rate map's `screenSize`
+    /// Which number: with foveation on, the drawable's colour textures are the
+    /// PHYSICAL size — already reduced — while the rate map's `screenSize`
     /// is the logical resolution the fovea is rasterized at. The guest should be
     /// sized against the latter: matching the physical size would throw away
     /// exactly the resolution `maxRenderQuality` was set to buy. Without a rate
@@ -2211,7 +2198,7 @@ final class KleptonCompositor {
     /// `viewport` is the guest's render viewport for this frame in eye-texture
     /// pixels, `.zero` for the whole texture — kl_ovrp_render_pose.viewport,
     /// taken from the same frame record the uniforms come from. It is part of
-    /// the key: Beat Saber shrinks it on entering a map (§ the render-viewport
+    /// the key: Beat Saber shrinks it on entering a map (the render-viewport
     /// note in kl_ovrp.h), and a grid built for the previous viewport crops the
     /// wrong rectangle with nothing anywhere reporting it.
     /// Returns the grid, the vertex count, and whether it carries a BLOCK PER
@@ -2504,20 +2491,19 @@ final class KleptonCompositor {
                 // Before the guest boots, so it allocates the right swapchain
                 // once instead of rebuilding when the size changes under it —
                 // and each of those rebuilds used to leak a whole generation
-                // (PLANNING §12.21).
+                //.
                 pushEyeTextureSize(drawable)
                 // Also before the guest boots, and for a stricter reason: the
                 // eye-texture provider builds the guest's own rate map from
                 // this curve, and it must be in force before the first render
-                // pass into an eye texture (notes/VISIONOS.md).
+                // pass into an eye texture.
                 captureDisplayFoveation(drawable)
             }
             // Every drawable the frame carries, not just the one measured from:
             // a frame that leaves one unpresented is a frame half-written.
             for d in all { clearAndPresent(d) }
-            // Only after a drawable was actually presented — trap 14. The old
-            // shape ended the submission even on the no-drawable path, which is
-            // the abort waiting to happen rather than the one already seen.
+            // Only after a drawable was actually presented: ending a
+            // submission on the no-drawable path is an abort.
             frame.endSubmission()
         }
 

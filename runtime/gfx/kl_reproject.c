@@ -160,8 +160,8 @@ static const char kl_msl_reproject[] =
 "\n"
 // One place, so a rung of the probe ladder cannot disagree with the real pass
 // about which eye it is looking at — which is the failure this whole file keeps
-// paying for (trap 43: an instrument answering confidently about the wrong
-// subject). A texture argument cannot be selected into a variable in MSL, so
+// paying for — an instrument answering confidently about the wrong subject. A
+// texture argument cannot be selected into a variable in MSL, so
 // this is a branch and not an index.
 "static float4 kl_eye_sample2(texture2d_array<float> t0,\n"
 "                             texture2d_array<float> t1, sampler samp,\n"
@@ -572,16 +572,13 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     // far away makes the system's correction rotational, which is the only
     // correction that is right for a picture with no per-pixel depth.
     //
-    // §12.16 recorded 500 m as *invisible* on device, and 2 m as the value that
-    // appeared. That comparison moved two variables at once: the same change
-    // also turned depth WRITES on and stopped discarding the depth attachment
-    // (`.dontCare` -> `.store`). Writes-off was sufficient on its own to make the
-    // frame vanish — a depth buffer that is never written says "no geometry here"
-    // whatever the quad's z would have been. And the drawable's own numbers
-    // settle the clipping question outright: `depthRange = (far inf, near 0.1)`,
-    // an INFINITE far plane, so nothing is ever clipped for being too far. The
-    // compositor logs the quad's actual NDC depth next to that range now, so this
-    // is a number in the log rather than an argument.
+    // A frame that vanishes on device is depth WRITES being off, not this
+    // distance: a depth buffer that is never written says "no geometry here"
+    // whatever the quad's z is, and the attachment must be stored rather than
+    // discarded (`.dontCare` -> `.store`). Distance cannot clip it either — the
+    // drawable reports `depthRange = (far inf, near 0.1)`, an INFINITE far
+    // plane. The compositor logs the quad's actual NDC depth beside that range,
+    // so this is a number in the log rather than an argument.
     static float s_depth = 0.0f;
     if (s_depth == 0.0f) {
         float v = kl_env_float("KL_REPROJECT_DEPTH", 0.0);

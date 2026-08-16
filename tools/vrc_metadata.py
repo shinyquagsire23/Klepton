@@ -6,7 +6,7 @@ Why this exists
 VRChat is the only guest in this tree whose IL2CPP metadata is protected, and
 that protection is what stands between us and every "what does the managed side
 actually do here?" question on the biggest APK in the project — most immediately
-the `VRCUiUnderConstruction` wall (notes/VRCHAT.md).
+the `VRCUiUnderConstruction` wall.
 
 Two doors were tried before this one and both are closed, so do not re-open them:
 

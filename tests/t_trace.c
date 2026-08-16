@@ -1,6 +1,6 @@
 // Does the GL tracing trampoline actually forward its arguments untouched?
 //
-// runtime/kl_gl_trace.S sits between the guest and a real GL entry point, logs the
+// runtime/gfx/kl_gl_trace.S sits between the guest and a real GL entry point, logs the
 // name, and tail-branches on. If it corrupts one register the failure is not a
 // crash — it is a *wrong picture*, or a texture uploaded from the wrong pointer,
 // and the trace itself would be the thing lying to us. An instrument that has to
@@ -17,8 +17,8 @@
 //   x30     the return address, so the callee returns to us and not into the
 //           trampoline
 //
-// Deliberately stressing rather than happy-path: PLANNING's variadic work found
-// two ABI bugs that passed a 4-argument test and failed at 9.
+// Deliberately stressing rather than happy-path: the variadic ABI work found
+// two bugs that passed a 4-argument test and failed at 9.
 #include <stdio.h>
 #include <string.h>
 #include "../runtime/klepton.h"

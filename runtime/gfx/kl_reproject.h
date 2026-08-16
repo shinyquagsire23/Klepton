@@ -1,55 +1,41 @@
 // Timewarp — the composite pass, shared by both compositors.
 //
-// PLANNING §12.1(3) claimed reprojection "falls out for free if the bookkeeping
-// is right". This is the half that consumes that bookkeeping; kl_ovrp.c is the
-// half that produces it (kl_ovrp_stage_render_pose).
+// This is the half that CONSUMES the timewarp bookkeeping; kl_ovrp.c produces
+// it (kl_ovrp_stage_render_pose).
 //
-// **What the problem actually is.** The guest renders a flat picture for each
-// eye, with a frustum *we* told it to use, about a head pose *we* told it it
-// had. By the time that picture reaches the display, the head has moved. Two
-// separate things therefore have to be corrected, and they are usually
-// confused with each other:
+// The guest renders a flat picture per eye, with a frustum we told it to use,
+// about a head pose we told it it had. Two separate things then need
+// correcting:
 //
-//   1. **The pose is stale.** The guest rendered against the pose we predicted
-//      at ovrp_BeginFrame; the display shows it one render later. That delta is
-//      what "timewarp" names, and it is a rotation (plus a translation we
-//      deliberately drop — see below).
-//   2. **The frustum does not match the display's.** The guest renders a
-//      Quest-shaped frustum (kl_ovrp answers ovrp_GetNodeFrustum2), and the
-//      Vision Pro's per-eye frustum is a different, asymmetric one. A
-//      full-screen blit of the guest's image stretches it to whatever the
-//      drawable's field of view happens to be, which is a *wrong picture* — the
-//      world is the wrong angular size — and no amount of pose correction fixes
-//      that.
+//   1. The pose is stale. The guest rendered against the pose predicted at
+//      ovrp_BeginFrame and the display shows it one render later. That delta is
+//      what "timewarp" names: a rotation, plus a translation deliberately
+//      dropped.
+//   2. The frustum does not match the display's. The guest renders a
+//      Quest-shaped frustum (ovrp_GetNodeFrustum2) and the Vision Pro's per-eye
+//      frustum is a different, asymmetric one. A full-screen blit stretches the
+//      image to the drawable's field of view, so the world comes out the wrong
+//      angular size — which no amount of pose correction fixes.
 //
-// Both are solved by the same pass, and that is the point of doing it this way
-// rather than as a UV-space homography: place the guest's picture as a quad at
-// a fixed far distance, sized by the tangents it was **rendered** with, in the
-// space the pose it was rendered with defines — then look at that quad from
-// where the head is **now**, through the projection the drawable actually
-// wants. Both corrections are then just the model-view and the projection.
+// Both fall out of one pass, which is why this is not a UV-space homography:
+// place the guest's picture as a quad at a fixed far distance, sized by the
+// tangents it was RENDERED with, in the space its render pose defines; then
+// look at that quad from where the head is NOW, through the projection the
+// drawable wants. The two corrections are then just the model-view and the
+// projection.
 //
-// This is the shape ALVR's visionOS client uses for the same job
-// (`ALVRClient/Renderer.swift`, `videoFrameVertexShaderCommon` in
-// `Shaders.metal`) — a worked, shipping example of reprojecting a
-// rendered-elsewhere frame into a Compositor Services drawable. PLANNING §12.8
-// records that that code is the user's own and can be relicensed; what is taken
-// here is the mechanism, not the streaming architecture around it.
+// Rotation only, deliberately. Positional reprojection needs per-pixel depth;
+// without it, translating the viewpoint smears disocclusions and is worse than
+// no correction. So both poses drop their translation. The eye offset IS kept —
+// it comes from the display side (the drawable's view transform) and is not
+// part of the delta. At the quad's distance, treating the render eye as the
+// render head costs under a pixel.
 //
-// **Rotation only, deliberately.** Positional reprojection needs per-pixel
-// depth to be correct; without it, translating the viewpoint smears
-// disocclusions and is worse than not correcting at all. So both poses have
-// their translation dropped and only the rotation delta is applied. The eye
-// offset *is* kept, because it comes from the display side (the drawable's view
-// transform) and is not part of the delta. At the quad's distance the residual
-// error from treating the render eye as the render head is under a pixel.
-//
-// **One implementation, two compositors.** KleptonCompositor.swift (visionOS,
+// One implementation, two compositors: KleptonCompositor.swift (visionOS,
 // Compositor Services) and kl_view_mtl.m (the macOS viewer, CAMetalLayer) both
-// build their uniforms with kl_reproject_build() and compile their shader from
-// kl_reproject_msl(). Having the flip, the quad and the delta exist twice is how
-// the picture gets debugged twice; on the host the viewer is also the only place
-// this math can be *run* before the device is available.
+// build uniforms with kl_reproject_build() and compile their shader from
+// kl_reproject_msl(). The viewer is also the only place this math can be RUN
+// without a device.
 #ifndef KL_REPROJECT_H
 #define KL_REPROJECT_H
 
@@ -61,8 +47,8 @@
 // eye-centred, so this does not affect our own picture at all — it is what the
 // SYSTEM's depth-based reprojection is told about our content, and placing it
 // far away is what keeps that correction rotational. See kl_reproject_build for
-// the full argument and for why the 2 m that sat here was a misattribution.
-// ALVR uses the same 500 m. KL_REPROJECT_DEPTH overrides it at runtime.
+// the full argument, including why a near placement does not fix a frame that
+// vanishes. ALVR uses the same 500 m. KL_REPROJECT_DEPTH overrides at runtime.
 #define KL_REPROJECT_DEPTH 500.0f
 
 // Matches the MSL struct in kl_reproject_msl(). Bound at buffer(0) for both
@@ -115,7 +101,7 @@ typedef struct {
     // left, like Metal's, so a picture a Vulkan guest drew comes out upside
     // down through the same mapping, with everything else about the pipeline
     // working. Measured, on the first run of the Vulkan compositor seam
-    // (notes/BONELAB.md).
+    //.
     //
     // The authority is kl_glfb_eye_mtl_origin_top_left(eye, stage) — recorded
     // with the texture when it is registered, because two guests can be in one
@@ -135,8 +121,8 @@ typedef struct {
     // its resolution, and false of one using Oculus SYMMETRIC PROJECTION, where
     // both eyes are rendered with a single union frustum into one widened
     // texture and each eye's own cone is a different SUB-RECT of it (measured
-    // on BONELAB: eye 0 at x=0, eye 1 at x=609, both 2271 of 2880 wide —
-    // notes/BONELAB.md). Sampling eye 1 through eye 0's crop shifts its picture
+    // on BONELAB: eye 0 at x=0, eye 1 at x=609, both 2271 of 2880 wide).
+    // Sampling eye 1 through eye 0's crop shifts its picture
     // by that offset, which is a warped, displaced right eye and nothing else.
     uint32_t      grid_eye;
 } kl_reproject_uniforms;
@@ -157,7 +143,7 @@ typedef struct {
 // of `ovrp_EndFrame4`'s list here walked past the rest. Unity's only other
 // layer is a 1x1 nothing renders into; **Unreal draws its UI this way**, so on
 // RE4 that dropped the studio splash, the loading screens and the menus while
-// the world composited perfectly (notes/RE4.md).
+// the world composited perfectly.
 //
 // It is a separate pass from the reprojection above rather than a mode of it,
 // because the two want opposite things. The eye quad is EYE-CENTRED and
@@ -234,57 +220,48 @@ const char *kl_reproject_msl(void);
 //
 // When the guest renders through a rasterization rate map its eye texture is
 // stored WARPED: the fovea keeps its texels and the periphery is squeezed, so
-// texel (x, y) is no longer screen position (x, y). Something has to undo that,
-// and this pass is the only thing that reads the picture, so it does.
+// texel (x, y) is no longer screen position (x, y). This pass is the only thing
+// that reads the picture, so it undoes that.
 //
-// **Not in the fragment shader.** The obvious implementation calls
-// `map_screen_to_physical_coordinates` per fragment, which pays a decoder
-// lookup on every pixel of both eyes at display rate. Instead the quad is
-// subdivided into a grid and each vertex carries a PRE-UNWARPED texture
-// coordinate; the rasterizer's own interpolation does the rest and the fragment
-// shader is unchanged — it still just samples at `in.uv`.
+// Not in the fragment shader: calling `map_screen_to_physical_coordinates` per
+// fragment pays a decoder lookup on every pixel of both eyes at display rate.
+// The quad is subdivided into a grid instead and each vertex carries a
+// PRE-UNWARPED texture coordinate, so the rasterizer's interpolation does the
+// rest and the fragment shader still just samples at `in.uv`.
 //
-// **And it is exact, not an approximation.** A Metal rate map is piecewise
-// linear, with its breakpoints at the zone boundaries of the layer descriptor.
-// A grid whose vertices land on those boundaries therefore reproduces the map
-// exactly, because linear interpolation between two breakpoints is what the map
-// already is between them. Build the grid at the map's own zone count (or a
-// multiple of it) and there is no error to trade off.
+// Exact, not an approximation. A Metal rate map is piecewise linear with its
+// breakpoints at the layer descriptor's zone boundaries, so a grid whose
+// vertices land on those boundaries reproduces the map exactly. Build it at the
+// map's zone count, or a multiple, and there is no error to trade off. The
+// coordinates are static for a given map, so this is built when the map is
+// made, not per frame.
 //
-// The coordinates are static for a given map, so this is built once — when the
-// map is made, not per frame.
-//
-// This is the shape ALVR uses for the same job, and PLANNING §12.8's note about
-// that code applies here too: the mechanism is what is taken.
-//
-// **Buffer layout**, bound at buffer(1) of the VERTEX stage:
+// Buffer layout, bound at buffer(1) of the VERTEX stage:
 //
 //     [0]      = (nx, ny) as floats — the cell counts
 //     [base + y*(nx+1) + x] = the texture coordinate for grid vertex (x, y),
 //                             where `base` is the drawing view's
 //                             kl_reproject_uniforms.grid_base
 //
-// self-describing in nx/ny, so the pass needs no extra uniform for the cell
+// Self-describing in nx/ny, so the pass needs no extra uniform for the cell
 // counts and a caller cannot bind a table that disagrees with the vertex count
 // it draws.
 //
-// **One block per eye is allowed, and sometimes required.** The cell counts are
+// One block per eye is allowed, and sometimes required. The cell counts are
 // shared — one draw, one mesh — but the COORDINATES need not be: under Oculus
 // symmetric projection each eye's picture is a different sub-rect of one
 // texture, so each eye needs its own crop. Build with
 // kl_reproject_grid_build_eye() into a buffer of kl_reproject_grid_entries_n()
-// entries and pass grid_per_eye = 1 to kl_reproject_build. A caller with one
-// viewport for both eyes builds one block and passes 0, which is exactly what
-// this was before per-eye blocks existed.
+// entries and pass grid_per_eye = 1; a caller with one viewport for both eyes
+// builds one block and passes 0.
 //
-// **The zone-aligned exactness is a full-viewport property.** Cells uniform in
-// screen space land on the map's own breakpoints only when they span the whole
-// screen; with a render viewport smaller than it (see `vp` below) the cells are
-// FINER than a zone and no longer coincide with the breakpoints, so the unwarp
-// becomes a dense sampling of the curve rather than a reproduction of it. That
-// is the same accuracy the built-map fallback has always had — sub-texel at
-// this cell count — and it is worth knowing before a hunt for a soft periphery
-// in a title that scales its resolution.
+// The zone-aligned exactness is a FULL-VIEWPORT property. Cells uniform in
+// screen space land on the map's breakpoints only when they span the whole
+// screen; with a smaller render viewport (`vp` below) the cells are finer than
+// a zone and no longer coincide, so the unwarp becomes a dense sampling of the
+// curve rather than a reproduction of it — sub-texel at this cell count, but
+// worth knowing before hunting a soft periphery in a title that scales its
+// resolution.
 #define KL_REPROJECT_GRID_MAX 64
 
 // Entries (each a simd_float2) a grid buffer needs, header included.

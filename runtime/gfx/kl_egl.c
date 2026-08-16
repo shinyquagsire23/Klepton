@@ -1,4 +1,4 @@
-// M5, first cut — EGL, and the door to everything behind it.
+// EGL, and the door to everything behind it.
 //
 // The 19 unresolved imports in libunity.so are all EGL and contain no GL entry
 // point whatsoever, because `eglGetProcAddress` is one of them: Unity resolves
@@ -16,7 +16,7 @@
 //   * calling the returned pointer is an ASSERTION. It aborts by name.
 //     KL_PERMISSIVE=1 downgrades that to a zero return so one run collects the
 //     whole GL surface instead of one function per run — which is the entire
-//     point of this file right now, since nothing can size M5 until we know
+//     point of this file right now, since nothing can be sized until we know
 //     what Unity actually calls.
 //
 // Nothing here draws anything. The configs describe the panel kl_jni.c already
@@ -127,10 +127,9 @@ static unsigned g_nsurf, g_nctx;
 // Saber creates two, that guard was firing: measured 140 -> 73
 // GL_INVALID_FRAMEBUFFER_OPERATIONs over the same span of log with this fixed.
 //
-// It did NOT take them to zero, so do not read this as the whole of that bug —
-// see notes/VRCHAT.md Session 12 for what is and is not established about it,
-// including that AVPro's third context was suspected and measured innocent.
-// This change stands on being what the spec says, not on that measurement.
+// It did NOT take them to zero, so this is not the whole of that bug (AVPro's
+// third context was suspected there and measured innocent). This change stands
+// on being what the spec says, not on that measurement.
 //
 // Nothing else in the tree reads these; the ANGLE context that actually backs
 // them migrates separately, through kl_glfb_make_current/_release_current.
@@ -194,9 +193,8 @@ static uint64_t klgl_noop(const char *name) {
 // ---------- the GL calls that are already forced ----------
 //
 // glGetString is not optional in the way the rest of GL is. It is the first
-// thing Unity calls, and a permissive zero is a NULL string that it immediately
-// parses — which is a SIGSEGV at address 0 three frames inside libunity, i.e.
-// exactly the "silent zeros are worse than errors" trap the shim has hit before.
+// thing Unity calls, and a permissive zero is a NULL string it immediately
+// parses — a SIGSEGV at address 0 three frames inside libunity.
 //
 // As with the display group in kl_jni.c, the capability set is answered as a
 // whole rather than call by call: the version string, the GLSL version and the
@@ -206,14 +204,13 @@ static uint64_t klgl_noop(const char *name) {
 //
 // 3.2 is a deliberate overstatement — ANGLE's Metal backend caps at ES 3.0 —
 // and it is priced: Unity emits "#version 320 es" shaders and calls the ES 3.1
-// program-interface queries, both of which an ES 3.0 context rejects. kl_glfb.c
-// repairs both at the GL boundary (the glShaderSource rewrite and the
-// program-interface translation). The honest 3.0 description was tried and is
-// *worse*: Unity gates B10G11R11_UFloatPack32 renderability on the version
-// number itself (no extension parse — the string appears nowhere in libunity),
-// so on 3.0 the post-processing stack falls back to format 'None' and aborts,
-// and the VRDevice switches to the distortion-window path besides. The gap is
-// smaller than the gate.
+// program-interface queries, both of which an ES 3.0 context rejects, and
+// kl_glfb.c repairs both at the GL boundary (the glShaderSource rewrite and the
+// program-interface translation). An honest 3.0 description costs more: Unity
+// gates B10G11R11_UFloatPack32 renderability on the version number itself (no
+// extension parse — the string appears nowhere in libunity), so on 3.0 the
+// post-processing stack falls back to format 'None' and aborts, and the VRDevice
+// switches to the distortion-window path besides.
 #define GL_NO_ERROR      0
 #define GL_VENDOR   0x1F00
 #define GL_RENDERER 0x1F01
@@ -232,9 +229,8 @@ void kl_egl_set_gles_version(int major, int minor) {
     g_es_major = major; g_es_minor = minor;
 }
 
-// The extensions we advertise. The list stayed EMPTY for a long time and the
-// reason was sound -- naming one is a promise, and a broken promise fails far
-// from its cause -- but empty turned out to be its own broken promise for a
+// The extensions advertised here. Naming one is a promise and a broken promise
+// fails far from its cause — but an EMPTY list is its own broken promise to a
 // guest that reads capabilities from the string instead of from the version.
 //
 // The rule for adding here is narrow: an extension may be named only if the
@@ -244,13 +240,13 @@ void kl_egl_set_gles_version(int major, int minor) {
 // the backend really does provide them (kl_glfb prints "renderable float:" at
 // context creation, and the vendored ANGLE answers yes to both).
 //
-// It cost a version swap to find. Unity 2019.4 infers RGBA16F renderability
-// from the ES level it is told and never looks at the string; Unity 2018.4
-// (Beat Saber 1.6.0) asks for the string, found nothing, and refused to create
-// the eye textures -- "RenderTexture.Create failed: format unsupported - RGBA16
-// SFloat (2)", then "Failure creating VR textures of size (4580, 2400)", then
-// it tore the distortion window down. Nothing in that chain mentions an
-// extension, and the ES 3.2 claim made the capability look already granted.
+// Unity 2019.4 infers RGBA16F renderability from the ES level it is told and
+// never looks at the string; Unity 2018.4 (Beat Saber 1.6.0) asks for the string
+// and, finding nothing, refuses to create the eye textures --
+// "RenderTexture.Create failed: format unsupported - RGBA16 SFloat (2)", then
+// "Failure creating VR textures of size (4580, 2400)", then it tears the
+// distortion window down. Nothing in that chain mentions an extension, and the
+// ES 3.2 claim makes the capability look already granted.
 static const char *const g_gl_extensions[] = {
     "GL_EXT_color_buffer_float",
     "GL_EXT_color_buffer_half_float",
@@ -567,7 +563,7 @@ static void klgl_GetTexParameteriv(uint32_t target, uint32_t pname, int32_t *par
 //
 // Second, shader sources: they are captured rather than discarded, because they
 // are the input to the GLSL ES -> SPIR-V -> MSL pipeline the backend will need
-// (PLANNING M5), and this is the only place they exist in plain text.
+//, and this is the only place they exist in plain text.
 static uint32_t g_gl_name = 1;
 
 static void klgl_gen(int32_t n, uint32_t *names) {
@@ -582,14 +578,13 @@ static uint32_t klgl_CreateShader(uint32_t type) {
 }
 static uint32_t klgl_CreateProgram(void) { return g_gl_name++; }
 
-// Buffer objects with real backing store. The first attempt handed each
-// glMapBufferRange a fresh malloc of exactly `length`; the guest overran it
-// within a second (xzone malloc caught the freelist corruption on the next
-// map — the crash site was klgl_MapBufferRange, the corruptor was the write
-// through the previous mapping). So buffers now own storage sized by
+// Buffer objects with real backing store: a buffer owns storage sized by
 // glBufferData, glBindBuffer tracks the current binding per target, and a map
-// returns a pointer into the bound buffer's storage. Contents then survive
-// unmap/map cycles too, which the streaming paths actually rely on.
+// returns a pointer into the bound buffer's storage, so contents survive
+// unmap/map cycles as the streaming paths require. A fresh malloc of exactly
+// `length` per glMapBufferRange instead is overrun within a second — xzone
+// malloc reports the freelist corruption at the NEXT map, so the crash site is
+// klgl_MapBufferRange and the corruptor is the previous mapping's write.
 #define KL_GL_MAX_BUFFERS 4096
 #define KL_GL_MAX_BINDINGS 16
 static struct { uint32_t name; uint8_t *data; size_t size; } g_gl_bufs[KL_GL_MAX_BUFFERS];
@@ -1085,18 +1080,16 @@ static unsigned klegl_Terminate(EGLDisplay dpy) {
 //                                         only image target we accept
 //   EGL_ANDROID_get_native_client_buffer  eglGetNativeClientBufferANDROID
 //
-// It used to be the empty string, on the reasoning that promising nothing is
-// the safest thing to promise. It is not, and VRChat is what said so: AVPro
-// Video's OpenGLESPlayerRenderer::setupEglContext strdup()s this string and
-// walks it with strtok, and its loop is BOTTOM-tested — the first token is
-// logged and strlen'd before the NULL check that ends the loop. So an empty
-// list, which is a legal answer no conformant driver on Android ever actually
-// gives, is a strlen(NULL) on the boot path. The symptom names EGL only if you
-// read the guest's own last log line ("- (null)"); the frame it dies on is
-// _platform_strlen.
+// The empty string is NOT the safe answer, legal as it is: AVPro Video's
+// OpenGLESPlayerRenderer::setupEglContext strdup()s this string and walks it
+// with strtok in a BOTTOM-tested loop — the first token is logged and strlen'd
+// before the NULL check that ends the loop — so an empty list is a strlen(NULL)
+// on the boot path. No conformant Android driver gives one. The symptom names
+// EGL only in the guest's own last log line ("- (null)"); the frame it dies on
+// is _platform_strlen.
 //
-// The empty string is still one env-var away, because the two answers are worth
-// being able to A/B against a guest that branches on a name here.
+// The empty string is one env-var away, to A/B against a guest that branches on
+// a name here.
 static const char *klegl_extensions(void) {
     static const char *s;
     if (!s) s = kl_env_str("KL_EGL_EXTENSIONS",
@@ -1139,8 +1132,8 @@ static unsigned klegl_ChooseConfig(EGLDisplay dpy, const int32_t *attribs,
 // The other way round from eglChooseConfig: hand over the whole list and let
 // the caller filter it itself with eglGetConfigAttrib. libvrlink_scene does it
 // this way rather than describing what it wants in an attribute list, so both
-// entry points have to agree about what configs exist — they are the same
-// g_configs, which is what makes that automatic.
+// entry points have to agree about what configs exist. They read the same
+// g_configs.
 //
 // Passing configs == NULL is the standard "how many are there?" query, and it
 // must not be confused with a zero-sized buffer.
@@ -1459,7 +1452,7 @@ static unsigned klegl_SwapInterval(EGLDisplay dpy, int32_t interval) {
 }
 
 // ---------------------------------------------------------------------------
-// The decoded-video image (SL-13). Three entry points, and between them they are
+// The decoded-video image. Three entry points, and between them they are
 // the whole path from a frame VideoToolbox produced to a texture the guest's
 // shader samples.
 //
@@ -1618,13 +1611,13 @@ void kl_egl_report(FILE *f) {
     // `calls` counts the NULL driver's own stubs. Under KL_GLFB=1 the guest gets
     // ANGLE's entry point directly and there is no seam left to count at, so a
     // zero here means "the host driver served it", not "the guest never called
-    // it" — the same distinction kl_openxr_report carries, and for the same
-    // reason: the heading used to assert the second (SL-13).
+    // it" — the same distinction kl_openxr_report carries, and the heading must
+    // not assert the second.
     fprintf(f, "  GL entry points resolved: %u, of which counted through the "
                "null driver: %u\n", g_ngl, called);
     if (!g_ngl) return;
     if (called) {
-        fprintf(f, "  --- called on the null driver (the M5 work list) ---\n");
+        fprintf(f, "  --- called on the null driver (the work list) ---\n");
         for (unsigned i = 0; i < g_ngl; i++)
             if (g_gl[i].calls) fprintf(f, "    %-40s x%u\n", g_gl[i].name, g_gl[i].calls);
     }
@@ -1663,7 +1656,7 @@ static const struct { const char *name; void *fn; } g_egl[] = {
     E("eglGetProcAddress",      klegl_GetProcAddress),
     E("eglBindAPI",             klegl_BindAPI),
     E("eglQueryAPI",            klegl_QueryAPI),
-    // SL-13 — the decoded-video image. glEGLImageTargetTexture2DOES is the
+    // The decoded-video image. glEGLImageTargetTexture2DOES is the
     // fourth member of this family and is intercepted in kl_glfb.c instead,
     // because the guest resolves it through eglGetProcAddress and it has to
     // fall through to ANGLE for anything that is not one of our images.

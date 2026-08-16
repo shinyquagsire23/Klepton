@@ -1,5 +1,5 @@
 // Klepton on-device probe battery (visionOS).
-// Batches every device-only unknown into one run. See PLANNING.md §5.
+// Batches every device-only unknown into one run.
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -97,14 +97,15 @@ static void probe_dlopen(SB *s, const char *bundle, const char *fw, const char *
     dlclose(h);
 }
 
-// ---------- P12: the M1b question — does a HAND-EMITTED dylib pass AMFI? ----------
+// ---------- P12: does a HAND-EMITTED dylib pass AMFI? ----------
 //
-// P7 above answers S0.2: a signed dylib in an embedded framework loads. It says
-// nothing about M1b, because those frameworks came out of clang and ld64. This
+// P7 above answers that a signed dylib in an embedded framework loads. It says
+// nothing about klepton-ld's output, because those frameworks came out of clang
+// and ld64. This
 // one is klepton-ld's output — a Mach-O no Apple linker ever touched, carrying a
 // guest ELF image verbatim in __TEXT,__klelf, with no chained fixups, no exports
 // trie and an empty symbol table. That is the shape AMFI has every reason to
-// refuse, and it is the single highest-information experiment in PLANNING §12.3.
+// refuse, and it is the single highest-information experiment here.
 //
 // It goes past loading and actually *runs* the guest, because "it mapped" and
 // "it executes" are different claims and only the second one matters. The ELF
@@ -132,7 +133,7 @@ static void probe_klepton_ld(SB *s, const char *bundle) {
 
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) { sb(s, "    dlopen FAILED: %s", dlerror());
-              sb(s, "    >>> AMFI REJECTED THE HAND-EMITTED DYLIB — M1b BLOCKED"); return; }
+              sb(s, "    >>> AMFI REJECTED THE HAND-EMITTED DYLIB"); return; }
     sb(s, "    dlopen OK  handle=%p   <<< AMFI ACCEPTED IT", h);
 
     // Find the mach_header by matching dyld's loaded-image list: the dylib
@@ -160,7 +161,7 @@ static void probe_klepton_ld(SB *s, const char *bundle) {
            st[1], st[2], st[3], st[4], st[5]);
 
     // W^X: the guest text must be mapped read-execute and NOT writable. If this
-    // says writable, the whole reason for M1b has quietly evaporated.
+    // says writable, the whole reason for the translated path has quietly evaporated.
     { vm_address_t a = (vm_address_t)elf; vm_size_t sz = 0;
       vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
       mach_port_t obj;
@@ -341,8 +342,8 @@ char *klepton_run_probes(const char *bundle_path) {
       sb(s, "    mmap RWX+MAP_JIT   : %s", jit != MAP_FAILED ? "ALLOWED" : strerror(errno));
       if (jit != MAP_FAILED) munmap(jit, L); }
 
-    // ---- P7 dlopen embedded frameworks (S0.2 core) ----
-    sb(s, "\n[P7] dlopen of embedded frameworks  (S0.2)");
+    // ---- P7 dlopen embedded frameworks ----
+    sb(s, "\n[P7] dlopen of embedded frameworks ");
     sb(s, "    bundle: %s", bundle_path ? bundle_path : "(null)");
     if (bundle_path) {
         probe_dlopen(s, bundle_path, "KleptonProbeA", "default segment alignment");
@@ -403,8 +404,8 @@ char *klepton_run_probes(const char *bundle_path) {
       }
     }
 
-    // ---- P12 the M1b question (PLANNING §12.3(1)) ----
-    sb(s, "\n[P12] klepton-ld hand-emitted dylib under AMFI  (M1b / port rung P3)");
+    // ---- P12 the hand-emitted-dylib question ----
+    sb(s, "\n[P12] klepton-ld hand-emitted dylib under AMFI");
     if (bundle_path) probe_klepton_ld(s, bundle_path);
 
     sb(s, "\n===== END =====");
@@ -412,23 +413,23 @@ char *klepton_run_probes(const char *bundle_path) {
 }
 
 // ============================ P13 ============================
-// ANGLE under AMFI, and the Metal interop primitive (port rung P5).
+// ANGLE under AMFI, and the Metal interop primitive.
 //
 // Two questions in one, because they need the same setup and the device is the
 // only place either can be answered:
 //
 //   1. does a `vtool`-retargeted third-party dylib pass AMFI? This is the last
-//      unverified tail of PLANNING §12.1(1). The link line and all 299 undefined
-//      symbols were checked against the xrOS SDK offline (§12.5); what no
+//      unverified tail of the ANGLE retarget. The link line and all 299 undefined
+//      symbols were checked against the xrOS SDK offline; what no
 //      host-side check can establish is whether AMFI objects to a Mach-O whose
 //      LC_BUILD_VERSION was rewritten after signing-time-1 by a stock tool.
 //   2. does eglCreateImageKHR(EGL_METAL_TEXTURE_ANGLE) work *here*? It works on
-//      macOS — `make mtltex`, S1.1, every check green including per-eye array
+//      macOS — `make mtltex`, every check green including per-eye array
 //      slices and RGBA16F at the guest's real 2198x2304. visionOS is a different
 //      Metal and a different sandbox.
 //
 // The texture comes from Swift, deliberately: that is the shipping seam
-// (§12.6 — Swift owns Metal, C owns the guest), so this rehearses the real
+// (Swift owns Metal, C owns the guest), so this rehearses the real
 // arrangement rather than a convenient one. C hands Swift ANGLE's MTLDevice,
 // Swift allocates on it and hands the texture back, and each side verifies the
 // pixels through its own API — GL says it wrote them, Metal says they landed in
@@ -554,7 +555,7 @@ void *klepton_angle_init(const char *bundle_path) {
     g_a_egl = dlopen(p, RTLD_NOW | RTLD_LOCAL);
     if (!g_a_egl) {
         sb(s, "    dlopen libEGL FAILED: %s", dlerror());
-        sb(s, "    >>> AMFI REJECTED THE vtool-RETARGETED DYLIB — §12.1(1) BLOCKED");
+        sb(s, "    >>> AMFI REJECTED THE vtool-RETARGETED DYLIB");
         return NULL;
     }
     sb(s, "    dlopen libEGL OK       <<< AMFI ACCEPTED THE RETARGETED DYLIB");

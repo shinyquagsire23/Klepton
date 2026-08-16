@@ -69,7 +69,7 @@
   It is also not a diagnosis. It was added while chasing a streaming
   regression, and the change that actually altered what the client publishes to
   the host is the interaction profile now being answered — KL_XR_PROFILE=0 in
-  runtime/kl_openxr.c is that A/B. Settle the cause there before concluding
+  runtime/xr/kl_openxr.c is that A/B. Settle the cause there before concluding
   anything about this key.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

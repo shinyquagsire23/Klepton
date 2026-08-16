@@ -1,4 +1,4 @@
-// libaaudio.so — the audio half of the Steam Link VR client (SL-11).
+// libaaudio.so — the audio half of the Steam Link VR client.
 //
 // The shape is kl_opensl.c's, one API family over: everything here is the
 // guest's contract, kl_audio.c is the host's, and the two meet at exactly one
@@ -8,7 +8,7 @@
 // AAudio differs from OpenSL ES in one way that matters: it is a *pull* API.
 // FMOD enqueued buffers and we played them; Steam Link registers a data
 // callback and we must call it. So the feeder thread runs GUEST CODE — which
-// makes kl_thread_init() mandatory before the first call (S0.1) — and it must
+// makes kl_thread_init() mandatory before the first call — and it must
 // not be CoreAudio's render thread, which may not block, allocate, or take a
 // lock the guest holds. Hence a thread of our own per stream, exactly as
 // kl_opensl.c already does, feeding the same lock-free ring.
@@ -17,7 +17,7 @@
 // for a capture stream for voice chat (it calls setInputPreset), and we report
 // no capture device rather than fabricating one — reporting silence would be
 // inventing behaviour, and a real microphone would need a privacy usage
-// description whose absence is a process kill on the request (trap 13). "No
+// description whose absence is a process kill on the request. "No
 // input device" is the same platform-absent answer kl_ovrplat.c gives, and it
 // grants nothing. If the guest ever treats that as fatal the log says so by
 // name, which is the point.

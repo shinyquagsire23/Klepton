@@ -1,7 +1,7 @@
 #!/bin/bash
 # Wrap the two ANGLE frameworks as XCFrameworks for the app to embed.
 #
-# ANGLE is the shipping renderer, not a diagnostic (PLANNING §12.1(2)): its
+# ANGLE is the shipping renderer, not a diagnostic: its
 # Metal backend *is* Metal and it already translates this title's GLES
 # correctly. Until now it only existed in spikes/device-probe, so a device run
 # fell back to the null GL driver and drew nothing.

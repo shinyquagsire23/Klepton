@@ -35,8 +35,8 @@
 // always aborts naming the entry point, whatever KL_PERMISSIVE says. Everything
 // else is measured and answered as the trace forces it.
 //
-// PLANNING §8. Reporting that the platform is unavailable is true here; answering
-// "yes, entitled" would not be.
+// Reporting that the platform is unavailable is true here; answering "yes,
+// entitled" would not be.
 #ifndef KL_OVRPLAT_H
 #define KL_OVRPLAT_H
 #include <stdio.h>

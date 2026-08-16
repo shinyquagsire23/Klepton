@@ -1,7 +1,7 @@
 // libvulkan.so — the synthetic Vulkan loader, over MoltenVK.
 //
 // BONELAB boots completely and cannot render because its graphics API is Vulkan
-// (notes/BONELAB.md). Unity `dlopen`s `libvulkan.so` as the first thing it
+//. Unity `dlopen`s `libvulkan.so` as the first thing it
 // tries, and it is the only API this build probes: when the open fails, Unity
 // warns that the device does not meet the application's hardware requirements
 // and falls back to a GLES 2 context whose shaders do not exist in the blob.

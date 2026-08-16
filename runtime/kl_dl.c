@@ -62,7 +62,7 @@ typedef struct {
 // dead thread may hold g_lock. Registration is append-only and g_nimgs is read
 // once, so a concurrent load is merely not seen yet — never a torn entry.
 // The callback is declared void*-first so this definition and kl_shim.c's extern
-// are the same type: a mismatch across two TUs compiles silently (trap 6b) and
+// are the same type: a mismatch across two TUs compiles silently and
 // the guest's real callback signature is bionic's, not ours, either way.
 int kl_dl_iterate_phdr(int (*cb)(void *, size_t, void *), void *data) {
     if (!cb) return 0;
@@ -171,7 +171,7 @@ const char *kl_addr_image(const void *addr, size_t *offset) {
 //
 // Case 2 has no file anywhere, by design: OVRPlugin, the platform loader, GLES
 // and OpenSL ES are synthesized because the real ones need Quest system
-// libraries that do not exist here (PLANNING 3.1). On the host that stayed
+// libraries that do not exist here. On the host that stayed
 // invisible — the APK's own libOVRPlugin.so sits in the guest lib directory and
 // access() finds it, even though we never load a byte of it. In the bundle only
 // the five *translations* are embedded and the ELF tree is deliberately absent,
@@ -185,9 +185,10 @@ const char *kl_addr_image(const void *addr, size_t *offset) {
 // healthy the whole time; it had nothing to show. Reproduced on the host in one
 // run by moving libOVRPlugin.so aside, which is the A/B if this regresses.
 //
-// Exactly the same bug as P5.4's "Failed to load Il2CPP." (see kl_can_load), one
-// library over and one cause deeper: that one was cured by asking kl_can_load
-// instead of stat(), and this is what kl_can_load itself could not see.
+// Exactly the same bug as the "Failed to load Il2CPP." stat (see kl_can_load),
+// one library over and one cause deeper: that one is cured by asking
+// kl_can_load instead of stat(), and this is what kl_can_load itself cannot
+// see.
 int kl_can_dlopen(const char *path) {
     if (!path) return 0;
     return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||

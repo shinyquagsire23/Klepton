@@ -5,14 +5,21 @@ CC      := clang
 # missing dependency BY NAME when a guest asks for Vulkan, rather than failing
 # the build for everyone who does not need it.
 MVK_INC := -Ivendor-moltenvk/out/include
-CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) -Iruntime -Iruntime/jni
+# Every header keeps its bare name on an #include line, wherever it lives: a
+# source that moves between runtime/<area>/ directories then needs no include
+# edits, and visionos/Sources/Klepton-Bridging-Header.h imports by bare name
+# too. One -I per source directory is what buys that; gen_xcodeproj.py carries
+# the same list as HEADER_SEARCH_PATHS.
+RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr \
+               -Iruntime/media -Iruntime/guest -Iruntime/diag
+CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
 # RUNTIME_SHIP — everything that links the runtime needs them.
 LDLIBS  := -lz -framework AudioToolbox \
            -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
            -framework CoreFoundation -framework AVFoundation -framework Foundation
-# The host/ship split is a source-list boundary, not a runtime getenv (§12.2).
+# The host/ship split is a source-list boundary, not a runtime getenv.
 #
 # RUNTIME_SHIP is everything that goes into the visionOS app bundle. It is the
 # list `make xros` builds against the xrOS SDK, so anything added here has to
@@ -69,7 +76,8 @@ RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 # that measured a build nobody has.
 # kl_phonon_hrtf.S .incbins the SOFA blob, so the data file is a prerequisite
 # of everything too — same missed-FAILURE argument as the generated tables.
-RUNTIME_HDRS := $(wildcard runtime/*.h) $(wildcard runtime/jni/*.h) $(wildcard tests/*.h) \
+RUNTIME_ALL_HDRS := $(wildcard runtime/*.h) $(wildcard runtime/*/*.h)
+RUNTIME_HDRS := $(RUNTIME_ALL_HDRS) $(wildcard tests/*.h) \
                 runtime/data/phonon_hrtf_cipic_124.sofa
 
 .PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
@@ -188,7 +196,7 @@ guestlibs:
 guestlibs-list:
 	@echo $(GUEST_LIBS)
 
-# SL-1 — the second target's boot harness (PLANNING §11). Links the same
+# The second target's boot harness. Links the same
 # runtime as m_boot, minus the host-only diagnostics: this target has no
 # managed side to probe and no viewer yet.
 #
@@ -210,14 +218,14 @@ build/m_slink: mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_
 slink: build/m_slink
 	./build/m_slink
 
-# The VR build of the same app (steamlink-vr.apk, PLANNING §11.8). Same seven
-# libraries for the 2D half, so SL-1 is the same gate; libvrlink_scene is the
+# The VR build of the same app (steamlink-vr.apk). Same seven
+# libraries for the 2D half, so `slink` is the same gate; libvrlink_scene is the
 # OpenXR NativeActivity and is NOT loaded by this target yet.
 SLVRLIBS := steamlink-vr/lib/arm64-v8a
 slink-vr: build/m_slink
 	./build/m_slink $(SLVRLIBS)
 
-# SL-2: onCreate's whole sequence, through nativeRunMain into SDL_main, with the
+# onCreate's whole sequence, through nativeRunMain into SDL_main, with the
 # app reaching its own renderer. Needs ANGLE (KL_GLFB=1) — the null GL driver
 # stops at glCheckFramebufferStatus by design, so this is a real-GL gate.
 #
@@ -229,10 +237,10 @@ slink-vr: build/m_slink
 slink-main: build/m_slink
 	KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
 
-# SL-4: the OTHER front door. The 2D configuration frontend — libshell + Qt6,
+# The OTHER front door: the 2D configuration frontend — libshell + Qt6,
 # which is what SteamLink.getMainSharedObject() actually names — instead of the
 # streaming client. The point of it is that it has pixels of its own: the client
-# draws nothing without a Steam host on the LAN (§11.11, zero swaps ever), and
+# draws nothing without a Steam host on the LAN (zero swaps ever), and
 # the shell draws Qt Widgets locally.
 #
 # VR APK only, and not for arbitrary reasons: the old APK ships Qt5 with the
@@ -252,10 +260,10 @@ slink-shell: build/m_slink
 slink-shell-gap: build/m_slink
 	KL_SLINK_SHELL=1 KL_GAP_ONLY=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
 
-# SL-8: the THIRD front door — libvrlink_scene.so, the OpenXR NativeActivity.
+# The THIRD front door: libvrlink_scene.so, the OpenXR NativeActivity.
 # Not SDL3 at all, and the chain is ONE guest library: its DT_NEEDED is entirely
-# Android system libraries we shim (§11.9). libopenxr_loader.so is deliberately
-# not loaded — it is REPLACED, the same call §3.1 made for libOVRPlugin.
+# Android system libraries we shim. libopenxr_loader.so is deliberately
+# not loaded — it is REPLACED, the same call made for libOVRPlugin.
 #
 # The gap first, because that is the number that matters: 127 unresolved names,
 # and they are the work list for the whole VR arc.
@@ -267,32 +275,32 @@ slink-vr-gap: build/m_slink
 slink-vr-scene: build/m_slink
 	KL_SLINK_VR=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
 
-# SL-9: ...and the whole thing running — the OpenXR boot sequence, the session
+# ...and the whole thing running: the OpenXR boot sequence, the session
 # state machine, and the frame loop, on ANGLE.
 #
-# KL_SLINK_SARGS is the SL-6 handoff arriving: without it the app prints
+# KL_SLINK_SARGS is the 2D-to-VR handoff arriving: without it the app prints
 # "No sArgs and release build panic" and exits before its first frame, which is
 # correct behaviour and not a failure of ours. The value below is a SYNTHETIC
 # one — the format, with no real host behind it — which is enough to carry the
 # app through scene setup and into the stream, where it stops by name at
-# AMediaCodec. Paste a real one from a pairing run (notes/STEAMLINK.md) to go
+# AMediaCodec. Paste a real one from a pairing run to go
 # further.
 #
 # Expected: the six-step boot, "Created session successfully", the state machine
 # walking IDLE -> READY -> SYNCHRONIZED -> VISIBLE -> FOCUSED, two
 # "[xr] eye N <- swapchain" lines from xrEndFrame, the decoder coming up
-# ("[SVLDecoder] Finished decoder init", SL-10), and then a stop inside
+# ("[SVLDecoder] Finished decoder init"), and then a stop inside
 # SVLDataLink::InitCrypt. Anything earlier is a regression.
 #
-# **This target exits NON-ZERO on success**, unlike the other three slink gates.
-# Since SL-10 the stop is not ours at all: it is the guest's own DebuggerBreak
-# (`brk #1` at libvrlink_scene+0x15b798, so SIGTRAP rather than SIGABRT) after
-# it rejects the SYNTHETIC token above. That is the same class of
-# correct-behaviour stop as SL-9's "No sArgs and release build panic": a
-# fabricated credential is refused, which is what a credential is for.
+# This target exits NON-ZERO on success, unlike the other three slink gates.
+# The stop is not ours: it is the guest's own DebuggerBreak (`brk #1` at
+# libvrlink_scene+0x15b798, so SIGTRAP rather than SIGABRT) after it rejects the
+# SYNTHETIC token above. Same class of correct-behaviour stop as "No sArgs and
+# release build panic": a fabricated credential is refused, which is what a
+# credential is for.
 #
-# With a REAL sArgs (SL-11: notes/STEAMLINK.md carries the pairing -> handoff
-# loop) it goes considerably further and exits 0 — the session is accepted, the
+# With a REAL sArgs, from the pairing -> handoff loop, it goes
+# considerably further and exits 0 — the session is accepted, the
 # UDP data link connects, the Steam host replies, AAudio comes up, and the run
 # reaches the stream scene's WebView pre-flight. Measured from the disassembly
 # so it is not re-derived: InitCrypt scans for SEVEN `~` and the int it logs is
@@ -306,7 +314,7 @@ slink-vr-run: build/m_slink
 	KL_SLINK_VR=1 KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 KL_SLINK_WAIT=25 \
 	  KL_SLINK_SARGS='$(KL_SLINK_SARGS)' ./build/m_slink $(SLVRLIBS)
 
-# SL-10: the video decode gate. kl_vtdec is the only piece of the video path
+# The video decode gate. kl_vtdec is the only piece of the video path
 # that can be checked with no guest and no Steam host — an elementary stream in,
 # frames out, both ends knowable — so it is where the assertions live. See
 # tests/t_hevc.c for what each one catches. Seconds; in `make check`.
@@ -317,7 +325,7 @@ build/t_hevc: tests/t_hevc.c $(RUNTIME) $(RUNTIME_HDRS)
 hevc: build/t_hevc
 	./build/t_hevc
 
-# SL-16: the OpenXR reference-space gate. The pose a runtime answers with is not
+# The OpenXR reference-space gate. The pose a runtime answers with is not
 # visible from anywhere else — every call succeeds and the picture is correct
 # either way — so the one thing that could see the eye-to-head carrying the
 # head's own position was a person turning their head in a live stream, at the
@@ -330,7 +338,7 @@ build/t_xrspace: tests/t_xrspace.c $(RUNTIME) $(RUNTIME_HDRS)
 xrspace: build/t_xrspace
 	./build/t_xrspace
 
-# SL-20: the OpenXR action-surface gate — the same argument as xrspace above,
+# The OpenXR action-surface gate — the same argument as xrspace above,
 # one API family across. A binding decoded to the wrong bit, two hands combined
 # the wrong way, a stale press surviving a controller being put down, an action
 # space following the other hand: every one of those returns XR_SUCCESS and
@@ -368,7 +376,7 @@ vatest: build/t_variadic
 # kl_view.c is the KL_VIEW=1 interactive viewer (SDL3); only m_boot links it,
 # so only this rule carries the pkg-config flags. kl_view.c compiles to a stub
 # without SDL3 headers, but the link flags below assume pkg-config finds sdl3.
-# tests/t_mtl_provider.m is the host stand-in for Compositor Services (P5.3):
+# tests/t_mtl_provider.m is the host stand-in for Compositor Services:
 # Objective-C because it has to *create* MTLTextures. Host-only and diagnostic —
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
@@ -386,7 +394,7 @@ boot: build/m_boot
 
 # ---- guest payloads we build ourselves ----
 #
-# A guest we control, so S0.5 can be checked for *correct answers* rather than
+# A guest we control, so the veneers can be checked for CORRECT ANSWERS rather than
 # only for absence of crashes (tests/t_guest.c explains the design).
 #
 # The triple is aarch64-linux-gnu, not -android, and that is deliberate: modern
@@ -411,7 +419,7 @@ build/t_guest: tests/t_guest.c guest/torture.c guest/torture.h $(RUNTIME) $(RUNT
 guest: build/t_guest build/guest_torture.so
 	./build/t_guest build/guest_torture.so
 
-# S0.5 — the x18 decoder, checked against objdump over every guest library.
+# The x18 decoder, checked against objdump over every guest library.
 # Deliberately not linked against the runtime: it reads ELF files, it does not
 # load them, so a decoder bug cannot hide behind a working loader.
 build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
@@ -421,7 +429,7 @@ build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 x18: build/t_x18
 	python3 tools/check_x18.py build/t_x18 $(foreach f,$(GUEST_LIBS),$(LIBS)/$(f).so)
 
-# Trap 26 — the CTR_EL0 veneer, EXECUTED. Same shape as t_x18: linked against
+# The CTR_EL0 veneer, EXECUTED. Same shape as t_x18: linked against
 # the decoder alone, so a veneer bug cannot hide behind a working loader. It
 # runs the real illegal instruction in a child as its control, which is why the
 # host can gate a crash that only ever happened on a headset.
@@ -432,7 +440,7 @@ build/t_ctr: tests/t_ctr.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 ctr: build/t_ctr
 	./build/t_ctr
 
-# SL-19 — the broadcast fan-out, driven through the shim's own sendto and aimed
+# The broadcast fan-out, driven through the shim's own sendto and aimed
 # at loopback, so it exercises the discovery path without putting 254 datagrams
 # on anyone's network. The path is otherwise reachable only from a live Qt
 # frontend with a Steam host on the LAN.
@@ -446,8 +454,8 @@ bcast: build/t_bcast
 # ...and the preemptive version of the same question: what OTHER system
 # registers do these guests touch, and which of them may EL0 not execute?
 #
-# Trap 26 cost a device run because ONE instruction in ONE library is illegal
-# from EL0 and nothing below the device took that path. This decodes every
+# ONE instruction in ONE library can be illegal from EL0 with nothing below the
+# device taking that path. This decodes every
 # `mrs`/`msr`/`sys` in every guest library, names the register, and sorts by
 # whether Darwin permits it — so a new target's answer is a command rather than
 # a crash. Reads ELF files; no guest runs, seconds.
@@ -466,10 +474,10 @@ x18-slink: build/t_x18
 	  $(SLLIBS)/libSDL3_ttf.so $(SLLIBS)/libSDL3_image.so $(SLLIBS)/libc++_shared.so
 	python3 tools/check_x18.py build/t_x18 $(SLVRLIBS)/libmain.so $(SLVRLIBS)/libSDL3.so \
 	  $(SLVRLIBS)/libvrlink_scene.so $(SLVRLIBS)/libopenxr_loader.so
-	# The 2D shell's chain, which SL-18 loads on the device too — and which is
-	# where trap 26 lives (libQt6Core carries the project's only `mrs CTR_EL0`).
-	# libshell is trap 0d's own library: 12 of its 14 apparent x18 sites are
-	# CRYPTOGAMS constants with no symbol over them.
+	# The 2D shell's chain, which the device loads too — and which is
+	# where the CTR_EL0 read lives (libQt6Core carries the project's only
+	# `mrs CTR_EL0`). libshell is the data-in-.text case: 12 of its 14 apparent
+	# x18 sites are CRYPTOGAMS constants with no symbol over them.
 	python3 tools/check_x18.py build/t_x18 $(SLVRLIBS)/libshell_arm64-v8a.so \
 	  $(SLVRLIBS)/libQt6Core_arm64-v8a.so $(SLVRLIBS)/libQt6Gui_arm64-v8a.so \
 	  $(SLVRLIBS)/libQt6Widgets_arm64-v8a.so $(SLVRLIBS)/libQt6Network_arm64-v8a.so
@@ -552,36 +560,36 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	     echo "  opus inside libunity). Guest code still executes under 'make boot'."; fi
 	@echo "=== all guest libraries ===" && for f in $(GUEST_LIBS); do \
 	  printf '%-24s' $$f; ./build/t_load $(LIBS)/$$f.so 2>/dev/null | grep -E '^  imports:'; done
-	@echo "=== S0.5 x18 veneers ===" && for f in $(GUEST_LIBS); do \
+	@echo "=== x18 veneers ===" && for f in $(GUEST_LIBS); do \
 	  printf '%-24s' $$f; ./build/t_load $(LIBS)/$$f.so 2>/dev/null | grep -E '^  x18 sites:'; done
-	@echo "  (refused sites are br x18 jump tables and trap-0d data words — see PLANNING"
-	@echo "   S0.5. The count is guest-specific, so it moves with the APK; what must not"
+	@echo "  (refused sites are br x18 jump tables and data words in .text."
+	@echo "   The count is guest-specific, so it moves with the APK; what must not"
 	@echo "   move is the count for a GIVEN guest. 'make x18' is the exhaustive decoder"
 	@echo "   check against objdump, run it after any change to runtime/kl_x18.c)"
-# S0.1's counts, watched for the same reason the veneer totals are. They were
-# not, and a single site the trap-0d data test refused re-opened trap 1 in
-# libunity for sixteen commits: `make check` stops at initJni and stayed green
-# while the lifecycle faulted on it. A REFUSED TLS site is a hard failure here,
-# not a statistic — unlike the x18 side, refusing one is never free.
-	@echo "=== S0.1 TLS rewrites (trap 1) ===" && for f in $(GUEST_LIBS); do \
+# The TLS rewrite counts, watched for the same reason the veneer totals are: a
+# single site the data test refuses leaves libunity reading a register the
+# kernel clobbers, and `make check` stops at initJni, so it stays green while
+# the lifecycle faults on it. A REFUSED TLS site is a hard failure here, not a
+# statistic — unlike the x18 side, refusing one is never free.
+	@echo "=== TLS rewrites ===" && for f in $(GUEST_LIBS); do \
 	  printf '%-24s' $$f; ./build/t_load $(LIBS)/$$f.so 2>/dev/null > build/tls-$$f.log; \
 	  grep -E '^  TLS rewrites:' build/tls-$$f.log; \
 	  if grep -q 'TLS sites REFUSED' build/tls-$$f.log; then \
 	    echo "  FAIL: $$f has a TLS site the data test refused — that thread pointer"; \
-	    echo "        is garbage on every thread (trap 1). The loader named the address."; \
+	    echo "        is garbage on every thread. The loader named the address."; \
 	    exit 1; fi; \
 	done
-	@if [ -x "$(NDK_CC)" ]; then echo "=== guest differential (S0.5) ===" && \
+	@if [ -x "$(NDK_CC)" ]; then echo "=== guest differential ===" && \
 	   $(MAKE) -s guest | grep -E 'x18 sites|identical to the host|lost '; \
 	 else echo "=== guest differential: SKIPPED (set ANDROID_NDK_HOME) ==="; fi
 	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so $(TARGET)/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log
 	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/m_boot $(LIBS) > build/boot.log 2>/dev/null && \
-	  grep -E 'guard verified|DLC enumeration|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|M3 EXIT|M4 \(partial\)' build/boot.log
+	  grep -E 'guard verified|DLC enumeration|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|EXIT CRITERION' build/boot.log
 
-# ---- M1b / the visionOS port (PLANNING §12) ----
+# ---- the translated-dylib path / the visionOS port ----
 #
 # klepton-ld translates a guest ELF .so into a Mach-O dylib so dyld — not our
-# mmap loader — maps the guest text. It links runtime/kl_x18.c because the S0.5
+# mmap loader — maps the guest text. It links runtime/kl_x18.c because that
 # decoder is the authority on what an x18 site is; a bit-field guess reports
 # 2158 sites in libunityopus.so where the decoder correctly reports 0.
 # kl_env.c is here because kl_x18.c reads knobs through it. It had been missing
@@ -591,12 +599,12 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 # forced a rebuild. A stale translator is not a harmless one: it bakes
 # KLX_TSD_SLOT into every veneer it emits.
 build/klepton-ld: tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c runtime/kl_x18.h \
-                  runtime/guest/kl_guestpatch.c runtime/kl_guestpatch.h
+                  runtime/guest/kl_guestpatch.c runtime/guest/kl_guestpatch.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c \
 	    runtime/guest/kl_guestpatch.c
 
-# P1 — the same t_opus roundtrip that M1a passes, through the translated dylib.
+# P1 — the same t_opus roundtrip the mmap loader passes, through the translated dylib.
 # t_opus picks its loader from the file's magic, so this is one test over two
 # loaders rather than two tests. arm64 macOS requires at least an ad-hoc
 # signature before dyld will map anything.
@@ -613,7 +621,7 @@ p1: build/klepton-ld build/t_opus
 	@./build/t_opus $(PWD)/build/libunityopus.dylib | tail -4
 
 # P2 — the same dylib under the visionOS Simulator's dyld, which is where a
-# malformed hand-emitted Mach-O gets caught (§4, rung 2). Needs a booted
+# malformed hand-emitted Mach-O gets caught (rung 2 of the ladder). Needs a booted
 # visionOS simulator; XRSIM overrides which one.
 XRSIM ?= $(shell xcrun simctl list devices booted 2>/dev/null | grep -o '[0-9A-F-]\{36\}' | head -1)
 .PHONY: p2
@@ -653,7 +661,7 @@ KL_PLATFORM ?= macos
 bootdylib: dylibs build/m_boot
 	@KL_DYLIB_DIR=$(PWD)/build/dylibs ./build/m_boot $(LIBS) > build/bootdylib.log 2>&1; \
 	  echo "  exit=$$?"; \
-	  grep -aE 'loaded as a translated dylib|guard verified|natives registered:|ids requested:|M3 EXIT' \
+	  grep -aE 'loaded as a translated dylib|guard verified|natives registered:|ids requested:|EXIT CRITERION' \
 	    build/bootdylib.log
 	@echo "  NOTE: this reaches libmain and libunity. libil2cpp arrives only in the"
 	@echo "  lifecycle ('make bootdylib-life'), and libunityopus/lib_burst_generated"
@@ -679,7 +687,7 @@ loaddylib: dylibs build/t_load
 	  KL_DYLIB_DIR=$(PWD)/build/dylibs ./build/t_load $(LIBS)/$$f.so 2>&1 \
 	    | grep -E '^  imports:' | tr -d '\n'; echo; done
 
-# ---- P4 — the runtime builds for visionOS (PLANNING §12.4) ----
+# ---- the runtime builds for visionOS ----
 #
 # Two gates, and the second is the one that carries the information. Compiling
 # proves the headers are there; *linking* proves every symbol the runtime
@@ -701,11 +709,11 @@ XRSIM_SDK := $(shell xcrun --sdk xrsimulator --show-sdk-path)
 # fails; a Vulkan guest simply reports that the hardware does not meet its
 # requirements, on device only). Nothing links against MoltenVK either way —
 # kl_vulkan.c is VK_NO_PROTOTYPES and dlopens it — so this is headers only.
-XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) -Iruntime -Iruntime/jni
+XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 
 .PHONY: xros xros-device xros-sim swiftcheck
 xros: xros-device xros-sim build/Klepton.xcframework swiftcheck
-	@echo "  P4 gate: the shipping runtime compiles and links for both visionOS platforms."
+	@echo "  gate: the shipping runtime compiles and links for both visionOS platforms."
 
 # ...and the OTHER half of that seam, which had no gate at all: the Swift app
 # against the C headers it imports through the bridging header.
@@ -713,7 +721,7 @@ xros: xros-device xros-sim build/Klepton.xcframework swiftcheck
 # `xros` proves the runtime compiles and links. It says nothing about whether
 # the app still calls it correctly — and every C signature the app touches is a
 # signature Swift binds by shape, so widening one (the eye-texture provider
-# gaining its GL internalformat, SL-19) breaks KleptonCompositor.swift with
+# gaining its GL internalformat) breaks KleptonCompositor.swift with
 # nothing on the host reporting it. The next time anyone found out was a
 # `visionos/run.sh` that needs a booted simulator or a headset.
 #
@@ -725,7 +733,7 @@ xros: xros-device xros-sim build/Klepton.xcframework swiftcheck
 swiftcheck:
 	@xcrun -sdk xros swiftc -typecheck -target arm64-apple-xros26.0 \
 	  -import-objc-header visionos/Sources/Klepton-Bridging-Header.h \
-	  -I runtime visionos/Sources/*.swift 2>&1 | grep -E '^[^ ].*error:' && exit 1; \
+	  $(RUNTIME_INC) visionos/Sources/*.swift 2>&1 | grep -E '^[^ ].*error:' && exit 1; \
 	  echo "  swiftcheck: the visionOS app typechecks against runtime/*.h"
 
 # The archives are real targets with real prerequisites, not side effects of a
@@ -739,7 +747,7 @@ swiftcheck:
 # runs the PREVIOUS constant while the source says otherwise. That is the same
 # stale-artifact trap the xcframework rule below already records; the fix there
 # stopped at the archives and left this behind it.
-build/xros/libklepton.a: $(RUNTIME_SHIP) $(wildcard runtime/*.h)
+build/xros/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
 	@mkdir -p build/xros
 	@rm -f $@
 	@for s in $(RUNTIME_SHIP); do \
@@ -748,7 +756,7 @@ build/xros/libklepton.a: $(RUNTIME_SHIP) $(wildcard runtime/*.h)
 	    -c $$s -o $$o || exit 1; done
 	@ar rcs $@ build/xros/*.o
 
-build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(wildcard runtime/*.h)
+build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
 	@mkdir -p build/xrsim
 	@rm -f $@
 	@for s in $(RUNTIME_SHIP); do \
@@ -794,7 +802,7 @@ xros-sim: build/xrsim/libklepton.dylib
 # trap visionos/README.md records for libklepton.a; the fix there stopped at the
 # archives and left the headers behind it.
 build/Klepton.xcframework: build/xros/libklepton.a build/xrsim/libklepton.a \
-                           $(wildcard runtime/*.h)
+                           $(RUNTIME_ALL_HDRS)
 	@rm -rf $@
 	@xcodebuild -create-xcframework \
 	   -library build/xros/libklepton.a -headers runtime \
@@ -805,8 +813,8 @@ build/Klepton.xcframework: build/xros/libklepton.a build/xrsim/libklepton.a \
 # ANGLE for visionOS. The vendored checkout's gn has no xros target and does not
 # need one: build for iOS — which already enables the Metal backend — and rewrite
 # LC_BUILD_VERSION afterwards. Confirmed prior art (ALVR ships a Rust dylib this
-# way); §12.1(1). ANGLE emits ios_framework_bundle on iOS, so the output is
-# already the .framework packaging §4.0.1 wants.
+# way). ANGLE emits ios_framework_bundle on iOS, so the output is already the
+# .framework packaging the app bundle wants.
 .PHONY: angle-ios angle-ios-sim angle-xros
 angle-ios: angle-fetch
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
@@ -817,7 +825,7 @@ angle-ios: angle-fetch
 
 # The simulator slice. Same trick one platform over: an iOS *simulator* build
 # vtool'd to visionossim. Needed because the simulator is the fast development
-# loop for P5.3 — a device round trip is minutes, the simulator is seconds — and
+# loop — a device round trip is minutes, the simulator is seconds — and
 # an xcframework with no matching slice fails as an arch mismatch rather than as
 # a missing slice.
 angle-ios-sim: angle-fetch
@@ -837,7 +845,7 @@ angle-xrsim: angle-ios-sim
 	@./tools/angle_retarget.sh ios-sim xrsim visionossim XRSimulator
 
 # ---- graphics spikes (host-only, not part of `make check`) ----
-# S0.7/S0.8 probe Apple's desktop GL; S0.9 probes ANGLE. None of them link the
+# s07/s08 probe Apple's desktop GL; s09 probes ANGLE. None of them link the
 # runtime — they answer questions about the host, not about the shim.
 build/s07_glfb: spikes/s07_glfb.c
 	$(CC) $(CFLAGS) -o $@ $< -framework OpenGL -lz
@@ -848,10 +856,10 @@ build/s09_angle: spikes/s09_angle.c
 build/s10_shared: spikes/s10_shared.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-# S1.1 — the P5 interop primitive: ANGLE rendering into an MTLTexture we own.
+# The compositor interop primitive: ANGLE rendering into an MTLTexture we own.
 # Objective-C because the spike has to *create* the MTLTexture; the shipping
 # path never does — it receives one from Swift as an opaque pointer, which is
-# why kl_glfb stays plain C (PLANNING §12.6).
+# why kl_glfb stays plain C.
 build/s11_mtltex: spikes/s11_mtltex.m
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ $< -framework Metal -framework Foundation
 
@@ -859,7 +867,7 @@ build/s11_mtltex: spikes/s11_mtltex.m
 mtltex: build/s11_mtltex
 	@./build/s11_mtltex
 
-# S1.2 — foveation: does ANGLE rasterize through an MTLRasterizationRateMap we
+# Foveation: does ANGLE rasterize through an MTLRasterizationRateMap we
 # own? The gate for the whole variable-rate arc, and the thing that says
 # angle-patches/klepton.patch's Metal-backend half actually engages. Needs the
 # PATCHED ANGLE (`make angle-debug`); it names that as the failure if the entry
@@ -875,22 +883,22 @@ vrr: build/s12_vrr
 # matrices, and that the shared shader actually compiles. Separate from `make
 # check` on purpose; it needs Metal's compiler service and the gate should not
 # take a dependency on that. See tests/t_reproject.m.
-build/t_reproject: tests/t_reproject.m runtime/gfx/kl_reproject.c runtime/kl_reproject.h \
-                   runtime/kl_env.c runtime/kl_ovrp.h
-	$(CC) $(CFLAGS) -fobjc-arc -Iruntime -o $@ $< runtime/gfx/kl_reproject.c \
+build/t_reproject: tests/t_reproject.m runtime/gfx/kl_reproject.c runtime/gfx/kl_reproject.h \
+                   runtime/kl_env.c runtime/xr/kl_ovrp.h
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $< runtime/gfx/kl_reproject.c \
 	  runtime/kl_env.c -framework Metal -framework Foundation
 
 .PHONY: reproject
 reproject: build/t_reproject
 	@./build/t_reproject
 
-# M8 — the haptics seam's model, with no guest and no headset: the three
+# The haptics seam's model, with no guest and no headset: the three
 # OVRPlugin entry points AS THE GUEST RESOLVES THEM (through kl_ovrp_sym, so
 # the struct returns go through the real sret thunk), the queue behind them,
 # and the pulses a frontend pulls. Fast and deterministic; part of `check`.
 build/t_haptics: tests/t_haptics.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Iruntime -o $@ tests/t_haptics.c $(RUNTIME) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ tests/t_haptics.c $(RUNTIME) $(LDLIBS)
 
 .PHONY: haptics
 haptics: build/t_haptics
@@ -900,8 +908,8 @@ haptics: build/t_haptics
 # the REAL libOVRPlugin.so about which arguments are OUT-parameters. Offline —
 # it disassembles the plugin in the guest tree, runs no guest and needs no
 # hardware, and takes about a second. It exists because that question has cost
-# two arcs now: trap 10 was its return-value half, and ovrp_GetVersion2 was its
-# argument half — an out pointer we never wrote, which is a strlen(NULL) in
+# two arcs now: the return-value half (ovrpResult vs ovrpBool), and the argument
+# half — an out pointer we never wrote, which is a strlen(NULL) in
 # whichever native library reads it and names nothing on the way down.
 # LIBS points it at whichever guest is current; a tree with no libOVRPlugin.so
 # says so and passes.
@@ -1037,7 +1045,7 @@ angle-status:
 # ---- MoltenVK (BONELAB / the synthetic libvulkan.so arc) ----------------------
 #
 # BONELAB boots completely and cannot render because the build's graphics API is
-# Vulkan (notes/BONELAB.md). MoltenVK is the host side of the answer, and unlike
+# Vulkan. MoltenVK is the host side of the answer, and unlike
 # ANGLE it is vendored as a PREBUILT: nothing here patches it, so a 180 MB
 # tarball buys what an ~18 GiB checkout and a 30-60 minute build would.
 #
@@ -1115,7 +1123,7 @@ mvk-status:
 angle: build/s09_angle
 	@./build/s09_angle
 
-# S1.0 — shared ANGLE contexts across threads. Runs the matrix that separates
+# Shared ANGLE contexts across threads. Runs the matrix that separates
 # "shared contexts" from "concurrent use"; see the spike's header for the S10_*
 # knobs.
 #

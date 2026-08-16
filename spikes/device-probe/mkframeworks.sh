@@ -52,7 +52,8 @@ make_xcframework() {     # <name> <extra ld flags...>
 
 # KleptonGuest — the P3 subject. NOT built by clang: this framework's binary is
 # emitted by klepton-ld from a real guest .so, so it is the *hand-emitted* Mach-O
-# that S0.2 never tested. S0.2 proved a signed dylib loads; the open question is
+# that the linker-built frameworks do not cover. Those prove a signed dylib
+# loads; the open question is
 # whether one dyld's own linker never touched survives AMFI on device.
 make_guest_framework() {
   local NAME="KleptonGuest"
@@ -92,7 +93,7 @@ EOF
   echo "  $NAME.xcframework   klepton-ld output ($(stat -f%z build/xros/$NAME/../$NAME.framework/$NAME 2>/dev/null || stat -f%z build/xros/$NAME.framework/$NAME) bytes)"
 }
 
-# ANGLE — the P13 / port-rung-P5 subject. Not built here either: these come out
+# ANGLE — the P13 subject. Not built here either: these come out
 # of the vendored iOS build, retargeted to visionOS by tools/angle_retarget.sh
 # (`make angle-xros angle-xrsim`). The open question is whether AMFI objects to a
 # Mach-O whose LC_BUILD_VERSION a stock tool rewrote after the fact.

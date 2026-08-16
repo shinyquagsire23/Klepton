@@ -75,9 +75,9 @@ static id<MTLRenderPipelineState> klvm_pipeline_blend(const char *msl, const cha
     // why it needed a 64K-entry LUT to be affordable at all.
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
     // Only the OVERLAY pass blends. The eye passes force alpha to 1.0 and must
-    // (trap 33: a guest leaves the eye texture's alpha at 0 because the layer is
+    // — a guest leaves the eye texture's alpha at 0 because the layer is
     // composited opaque, so a blending eye pass hands the window server a
-    // transparent frame over a correct picture). A UI quad's alpha is authored
+    // transparent frame over a correct picture. A UI quad's alpha is authored
     // and is the whole reason it is a separate layer.
     if (blend) {
         pd.colorAttachments[0].blendingEnabled = YES;
@@ -135,7 +135,7 @@ static float         g_grid_vp[4];
 // Which eye this window shows. One, because the window is one flat surface —
 // but WHICH one is a question worth being able to ask: a guest under Oculus
 // symmetric projection renders the two eyes into different sub-rects of one
-// texture (notes/BONELAB.md), so eye 1 is the one whose crop and whose quad can
+// texture, so eye 1 is the one whose crop and whose quad can
 // be wrong while eye 0 looks perfect. Without this the only instrument for that
 // is a person wearing the headset.
 //
@@ -458,7 +458,7 @@ int kl_viewmtl_start(void *metal_layer) {
     // that can possibly be right is the one that owns the thing being sampled —
     // and asking the texture is the one phrasing that is right for both guests.
     // On GL that is ANGLE's device by construction (the extension requires the
-    // eye texture to belong to the display's device, PLANNING §12.9); on the
+    // eye texture to belong to the display's device); on the
     // Vulkan path it is MoltenVK's, and `kl_glfb_mtl_device()` answers NULL
     // there because ANGLE was never brought up at all.
     g_dev = ((__bridge id<MTLTexture>)eyep).device;

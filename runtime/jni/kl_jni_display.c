@@ -137,7 +137,7 @@ static klj_val klj_Display_isHdr(void *env, void *self, const klj_val *a, int n)
 // constant, the frame clock is the Choreographer's, and on device the real
 // number is pushed from the compositor's primeDisplay. One mode makes the panel
 // self-consistent by construction, which is the rule that got Bloom and the
-// GLES 3.2 capability set right (trap 9).
+// GLES 3.2 capability set right.
 static klj_val klj_Display_getSupportedModes(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *modes;
@@ -189,8 +189,8 @@ static klj_val klj_UnityPlayer_skipPermissionsDialog(void *env, void *self,
 //
 // It also has to be false rather than the more agreeable true: the true arm
 // promises the listener is ENABLED, i.e. that orientation callbacks will keep
-// arriving, and the guest is entitled to wait for one. Trap 6d's shape — a
-// silent yes is worse than an honest no.
+// arriving, and the guest is entitled to wait for one. A silent yes is worse
+// than an honest no.
 static klj_val klj_UnityPlayer_startOrientationListener(void *env, void *self,
                                                         const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -229,7 +229,7 @@ static klj_val klj_UnityPlayer_startActivityIndicator(void *env, void *self,
 // model that checkSelfPermission reads — so there is nothing to wait for and
 // nothing this call could change. The one thing it must not do is model the
 // wait: this is the caller's thread, and a wait for a response no one can send
-// is trap 6e, a hang rather than an error.
+// is a hang rather than an error.
 static klj_val klj_UnityPlayer_requestUserAuthorization(void *env, void *self,
                                                         const klj_val *a, int n) {
     (void)env; (void)self;

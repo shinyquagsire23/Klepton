@@ -12,7 +12,7 @@
 //
 //   - The guest hands us Annex-B, because that is what MediaCodec takes, and it
 //     puts its parameter sets IN BAND (its AMediaFormat carries no csd-0/csd-1
-//     — measured, PLANNING §11.15). VideoToolbox takes neither: it wants a
+//     — measured). VideoToolbox takes neither: it wants a
 //     CMVideoFormatDescription built from the parameter sets up front and
 //     length-prefixed NALs after. Both conversions live in here.
 //   - Output is BGRA, not NV12, and that is a decision rather than a default.
@@ -20,7 +20,7 @@
 //     promise on Android is that the YUV->RGB conversion has already happened
 //     by the time the shader sees it. Asking VideoToolbox for BGRA keeps that
 //     promise on the host side, where a hardware converter does it for free,
-//     and leaves us with a single-plane texture that the P5 MTLTexture->EGLImage
+//     and leaves us with a single-plane texture that the MTLTexture->EGLImage
 //     path in kl_glfb.c already knows how to hand to ANGLE. The alternative —
 //     two planes and a conversion in the shader — would mean rewriting the
 //     guest's shader rather than merely retargeting its sampler. See kl_egl.c.
@@ -35,8 +35,8 @@
 //     author, ~2 ms a frame at high resolution; ours is 1536x6144). What
 //     stands in the way is ANGLE, whose IOSurface path knows only nine public
 //     formats. The format table and the route through
-//     EGL_METAL_TEXTURE_ANGLE are written up in notes/STEAMLINK.md, SL-13
-//     pickup 7 — this is a device-time optimisation, not a correction.
+//     EGL_METAL_TEXTURE_ANGLE is a device-time optimisation, not a
+//     correction.
 #ifndef KL_VTDEC_H
 #define KL_VTDEC_H
 

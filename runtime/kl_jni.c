@@ -58,7 +58,7 @@ enum { KL_JVM_SLOTS(KLJ_ENUM_VM) };
 // the instrument that makes the JNI surface measurable instead of guessable.
 static __attribute__((noreturn)) void klj_unimpl(const char *table, int idx, const char *name) {
     fprintf(stderr, "\n[jni] UNIMPLEMENTED %s slot %d: %s\n", table, idx, name);
-    fprintf(stderr, "[jni] this is an M4 work item — the guest wants it, so implement it.\n");
+    fprintf(stderr, "[jni] this is a work item — the guest wants it, so implement it.\n");
     kl_jni_report(stderr);
     kl_egl_report(stderr);
     kl_fatal_prepare(); abort();
@@ -490,8 +490,8 @@ static void *klj_ref_identity(void *env, void *obj)       { (void)env; return ob
 // read retired strings and every argument arrived EMPTY. argc was right, the
 // strings were right, and the app simply saw no options: Steam Link's
 // EStreamTransport stayed 0 and it reported "couldn't find a streaming game for
-// your account" without opening a socket. Same shape as trap 15 — a rule that
-// held for Beat Saber because Beat Saber never deleted a container-derived ref.
+// your account" without opening a socket. The rule held for Beat Saber only
+// because Beat Saber never deletes a container-derived ref.
 //
 // The frame record is the only evidence we have of which refs a frame actually
 // created, so that is the test: retire only what this thread's open frames
@@ -536,7 +536,7 @@ static kl_jint klj_IsSameObject(void *env, void *a, void *b) { (void)env; return
 // name match would say "no" and send the engine down its no-Activity path.
 static const struct { const char *cls, *super; } g_supers[] = {
     {"com/unity3d/player/UnityPlayerActivity", "android/app/Activity"},
-    // Steam Link's own activity really does extend SDLActivity (§11.6), and
+    // Steam Link's own activity really does extend SDLActivity, and
     // SDL3 hands `SDLActivity.getContext()` — i.e. that subclass — to code that
     // then calls Context methods on it. Without this edge, getFilesDir() and
     // every other inherited Context method would have to be re-declared against
@@ -742,8 +742,8 @@ static kl_jint klj_UnregisterNatives(void *env, void *clazz) { (void)env; (void)
 static kl_jint klj_GetJavaVM(void *env, void **vm) { (void)env; *vm = kl_jni_vm(); return 0; }
 
 // The measurement instrument. Every id the guest wants is recorded; in strict
-// mode the first unknown one stops the run, which is the bring-up loop from
-// PLANNING §6 M4. Permissive mode hands back a synthetic id so a single run
+// mode the first unknown one stops the run, which is the bring-up loop.
+// Permissive mode hands back a synthetic id so a single run
 // collects the whole batch of lookups an init path performs.
  void *klj_want(void *clazz, const char *name, const char *sig, char kind) {
     const char *cls = klj_class_name(clazz);
@@ -946,7 +946,7 @@ static const klj_binding *klj_find_binding(const char *cls, const char *name,
                                            const char *sig) {
     // Exact wins outright across EVERY family table, so the answer does not
     // depend on which file a class landed in; a loose match is only ever the
-    // fallback (trap 39).
+    // fallback.
     const klj_binding *loose = NULL;
     for (const klj_binding *const *t = klj_binding_tables; *t; t++)
         for (const klj_binding *b = *t; b->cls; b++) {
@@ -1032,7 +1032,7 @@ static klj_val klj_call_common(void *env, void *self, void *mid, char want,
 
     KLJ_LOG("no host implementation for %s.%s%s", w->cls, w->name, w->sig);
     if (!g_permissive) {
-        fprintf(stderr, "[jni] this is an M4 work item — add it to the family table in runtime/jni/.\n");
+        fprintf(stderr, "[jni] this is a work item — add it to the family table in runtime/jni/.\n");
         kl_jni_report(stderr);
     kl_egl_report(stderr);
         kl_fatal_prepare(); abort();
@@ -1081,9 +1081,8 @@ static void klj_CallStaticVoidMethodV(void *env, void *cls, void *mid, kl_va *va
 // AAPCS64 descriptor by reference. SDL3 is C. It calls
 // `(*env)->CallStaticBooleanMethod(env, cls, mid, ...)` directly, so the
 // arguments arrive spread across x0-x7/v0-v7 with no descriptor anywhere — the
-// ordinary trap 2 situation, which is exactly what kl_va_thunks.S exists for.
-// PLANNING §11.5's "the second target exercises the half Beat Saber does not"
-// paid for itself here.
+// ordinary variadic-forwarding problem kl_va_thunks.S exists for.
+// This half of the shim is Steam Link's alone: Beat Saber never reaches it.
 //
 // Each entry point is an asm thunk that spills the register file, materialises
 // a kl_va over it and calls the handler below. The handlers are one line each
@@ -1354,7 +1353,7 @@ static const klj_field g_fields[];
 // <ro.product.model>" matched against "Oculus Quest" / "Pico " / "HTC VIVE ",
 // so the model we report is what decides whether Steam Link's shell asks its
 // host for a VR session or a flat 2D one — and those two sessions are
-// different wire protocols on different ports (notes/STEAMLINK.md, SL-7).
+// different wire protocols on different ports.
 // Presenting a Quest 2 stays the default and the settled decision; this is the
 // A/B, not a new answer.
 static const char *klj_field_sval(const klj_field *f) {
@@ -1473,7 +1472,7 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
     }
     KLJ_LOG("no host value for field %s.%s %s", w->cls, w->name, w->sig);
     if (!g_permissive) {
-        fprintf(stderr, "[jni] this is an M4 work item — add it to g_fields.\n");
+        fprintf(stderr, "[jni] this is a work item — add it to g_fields.\n");
         kl_jni_report(stderr);
     kl_egl_report(stderr);
         kl_fatal_prepare(); abort();
@@ -1857,7 +1856,7 @@ static void *g_env_vtable[KL_JNI_SLOTS_COUNT];
 static void *g_vm_vtable[KL_JVM_SLOTS_COUNT];
 
 // A JNIEnv is per-thread by contract, and a thread running guest code needs the
-// bionic stack canary in TSD slot 5 before it executes anything (S0.1), so the
+// bionic stack canary in TSD slot 5 before it executes anything, so the
 // attach path is also where kl_thread_init() belongs.
 typedef struct { void *functions; } klj_env_t;
 static pthread_key_t  g_env_key;

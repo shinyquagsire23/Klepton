@@ -15,7 +15,7 @@
 // about every one of them (the app bundle never forks, has no argv, and cannot
 // re-exec — see kl_slink_vr_pump's note on who owns the loop).
 //
-// The three front doors are PLANNING §11.9's, and they are not a sequence:
+// The three front doors, which are not a sequence:
 //
 //   CLIENT  libmain.so — the streaming client. SDL3. Its picture IS a decoded
 //           video stream, so it draws nothing without a Steam host.
@@ -158,7 +158,7 @@ void kl_slink_vr_start(FILE *out);
 //
 // `seconds` is a DEADLINE in wall time, not a pump count — kl_ndk_pump_looper
 // returns as soon as it has work, so counting iterations measures the guest's
-// busyness rather than time (SL-13 lost a run to exactly that). A negative
+// busyness rather than time. A negative
 // deadline means "until *quit becomes non-zero", which is the app-bundle shape:
 // there the run ends when the immersive space does, not on a timer.
 // `quit` may be NULL. Returns the seconds actually spent.

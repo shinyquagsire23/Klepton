@@ -30,7 +30,7 @@
 #include <unistd.h>
 #include <math.h>          // powf — the debug tone map in the capture path
 #include <zlib.h>
-// The decoded-video image path (SL-13) — an AHardwareBuffer here is a
+// The decoded-video image path — an AHardwareBuffer here is a
 // CVPixelBuffer, and what ANGLE can take is the IOSurface behind it.
 #include <CoreVideo/CoreVideo.h>
 #include "kl_glfb.h"
@@ -218,7 +218,7 @@ int kl_glfb_init(void) {
     }
 
     // Metal by name. The default display selects ANGLE's OpenGL backend, and with
-    // it every limitation this move exists to escape (S0.9).
+    // it every limitation this move exists to escape.
     const char *want = kl_env_str("KL_ANGLE_BACKEND", "angle");
     int use_gl = want && strcmp(want, "gl") == 0;
     const int32_t dpy_attrs[] = {
@@ -505,7 +505,7 @@ static void (*g_real_ShaderSource)(uint32_t, int32_t, const char *const *,
 static void (*g_real_GetShaderiv)(uint32_t, uint32_t, int32_t *);
 static void (*g_real_GetShaderInfoLog)(uint32_t, int32_t, int32_t *, char *);
 
-// The shader capture, and the version rewrite it forced (trap 9).
+// The shader capture, and the version rewrite it forced.
 //
 // Every glShaderSource is kept, keyed by shader name; on a failed compile the
 // info log and the source that produced it are printed, and written to
@@ -525,9 +525,8 @@ static void (*g_real_GetShaderInfoLog)(uint32_t, int32_t, int32_t *, char *);
 // ANGLE via build/s09_angle:
 //
 //   1. "#version 3xx es" with xx > 00 -> "#version 300 es". Nothing in the
-//      failing corpus uses a real 3.1/3.2 feature; if a later shader does,
-//      it fails loudly here with the true error, which is what the failure
-//      reporter is for.
+//      failing corpus uses a real 3.1/3.2 feature; a later shader that does
+//      fails here with the true error, which the failure reporter prints.
 //   2. drop "binding = <tok>" from layout qualifiers. layout(binding=N) on
 //      uniform blocks is an ES 3.1 feature ("only valid when used with
 //      pixel local storage" on this ANGLE). Dropping it is safe because
@@ -860,7 +859,7 @@ static char *klfb_rewrite_glsl(char *buf, uint32_t shader) {
         if (q) { p = q; changed = 1; } else p += 8;
     }
 
-    // SL-10: external images, which ANGLE's Metal backend does not have.
+    // External images, which ANGLE's Metal backend does not have.
     //
     // Steam Link's video shader is the ordinary Android one — it declares
     // `#extension GL_OES_EGL_image_external_essl3` and a `samplerExternalOES`,
@@ -947,11 +946,10 @@ static char *klfb_rewrite_glsl(char *buf, uint32_t shader) {
 static void klfb_ShaderSource(uint32_t shader, int32_t count,
                               const char *const *strings, const int32_t *lengths) {
     if (strings && count > 0) {
-        // The buffer is built for the rewrite, not just the capture: the
-        // first version of this tied the two together, and once the capture
-        // table filled (1024 entries; a long run sources thousands) the
-        // rewrite silently stopped applying and the 320 es failures came
-        // straight back.
+        // The buffer is built for the rewrite, NOT tied to the capture: the
+        // capture table holds 1024 entries and a long run sources thousands,
+        // so a shared buffer stops rewriting the moment it fills and the 320
+        // es failures return with nothing reporting it.
         size_t total = 0;
         for (int32_t i = 0; i < count; i++)
             total += lengths && lengths[i] >= 0 ? (size_t)lengths[i]
@@ -1289,9 +1287,9 @@ void kl_glfb_gl_census(FILE *f) {
     fprintf(f, "\n");
 }
 
-// The gen/delete pairs. Six near-identical thunks per family is worse than a
-// macro here: the only thing that varies is which counter moves, and a typo in
-// one hand-written copy is a census that lies about exactly one class.
+// The gen/delete pairs, as a macro: the only thing that varies is which counter
+// moves, and a typo in one hand-written copy is a census that lies about exactly
+// one class.
 #define KLFB_GENDEL(Name, KIND)                                               \
     static void (*g_real_Gen##Name)(int32_t, uint32_t *);                     \
     static void (*g_real_Delete##Name)(int32_t, const uint32_t *);            \
@@ -1334,10 +1332,9 @@ static void klfb_TexImage2D(uint32_t target, int32_t level, int32_t ifmt,
                             int32_t w, int32_t h, int32_t border, uint32_t fmt,
                             uint32_t type, const void *pixels) {
     if (level == 0) g_census_teximage++;
-    // A MUTABLE allocation is an allocation: only glTexStorage2D/3D used to be
-    // recorded, so a render target created this way was invisible to every
-    // readback path — the same blindness as a full table, arriving by a
-    // different door.
+    // A MUTABLE allocation is an allocation: recording only glTexStorage2D/3D
+    // leaves a render target created this way invisible to every readback path
+    // — the same blindness as a full table, by a different door.
     if (level == 0 && w > 0 && h > 0 && a_glGetIntegerv) {
         int32_t bound = -1;
         a_glGetIntegerv(target == 0x8C1A /* TEXTURE_2D_ARRAY */ ? 0x8C1D
@@ -1583,7 +1580,7 @@ static void klfb_BindFramebuffer(uint32_t target, uint32_t fb) {
     if (g_real_BindFramebuffer) g_real_BindFramebuffer(target, fb);
     // Did GL take the name? Only asked when ERRSCAN is already draining the
     // error queue every call — otherwise this would eat exactly the errors the
-    // guest's own glGetError is looking for (trap 41).
+    // guest's own glGetError is looking for.
     if (glfb_errscan() && a_glGetError) {
         unsigned i = g_bindlog_slot % KLFB_BINDLOG;
         g_bindlog_err[i] = a_glGetError();
@@ -1665,7 +1662,7 @@ static void klfb_FramebufferTextureLayer(uint32_t target, uint32_t attachment,
     //
     // Its own FBO, never the probe's: klfb_read_from_texture_layer's is
     // re-pointed on every probe, and a diagnostic that silently moved the
-    // guest's blit source would be trap 41's shape with the sign flipped.
+    // guest's blit source is an instrument corrupting what it measures.
     // KL_GLFB_READ_ATTACH_FIX=0 restores the failing configuration exactly.
     static int read_fix = -1;
     if (read_fix < 0) read_fix = kl_env_on("KL_GLFB_READ_ATTACH_FIX", 1);
@@ -1838,11 +1835,10 @@ void kl_glfb_report_formats(void) {
 // appends are serialised with the compile lock because the eye-texture setup
 // arrives on a different thread than some of the guest's own storage calls.
 // 4096 rather than 512 because VRChat allocates over 1400 textures and the
-// eye render targets are among the LAST — a table that fills up drops exactly
-// the entries the readback path is about, and every consumer then reads
-// "never heard of it", which klfb_probe_fbo used to turn into a silent 0 lit.
-// It still has a ceiling, so it says by name when it reaches one: a full table
-// is a diagnostic going quiet, and going quiet is what made this expensive.
+// eye render targets are among the LAST — a table that fills drops exactly the
+// entries the readback path is about, and every consumer then reads "never
+// heard of it". It still has a ceiling, so it names its first drop:
+// a full table is a diagnostic going quiet.
 #define KLFB_MAX_TEX 4096
 static struct { uint32_t name, fmt; int32_t w, h; } g_tex[KLFB_MAX_TEX];
 static unsigned g_ntex;
@@ -1909,9 +1905,9 @@ void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex) {
     // tell them apart. See kl_present.h.
     kl_present_note_eye_texture();
     if ((unsigned)stage >= KLFB_MAX_STAGES) return;
-    // GL recycles names, and Unity re-creates the whole eye swapchain on
-    // resize. A name that used to mean some other (eye, stage) must stop
-    // answering for it the moment it is re-registered: klfb_stage_of_tex
+    // GL recycles names, and Unity re-creates the whole eye swapchain
+    // on resize. A name that meant some other (eye, stage) must stop answering
+    // for it the moment it is re-registered: klfb_stage_of_tex
     // returns the FIRST match, so one stale entry files a frame's pose against
     // a different stage's picture for the rest of the run — permanently, and
     // silently, because every count still looks healthy.
@@ -1942,8 +1938,8 @@ void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex) {
 // glFramebufferTexture2D cannot attach a slice of a 2D array at all.
 //
 // So the OpenXR path states the whole thing — name, size, layer — because it
-// is the one place that knows it, and the capture stops searching. Trap 31 is
-// the reason this is not a search: a GL name is a slot, not an identity.
+// is the one place that knows it, and the capture stops searching. It is not a
+// search because a GL name is a slot, not an identity: names are reissued.
 static struct { uint32_t tex; int32_t w, h; int layer; } g_live_eye[2];
 
 void kl_glfb_set_live_eye_image(int eye, uint32_t tex, int32_t w, int32_t h, int layer) {
@@ -2101,8 +2097,7 @@ static void klfb_note_render_stage(int stage) {
 }
 
 // ---------------------------------------------------------------------------
-// The Metal interop (P5). PLANNING §12.9 for why it is eglCreateImageKHR and
-// not a pbuffer, and for the host/device measurements that came before this.
+// The Metal interop: eglCreateImageKHR rather than a pbuffer.
 //
 // The extension is unconditional on ANGLE's Metal backend (DisplayMtl.mm sets
 // both mtlTextureClientBuffer and EGLImageOES), so there is no capability path
@@ -2149,8 +2144,8 @@ static kl_glfb_mtl_provider g_mtl_provider;
 static void *g_mtl_provider_ctx;
 // One record per (eye, stage). Stage count is ovrp_GetEyeTextureStageCount's
 // answer, which is 1 today — raising it for GPU pipelining is what makes
-// §12.1(3)'s "key the pose to the stage" warning bite, so the array is indexed
-// by stage from the start rather than retrofitted later.
+// the pose-keyed-to-stage requirement bite, so the array is indexed by stage
+// from the start rather than retrofitted later.
 #define KL_MTL_MAX_STAGES 4
 // w/h are carried so a rate map can be matched against the texture it would be
 // attached to. A map is built for one screen size; attaching it to a texture of
@@ -2259,8 +2254,8 @@ static int g_eye_mirroring;
 
 void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate_map) {
     if (!kl_glfb_init() || !mtl_resolve()) return;
-    // **Not available on the copy path, and the reason is that there is nothing
-    // there to save.** Foveation is a bargain with the GUEST's rasterizer: it
+    // Not available on the copy path: there is nothing there to save.
+    // Foveation is a bargain with the GUEST's rasterizer: it
     // writes fewer fragments, and the compositor's grid unwarps what it wrote.
     // On the array-mirror path the guest rasterizes into a swapchain of its own
     // that carries no map (klxr_CreateSwapchain gives it plain glTexStorage3D
@@ -2268,10 +2263,10 @@ void kl_glfb_set_eye_rate_map(int w, int h, int zones_x, int zones_y, void *rate
     // full-resolution picture would be squeezed on the way in and stretched back
     // out on the way to the display, paying twice for a saving nobody made.
     //
-    // Worse than pointless if the blit turns out not to rasterize at all: the
-    // destination would then hold an unwarped picture that the compositor
-    // unwarps anyway, which is a magnified centre and a correct-looking frame —
-    // the failure this file has no instrument for. Refused rather than left to
+    // And if the blit does not rasterize at all, the destination holds an
+    // unwarped picture the compositor unwarps anyway: a magnified centre in a
+    // correct-looking frame, which is the failure this file has no instrument
+    // for. Refused rather than left to
     // the frontends, because both of them build a map from the display and
     // neither can know which guest is underneath.
     if (g_eye_mirroring && rate_map) {
@@ -2440,10 +2435,10 @@ void kl_glfb_release_eye_texture(int eye, int stage) {
 // once — so the composite receives `V`, an sRGB code value, and treats it as
 // linear. That is the picture reading too bright, and it has no error surface
 // at all: every call after the two INVALID_ENUMs succeeds and the frame is
-// perfectly well-formed. The note that stood here through SL-15..SL-20 — "an
-// encode on write and a decode on sample cancel, so this is precision rather
-// than gamma" — is true about the pair and wrong about the conclusion: what
-// they cancel back to is the guest's sRGB code value, and the composite needs
+// perfectly well-formed. "An encode on write and a decode on sample cancel, so
+// this is precision rather than gamma" is true about the pair and wrong about
+// the conclusion: what they cancel back to is the guest's sRGB code value, and
+// the composite needs
 // linear.
 //
 // So the state is RECORDED rather than forwarded. Swallowing it also removes
@@ -2526,10 +2521,10 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
     // by the time a new texture arrives (24 binds, 18 teardowns — the six
     // without a teardown are the first generation, which has no predecessor).
     // It exists because the guest never calls glDeleteTextures on these names
-    // itself: if a teardown ever goes missing, destroying only the EGLImage —
-    // which is all this used to do — leaves ANGLE's texture holding the
-    // MTLTexture, and the provider's release then reclaims nothing. It says so
-    // when it fires, because a silent backstop is how a leak comes back.
+    // itself: if a teardown ever goes missing, destroying only the EGLImage
+    // leaves ANGLE's texture holding the MTLTexture and the provider's release
+    // reclaims nothing. It says so when it fires — a silent backstop is how a
+    // leak comes back.
     //
     // The same name re-bound to new storage is not a replacement, so it falls
     // through to the image destroy alone.
@@ -2559,7 +2554,7 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
     // guest renders into this texture, not after: ANGLE caches a framebuffer's
     // render pass descriptor and only rebuilds it on a GL state sync, so a map
     // bound afterwards misses the first pass with nothing reporting it
-    // (notes/VISIONOS.md).
+    //.
     //
     // The size test is the invariant, held HERE rather than trusted to the
     // frontend. Both of ours re-drive kl_glfb_set_eye_rate_map from the provider
@@ -2798,7 +2793,7 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
 }
 
 // ---------------------------------------------------------------------------
-// The decoded-video image (SL-13). An AHardwareBuffer — which is one of our
+// The decoded-video image. An AHardwareBuffer — which is one of our
 // CVPixelBuffers, see kl_mediandk.h — sampled as a GL texture.
 //
 // The guest's sequence is Android's, and every step of it is missing here:
@@ -2808,7 +2803,7 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
 //     glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex)
 //     glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, img)
 //
-// ANGLE's Metal backend has no external images at all (SL-10, DisplayMtl.mm:984)
+// ANGLE's Metal backend has no external images at all (DisplayMtl.mm:984)
 // and no notion of an Android buffer, so there is nothing to forward to. What it
 // *does* have is EGL_ANGLE_iosurface_client_buffer, and a VideoToolbox pixel
 // buffer is IOSurface-backed by construction (kl_vtdec.c asks for it) — so the
@@ -2820,7 +2815,7 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
 //
 // The guest cannot tell the difference. Its sampler is already a plain
 // `sampler2D` on GL_TEXTURE_2D by the time this runs (klfb_rewrite_glsl and
-// klfb_detarget did that in SL-10), and BGRA output means the YUV→RGB conversion
+// klfb_detarget did that), and BGRA output means the YUV→RGB conversion
 // an external image would have promised has already happened in the decoder.
 #define EGL_IOSURFACE_ANGLE_        0x3454
 #define EGL_IOSURFACE_PLANE_ANGLE_  0x345A
@@ -2949,8 +2944,8 @@ void *kl_glfb_image_from_pixels(void *pixels, int *out_w, int *out_h) {
     return im;
 }
 
-// The other half of SL-10's detarget, and it is the difference between a picture
-// and a black rectangle.
+// The other half of the detarget, and it is the difference between a picture and
+// a black rectangle.
 //
 // GL_OES_EGL_image_external specifies its OWN sampler defaults, and they are not
 // GL_TEXTURE_2D's: MIN_FILTER defaults to LINEAR (external textures have no
@@ -3424,9 +3419,9 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
             // timeline — "nothing was drawn" and "the copy read the wrong
             // source" — and probing only the blit's own source cannot tell
             // them apart, because the source is whatever the guest bound. The
-            // texture is named rather than guessed for the reason trap 32 and
-            // trap 41 are both about: an instrument that assumes reports a
-            // working pipeline as a broken one. Layer 1 on a non-array texture
+            // texture is named rather than guessed: an instrument that
+            // assumes reports a working pipeline as a broken one. Layer 1 on a
+            // non-array texture
             // reports "incomplete", which is the honest answer.
             static int probe_tex = -1;
             if (probe_tex < 0) probe_tex = kl_env_int("KL_GLFB_PROBE_TEX", 0);
@@ -3514,7 +3509,7 @@ static void klfb_TexSubImage3D(uint32_t target, int32_t level, int32_t xoff,
 // _platform_memmove under TextureMtl::setPerSliceSubImage, from
 // glCompressedTexSubImage2D of 0x9279 at 2048x1024. A memmove overruns, so
 // something disagrees about how many bytes the call describes. Everything about
-// the *format* has already been ruled out (PLANNING §12.9): the emulated-format
+// the *format* has already been ruled out: the emulated-format
 // table entry is gated on macOS/Catalyst rather than the simulator, the
 // simulator block maps ETC2 to native EAC, and a standalone
 // EAC_RGBA8_sRGB + replaceRegion with exactly the guest's 2 MB succeeds.
@@ -3604,8 +3599,8 @@ static void klfb_CompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
     else if (have && fmt != tfmt)      verdict = "  <-- FORMAT != ALLOCATED";
 
     // A verdict always prints, even with no knob set — a wrong upload is worth
-    // a line in any run. The knobs add the clean ones, which is what makes the
-    // host and the Simulator diffable.
+    // a line in any run. The knobs add the clean ones, so the host and the
+    // Simulator are diffable.
     if (klfb_trace_tex() || klfb_probe_ctex() || *verdict)
         fprintf(stderr, "  [glfb] #%u glCompressedTexSubImage2D target=0x%04x "
                         "level=%d %dx%d at %d,%d fmt=0x%04x imageSize=%d "
@@ -3690,7 +3685,7 @@ static void klfb_note_draw(void) {
 }
 
 // ...and the table SAID so, to nobody: it was filled from the first day of the
-// M5 arc and never printed, so "where is the guest actually drawing?" — the
+// GL path and never printed, so "where is the guest actually drawing?" — the
 // question it was built to answer — still needed a bespoke trace every time it
 // came up. Each row's colour attachment is resolved at report time rather than
 // at draw time, because an FBO's attachment is re-pointed per frame and the
@@ -3775,8 +3770,7 @@ static void klfb_errprobe(const char *what, const char *detail);
 // before the capture" — the readback happens inside the same command stream,
 // so there is no timing or thread question left. The read goes through
 // klfb_probe_fbo: the scene target is an RGBA16F 4xMSAA renderbuffer, which a
-// direct RGBA/UNSIGNED_BYTE readback cannot see (that was the first version
-// of this probe, and its err 0x500 lines).
+// direct RGBA/UNSIGNED_BYTE readback cannot see — it answers err 0x500.
 static void klfb_draw_probe(int verts) {
     static int on = -1, said, quota, skip, seen;
     if (on < 0) {
@@ -4353,8 +4347,8 @@ static void *(*a_eglCreateSync)(void *, uint32_t, const intptr_t *);
 static unsigned (*a_eglDestroySync)(void *, void *);
 // Resolved from ANGLE directly rather than reusing g_real_Flush: that one is
 // only filled in once the GUEST has resolved glFlush through the trampoline
-// table, and a fence that is created but never committed is worse than no
-// fence at all — the compositor would wait on a value the GPU never reaches.
+// table, and a fence created but never committed leaves the compositor waiting
+// on a value the GPU never reaches.
 static void (*a_glFlush_fence)(void);
 static void     *g_gpu_fence;        // an id<MTLSharedEvent>, owned by the caller
 static void     *g_gpu_fence_sync;   // last frame's EGLSync, destroyed one frame late
@@ -4446,9 +4440,9 @@ static void (*g_real_GetInternalformativ)(uint32_t, uint32_t, uint32_t, int32_t,
 // description, and a unit > 31 is the guest over-reading it.
 static void (*g_real_ActiveTexture)(uint32_t);
 static void klfb_ActiveTexture(uint32_t unit) {
-    // Drain first: the guest leaves errors unread, and the first version of
-    // this bracket misreported a leftover as glActiveTexture's own. Errors
-    // after this point are provably this call's.
+    // Drain first: the guest leaves errors unread, so an undrained bracket
+    // reports a leftover as glActiveTexture's own. Errors after this point are
+    // provably this call's.
     if (a_glGetError) while (a_glGetError()) {}
     if (g_real_ActiveTexture) g_real_ActiveTexture(unit);
     // Which units does the guest actually select? Unity's "Invalid texture
@@ -4573,9 +4567,9 @@ static int32_t klfb_GetUniformLocation(uint32_t prog, const char *name) {
 }
 
 // What the guest was told about this program, in the order it asked. Appends to
-// `out`. Printing only the matching location was not enough: the answer to "why
-// is the guest writing a float at location 1" turned out to be that it never
-// asked for location 1 at all, and only the whole list says so.
+// `out`. The WHOLE list, not just the matching location: "why is the guest
+// writing a float at location 1" is answered by the guest never having asked
+// for location 1, and only the whole list says so.
 static void klfb_locs_say(uint32_t prog, char *out, size_t n) {
     size_t at = strlen(out);
     pthread_mutex_lock(&g_compile_lock);
@@ -4837,7 +4831,7 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
 // and anything else is dynamic *state* (READ_BUFFER, bindings, viewport) that
 // only ANGLE tracks. Answering those with the tables' 0 was not neutral: a 0
 // for GL_READ_BUFFER became GL_INVALID_ENUM one glReadBuffer later, and the
-// eye blit died GL_INVALID_FRAMEBUFFER_OPERATION every frame (M6).
+// eye blit died GL_INVALID_FRAMEBUFFER_OPERATION every frame.
 // The query family is the hybrid, but the split is not "table vs rest":
 // ANGLE's context here is ES 3.0 while we describe 3.2 to the guest, so a
 // capability pname the table does not list (the SSBO family, 0x90d6..) must
@@ -4846,7 +4840,7 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
 // dynamic *state* — Unity's save/restore set around its blits — belongs to
 // ANGLE, which alone tracks it. The proof was 0x0C02 (READ_BUFFER): our 0
 // became GL_INVALID_ENUM one glReadBuffer later, and the eye blit died
-// GL_INVALID_FRAMEBUFFER_OPERATION every frame (M6).
+// GL_INVALID_FRAMEBUFFER_OPERATION every frame.
 static int glfb_state_pname(uint32_t p) {
     switch (p) {
     case 0x0C01: case 0x0C02:   // DRAW_BUFFER, READ_BUFFER
@@ -5006,17 +5000,17 @@ static void klfb_selftest(void) {
 //
 // KL_GLFB_TRACE=1 routes every entry point the guest resolves through a per-name
 // forwarding stub, so the log names the exact GL call rather than the family a
-// census can reach. This is the instrument the AGX abort needs: the texture trace
-// could only say the crash arrived somewhere after an R8 upload, and "somewhere
-// after" spans every call the engine makes next.
+// census can reach. The texture trace can only say a crash arrived somewhere
+// after an R8 upload, and "somewhere after" spans every call the engine makes
+// next.
 //
 // It is expensive by construction — a log line per GL call — so it is off unless
 // asked for. KL_GLFB_TRACE_FROM=<n> starts printing only after the nth call, which
 // is how a crash tens of thousands of calls in stays readable.
 typedef struct { const char *name; void *real; } klfb_trace_desc;
 
-extern void kl_gl_trace_tramp(void);       // runtime/kl_gl_trace.S
-extern void kl_gl_lock_tramp(void);        // runtime/kl_gl_lock.S
+extern void kl_gl_trace_tramp(void);       // runtime/gfx/kl_gl_trace.S
+extern void kl_gl_lock_tramp(void);        // runtime/gfx/kl_gl_lock.S
 
 // KL_GLFB_LOCK=1 wraps every resolved GL entry point in a process-wide lock,
 // held ACROSS the call (kl_gl_lock.S). It tests whether the transient
@@ -5088,8 +5082,8 @@ static int glfb_errscan(void) {
 // wrong is the whole question.
 //
 // Everything here is a QUERY — no state is set — and the error queue is drained
-// afterwards so this cannot become the thing the next scan reports (trap 41's
-// rule: an instrument that perturbs what it measures is worse than none).
+// afterwards so this cannot become the thing the next scan reports — an
+// instrument must not perturb what it measures.
 static const char *glfb_fb_status_name(uint32_t s) {
     switch (s) {
     case 0x8CD5: return "COMPLETE";
@@ -5360,11 +5354,10 @@ static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
         snprintf(note, note_n, "no GL entry points");
         return 0;
     }
-    // Finish first, for every caller. The draw probe used to do this and the
-    // blit probe did not, and the two then disagreed about the same texture in
-    // the same run — which is a difference between the INSTRUMENTS being read
-    // as a difference in the pipeline. A debug readback can afford the stall;
-    // being unable to trust it costs whole sessions.
+    // Finish first, for EVERY caller. One probe that finishes and one that does
+    // not disagree about the same texture in the same run, and a difference
+    // between the instruments then reads as a difference in the pipeline. A
+    // debug readback can afford the stall.
     if (a_glFinish) a_glFinish();
     r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, fb);
     if (r_CheckFramebufferStatus(0x8CA8) != 0x8CD5) {
@@ -5468,10 +5461,9 @@ static unsigned long klfb_probe_fbo(uint32_t fb, float *fbuf, uint8_t *bbuf,
             r_BindFramebuffer(0x8CA9, stage_fb);
             // Sentinel first: a pixel the resolve blit did not write keeps the
             // sentinel colour, so a silently-failing resolve reads as sentinel
-            // rather than as whatever the staging texture held before. The
-            // first version of this probe had no sentinel and produced
-            // back-to-back contradictory readings of the same renderbuffer —
-            // check the instrument before trusting it.
+            // rather than as whatever the staging texture held before.
+            // Without it the same renderbuffer reads back differently on
+            // consecutive probes.
             static void (*r_ClearColor)(float, float, float, float);
             static void (*r_Clear)(uint32_t);
             if (!r_ClearColor) {
@@ -6131,9 +6123,9 @@ static unsigned glfb_capture_now(const char *dir) {
                     int32_t dw = 0, dh = 0;
                     // No hint here on purpose: this is a SWEEP over every FBO,
                     // and a size borrowed from elsewhere would read past a
-                    // small attachment into undefined pixels — a census that
-                    // invents lit counts is worse than one that says it could
-                    // not look. The targeted probes (blit, draw, clear) each
+                    // small attachment into undefined pixels. A census must
+                    // say it could not look rather than invent a lit count
+                    //. The targeted probes (blit, draw, clear) each
                     // know a real size and pass it.
                     unsigned long flit = klfb_probe_fbo(i, fbuf, bbuf,
                                                         note, sizeof note,

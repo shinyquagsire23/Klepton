@@ -74,7 +74,7 @@ KL_VTHUNK klv_ioctl,              klh_ioctl,             2
 //
 // Beat Saber never reached these — Unity is C++, so jni.h's inline wrappers
 // va_start and call the ...V forms, which already receive an AAPCS64 descriptor
-// by reference. Steam Link is C. (PLANNING §11.5, §11.6.)
+// by reference. Steam Link is C.
 //
 // Named GP args are 3 throughout: (env, obj|cls, methodID). The handlers in
 // kl_jni.c forward straight to the matching ...V implementation, so the return

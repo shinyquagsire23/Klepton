@@ -32,7 +32,7 @@ MODE="${1:-sim}"
 # The trap that stops this being a plain `KL_SKIP_STAGE=1` default is that a
 # target which has NEVER been staged then launches with no assets, and Unity
 # does not report that as missing assets — it reports it three layers up as
-# "Not enough storage space to install required resources" (trap 6c). That is
+# "Not enough storage space to install required resources". That is
 # an expensive sentence to debug when the real answer is "nothing was uploaded".
 #
 # So a stamp records that this target has been staged with this APK. No stamp
@@ -42,9 +42,9 @@ MODE="${1:-sim}"
 # us — KL_STAGE=1 is the answer to that, and the symptom is the same sentence.
 STAMP_DIR="build/staged"
 # ...and the stamp is keyed on the LAYOUT as well as the APK, because what gets
-# staged is not fixed. SL-18 added the Qt plugin .so files, and a stamp that
-# knew only about the APK would have skipped staging them on every machine that
-# had ever staged this target — a shell that aborts with `Could not find the Qt
+# staged is not fixed. The Qt plugin .so files are staged too, and a stamp that
+# knew only about the APK would skip them on every machine that had ever staged
+# this target — a shell that aborts with `Could not find the Qt
 # platform plugin "virtual"` and a run.sh that says the assets are already
 # there. Bump this whenever stage_assets.sh stages something new.
 STAGE_SCHEMA=3
@@ -88,12 +88,12 @@ stage_if_needed() {
 #
 # KL_IMMERSIVE was missing from this list until 2026-08-07, which made the
 # documented `KL_IMMERSIVE=1 ./run.sh` a no-op: the shell had it, the app never
-# did, and the run took P4's window-and-report path while looking like the
+# did, and the run took the window-and-report path while looking like the
 # compositor had failed to come up.
 # Everything KL_* in this shell is forwarded, minus the few that belong to this
 # script rather than to the app. A hand-maintained allow-list was the previous
 # shape and it silently dropped KL_IMMERSIVE for a whole session: the shell had
-# it, the app never did, and the run took P4's window path while looking like the
+# it, the app never did, and the run took the window path while looking like the
 # compositor had failed to come up. A knob that is set and not delivered is worse
 # than one that does not exist, so the default is now "forward it".
 FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
@@ -173,9 +173,9 @@ print(phys[0]["identifier"])
   stage_if_needed "$DEVID" "$DEVID"
 
   echo "[5/5] launching (report also renders on-screen)…"
-  # KL_FRAMES carries the app past P4's initJni gate into the Android lifecycle
-  # (P5.4) — which is where libil2cpp and its 3,083 veneers first load under
-  # AMFI. Unset, the run stops at initJni, which is P4's measurement and has to
+  # KL_FRAMES carries the app past the initJni gate into the Android lifecycle
+  # — which is where libil2cpp and its 3,083 veneers first load under
+  # AMFI. Unset, the run stops at initJni, which is the gate's measurement and has to
   # stay takeable.
   ENVJSON='{"KL_AUTOBOOT":"1"'
   for K in $FORWARD; do
@@ -283,7 +283,7 @@ print(phys[0]["identifier"])
     fi
     echo "    log: $LOCAL"
   elif [ -z "$OPEN_ENDED" ]; then
-    # P4's shape: --console blocks until the app terminates, which for a UI app
+    # Boot-only shape: --console blocks until the app terminates, which for a UI app
     # means until it is quit by hand. Fine for a run that finishes in seconds.
     xcrun devicectl device process launch --device "$DEVID" --console \
       --terminate-existing --environment-variables "$ENVJSON" "$BUNDLE_ID"

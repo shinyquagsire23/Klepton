@@ -1,4 +1,4 @@
-// S0.5 — x18 veneering.
+// x18 veneering.
 //
 // Android leaves x18 a general-purpose temporary and the Quest toolchain
 // allocates into it; Darwin reserves it and the kernel zeroes it on any
@@ -75,9 +75,9 @@ typedef struct {
 // the same machinery: the site is rewritten in place to a branch into a stub
 // that answers, because one instruction cannot materialise a 64-bit constant.
 //
-// TPIDR_EL0 is not here — it is a one-bit rewrite (trap 1) and needs no stub.
+// TPIDR_EL0 is not here — it is a one-bit rewrite and needs no stub.
 #define KLX_SYS_NONE    0
-#define KLX_SYS_CTR_EL0 1   // trap 26: SIGILL from EL0 on Darwin
+#define KLX_SYS_CTR_EL0 1   // SIGILL from EL0 on Darwin
 
 // Decode one instruction word. Returns out->ok. Sites where x18 does not appear
 // come back ok with nfields == 0.
@@ -94,7 +94,8 @@ uint32_t klx_substitute(uint32_t insn, const klx_info *info, unsigned reg);
 // It is baked into every veneer as the immediate of `ldr b, [a, #SLOT*8]`, so it
 // MUST be a build-time constant: klepton-ld emits veneers offline, where no
 // pthread key exists yet, and a runtime-chosen slot cannot be patched in later
-// without writing to a dyld-mapped __TEXT — the exact thing M1b exists to stop.
+// without writing to a dyld-mapped __TEXT, which the translated path exists to
+// avoid.
 //
 // The constant is nevertheless a REAL pthread key, claimed at runtime, not a
 // squatted reserved slot. kl_x18_init() calls pthread_key_create in a loop until
@@ -102,54 +103,37 @@ uint32_t klx_substitute(uint32_t insn, const klx_info *info, unsigned reg);
 // the way. Darwin allocates external keys upward from 258 and never returns one
 // that is currently held, so the walk terminates here and the key is genuinely
 // ours; if something else already holds it, we fail loudly instead of sharing.
+// Surveying the TSD array for a free slot cannot replace this: a slot used
+// transiently reads as zero whenever it is sampled, so an empty reading proves
+// the slot was unused at an instant, never that it is unowned.
 //
-// SQUATTING A RESERVED SLOT WAS TRIED FIRST AND IS WRONG. Slot 200 looked ideal:
-// Darwin's assigned blocks are the pthread/libc internals at 0-9 and per-
-// framework blocks running to roughly 130, the dynamic range starts at 258, and
-// surveying the live TSD array with ANGLE, Metal and QuartzCore loaded showed
-// only 0,1,2,3,4,7,20,25,40,43,55,114 occupied. It still corrupted the process:
-// a 30-frame lifecycle run died in `malloc: pointer being freed was not
-// allocated: 0x3` — 0x3 being a guest x18 value that some libSystem consumer of
-// that slot then read back as its own pointer.
+// The slot is high because claiming is a RACE an app bundle loses. Darwin issues
+// external keys upward from 258 and the TSD array holds 512, so the highest
+// slots are the last to be taken: 500 survives a process that created ~240 keys
+// before us, where 300 survives about forty. On the visionOS 27 simulator the
+// Steam Link app's first pthread_key_create is handed 330 — SwiftUI and UIKit
+// burn past 300 during dyld's initialization of THEIR images, before a
+// constructor in ours can run, which is why klx_claim_slot_early() exists and is
+// still not early enough for 300.
 //
-// The survey was the bug. It proved the slot was empty at three *instants*, not
-// that it was unowned; a slot used transiently reads as zero whenever you are
-// not looking. There is no sampling schedule that establishes ownership, which
-// is why this is now a claimed key rather than a measured-free one.
-//
-// WHY 500 AND NOT 300. Claiming is a RACE, and in an app bundle we do not get to
-// run first. On the visionOS 27 simulator the Steam Link app's first
-// pthread_key_create is handed **330**: SwiftUI, UIKit and their dependencies
-// burn past 300 during dyld's initialization of THEIR images, which is before a
-// constructor in ours can run — measured, not assumed, and it is why
-// klx_claim_slot_early() exists and is still not early enough for 300. The guest
-// then refuses to load with "TSD slot 300 is unavailable", which reads as a
-// platform limit and is a starting-gun problem.
-//
-// Darwin issues external keys UPWARD from 258 and the TSD array holds 512, so
-// the HIGHEST slots are the last to be taken and the most robust choice
-// available: 500 survives a process that has created ~240 keys before us, where
-// 300 survives about forty. It is not a measured-free slot either — the same
-// walk claims it, kl_x18_init still proves tsd[500] agrees with
-// pthread_setspecific before emitting anything, and a translation built against
-// a different slot is refused BY NAME at load (kl_image.c) rather than running
-// against the wrong one.
+// kl_x18_init still proves tsd[SLOT] agrees with pthread_setspecific before
+// emitting anything, and a translation built against a different slot is refused
+// BY NAME at load (kl_image.c) rather than running against the wrong one.
 //
 // Changing it means re-translating: `make dylibs` and visionos/mkguest.sh both
 // bake it in, and visionos/run.sh rebuilds klepton-ld for exactly this reason.
 #define KLX_TSD_SLOT 500
 
-// ---------------------------------------------------- trap 26: CTR_EL0
+// ---------------------------------------------------- CTR_EL0
 //
 // What a veneered `mrs Xt, CTR_EL0` answers. Baked into the veneer as a
 // movz/movk pair, so — like KLX_TSD_SLOT — it must be a constant at translation
 // time; KL_CTR_EL0=<hex> overrides it for an A/B, at the cost of re-translating.
 //
-// **This is Apple silicon's own CTR_EL0, not a convenient invention.** The
-// register cannot be read from EL0 on any Darwin kernel (measured: `mrs x0,
-// ctr_el0` SIGILLs on macOS 26 as well as on visionOS — trap 26's claim that
-// macOS permits it is wrong, and the simulator does not catch the crash only
-// because Qt's `__clear_cache` is never reached there), so the value is
+// This is Apple silicon's own CTR_EL0, not a convenient invention. The register
+// cannot be read from EL0 on ANY Darwin kernel — measured: `mrs x0, ctr_el0`
+// SIGILLs on macOS 26 as well as on visionOS, and the simulator stays silent
+// only because Qt's `__clear_cache` is never reached there — so the value is
 // transcribed rather than sampled:
 //
 //     IminLine 4, DminLine 4   64-byte lines, the minimum across all levels
@@ -193,10 +177,10 @@ typedef struct {
     unsigned far_refused;
     uint64_t pool_va, pool_bytes;
     unsigned data_words; // words that decode as an x18 site but sit in data
-                         // (trap 0b's second detector — NOT refusals: these
+                         // (found by the data detector — NOT refusals: these
                          // were never instructions, and patching them is the
                          // corruption the detector exists to prevent)
-    // trap 26, counted APART from the x18 numbers on purpose: those are exact
+    // CTR_EL0, counted APART from the x18 numbers on purpose: those are exact
     // and `make check` gates on them, so a second population sharing the same
     // counters would move a number that is supposed to be stable.
     unsigned ctr_sites, ctr_patched, ctr_refused;
@@ -241,12 +225,12 @@ int  kl_x18_emit(void *code, size_t size, uint64_t code_va,
 int  kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
                   size_t *arena_used, kl_x18_stats *st);
 
-// Trap 0d's second detector, exposed so tests/t_x18.c reports the same verdict
+// The data-inside-code detector, exposed so tests/t_x18.c reports the verdict
 // the loader acts on. `index` is a WORD index into `code`; the window is
 // clamped to the buffer, so pass the same chunk the scanner is walking.
 int kl_x18_is_data(const void *code, size_t size, size_t index);
 
-// Count sites that will need a VENEER — x18 sites plus trap 26's CTR_EL0 reads
+// Count sites that will need a VENEER — x18 sites plus the CTR_EL0 reads
 // — without emitting anything. klepton-ld sizes its pool with it, so it has to
 // be the total rather than the x18 half; the stats keep the two apart.
 unsigned kl_x18_count(const void *code, size_t size);
@@ -256,18 +240,18 @@ unsigned kl_x18_count(const void *code, size_t size);
 // load time — the veneers are already in its text — so without this the loader
 // would report "x18 sites: 0", which reads as "this library never needed any"
 // rather than "this was handled at translation time". Silent zeros are worse
-// than errors (CLAUDE.md trap 6d).
+// than errors.
 // The magic carries a VERSION, and the loader refuses a record it does not
 // recognise BY NAME rather than ignoring it. A record that merely got longer
 // would fail the `statsz >= sizeof` test and be skipped silently — which also
 // skips the TSD-slot check that is the whole reason it is read.
-#define KLX_STAT_MAGIC 0x39315838u   /* "8X19" — was "8X18" before trap 26 */
+#define KLX_STAT_MAGIC 0x39315838u   /* "8X19" */
 typedef struct {
     uint32_t magic;
     uint32_t sites, patched, refused;
     uint32_t tls_rewrites;
     uint32_t slot;          // KLX_TSD_SLOT the veneers were built against
-    uint32_t ctr_sites, ctr_patched;   // trap 26
+    uint32_t ctr_sites, ctr_patched;   // the CTR_EL0 population
     uint32_t ctr_value;     // ...and what they were built to answer
 } klx_stat_section;
 
@@ -277,8 +261,8 @@ void kl_x18_report(FILE *f);
 
 // ---------------------------------------------------- data inside code
 //
-// "Executable sections, not the executable segment" (trap 0) is one level too
-// shallow: a `.text` SECTION can itself contain data. Steam Link's libmain.so
+// "Executable sections, not the executable segment" is one level too shallow:
+// a `.text` SECTION can itself contain data. Steam Link's libmain.so
 // carries BoringSSL's `ecp_nistz256_precomputed` — 148 KB of elliptic-curve
 // constants — as an STT_OBJECT at 0xb23000, inside .text, and 1059 of that
 // library's 1080 apparent x18 sites are words of that table. Veneering them

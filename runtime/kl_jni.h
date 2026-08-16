@@ -1,4 +1,4 @@
-// Synthetic JavaVM / JNIEnv (M3 bootstrap, M4 surface measurement).
+// Synthetic JavaVM / JNIEnv: guest bootstrap, and the JNI surface measurement.
 //
 // There is no JVM here and there will never be one. Beat Saber is a
 // com.unity3d.player.UnityPlayerActivity app, not a NativeActivity: libmain.so
@@ -9,7 +9,7 @@
 // populated, and every slot we have not implemented is a *named* abort rather
 // than a NULL. That is the point: it turns "the guest wandered off" into
 // "the guest called GetMethodID(android/os/Build, getFingerprint)". The JNI
-// surface is measured this way, not guessed (PLANNING §6 M4).
+// surface is measured this way, not guessed.
 #ifndef KL_JNI_H
 #define KL_JNI_H
 #include <stdint.h>
@@ -65,7 +65,7 @@ void *kl_jni_new_object(const char *class_name);
 // VRChat dies in GetObjectClass(NULL) resolving `HFPStatus.clearHFPStat`.
 //
 // Both drivers must call this, which is why it lives here rather than in either
-// one (see runtime/kl_slink.c for the same argument). Idempotent.
+// one (see runtime/guest/kl_slink.c for the same argument). Idempotent.
 void kl_jni_unity_construct_helpers(void);
 
 // The interned jclass for a name — the host side of FindClass. A native method
@@ -87,7 +87,7 @@ void *kl_jni_new_string(const char *utf8);
 void *kl_jni_new_string_array(const char *const *items, int n);
 
 // The 2D->VR handoff: SteamLink.startVRLink(String) reached, with the session
-// the host just authorized (PLANNING §11.9).
+// the host just authorized.
 //
 // A callback rather than something this file does itself, because honouring the
 // handoff means starting a different FRONT DOOR — a different guest library,
@@ -193,7 +193,7 @@ void kl_jni_set_native_lib_dir(const char *dir);
 void kl_jni_add_manifest_env(const char *key, const char *value);
 
 // Everything the guest asked us for: classes found, natives registered, and
-// every method/field id it wanted. This is the M4 work list.
+// every method/field id it wanted. This is the work list.
 void kl_jni_report(FILE *out);
 
 // Runnables queued by Activity.runOnUiThread that nothing has run yet. Non-zero

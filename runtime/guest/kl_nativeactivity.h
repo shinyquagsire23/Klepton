@@ -33,7 +33,7 @@
 // `clazz` is the NDK's own misnomer — it is the activity INSTANCE object, not a
 // jclass, and the guest calls getIntent()/getPackageName() on it. Ours is the
 // jobject kl_jni hands out for the activity, so those land on g_bindings and
-// fail by name like every other M4 gap.
+// fail by name like every other gap in the surface.
 typedef struct kl_ANativeActivity kl_ANativeActivity;
 typedef struct {
     void (*onStart)(kl_ANativeActivity *);

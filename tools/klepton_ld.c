@@ -1,8 +1,8 @@
-// klepton-ld — M1b: translate an Android ARM64 ELF .so into a Mach-O dylib.
+// klepton-ld: translate an Android ARM64 ELF .so into a Mach-O dylib.
 //
 // This is the offline half of the loader. Today `kl_image.c` mmaps the guest
 // ELF and makes its text RWX; on visionOS that is exactly the shape AMFI and
-// library validation exist to refuse (PLANNING §12.1, M1b). So the guest text
+// library validation exist to refuse. So the guest text
 // has to arrive as a *signed Mach-O*, mapped by dyld, and this tool is what
 // produces it.
 //
@@ -33,7 +33,7 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include "../runtime/kl_x18.h"
-#include "../runtime/kl_guestpatch.h"
+#include "../runtime/guest/kl_guestpatch.h"
 
 // ---------- ELF64 subset (macOS has no <elf.h>) ----------
 typedef struct { uint8_t e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version;
@@ -84,7 +84,7 @@ static uint32_t *gp_at(void *ctx, uint64_t va) {
     return NULL;
 }
 
-// ---------- S0.1: the TLS rewrite, moved offline ----------
+// ---------- the TLS rewrite, moved offline ----------
 // Darwin keeps the thread pointer in TPIDRRO_EL0; TPIDR_EL0 is clobbered by the
 // kernel on preemption, so a guest read of it is a wrong answer on every
 // thread. The two encodings differ by exactly one bit. Instruction count is
@@ -95,7 +95,8 @@ static uint32_t *gp_at(void *ctx, uint64_t va) {
 // this one rewrote libunity.so+0x3f2118 and the loader refused it, so the same
 // guest crashed as an ELF on the host and ran as a dylib on device, which reads
 // like a platform difference and is not one. A refusal is named, because a TLS
-// site left alone is trap 1 in whatever runs the output (see kl_image.c).
+// site left alone reads a register the kernel clobbers, in whatever runs the
+// output (see kl_image.c).
 static unsigned rewrite_tls(uint8_t *p, size_t n, uint64_t va, unsigned *refused) {
     unsigned hits = 0;
     uint32_t *w = (uint32_t *)p;
@@ -105,8 +106,8 @@ static unsigned rewrite_tls(uint8_t *p, size_t n, uint64_t va, unsigned *refused
         if (kl_x18_is_data(w, n, i)) {
             (*refused)++;
             fprintf(stderr, "klepton-ld: TLS site at +0x%llx left alone — its "
-                            "neighbourhood reads as data (trap 0d). If it IS code, "
-                            "that thread pointer is garbage (trap 1)\n",
+                            "neighbourhood reads as data. If it IS code, "
+                            "that thread pointer is garbage\n",
                     (unsigned long long)(va + i * 4));
             continue;
         }
@@ -116,7 +117,7 @@ static unsigned rewrite_tls(uint8_t *p, size_t n, uint64_t va, unsigned *refused
     return hits;
 }
 
-// x18 sites are found with the real S0.5 decoder, never a bit-field guess.
+// x18 sites are found with the real decoder, never a bit-field guess.
 // Which fields of an encoding are general-purpose registers — as opposed to
 // immediates, condition codes or vector registers — is exactly what klx_decode
 // exists to decide, and guessing gets it wrong in the unsafe direction: a naive
@@ -208,7 +209,7 @@ int main(int argc, char **argv) {
     // Executable *sections*, not the executable segment: the r-x LOAD starts at
     // file offset 0 and also spans .rodata, .rela.dyn and .eh_frame, and
     // rewriting a word that merely looks like an instruction in there would
-    // corrupt data (CLAUDE.md trap 0). Work on a private copy of the file.
+    // corrupt data. Work on a private copy of the file.
     uint8_t *img = malloc((size_t)sb.st_size);
     if (!img) die("out of memory");
     memcpy(img, f, (size_t)sb.st_size);
@@ -217,7 +218,7 @@ int main(int argc, char **argv) {
     const Elf64_Shdr *sh = (eh->e_shoff && eh->e_shnum)
                          ? (const Elf64_Shdr *)(f + eh->e_shoff) : NULL;
     if (!sh) die("%s has no section headers — cannot separate code from rodata "
-                 "(see CLAUDE.md trap 0); refusing to rewrite", in);
+                 "; refusing to rewrite", in);
 
     // ...and code inside those sections, not whole sections: a `.text` can hold
     // constant tables (Steam Link's libmain.so has 148 KB of BoringSSL's P-256
@@ -362,8 +363,8 @@ int main(int argc, char **argv) {
     // 8038 were refused, silently as far as any gate here was concerned, and RE4
     // ran on the HOST (where kl_image.c places its pool next to the code) and
     // could not boot on a headset, where a klepton-ld dylib is the only path.
-    // Trap 0 with the veneers switched off is not a crash at a named place: it
-    // is a guest reading Darwin's reserved x18.
+    // Refused veneers are not a crash at a named place: they are a guest
+    // reading Darwin's reserved x18.
     //
     // The reach is measured against the executable sections' span rather than
     // against the sites, because it has to hold for a site anywhere in them.
@@ -420,20 +421,21 @@ int main(int argc, char **argv) {
     }
     if (x18st.refused) {
         // Same posture as the runtime loader: a refused site keeps its raw x18
-        // and stays exposed to trap 0, so it is reported rather than hidden. The
-        // two known ones are libunity's `br x18` jump tables (PLANNING S0.5).
-        fprintf(stderr, "klepton-ld: %s: %u of %u x18 sites refused — still "
-                        "exposed to trap 0:\n", in, x18st.refused, x18st.sites);
+        // reads Darwin's, so it is reported rather than hidden. The
+        // two known ones are libunity's `br x18` jump tables.
+        fprintf(stderr, "klepton-ld: %s: %u of %u x18 sites refused — these "
+                        "read Darwin's reserved x18:\n", in, x18st.refused, x18st.sites);
         kl_x18_report(stderr);
     }
-    // Trap 26 is louder than trap 0 because the failure is immediate: a
+    // The CTR_EL0 half is louder than the x18 half because the failure is
+    // immediate: a
     // `mrs Xt, CTR_EL0` left alone is SIGILL the first time it executes, not a
     // wrong value some time later. Announced even when it worked, because one
     // instruction in one library is exactly the kind of thing that goes missing
     // when the guest is re-translated by a different build.
     if (x18st.ctr_sites)
         fprintf(stderr, "klepton-ld: %s: %u CTR_EL0 read(s), %u veneered to "
-                        "answer %#llx%s (trap 26)\n", in, x18st.ctr_sites,
+                        "answer %#llx%s\n", in, x18st.ctr_sites,
                 x18st.ctr_patched, (unsigned long long)kl_x18_ctr_value(),
                 x18st.ctr_refused ? " — SOME REFUSED, they will SIGILL" : "");
 
@@ -647,7 +649,7 @@ int main(int argc, char **argv) {
         memcpy(lc + sizeof(struct dylib_command), libsystem, strlen(libsystem) + 1);
         lc += sz_ld;
     }
-    // LC_BUILD_VERSION — the one field that differs across §4's three rungs.
+    // LC_BUILD_VERSION — the one field that differs across the three platforms.
     {
         struct build_version_command *b = (struct build_version_command *)lc;
         b->cmd = LC_BUILD_VERSION; b->cmdsize = sz_bv;

@@ -1,17 +1,17 @@
-// S1.1 — the P5 interop primitive: does ANGLE render into an MTLTexture *we* own?
+// The compositor interop primitive: does ANGLE render into an MTLTexture we own?
 //
-// This is the one mechanism the whole visionOS renderer rests on (PLANNING
-// §12.1(2)). Compositor Services hands out drawables as MTLTextures; Unity
+// The one mechanism the whole visionOS renderer rests on. Compositor Services
+// hands out drawables as MTLTextures; Unity
 // renders into GL textures our ovrp_SetupEyeTexture2 gives storage to. If ANGLE
 // can be told "this GL texture's storage IS that MTLTexture", the two halves
-// meet with no copy and P5 is bookkeeping. If it cannot, P5 needs a blit pass
+// meet with no copy and the compositor is bookkeeping. If it cannot, it needs a blit pass
 // and a second full-eye allocation, which is a different (and worse) design.
 //
-// Answered on the host first, deliberately — this is rung 1 of §4's ladder and
-// the same code then goes to the device probe as P5.2, where the open question
-// is AMFI rather than ANGLE.
+// Answered on the host first, deliberately — rung 1 of the development ladder,
+// and the same code then goes to the device probe, where the open
+// question is AMFI rather than ANGLE.
 //
-// §12.1(2) sketched this as eglCreatePbufferFromClientBuffer. The extension
+// eglCreatePbufferFromClientBuffer is the obvious primitive; the extension
 // spec (vendor/extensions/EGL_ANGLE_metal_texture_client_buffer.txt) is written
 // against eglCreateImageKHR instead, which is the better primitive for us: an
 // EGLImage-backed texture is a normal GL texture and so is FBO-renderable,
@@ -20,7 +20,7 @@
 // exactly that shape, so the shipping change is one call:
 //
 //     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA16F, h, w)     // today
-//     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image)     // P5.3
+//     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image)
 //
 // Four questions, in the order a failure would matter:
 //
@@ -317,7 +317,7 @@ int main(void) {
         fprintf(stderr, "FAIL: dlopen ANGLE: %s\n  (set KL_ANGLE_DIR)\n", dlerror());
         return 1;
     }
-    printf("=== S1.1 — ANGLE renders into an MTLTexture we own (P5 interop) ===\n");
+    printf("=== ANGLE renders into an MTLTexture we own ===\n");
     printf("  ANGLE from %s\n", dir);
     if (!resolve_all()) {
         // A missing entry point here is a real answer, not a setup problem: it
@@ -350,7 +350,7 @@ int main(void) {
     static const char *want[] = {
         "EGL_ANGLE_metal_texture_client_buffer",
         "EGL_KHR_image_base",
-        "EGL_ANGLE_metal_shared_event_sync",   // P5b's GPU-side ordering
+        "EGL_ANGLE_metal_shared_event_sync",   // the GPU-side ordering
     };
     for (size_t i = 0; i < sizeof want / sizeof *want; i++)
         check(exts && strstr(exts, want[i]) != NULL, want[i]);
@@ -589,7 +589,7 @@ int main(void) {
     }
 
     printf("\n=== %s ===\n", g_fail
-        ? "S1.1 FAILED — the interop primitive does not hold; P5 needs a blit design"
-        : "S1.1 PASSED — ANGLE renders into MTLTextures we own, per eye slice");
+        ? "FAILED — the interop primitive does not hold; the compositor needs a blit design"
+        : "PASSED — ANGLE renders into MTLTextures we own, per eye slice");
     return g_fail;
 }

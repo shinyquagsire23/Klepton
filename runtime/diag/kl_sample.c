@@ -1,6 +1,6 @@
 // Guest-thread sampler: where is the guest actually spending its time?
 //
-// Built for the loading-pace investigation (PLANNING.md "Loading-pace arc"):
+// Built for the loading-pace investigation:
 // the game never finishes loading, the CPU is idle, and every wait primitive
 // was exonerated — so the question became which managed code, if any, runs at
 // all. KL_TRACE_IO/FUTEX/SLEEP measure shim calls; this measures the guest

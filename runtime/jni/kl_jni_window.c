@@ -423,8 +423,8 @@ static klj_val klj_PackageManager_hasSystemFeature(void *env, void *self, const 
 // place to be permissive. bindService is asynchronous and `true` is a PROMISE
 // that ServiceConnection.onServiceConnected will be called later; we have no
 // service to call it from, so a fabricated true leaves the guest waiting on a
-// callback that cannot come — trap 6e's shape, a wait that never ends, rather
-// than an error it can handle. False is a state its own code already handles,
+// callback that cannot come — a wait that never ends, rather than an error it
+// can handle. False is a state its own code already handles,
 // and it leaves the connection with nothing queued against it, so the matching
 // unbindService has nothing to undo either.
 static klj_val klj_Context_bindService(void *env, void *self, const klj_val *a, int n) {
@@ -442,7 +442,7 @@ static klj_val klj_Context_bindService(void *env, void *self, const klj_val *a, 
 //
 // Real Android throws IllegalArgumentException for a ServiceConnection that was
 // never bound, and we deliberately do not: this project's exception state is
-// always clear (CLAUDE.md), so throwing would mean building machinery for a
+// always clear, so throwing would mean building machinery for a
 // path whose only purpose is to be caught and ignored. Returning quietly is
 // what the caller's catch block would have produced anyway.
 static klj_val klj_Context_unbindService(void *env, void *self, const klj_val *a, int n) {
@@ -605,7 +605,7 @@ static klj_val klj_Context_checkSelfPermission(void *env, void *self, const klj_
     return (klj_val){.j = granted ? 0 : (uint64_t)(int64_t)-1};
 }
 
-// SteamLink.startVRLink(String) — the 2D->VR handoff of PLANNING §11.9, and by
+// SteamLink.startVRLink(String) — the 2D->VR handoff, and by
 // the time it is called the hard part has already succeeded: the shell paired,
 // the host sent its authorization proof request, and the answer was
 // k_ERemoteDeviceStreamingSuccess. Its body (smali, SteamLink.smali:1676) is an
@@ -639,7 +639,7 @@ static klj_val klj_SL_startVRLink(void *env, void *self, const klj_val *a, int n
     (void)env; (void)self;
     const char *args = n > 0 ? klj_str(a[0].l) : "";
     KLJ_LOG("SteamLink.startVRLink: the shell paired and the host authorized the "
-            "session — this is the 2D -> VR handoff (PLANNING §11.9)");
+            "session — this is the 2D -> VR handoff");
     KLJ_LOG("  sArgs = \"%s\"", args ? args : "");
     if (args) {
         int  field = 0;
@@ -668,7 +668,7 @@ static klj_val klj_SL_startVRLink(void *env, void *self, const klj_val *a, int n
 // There is no user to prompt, so the answer is the one checkSelfPermission just
 // gave — a prompt cannot turn "no such sensor" into yes. What must not happen is
 // silence: the guest asked a question, and a request that never resolves is a
-// wait that never ends (trap 6d's class). The delivery path is not invented
+// wait that never ends. The delivery path is not invented
 // either, it is read off the guest's own SDLActivity bytecode:
 // onRequestPermissionsResult computes `grantResults[0] == PERMISSION_GRANTED`
 // and calls the static native nativePermissionResult(requestCode, granted). We
@@ -726,7 +726,7 @@ const klj_binding klj_bind_window[] = {
      klj_Activity_requestPermissions},
     {"com/valvesoftware/steamlink/SteamLink", "requestPermissions", "([Ljava/lang/String;I)V",
      klj_Activity_requestPermissions},
-    // §11.9's handoff, reached: the shell has paired, the host has answered
+    // The handoff, reached: the shell has paired, the host has answered
     // k_ERemoteDeviceStreamingSuccess, and this is the 2D frontend handing the
     // authorized session to the VR half. See klj_SL_startVRLink — it stops, but
     // it prints the payload first, because that string IS the session.

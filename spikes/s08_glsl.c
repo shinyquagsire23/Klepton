@@ -1,6 +1,7 @@
-// S0.8 — will the guest's own shaders compile on the host's GL?
+// Will the guest's own shaders compile on the host's GL?
 //
-// S0.7 proved there is a real offscreen framebuffer. This asks the question that
+// spikes/s07_glfb.c proved there is a real offscreen framebuffer. This asks the
+// question that
 // decides whether a *forwarding* backend is viable at all: Unity ships GLSL ES 300
 // and macOS offers GL 4.1 core / GLSL 4.10. If the guest's actual shader text
 // compiles after a mechanical rewrite, then the cheapest possible compositor is to
@@ -114,7 +115,7 @@ int main(int argc, char **argv) {
            glGetUniformLocation(prog, "uvOffsetAndScale"));
     printf("  attrib  'vertex'           -> location %d\n", glGetAttribLocation(prog, "vertex"));
 
-    printf("=== S0.8 PASS: the guest's GLSL ES 300 compiles and links as GL 4.10 core\n");
+    printf("=== PASS: the guest's GLSL ES 300 compiles and links as GL 4.10 core\n");
     printf("    (rewrite required: the #version line, and nothing else)\n");
     return 0;
 }

@@ -1,4 +1,4 @@
-// S0.5 — dump what the x18 decoder makes of a guest library's .text.
+// Dump what the x18 decoder makes of a guest library's .text.
 //
 // This is the measurement half of the veneer work. It does not load or run
 // anything: it walks the executable segments of an ELF as a file and reports,
@@ -104,8 +104,9 @@ static void scan(const char *path) {
                 klx_decode(w[k], &info);
                 g_words++;
                 if (info.ok && info.nfields == 0) continue;    // nothing to do here
+                int data = kl_x18_is_data(w, csz, k);
                 if (!info.ok) g_refused++;
-                // Trap 0d: decodes as a site, but its neighbourhood is not code,
+                // Decodes as a site, but its neighbourhood is not code,
                 // so the loader will not veneer it. Counted apart from the real
                 // sites, which is what makes this total comparable with the
                 // loader's — but the ROW IS STILL PRINTED. check_x18.py matches
@@ -113,17 +114,22 @@ static void scan(const char *path) {
                 // code either, so suppressing them reads as a decoder MISS. The
                 // decoder's answer for such a word is still worth checking; what
                 // changed is only whether anything acts on it.
-                else if (kl_x18_is_data(w, csz, k)) g_data++;
+                else if (data) g_data++;
                 else {
                     g_sites++;
                     if (info.roles == KLX_R) g_rd++;
                     else if (info.roles == KLX_W) g_wr++;
                     else g_rw++;
                 }
-                printf("%llx %08x %08x %d %u %u\n",
+                // The seventh column is the trap-0d verdict, and check_x18.py
+                // needs it: objdump decodes a data word as whatever encoding
+                // its bytes spell, so a disagreement about a word the loader
+                // will never patch is not a decoder bug. Printed for every row
+                // rather than filtered here, so the tool reports the counts.
+                printf("%llx %08x %08x %d %u %u %d\n",
                        (unsigned long long)va, w[k],
                        info.ok ? klx_substitute(w[k], &info, TEST_REG) : w[k],
-                       info.ok, info.nfields, info.roles);
+                       info.ok, info.nfields, info.roles, data);
             }
         }
     }
@@ -135,7 +141,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) scan(argv[i]);
     fprintf(stderr,
             "[t_x18] %lu words scanned, %lu x18 sites (%lu read-only, %lu write-only, "
-            "%lu read-write), %lu encodings refused, %lu data words (trap 0d)\n",
+            "%lu read-write), %lu encodings refused, %lu data words\n",
             g_words, g_sites, g_rd, g_wr, g_rw, g_refused, g_data);
     return 0;
 }

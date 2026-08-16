@@ -1,4 +1,4 @@
-// S1.2 — does ANGLE rasterize through an MTLRasterizationRateMap we own?
+// Does ANGLE rasterize through an MTLRasterizationRateMap we own?
 //
 // The gate for foveated guest rendering. Upstream ANGLE has no notion of a rate
 // map at all (`grep rasterizationRate` in the Metal backend returns nothing), so
@@ -398,7 +398,7 @@ int main(void) {
         fprintf(stderr, "FAIL: dlopen ANGLE: %s\n  (set KL_ANGLE_DIR)\n", dlerror());
         return 1;
     }
-    printf("=== S1.2 — ANGLE rasterizes through an MTLRasterizationRateMap ===\n");
+    printf("=== ANGLE rasterizes through an MTLRasterizationRateMap ===\n");
     printf("  ANGLE from %s\n", dir);
     if (!resolve_all()) {
         fprintf(stderr, "FAIL: this ANGLE is missing an interop entry point\n");

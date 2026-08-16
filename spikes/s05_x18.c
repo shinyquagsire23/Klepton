@@ -1,4 +1,4 @@
-// S0.5 — is x18 usable by guest code on Darwin arm64?
+// Is x18 usable by guest code on Darwin arm64?
 //
 // AAPCS64 calls x18 "the platform register" and leaves its meaning to the OS.
 // Android leaves it as a general-purpose temporary unless the build opts into

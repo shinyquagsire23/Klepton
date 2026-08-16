@@ -71,7 +71,7 @@ struct ContentView: View {
         }
 
         // ---- P9: does loading graphics/AR frameworks claim Darwin TSD slot 5? ----
-        out += "\n[P9] TSD slot 5 after graphics frameworks load (S0.1 residual)\n"
+        out += "\n[P9] TSD slot 5 after graphics frameworks load\n"
         out += "    slot 5 after Metal: \(hex(klepton_tsd_slot(5)))"
         out += klepton_tsd_slot(5) == 0 ? "  [still FREE]\n" : "  [CLAIMED - problem]\n"
         for fw in ["/System/Library/Frameworks/ARKit.framework/ARKit",
@@ -95,7 +95,7 @@ struct ContentView: View {
         out += "    started \(made) threads with 512KB stacks: OK\n"
 
         // ---- P13: vtool'd ANGLE under AMFI, and the Metal interop primitive ----
-        // The last unverified tail of PLANNING §12.1(1), plus the mechanism the
+        // The last unverified tail of the ANGLE retarget, plus the mechanism the
         // whole P5 renderer rests on. Swift allocates the texture because that is
         // where it will come from for real (Compositor Services), and each side
         // verifies through its own API: C reports what GL wrote, Swift reports

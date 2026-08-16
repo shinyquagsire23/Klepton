@@ -15,6 +15,17 @@ against an independent disassembler in both directions:
                 Not dangerous — the loader will refuse to patch it and say so —
                 but it is work remaining, so they are listed by encoding.
 
+DATA WORDS ARE NOT GRADED, and that is the seventh column t_x18 prints. An
+executable section can hold constant tables (libcrypto.so keeps 148 KB
+of them in .text, libmain.so on the Steam Link side likewise), objdump decodes
+those bytes as whatever encoding they spell, and the loader patches none of
+them. Grading them makes the gate measure the disassembler against a random
+number generator: 327 "false alarms" on undecodable words and 68 "refusals" of
+SVE/SME/MTE encodings no AArch64 BoringSSL build emits, all inside one 148 KB
+block, none of them reachable. What IS graded is every word the loader would
+act on. The excluded counts are printed per library rather than dropped: they
+are how a data detector that starts swallowing real code shows up.
+
 Substitution is checked by assembling the original and rewritten words into two
 objects at identical offsets, so pc-relative operands render identically and any
 difference is the register itself.
@@ -70,22 +81,37 @@ def check(t_x18, lib):
     if proc.returncode != 0:
         sys.exit(f"{t_x18} failed:\n{proc.stderr}")
     for line in proc.stdout.splitlines():
-        va, word, subst, ok, nfields, roles = line.split()
+        va, word, subst, ok, nfields, roles, data = line.split()
         decoded[int(va, 16)] = (int(word, 16), int(subst, 16),
-                                int(ok), int(nfields), int(roles))
+                                int(ok), int(nfields), int(data))
 
     real = disassemble(lib)
     misses, false_alarms, refused = [], [], []
     sites = []
+    skipped = Counter()
 
     for addr, text in real.items():
         entry = decoded.get(addr)
         objdump_x18 = bool(X18.search(text))
         if entry is None:
+            # Not printed by t_x18 at all: either the decoder had nothing to say
+            # (ok, no fields) or the word is inside a range the loader skips
+            # wholesale. Only an x18 operand makes that interesting.
             if objdump_x18:
                 misses.append((addr, text, None))
             continue
-        word, subst, ok, nfields, _roles = entry
+        word, subst, ok, nfields, data = entry
+        if data:
+            # A word the loader will not patch. Count the disagreement, do not
+            # grade it — see the module docstring.
+            if not ok and objdump_x18:
+                skipped["refusal"] += 1
+            elif nfields and not objdump_x18:
+                skipped["false alarm"] += 1
+            elif objdump_x18 and not nfields:
+                skipped["miss"] += 1
+            skipped["total"] += 1
+            continue
         if not ok:
             if objdump_x18:
                 refused.append((addr, word, text))
@@ -114,6 +140,11 @@ def check(t_x18, lib):
 
     name = Path(lib).name
     print(f"=== {name}: {len(real)} instructions, {len(sites)} x18 sites ===")
+    if skipped["total"]:
+        detail = ", ".join(f"{skipped[k]} {k}" for k in ("miss", "false alarm", "refusal")
+                           if skipped[k]) or "no disagreement with objdump"
+        print(f"  {skipped['total']} data word(s) inside executable "
+              f"sections not graded — {detail}")
     ok = True
 
     def report(label, rows, fmt, limit=12):

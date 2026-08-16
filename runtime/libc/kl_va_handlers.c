@@ -76,9 +76,9 @@ int klh_open(const char *path, int flags, kl_va *va) {
     kl_fs_trace_open(path, flags, fd);
     return fd;
 }
-// Both of these used to forward cmd/req and the trailing argument RAW, which is
-// trap 4 in the two calls where it is least visible: the numbers are close
-// enough that a wrong one succeeds meaning something else. F_SETFL takes the
+// cmd/req and the trailing argument are TRANSLATED, never forwarded raw: the
+// two numberings are close enough that a wrong one succeeds meaning something
+// else. F_SETFL takes the
 // same flag word open() takes — Linux O_NONBLOCK is Darwin O_EXCL — so the
 // translation lives next to kl_open_flags in kl_libc.c rather than here.
 int kl_fcntl(int fd, int cmd, uintptr_t arg);         // kl_libc.c

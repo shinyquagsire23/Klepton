@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and run the Steam Link target on macOS — the SL-1 loop (PLANNING §11.6).
+# Build and run the Steam Link target on macOS.
 #
 # The counterpart to build_run_vpro.sh: that one wraps a device launch, this one
 # wraps `make slink`. Both exist for the same reason — a run should end with an
@@ -7,10 +7,10 @@
 # questions this target's bring-up loop asks of every run:
 #
 #   1. did the seven-library chain bind, and what is still unresolved
-#   2. did SL-1 still pass (JNI_OnLoad, 68 natives, SDL_main)
+#   2. did the chain gate still pass (JNI_OnLoad, 68 natives, SDL_main)
 #   3. where did it stop, BY NAME
 #
-# (3) is the whole M4 method applied to the second target: everything
+# (3) is the whole abort-by-name method applied to the second target: everything
 # unimplemented fails by name, so the stop is the work item. This script's job
 # is to pull that one line out of a few hundred.
 #
@@ -26,7 +26,7 @@
 #   ./build_run_slink.sh --gl         # ANGLE instead of the null GL driver. Steam
 #                                     #   Link is GLES2-only, so this is the real
 #                                     #   path once anything draws
-#   ./build_run_slink.sh --main       # SL-2: drive onCreate through nativeRunMain
+#   ./build_run_slink.sh --main       # drive onCreate through nativeRunMain
 #                                     #   into SDL_main, so the app actually starts.
 #                                     #   Implies --gl (the null driver stops at
 #                                     #   glCheckFramebufferStatus by design)
@@ -70,7 +70,7 @@ while [ $# -gt 0 ]; do
     --permissive)  export KL_PERMISSIVE=1; shift ;;
     --gl)          export KL_GLFB=1; shift ;;
     # --main and --view both imply the real GL path: the null driver stops at
-    # glCheckFramebufferStatus, so SL-2 cannot be reached on it at all.
+    # glCheckFramebufferStatus, so SDL_main cannot be reached on it at all.
     --main)        export KL_SLINK_MAIN=1; export KL_GLFB=1; export KL_NOFORK=1; shift ;;
     # The other front door: the 2D configuration frontend (libshell + Qt6)
     # instead of the streaming client. VR APK only, so it selects that LIBDIR
@@ -134,14 +134,14 @@ summarise() {
   # Skipped under --gap: the run stops before any of it happens, and an empty
   # heading reads as a failure rather than as a question not asked.
   if g -q 'phase 2' "$LOG"; then
-    echo "  -- SL-1 --"
+    echo "  -- the chain --"
     g -E 'JNI_OnLoad returned|static Java_\* natives|SDL_main=|EXIT CRITERION|nativeSetupJNI returned' \
       "$LOG" | sed 's/^ *//; s/^/    /' || true
     g -E '^  (natives registered|ids requested|classes found):' "$LOG" \
       | sed 's/^ *//; s/^/    /' || true
   fi
 
-  # ---- SL-2: did the app actually start, and did it draw? ----
+  # ---- did the app actually start, and did it draw? ----
   #
   # Two numbers decide whether a window is black for an interesting reason.
   # SWAPS is the honest one: no eglSwapBuffers means the guest never presented a
@@ -150,7 +150,7 @@ summarise() {
   # normal no-host outcome, not a crash. Printing them together is what stops a
   # black window being mistaken for a rendering bug.
   if g -q 'phase 4' "$LOG"; then
-    echo "  -- SL-2: the app --"
+    echo "  -- the app --"
     g -E 'Audio initialized|Video initialized|Desktop mode|Created .* renderer|Initialized player|present\]|guest is (MONO|STEREO)' \
       "$LOG" | sed 's/^\[[0-9]*\/SDL\/APP\] //; s/^ *//; s/^/    /' | awk '!seen[$0]++' || true
     local swaps
@@ -197,7 +197,7 @@ summarise() {
     if [ -n "${KL_GAP_ONLY:-}" ]; then
       echo "    (--gap: stopped before DT_INIT_ARRAY on purpose — nothing was run)"
     elif [ "${rc:-0}" -eq 0 ]; then
-      echo "    clean: SL-1 passed with no unimplemented call reached"
+      echo "    clean: the chain bound with no unimplemented call reached"
     else
       echo "    (no named stop — the guest died somewhere with no instrument;" \
            "try --nofork under lldb)"
@@ -212,7 +212,7 @@ if [ -n "$LOG_ONLY" ]; then summarise; exit 0; fi
 # Gate on the BUILD's exit status, not on the binary existing. A failed
 # incremental build leaves the last good ./build/m_slink in place, so running
 # anyway would test the previous code and report it as the new code's result —
-# the same trap visionos/run.sh had (CLAUDE.md, "Verify the artifact").
+# the same trap visionos/run.sh had.
 echo "building  : build/m_slink"
 BUILDLOG="${LOG%.log}-build.log"
 make build/m_slink > "$BUILDLOG" 2>&1
@@ -229,14 +229,13 @@ echo "knobs     : ${KNOBS:-(none — the default run)}"
 echo "log       : $LOG"
 
 # `script -q /dev/null` gives the child a pty, and the redirect sends it to a
-# FILE. Both matter and both cost time to rediscover (CLAUDE.md, "Operating the
-# M4 loop"): with stdout a plain file stdio goes fully buffered, and a child
+# FILE. Both matter and both cost time to rediscover: with stdout a plain file stdio goes fully buffered, and a child
 # that dies on a signal rather than through kl_fatal_prepare() loses the entire
 # buffer — you get a dozen lines and no report, which reads as a much earlier
 # failure than actually happened. A pipe straight to head/sed is the other half
 # of the same trap: the child forks, and the report arrives out of order.
 if [ -n "$VIEW" ]; then
-  # No timeout: the run ends when the window is closed. The window IS the
+# No timeout: the run ends when the window is closed. The window IS the
   # output here, so the log is for afterwards rather than for watching.
   echo "            (window open — close it to end the run)"
   script -q /dev/null ./build/m_slink "$LIBDIR" 2>&1 | tee "$LOG"

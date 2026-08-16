@@ -186,9 +186,8 @@ int kl_ue4_load(FILE *out) {
         // that keeps paying off here — a UE4 guest owns its own frame loop, so
         // "what is the game thread doing" is a question no return value answers
         // — and it reports every guest frame as `??? (in <unknown binary>)`
-        // until something joins the two. m_slink has printed this since SL-1;
-        // this door never did, which made the sampler useless on the one target
-        // that needs it most.
+        // until something joins the two. m_slink prints it; without it here the
+        // sampler is useless on the one target that needs it most.
         if (out) {
             fprintf(out, "  mapped %-22s @%p %7.2f MB\n", UE4_CHAIN[i],
                     kl_base(img), kl_span(img) / 1048576.0);
@@ -358,8 +357,8 @@ static void kl_ue4_java_create(FILE *out) {
     // are `getFilesDir()` and `getExternalFilesDir(null)`, two directories the
     // app owns; here there is one, and handing over two names for it is what
     // makes `bUseExternalFilesDir` a choice with no consequence rather than a
-    // fork into a tree that does not exist (trap 45's shape — a resource with
-    // two doors has to resolve to one place by construction).
+    // fork into a tree that does not exist: a resource with two doors has to
+    // resolve to one place by construction.
     const char *files = kl_jni_files_dir();
     void *jinternal = kl_jni_new_string(files);
     void *jexternal = kl_jni_new_string(files);
@@ -463,8 +462,8 @@ double kl_ue4_pump(double seconds, const volatile int *quit) {
         kl_ndk_pump_looper(100);
         // The UI thread's task queue and the frame clock, on the same thread
         // that turns the looper — which is what makes it the UI thread by the
-        // only definition that matters (trap 35: "am I the UI thread" is
-        // answered by WHO DRAINS THE QUEUE).
+        // only definition that matters: "am I the UI thread" is answered by
+        // WHO DRAINS THE QUEUE.
         if ((t + 1) % 10 == 0) kl_jni_drain_ui_tasks();
         kl_jni_tick_choreographer();
         struct timespec now;

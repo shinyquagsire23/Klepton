@@ -1,4 +1,4 @@
-// The viewer's hardware compositor — the macOS half of P5b.
+// The viewer's hardware compositor — the macOS twin of KleptonCompositor.swift.
 //
 // kl_view.c's original frame path was the CPU one: kl_glfb read the eye back
 // with glReadPixels, tone-mapped it, handed the buffer to a sink, which memcpy'd
@@ -9,7 +9,7 @@
 //
 // This is the same seam done in hardware, and deliberately the same shape as
 // KleptonCompositor.swift: the guest's eye textures are MTLTextures we allocated
-// (the P5 interop, `make mtltex`), and a Metal pass samples one into the
+// (the interop `make mtltex` gates), and a Metal pass samples one into the
 // window's CAMetalLayer drawable with the GL->Metal vertical flip. Zero copies,
 // zero readback. Ordering across ANGLE's command queue and ours comes from an
 // MTLSharedEvent (see kl_glfb_set_gpu_fence).

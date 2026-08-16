@@ -1,9 +1,9 @@
-// S0.9 — ANGLE on macOS, and how it compares to the desktop-GL reference path.
+// ANGLE on macOS, and how it compares to the desktop-GL reference path.
 //
-// S0.7/S0.8 built a reference renderer on Apple's desktop GL 4.1. It works, but it
-// is the wrong shape twice over: visionOS has no GL at all, and the driver rejects
-// ETC2 (S0.8's follow-up found GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC raising
-// GL_INVALID_ENUM), which is a format *mandatory* in the GLES 3.0 the guest speaks.
+// spikes/s07_glfb.c and s08_glsl.c built a reference renderer on Apple's desktop
+// GL 4.1. It works, but it is the wrong shape twice over: visionOS has no GL at
+// all, and the driver rejects ETC2 (GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC raises
+// GL_INVALID_ENUM), a format MANDATORY in the GLES 3.0 the guest speaks.
 //
 // ANGLE is the other candidate and is a much better fit on paper:
 //
@@ -32,7 +32,7 @@
 #include <unistd.h>
 
 // The vendored build (vendor/out/Debug, see Makefile `angle-debug`), always —
-// same policy and same reason as runtime/kl_glfb.c: our ANGLE is patched, so
+// same policy and same reason as runtime/gfx/kl_glfb.c: our ANGLE is patched, so
 // quietly substituting another one on the machine would make this spike report
 // on something other than what the runtime actually loads. KL_ANGLE_DIR
 // overrides deliberately.
@@ -239,7 +239,7 @@ int main(int argc, char **argv) {
         if (!linked) ok = 0;
     }
 
-    printf(ok ? "=== S0.9 PASS: ANGLE gives a real GLES 3 driver that takes the guest's\n"
+    printf(ok ? "=== PASS: ANGLE gives a real GLES 3 driver that takes the guest's\n"
                 "    shaders as-is and accepts ETC2 — the two things desktop GL could not\n"
               : "FAIL: ANGLE did not clear the bar\n");
     return ok ? 0 : 1;

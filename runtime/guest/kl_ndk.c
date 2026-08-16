@@ -3,7 +3,7 @@
 // Three independent pieces:
 //   ALooper       — real implementation over poll() and a self-pipe. Unity waits
 //                   on this, so a stub that returns immediately would spin.
-//   ANativeWindow — a synthetic window carrying geometry. No pixels until M5.
+//   ANativeWindow — a synthetic window carrying geometry. No pixels until EGL binds one.
 //   ASensor       — an empty sensor list, which is a legitimate Android device
 //                   configuration and the honest answer here (see below).
 #include <errno.h>
@@ -99,7 +99,7 @@ static int kl_looper_poll(int timeoutMillis, int *outFd, int *outEvents, void **
 // Looper.loop() whenever it is not inside a callback — that loop is what makes
 // a posted message run. A host that prepares a looper and then sleeps has built
 // the queue and left nothing draining it, which is the Choreographer lesson from
-// M4 in a different subsystem: the guest is not stuck, it is waiting for a pump
+// The same rule in a different subsystem: the guest is not stuck, it is waiting for a pump
 // we declined to run.
 int kl_ndk_pump_looper(int timeout_ms) {
     return kl_looper_poll(timeout_ms, NULL, NULL, NULL);
@@ -207,7 +207,7 @@ static int64_t kl_now_ms(void) {
 // The timeout is a deadline, not a per-iteration budget: re-polling with the
 // full timeout after each callback would let this overshoot without bound.
 // Nothing triggers a callback today (the sensor queue never produces events),
-// but frame pacing is this project's hardest open risk (§6 M6) and a looper
+// but frame pacing is this project's hardest open risk and a looper
 // that sleeps longer than asked is exactly the kind of thing that shows up
 // later as judder and is miserable to trace back.
 static int kl_ALooper_pollAll(int timeoutMillis, int *outFd, int *outEvents, void **outData) {
@@ -240,9 +240,9 @@ typedef struct kl_native_window {
 } kl_native_window;
 
 // Quest 2 per-eye geometry, which is what this title was built against. Only a
-// placeholder: in VR the eye buffers come from the XR runtime (M6), and this
+// placeholder: in VR the eye buffers come from the XR runtime, and this
 // surface exists mainly to give Unity a non-zero Screen size at startup. The
-// host overrides it via kl_ndk_set_window once a real drawable exists (M5).
+// host overrides it via kl_ndk_set_window once a real drawable exists.
 static kl_native_window g_window = {1, 1832, 1920, 1 /* RGBA_8888 */, NULL};
 
 void kl_ndk_set_window(int32_t w, int32_t h, int32_t format) {
@@ -309,7 +309,7 @@ static int32_t kl_ANativeWindow_setBuffersGeometry(kl_native_window *w,
 // The software path: SDL3's renderer is GLES2, but the lock/unlockAndPost pair
 // is what a canvas renderer would paint through, and libmain imports both.
 // The bits buffer is real memory so the guest can draw without faulting;
-// nothing displays it — display goes through EGL (M5).
+// nothing displays it — display goes through EGL.
 typedef struct { int32_t width, height, stride, format; void *bits; uint32_t rsvd[6]; }
     kl_window_buffer;
 static void *g_lock_bits;
@@ -403,8 +403,8 @@ static const void *kl_AAsset_getBuffer(kl_asset *a) {
 // is compressed, so this never takes that arm.
 //
 // Both out-parameters are WRITTEN on success and left alone on failure, which is
-// trap 10b's rule: a caller that reads an out-parameter we never wrote is
-// reading its own uninitialised stack.
+// the rule everywhere here: a caller that reads an out-parameter we never wrote
+// is reading its own uninitialised stack.
 static int kl_AAsset_openFileDescriptor(kl_asset *a, int64_t *out_start, int64_t *out_len) {
     if (!a || !a->path[0]) return -1;
     int fd = open(a->path, O_RDONLY | O_CLOEXEC);
@@ -475,7 +475,7 @@ static void kl_AAssetDir_close(kl_assetdir *ad) {
 // The sensor list is empty, and that is the correct answer rather than a
 // shortcut. Vision Pro exposes no Android-shaped accelerometer/gyro to the
 // guest, and this title does not want one: head and controller poses arrive
-// through ovrp_* (M6), not through Input.acceleration. An empty list is a
+// through ovrp_*, not through Input.acceleration. An empty list is a
 // configuration real Android devices ship, so Unity already handles it —
 // whereas a fabricated sensor would feed the engine invented motion data.
 //
@@ -624,7 +624,7 @@ static void kl_AConfiguration_getCountry(void *c, char *out) {
 // ========================================================== ANativeActivity
 // The two calls the guest makes back INTO the activity. Both are requests to
 // the framework, not queries, so there is nothing to answer — but neither is a
-// no-op in meaning, and a silent one would be trap 6d.
+// no-op in meaning, and a silent one invents an answer.
 static void kl_ANativeActivity_finish(void *act) {
     (void)act;
     fprintf(stderr, "  [ndk] ANativeActivity_finish() — the guest is asking to "

@@ -8,7 +8,7 @@
 #
 # Through `script` and not a bare pipe: with stdout a pipe, stdio buffers in
 # full blocks, and a death by SIGNAL loses the buffer — which is exactly the
-# report you wanted (CLAUDE.md, "Operating the M4 loop"). A pty forces line
+# report you wanted. A pty forces line
 # buffering. The SDL window and the mouse are unaffected; only stdio moves.
 #
 # Which guest, as the first argument, defaulting to beatsaber —

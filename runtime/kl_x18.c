@@ -1,4 +1,4 @@
-// S0.5 — A64 decoder for x18 substitution. See kl_x18.h for why this exists.
+// A64 decoder for x18 substitution. See kl_x18.h for why this exists.
 //
 // The job is narrow: given one instruction word, say which bit-fields are
 // general-purpose register operands, which of those name x18, and whether each
@@ -108,7 +108,7 @@ static int branch_sys(uint32_t w, klx_info *o) {
     if (((w >> 25) & 0x7f) == 0x2a) return 1;  // b.cond
     if (((w >> 24) & 0xff) == 0xd4) return 1;  // svc / brk / hlt
     if (((w >> 22) & 0x3ff) == 0x354) {        // system: mrs / msr / hints / barriers
-        // Trap 26. `mrs Xt, CTR_EL0` is S3_3_C0_C0_1, i.e. 0xD53B0020 | Rt, and
+        // `mrs Xt, CTR_EL0` is S3_3_C0_C0_1, i.e. 0xD53B0020 | Rt, and
         // reading it from EL0 is an ILLEGAL INSTRUCTION on Darwin — measured on
         // macOS as well as visionOS. It is flagged here rather than refused
         // because the veneer answers it; note the flag is orthogonal to the x18
@@ -170,7 +170,13 @@ static int ldst(uint32_t w, klx_info *o) {
     if ((w & 0x3B000000) == 0x18000000) {
         if (!((w >> 26) & 1)) {
             o->pcrel = KLX_PC_LITERAL;
-            addfld(o, w, KLX_RD, KLX_W);
+            // opc == 11 is PRFM (literal), where bits[4:0] name a prefetch
+            // operation rather than a register — the same field-is-not-Rt case
+            // as PRFM/PRFUM below. prfop 18 is `pstl2keep`, so treating it as a
+            // register is a phantom x18 site in ordinary code: 4 of them in
+            // this corpus's libcrypto.so, each of which the loader would patch
+            // a branch over.
+            if (((w >> 30) & 3) != 3) addfld(o, w, KLX_RD, KLX_W);
         }
         return 1;
     }
@@ -338,8 +344,8 @@ uint32_t klx_substitute(uint32_t w, const klx_info *info, unsigned reg) {
 //
 // Each x18 site is replaced by a single `b` to a veneer, so the instruction
 // count never changes and every pc-relative offset elsewhere in the image stays
-// valid — which is what makes this possible in place, without the offline
-// re-layout that PLANNING S0.5 assumed any fix would need.
+// valid. That is what makes the pass possible IN PLACE, with no offline
+// re-layout of the image.
 //
 // The veneer keeps x18's value in a per-thread TSD slot and never lets it live
 // in the architectural register at all:
@@ -399,7 +405,7 @@ int kl_x18_init(void) {
     __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
     // Darwin's own os/tsd.h masks the low three bits off as a CPU number. They
     // measure as always zero on Apple silicon, and kl_thread_init has relied on
-    // that since S0.1 — but a veneer indexes the TSD array on every guest x18
+    // that — but a veneer indexes the TSD array on every guest x18
     // access, and a misaligned base there is a silently wrong read rather than
     // a fault. Cheap to check once, so check rather than assume.
     if (tp & 7) return -1;
@@ -454,7 +460,7 @@ int kl_x18_init(void) {
     return 0;
 }
 
-// ---------- trap 0b, second detector: is this word's NEIGHBOURHOOD code? ----
+// ---------- second detector: is this word's NEIGHBOURHOOD code? ------------
 //
 // kl_x18_data_ranges finds data inside executable sections from sized
 // STT_OBJECT symbols, and symbol coverage is the ceiling on what that can see.
@@ -479,17 +485,18 @@ int kl_x18_init(void) {
 // positives it is 3 to 12. The threshold is 2 rather than 1 purely for margin
 // against a literal pool landing inside the window; nothing observed needs it.
 //
-// A missed real site is the other half of trap 0 and must not be silent, so
-// every refusal is counted and `make check`'s veneer totals are the gate: they
+// A missed real site leaves the guest reading Darwin's reserved x18 and must
+// not be silent, so every refusal is counted and `make check`'s totals gate it:
+// they
 // are exact numbers, and this rule must not move them.
 //
 // A WORD OF ZERO IS NOT EVIDENCE. It is what a linker leaves in the GAP between
 // functions, and a gap is adjacent to code by definition — so counting it makes
-// the window vote on the wrong side of a boundary it cannot see. It cost the
-// arc that found it: libunity.so+0x3f2118 is a `-fstack-protector` prologue
-// three words past thirteen zero words of padding, the window refused it, and a
-// REFUSED TLS SITE IS TRAP 1 BACK (see rewrite_tls in kl_image.c). It presented
-// as a SIGSEGV in the guest 40 minutes of bisect away, on the lifecycle path
+// the window vote on the wrong side of a boundary it cannot see.
+// libunity.so+0x3f2118 is a `-fstack-protector` prologue three words past
+// thirteen zero words of padding: counting zeros refuses it, and a REFUSED TLS
+// SITE puts back the register the rewrite exists to fix (see rewrite_tls in
+// kl_image.c). It presents as a SIGSEGV in the guest on the lifecycle path
 // only, with `make check` green throughout.
 //
 // The margin for dropping it is measured, not assumed: across every trap-0d
@@ -529,7 +536,7 @@ int kl_x18_is_data(const void *code, size_t size, size_t index) {
 // correctly, there is nothing to veneer — and counting there alone silently
 // undercounted, which is the one thing this number must not do.
 //
-// `ctr` is trap 26's population and is counted APART: the x18 totals are exact
+// `ctr` is the CTR_EL0 population and is counted APART: the x18 totals are exact
 // numbers `make check` gates on, and a second population sharing them would
 // move a number that is meant to be stable. The data-word test applies to both,
 // for the same reason — 0xd53b0029 is a perfectly ordinary word to find in a
@@ -665,7 +672,7 @@ static int veneer_enabled(void) {
     return cached;
 }
 
-// Trap 26's own knob, deliberately independent of KL_X18: the two rewrites fix
+// CTR_EL0's own knob, deliberately independent of KL_X18: the two rewrites fix
 // different registers and an A/B on one must not silently move the other.
 // KL_CTR=0 leaves `mrs Xt, CTR_EL0` alone, which is a SIGILL wherever it runs.
 static int ctr_enabled(void) {
@@ -675,7 +682,7 @@ static int ctr_enabled(void) {
 }
 
 // ...and what the veneer answers. See KLX_CTR_EL0_VALUE in kl_x18.h for why
-// this value and not the IDC=1/DIC=1 one trap 26 designed.
+// this value and not a fabricated IDC=1/DIC=1 one.
 uint64_t kl_x18_ctr_value(void) {
     static uint64_t cached;
     static int init;
@@ -731,7 +738,7 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
         uint64_t vpc = pool_va + (uint64_t)((uint8_t *)out - (uint8_t *)pool);
         uint32_t word = w[i];
 
-        // Trap 26: `mrs Xt, CTR_EL0`. No spill, no TSD and no scratch — the
+        // `mrs Xt, CTR_EL0`. No spill, no TSD and no scratch — the
         // veneer materialises a constant into the destination the instruction
         // already names and branches back. The only case that needs the x18
         // machinery is `mrs x18, CTR_EL0`, where the destination is the shadow
@@ -768,7 +775,7 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
             continue;
         }
 
-        // `br x18` — trap 0's one terminal case, and the only site shape served
+        // `br x18` — the one terminal case, and the only site shape served
         // without a spill or a scratch register:
         //
         //      mrs  x18, tpidrro_el0
@@ -792,7 +799,7 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
         // branches to 0. That window is one instruction and cannot be made
         // smaller — a64 has no memory-indirect branch, so the target must sit in
         // a register across at least one boundary. It is a real race, not a
-        // theoretical one (trap 0), and it is left standing deliberately: the
+        // theoretical one, and it is left standing deliberately: the
         // alternative is refusing the site, which is not a smaller risk but a
         // CERTAIN branch through a zeroed x18 every time it executes. Beat Saber
         // 1.6.0 reaches one of these during scene load and dies on it every run.
@@ -964,8 +971,8 @@ static uint8_t *klx_place_pool(void *code, size_t size, size_t cap) {
         return (uint8_t *)a;
     }
     // Nothing in range. Fall back to wherever the kernel will have us so the
-    // chunk's ctr veneers (trap 26, which need no reach — they are emitted the
-    // same way but a refusal there is a SIGILL) still get a home, and let the
+    // chunk's ctr veneers (which need no reach — emitted the same way, but a
+    // refusal there is a SIGILL) still get a home, and let the
     // per-site refusal count and kl_image.c's report say what was lost.
     uint8_t *p = mmap(NULL, cap, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -987,7 +994,7 @@ int kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
                        (ctr_enabled() ? st->ctr_sites : 0);
     if (!veneers) return 0;
     // The TSD slot is only needed by the x18 half; a chunk whose only veneer is
-    // trap 26's does not touch it. Checking it anyway would refuse to fix a
+    // a CTR_EL0 one does not touch it. Checking it anyway would refuse to fix a
     // SIGILL because of a register the code in question never names.
     if (want && veneer_enabled() && g_slot < 0 && kl_x18_init() != 0) return -1;
 
@@ -1116,7 +1123,7 @@ int kl_x18_next_code(uint64_t sec_va, size_t sec_size,
 
 void kl_x18_report(FILE *f) {
     if (!g_refused_total) return;
-    fprintf(f, "  [klepton] x18: %u sites refused (still exposed to trap 0):\n",
+    fprintf(f, "  [klepton] x18: %u sites refused (reading Darwin's x18):\n",
             g_refused_total);
     for (unsigned i = 0; i < g_nrefused_kinds; i++)
         fprintf(f, "    %08x  x%u\n", g_refused[i].word, g_refused[i].n);

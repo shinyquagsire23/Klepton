@@ -3,7 +3,7 @@
 Every environment variable the tooling reads — the C/Swift sources, the mains,
 and the wrapper scripts — found by grepping for `getenv`/`kl_env_*`/
 `ProcessInfo` and reading each usage site. Grouped by area. The source is the
-authority; CLAUDE.md keeps no knob table of its own and points here. Unless an entry
+authority; the orientation manual keeps no knob table of its own and points here. Unless an entry
 says otherwise, presence of the variable (any value, even empty-but-set for the
 C `getenv` checks) turns the knob on, the default is off, and the reader is the
 `m_boot` binary via the runtime it links.
@@ -27,9 +27,11 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
 - `KL_FRAMES=N` — after the lifecycle, pump N `nativeRender` calls, ticking
   the Choreographer before each frame and draining the posted-task queue
   between them. One frame is engine setup and draws nothing. Default 0.
-- `KL_ALARM=<s>` — the watchdog around each lifecycle call (default 20s) and
-  around the whole frame pump (default 60s). Widen it when the question is
-  what the guest is waiting on.
+- `KL_ALARM=<s>` — the watchdog around each lifecycle call (default 20s in
+  `m_boot`) and around the whole frame pump (default 60s). The visionOS app
+  (`kl_app.c`) uses one value for every phase and defaults it to 120s, because a
+  device run pays staging and first-frame costs the host does not. Widen it when
+  the question is what the guest is waiting on.
 - `KL_PERMISSIVE=1` — unimplemented JNI/GL/OVRPlugin/OVRPlatform calls return
   0 instead of aborting. Read by `kl_jni.c` (via `kl_jni_set_permissive`),
   `kl_egl.c`, `kl_ovrp.c`, `kl_ovrplat.c`. Scouting only — the guest carries
@@ -39,7 +41,7 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   `make bootdylib*` runs the translated images. Unset, the runtime ELF loader
   maps the `.so` directly.
 
-## GL / null driver (`runtime/kl_egl.c`)
+## GL / null driver (`runtime/gfx/kl_egl.c`)
 
 - `KL_DUMP_SHADERS=<dir>` — after the frame pump, write every captured
   `glShaderSource` text into `<dir>`. Read by m_boot; the dump runs in
@@ -49,7 +51,7 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   (uploads happen all through init). Compressed uploads (ETC2/ASTC) are
   skipped rather than guessed at.
 
-## ANGLE reference renderer (`runtime/kl_glfb.c`)
+## ANGLE reference renderer (`runtime/gfx/kl_glfb.c`)
 
 All of these require `KL_GLFB=1` to mean anything; without it the null driver
 answers GL and kl_glfb never initializes.
@@ -65,7 +67,7 @@ answers GL and kl_glfb never initializes.
   because a guest may branch on a name here — and because an empty list, though
   legal, is what no Android driver actually ships: AVPro Video walks this string
   with `strtok` in a bottom-tested loop and `strlen(NULL)`s the first token
-  (notes/VRCHAT.md).
+
 - `KL_EGL_TRACE=1` — log every EGL entry point the guest actually REACHES, in
   order, with the interesting arguments. A census, not a diagnostic: it says
   nothing about what we answered. It exists because every EGL symbol binds at
@@ -75,7 +77,7 @@ answers GL and kl_glfb never initializes.
   wrongly. That is how BONELAB's renderer was identified: Beat Saber's per-API
   probe runs `eglChooseConfig` -> `eglCreateContext` (GLES 3) ->
   `eglDestroyContext`, and BONELAB's stops after `eglInitialize` because the
-  only API in its list is Vulkan (`notes/BONELAB.md`).
+  only API in its list is Vulkan.
 - `KL_ANGLE_DIR=<dir>` — where to load `libEGL.dylib`/`libGLESv2.dylib` from.
   Default: `vendor/out/Debug` when its libEGL is present, else Google Chrome's
   framework Libraries dir. Also read by spikes s09, s10, s11.
@@ -182,7 +184,7 @@ answers GL and kl_glfb never initializes.
   window, and the eye receives black. The attach STATES its source completely,
   so the same attachment is carried on a framebuffer of ours and bound as READ;
   the guest's next read bind takes it away. `=0` restores the failing
-  configuration. See notes/VRCHAT.md §4.
+  configuration.
 - `KL_GLFB_BLIT_READ_FIX=1` — an earlier EXPERIMENT, off by default, kept
   because it is the measurement that pointed at the read binding at all: it
   substitutes the framebuffer the guest was drawing into immediately before.
@@ -277,7 +279,7 @@ answers GL and kl_glfb never initializes.
 - `KL_GLFB_LOG_UNITS=1` — log texture-unit traffic (the "Invalid texture
   unit!" neighbourhood — see `KL_POKE_CAP` under Viewer).
 
-## Networking (`runtime/kl_shim.c`)
+## Networking (`runtime/libc/kl_shim.c`)
 
 - `KL_NET_BCAST_FANOUT=0` — stop delivering a broadcast as unicast to every host
   on the subnet. Default ON. **This is what makes Steam Link's host discovery
@@ -337,8 +339,7 @@ gamelift region probes failed EINVAL in a retry storm.
   region probe retries 4× per region and gives up) and the run completes.
   The abort this used to cause was *not* a DNS bug — it was the empty
   `dl_iterate_phdr` breaking the guest's unwinder, so the `SocketException`
-  could never reach its handler. See trap 8 (CLAUDE.md's traps index; the
-  full record is in `notes/TRAPS.md`).
+  could never reach its handler. See trap 8.
 - `KL_NO_DL_PHDR=1` — restore the old empty `dl_iterate_phdr`. Any guest
   throw then aborts in `_Unwind_RaiseException` instead of being caught;
   this is the A/B for trap 8.
@@ -366,7 +367,7 @@ the same rule as the DRM guard.
   complete). The A/B for "is the trust store what is blocking this?", and it
   restores the failing configuration exactly.
 
-## Loader diagnostics (`runtime/kl_shim.c`, `runtime/kl_libc.c`)
+## Loader diagnostics (`runtime/libc/kl_shim.c`, `runtime/libc/kl_libc.c`)
 
 Built for the loading-pace investigation; all default off.
 
@@ -390,20 +391,19 @@ Built for the loading-pace investigation; all default off.
   hide a gap: a guest that dlopens an optional plugin already has a path for it
   being absent, and a NULL here is what a device gives it. What it buys is
   **isolation** — `KL_DLOPEN_REFUSE=phonon` takes Steam Audio out of a VRChat
-  run, which is the difference between reaching the frame loop and not (see
-  `notes/VRCHAT.md`). Nothing is refused by default and every refusal is named.
+  run, which is the difference between reaching the frame loop and not.
+  Nothing is refused by default and every refusal is named.
 - `KL_X18_MAP=<file>` — append "veneer_addr site_addr" per patched x18 site,
   so a guest pc captured in a shim maps back to its call site.
 - `KL_TRACE_IMAGES=1` — per-image base/span; needed to turn a guest pc into a
   file offset (`pc - image base`, e.g. the connect-NULL site at
   libunity+0x966964).
 
-## Guest patches (`runtime/kl_guestpatch.c`)
+## Guest patches (`runtime/guest/kl_guestpatch.c`)
 
 Measured one-instruction rewrites of a guest image, applied at load while it is
 still writable. There are two, both VRChat's, and both are named in the log
-every time they fire — see `notes/VRCHAT.md` §Session 8 for how each was found
-and why nothing outside the binary could answer it.
+every time they fire, with the address and the instruction each replaces.
 
 - `KL_GUEST_PATCH=0` — apply none of them. The A/B for every row: with it VRChat
   stops on its "Under Construction" screen exactly as it did before.
@@ -415,14 +415,14 @@ and why nothing outside the binary could answer it.
   it is a newer APK, not a patch. `vrchat-fbo-context-guard` is the A/B for
   Unity's cross-context framebuffer guard: off, VRChat binds `(GLuint)-1` as its
   draw framebuffer and loses whole render passes to
-  `GL_INVALID_FRAMEBUFFER_OPERATION` (322 a run vs 0) — see notes/VRCHAT.md
-  Session 12, including what it does *not* fix.
+  `GL_INVALID_FRAMEBUFFER_OPERATION` (322 a run vs 0), including what it does
+  *not* fix.
 - `KL_TRACE_HRTF=1` — interpose Steam Audio's `iplHRTFCreate` and print the
   `IPLAudioSettings` and `IPLHRTFSettings` the guest passes, plus the result.
   Managed code resolves a P/Invoke by name through `klb_dlsym`, so a wrapper
   handed back there sits on the seam with the real function one call away. This
-  is what showed that `size == 1` is not the frame size we supply
-  (notes/VRCHAT.md Session 12 §5).
+  is what showed that `size == 1` is not the frame size we supply.
+
 - `KL_TRACE_WMEMCHR=1` — print every `wmemchr`, with the haystack on a miss.
   Steam Audio picks its HRIR length by `std::find` over an int array, which
   lowers to `wmemchr`; a miss there has no error surface at all.
@@ -437,10 +437,9 @@ corrupt an APK they were not measured on. **Not yet wired for device**: a
 klepton-ld dylib's text is signed and cannot be written at run time, so a device
 run currently behaves as `KL_GUEST_PATCH=0`.
 
-## Memory: decommit, budget and pressure (`runtime/kl_libc.c`)
+## Memory: decommit, budget and pressure (`runtime/libc/kl_libc.c`)
 
 The guest's own memory management, and the three seams that used to disable it.
-See `notes/MEMORYLEAK.md` for the measurements behind each default.
 
 - `KL_CPUS=<n>` — how many CPUs the guest is told it has. Default is this
   machine's real count, and it is answered through **one** function so the two
@@ -501,7 +500,7 @@ See `notes/MEMORYLEAK.md` for the measurements behind each default.
   one. visionOS ignores it: the app container is the only writable location
   there and `kl_app.c` passes it in explicitly.
 
-- `KL_PLAT_CLOUD_DIR=<dir>` (`runtime/kl_ovrplat.c`) — where
+- `KL_PLAT_CLOUD_DIR=<dir>` (`runtime/xr/kl_ovrplat.c`) — where
   `ovr_CloudStorage2_GetUserDirectoryPath` says the user's cloud-save directory
   is. Default `<files-dir>/cloudstorage`, a sibling of the `files` directory
   that is `Application.persistentDataPath`, and created if it is not there —
@@ -521,7 +520,7 @@ See `notes/MEMORYLEAK.md` for the measurements behind each default.
 - `KL_BUILD_<FIELD>=<value>` — override one `android/os/Build` (or
   `Build$VERSION`) String constant, e.g. `KL_BUILD_MODEL="Pixel 6"`,
   `KL_BUILD_MANUFACTURER=Google`. The default is a Quest 2 and that is a
-  settled decision (CLAUDE.md) — this is the A/B, not a new answer.
+  settled decision — this is the A/B, not a new answer.
 
   The override is applied at the single source both readers go through, so
   `Build.MODEL` over JNI and `ro.product.model` through
@@ -531,7 +530,7 @@ See `notes/MEMORYLEAK.md` for the measurements behind each default.
   It matters more than "Oculus branches": libshell's `BIsVRHeadset()` is
   literally `"<ro.product.manufacturer> <ro.product.model>"` matched against
   `Oculus Quest` / `Pico ` / `HTC VIVE `. (Measured: on `steamlink-vr.apk` it
-  does *not* change the 2D→VR handoff — see notes/STEAMLINK.md SL-7.)
+  does *not* change the 2D→VR handoff, SL-7.)
 
 - `KL_BATTERY_CHARGING=1` / `KL_BATTERY_LEVEL=<0..100>` — what
   `BatteryManager.isCharging()` and `getIntProperty(BATTERY_PROPERTY_CAPACITY)`
@@ -545,14 +544,14 @@ See `notes/MEMORYLEAK.md` for the measurements behind each default.
   device the real values are available and wiring them is the honest fix; a
   fixed answer at least does not fluctuate in the meantime.
 
-## Video decode (`runtime/kl_vtdec.c`, `runtime/kl_mediandk.c`)
+## Video decode (`runtime/media/kl_vtdec.c`, `runtime/media/kl_mediandk.c`)
 
 The decoder is VideoToolbox and it is either there or it is not; what would
 otherwise be a knob is a gate instead (`make hevc`, in `make check`). Worth
 knowing rather than setting: output is **BGRA**, not the decoder's native NV12,
 because the guest samples the frame through a `samplerExternalOES` whose whole
 promise is that the YUV→RGB conversion has already happened. See
-`runtime/kl_vtdec.h`.
+`runtime/media/kl_vtdec.h`.
 
 - `KL_VTDEC_DUMP=<path>` — write the elementary stream exactly as the guest
   queued it, as plain Annex-B that `ffprobe` reads directly, plus a sidecar
@@ -575,12 +574,12 @@ These are fixes, not knobs: bionic clock ids differ from Darwin's, and bionic
 condition variables default to CLOCK_MONOTONIC while Darwin conds speak only
 CLOCK_REALTIME. Forwarding either verbatim poisons guest time:
 
-- `klb_clock_gettime`/`klb_clock_getres` (`runtime/kl_libc.c`) translate clock
+- `klb_clock_gettime`/`klb_clock_getres` (`runtime/libc/kl_libc.c`) translate clock
   ids (1/6→6, 4→4, 7/9→8, 2/3→12, 0/5/8→0). Before this, the guest's
   `clock_gettime(CLOCK_MONOTONIC=1)` failed EINVAL and libunity's time
   functions (libunity+0x883c58, +0x883c8c — no return-value check) computed
   with the unwritten buffer: stack-garbage "now", hours to days off.
-- `klb_pthread_cond_timedwait` (`runtime/kl_pthread.c`) rebases
+- `klb_pthread_cond_timedwait` (`runtime/libc/kl_pthread.c`) rebases
   monotonic-based abstimes (ts->tv_sec < 1e8) onto realtime before forwarding.
   Before this, libil2cpp's ConditionVariableImpl built abstimes from a
   monotonic tick source and Darwin compared them against realtime — class-init
@@ -599,7 +598,7 @@ CLOCK_REALTIME. Forwarding either verbatim poisons guest time:
   `klb_pthread_cond_timedwait` entirely. Diagnostic for the capture deadlock;
   breaks class-init waiters.
 
-## Mutex map (`runtime/kl_pthread.c`) — deadlock instruments
+## Mutex map (`runtime/libc/kl_pthread.c`) — deadlock instruments
 
 Mutexes are keyed by guest *address* (a stale slot index in reused or
 memcpy'd storage used to alias two logical mutexes onto one host object —
@@ -615,7 +614,7 @@ m_boot's fault handler on every fatal path:
   address, slot/map index, tid, return address). How the slot-23 double-init
   was caught.
 
-## Guest-thread sampler (`runtime/kl_sample.c`, `runtime/kl_il2cpp.c`)
+## Guest-thread sampler (`runtime/diag/kl_sample.c`, `runtime/guest/kl_il2cpp.c`)
 
 Built to name the loop the loading-pace arc kept measuring: samples every
 guest thread's pc and x29-chained backtrace with thread_get_state, resolves
@@ -648,14 +647,14 @@ handler).
   method-name resolver and print the resolution of each given libil2cpp
   offset; the standalone probe for the sampler's resolver.
 
-## Managed-side probe (`runtime/kl_mprobe.c`)
+## Managed-side probe (`runtime/diag/kl_mprobe.c`)
 
 Calls Unity's **own C#** from the host, through the IL2CPP embedding API that
 libil2cpp exports (domain → assembly → image → class → `MethodInfo` →
 `il2cpp_runtime_invoke`). Every other instrument measures the native side of the
 boundary; this one measures the far side, which is where a wrongly-encoded
 status answer actually shows up. It is what found the `ovrpResult`-vs-`ovrpBool`
-trap (trap 10 in CLAUDE.md's traps index / `notes/TRAPS.md`) and named
+trap (trap 10) and named
 `MenuControllers` as the disabled object
 behind "no controllers render". Diagnostic only, off unless asked for.
 
@@ -720,7 +719,7 @@ behind "no controllers render". Diagnostic only, off unless asked for.
   default 1), **printing what it found before changing it**. That report is the
   point: it separates "the game turned traces off" from "this build has none".
   BONELAB already answers `Exception: ScriptOnly` and still emits an empty
-  stack, so it is a dead end there and `notes/BONELAB.md` says not to retry it.
+  stack, so it is a dead end there: do not retry it.
   Independent of `KL_PROBE_INPUT`; runs once, at the first tick.
 - `KL_PROBE_TYPES=<a,b,...>` — types to census, as `Namespace.Type` (bare name
   for the global namespace); default is the menu pointer chain
@@ -736,7 +735,7 @@ behind "no controllers render". Diagnostic only, off unless asked for.
 pointer id −1 (the mouse), while this title's `VRInputModule` uses its own id.
 It is a blind detector, not evidence that the ray misses.
 
-## IL2CPP metadata dump (`runtime/kl_metadump.c`)
+## IL2CPP metadata dump (`runtime/diag/kl_metadump.c`)
 
 Writes the guest's **decrypted** `global-metadata.dat` out of its own memory
 after `il2cpp_init`. Built for VRChat, whose file is protected — it begins
@@ -833,7 +832,7 @@ Two supporting hooks exist for it and are NULL unless it installs them:
 any tier — it is how the watch wraps `read` without a permanent wrapper in the
 shim). Both cost one null check on a path that is not hot.
 
-## XR runtime / controllers (`runtime/kl_ovrp.c`)
+## XR runtime / controllers (`runtime/xr/kl_ovrp.c`)
 
 Poses live in the space the guest asked for with `ovrp_SetTrackingOriginType`.
 Beat Saber asks for **FloorLevel**, so y=0 is the floor and a head belongs at
@@ -928,7 +927,7 @@ puts the camera on the ground with its hands underneath it.
   vaddr (`libunity+0x127a6c0`), which is why it is opt-in.
 - `KL_OVRP_IPD=<m>` — force a symmetric head→eye separation, overriding
   whatever the frontend pushed. The guest's IPD arrives *only* through
-  `ovrp_GetNodePoseState` nodes 0/1 (PLANNING §12.17), so this is the A/B for
+  `ovrp_GetNodePoseState` nodes 0/1, so this is the A/B for
   "is the compositor's number wrong" — and on the host, where nothing pushes
   one, the only way to get stereo at all. Refused outside 0..0.2 m.
   **Required for host Steam Link VR runs (SL-12).** Its VR client publishes the
@@ -940,10 +939,10 @@ puts the camera on the ground with its hands underneath it.
   real offsets, so this stays what it has always been there: the A/B for "is the
   compositor's number the wrong one".
 - `KL_OVRP_STAGES=<n>` — eye-swapchain depth (default 3, clamped to
-  1..max). `=1` restores the single-buffered behaviour every pre-§12.19
+  1..max). `=1` restores the earlier single-buffered behaviour, which every
   measurement was taken against, and its tearing; each extra stage costs a
   full-size RGBA16F two-slice eye texture (~160 MB at map resolution). The
-  A/B in both directions (PLANNING §12.19).
+  A/B in both directions.
 - `KL_OVRP_LAYERS=1` — census the whole `ovrp_EndFrame4` submit list: one line
   per distinct `(layer, shape, stage, viewport, pose, flags)`, printed when it
   first appears and when it changes, plus the union's per-shape tail. Every
@@ -951,7 +950,7 @@ puts the camera on the ground with its hands underneath it.
   a guest submitting OVERLAY layers looked from every log here exactly like one
   submitting none — RE4 draws its intro logos as an `ovrpShape_Quad` splash and
   the run said nothing about them. A title that submits one eye layer forever
-  pays one line for the run, so this is cheap to leave on. (notes/RE4.md carries
+  pays one line for the run, so this is cheap to leave on. (RE4 carries
   what it measured and where the quad's world size lives.)
 - `KL_OVRP_LATCH=0` — restore the live per-call pose read instead of latching
   head+hands once per frame at `ovrp_Update2` (the guest's real per-step latch
@@ -975,7 +974,7 @@ puts the camera on the ground with its hands underneath it.
   guest, which was the stopgap for BONELAB's warped right eye. That is now
   understood — it is Oculus symmetric projection, the plugin computes the same
   union itself and submits a per-eye `ViewportRect` saying where each eye's
-  picture landed, and the composite honours those (notes/BONELAB.md). Told the
+  picture landed, and the composite honours those. Told the
   union, the guest stops widening its own eye texture and each eye loses ~21% of
   its horizontal pixels. Renders correctly on device with it **off**
   (2026-08-13, user-confirmed), so 1 is now purely the A/B — and the answer for
@@ -1110,7 +1109,7 @@ puts the camera on the ground with its hands underneath it.
   **On the macOS viewer this needs `KL_VIEW_TIMEWARP=1`**: the default viewer
   path is the plain blit, which has no unwarp grid and therefore no crop.
 
-### Haptics (`runtime/kl_ovrp.c` — the seam that runs OUT of the guest)
+### Haptics (`runtime/xr/kl_ovrp.c` — the seam that runs OUT of the guest)
 
 The guest queues an amplitude envelope through OVRPlugin's buffered haptics API
 (320 Hz, one byte a sample); `kl_ovrp_haptics_pull` is an **envelope follower**
@@ -1121,7 +1120,7 @@ that reports what came due since the frontend last asked. Platform-independent
   out, default 32. ALVR's number and ALVR's reason: *"controllers can't do 10ms
   vibrations"*. It is a floor on the DRIVE, not on how long we wait before
   reporting one — waiting was the first design and it lost note cuts entirely
-  (PLANNING §12.20). The same knob sets the floor on a discrete pulse's
+  The same knob sets the floor on a discrete pulse's
   duration in the visionOS fallback path.
 
 - `KL_HAPTICS_TRACE=1` — both halves of the conversation: every buffer the
@@ -1164,7 +1163,7 @@ that reports what came due since the frontend last asked. Platform-independent
   and the negotiation is visible in the guest's own log
   (`Server requested refresh rate 90.0 was not available. Using 72.0`).
 - `KL_XR_CAPTURE_LAYER=N` — which projection layer `KL_GLFB_OUT` reads (default
-  0, `runtime/kl_openxr.c`). Steam Link's VR client submits **four** projection
+  0, `runtime/xr/kl_openxr.c`). Steam Link's VR client submits **four** projection
   layers a frame — two 1536x1536 pairs for its panels and two 2290x2400 pairs
   for the eyes — and nothing in the submission says which holds what, so this
   moves the capture without a rebuild. That matters because a streaming run
@@ -1179,7 +1178,7 @@ that reports what came due since the frontend last asked. Platform-independent
   window's size and produced the window, and a GL name is a slot rather than
   an identity anyway (trap 31).
 - `KL_XR_EYE_MIRROR=0` — stop copying an ARRAY eye swapchain into storage the
-  compositor can sample (`runtime/kl_openxr.c` →
+  compositor can sample (`runtime/xr/kl_openxr.c` →
   `kl_glfb_mirror_eye_layer`), which restores the configuration in which the
   visionOS immersive space is BLACK for a Unity OpenXR guest.
   Every Unity OpenXR guest asks for one 2-slice swapchain and renders both eyes
@@ -1199,13 +1198,13 @@ that reports what came due since the frontend last asked. Platform-independent
   lit of 5,496,000, which is the foveation ratio exactly; with the map dropped,
   5,496,000.
 - `KL_XR_REFRESH_EXT=0` — stop advertising `XR_FB_display_refresh_rate`
-  (`runtime/kl_openxr.c`), putting the runtime back to before SL-11. The A/B
+  (`runtime/xr/kl_openxr.c`), putting the runtime back to before SL-11. The A/B
   for anything that changes when the client can answer the host's rate
   question at all: without the extension the client publishes an EMPTY rate
   list, and a host told the client can present at no rate never starts sending
   video.
 - `KL_XR_VULKAN=0` — stop advertising `XR_KHR_vulkan_enable`
-  (`runtime/kl_openxr.c`), putting the runtime back to before the OpenXR↔Vulkan
+  (`runtime/xr/kl_openxr.c`), putting the runtime back to before the OpenXR↔Vulkan
   bridge. The A/B for Open Brush, and it restores the original failure
   **exactly**: the guest's `xrCreateInstance` returns
   `XR_ERROR_EXTENSION_NOT_PRESENT`, its own startup diagnostic prints
@@ -1215,7 +1214,7 @@ that reports what came due since the frontend last asked. Platform-independent
   cannot back the promise never makes it.
 - `KL_XR_EXTRA_EXTENSIONS="<name> [<name> ...]"` — append names to the
   extension list `xrEnumerateInstanceExtensionProperties` advertises
-  (`runtime/kl_openxr.c`). **Scouting only, and a lie by construction**: an
+  (`runtime/xr/kl_openxr.c`). **Scouting only, and a lie by construction**: an
   extension named here has no entry points behind it, so a guest that takes us
   up on it resolves NULL or aborts by name. It exists so that "what does this
   guest do differently if the runtime claims X?" costs a run instead of a
@@ -1226,16 +1225,19 @@ that reports what came due since the frontend last asked. Platform-independent
   not support it; that made it the only thing in the whole boot the guest asked
   for and did not get, and therefore the only cheap suspect for a gate.
 
-## Reprojection (`runtime/kl_reproject.c`)
+## Reprojection (`runtime/gfx/kl_reproject.c`)
 
 The composite/timewarp pass — one file, compiled by both compositors
 (`KleptonCompositor.swift` on device, `kl_view_mtl.m` in the viewer).
 
 - `KL_REPROJECT_DEPTH=<m>` — how far out the reprojection quad is placed
-  (default 2.0 m). It must stay well clear of reverse-Z 0 or **visionOS
-  discards the frame** — 500 m is depth 0.0002 and is invisible (PLANNING
-  §12.16). Within that it is free, and it is one of the two knobs that set
-  apparent scale.
+  (default **500 m**, the same distance ALVR uses). The quad is eye-centred, so
+  this changes nothing about our own picture: it is what the SYSTEM's
+  depth-based reprojection is told about our content, and placing it far away is
+  what keeps that correction rotational. Far is not a clipping risk — the
+  drawable reports `depthRange = (far inf, near 0.1)`, so nothing is ever
+  discarded for being too far; a frame that vanishes is depth WRITES being off,
+  not this number.
 - `KL_REPROJECT_MODE=off|inverse` — the bisection the pass never had. `off`
   corrects nothing (the delta is dropped and the pass becomes the frustum fit
   alone — if instability survives this, the timewarp is not causing it);
@@ -1258,7 +1260,7 @@ The composite/timewarp pass — one file, compiled by both compositors
   inside one session is the difference between settling it and arguing about
   it. `make reproject` gates the shader half (128 → 55).
 
-## Viewer (`runtime/kl_view.c`, `mains/m_boot.c`)
+## Viewer (`runtime/gfx/kl_view.c`, `mains/m_boot.c`)
 
 - `KL_POKE_CAP=<n>` — at frame-pump start, overwrite libunity's texture-unit
   cap (the value its `SetTexture` path checks before logging "Invalid texture
@@ -1316,7 +1318,7 @@ The composite/timewarp pass — one file, compiled by both compositors
   CGEvent at the desktop, which clicks whatever window is really under that
   point.
   Not a viewer knob any more despite the name (SL-18): it lives in
-  `runtime/kl_mono.c` and is driven from `kl_slink_sdl_pump`, i.e. the Android
+  `runtime/guest/kl_mono.c` and is driven from `kl_slink_sdl_pump`, i.e. the Android
   UI thread — where a real MotionEvent would be delivered, and the one thread
   guaranteed to keep turning. So it needs **no window at all**, which is what
   makes it usable inside the visionOS simulator, where `simctl` runs the app
@@ -1338,11 +1340,11 @@ The composite/timewarp pass — one file, compiled by both compositors
   samples the eye as an MTLTexture and ANGLE's Metal EGLImage is always 2D, so
   `klxr_back_eye_images` refuses the swapchain by name and there is nothing to
   composite. The readback path states the layer instead
-  (`kl_glfb_set_live_eye_image`) and works. See notes/VRCHAT.md §4.
+  (`kl_glfb_set_live_eye_image`) and works.
 - `KL_VIEW_EYE=1` — composite the **right** eye instead of the left. The window
   shows one eye, and which one is not a detail: a guest under Oculus symmetric
-  projection renders the two eyes into different sub-rects of one texture
-  (notes/BONELAB.md), so eye 1 is the one whose crop and whose quad can be wrong
+  projection renders the two eyes into different sub-rects of one texture, so
+  eye 1 is the one whose crop and whose quad can be wrong
   while eye 0 looks perfect. With `KL_OVRP_EYE_TAN=vision` and
   `KL_VIEW_TIMEWARP=1` this is the whole canted-stereo failure, on macOS.
 - `KL_VIEW_TIMEWARP=1` — composite the viewer's frame through the reprojection
@@ -1366,10 +1368,10 @@ The composite/timewarp pass — one file, compiled by both compositors
   posed, so they disagree as the head moves — which the viewer says once rather
   than leaving it to look like a placement bug.
 
-## Audio (`runtime/kl_audio.c`)
+## Audio (`runtime/media/kl_audio.c`)
 
 The CoreAudio output sink behind `kl_opensl.c`'s buffer queue (which itself
-reads no knobs). See PLANNING §12.18.
+reads no knobs).
 
 - `KL_AUDIO=0` — no CoreAudio device at all: the OpenSL feeder goes back to
   pacing each buffer with `usleep` and dropping it, which is what this runtime
@@ -1377,7 +1379,7 @@ reads no knobs). See PLANNING §12.18.
   like an audio-induced timing change — and read **by value** (`kl_env_on`),
   since it defaults on.
 - `KL_AAUDIO_BURST=<frames>` — the frames-per-callback the AAudio surface
-  (`runtime/kl_aaudio.c`) reports and asks the guest's data callback to fill.
+  (`runtime/media/kl_aaudio.c`) reports and asks the guest's data callback to fill.
   Default 240, which is 5 ms at 48 kHz and the unit Steam Link's own jitter
   buffer is configured in multiples of. Clamped to 32..8192. AAudio is a *pull*
   API, unlike OpenSL's buffer queue, so this is the size of every call INTO the
@@ -1487,7 +1489,7 @@ reads no knobs). See PLANNING §12.18.
 
 The wrapper's flags map onto these: `--gap` → `KL_GAP_ONLY=1 KL_NOFORK=1`,
 `--main` → `KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1`, `--view` adds `KL_VIEW=1`.
-See PLANNING §11.
+
 
 - `KL_SLINK_MAIN=1` — run phase 4 at all (onCreate → `nativeRunMain` →
   `SDL_main` on its own thread). SL-1 (chain binds, `JNI_OnLoad`) stays the
@@ -1503,7 +1505,7 @@ See PLANNING §11.
   **OpenXR NativeActivity** (`ANativeActivity_onCreate`), instead of either SDL3
   half. Not a chain — its `DT_NEEDED` is entirely Android system libraries we
   shim, so one guest library is the whole working set, and `libopenxr_loader.so`
-  is deliberately NOT loaded because it is replaced by `runtime/kl_openxr.c`.
+  is deliberately NOT loaded because it is replaced by `runtime/xr/kl_openxr.c`.
   VR APK only, and it says so by name if pointed at the other tree. Mutually
   exclusive with `KL_SLINK_SHELL` (VR wins, with a line saying so).
   **Both knobs reach the visionOS app too, and the DEFAULT there is different**
@@ -1516,10 +1518,10 @@ See PLANNING §11.
   (`onStart`/`onResume`/`onNativeWindowCreated`/`onWindowFocusChanged`) and then
   **pumps the main looper**, which this guest requires — it hangs its callback
   handler off the UI thread's looper rather than running work on a thread of its
-  own (PLANNING §11.14).
+  own.
 - `KL_SLINK_ARGS="<space-separated argv>"` — `SDL_main`'s own options, which
   the real activity fills from the launching intent's `sArgs` extra. Without
-  it the streaming client is being asked to stream nothing (PLANNING §11.12).
+  it the streaming client is being asked to stream nothing.
   `--transport k_EStreamTransportUDP --server <ip>` is the pair that reaches a
   connection attempt — `--transport` is load-bearing and its value is a
   protobuf enum name (`k_EStreamTransport{None,UDP,UDPRelay,SDR,UDP_SNS,
@@ -1530,7 +1532,7 @@ See PLANNING §11.
   prints "No sArgs and release build panic. Aborting back to SteamLink." and
   exits before its first frame. Set it and the app runs its scene setup, its
   frame loop and its SVL stack instead. The value is what SL-6 measured the 2D
-  shell building after the host authorized (notes/STEAMLINK.md); a synthetic
+  shell building after the host authorized; a synthetic
   one of the right shape is enough to get past scene setup, a real one is
   needed for an actual stream. `make slink-vr-run` carries a synthetic default.
 
@@ -1559,7 +1561,7 @@ See PLANNING §11.
     for mode 2.
 
   A token that fails with **"XOR0 transport specified, but len too short"**
-  after all that is trap 19, not a bad token — see notes/TRAPS.md.
+  after all that is trap 19, not a bad token.
   **Since SL-15 you rarely set this by hand.** `KL_SLINK_HANDOFF` (below) makes
   the shell re-exec into the VR front door with the session it just earned, so
   `KL_SLINK_SARGS` is for replaying an old session or driving the VR half alone.
@@ -1627,7 +1629,7 @@ See PLANNING §11.
   known to bite: `VTE_PROPS_STATIC_{L,R} was updated` appears **4 times** with
   it on and **0** with it off, same run otherwise.
 - `KL_XR_GRIP_PITCH=<degrees>` — rotate the CONTROLLER pose about its X axis,
-  positive tilting forward up. **Default +35, confirmed by eye on a headset
+  positive tilting forward up. **Default +37, confirmed by eye on a headset
   streaming from SteamVR.** This is the one that visibly rotates the controller.
 
   **It affects the OpenXR guest only, so Beat Saber is untouched** — no
@@ -1658,8 +1660,8 @@ See PLANNING §11.
 
   **The guest's own `controller_config.json` does not predict the sign, and it
   looks like it should.** Its per-profile hilt rotations are all *negative*
-  about the same axis (-20.6 Touch, -10 Pico, -5 Vive), which is why -35 was
-  tried first and was wrong by twice the angle. Those are the guest's
+  about the same axis (-20.6 Touch, -10 Pico, -5 Vive) — a negative default
+  here is wrong by twice the angle. Those are the guest's
   grip-to-*device* offsets, applied on its side to a pose it already has; this
   is the correction from the frontend's hilt frame *into* the grip pose the
   guest expects, and the two run opposite ways. A plausible source that gives
@@ -1673,7 +1675,7 @@ See PLANNING §11.
   produced a knob which did nothing.
 
   Both are read once and printed together at the first `xrCreateActionSpace`
-  (`[xr] controller pose: grip pitched -35.0 deg …`) — **not** lazily when a
+  (`[xr] controller pose: grip pitched 37.0 deg …`) — **not** lazily when a
   pose is first corrected, which never runs on a host with no frontend and so
   never said which value was in force.
 - `KL_SLINK_SIZE=WxH` — the panel size, published to SDL
@@ -1713,9 +1715,9 @@ Standalone reproducers, not part of the runtime; each reads its own knobs.
 - `S10_EYE=1` — run only the eye-sized SRGB8_ALPHA8 FBO draw-and-blit stage.
 - `S11_SIZE=WxH` — pbuffer size for s11_draw (default 1832x1920).
 
-## Vulkan (`runtime/kl_vulkan.c`) — the synthetic libvulkan.so
+## Vulkan (`runtime/gfx/kl_vulkan.c`) — the synthetic libvulkan.so
 
-BONELAB's graphics API (`notes/BONELAB.md`). Needs `make mvk`; with no MoltenVK
+BONELAB's graphics API. Needs `make mvk`; with no MoltenVK
 vendored the whole path refuses by name and none of these do anything.
 
 - `KL_VK_OUT=<dir>` — write each submitted frame there as a PNG. On this guest
@@ -1766,7 +1768,7 @@ vendored the whole path refuses by name and none of these do anything.
 
 ## MoltenVK vendoring gate (`tests/t_mvk.c`, `make mvk-check`)
 
-The Vulkan side of BONELAB (`notes/BONELAB.md`). Not part of the runtime yet —
+The Vulkan side of BONELAB. Not part of the runtime yet —
 these are the gate's own knobs.
 
 - `KL_MVK_DYLIB=<path>` — which MoltenVK to load (default
@@ -1781,7 +1783,7 @@ these are the gate's own knobs.
 ## visionOS app (`visionos/Sources/*.swift`, `visionos/Sources/kl_app.c`)
 
 Read on the device/simulator; `visionos/run.sh` forwards every `KL_*` it sees
-except its own control vars (next section). See PLANNING §12.
+except its own control vars (next section).
 
 - `KL_TARGET=<name>` — which guest the app boots: `beatsaber`, `superhot` or
   `steamlink-vr` (`visionos/targets.py --list`). The **default is compiled in**
@@ -1800,7 +1802,7 @@ except its own control vars (next section). See PLANNING §12.
   `KL_IMMERSIVE=1` turns it on for a run that HAS a session. Note the window
   path never opens a `LayerRenderer.Drawable`, so nothing measures the display:
   the guest gets Quest 2 defaults and a **zero IPD**, and `KL_OVRP_IPD=0.063` is
-  required there for the reason SL-12 records (see `notes/VISIONOS.md`, "The eye
+  required there for the reason SL-12 records ("The eye
   geometry has ONE source").
 - `KL_AUTOBOOT=0` — autoboot is the default too; `=0` restores the
   Boot-button-only shape, for attaching a debugger or starting a GPU capture
@@ -1814,7 +1816,7 @@ except its own control vars (next section). See PLANNING §12.
   capture or a debugger still attached. Either way the phase change is logged
   (`[app] scene phase -> …`).
 - `KL_SYNC_GUEST=1` — drive the guest inline on the compositor thread, i.e.
-  P5b's shape before §12.12. The clock P5.4's device numbers were taken
+  P5b's shape before the guest moved to its own thread. The clock P5.4's device numbers were taken
   against, and the A/B for anything that looks like a pacing regression.
   Default is the guest on its own thread, one frame per published pose.
 - `KL_FULL=1` — `.full` immersion. `.mixed` is the default — the guest's world
@@ -1861,12 +1863,12 @@ except its own control vars (next section). See PLANNING §12.
   grip's frame, applied to `AccessoryAnchor`'s `.grip` pose. Replaces the
   default outright. `_L`/`_R` per hand.
 - `KL_SENSE_PITCH=<deg>` — just the X term of that rotation, which is the one
-  that has ever needed changing. Default **-35**: the magnitude is Beat Saber's
-  own in-game controller adjustment, the sign is device-measured (+35 pitched
-  the hilts backward — the game applies its adjustment in Unity's left-handed
-  frame). It stacks with ALVR's +5.037° PSVR2 model tilt, so the default pair is
-  `-29.963,0,0` and `0.002,0,-0.01`. If a playtest leaves about five degrees
-  forward, try `KL_SENSE_PITCH=-45.037` (= -40.04 total, Beat Saber's own
+  that has ever needed changing. Default **-37**: the magnitude is Beat Saber's
+  own in-game controller adjustment, the sign is device-measured (the same
+  magnitude positive pitches the hilts backward — the game applies its
+  adjustment in Unity's left-handed frame). It stacks with ALVR's +5.037° PSVR2
+  model tilt, for **-31.963°** about X. If a playtest leaves about five degrees
+  forward, try `KL_SENSE_PITCH=-45.037` (= -40.0 total, Beat Saber's own
   Oculus Touch constant).
 - `KL_SENSE_VEL_FRAME=world` — read `AccessoryAnchor.velocity`/`angularVelocity`
   as already being in tracking space. Default treats them as accessory-local
@@ -1874,7 +1876,7 @@ except its own control vars (next section). See PLANNING §12.
   documents neither, and the two differ only in direction.
 - `KL_HAND_MIRROR=1` — left hand back on ALVR's *mirrored* wrist→grip
   constant. The default left constant is `R · Rx(180)`, forced by four
-  playtests (PLANNING §12.17c).
+  playtests.
 - `KL_HAND_ANATOMICAL=1` — build the left grip frame from joint **positions**
   (index/little knuckle + wrist) rather than any wrist-frame constant —
   OpenXR's own basis, consistent between hands by construction. Off by default
@@ -1908,7 +1910,8 @@ except its own control vars (next section). See PLANNING §12.
   **one long-lived looping player per hand whose intensity follows the guest's
   envelope**. ALVR's source is discrete server events; ours is a continuous
   320 Hz stream, and playing that as a run of short events is a restart per
-  frame — which is what a note cut felt like on device before §12.20. A hand
+  frame — which is what a note cut felt like on device before the envelope
+  follower. A hand
   also falls back to this on its own if the continuous player cannot be made
   or started, and says so in the log.
 - `KL_CP_PROBE=<n>` — bisection ladder for a dark compositor: 1 = clear only
@@ -1919,7 +1922,7 @@ except its own control vars (next section). See PLANNING §12.
   executed" is visible.
 - `KL_CP_EYE=<0|1>` — composite ONLY that eye, leaving the other black. The
   binocular-vs-temporal split for a doubled image: one second, halves the
-  search space (PLANNING §12.19).
+  search space.
 - `KL_CP_AMPLIFY=0` — one render pass per eye instead of the single
   vertex-amplified composite. Takes foveation down with it (the rate map
   needs the amplified pass).

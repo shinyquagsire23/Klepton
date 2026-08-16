@@ -1,9 +1,9 @@
-// M1 exit criterion: libunityopus.so translated, loaded, and decoding correctly.
+// libunityopus.so loaded and decoding correctly.
 //
-// The same roundtrip is also the P1 gate for M1b (PLANNING §12.4): hand it a
-// klepton-ld-produced Mach-O dylib instead of the ELF and it must pass
-// identically. Which loader runs is decided by the file's magic, not a flag, so
-// the two paths are held to one test rather than two.
+// The same roundtrip gates the translated path: hand it a klepton-ld-produced
+// Mach-O dylib instead of the ELF and it must pass identically. Which loader
+// runs is decided by the file's magic, not a flag, so the two paths are held to
+// one test rather than two.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,14 +27,14 @@ int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1]
         : "beatsaber/lib/arm64-v8a/libunityopus.so";
 
-    kl_thread_init();                       // canary for the main thread (S0.1)
+    kl_thread_init();                       // canary for the main thread
 
     int macho = is_macho(path);
     if (macho < 0) { printf("load failed: %s is neither ELF64 nor Mach-O\n", path); return 1; }
 
-    printf("=== klepton M1: loading %s ===\n", path);
-    printf("  loader: %s\n", macho ? "kl_load_dylib (M1b — dyld maps the guest text)"
-                                   : "kl_load (M1a — mmap + runtime rewrite)");
+    printf("=== klepton: loading %s ===\n", path);
+    printf("  loader: %s\n", macho ? "kl_load_dylib (dyld maps the guest text)"
+                                   : "kl_load (mmap + runtime rewrite)");
     kl_image *img = macho ? kl_load_dylib(path) : kl_load(path);
     if (!img) { printf("load failed: %s\n", kl_error()); return 1; }
 
@@ -107,6 +107,6 @@ int main(int argc, char **argv) {
     if (dec_destroy) dec_destroy(dec);
     kl_unload(img);
 
-    printf("\n=== M1 EXIT CRITERION MET: guest ELF loaded, relocated and executing ===\n");
+    printf("\n=== EXIT CRITERION MET: guest ELF loaded, relocated and executing ===\n");
     return 0;
 }

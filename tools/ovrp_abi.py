@@ -2,11 +2,11 @@
 """Do our OVRPlugin implementations agree with the REAL plugin about pointers?
 
 The APK ships the libOVRPlugin.so we replace. We never load a byte of it — it
-needs Quest system libraries that do not exist here (PLANNING §3.1) — but it is
+needs Quest system libraries that do not exist here — but it is
 the authority on the one thing about each entry point we cannot derive: whether
 an argument is an out-parameter, and which one.
 
-That question has now cost two separate arcs. Trap 10 was its return-value half
+That question has now cost two separate arcs. One half is the return value
 (`ovrpResult` success is 0, `ovrpBool` success is 1, and answering one where the
 other is read is a failure code the guest carries far away). This is its
 argument half, and it is worse, because there is no value to get wrong:

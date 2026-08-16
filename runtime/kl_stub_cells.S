@@ -14,9 +14,10 @@
 // — the faulting pc is the pool, base + 0x340. AMFI does not care that we own
 // the pages or that they were mapped RX: code that did not come from a signed
 // file cannot be executed, full stop. Note what this is NOT: it is not the
-// W^X/RWX question §12.5 answered (mapping RWX is permitted, MAP_JIT is not),
-// and it is not M1b. The guest's own libraries are signed dylibs and run fine;
-// this is the last hand-written code generation left in the process.
+// W^X/RWX question (mapping RWX is permitted, MAP_JIT is not),
+// and it is not about the translated guest libraries: those are signed dylibs
+// and run fine. This is the last hand-written code generation left in the
+// process.
 //
 // THE SHAPE OF THE FIX
 //

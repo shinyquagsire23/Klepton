@@ -1,4 +1,4 @@
-// Trap 26 — the CTR_EL0 veneer, EXECUTED. `make ctr`, in `make check`.
+// The CTR_EL0 veneer, EXECUTED. `make ctr`, in `make check`.
 //
 // This gate exists because the failure it guards is a process kill with no
 // diagnostic of its own: a guest `mrs Xt, CTR_EL0` is an illegal instruction
@@ -8,10 +8,10 @@
 // visionOS *simulator* never reaches that code, so the whole rung of the ladder
 // below the device had nothing to say about it.
 //
-// **The host has everything to say about it.** `mrs Xt, CTR_EL0` traps on macOS
-// too (measured; trap 26's record says otherwise and is wrong — the simulator's
-// silence is Qt's code path not being taken there, not the kernel permitting
-// the read). So this runs the real instruction, in a real executable mapping,
+// The host has everything to say about it: `mrs Xt, CTR_EL0` traps on macOS
+// too (measured — the simulator's silence is Qt's code path not being taken
+// there, not the kernel permitting the read). So this runs the real
+// instruction, in a real executable mapping,
 // through the real emitter:
 //
 //   1. the control — the raw instruction, in a child, must die on SIGILL.
@@ -122,7 +122,7 @@ static int raw_mrs_dies(void) {
 }
 
 int main(void) {
-    printf("=== trap 26: the CTR_EL0 veneer ===\n");
+    printf("=== the CTR_EL0 veneer ===\n");
     const uint64_t want = kl_x18_ctr_value();
     printf("  the veneer answers %#llx (IDC=%llu DIC=%llu DminLine=%llu "
            "IminLine=%llu)\n", (unsigned long long)want,
@@ -204,7 +204,7 @@ int main(void) {
     // ---- 5. `mrs x18, CTR_EL0` — both kinds of site at once ----
     //
     // The destination is the one register that must never hold guest state on
-    // Darwin (trap 0), so the veneer puts the constant in the shadow slot
+    // Darwin, so the veneer puts the constant in the shadow slot
     // instead. Read back through pthread_getspecific, which is the API side of
     // the same slot the veneers index directly.
     if (kl_x18_init() != 0) {
@@ -263,6 +263,6 @@ int main(void) {
 
     printf("       (KL_CTR=0 is the A/B and KL_CTR_EL0=<hex> changes the answer; "
            "both are read once, before the first library loads)\n");
-    printf("%s: trap 26\n", g_fail ? "FAIL" : "PASS");
+    printf("%s: CTR_EL0 veneer\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

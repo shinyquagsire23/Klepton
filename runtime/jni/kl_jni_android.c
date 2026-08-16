@@ -30,7 +30,7 @@
 #include "kl_jni_int.h"
 
 // ---- assets ----
-// This is the path the M3 measurement predicted: with no AAssetManager_* import,
+// The path the import census predicted: with no AAssetManager_* import,
 // assets reach Unity over JNI instead — Context.getAssets() -> AssetManager.open()
 // -> InputStream -> Scanner. We serve it from the unpacked APK on disk.
 // Every path we hand the guest must be absolute. Android's are — getPackageCodePath
@@ -323,9 +323,9 @@ static klj_val klj_Activity_getIntent(void *env, void *self, const klj_val *a, i
     static void *intent;
     return klj_singleton("android/content/Intent", &intent);
 }
-// The launch extras — i.e. the SL-6 handoff, arriving.
+// The launch extras — the 2D-to-VR handoff, arriving.
 //
-// SL-6 measured the 2D shell building an explicit Intent for
+// The 2D shell builds an explicit Intent for
 // `com.valvesoftware.steamlinkvr/android.app.NativeActivity` carrying four
 // string extras, and refused it because the VR activity did not exist. It does
 // now, and it reads them back through exactly this call: getIntent().getExtras()
@@ -336,8 +336,7 @@ static klj_val klj_Activity_getIntent(void *env, void *self, const klj_val *a, i
 //
 // The values come from the environment rather than from a live shell, because
 // the two halves do not yet run in one process: KL_SLINK_SARGS is pasted from a
-// pairing run (notes/STEAMLINK.md has the format,
-// "<ip>~10400~10400~0,0,1~~~~<token>"). Wiring the shell's startVRLink straight
+// pairing run. Wiring the shell's startVRLink straight
 // into this table is what removes the paste step.
 //
 // **Unset means unset.** With no sArgs the whole Bundle is absent and getExtras
@@ -404,7 +403,7 @@ static klj_val klj_Intent_getExtras(void *env, void *self, const klj_val *a, int
     }
     return (klj_val){.l = extras};
 }
-// new Intent(action). The action string is the only part anything reads so far.
+        // new Intent(action). The action string is the only part anything reads so far.
 static klj_val klj_Intent_init(void *env, void *clazz, const klj_val *a, int n) {
     (void)env; (void)clazz;
     const char *action = n > 0 ? klj_str(a[0].l) : NULL;
@@ -457,7 +456,7 @@ static void klj_if_add(void *self, const char *action) {
     klj_intent_filter *f = o ? o->data : NULL;
     if (!f || !action) return;
     if (f->n >= KLJ_IF_MAX_ACTIONS) {
-        // Bounded, and it says so: a filter that silently drops the action the
+// Bounded, and it says so: a filter that silently drops the action the
         // caller cares about is a registration that matches nothing.
         KLJ_LOG("IntentFilter.addAction(\"%s\") — DROPPED, filter is full (%d)",
                 action, KLJ_IF_MAX_ACTIONS);
@@ -536,7 +535,7 @@ static klj_val klj_Intent_getIntExtra(void *env, void *self, const klj_val *a, i
     if (strcmp(key, "level") == 0) return (klj_val){.j = (uint32_t)kl_ovrp_battery_level()};
     if (strcmp(key, "scale") == 0) return (klj_val){.j = 100};
     if (strcmp(key, "status") == 0) {
-        // BatteryManager.BATTERY_STATUS_*: CHARGING 2, DISCHARGING 3, FULL 5.
+    // BatteryManager.BATTERY_STATUS_*: CHARGING 2, DISCHARGING 3, FULL 5.
         // FULL at 100% is the documented mapping, and Unity's own
         // SystemInfo.batteryStatus distinguishes it from Charging.
         int charging = kl_ovrp_battery_charging();
@@ -1052,7 +1051,7 @@ static klj_val klj_Context_getSystemService(void *env, void *self, const klj_val
     };
     const char *want = n > 0 ? klj_str(a[0].l) : NULL;
     if (!want) return (klj_val){.l = NULL};
-    // One instance per service, as Android does — callers compare identity.
+// One instance per service, as Android does — callers compare identity.
     static void *cache[sizeof services / sizeof services[0]];
     for (unsigned i = 0; services[i].svc; i++) {
         if (strcmp(services[i].svc, want)) continue;
@@ -1064,7 +1063,7 @@ static klj_val klj_Context_getSystemService(void *env, void *self, const klj_val
     return (klj_val){.l = NULL};
 }
 
-// String.equals compares content, not identity — which matters, because our
+    // String.equals compares content, not identity — which matters, because our
 // jstrings are freshly allocated per call and a constant read twice is not the
 // same object. Anything comparing strings must come through here.
 static klj_val klj_String_equals(void *env, void *self, const klj_val *a, int n) {
@@ -1108,7 +1107,7 @@ const char *kl_userdata_dir(const char *guest) {
     size_t n = (home ? strlen(home) : 0) + strlen(guest) + 64;
     char *out = malloc(n);
     if (!out) return klj_abspath("userdata");
-    // No HOME is not a case worth inventing a policy for, but it must not
+// No HOME is not a case worth inventing a policy for, but it must not
     // produce a path at the filesystem root: fall back beside the build tree.
     if (home && *home)
         snprintf(out, n, "%s/Library/Application Support/Klepton/userdata/%s",
@@ -1118,19 +1117,19 @@ const char *kl_userdata_dir(const char *guest) {
     return klj_abspath(out);
 }
 
-// NULL until something asks or something sets it. Resolved lazily because
+    // NULL until something asks or something sets it. Resolved lazily because
 // kl_userdata_dir reads the environment, and a static initialiser cannot.
 static const char *g_files_dir;
 void kl_jni_set_files_dir(const char *dir) { g_files_dir = klj_abspath(dir); }
 const char *kl_jni_files_dir(void) {
-    // The DEFAULT target's key, not a literal: a driver that never called
+// The DEFAULT target's key, not a literal: a driver that never called
     // kl_target_apply_host still gets the guest the rest of this file defaults
     // to, and the two cannot drift apart.
     if (!g_files_dir) g_files_dir = kl_userdata_dir(kl_target_default()->userdata);
     return g_files_dir;
 }
 
-// The APK itself. Unity opens this as a zip to read streaming assets, so it has
+    // The APK itself. Unity opens this as a zip to read streaming assets, so it has
 // to be a real file — the unpacked tree under beatsaber/ is not a substitute.
  const char *g_apk_path = "beatsaber.apk";
 void kl_jni_set_apk_path(const char *path) { g_apk_path = klj_abspath(path); }
@@ -1175,16 +1174,16 @@ static klj_val klj_ClassLoader_findLibrary(void *env, void *self, const klj_val 
         snprintf(path, sizeof path, "%s/%s", g_native_lib_dir, name);
     else
         snprintf(path, sizeof path, "%s/lib%s.so", g_native_lib_dir, name);
-    // kl_can_dlopen, not stat and not kl_can_load: the question Unity is really
+// kl_can_dlopen, not stat and not kl_can_load: the question Unity is really
     // asking is "would the dlopen you are about to make succeed", and on this
     // platform a library can be loadable without being a file. Two ways that
     // happens, and each one cost a device run to learn:
     //
-    //   - klepton-ld translations are embedded in the bundle and the ELF tree is
+    //  - klepton-ld translations are embedded in the bundle and the ELF tree is
     //     not, so stat'ing the .so answers "absent" for a library that loads
-    //     fine. That killed P5.4's first device lifecycle run: findLibrary
-    //     ("il2cpp") returned null, Unity never attempted the dlopen, and the
-    //     symptom was "Failed to load Il2CPP." nowhere near the stat.
+    //     fine. Stat'ing it kills a device lifecycle run: findLibrary
+    //     ("il2cpp") returns null, Unity never attempts the dlopen, and the
+    //     symptom is "Failed to load Il2CPP." nowhere near the stat.
     //   - synthetic libraries (OVRPlugin, the platform loader, GLES, OpenSL ES)
     //     have no file at all, anywhere. On the host the APK's own unused copy
     //     happened to sit on disk and hid this; in the bundle nothing does.
@@ -1199,7 +1198,7 @@ static klj_val klj_ClassLoader_findLibrary(void *env, void *self, const klj_val 
     return (klj_val){.l = found ? kl_jni_new_string(path) : NULL};
 }
 
-// getObbDir() and getObbDirs() are ONE answer asked two ways — Android's plural
+    // getObbDir() and getObbDirs() are ONE answer asked two ways — Android's plural
 // form is the singular one followed by any adopted external volumes, and there
 // are none here. They used to disagree: the plural returned an empty array
 // under a comment asserting "this APK carries its assets inline", which was
@@ -1264,7 +1263,7 @@ static void klj_obb_census(const char *dir) {
     }
     closedir(d);
     if (match) {
-        // 1 MB is not a threshold anyone has to tune: the smallest real OBB in
+    // 1 MB is not a threshold anyone has to tune: the smallest real OBB in
         // this project is hundreds of megabytes, and the failures this catches
         // are a dangling link (no size at all) and a copied link (~175 bytes).
         if (bytes < 0 || bytes < (1 << 20))
@@ -1279,7 +1278,7 @@ static void klj_obb_census(const char *dir) {
                     code, dir, bytes);
         return;
     }
-    // No OBB at all is not an error here: 1.28 and Steam Link have none.
+        // No OBB at all is not an error here: 1.28 and Steam Link have none.
     if (!others) return;
     KLJ_LOG("obb: %s holds %s but this guest is versionCode %ld, so it will look "
             "for main.%ld.*.obb and find nothing. That is a MISSING GAME DATA "
@@ -1322,7 +1321,7 @@ static klj_val klj_Context_getObbDir(void *env, void *self, const klj_val *a, in
 }
 
 const klj_binding klj_bind_android[] = {
-    // ICU's time zones, which is where Mono's TimeZoneInfo looks on Android.
+// ICU's time zones, which is where Mono's TimeZoneInfo looks on Android.
     {"android/icu/util/TimeZone", "getDefault", "()Ljava/lang/Object;", klj_TimeZone_getDefault},
     {"android/icu/util/TimeZone", "getID", "()Ljava/lang/String;", klj_TimeZone_getID},
     {"android/icu/util/TimeZone", "getAvailableIDs", "()[Ljava/lang/String;", klj_TimeZone_getAvailableIDs},

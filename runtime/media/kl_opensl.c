@@ -198,7 +198,7 @@ static void player_wait_cb(kl_sl_player *p);   // caller must hold p->lock
 //
 // FMOD enqueues a buffer, we "play" it for as long as it would really take, then
 // call back so it enqueues the next. That callback runs guest code on this
-// thread, so kl_thread_init() is mandatory before the first one (S0.1) — without
+// thread, so kl_thread_init() is mandatory before the first one — without
 // it the stack-protector prologue reads an empty TSD slot and the guest dies far
 // from here.
 static void *feeder(void *arg) {
@@ -450,7 +450,7 @@ static void player_stop(kl_sl_player *p) {
 //
 // The self-check is not hypothetical politeness: the guest may well call
 // SetPlayState from inside the callback, and waiting for ourselves there would
-// hang rather than crash — which is the harder failure to read (trap 5).
+// hang rather than crash — which is the harder failure to read.
 static void player_wait_cb(kl_sl_player *p) {
     if (p->started && !pthread_equal(pthread_self(), p->thread))
         while (p->in_cb) pthread_cond_wait(&p->cb_done, &p->lock);

@@ -48,7 +48,7 @@ const char *kl_ue4_error(void);
 // Returns 0 on success. `out` gets the load report.
 int kl_ue4_load(FILE *out);
 
-// What the entry library still has unbound after the chain is up — the M4 work
+// What the entry library still has unbound after the chain is up — the work
 // list, and the most valuable thing a first run of a new target produces.
 // Returns the number of unique names.
 unsigned kl_ue4_gap(FILE *out);

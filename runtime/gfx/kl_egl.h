@@ -1,4 +1,4 @@
-// M5, first cut — the EGL surface libunity.so imports.
+// The EGL surface libunity.so imports.
 //
 // Exactly the 19 symbols in the unresolved list and nothing else. Notably that
 // list contains no GL entry points at all: `eglGetProcAddress` is in it, so
@@ -45,11 +45,11 @@ unsigned long kl_egl_swap_count(void);
 void *kl_egl_current_context(void);
 
 // What the guest asked eglGetProcAddress for, and which of those it went on to
-// call. This is the M5 work list, in the order the guest wanted it.
+// call. This is the work list, in the order the guest wanted it.
 void kl_egl_report(FILE *f);
 
 // Shader sources the guest handed to glShaderSource. They are the input to the
-// GLSL ES -> SPIR-V -> MSL pipeline M5 needs, and this is the only place they
+// GLSL ES -> SPIR-V -> MSL pipeline needs, and this is the only place they
 // exist in plain text — the APK stores them compressed inside Unity's assets.
 unsigned kl_egl_shader_count(void);
 void     kl_egl_dump_shaders(const char *dir);

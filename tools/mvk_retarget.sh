@@ -23,7 +23,7 @@
 # against the retargeted slice with the local SDK, which is exactly where a
 # genuinely absent symbol would surface.
 #
-# Three slices, because the ladder in PLANNING §4 has three rungs:
+# Three slices, because the development ladder has three rungs:
 #   macos  the host loop, `./build/m_boot bonelab`. A plain dylib, untouched —
 #          its floor is 12.0 and there is nothing to fix.
 #   xrsim  the visionOS Simulator. Thinned to arm64 first: the release slice is

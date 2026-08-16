@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate runtime/kl_libc_table.h — the direct bionic->Darwin forwards.
+"""Regenerate runtime/libc/kl_libc_table.h — the direct bionic->Darwin forwards.
 
 A symbol qualifies for a direct forward only if its signature AND every struct it
 touches are identical on both platforms. Everything else is hand-written in
@@ -67,7 +67,7 @@ TARGETS = [(d, None) for d in UNITY_TREES] + [
     (os.path.join(ROOT, 'steamlink-android/lib/arm64-v8a'),
      ['libmain', 'libSDL3', 'libSDL3_ttf', 'libSDL3_image',
       'libh264bitstream', 'libhevcbitstream', 'libc++_shared']),
-    # The VR build of the same app (steamlink-vr.apk, PLANNING §11.8). Its 2D
+    # The VR build of the same app (steamlink-vr.apk). Its 2D
     # half is the same seven libraries; libvrlink_scene is the OpenXR
     # NativeActivity and is listed because it imports a different libc surface
     # (AAudio, more of the NDK) that has to reach the same shim.
@@ -76,9 +76,8 @@ TARGETS = [(d, None) for d in UNITY_TREES] + [
       'libh264bitstream', 'libhevcbitstream', 'libc++_shared',
       'libvrlink_scene']),
     # ...and the app's OTHER front door: the 2D configuration frontend, which is
-    # what SteamLink.getMainSharedObject() actually names. §11.2 declared libshell
-    # and Qt out of scope, and the comment above used to say so; that was priced
-    # against the wrong question. The frontend is the only half of this app with
+    # what SteamLink.getMainSharedObject() actually names. In scope despite the
+    # Qt chain it drags in: the frontend is the only half of this app with
     # pixels of its own — the streaming client draws nothing without a Steam host
     # on the LAN — and its libc surface turns out to be small (zlib, a few
     # Linux-only syscall wrappers) rather than "a 22 MB dependency nothing loads".
@@ -93,7 +92,7 @@ TARGETS = [(d, None) for d in UNITY_TREES] + [
       'libplugins_platforms_qvirtual_arm64-v8a']),
 ]
 
-# Libraries we REPLACE rather than translate (PLANNING §3.1), so their imports
+# Libraries we REPLACE rather than translate, so their imports
 # are not ours to satisfy: libOVRPlugin needs Quest system libraries absent from
 # any APK, libovrplatformloader is a forwarder to com.oculus.horizon, and
 # libvrapi is never loaded because the chain terminates before it. Keep this in
@@ -106,7 +105,7 @@ GUEST_REPLACED = {'libOVRPlugin', 'libovrplatformloader', 'libvrapi'}
 # Frida-based injector, configured by libfrda.config.so to patch
 # libovrplatformloader / libvrapi / libc and hijack entitlement RESPONSES for a
 # table of 249 DLC asset IDs and ~270 SKUs. That is the circumvention this
-# project refuses in code (kl_ovrplat.c, "The DRM line" in CLAUDE.md), and
+# project refuses in code (kl_ovrplat.c, the DRM line), and
 # nothing in the game depends on it: no DT_NEEDED anywhere names either
 # library. Keep in step with GUEST_EXCLUDED in the Makefile.
 GUEST_EXCLUDED = {'libfrda', 'libscript'}
@@ -231,12 +230,12 @@ mmap madvise sysinfo
 # table, which is the one genuinely wrong answer available here: Linux's
 # ptrace(enum __ptrace_request, ...) and Darwin's ptrace(int, pid_t, caddr_t,
 # int) share a name and share almost no request numbers, so a direct forward
-# would execute a DIFFERENT operation and report success (trap 6b's class).
+# would execute a DIFFERENT operation and report success.
 #
 # ptrace is Beat Saber 1.6.0's libunity only — an anti-debug probe, on no path
 # 1.28 takes. Left unresolved rather than answered because nothing has yet
-# forced a decision about what it should say, and inventing one is how trap 6d
-# happens.
+# forced a decision about what it should say, and an invented answer is worse
+# than an unresolved import.
 UNRESOLVED_BY_DESIGN = set("""
 ptrace
 """.split())
@@ -245,7 +244,7 @@ ptrace
 # VR build's audio API (kl_audio.c's sink already exists; the API in front of it
 # does not), and xr* is the OpenXR runtime we must REPLACE rather than forward —
 # libopenxr_loader.so talks to an Android runtime broker that does not exist
-# here, exactly as libOVRPlugin.so did (PLANNING §3.1).
+# here, exactly as libOVRPlugin.so did.
 PREFIX_SUBSYSTEM = ('AAudio', 'xr')
 
 # `_Z` is Itanium C++ mangling: never a libc forward, and never OURS to
@@ -264,7 +263,8 @@ PREFIX_SKIP = ('pthread_', 'sem_', '__android_log', 'egl', '_Z')
 # none of which exist on Darwin — and a generated forward for a symbol that
 # does not exist is caught by the linker, which is the only reason this was not
 # a silent wrong answer. Keep it generous: an over-skip costs one hand-written
-# line, an under-skip costs a link error at best and trap 6b at worst.
+# line, an under-skip costs a link error at best and a wrong signature at
+# worst.
 RE_SKIP = re.compile(r'^(A[A-Z]|AMEDIA|SL_|sl[A-Z]|SDL_|IMG_|TTF_|Mix_|gl[A-Z])')
 
 # Which platform refused a dropped name, for the header. Filled by main().
@@ -333,7 +333,7 @@ def main():
     # does not exist on Darwin. The linker catches that, but only after the
     # question has been made confusing; these belong to kl_ovrp.c / kl_ovrplat.c,
     # or to nothing at all, since the chain terminates before libvrapi loads
-    # (PLANNING §3.1). Read off the replaced libraries themselves rather than
+    #. Read off the replaced libraries themselves rather than
     # listed, so a new Oculus family arriving with a future title is handled.
     #
     # This one IS global: a replaced library is replaced for every guest, and
@@ -365,7 +365,7 @@ def main():
                  and s not in UNRESOLVED_BY_DESIGN
                  and s not in listed)
 
-    out = os.path.join(ROOT, 'runtime/kl_libc_table.h')
+    out = os.path.join(ROOT, 'runtime/libc/kl_libc_table.h')
 
     def write(names, dropped):
         with open(out, 'w') as f:

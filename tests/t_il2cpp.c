@@ -1,18 +1,18 @@
-// M2 exit criterion: libil2cpp.so loads with 0 unresolved imports and il2cpp_init
+// libil2cpp.so loads with 0 unresolved imports and il2cpp_init
 // returns. This drives Unity's IL2CPP runtime far enough to parse global-metadata.dat
 // and stand up its type system.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../runtime/klepton.h"
-#include "../runtime/kl_il2cpp.h"
+#include "../runtime/guest/kl_il2cpp.h"
 
 int main(int argc, char **argv) {
     const char *lib  = argc > 1 ? argv[1] : "beatsaber/lib/arm64-v8a/libil2cpp.so";
     const char *data = argc > 2 ? argv[2] : "beatsaber/assets/bin/Data";
 
     kl_thread_init();
-    printf("=== klepton M2: %s ===\n", lib);
+    printf("=== klepton: %s ===\n", lib);
 
     kl_image *img = kl_load(lib);
     if (!img) { printf("load failed: %s\n", kl_error()); return 1; }
@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
         printf("  loaded assemblies: %zu (array %p)\n", n, as);
     }
 
-    printf("\n=== M2 EXIT CRITERION MET: IL2CPP runtime initialised ===\n");
+    printf("\n=== EXIT CRITERION MET: IL2CPP runtime initialised ===\n");
 
     // KL_RESOLVE=0xoff,0xoff,... — init the method-name resolver and print
     // the managed method containing each libil2cpp image offset. Built to

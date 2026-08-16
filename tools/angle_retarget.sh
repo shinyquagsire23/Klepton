@@ -1,5 +1,5 @@
 #!/bin/bash
-# Retarget an iOS ANGLE build to a visionOS platform (PLANNING §12.1(1)).
+# Retarget an iOS ANGLE build to a visionOS platform.
 #
 # Two things have to change, and only one of them is the famous one:
 #
@@ -9,7 +9,7 @@
 #      plist still says CFBundleSupportedPlatforms=iPhoneOS. That is a
 #      *bundle-validation* failure at install time, before dyld ever runs — and
 #      it would present as "the device rejected ANGLE", which is exactly the
-#      answer P5.2 is trying to measure. So it gets rewritten too.
+#      answer the probe is trying to measure. So it gets rewritten too.
 #
 # Usage: angle_retarget.sh <src-outdir> <dst-outdir> <vtool-platform> <plist-platform>
 #   e.g. angle_retarget.sh ios    xros  visionos    XROS

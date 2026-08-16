@@ -1,8 +1,8 @@
 // Klepton runtime — load an Android ARM64 ELF .so into a Darwin arm64 process.
 //
-// M1a: images are mmap'd and self-relocated at runtime. This works on macOS and
-// (per S0.0 P11) on development-signed visionOS builds. klepton-ld's Mach-O
-// emitter (M1b) reuses this exact relocation logic offline.
+// Images are mmap'd and self-relocated at runtime, on macOS and on
+// development-signed visionOS builds. klepton-ld's Mach-O emitter reuses this
+// exact relocation logic offline.
 #ifndef KLEPTON_H
 #define KLEPTON_H
 #include <stddef.h>
@@ -14,7 +14,7 @@ typedef struct kl_image kl_image;
 
 // Load and fully relocate an ELF .so. Returns NULL on error; kl_error() explains.
 kl_image *kl_load(const char *path);
-// M1b: load a klepton-ld-translated Mach-O dylib instead. dyld maps the guest
+// Load a klepton-ld-translated Mach-O dylib instead. dyld maps the guest
 // text — nothing is RWX and no guest byte is written at runtime, because the
 // TLS and x18 rewrites happened offline. This is the path that has to work on
 // visionOS; kl_load() above is the development one. Same kl_image afterwards.
@@ -46,13 +46,14 @@ const char *kl_error(void);
 void      *kl_base(kl_image *img);
 size_t     kl_span(kl_image *img);
 
-// Stats, for tests and the M1 exit criterion.
+// Stats, for tests and the load gate.
 typedef struct {
     unsigned relative, abs64, glob_dat, jump_slot;   // relocations applied
     unsigned tls_rewrites;                           // mrs tpidr_el0 -> tpidrro_el0
-    // ...and TLS sites the trap-0d data test refused. Counted apart from
+    // ...and TLS sites the data test refused. Counted apart from
     // x18_data_words because the two mean opposite things: a refused x18 site
-    // costs nothing, a refused TLS site is trap 1 live in the guest. Nonzero
+    // costs nothing, a refused TLS site leaves the guest reading a register the
+    // kernel clobbers. Nonzero
     // here is a finding, not a statistic — rewrite_tls names each one.
     unsigned tls_refused;
     unsigned svc_sites;                              // inline syscalls found
@@ -66,15 +67,15 @@ typedef struct {
     // jemalloc's mallctl, TSAN's __google_potentially_blocking_region_*), but a
     // NULL-pointer fault with no name in the log starts by reading this list.
     unsigned imports_weak_null;
-    // S0.5: guest instructions naming x18, and how many were redirected to a
-    // veneer. Anything refused is still exposed to trap 0.
+    // Guest instructions naming x18, and how many were redirected to a veneer.
+    // Anything refused reads Darwin's reserved x18.
     unsigned x18_sites, x18_patched, x18_refused;
     // Words that decode as an x18 site but sit in DATA inside an
-    // executable section (trap 0b). Not sites and not refusals — reported
+    // executable section. Not sites and not refusals — reported
     // separately because a number moving here means the second detector
     // changed its mind about what is code.
     unsigned x18_data_words;
-    // Trap 26: `mrs Xt, CTR_EL0`, which EL0 may not execute on Darwin. Same
+    // `mrs Xt, CTR_EL0`, which EL0 may not execute on Darwin. Same
     // veneer machinery, counted apart because the x18 numbers above are exact
     // and `make check` gates on them.
     unsigned ctr_sites, ctr_patched, ctr_refused;
@@ -91,7 +92,7 @@ const char *const *kl_weak_imports(kl_image *img, unsigned *count);
 // Resolve a bionic/NDK import by name. Returns NULL if unimplemented.
 void *kl_shim_lookup(const char *name);
 // Install the bionic stack-guard canary into Darwin TSD slot 5 for this thread.
-// Must be called on every thread that will execute guest code. (S0.1)
+// Must be called on every thread that will execute guest code.
 void  kl_thread_init(void);
 // Restore default fatal-signal disposition and flush stdio. Call before abort()
 // in any diagnostic path: the guest installs handlers that expect a Linux
@@ -107,7 +108,7 @@ void *kl_named_stub(const char *name, void *handler);
 // The forwarding variant: a stub that branches to `tramp` with `desc` in x16 and
 // nothing else disturbed, so the trampoline can log and then let the original call
 // run with its arguments intact. `desc` must be a stable { const char *name;
-// void *real; } pair. See runtime/kl_gl_trace.S for the register contract.
+// void *real; } pair. See runtime/gfx/kl_gl_trace.S for the register contract.
 void *kl_trace_stub(const char *name, void *desc, void *tramp);
 
 // ---- image registry (backs guest dlopen/dlsym/dladdr) ----

@@ -23,7 +23,7 @@
 #                                       #   data, the log this script pulls back)
 #                                       #   is keyed on it
 #   ./build_run_vpro.sh --frames 30     # bound the guest's frame count
-#   ./build_run_vpro.sh --p4            # P4's shape: boot to initJni, no compositor
+#   ./build_run_vpro.sh --p4            # boot to initJni, no compositor
 #   ./build_run_vpro.sh --window --frames 300
 #                                       # the lifecycle in the window, no immersive
 #                                       #   space. --window ALONE is just --p4: the
@@ -58,7 +58,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --list)       python3 visionos/targets.py --list; exit 0 ;;
     --frames)     FRAMES="$2"; shift 2 ;;
-    --p4)         FRAMES=""; IMMERSIVE=0; shift ;;    # boot only — P4's measurement
+    --p4)         FRAMES=""; IMMERSIVE=0; shift ;;    # boot only, no lifecycle
     --window)     IMMERSIVE=0; shift ;;
     --null)       GLFB=0; shift ;;
     --stage)      STAGE=1; shift ;;

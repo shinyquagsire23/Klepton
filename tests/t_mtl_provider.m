@@ -1,12 +1,11 @@
-// The host-side stand-in for Compositor Services (P5.3), and the gate that says
+// The host-side stand-in for Compositor Services, and the gate that says
 // the guest's frame really lands in an MTLTexture.
 //
 // On visionOS the eye textures come from the Swift side, backed by whatever the
 // compositor is about to sample. There is no compositor here, so this allocates
 // equivalent MTLTextures itself — same device, same format, same size — and then
 // reads them back, which is the whole point: it turns "the interop primitive
-// works" (S1.1, `make mtltex`) into "the guest's own rendering arrives through
-// it".
+// works" (`make mtltex`) into "the guest's own rendering arrives through it".
 //
 // Host-only and diagnostic: named by the t_boot rule alone, never in
 // RUNTIME_SHIP. Objective-C because it has to *create* textures; the shipping
@@ -22,7 +21,7 @@
 #include <math.h>
 #include <zlib.h>
 #include "../runtime/kl_env.h"
-#include "../runtime/kl_glfb.h"
+#include "../runtime/gfx/kl_glfb.h"
 #include "t_mtl_provider.h"
 
 // The textures are held for the process lifetime, exactly as the contract in
@@ -136,7 +135,7 @@ static int provide(int eye, int stage, int w, int h, uint32_t internal_fmt,
         return 0;
     }
     // ANGLE's device, not the system default: the extension requires the texture
-    // come from the display's device (PLANNING §12.9).
+    // come from the display's device.
     id<MTLDevice> dev = (__bridge id<MTLDevice>)devp;
 
     // Reallocate when the requested size changes, because Unity DOES change it:
@@ -196,7 +195,7 @@ void kl_mtl_provider_install(void) {
         return;
     }
     kl_glfb_set_mtl_provider(provide, NULL);
-    fprintf(stderr, "  [mtl] eye textures will be MTLTexture-backed (P5 interop)\n");
+    fprintf(stderr, "  [mtl] eye textures will be MTLTexture-backed\n");
 }
 
 // Read (eye, stage) back through Metal and count lit pixels, on a stride so a
@@ -216,9 +215,9 @@ static uint8_t tone8(float c) {
     return (uint8_t)(powf(c, 1.0f / 2.2f) * 255.0f + 0.5f);
 }
 
-// ...and the format has to be the TEXTURE's, for the same reason. SL-19 taught
-// the provider to allocate whatever internalformat the guest asked for; both
-// readbacks below went on decoding every eye as RGBA16F. A 1.40 eye is
+// ...and the format has to be the TEXTURE's, for the same reason. The provider
+// allocates whatever internalformat the guest asked for, so a readback that
+// assumes RGBA16F is wrong for any other: a 1.40 eye is
 // R8G8B8A8_sRGB, so eight bytes were read where four exist: the picture landed
 // in the left third of the image, magenta, with the rest of the row read out of
 // the next one — indistinguishable from a broken interop, and it WAS the
@@ -358,8 +357,8 @@ unsigned long kl_mtl_count_lit(int eye, int stage, int *out_w, int *out_h) {
 }
 
 // The eye's MTLTexture as a PNG, tone-mapped exactly as kl_glfb's capture is, so
-// the two files can be looked at side by side. This is the part of P5 that a lit
-// count cannot answer: not "did pixels arrive" but "are they the same picture".
+// the two files can be looked at side by side. This is what a lit count cannot
+// answer: not "did pixels arrive" but "are they the same picture".
 // Full resolution, no stride — it runs once at the end of a run.
 int kl_mtl_dump_png(int eye, int stage, const char *path) {
     int slice = 0;
@@ -387,7 +386,7 @@ int kl_mtl_dump_png(int eye, int stage, const char *path) {
         // BOTTOM left while Metal (and PNG) put row 0 at the top. Without the
         // flip the picture is upside down — which is how this was found, and is
         // exactly the mistake the compositor pass must not make when it samples
-        // these textures for real (see PLANNING §12.9, P5b).
+        // these textures for real.
         //
         // ...and NOT flipped when a Vulkan guest rendered it, because Vulkan's
         // origin is the top left like Metal's. The flip is a property of the API

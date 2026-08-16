@@ -64,8 +64,7 @@ struct kl_vtdec {
     // The most recent copy of each parameter set. Kept rather than pointed at:
     // they arrive inside a guest buffer that is reused the moment we return,
     // and a format description built from a dangling pointer fails much later
-    // and somewhere else (trap 6's shape — copy RegisterNatives strings — in a
-    // new subsystem).
+    // and somewhere else.
     uint8_t *set[KLVT_NSETS];
     size_t   set_len[KLVT_NSETS];
     int      sets_changed;      // a set arrived that differs from the one held

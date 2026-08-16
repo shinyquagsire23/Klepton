@@ -1,4 +1,4 @@
-// Host-side stand-in for Compositor Services (P5.3). See t_mtl_provider.m.
+// Host-side stand-in for Compositor Services. See t_mtl_provider.m.
 // Diagnostic, host-only: t_boot links it, RUNTIME_SHIP never does.
 #ifndef KL_MTL_PROVIDER_H
 #define KL_MTL_PROVIDER_H

@@ -23,7 +23,7 @@
 //
 // Everything in this file is host-only scaffolding, like kl_glfb itself: it
 // exists so a human can look at the frame and walk the pose around while the
-// M6 problems (no scene draws, the Bloom abort) are worked.
+// XR problems (no scene draws, the Bloom abort) are worked.
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -108,7 +108,7 @@ int kl_view_available(void) {
 // ---- mono input: the window's pointer and keys, into the guest ---------------
 //
 // A flat guest has no pose to drive, so the mouse means what it means on a
-// desktop: it is the pointer. The route into the guest is runtime/kl_mono.c —
+// desktop: it is the pointer. The route into the guest is runtime/guest/kl_mono.c —
 // its OWN Android input path, `SDLActivity.onNativeMouse` / `onNativeKeyDown` /
 // `onNativeKeyUp`, which SDL3 registered with us at JNI_OnLoad. That moved out
 // of this file when the visionOS app became a second window frontend for the
@@ -180,7 +180,7 @@ static int32_t view_mono_keycode(SDL_Scancode sc) {
     }
 }
 
-// KL_VIEW_POKE lives in runtime/kl_mono.c now — the fractions are of the
+// KL_VIEW_POKE lives in runtime/guest/kl_mono.c now — the fractions are of the
 // guest's own surface, which both frontends scale into, so one implementation
 // serves the SDL window and the visionOS one and a click means the same thing
 // on each. See kl_mono.h for what it is for.
@@ -580,7 +580,7 @@ int kl_view_main(const char *libdir, int hw) {
             hqx = cyw * sp; hqy = cp * syw; hqz = -syw * sp; hqw = cyw * cp;
             if (!mono) kl_ovrp_set_head_pose(px, py, pz, hqx, hqy, hqz, hqw);
         }
-        // M7 controller emulation — VR only; a flat guest has no hands.
+        // Controller emulation — VR only; a flat guest has no hands.
         // Both hands ride head-relative offsets
         // (rotated by the head quat) with the head's orientation — a menu
         // pointer, not a saber sim. ovrpButton bits (guest metadata):
@@ -644,9 +644,9 @@ int kl_view_main(const char *libdir, int hw) {
             // two DIFFERENT physical buttons on a Sense controller (Create /
             // Options, and the PlayStation button), so two keys. On the OpenXR
             // path Back is `/user/hand/right/input/system/click`, which is how
-            // a SteamVR guest is asked for its dashboard; nothing set it until
-            // SL-21, and it is driven from here as well so the path can be
-            // exercised with no headset and no controller paired.
+            // a SteamVR guest is asked for its dashboard. Driven from here as
+            // well, so the path can be exercised with no headset and no
+            // controller paired.
             if (keys[SDL_SCANCODE_Q]) { lb |= 0x00100000; rb |= 0x00100000; }
             if (keys[SDL_SCANCODE_E]) { lb |= 0x00200000; rb |= 0x00200000; }
             if (keys[SDL_SCANCODE_UP])    { rb |= 0x00001000; sy2 =  1.0f; }  // RThumbstickUp

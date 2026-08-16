@@ -1,15 +1,15 @@
-// M3 gate: enter the guest through its real entry point.
+// Enter the guest through its real entry point.
 //
-// The plan said this milestone ends at ANativeActivity_onCreate. It does not —
-// there is no NativeActivity in this APK. AndroidManifest.xml declares
+// There is no NativeActivity in the Unity APK. AndroidManifest.xml declares
 // com.unity3d.player.UnityPlayerActivity, and libmain.so exports exactly one
 // thing: JNI_OnLoad. So the true entry is a JNI call, and the gate is that
 // libmain's JNI_OnLoad runs against our synthetic JavaVM and registers the two
 // natives the Java side expects.
 //
 // Phase 1 is the assertion. Phase 2 is reconnaissance: it drives the registered
-// NativeLoader.load() to find out what the *next* milestone has to answer for,
-// and runs in a forked child because an unimplemented JNI slot aborts by design.
+// NativeLoader.load() to find out what the JNI surface has still to answer for,
+// and runs in a forked child because an unimplemented JNI slot aborts by
+// design.
 #include <ctype.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -22,23 +22,23 @@
 #include <time.h>
 #include <unistd.h>
 #include "../runtime/klepton.h"
-#include "../runtime/kl_glfb.h"
+#include "../runtime/gfx/kl_glfb.h"
 #include "../runtime/kl_jni.h"
-#include "../runtime/kl_egl.h"
-#include "../runtime/kl_opensl.h"
-#include "../runtime/kl_mediandk.h"
-#include "../runtime/kl_ovrp.h"
-#include "../runtime/kl_ovrplat.h"
-#include "../runtime/kl_openxr.h"
-#include "../runtime/kl_view.h"
-#include "../runtime/kl_sample.h"
-#include "../runtime/kl_mprobe.h"
-#include "../runtime/kl_metadump.h"
-#include "../runtime/kl_il2cpp.h"
-#include "../runtime/kl_guestpoke.h"
+#include "../runtime/gfx/kl_egl.h"
+#include "../runtime/media/kl_opensl.h"
+#include "../runtime/media/kl_mediandk.h"
+#include "../runtime/xr/kl_ovrp.h"
+#include "../runtime/xr/kl_ovrplat.h"
+#include "../runtime/xr/kl_openxr.h"
+#include "../runtime/gfx/kl_view.h"
+#include "../runtime/diag/kl_sample.h"
+#include "../runtime/diag/kl_mprobe.h"
+#include "../runtime/diag/kl_metadump.h"
+#include "../runtime/guest/kl_il2cpp.h"
+#include "../runtime/guest/kl_guestpoke.h"
 #include "../runtime/kl_fault.h"
 #include "../runtime/kl_target.h"
-#include "../runtime/kl_ue4.h"
+#include "../runtime/guest/kl_ue4.h"
 #include "../tests/t_mtl_provider.h"
 
 // Which guest, and where its libraries are. Both come from the target table
@@ -51,7 +51,7 @@
 //   ./build/m_boot superhot             ...by name
 //   ./build/m_boot superhot/lib/arm64-v8a   ...the same, by path
 //
-// The path form is what every command in CLAUDE.md and every Makefile gate
+// The path form is what every documented run command and every Makefile gate
 // passes, and it resolves to the same target as the name.
 static const kl_target *TARGET;
 static const char *LIBDIR;
@@ -62,7 +62,7 @@ typedef int8_t (*nativeloader_load_fn)(void *env, void *clazz, void *path);
 static int fail(const char *msg) { fprintf(stderr, "FAIL: %s\n", msg); return 1; }
 
 // The fatal-signal reporter moved to runtime/kl_fault.c when the visionOS app
-// needed the same thing inside a bundle (PLANNING §12.7) — it is a diagnostic
+// needed the same thing inside a bundle — it is a diagnostic
 // that ships, not a harness detail. The sampling profiler stays host-only, so
 // t_boot registers it rather than kl_fault.c referencing RUNTIME_DIAG.
 static void install_fault_reporter(void) {
@@ -228,16 +228,15 @@ static const char *metadata_path(char *buf, size_t n) {
     return buf;
 }
 
-// The guest's frame, read back through Metal — the P5 gate, and it belongs to
-// the RUN rather than to the Unity lifecycle it used to be nested inside.
-// Every non-Unity door reaches the eye textures the same way (kl_glfb's eye
-// table), so a driver that stops before this reports a working pipeline as
-// nothing at all — the same shape as m_boot never calling kl_mediandk_report.
+// The guest's frame, read back through Metal. It belongs to the RUN rather than
+// to the Unity lifecycle: every non-Unity door reaches the eye textures the same
+// way (kl_glfb's eye table), so a driver that stops before this reports a
+// working pipeline as nothing at all.
 static void report_eye_interop(void) {
     if (!kl_glfb_has_mtl_provider() && !kl_glfb_eye_mtl_texture(0, 0, NULL)) return;
-    printf("\n=== P5 interop: the guest's frame, read back through Metal ===\n");
-    // P5.3's gate. Not "did the interop bind" — that is reported when it
-    // happens — but "did the guest's rendering arrive in the MTLTexture".
+    printf("\n=== Metal interop: the guest's frame, read back ===\n");
+    // Not "did the interop bind" — that is reported when it happens — but
+    // "did the guest's rendering arrive in the MTLTexture".
     // The lit count uses the same luma threshold as kl_glfb's capture, so
     // it is directly comparable with the reference path's number: the two
     // should agree, and a lit reference frame beside a black interop one
@@ -266,9 +265,9 @@ static void report_eye_interop(void) {
     // kl_ovrp_last_complete_stage() — so on a guest whose swapchain
     // has more than one image the PNG and the screen are DIFFERENT
     // PICTURES, and the readback can report a perfect frame for
-    // something nobody is looking at. That is trap 43's family: an
-    // instrument answering confidently about the wrong subject.
-    // Open Brush is where it bit (3 OpenXR swapchain images).
+    // something nobody is looking at — an instrument answering
+    // confidently about the wrong subject. Open Brush has 3 OpenXR
+    // swapchain images and shows it.
     int shown = kl_ovrp_last_complete_stage();
     int stages = kl_ovrp_stage_count();
     if (stages < 1) stages = 1;
@@ -311,7 +310,7 @@ static void report_eye_interop(void) {
 // point of adding a non-Unity engine at all.
 static int ue4_run(void) {
     // The guest's threads need x18 and the TLS veneer's slot before any guest
-    // code runs (trap 1). The Unity path gets this from kl_app_boot; nothing
+    // code runs. The Unity path gets this from kl_app_boot; nothing
     // was calling it here, and libUE4 has stack protectors.
     kl_thread_init();
 
@@ -346,7 +345,7 @@ static int ue4_run(void) {
 
     printf("\n=== reports ===\n");
     kl_ue4_report(stdout);
-    // ...and the P5 gate, which is the only thing here that says whether the
+    // ...and the interop readback, the only thing here that says whether the
     // guest's rendering ARRIVED. This door reaches the eye textures exactly the
     // way BONELAB's does — kl_vulkan publishes the MTLTexture behind each eye
     // VkImage into kl_glfb's eye table — so leaving it to the Unity tail meant
@@ -368,8 +367,8 @@ static int recon_run(int view_pump) {
     // Set BEFORE the door is chosen, with the texture dump: both are properties
     // of the run rather than of the engine, and they used to sit below the UE4
     // branch, which silently made KL_PERMISSIVE and KL_DUMP_TEXTURES do nothing
-    // at all on a NativeActivity target — the M4 loop's batch-scouting mode,
-    // absent exactly where a brand-new target most needs it.
+    // at all on a NativeActivity target — the batch-scouting mode, absent
+    // exactly where a brand-new target most needs it.
     kl_jni_set_permissive(getenv("KL_PERMISSIVE") != NULL);
 
     // Armed before anything runs: texture uploads happen all through init and the
@@ -409,7 +408,7 @@ static int recon_run(int view_pump) {
     if (!load || !unload) return fail("NativeLoader natives were not registered");
     printf("  registered %s.load=%p unload=%p\n", CLS, load, unload);
 
-    printf("\n=== M3 EXIT CRITERION MET: guest JNI_OnLoad ran, natives registered ===\n");
+    printf("\n=== EXIT CRITERION MET: guest JNI_OnLoad ran, natives registered ===\n");
 
     // ---- phase 2: reconnaissance, non-fatal ----
     printf("\n=== recon: driving NativeLoader.load(\"libunity.so\") ===\n");
@@ -447,10 +446,10 @@ static int recon_run(int view_pump) {
     }
 
     // Lifecycle, in the order UnityPlayerActivity drives it: attach a
-    // surface, resume, then pump one frame. This is where M4 runs into M5 —
-    // nativeRecreateGfxState is what reaches for EGL.
+    // surface, resume, then pump one frame. nativeRecreateGfxState is what
+    // reaches for EGL.
     if (getenv("KL_LIFECYCLE")) {
-        // P5.3: with KL_GLFB_MTL=1, the eye textures Unity is about to ask for
+        // With KL_GLFB_MTL=1, the eye textures Unity is about to ask for
         // become MTLTextures we allocated — the host stand-in for what
         // Compositor Services will hand over. Registered here because
         // ovrp_SetupEyeTexture2 arrives inside nativeRecreateGfxState, below.
@@ -641,7 +640,7 @@ static int recon_run(int view_pump) {
 
 // The KL_VIEW guest thread: the same recon sequence the re-exec'd child runs,
 // but in-process and pumping until the window closes. kl_thread_init() first —
-// this thread runs guest code, and guest code needs its TLS slot (trap 1).
+// this thread runs guest code, and guest code needs its TLS slot.
 static void *view_guest_thread(void *arg) {
     (void)arg;
     kl_thread_init();
@@ -765,7 +764,7 @@ int main(int argc, char **argv) {
 
     // ---- phase 2: reconnaissance, in a child ----
     // Unimplemented JNI slots abort the process on purpose, so this runs in a
-    // child. Whatever it prints before dying is the M4 work list.
+    // child. Whatever it prints before dying is the work list.
     //
     // The child is re-EXEC'd, not a bare fork. Metal's shader compiler is an
     // XPC service that refuses forked children, and AGX treats the resulting
@@ -825,7 +824,7 @@ int main(int argc, char **argv) {
     // a diagnostic asserting something it never established, which is the habit
     // this tree keeps having to unlearn (the getrandom stop that reported
     // itself as "an unimplemented JNI call" is the same shape).
-    printf("\n=== M4 (partial): %s ===\n",
+    printf("\n=== EXIT CRITERION MET: %s ===\n",
            TARGET && TARGET->kind == KL_GUEST_UE4
                ? "the NativeActivity lifecycle ran with no unimplemented JNI calls"
                : "initJni completed with no unimplemented JNI calls");

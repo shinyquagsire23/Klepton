@@ -29,7 +29,7 @@
 
 // ------------------------------------------------------------ Java class impls
 // Host implementations of the Java methods the guest actually calls. This stays
-// here while it is small; it splits into its own file once M4 fills it out.
+// here while it is small; it splits into its own file once it fills out.
 
 // Unity asks the Context for a ClassLoader so it can resolve classes from
 // threads that have no Java stack frame. One loader is enough — ours resolves

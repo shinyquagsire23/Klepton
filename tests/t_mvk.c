@@ -1,8 +1,7 @@
 // MoltenVK, RUNNING — the host half of `make mvk-check`.
 //
 // This is the vendoring gate for the synthetic `libvulkan.so` arc
-// (notes/BONELAB.md: BONELAB boots completely and cannot render because its
-// graphics API is Vulkan). It answers one question and answers it by doing it
+//  (BONELAB boots completely and cannot render because its graphics API is Vulkan). It answers one question and answers it by doing it
 // rather than by inspecting a file: **does the MoltenVK we vendored actually
 // bring up Vulkan on Metal on this machine?**
 //
@@ -44,7 +43,7 @@ static const char *mvk_path(void) {
 int main(void) {
     printf("=== MoltenVK vendoring gate\n");
 
-    // MoltenVK logs its whole device census at info level on stderr, which
+// MoltenVK logs its whole device census at info level on stderr, which
     // buries the eleven lines this gate exists to produce. It reads the level
     // from the environment when it loads, so this has to precede the dlopen.
     // KL_MVK_VERBOSE=1 puts it back — the census is genuinely worth reading the
@@ -69,7 +68,7 @@ int main(void) {
     ck(gipa != NULL, "vkGetInstanceProcAddr resolves");
     if (!gipa) return 2;
 
-#define GIPA(inst, name) ((PFN_##name)gipa((inst), #name))
+    // define GIPA(inst, name) ((PFN_##name)gipa((inst), #name))
 
     PFN_vkEnumerateInstanceExtensionProperties enum_ext =
         GIPA(VK_NULL_HANDLE, vkEnumerateInstanceExtensionProperties);
@@ -78,7 +77,7 @@ int main(void) {
     ck(create_inst != NULL, "vkCreateInstance from the loader");
     if (!enum_ext || !create_inst) return 2;
 
-    // The instance extension list. VK_EXT_metal_surface is the one that matters
+// The instance extension list. VK_EXT_metal_surface is the one that matters
     // downstream and is asserted rather than merely printed: it is how a
     // CAMetalLayer becomes a VkSurfaceKHR, and its absence would only surface
     // once the compositor seam is being written.

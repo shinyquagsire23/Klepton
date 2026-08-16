@@ -18,7 +18,7 @@
 # ACROSS platforms — Khronos ships native xros and xros-simulator slices, and
 # `tools/mvk_retarget.sh` only lowers the deployment FLOOR (26.5 -> 1.0, in the
 # Mach-O load command AND in the framework Info.plist, which is a separate
-# install-time bundle validation). See notes/BONELAB.md.
+# install-time bundle validation).
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=".."

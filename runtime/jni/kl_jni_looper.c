@@ -239,7 +239,7 @@ typedef struct {
 
 
 // Guest code runs on this thread, so kl_thread_init() before the first delivery is
-// mandatory (S0.1 / trap 1) — without it the stack-protector prologue reads an
+// mandatory — without it the stack-protector prologue reads an
 // empty TSD slot and the guest dies a long way from here.
 static void *klj_looper_thread(void *arg) {
     klj_looper *lp = arg;
@@ -625,8 +625,8 @@ static klj_val klj_SDLAM_audioSetThreadPriority(void *env, void *self, const klj
 // vary, so nothing is owed a callback and nothing is lost by forgetting one.
 //
 // Reached on TEARDOWN, which is why it took until a run got far enough to shut
-// down cleanly to find it — SL-2's gate ends with the app's own "no streaming
-// host" message box and then exits.
+// down cleanly to reach it: the app puts up its own "no streaming host" message
+// box and then exits.
 static klj_val klj_SDLAM_unregisterAudioDeviceCallback(void *env, void *self,
                                                        const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;

@@ -4,7 +4,7 @@
 # Assets go here rather than into the .app for one reason: there are 2.2 GB of
 # them and they change only when the APK does, while the code changes every few
 # minutes. Bundling them would put a multi-minute upload in front of every
-# build, which is the difference between the M4 loop working on device and not.
+# build, which is the difference between the edit/run loop working on device and not.
 # Code is the other way round — the guest libraries ride in the bundle, because
 # P3 established AMFI's tolerance for a klepton-ld dylib *inside a bundle we
 # signed* and established nothing about one pushed into Documents.
@@ -117,7 +117,7 @@ if [ -z "$TARGET" ]; then
   fi
   echo "[stage] simulator $UDID -> $DEST ($KLT_NAME)"
   rm -rf "$DEST/$TREE/assets"
-  # A copy, not a symlink: the guest resolves paths by concatenation (trap 6c)
+  # A copy, not a symlink: the guest resolves paths by concatenation
   # and a link would work here but hide a real failure on device.
   cp -R "$ASSETS" "$DEST/$TREE/assets"
   cp "$APK" "$DEST/$KLT_APK"

@@ -18,17 +18,15 @@
 //   the session                          and the state machine xrPollEvent drives
 //   spaces                               reference and action frames
 //   actions                              bookkeeping, and the binding census
-//   swapchains                           the eye images — where this meets P5
+//   swapchains                           the eye images — the compositor seam
 //   the frame loop                       wait/begin/end, locate views and spaces
 //
 // Two things about the ABI, since neither is obvious from the spec text:
 //
-//   - Every xr* function returns XrResult, an int32 where **0 is XR_SUCCESS**
-//     and negatives are failures. Trap 10 is the standing warning here: on the
-//     OVRPlugin side, answering a plain "1 for true" to a function that returns
-//     a result code produced a *failure* the engine ignored and managed code
-//     tripped over three layers away. The same mistake is available here and
-//     would look exactly as innocent.
+//   - Every xr* function returns XrResult, an int32 where 0 is XR_SUCCESS and
+//     negatives are failures. Answering a plain "1 for true" here produces a
+//     FAILURE code the engine may ignore and managed code trips over three
+//     layers away.
 //   - Structures are versioned by a `type` enum in their first field and
 //     chained through `next`. We never invent a layout: anything we fill in is
 //     transcribed from the specification, and anything we have not transcribed
@@ -61,7 +59,7 @@
 // The three rules that keep this honest, all of them learned elsewhere:
 //   - Handles are XR_DEFINE_HANDLE, i.e. pointers on LP64. Ours point at our
 //     own singletons and carry a magic, so a handle from the wrong door is a
-//     named refusal rather than a wild read (trap 3's cousin).
+//     named refusal rather than a wild read.
 //   - `type`/`next` lead every struct. We never *write* into a `next` we did
 //     not recognise, and we log the chain, because a chained struct the guest
 //     appended is a capability question it is asking us and silence is the
@@ -578,9 +576,9 @@ void kl_openxr_report(FILE *f) {
     // REFUSALS only — klxr_unimplemented is the sole place it is bumped, because
     // an implemented entry point is dispatched straight through the pointer
     // xrGetInstanceProcAddr handed out and there is no seam left to count at.
-    // This used to be headed "resolved but never called", which listed
-    // xrEndFrame under it on a run whose own log shows xrEndFrame working —
-    // a report that contradicts the trace costs more than no report (SL-13).
+    // The heading must not claim "resolved but never called": that reading
+    // lists xrEndFrame on a run whose own log shows xrEndFrame working, and a
+    // report contradicting the trace costs more than no report.
     int shown = 0;
     for (int i = 0; i < KLXR_COUNT; i++)
         if (g_xr[i].resolved && !g_xr[i].called) {
@@ -593,15 +591,13 @@ void kl_openxr_report(FILE *f) {
 }
 
 // ------------------------------------------------------------- the refusal
-// Everything not yet built. Named, so the guest says which of the forty-six it
-// wants — the whole point of the surface existing at all.
+// Everything not yet built, named — so the guest states which of the forty-six
+// it wants.
 //
-// This aborts rather than returning an error code, and that is deliberate. An
-// XrResult failure is a value the guest is entitled to handle, and it would:
-// XrAppManager has error paths and would take one, land somewhere plausible,
-// and the log would show a tidy shutdown with no mention of the function that
-// was missing. That is precisely the "abort read as a crash" confusion in
-// reverse, and it costs more than it saves.
+// This aborts rather than returning an error code. An XrResult failure is a
+// value the guest is entitled to handle, and XrAppManager does: it takes an
+// error path, lands somewhere plausible, and the log shows a tidy shutdown
+// naming nothing that was missing.
 static int klxr_unimplemented(klxr_row *row) {
     row->called++;
     fprintf(stderr, "\n[klepton] fatal: guest called unimplemented OpenXR entry "
@@ -625,8 +621,8 @@ KL_XR_ENTRY_POINTS(X)
 
 // --------------------------------------------------- what we do implement
 //
-// xrGetInstanceProcAddr, and it plays exactly the role the ovrp entry table
-// plays in M6: our function handing out our own pointers. It is the one entry
+// xrGetInstanceProcAddr, playing the role the ovrp entry table plays: our
+// function handing out our own pointers. It is the one entry
 // point a runtime must serve before anything else exists, because the spec has
 // it work with `instance == XR_NULL_HANDLE` for the bootstrap trio
 // (xrEnumerateInstanceExtensionProperties, xrEnumerateApiLayerProperties,
@@ -738,11 +734,10 @@ static klxr_instance *klxr_inst(void *h) {
 // XR_KHR_android_create_instance is here because this guest IS an Android
 // activity and passes its VM and activity object through
 // XrInstanceCreateInfoAndroidKHR; we already hold both.
-// Why each built-in may be withheld. A GATE rather than a position, because the
-// count used to be arithmetic on the array length ("the refresh-rate entry is
-// deliberately the LAST one, so hiding it is count - 1") and that made every
-// future conditional extension a trap: the second one to be added would have
-// silently hidden the first. Vulkan is exactly that second one.
+// Why each built-in may be withheld. A per-entry GATE, never arithmetic on the
+// array length: a positional "hiding the last entry is count - 1"
+// silently hides the previous conditional entry as soon as a second one exists.
+// Vulkan is that second one.
 enum { KLXR_GATE_ALWAYS = 0,      // unconditional
        KLXR_GATE_REFRESH = 1,     // ...unless KL_XR_REFRESH_EXT=0
        KLXR_GATE_VULKAN = 2 };    // ...only when MoltenVK is actually reachable
@@ -758,26 +753,23 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     // formatted I/O, and it buried the six lines of the video path that the run
     // existed to produce.
     { "XR_KHR_convert_timespec_time",   1, KLXR_GATE_ALWAYS },
-    // XR_FB_display_refresh_rate is the exception to the paragraph above, and
-    // it is here because absence turned out NOT to be handled gracefully after
-    // all (SL-11). The guest prints "XR_EXT_display_refresh_rate is not
-    // available on this runtime" and carries on — but the thing it carried on
-    // to was "[SVLClientXR] Supported refresh rates was empty!", and it
+    // XR_FB_display_refresh_rate is the exception to the paragraph above:
+    // absence is NOT handled gracefully here. The guest prints
+    // "XR_EXT_display_refresh_rate is not available on this runtime" and
+    // carries on to "[SVLClientXR] Supported refresh rates was empty!", then
     // publishes that empty list to the Steam host as
     // VTE_AVAILABLE_FRAMETIMES_US. A host told the client can present at no
-    // rate at all never starts sending video: the link came up, the control
-    // channel exchanged updates, and the decoder was configured and then never
-    // handed a single buffer.
+    // rate at all never starts sending video: the link comes up, the control
+    // channel exchanges updates, and the decoder is configured and never handed
+    // a single buffer.
     //
-    // Claiming it is truthful because we can answer it truthfully: the display
-    // frequency is measured (kl_ovrp_set_display_frequency, pushed by the
-    // compositor's primeDisplay) and it is the SAME number the OVRP side
-    // reports, so the two XR APIs cannot disagree about the panel — SL-9's
-    // rule for eye poses, in the one other place a headset property is
-    // answered twice.
+    // Claiming it is truthful because it can be answered truthfully: the
+    // display frequency is measured (kl_ovrp_set_display_frequency, pushed by
+    // the compositor's primeDisplay) and is the SAME number the OVRP side
+    // reports, so the two XR APIs cannot disagree about the panel.
     { "XR_FB_display_refresh_rate",     1, KLXR_GATE_REFRESH },
     // XR_KHR_vulkan_enable — Open Brush, and the first guest to need this half
-    // of the runtime joined to the Vulkan half (notes/OPENBRUSH.md).
+    // of the runtime joined to the Vulkan half.
     //
     // GATED on MoltenVK actually being reachable, and that is the whole reason
     // gates exist: a runtime that names this extension promises four entry
@@ -1079,9 +1071,9 @@ static XrResult klxr_GetViewConfigurationProperties(void *instance, XrSystemId s
 // OPAQUE only. The guest's picture covers the display and nothing of the room
 // shows through it — which is what every compositor path in this project does
 // (kl_reproject draws the eye texture as the whole scene). ADDITIVE and
-// ALPHA_BLEND are the passthrough modes, and offering one would have the guest
-// leave its background transparent for a blend that never happens: trap 33's
-// failure, arrived at deliberately.
+// ALPHA_BLEND are the passthrough modes, and offering one has the guest leave
+// its background transparent for a blend that never happens — a correct RGB
+// frame that composites as fully transparent, with no error surface.
 enum { KLXR_BLEND_OPAQUE = 1 };
 static XrResult klxr_EnumerateEnvironmentBlendModes(void *instance, XrSystemId system_id,
                                                     int32_t view_config_type,
@@ -1235,8 +1227,8 @@ static XrResult klxr_EnumerateViewConfigurationViews(
         views[i].maxImageRectWidth  = (uint32_t)ew * 2;
         views[i].maxImageRectHeight = (uint32_t)eh * 2;
         // One sample recommended: the guest resolves into the eye texture
-        // itself, and MSAA there is the shape trap 12's VRR note is about —
-        // a foveated pass whose resolve must stay physical-to-physical.
+        // itself, and a foveated pass's resolve must stay
+        // physical-to-physical.
         views[i].recommendedSwapchainSampleCount = 1;
         views[i].maxSwapchainSampleCount = 4;
     }
@@ -1250,9 +1242,9 @@ static XrResult klxr_EnumerateViewConfigurationViews(
 // runtimes get to state a version range before an app commits to a context.
 //
 // The range we state is ANGLE's, because ANGLE is what is underneath: ES 3.0 as
-// the floor (that is the context kl_egl actually creates — trap 9 is the
-// standing reminder that the *description* being 3.2 does not make the context
-// 3.2) and 3.2 as the ceiling we will answer queries for. Overstating the floor
+// the floor (the context kl_egl actually creates — a capability set describing
+// 3.2 does not make the context 3.2) and 3.2 as the ceiling we answer queries
+// for. Overstating the floor
 // is the dangerous direction: an app told it needs 3.2 asks for 3.2, and gets a
 // context whose 3.2 entry points resolve and then fail on use.
 //
@@ -1377,12 +1369,11 @@ static XrResult klxr_GetVulkanGraphicsRequirementsKHR(
 // waiting on, in order, and a runtime that posts none leaves a correct app
 // sitting in its event loop forever with nothing wrong anywhere.
 //
-// That is the same shape as the Choreographer in M4 and the looper in SL-8: on
-// Android something else was driving the pump, and here the runtime IS the
-// something else. Third time this class of bug has cost a session, so the
-// transitions are queued eagerly rather than waiting for a frontend to say the
-// headset is worn — we have no such signal on the host, and an idle guest looks
-// exactly like a hung one.
+// Same shape as the Choreographer and the looper: on Android something else
+// drives the pump, and here the runtime IS the something else. The transitions
+// are queued eagerly rather than waiting for a frontend to say the headset is
+// worn — there is no such signal on the host, and an idle guest looks exactly
+// like a hung one.
 enum { KLXR_MAGIC_SESSION = 0x584b4c53 /* 'XKLS' */ };
 enum { KLXR_EVENT_QUEUE = 16 };
 
@@ -1410,12 +1401,11 @@ typedef struct {
     int      frame_begun;         // between xrBeginFrame and xrEndFrame
     int64_t  frame_predicted_time;// what the last xrWaitFrame promised
     uint64_t frames_waited, frames_ended, layers_ignored;
-    // Pending events, in order. The payload is a state for a session-state
-    // change and unused for everything else — this used to be a bare `int
-    // queue[]` of states, and it grew a kind the moment a second event type
-    // existed (the interaction profile changing, which is how an app learns a
-    // controller appeared). A queue that can only carry one event type is a
-    // queue that silently cannot deliver the second.
+    // Pending events, in order. Each carries a KIND as well as a payload (a
+    // state, for a session-state change; unused otherwise): a queue of bare
+    // states cannot deliver the second event type — the interaction profile
+    // changing, which is how an app learns a controller appeared — and does not
+    // say so.
     struct { int kind, state; } queue[KLXR_EVENT_QUEUE];
     int   qhead, qcount;
 } klxr_session;
@@ -1436,9 +1426,8 @@ static klxr_session *klxr_sess(void *h) {
 // single source, as ovrp_GetSystemDisplayAvailableFrequencies in kl_ovrp.c.
 //
 // The Steam host asks for a rate it prefers (90 Hz here); the client compares
-// it against this list, picks what it can do, and tells the host. That
-// negotiation is the whole point of the extension for this guest, and an empty
-// list is not a neutral answer to it.
+// it against this list, picks what it can do, and tells the host. An empty list
+// is not a neutral answer to that negotiation — see the gate above.
 enum { KLXR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB = -1000101000 };
 
 static XrResult klxr_EnumerateDisplayRefreshRatesFB(void *session, uint32_t capacity,
@@ -1503,9 +1492,8 @@ static XrResult klxr_ConvertTimeToTimespecTimeKHR(void *instance, int64_t time,
 
 // XrTime is int64 nanoseconds on a monotonic clock the runtime chooses. It must
 // be the SAME clock the guest's own timing uses, for the reason the
-// Choreographer note in CLAUDE.md gives: two monotonic clocks differ by an
-// offset, and a frame delta computed across the pair is that offset rather than
-// a duration. CLOCK_MONOTONIC is what System.nanoTime() already answers here.
+// Choreographer runs on one: two monotonic clocks differ by an offset, and a
+// frame delta computed across the pair is that offset rather than a duration. CLOCK_MONOTONIC is what System.nanoTime() already answers here.
 static int64_t klxr_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1674,11 +1662,11 @@ static XrResult klxr_RequestExitSession(void *session) {
 }
 
 // xrPollEvent — XR_EVENT_UNAVAILABLE (a SUCCESS code, 4, not an error) when the
-// queue is empty, which is the normal answer most frames. Trap 10's warning
-// applies in an unusual direction here: a *positive* result is still success,
-// so a caller testing `result == XR_SUCCESS` rather than `>= 0` would read an
-// empty queue as an event. That is the guest's business, but it is why this
-// returns the specified code rather than an error.
+// queue is empty, which is the normal answer most frames. The return convention
+// runs an unusual direction here: a POSITIVE result is still success, so a
+// caller testing `result == XR_SUCCESS` rather than `>= 0` reads an empty queue
+// as an event. That is the guest's business, but it is why this returns the
+// specified code rather than an error.
 static XrResult klxr_PollEvent(void *instance, XrEventDataBuffer *data) {
     if (!klxr_inst(instance)) return KLXR_ERROR_HANDLE_INVALID;
     if (!data) return KLXR_ERROR_VALIDATION_FAILURE;
@@ -1727,7 +1715,7 @@ static XrResult klxr_PollEvent(void *instance, XrEventDataBuffer *data) {
 // the standing rule rather than an oversight: locating a space against another
 // is where the head pose enters, and the head pose has a per-frame LATCH in
 // kl_ovrp that exists because reading it live mid-frame is precisely the bug
-// behind the visionOS temporal doubling (PLANNING §12.19). Wiring a second
+// behind the visionOS temporal doubling. Wiring a second
 // consumer to the unlatched value would reintroduce it in a new place. So
 // spaces are created and named here, and the locate lands with the frame loop
 // that latches.
@@ -1774,9 +1762,9 @@ static const char *klxr_ref_space_name(int t) {
 // the first time each combination is seen, because at 90 Hz this can only be a
 // census.
 //
-// The list of resolved entry points cannot answer this and reading it as if it
-// could has cost time before (SL-14): a guest resolves plenty it never calls,
-// and `xrLocateViews` appearing there says nothing about which space it passes.
+// The list of resolved entry points cannot answer this: a guest resolves plenty
+// it never calls, and `xrLocateViews` appearing there says nothing about which
+// space it passes.
 // The distinction is the whole question. A guest that locates its views in VIEW
 // space is asking "where are the eyes relative to the head" — an eye-to-head —
 // and one that locates them in LOCAL is asking where they are in the world.
@@ -1785,16 +1773,15 @@ static const char *klxr_ref_space_name(int t) {
 // swings around instead of turning in place.
 //
 // Returns 1 the first time a combination is seen, and nothing else: the caller
-// prints the line, in one fprintf, once it also has the answer it gave. Split
-// across the computation it would be split in the log too — the guest logs from
-// several threads and one landed in the middle of the first version of this.
+// prints the line, in ONE fprintf, once it also has the answer it gave. The
+// guest logs from several threads, so a line split across the computation is a
+// line split in the log.
 // ...once per (call, space, base), AND THEN RARELY AGAIN.
 //
-// Once was enough while the only question was WHICH spaces the guest asks
-// about (SL-16 answered a whole arc with that census). It is not enough for the
-// question that follows — whether the ANSWERS are right — because the first
-// call happens before the head has moved, so every position in the census is
-// 0 and a leak of the head's own position is indistinguishable from no leak.
+// Once answers WHICH spaces the guest asks about, but not whether the ANSWERS
+// are right: the first call happens before the head has moved, so every position
+// in the census is 0 and a leak of the head's own position is indistinguishable
+// from no leak.
 // The repeat costs one line per pair per ~600 calls and is the difference
 // between a census and a measurement. KL_XR_LOCATE_EVERY=0 turns it off.
 static int klxr_locate_seen(const char *call, int sp_type, int base_type) {
@@ -1872,15 +1859,12 @@ static XrPosef klxr_pose_apply(XrPosef base, XrPosef p) {
 // same space raised by the standing height, and VIEW *is the head*, pose and
 // all.
 //
-// VIEW being a whole pose rather than a y displacement is the point of this
-// function. It used to be a single float, with a comment asserting that VIEW
-// "never appears here as a base" — and this guest passes VIEW as the base to
-// xrLocateViews, which is how a client asks for its eye-to-head. Answered with
-// a y of zero, the eye-to-head came back carrying the standing height, so the
-// eye sat 1.7 m from the point it was rotated about and the head swung through
-// a large arc instead of turning in place. The census above is what settles
-// which spaces a guest actually asks about; do not assume it confines itself to
-// the two static ones.
+// VIEW is a whole POSE here, not a y displacement. A guest passes VIEW as the
+// base to xrLocateViews to ask for its eye-to-head, and a space modelled as a
+// scalar answers with the head's own position folded in — the eye then sits
+// 1.7 m from the point it is rotated about and the head swings through an arc
+// instead of turning in place. The census above settles which spaces a guest
+// actually asks about; do not assume the two static ones.
 //
 // Getting the static two wrong is not subtle in the end result and is very
 // subtle here: an app that places its UI in LOCAL and is answered STAGE puts
@@ -1890,38 +1874,29 @@ static XrPosef klxr_pose_apply(XrPosef base, XrPosef p) {
 // -1 when the space is anchored to nothing we can locate.
 static int klxr_action_space_hand(const klxr_space *sp, int *is_aim);
 
-// The aim pose, as a rotation off the grip pose. **-35 degrees, measured on
-// hardware, not derived here.**
+// The aim pose, as a rotation off the grip pose. Measured on hardware, not
+// derived here: 37 degrees, close to the angle a Touch controller needs.
 //
 // OpenXR gives a controller two poses: the GRIP (the hilt — where the hand is)
 // and the AIM (the ray — where the user is pointing). Steam Link asks for both
 // by name: `pamir-stream-pose` binds grip and `ui_pointer_pose` binds aim, so
 // the in-headset UI pointer is the aim one, and with the two collapsed the
 // laser leaves the hand at the hilt's angle instead of the pointing angle.
-//
-// SL-20 shipped this at 0, on the argument that KleptonControllers already
-// builds a hilt frame whose -Z points along the direction the hilt points, so
-// aim and grip nearly coincide for this input source. **That argument was
-// wrong on hardware** — the same 35 degrees a Touch controller needs is needed
-// here too — which is worth keeping because it was a plausible argument from a
-// real property of the frontend, and the headset settled it in one A/B where
-// no amount of reading the basis conversion would have.
+// KleptonControllers' hilt frame does not make the two coincide, close as its
+// -Z is to the direction the hilt points.
 //
 // Sign convention: R_x(θ) takes the forward vector (0,0,-1) to (0, sinθ,
 // -cosθ), so positive pitches forward UP and negative pitches it down.
+// POSITIVE on the grip, confirmed by eye on a headset streaming from SteamVR.
 //
-// +35 on the grip, confirmed by eye on a headset streaming from SteamVR.
+// The guest's own controller_config.json does not predict that sign and looks
+// as though it should: its per-profile hilt rotations are all negative about
+// the same axis (-20.6 Touch, -10 Pico, -5 Vive). Those are the guest's
+// grip-to-DEVICE offsets, applied on its side to a pose it already has; this is
+// the correction from the frontend's hilt frame INTO the grip pose the guest
+// expects, and the two run opposite ways. Do not re-derive the sign there.
 //
-// **The guest's own controller_config.json does NOT predict this sign, and it
-// looks like it should.** Its per-profile hilt rotations are all negative about
-// the same axis (-20.6 Touch, -10 Pico, -5 Vive), which is why -35 was tried
-// first and was wrong by twice the angle. Those are the guest's
-// grip-to-*device* offsets, applied on its side to a pose it already has; this
-// is the correction from the frontend's hilt frame INTO the grip pose the guest
-// expects, and the two run opposite ways. Do not re-derive the sign from that
-// table — it is a plausible source that gives the wrong answer.
-//
-// **This is the OpenXR path only, so it does not touch Beat Saber**, which
+// OpenXR path only, so it does not touch Beat Saber, which
 // speaks OVRPlugin and never resolves a single xr* entry point (its own
 // end-of-run report reads `0 resolved by the guest`). The rotation is applied
 // to kl_openxr's local copy of the pose, not written back into kl_ovrp, so the
@@ -1937,9 +1912,10 @@ static void klxr_pitch_about_x(XrPosef *p, float degrees) {
     p->orientation = klxr_qmul(p->orientation, rx);
 }
 
-// The two corrections, applied to every action-space pose. They are separate
-// because they answer different questions, and collapsing them into one knob is
-// exactly the mistake this code made first time round.
+// The two corrections, applied to every action-space pose. They answer
+// different questions and stay separate; each applies to its OWN pose, and a
+// correction applied to the aim pose alone leaves the controller the user is
+// looking at — the grip — untouched, which reads as the knob doing nothing.
 //
 //   KL_XR_GRIP_PITCH  corrects the CONTROLLER — the pose bound to
 //                     .../input/grip/pose, which for Steam Link is
@@ -1955,17 +1931,11 @@ static void klxr_pitch_about_x(XrPosef *p, float degrees) {
 //                     measured, and the frontend's hilt frame already points
 //                     roughly where a hand points.
 //
-// **The first version applied the whole thing to the aim pose only**, which is
-// why setting KL_XR_AIM_PITCH appeared to do nothing at all: the controller a
-// user is looking at is the GRIP pose, and nothing touched it. A knob whose
-// name matched the symptom but not the pose is worse than no knob — it reads as
-// "the rotation is not the problem" when the rotation was never applied.
-// Read once and SAY so, and the saying is why this is split out rather than
-// being a lazy init inside the corrector: the corrector only runs when a hand
-// is actually being tracked, so on any run without a frontend — every host run
-// — it never executes and the log never said which pitch was in force. A knob
-// whose value cannot be confirmed from the log is half a knob, and this pair is
-// specifically the one a person A/Bs against a picture.
+// Read once and SAY so, which is why this is split out rather than being a lazy
+// init inside the corrector: the corrector only runs while a hand is tracked, so
+// on a run without a frontend — every host run — it never executes and the log
+// never states which pitch is in force. This pair is the one a person A/Bs
+// against a picture.
 //
 // Called from xrCreateActionSpace, which happens whenever a guest uses
 // controllers at all, tracked or not.
@@ -2167,9 +2137,8 @@ enum { KLXR_ACTION_TYPE_BOOLEAN = 1, KLXR_ACTION_TYPE_FLOAT = 2,
 // descriptions up in controller_config.json's `staticProps` table **keyed by
 // the active profile**, and says so by name when it fails: `[XRInput] Couldn't
 // find static props for active interaction profile: %lu`. Answering XR_NULL_PATH
-// is what left VTE_PROPS_STATIC_L/_R unpublished — the same shape as the
-// `delmar` -> `hollywood` correction (SL-12), a lookup keyed on a device
-// identity we answered wrong, breaking a feature two subsystems away.
+// is what leaves VTE_PROPS_STATIC_L/_R unpublished: a lookup keyed on a device
+// identity answered wrong, breaking a feature two subsystems away.
 //
 // Touch is also the CONSISTENT answer rather than merely a plausible one: this
 // shim presents a Quest 2 everywhere else (Build.MODEL, Build.PRODUCT
@@ -2177,8 +2146,8 @@ enum { KLXR_ACTION_TYPE_BOOLEAN = 1, KLXR_ACTION_TYPE_FLOAT = 2,
 // reads "Oculus Quest2 (Left Controller)" / "oculus_touch". Answering a
 // different profile would be the inconsistent act.
 //
-// It is not, however, the ONLY profile we can drive, and 2026-08-14 proved
-// WHY it cannot stay hardcoded: VRChat NEVER suggests the Touch profile. A
+// It is not, however, the ONLY profile we can drive, and it cannot be
+// hardcoded: VRChat NEVER suggests the Touch profile. A
 // Steam Frame build binds exclusively under /interaction_profiles/valve/
 // frame_controller_valve (48 bindings), and with Touch hardcoded as active
 // every one of them decoded "inactive profile" — so VRChat had controllers and
@@ -2682,14 +2651,13 @@ static XrResult klxr_AttachSessionActionSets(void *session,
 
 // Which physical controller the runtime bound this hand's actions to.
 //
-// This USED to answer XR_NULL_PATH, on the reasoning that no controller is
-// present so nothing is bound. The reasoning was sound and the consequence was
-// not: the guest keys its whole controller description off this value, so
-// "nothing" meant SteamVR was never told the controllers exist. See the
-// KLXR_ACTIVE_PROFILE comment for why Touch is the consistent answer.
+// Never XR_NULL_PATH, however reasonable "no controller is present, so nothing
+// is bound" sounds: the guest keys its whole controller description off this
+// value, and nothing bound means SteamVR is never told the controllers exist.
+// See the KLXR_ACTIVE_PROFILE comment for why Touch is the consistent answer.
 //
-// It is answered per top-level path, and only for the two hands: a profile for
-// `/user/gamepad` would be a claim we have one.
+// Answered per top-level path, and only for the two hands: a profile for
+// `/user/gamepad` would be a claim to have one.
 static XrResult klxr_GetCurrentInteractionProfile(void *session, XrPath top_level_path,
                                                   XrInteractionProfileState *state) {
     klxr_session *s = klxr_sess(session);
@@ -3210,26 +3178,24 @@ static XrResult klxr_StopHapticFeedback(void *session, const XrHapticActionInfo 
 
 // --------------------------------------------------------------- swapchains
 //
-// **This is where the VR arc meets P5.** In OpenXR the RUNTIME owns the eye
-// images and lends them to the app — the reverse of OVRPlugin, where Unity
-// generated the texture names and ovrp_SetupEyeTexture2 was handed one to put
-// storage behind. The consequence is good for us: the guest renders into
-// textures WE created, so the compositor's seam is on our side of the boundary
-// from the start rather than being recovered from a name the guest picked.
+// The eye seam runs the OPPOSITE direction from OVRPlugin's: in OpenXR the
+// RUNTIME owns the eye images and lends
+// them to the app, where Unity generates the texture names and
+// ovrp_SetupEyeTexture2 is handed one to put storage behind. The guest
+// therefore renders into textures created here, so the compositor's seam needs
+// no recovery from a name the guest picked.
 //
-// So an image here is created exactly the way kl_ovrp's eye textures are, and
-// registered with kl_glfb the same way — kl_glfb_note_eye_texture for the
-// capture path, and the MTLTexture provider when one is present, which is what
-// makes these images the *same* MTLTextures KleptonCompositor already samples.
-// Nothing new has to be invented for the visionOS side; it is the identical
-// seam reached through a different API.
+// An image is created exactly as kl_ovrp's eye textures are and registered with
+// kl_glfb the same way — kl_glfb_note_eye_texture for the capture path, plus the
+// MTLTexture provider when one is present — so these images ARE the MTLTextures
+// KleptonCompositor samples. The visionOS side is the identical seam reached
+// through a different API.
 //
-// One thing deliberately NOT done: multisampling. sampleCount > 1 would need an
-// MSAA texture and a resolve, and the VRR work (trap in notes/VISIONOS.md) is
-// specifically about keeping the eye resolve a physical-to-physical copy. We
-// recommend 1 sample in the view configuration; an app asking for more gets a
-// named refusal rather than a silent downgrade to 1, because a silent one would
-// have it believe its edges were being antialiased.
+// Deliberately absent: multisampling. sampleCount > 1 needs an MSAA texture and
+// a resolve, and the VRR work keeps the eye resolve a
+// physical-to-physical copy. The view configuration recommends 1 sample; an app
+// asking for more gets a named refusal rather than a silent downgrade, which
+// would leave it believing its edges were antialiased.
 enum { KLXR_MAGIC_SWAPCHAIN = 0x584b4c57 /* 'XKLW' */ };
 // Measured, not guessed: this guest creates a pair of eye swapchains, tears
 // them down and rebuilds them as it moves between scenes, and allocates one
@@ -3280,7 +3246,7 @@ static klxr_swapchain *klxr_swapchain_of(void *h) {
 // tonemapping of its own. The depth formats are last and are there because an
 // app that submits a depth layer needs somewhere to render depth into — and on
 // visionOS depth is not optional decoration, it is what the system reprojects
-// with (§12.16, and it cost a session to find).
+// with.
 #define KLXR_GL_SRGB8_ALPHA8      0x8C43
 #define KLXR_GL_RGBA8             0x8058
 #define KLXR_GL_RGBA16F           0x881A
@@ -3398,8 +3364,8 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
                 info->sampleCount);
         return KLXR_ERROR_FEATURE_UNSUPPORTED;
     }
-    // faceCount 6 is a cubemap. Nothing in the eye path wants one, and serving
-    // it wrongly would be worse than not serving it.
+    // faceCount 6 is a cubemap. Nothing in the eye path wants one; refused
+    // rather than served as a 2D image.
     if (info->faceCount != 1) return KLXR_ERROR_FEATURE_UNSUPPORTED;
     if (!info->width || !info->height || !info->arraySize || !info->mipCount)
         return KLXR_ERROR_VALIDATION_FAILURE;
@@ -3490,22 +3456,22 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
     return KLXR_SUCCESS;
 }
 
-// ---- P5: giving an eye swapchain's images MTLTexture storage -------------
+// ---- giving an eye swapchain's images MTLTexture storage -----------------
 //
-// **The ordering problem, and why this is here and not in xrCreateSwapchain.**
-// The provider is asked for storage for a texture the guest has already told us
+// The ordering problem, and why this is here and not in xrCreateSwapchain: the
+// provider is asked for storage for a texture the guest has already told us
 // is an eye. An OpenXR guest cannot tell us that at allocation time:
 // xrCreateSwapchain knows a size and a format, nothing more, and *which*
 // swapchain is an eye is only asserted at xrEndFrame, from the projection
-// layer. Creation order does not say it either — measured, and wrong (SL-9):
-// this guest makes a pair per projection layer, more for its UI panels and its
+// layer. Creation order does not say it either, measured and wrong: this guest
+// makes a pair per projection layer, more for its UI panels and its
 // video stream, and rebuilds all of them across scene changes.
 //
 // So the backing is retroactive: the guest renders into ordinary GL storage
 // until it presents a frame that names the swapchain as an eye, and from that
 // frame on the same GL texture names are re-pointed at MTLTextures the
-// compositor owns. **One frame per swapchain generation is lost** — it was
-// drawn into storage nothing samples — and that is the whole price. The
+// compositor owns. ONE frame per swapchain generation is lost — drawn into
+// storage nothing samples — and that is the whole price. The
 // alternative, backing every swapchain image at creation, costs the memory of
 // every UI panel and stream buffer as well; this guest submits four projection
 // layers a frame plus 1536x1536 panels, so it is not a small difference.
@@ -3523,7 +3489,7 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
 // one. Under Vulkan there is nothing to provide and nothing to copy: the image
 // was allocated through MoltenVK, which has ALREADY backed it with an
 // MTLTexture, so the texture the compositor wants exists before we ask. We
-// EXPORT it. That is BONELAB's finding (notes/BONELAB.md) reached through the
+// EXPORT it. That is BONELAB's finding reached through the
 // other API, and it is why this path needs no provider at all — which matters,
 // because a host run without a frontend has none.
 //
@@ -3777,7 +3743,7 @@ static XrResult klxr_ReleaseSwapchainImage(void *swapchain,
 // the head pose for the duration of a guest frame because reading it live
 // mid-frame means the pose recorded for reprojection is not the pose the
 // picture was drawn from — an error that presents as the image doubling during
-// head turns and grows as the frame rate falls (§12.19). OpenXR's frame loop
+// head turns and grows as the frame rate falls. OpenXR's frame loop
 // has exactly one place that means "the guest's next frame starts here", and
 // this is it.
 // See kl_openxr.h. NULL is the command line's state and the default.
@@ -3796,7 +3762,7 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
     // the pose this frame is pinned to must be the one the compositor just
     // published, not the one it had published by the time the guest last asked.
     // Getting that order wrong costs a whole frame of prediction and presents as
-    // the doubling §12.19 records, which is exactly the bug the latch exists for.
+    // the temporal doubling the latch exists to prevent.
     if (g_frame_pacer) g_frame_pacer();
 
     kl_ovrp_frame_latch();
@@ -4115,14 +4081,12 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
 // Where one space is, relative to another.
 //
 // Both spaces are put into the tracking space and one is composed into the
-// other, which is klxr_space_pose_ex and klxr_pose_rel and nothing else here.
-// The pair that used to be special-cased — VIEW located in a static space — is
-// just the case where the left operand carries a rotation, and the pair that
-// used to be impossible to express — anything located in VIEW — falls out. An
-// ACTION space is now the third kind and needs no case of its own either: it is
-// a pose in the tracking space like the others, and the only thing that
-// distinguishes it is that it can be UNTRACKED, which is a flags answer rather
-// than a different computation.
+// other — klxr_space_pose_ex and klxr_pose_rel, and nothing else here. No pair
+// is special-cased: VIEW located in a static space is the case where the left
+// operand carries a rotation, anything located in VIEW falls out of the same
+// composition, and an ACTION space is a pose in the tracking space like the
+// others. The only thing distinguishing an action space is that it can be
+// UNTRACKED, which is a flags answer rather than a different computation.
 static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
                                  XrSpaceLocation *location) {
     klxr_space *sp = klxr_space_of(space);
@@ -4183,8 +4147,8 @@ static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
     // unchanged while that base is static; against VIEW or another action space
     // it would need the base's own motion, which nothing here measures. Saying
     // "we do not know" there is the honest answer — and the alternative is the
-    // failure this call already had once, where an unfilled struct became the
-    // client's basis for pose prediction (SL-13).
+    // alternative is an unfilled struct becoming the client's basis for pose
+    // prediction.
     int base_static = bs->reference_type == KLXR_REF_SPACE_LOCAL ||
                       bs->reference_type == KLXR_REF_SPACE_STAGE;
     // ...and only if it is a measurement. Without this the derived-velocity
@@ -4339,7 +4303,7 @@ static void klxr_install(void) {
                                    (void *)klxr_GetInputSourceLocalizedName},
         {"xrApplyHapticFeedback",  (void *)klxr_ApplyHapticFeedback},
         {"xrStopHapticFeedback",   (void *)klxr_StopHapticFeedback},
-        // swapchains — the eye images, and the P5 seam
+        // swapchains — the eye images, and the compositor seam
         {"xrEnumerateSwapchainFormats",
                                    (void *)klxr_EnumerateSwapchainFormats},
         {"xrCreateSwapchain",      (void *)klxr_CreateSwapchain},
@@ -4419,21 +4383,19 @@ void *kl_openxr_sym(const char *name) {
     return kl_openxr_lookup(name);
 }
 
-// --- SL-16: the space algebra, with no session and no guest -----------------
+// --- the space algebra, with no session and no guest ------------------------
 //
-// `make xrspace`. This gate exists because the bug it catches does not look
-// like a bug from anywhere else: the runtime answered every call, returned
-// success, and the picture was correct. What was wrong was a pose, and the only
-// instrument that could see it was a human turning their head — which, on this
-// arc, costs a fresh Steam pairing to arrange and cannot be repeated
-// identically. So the invariant is asserted here instead, in a second.
+// `make xrspace`. The bug this catches is invisible from anywhere else: every
+// call returns success and the picture is correct, and the only other
+// instrument is a human turning their head inside a live stream — which costs a
+// fresh Steam pairing and cannot be repeated identically.
 //
-// The invariant is the one klxr_space_pose exists to keep: an answer given
-// RELATIVE to the head must not contain the head's own position. Location in
-// VIEW space used to be modelled as a y displacement of zero, which meant the
-// eye-to-head came back as the eye's absolute position in the tracking space —
-// so SteamVR rotated the eye about a point as far away as the head was from the
-// origin, and the view swung through an arc instead of turning in place.
+// The invariant klxr_space_pose exists to keep: an answer given RELATIVE to the
+// head must not contain the head's own position. Model
+// VIEW as a y displacement of zero and the eye-to-head comes back as the eye's
+// absolute position in the tracking space, so SteamVR rotates the eye about a
+// point as far from it as the head is from the origin and the view swings
+// through an arc instead of turning in place.
 static int klxr_st_pos(FILE *f, const char *what, XrVector3f p,
                        float x, float y, float z) {
     int ok = fabsf(p.x - x) <= 1e-4f && fabsf(p.y - y) <= 1e-4f &&
@@ -4455,7 +4417,7 @@ static klxr_space klxr_st_space(int type, float ox, float oy, float oz) {
     return s;
 }
 
-// --- SL-20: the action surface, with no session and no guest ----------------
+// --- the action surface, with no session and no guest -----------------------
 //
 // `make xrinput`. Same reason as the gate above, one API family across: every
 // failure this path can have returns XR_SUCCESS and draws a correct picture.
@@ -4753,13 +4715,11 @@ int kl_openxr_input_selftest(FILE *f) {
                 loc.pose.position.x, want);
         ok &= good;
 
-        // ...and the correction actually REACHES the grip pose. This assertion
-        // exists because the first version applied the pitch to aim spaces
-        // only, so KL_XR_GRIP_PITCH moved nothing a user could see — the
-        // controller is the grip pose — and the knob read as "the rotation is
-        // not the problem" while the rotation was never applied. A pitch that
-        // silently misses its pose has no other symptom: the position is right,
-        // the space is tracked, and every call returns XR_SUCCESS.
+        // ...and the correction actually REACHES the grip pose. A pitch that
+        // misses its pose has no other symptom — the position is right, the
+        // space is tracked, every call returns XR_SUCCESS — and applied to aim
+        // spaces alone it moves nothing a user can see, because the controller
+        // they are looking at IS the grip pose.
         //
         // The hand was published at the identity, so the whole orientation here
         // IS the correction: q.x = sin(pitch/2).
@@ -4792,9 +4752,8 @@ int kl_openxr_input_selftest(FILE *f) {
                          fabsf(a.pose.orientation.x - g.pose.orientation.x) < 1e-4f);
     }
 
-    // Haptics: the two entry points that used to abort. What is checked is that
-    // the order REACHES kl_ovrp's queue — the frontend half of that seam is
-    // M8's and already gated by `make haptics`.
+    // Haptics: what is checked is that the order REACHES kl_ovrp's queue — the
+    // frontend half of that seam is M8's, gated by `make haptics`.
     fprintf(f, "  --- haptics ---\n");
     XrHapticActionInfo hi;
     memset(&hi, 0, sizeof hi);
@@ -4826,7 +4785,8 @@ int kl_openxr_input_selftest(FILE *f) {
     // ---- the Steam Frame profile (VRChat) ----------------------------------
     //
     // This is the section that made the active profile dynamic. VRChat is the
-    // guest that did: it suggests ONLY /interaction_profiles/valve/\n    // frame_controller_valve (48 bindings), NEVER Touch, so with Touch
+    // guest that did: it suggests ONLY /interaction_profiles/valve/\n    
+    // frame_controller_valve (48 bindings), NEVER Touch, so with Touch
     // hardcoded as active every one of its suggestions decoded "inactive
     // profile" and the guest's controllers were dead. The map below is that
     // guest's own, transcribed from a real run and trimmed to the controls
@@ -4891,10 +4851,8 @@ int kl_openxr_input_selftest(FILE *f) {
                          ((klxr_action *)vgrip)->bit[0] == KL_OVRP_RAW_LHAND_TRIGGER &&
                          ((klxr_action *)vgrip)->kind[1] == KLXR_SRC_BUTTON &&
                          ((klxr_action *)vgrip)->bit[1] == KL_OVRP_RAW_RHAND_TRIGGER);
-        // The whole-stick path decodes to a NEW kind that only the Vector2f
-        // getter reads — this is the guest's locomotion input, and it used to
-        // be entirely unreachable because neither the kind nor the getter
-        // existed.
+        // The whole-stick path decodes to a kind only the Vector2f getter
+        // reads — the guest's locomotion input, unreachable without both.
         ok &= klxr_st_ok(f, "Valve: /input/thumbstick is a Vector2f source",
                          ((klxr_action *)vstick)->kind[0] == KLXR_SRC_STICK_VEC &&
                          ((klxr_action *)vstick)->kind[1] == KLXR_SRC_STICK_VEC);
@@ -5050,8 +5008,8 @@ int kl_openxr_space_selftest(FILE *f) {
         ok &= klxr_st_pos(f, "LOCAL in STAGE is the standing height",
                           local_in_stage.position, 0, eh, 0);
 
-        // poseInReferenceSpace, which nothing read at all until SL-16. In VIEW
-        // it must be ROTATED by the head, not merely added to it: a metre in
+        // poseInReferenceSpace. In VIEW it must be ROTATED by the head, not
+        // merely added to it: a metre in
         // front of a head yawed 90 degrees is a metre along -x, not along -z.
         klxr_space ahead = klxr_st_space(KLXR_REF_SPACE_VIEW, 0, 0, -1.0f);
         XrPosef a = klxr_pose_rel(klxr_space_pose(&stage), klxr_space_pose(&ahead));

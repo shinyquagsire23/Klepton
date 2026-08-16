@@ -1,6 +1,6 @@
-// SL-19 — the broadcast fan-out. `make bcast`, in `make check`.
+// The broadcast fan-out. `make bcast`, in `make check`.
 //
-// Steam Link finds hosts by UDP broadcast to 255.255.255.255:27036 (SL-5). On
+// Steam Link finds hosts by UDP broadcast to 255.255.255.255:27036. On
 // visionOS an app may not broadcast without `com.apple.developer.networking.
 // multicast`, which Apple grants by REQUEST — so the computer list stays empty
 // and there is no build setting that fixes it. kl_shim.c's answer is to deliver
@@ -19,8 +19,7 @@
 //   2. the datagram actually ARRIVES at the configured host, byte for byte;
 //   3. the call REPORTS SUCCESS even though the underlying broadcast was
 //      refused — the guest must not see the platform's refusal, or it counts a
-//      TX failure and tears the link down (the shape SL-11's sendto-on-a-
-//      connected-socket bug had);
+//      TX failure and tears the link down;
 //   4. an ordinary unicast send is untouched, which is what says this is a
 //      narrow intercept and not a rewrite of the send path.
 #include <arpa/inet.h>
@@ -111,7 +110,7 @@ int main(void) {
     setenv("KL_SLINK_HOST", "127.0.0.1", 1);
     setenv("KL_NET_BCAST_FANOUT", "1", 1);
 
-    printf("=== SL-19: the broadcast fan-out ===\n");
+    printf("=== the broadcast fan-out ===\n");
 
     sendto_fn shim_sendto = (sendto_fn)kl_shim_lookup("sendto");
     if (!shim_sendto) { printf("FAIL: the shim has no sendto\n"); return 1; }

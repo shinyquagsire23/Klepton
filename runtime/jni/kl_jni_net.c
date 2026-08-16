@@ -103,7 +103,7 @@ static klj_val klj_X509TM_getAcceptedIssuers(void *env, void *self, const klj_va
 // that is where Java declares it and where libunity looks it up (see g_supers).
 // Built fresh on every call rather than cached: the guest copies the bytes out
 // and drops the array, and a cached one would be retired by the guest's own
-// correct DeleteLocalRef (trap 16c).
+// correct DeleteLocalRef.
 static klj_val klj_X509Cert_getEncoded(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_object *o = klj_as_object(self);
@@ -359,8 +359,7 @@ static klj_val klj_Thread_setName(void *env, void *self, const klj_val *a, int n
 // A void method whose effect is on state we do not model. Shared, but only ever
 // bound to methods that genuinely return void — the arguments are ignored, so
 // binding it to something with a return value would hand the guest a zero it
-// would read as an answer (trap 6b, which was exactly a handler reused for the
-// wrong shape).
+// would read as an answer.
 static klj_val klj_void_noop(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 0};

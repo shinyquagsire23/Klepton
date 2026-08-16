@@ -2,19 +2,17 @@
 //
 // This is t_boot's sequence with the harness removed. What goes away is
 // everything that assumed a command line and a Unix process tree: the forked
-// DRM-guard self-test, the re-exec'd recon child (PLANNING §12.2 — an app
-// bundle never forks, and the Metal-refuses-forked-children reason for it is
-// moot once it does not), argv path handling, and the SDL viewer.
+// DRM-guard self-test, the re-exec'd recon child (an app bundle never forks, and the Metal-refuses-forked-children reason for it is moot once it does not), argv path handling, and the SDL viewer.
 //
 // What stays is the part that is actually under test: load libmain, run its
 // JNI_OnLoad against the synthetic JavaVM, drive NativeLoader.load to pull in
-// libunity, and call UnityPlayer.initJni. That is the P4 gate.
+// libunity, and call UnityPlayer.initJni. That is the boot gate.
 //
 // Deliberately C, not Swift. Everything here is guest-facing — opaque jobjects,
 // function pointers cast to JNI signatures, a JNIEnv we synthesise — and none
 // of it is expressible in Swift without fighting the type system for nothing.
-// PLANNING §12.6 puts the language boundary at the platform layer: Swift owns
-// the App, the ImmersiveSpace, Metal and ARKit; C owns the guest.
+// The language boundary is the platform layer: Swift owns the App, the
+// ImmersiveSpace, Metal and ARKit; C owns the guest.
 #ifndef KL_APP_H
 #define KL_APP_H
 
@@ -23,7 +21,7 @@
 // the app's Documents dir, where the 2.3 GB of APK assets are staged and where
 // the guest's writable roots live.
 //
-// Both must be absolute — trap 6c: Unity mounts the APK into its VFS under
+// Both must be absolute: Unity mounts the APK into its VFS under
 // whatever getPackageCodePath() returned and then resolves entries by
 // concatenation, so a relative mount point silently stops matching and the
 // failure surfaces three layers away as "not enough storage space".
@@ -51,19 +49,20 @@ int kl_app_boot(void);
 // nativeRender, then `frames` more pumped frames with the Choreographer ticked
 // and the posted-task queue drained between them.
 //
-// Separate from kl_app_boot on purpose. Boot is the P4 gate and refuses a second
+// Separate from kl_app_boot on purpose. Boot is the gate and refuses a second
 // entry, so keeping them apart lets a run take the gate's numbers first and only
 // then go further — and it keeps "initJni completed" reportable even when the
-// lifecycle is what fails. This is P5.4: it is where libil2cpp (66 MB, 3,083 x18
-// veneers) first loads under AMFI, and where the synthetic /proc is first read on
-// device (trap 6d — it prints that before anything else, because a silent zero
-// there is what made Unity refuse to start on the host).
+// lifecycle is what fails. It is where libil2cpp (66 MB, 3,083 x18 veneers)
+// first loads under AMFI, and where the synthetic /proc is first read on device.
+// The /proc dump prints before anything else, because a silent zero there is
+// what makes Unity refuse to start.
 //
 // Returns 0 if the sequence completed. Once per process.
 int kl_app_lifecycle(unsigned frames);
 
 // The same lifecycle, taken apart so something else can be the frame clock.
-// P5b needs this: on device the deadline belongs to Compositor Services
+// The compositor needs this: on device the deadline belongs to Compositor
+// Services
 // (cp_frame_predict_timing), so the compositor calls kl_app_frame() once per
 // drawable rather than the guest owning a pump loop of its own. This is also
 // why CADisplayLink was not added as an interim pacer — it would be a third
@@ -72,17 +71,18 @@ int kl_app_lifecycle(unsigned frames);
 // _begin runs everything up to the first frame (the synthetic /proc report,
 // nativeRecreateGfxState, nativeResume, nativeRender) and is once per process,
 // exactly as kl_app_lifecycle is. _frame runs one frame and returns what
-// nativeRender returned, or -1 if _begin has not run. _report prints the P5.4
-// numbers. kl_app_lifecycle is implemented on top of these three, so its
+// nativeRender returned, or -1 if _begin has not run. _report prints the
+// lifecycle numbers. kl_app_lifecycle is implemented on top of these three, so its
 // measurement is unchanged.
 int  kl_app_lifecycle_begin(void);
 int  kl_app_frame(void);
 void kl_app_lifecycle_report(void);
 
-// The guest on its own thread — PLANNING §12.12.
+// The guest on its own thread.
 //
 // Calling kl_app_frame() straight from the compositor's render loop, which is
-// what P5b did, means the guest's nativeRender runs *inside* Compositor
+// the compositor once did, means the guest's nativeRender runs INSIDE
+// Compositor
 // Services' submission window: the loop cannot present until the guest has
 // finished, so a late guest frame is a missed display frame rather than a
 // reprojected one. That defeats the reprojection pass, whose entire purpose is
@@ -103,7 +103,8 @@ void kl_app_lifecycle_report(void);
 // _start is once per process, as _begin is. It returns 0 if the thread was
 // spawned — not if the guest booted, which happens on the thread and is
 // reported through kl_app_guest_state(). _stop asks the thread to finish the
-// frame it is in, joins it, and only then returns, so the P5.4 report (which
+// frame it is in, joins it, and only then returns, so the lifecycle report
+// (which
 // belongs to the guest's loop end, not the render loop's) has been written by
 // the time the caller continues.
 int  kl_app_guest_start(void);
@@ -140,11 +141,11 @@ int         kl_app_target_is_steamlink(void);
 // symptom is a black immersive space and a pacing hypothesis.
 int         kl_app_target_owns_frame_loop(void);
 
-// The 2D -> VR handoff (PLANNING §11.9), from the Swift side's point of view.
+// The 2D -> VR handoff, from the Swift side's point of view.
 //
 // Steam Link's 2D shell pairs with a host, and when the host authorizes it
 // calls SteamLink.startVRLink(sArgs) and finishes itself. On the host that is a
-// re-exec into the OpenXR front door (SL-15); an app bundle cannot re-exec, so
+// re-exec into the OpenXR front door; an app bundle cannot re-exec, so
 // here the window's job is to notice this has happened and open the
 // ImmersiveSpace. The guest thread the compositor then starts opens the other
 // front door in the same process.

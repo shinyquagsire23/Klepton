@@ -69,7 +69,7 @@ static void push(uint32_t mask, uint8_t value, int n) {
 }
 
 int main(void) {
-    printf("=== haptics seam (M8) ===\n");
+    printf("=== haptics seam ===\n");
     get_desc      = kl_ovrp_sym("ovrp_GetControllerHapticsDesc");
     get_state     = kl_ovrp_sym("ovrp_GetControllerHapticsState");
     set_haptics   = kl_ovrp_sym("ovrp_SetControllerHaptics");

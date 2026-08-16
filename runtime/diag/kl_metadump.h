@@ -3,8 +3,8 @@
 //
 // It exists for VRChat, and for every target that ever protects its metadata the
 // same way. VRChat's `global-metadata.dat` on disk begins `0xad6b5f05` instead of
-// IL2CPP's `0xFAB11BAF`: the string table is plaintext (which is why every type
-// name and source path in notes/VRCHAT.md is greppable) and the index tables are
+// IL2CPP's `0xFAB11BAF`: the string table is plaintext (so every type name and
+// source path is greppable on disk) and the index tables are
 // not, so nothing on disk maps a name to a method or a method to an address. The
 // usual second door is shut too — `libil2cpp.so` has 2241 dynamic symbols and
 // exactly three matching `il2cpp_*`, the rest renamed, which is the real reason

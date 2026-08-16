@@ -2,16 +2,16 @@ import SwiftUI
 import Foundation
 import CompositorServices
 
-// The visionOS host app (PLANNING §12.6 — Swift for the platform layer).
+// The visionOS host app (Swift for the platform layer).
 //
-// P4 was deliberately a plain WindowGroup and nothing else: the gate is "the
+// The boot gate is deliberately a plain WindowGroup and nothing else: the gate is "the
 // guest boots inside an app bundle under AMFI, and a veneer executes", and an
 // ImmersiveSpace would have put Compositor Services into the picture before
 // there was anything to present, so a failure in either half would have read
 // as a failure of the other.
 //
-// P5b adds the immersive path *beside* it rather than in place of it, behind
-// KL_IMMERSIVE. The window still boots and still reports, so P4's measurement
+// The immersive path sits BESIDE it rather than in place of it, behind
+// KL_IMMERSIVE. The window still boots and still reports, so the boot measurement
 // stays takeable on the same binary — which matters because that measurement
 // is how a device regression gets localised.
 
@@ -38,7 +38,7 @@ enum Immersive {
     //
     // Klepton runs a VR title, so the immersive space IS the app: launching from
     // the Home View and getting a window with a Boot button is a test harness,
-    // not a product. P4's window-and-report shape stays exactly one knob away
+    // not a product. The window-and-report shape stays exactly one knob away
     // (KL_IMMERSIVE=0) because it is the measurement that localises a device
     // regression.
     //
@@ -351,10 +351,10 @@ struct BootView: View {
             // the path. There is a wide margin here: boot ends at initJni and
             // the first [sl] line is thousands of log lines later.
             KleptonAudio.start()
-            // P5.4: carry on into the Android lifecycle when asked, in the same
+            // Carry on into the Android lifecycle when asked, in the same
             // process and on the same thread. Only after boot has reported, so a
             // lifecycle failure cannot be mistaken for a boot failure — and only
-            // when asked, because P4's gate is a boot that stops at initJni and
+            // when asked, because the gate is a boot that stops at initJni and
             // it must stay possible to take exactly that measurement.
             //
             // This is where libil2cpp (66 MB, 3,083 x18 veneers) first loads
@@ -375,7 +375,7 @@ struct BootView: View {
             // finished and never started the activity.
             // ...and whether it is asked for AT ALL differs too. Beat Saber's
             // window path stops at initJni unless KL_FRAMES says otherwise,
-            // because continuing is what P4's gate must not do. Steam Link's has
+            // because continuing is what the gate must not do. Steam Link's has
             // no such reason: its chain report is printed and complete BEFORE
             // the activity starts, so that measurement stays takeable from any
             // run, and stopping there instead would mean the default launch

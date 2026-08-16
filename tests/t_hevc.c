@@ -43,7 +43,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "../runtime/kl_vtdec.h"
+#include "../runtime/media/kl_vtdec.h"
 
 #define STREAM "tests/data/t_hevc.h265"
 #define EXPECT_W 320

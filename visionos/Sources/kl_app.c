@@ -21,16 +21,15 @@
 #include "kl_ue4.h"       // the NativeActivity door for an Unreal guest
 #include "kl_mono.h"      // the flat guest's window seam — frame out, pointer in
 #include "kl_glfb.h"      // kl_glfb_release_current — the handoff hands the context on
-#include "kl_x18.h"       // trap 11 — claim TSD slot 300 before anything else can
+#include "kl_x18.h"       // claim the veneers' TSD slot before anything else can
 #include "kl_guestpoke.h" // libunity's texture-unit cap, raised before frame 1
 #include "kl_env.h"
 
 // --- Which guest ------------------------------------------------------------
 //
-// The table itself is runtime/kl_target.h now — one row per guest, generated
-// from visionos/targets.py, and shared with `build/m_boot` so the host driver
-// and the app cannot describe one guest differently. This file used to carry
-// its own array of literals; that was the third copy of the same table.
+// The table is runtime/kl_target.h — one row per guest, generated from
+// visionos/targets.py and shared with `build/m_boot`, so the host driver and the
+// app cannot describe one guest differently.
 //
 // The default is baked in at BUILD time (KL_TARGET_DEFAULT, set by
 // gen_xcodeproj.py) rather than read from the environment, because the app has
@@ -48,10 +47,10 @@ static const kl_target *g_target;
 // Which of Steam Link's front doors this run opened, and whether the VR one's
 // chain has been mapped yet.
 //
-// **Both doors can be opened by one process here, and that is the difference
-// between this driver and `build/m_slink`.** On the host the shell pairs and
-// then re-EXECs into the VR door carrying the session (SL-15), which makes
-// every question about tearing the shell down go away. An app bundle cannot
+// Both doors can be opened by one process here, which is the difference between
+// this driver and `build/m_slink`. On the host the shell pairs and then re-EXECs
+// into the VR door carrying the session, which makes every question about
+// tearing the shell down go away. An app bundle cannot
 // re-exec, so the two chains coexist: the shell's fourteen libraries stay
 // mapped and its main thread parks inside startVRLink, exactly as an Android
 // activity that called finishAndRemoveTask() would stop running.
@@ -112,15 +111,16 @@ int kl_app_configure(const char *resources, const char *container) {
     g_target = kl_target_lookup(want);
     if (!g_target) return missing("guest target (KL_TARGET)", want);
 
-    // Trap 11, claimed HERE rather than wherever the first guest library happens
-    // to load. TSD slot 300 is a constant baked into every veneer, and Darwin
-    // hands external pthread keys out upward and never reissues a held one — so
-    // whether it is still free is a race against everything else in the process
-    // that creates keys. Beat Saber won that race by accident: kl_app_boot loads
-    // libmain before ANGLE exists. The Steam Link chain does not — something on
-    // its load path brings ANGLE up first, ANGLE takes the process past 300, and
-    // the guest then fails to load with "TSD slot 300 is unavailable", which
-    // reads as a platform limit and is a scheduling accident.
+    // The veneers' TSD slot is claimed HERE rather than wherever the first guest
+    // library happens to load. The slot number is a constant baked into every
+    // veneer, and Darwin hands external pthread keys out upward and never
+    // reissues a held one — so whether it is still free is a race against
+    // everything else in the process that creates keys. Beat Saber wins it by
+    // accident: kl_app_boot loads libmain before ANGLE exists. The Steam Link
+    // chain does not — something on its load path brings ANGLE up first, ANGLE
+    // takes the process past the slot, and the guest fails to load with "TSD
+    // slot N is unavailable", which reads as a platform limit and is a
+    // scheduling accident.
     //
     // This is the earliest point both targets share. It is not fatal on its own:
     // an ELF-tree run with no veneered library is unaffected, and the load path
@@ -130,12 +130,11 @@ int kl_app_configure(const char *resources, const char *container) {
                         "configure time — a veneered guest will refuse to load\n",
                 KLX_TSD_SLOT);
 
-    // The guest libraries ride in the bundle: AMFI is content about a dylib
-    // inside a bundle we signed (P3/P12), and nothing has established that it
-    // is content about one pushed into Documents afterwards. The 2.3 GB of
-    // assets go the other way — into the container — because they carry no
-    // code and re-uploading them on every install would make the M4 loop
-    // unusable. See visionos/README.md.
+    // The guest libraries ride in the bundle: AMFI accepts a dylib inside a
+    // bundle we signed, and nothing has established that it accepts one pushed
+    // into Documents afterwards. The 2.3 GB of assets go the other way — into
+    // the container — because they carry no code and re-uploading them on every
+    // install would make the edit/run loop unusable. See visionos/README.md.
     snprintf(g_libdir, sizeof g_libdir, "%s/guest/lib/arm64-v8a", resources);
     // Frameworks/, not a directory of our own: that is where Xcode code-signs
     // what it embeds, and a loose Mach-O elsewhere in the bundle is only
@@ -148,13 +147,13 @@ int kl_app_configure(const char *resources, const char *container) {
 
     // Check before running, not after failing. A missing asset tree otherwise
     // surfaces three layers up inside Unity as something that reads like a shim
-    // bug — trap 6c is exactly that failure wearing a different hat.
+    // bug.
     // With translations embedded, g_libdir never has to exist: it is only the
     // string NativeLoader.load() is handed and the prefix the DT_NEEDED walk
     // builds paths from, and kl_load_auto turns "<libdir>/libunity.so" into
-    // "Frameworks/libunity.framework/libunity" before touching the disk. So the
-    // ELF tree is not in the bundle — 80 MB that would buy an A/B against the
-    // mmap loader, which is the thing M1b exists to replace.
+    // "Frameworks/libunity.framework/libunity" before touching the disk. The ELF
+    // tree is therefore not in the bundle — 80 MB that would buy only an A/B
+    // against the mmap loader the translations replace.
     if (!have_translations() && !have(g_libdir))
         return missing("guest libraries (neither translations nor an ELF tree)", g_libdir);
     if (!have(g_assets)) return missing("staged assets (run stage_assets.sh)", g_assets);
@@ -165,9 +164,9 @@ int kl_app_configure(const char *resources, const char *container) {
         // Which front door this launch opens. The SHELL is the default because
         // it is the only one that can produce a session: the VR half reads its
         // own out of the launching Intent and leaves before its first frame
-        // without one (SL-9). A run that was HANDED a session by hand — the
-        // SL-17 shape, KL_SLINK_SARGS from a host pairing — wants the VR door
-        // directly, and says so by carrying one.
+        // without one. A run handed a session by hand — KL_SLINK_SARGS from a
+        // host pairing — wants the VR door directly, and says so by carrying
+        // one.
         g_door = KL_SLINK_SHELL;
         if (kl_env_on("KL_SLINK_VR", 0) || kl_env_str("KL_SLINK_SARGS", NULL))
             g_door = KL_SLINK_VR;
@@ -222,7 +221,7 @@ int kl_app_configure(const char *resources, const char *container) {
         kl_jni_set_apk_path(g_apk);
         kl_jni_set_files_dir(g_files);
         // Raw "<apk>/assets/..." opens: Unity mounts the APK into its VFS and
-        // then resolves entries by concatenating onto the mount point (trap 6c).
+        // then resolves entries by concatenating onto the mount point.
         kl_guest_path_map(g_apk, g_assets);
     }
 
@@ -458,7 +457,7 @@ int kl_app_open_log(void) {
 static int steamlink_load_vr(void) {
     if (g_vr_loaded) return 0;
     // Re-describing the app, because the VR half is a DIFFERENT ACTIVITY in the
-    // same package (§11.9) — android/app/NativeActivity with `android.app.
+    // same package — android/app/NativeActivity with `android.app.
     // lib_name`, not SteamLink with the SDL <meta-data>. On the host the
     // re-exec did this by starting over; here it is a second call.
     if (kl_slink_configure(KL_SLINK_VR, g_libdir, g_assets, g_apk, g_files,
@@ -476,7 +475,7 @@ static int steamlink_load_vr(void) {
     return 0;
 }
 
-// The 2D -> VR handoff, PLANNING §11.9 — and the one thing about it that is
+// The 2D -> VR handoff — and the one thing about it that is
 // this driver's rather than the host driver's is that **there is no re-exec**.
 //
 // `build/m_slink` replaces its process image, which makes every question about
@@ -503,16 +502,16 @@ static void app_vrlink_handoff(const char *sargs) {
     snprintf(g_sargs, sizeof g_sargs, "%s", sargs ? sargs : "");
     // Through the environment as well as the variable, because that is the path
     // a hand-carried session already takes (KL_SLINK_SARGS) and the guest must
-    // not be able to tell the two apart — SL-17's device runs are the same code.
+    // not be able to tell the two apart.
     setenv("KL_SLINK_SARGS", g_sargs, 1);
 
     printf("\n=== 2D -> VR handoff: the shell paired and the host authorized ===\n");
     printf("    the OpenXR front door opens in the ImmersiveSpace; this thread "
            "parks (no re-exec inside an app bundle)\n");
-    // SL-12's stopgap, and it is announced rather than assumed. On the window
-    // path nothing ever holds a drawable, so no eye offsets are measured and the
-    // IPD is 0 — which this client reads as "unchanged" and never publishes its
-    // projection, so the host sends no video. See notes/VISIONOS.md.
+    // A stopgap, announced rather than assumed. On the window path nothing ever
+    // holds a drawable, so no eye offsets are measured and the IPD is 0 — which
+    // this client reads as "unchanged" and never publishes its projection, so
+    // the host sends no video.
     if (!getenv("KL_OVRP_IPD")) {
         setenv("KL_OVRP_IPD", "0.063", 1);
         printf("    KL_OVRP_IPD=0.063   (STOPGAP: an IPD of 0 stops the host "
@@ -575,7 +574,7 @@ static int boot_steamlink(void) {
         if (!getenv("KL_SLINK_SARGS"))
             printf("\n  NOTE: KL_SLINK_SARGS is unset. This guest reads its session out of\n"
                    "  the launching Intent and exits before its first frame without one —\n"
-                   "  see notes/STEAMLINK.md for the pairing -> handoff loop.\n");
+                   "  pair in the 2D shell first; the handoff carries it.\n");
     } else {
         printf("=== Steam Link: %s front door (%s -> %s) ===\n",
                kl_slink_door_name(), kl_slink_main_lib(), kl_slink_main_fn());
@@ -659,16 +658,13 @@ int kl_app_boot(void) {
     if (!*g_libdir) return fail("kl_app_configure was not called");
     if (open_log()) return fail("could not open the log file");
 
-    // Trap 1, and it had been missing from this driver since P4 — a gap that
-    // one guest happened not to expose. Every thread that runs guest code must
-    // seed bionic's stack-guard canary into TSD slot 5 first, and this is the
-    // thread the whole boot runs on. Beat Saber's chain never noticed: nothing
-    // on the path to initJni has a stack protector on it. libSDL3's JNI_OnLoad
-    // does, so the first Steam Link shell run inside the app died with
-    // `stack smashing detected in libSDL3.so+0xa6f9c` — a real canary mismatch
-    // with no buffer overflow anywhere near it, which is exactly how this trap
-    // presents. Idempotent, so calling it on a thread that already has one is
-    // free.
+    // Every thread that runs guest code must seed bionic's stack-guard canary
+    // into TSD slot 5 first, and this is the thread the whole boot runs on.
+    // Beat Saber's chain does not expose the gap: nothing on the path to initJni
+    // has a stack protector on it. libSDL3's JNI_OnLoad does, and without this
+    // dies with `stack smashing detected in libSDL3.so+0xa6f9c` — a canary
+    // mismatch with no buffer overflow anywhere near it. Idempotent, so calling
+    // it on a thread that already has one is free.
     kl_thread_init();
 
     heartbeat_start();
@@ -683,7 +679,7 @@ int kl_app_boot(void) {
     kl_jni_set_permissive(kl_env_on("KL_PERMISSIVE", 0));
     kl_egl_dump_textures(kl_env_str("KL_DUMP_TEXTURES", NULL));
 
-    printf("=== Klepton on visionOS — P4 ===\n");
+    printf("=== Klepton on visionOS ===\n");
     printf("  target    : %s\n", g_target->name);
     // The front door, with the reason. It is chosen from the ENVIRONMENT in
     // kl_app_configure — which runs before the log file is open, so it cannot
@@ -733,7 +729,7 @@ int kl_app_boot(void) {
     if (!load || !kl_jni_native(CLS, "unload", NULL))
         return fail("NativeLoader natives were not registered");
     printf("  registered %s.load=%p\n", CLS, load);
-    printf("\n=== M3 EXIT CRITERION MET: guest JNI_OnLoad ran, natives registered ===\n");
+    printf("\n=== EXIT CRITERION MET: guest JNI_OnLoad ran, natives registered ===\n");
     fflush(NULL);
 
     // load() takes the *directory* — it appends "/libunity.so" itself.
@@ -768,7 +764,7 @@ int kl_app_boot(void) {
     // other is a guest described differently by two drivers.
     kl_jni_unity_construct_helpers();
 
-    printf("\n=== P4 EXIT CRITERION MET: initJni completed on visionOS, "
+    printf("\n=== EXIT CRITERION MET: initJni completed on visionOS, "
            "no unimplemented JNI calls ===\n");
     g_phase = "boot report";
     kl_jni_report(stdout);
@@ -778,18 +774,16 @@ int kl_app_boot(void) {
     return 0;
 }
 
-// The synthetic /proc that trap 6d built, read back on the platform where it has
-// never been read. PLANNING §12.7 asks for this BEFORE chasing anything else in
-// a device lifecycle run, and the reason is specific: proc_build() gets the
-// free-page count from host_statistics64(), which links on visionOS but may be
-// restricted inside the sandbox — and a silent zero there is not read by Unity
-// as "unknown", it is read as a machine with no memory. That is the exact
-// failure trap 6d records: `Cores = 0, Memory = 0mb`, and Unity refuses to
-// start, with nothing anywhere mentioning memory.
+// The synthetic /proc, read back on device. Read it BEFORE chasing anything
+// else in a device lifecycle run: proc_build() gets the free-page count from
+// host_statistics64(), which links on visionOS but may be restricted inside the
+// sandbox, and a silent zero there is not read by Unity as "unknown" but as a
+// machine with no memory — `Cores = 0, Memory = 0mb`, after which Unity refuses
+// to start with nothing anywhere mentioning memory.
 static void report_proc(void) {
     static const char *files[] = { "/proc/cpuinfo", "/proc/meminfo",
                                    "/sys/devices/system/cpu/possible" };
-    printf("\n=== the synthetic /proc, on device (trap 6d) ===\n");
+    printf("\n=== the synthetic /proc, on device ===\n");
     for (unsigned i = 0; i < sizeof files / sizeof *files; i++) {
         // Through the same rewrite the guest's own open() takes, so this reads
         // what the guest reads and not something adjacent to it.
@@ -809,7 +803,7 @@ static void report_proc(void) {
             printf("  %-34s %s\n", shown ? "" : files[i], line);
             shown++;
         }
-        if (!shown) printf("  %-34s (served but EMPTY — see trap 6d)\n", files[i]);
+        if (!shown) printf("  %-34s (served but EMPTY)\n", files[i]);
         fclose(f);
     }
     fflush(NULL);
@@ -822,8 +816,8 @@ static void *g_thiz, *g_render;
 static unsigned g_alarm_secs = 120, g_frames_pumped;
 
 int kl_app_lifecycle_begin(void) {
-    // Separate from kl_app_boot rather than folded into it, because boot is the
-    // P4 gate and refuses a second entry: keeping them apart lets the UI run the
+    // Separate from kl_app_boot rather than folded into it, because boot is a
+    // gate and refuses a second entry: keeping them apart lets the UI run the
     // gate, read its numbers, and only then go further.
     static pthread_mutex_t once_mu = PTHREAD_MUTEX_INITIALIZER;
     static int entered;
@@ -899,7 +893,7 @@ int kl_app_lifecycle_begin(void) {
     // The order UnityPlayerActivity drives, exactly as t_boot's recon does:
     // attach a surface, resume, then one frame. nativeRecreateGfxState is what
     // reaches for EGL, and on device it is also what pulls in libil2cpp — the
-    // 66 MB image with 3,083 x18 veneers that P4 never loaded here (§12.7).
+    // 66 MB image with 3,083 x18 veneers, which the boot gate never loads.
     void *surface = kl_jni_new_object("android/view/Surface");
     struct { const char *name; int kind; } seq[] = {
         { "nativeRecreateGfxState", 2 }, { "nativeResume", 0 }, { "nativeRender", 1 },
@@ -948,10 +942,10 @@ int kl_app_lifecycle_begin(void) {
 }
 
 // One guest frame. Split out of the pump loop so that Compositor Services can
-// be the clock (P5b): on device the frame deadline belongs to
-// cp_frame_predict_timing, and a pump that owns its own loop cannot be paced by
-// something else. kl_app_lifecycle keeps calling this in a plain loop, so the
-// P5.4 measurement is the same code it always was.
+// be the clock: on device the frame deadline belongs to cp_frame_predict_timing,
+// and a pump that owns its own loop cannot be paced by something else.
+// kl_app_lifecycle keeps calling this in a plain loop, so both paths run the
+// same code.
 //
 // Returns what nativeRender returned, or -1 if kl_app_lifecycle_begin has not
 // run (or nativeRender was never registered).
@@ -1009,7 +1003,7 @@ void kl_app_lifecycle_report(void) {
         // Same argument as the arm above, and one more of its own: a run that
         // produced no frames at all looks exactly like one that produced them
         // until this is read, because there is no return value from a render
-        // call to say otherwise (notes/RE4.md).
+        // call to say otherwise.
         printf("\n=== the Unreal run ===\n");
         kl_ue4_report(stdout);
         fflush(NULL);
@@ -1017,7 +1011,7 @@ void kl_app_lifecycle_report(void) {
         return;
     }
     printf("  pumped %u frames\n", g_frames_pumped);
-    printf("\n=== P5.4: the lifecycle ran on device ===\n");
+    printf("\n=== the lifecycle ran on device ===\n");
     kl_jni_report(stdout);
     kl_egl_report(stdout);
     kl_opensl_report(stdout);
@@ -1039,16 +1033,16 @@ int kl_app_lifecycle(unsigned frames) {
     // The Steam Link guest counts no frames here, because it does not take any
     // from us: what a bounded run means for it is a bounded PUMP. That is the
     // window-and-report shape (KL_IMMERSIVE=0) — the recon run that says how far
-    // the guest got with no compositor in the picture, which is exactly the
-    // measurement P4 is for Beat Saber and has to stay takeable for this guest
-    // too. `frames` would be a number with nothing behind it, so the deadline is
+    // the guest got with no compositor in the picture, and it has to stay
+    // takeable for this guest as it is for Beat Saber. `frames` would be a
+    // number with nothing behind it, so the deadline is
     // KL_SLINK_WAIT's, in seconds, as it is on the command line.
     if (kl_app_target_is_steamlink()) {
         // ...and the shell has no deadline at all by default, which is the one
         // place the two doors differ here. A bounded pump measures how far a
         // guest got by itself; the shell is not measuring, it is being USED —
         // a person is reading it, typing a PIN into it and waiting on a host,
-        // and pairing alone took ~35 s the first time (SL-6). An explicit
+        // and a first pairing takes ~35 s. An explicit
         // KL_SLINK_WAIT still bounds it, for a scripted run that wants that.
         double secs = 30;
         if (g_door == KL_SLINK_SHELL)
@@ -1071,7 +1065,7 @@ int kl_app_lifecycle(unsigned frames) {
     // seconds of looper pump, because a frame budget is meaningless to a guest
     // that owns its own frame loop. KL_UE4_WAIT is the budget on the command
     // line too, and RE4 needs 300 of them — the first minute is the engine's
-    // own one-time shader optimization (notes/RE4.md).
+    // own one-time shader optimization.
     if (target_is_ue4()) {
         double secs = kl_env_str("KL_UE4_WAIT", NULL) ? strtod(getenv("KL_UE4_WAIT"), NULL) : 5.0;
         printf("\n=== pumping the looper for %.1f s ===\n", secs);
@@ -1088,10 +1082,10 @@ int kl_app_lifecycle(unsigned frames) {
     return 0;
 }
 
-// --- The guest on its own thread — PLANNING §12.12 --------------------------
+// --- The guest on its own thread ---------------------------------------
 // See kl_app.h for what this is for. What is here is the handoff itself, and
 // it is deliberately in C rather than Swift for one reason above the language
-// boundary in §12.6: trap 1. Every thread that runs guest code must call
+// boundary: every thread that runs guest code must call
 // kl_thread_init() before it does — the TPIDR slot the veneered guest reads is
 // per-thread and this is where it is established. A Swift `Thread {}` that
 // called kl_app_frame() without it would fault in a way that looks exactly
@@ -1162,7 +1156,7 @@ static void guest_pace_wait(void) {
 
 static void *guest_thread(void *unused) {
     (void)unused;
-    // Trap 1, before a single guest instruction runs on this thread.
+    // The guest's TPIDR slot, before a single guest instruction runs here.
     kl_thread_init();
     pthread_setname_np("Klepton Guest");
 

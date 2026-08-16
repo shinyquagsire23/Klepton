@@ -7,7 +7,7 @@
 //               a frustum we handed it. It needs a stereo, head-locked surface:
 //               an immersive space on visionOS, the compositor's drawable.
 //   Steam Link  renders ONE flat image into an EGL window surface, with no pose
-//               and no stereo anywhere in it (PLANNING §11.7). It needs a
+//               and no stereo anywhere in it. It needs a
 //               window.
 //
 // **This file does not decide which; it observes which.** The mode is derived
@@ -24,7 +24,7 @@
 // dismissImmersiveSpace — asynchronous scene lifecycle, on the main actor, not
 // something a render loop can do inline. So a consumer needs to detect that a
 // transition HAPPENED and act on it once, which is what the generation is for.
-// Steam Link's own 2D->VR handoff (§11.9: the 2D activity starts the OpenXR
+// Steam Link's own 2D->VR handoff (the 2D activity starts the OpenXR
 // NativeActivity and finishes itself) is exactly this transition, so it is not
 // hypothetical for this target.
 //

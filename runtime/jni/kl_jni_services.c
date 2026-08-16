@@ -463,8 +463,8 @@ static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, in
         char lang[16], country[16];
         klj_locale_parts(lang, sizeof lang, country, sizeof country);
         locale = kl_jni_new_object("java/util/Locale");
-        // PINNED, because the cache outlives the read — trap 16c, in a place it
-        // had not been applied. The object is handed out again on every later
+        // PINNED, because the cache outlives the read. The object is handed
+        // out again on every later
         // call, but the guest is entitled to retire the reference it was given:
         // Open Brush calls this from inside a local frame, PopLocalFrame retires
         // it correctly, and every subsequent getDefault() then returns a handle
@@ -540,7 +540,7 @@ static klj_val klj_String_init_bytes(void *env, void *self, const klj_val *a, in
 // WITHOUT the terminator (a Java byte[] carries no NUL, and one that did would
 // show up as a trailing garbage character in whatever the guest builds from it).
 // A non-UTF-8 charset is reported for the same reason as there — silently
-// handing back the wrong encoding is trap 6d in string form.
+// handing back the wrong encoding is a silent zero in string form.
 static klj_val klj_String_getBytes(void *env, void *self, const klj_val *a, int n) {
     (void)env;
     const char *s       = klj_str(self);
@@ -1108,8 +1108,8 @@ static klj_val klj_ActivityThread_getApplication(void *env, void *self, const kl
 // So the answer is the Quest's, and the path is MAPPED rather than invented —
 // kl_guest_path already redirects the guest's absolute paths, and a font
 // directory that answers a name and then has no files in it is the shape of
-// trap 45: a read that silently finds nothing, where the guest is entitled to
-// assume the directory it was handed exists. Whether the engine actually loads
+// a read that silently finds nothing, where the guest is entitled to assume the
+// directory it was handed exists. Whether the engine actually loads
 // from here is the next run's question; until it does, this is a name.
 static klj_val klj_UE4_GetFontDirectory(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -1174,7 +1174,7 @@ static klj_val klj_Environment_isExternalStorageManager(void *env, void *self, c
 }
 
 // There is no ARCore here and there never will be — Vision Pro's world sensing
-// arrives through ARKit under our own ovrp_* layer (M6), not through Google AR.
+// arrives through ARKit under our own ovrp_* layer, not through Google AR.
 // False is the truthful answer, and Unity has a supported no-AR path.
 // libOculusXRPlugin's GetIsSupportedDevice() upcall, and the gate Beat Saber
 // 1.40 fails without: the Oculus XR Plugin loader refuses to initialize on
@@ -1182,8 +1182,9 @@ static klj_val klj_Environment_isExternalStorageManager(void *env, void *self, c
 //
 // Not invented — this is the guest's own OculusUnity.getIsOnOculusHardware(),
 // transcribed: `Build.MANUFACTURER.toLowerCase(Locale.ENGLISH).contains("oculus")`.
-// We present Build.MANUFACTURER = "Oculus" (the settled decision in CLAUDE.md),
-// so running the guest's test against our own answer gives true, and answering
+// Build.MANUFACTURER is answered "Oculus" (a settled decision — reporting Apple
+// hardware fails every Oculus branch in the guest), so running the guest's test
+// against that answer gives true, and answering
 // true here is the same statement made directly rather than through three
 // String methods. Read back through kl_jni_build_string for exactly that
 // reason: that is the single source Build.MANUFACTURER and

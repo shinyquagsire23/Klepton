@@ -57,7 +57,7 @@ static const kl_target *synthesize(const char *tree, const char *libdir) {
 
     // The userdata key: the tree with a trailing "-<digits>" removed, so
     // beatsaber-128 and beatsaber share one save/pairing profile. See the
-    // header, and CLAUDE.md's "Knobs".
+    // header; KL_FILES_DIR overrides the whole directory.
     snprintf(s_key, sizeof s_key, "%s", tree);
     char *dash = strrchr(s_key, '-');
     if (dash && dash[1]) {
@@ -120,6 +120,6 @@ void kl_target_apply_host(const kl_target *t, const char *libdir_override) {
     // synthesize() note above. KL_FILES_DIR still overrides it outright, which
     // is how a run gets a scratch profile.
     kl_jni_set_files_dir(kl_userdata_dir(t->userdata));
-    // The raw "<apk>/assets/..." path map (trap 6c) is derived from the assets
+    // The raw "<apk>/assets/..." path map is derived from the assets
     // directory inside kl_jni's init, so nothing to do here.
 }

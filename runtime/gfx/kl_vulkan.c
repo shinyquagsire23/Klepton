@@ -831,9 +831,9 @@ static int cap_prepare(klvk_device *d, VkDeviceSize need) {
         mt = mem_type(d, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
     if (mt == UINT32_MAX) return 0;
     VkMemoryAllocateInfo ai = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = mr.size,
-        .memoryTypeIndex = mt,
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = mr.size,
+            .memoryTypeIndex = mt,
     };
     if (d->AllocateMemory(d->dev, &ai, NULL, &d->cap_mem) != VK_SUCCESS) return 0;
     if (d->BindBufferMemory(d->dev, d->cap_buf, d->cap_mem, 0) != VK_SUCCESS) return 0;
@@ -929,7 +929,7 @@ static int cap_image_layer(klvk_device *d, VkQueue q, VkImage img, uint32_t w, u
         for (uint32_t i = 0; i < nwait; i++) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     }
     VkSubmitInfo si = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .waitSemaphoreCount = nwait,
         .pWaitSemaphores = nwait ? waits : NULL,
         .pWaitDstStageMask = stages,
@@ -956,8 +956,8 @@ static int cap_image_layer(klvk_device *d, VkQueue q, VkImage img, uint32_t w, u
         for (size_t i = 0; i < n; i++) {
             uint8_t t = px[i * 4]; px[i * 4] = px[i * 4 + 2]; px[i * 4 + 2] = t;
         }
-    // Alpha is not a coverage value here — trap 33's shape, one API over. A
-    // guest that never authors alpha leaves it 0, and a correct RGB frame then
+    // Alpha is not a coverage value here. A guest that never authors alpha
+    // leaves it 0, and a correct RGB frame then
     // writes out as a fully TRANSPARENT PNG, which is visually identical to
     // black and has no error surface at all.
     for (size_t i = 0; i < n; i++) px[i * 4 + 3] = 255;
@@ -1060,7 +1060,7 @@ int kl_vulkan_guest_active(void) { return g_avail && g_ndev > 0; }
 // The compositor seam — the MTLTexture behind an eye VkImage
 // ---------------------------------------------------------------------------
 //
-// P5's compositors (KleptonCompositor.swift on device, kl_view_mtl.m on the
+// Both compositors (KleptonCompositor.swift on device, kl_view_mtl.m on the
 // host) sample an `id<MTLTexture>` the guest rendered into, found through
 // `kl_glfb_eye_mtl_texture`. On the GL path the host ALLOCATES that texture and
 // ANGLE is told to use it as the eye's storage. On the Vulkan path the
@@ -1115,7 +1115,7 @@ static void *eye_mtl_texture(klvk_device *d, VkImage img) {
     if (export_ext) {
         VkExportMetalTextureInfoEXT tex = {
             .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
-            .image = img,
+        .image = img,
             .plane = VK_IMAGE_ASPECT_PLANE_0_BIT,
         };
         VkExportMetalObjectsInfoEXT info = {
@@ -1164,17 +1164,17 @@ static VkImage klvk_image_alloc(klvk_device *d, VkFormat fmt,
                                 VkDeviceMemory *mem_out) {
     if (mem_out) *mem_out = VK_NULL_HANDLE;
     VkImageCreateInfo ic = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D,
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
         .format = fmt,
         .extent = { w, h, 1 },
         .mipLevels = mips ? mips : 1,
         .arrayLayers = layers ? layers : 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
     VkImage img = VK_NULL_HANDLE;
     if (d->CreateImage(d->dev, &ic, NULL, &img) != VK_SUCCESS) {
@@ -1186,9 +1186,9 @@ static VkImage klvk_image_alloc(klvk_device *d, VkFormat fmt,
     uint32_t mt = mem_type(d, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mt == UINT32_MAX) mt = mem_type(d, mr.memoryTypeBits, 0);
     VkMemoryAllocateInfo ai = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = mr.size,
-        .memoryTypeIndex = mt,
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = mr.size,
+            .memoryTypeIndex = mt,
     };
     VkDeviceMemory mem = VK_NULL_HANDLE;
     if (d->AllocateMemory(d->dev, &ai, NULL, &mem) != VK_SUCCESS ||
@@ -1279,19 +1279,19 @@ unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
     if (kl_env_on("KL_VK_EYE_TINT", 0) && d->CmdClearColorImage &&
         cap_prepare(d, 4)) {
         VkCommandBufferBeginInfo bi = {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         };
         d->ResetCommandBuffer(d->cap_cmd, 0);
         d->BeginCommandBuffer(d->cap_cmd, &bi);
         VkImageMemoryBarrier b = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
             .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = img,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img,
             // EVERY layer: under the Array layout the two eyes are layers of
             // this one image, and tinting only layer 0 would leave the right
             // eye's "did the guest draw?" question unanswered.
@@ -1438,8 +1438,8 @@ void *kl_vulkan_xr_physical_device(void *vk_instance) {
 // Deliberately NOT keyed on (stage, eye) the way the OVRPlugin eye images are:
 // in OpenXR the runtime allocates a swapchain's images at xrCreateSwapchain,
 // which knows a size and a format and nothing else — WHICH swapchain is an eye
-// is only asserted later, at xrEndFrame, from the projection layer. That is
-// SL-19's finding and it is a property of the API, not of a guest.
+// is only asserted later, at xrEndFrame, from the projection layer. That is a
+// property of the API, not of a guest.
 //
 // So this hands back a bare image and keeps no table of its own; the eye
 // association, and with it the MTLTexture publication, belongs at the assertion.
@@ -1610,10 +1610,10 @@ static VkResult klvk_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
             for (uint32_t k = 0; k < pi->waitSemaphoreCount; k++)
                 stages[k] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
             VkSubmitInfo si = {
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                 .waitSemaphoreCount = pi->waitSemaphoreCount,
                 .pWaitSemaphores = pi->pWaitSemaphores,
-                .pWaitDstStageMask = stages,
+        .pWaitDstStageMask = stages,
             };
             d->QueueSubmit(q, 1, &si, VK_NULL_HANDLE);
             free(stages);

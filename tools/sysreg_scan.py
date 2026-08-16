@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Every system-register and cache-maintenance instruction in a guest ELF.
 
-Trap 26 cost a device run because ONE instruction in ONE library — `mrs x9,
-CTR_EL0` in libQt6Core's `__clear_cache` — is illegal from EL0 on Darwin, and
-nothing below the device executes it. This is the preemptive version of that
+ONE instruction in ONE library — `mrs x9, CTR_EL0` in libQt6Core's
+`__clear_cache` — is illegal from EL0 on Darwin, and nothing below the device
+executes it. This is the preemptive version of that
 question: what OTHER system registers do these guests touch, and which of them
 can the kernel refuse?
 
@@ -28,7 +28,7 @@ import struct, sys, array, os
 
 # --- ELF64: the executable sections only ------------------------------------
 # Segment-wide scanning finds "instructions" in .rodata and the relocation
-# tables, which for libunity is 2 MB of false positives (trap 0's own lesson).
+# tables, which for libunity is 2 MB of false positives.
 def exec_sections(data):
     if data[:4] != b'\x7fELF':
         return []
@@ -66,12 +66,12 @@ def decode(w):
     return None                                         # hints, barriers, MSR imm
 
 # Name, and what EL0 may do with it on Darwin. Everything measured on this
-# machine unless marked; see notes/TRAPS.md trap 26 for how CTR_EL0 was found.
+# machine unless marked.
 SYSREG = {
     # (op0, op1, crn, crm, op2): (name, verdict)
-    (3, 3, 0, 0, 1): ('CTR_EL0',    'handled'),  # trap 26 — veneered (kl_x18.c)
+    (3, 3, 0, 0, 1): ('CTR_EL0',    'handled'),  # veneered (kl_x18.c)
     (3, 3, 0, 0, 7): ('DCZID_EL0',  'ok'),
-    (3, 3, 13, 0, 2): ('TPIDR_EL0', 'handled'),  # trap 1 — rewritten to TPIDRRO
+    (3, 3, 13, 0, 2): ('TPIDR_EL0', 'handled'),  # rewritten to TPIDRRO
     (3, 3, 13, 0, 3): ('TPIDRRO_EL0', 'ok'),
     (3, 3, 14, 0, 0): ('CNTFRQ_EL0', 'ok'),
     (3, 3, 14, 0, 1): ('CNTPCT_EL0', 'ok'),
@@ -114,7 +114,7 @@ def name_of(kind, op0, op1, crn, crm, op2):
         return n
     return (f'S{op0}_{op1}_C{crn}_C{crm}_{op2}', '?')
 
-# Trap 0b/0d, the same window test kl_x18.c uses: an executable SECTION can
+# The same window test kl_x18.c uses: an executable SECTION can
 # contain data, and a constant table hits these encodings by chance. Without
 # this every crypto table in the tree reports a handful of exotic `sys #6, c2,
 # c3, #3`-shaped entries that are not instructions at all — noise in exactly the
@@ -184,9 +184,9 @@ def main(argv):
                                          key=lambda kv: (rank.get(kv[0][2], 0), kv[0][1])):
         mark = '' if verdict == 'ok' else '   <-- ' + verdict
         print(f'  {kind:5s} {nm:<22s} x{n}{mark}')
-    # 'handled' is TPIDR_EL0 (trap 1, rewritten at load) and CTR_EL0 (trap 26,
-    # veneered) — real traps with a fix already in the tree, so counting them
-    # here would bury the ones that have neither.
+    # 'handled' is TPIDR_EL0 (rewritten at load) and CTR_EL0 (veneered) — real
+    # hazards with a fix already in the tree, so counting them here would bury
+    # the ones that have neither.
     bad = sum(n for (k, nm, v), n in total.items() if v in ('?', 'TRAPS', 'EL1'))
     done = sum(n for (k, nm, v), n in total.items() if v == 'handled')
     print(f'\n{bad} instruction(s) EL0 may not execute and NOTHING handles, '

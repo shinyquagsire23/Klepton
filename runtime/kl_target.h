@@ -69,8 +69,8 @@ const char      *kl_target_names(void);
 //   "superhot/lib/arm64-v8a"      ...the same one, named by its libdir
 //   "beatsaber-128/lib/arm64-v8a" a tree with no table entry: SYNTHESIZED
 //
-// The third form is what every command in CLAUDE.md and every Makefile gate
-// passes, so it has to keep working exactly as it did. The fourth is the
+// The third form is what every documented run command and every Makefile gate
+// passes, so it has to keep working exactly as it does. The fourth is the
 // version-swap trees (beatsaber-113, -128, -16): a path is taken at its word,
 // because refusing it would break the one workflow those directories exist for,
 // and a synthesized target reads its assets and APK from BESIDE the libdir
@@ -80,7 +80,7 @@ const char      *kl_target_names(void);
 //
 // A synthesized target's `userdata` key drops a trailing "-<digits>", so
 // beatsaber-128 and beatsaber share one profile. That is not tidiness: it is
-// the documented rule (CLAUDE.md, "Knobs") that swapping Beat Saber versions
+// the documented rule that swapping Beat Saber versions
 // must not repeat first-run setup.
 //
 // Never returns NULL for a path; returns NULL only for an unknown NAME, which

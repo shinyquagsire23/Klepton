@@ -198,10 +198,10 @@ extern const klj_binding *const klj_binding_tables[];
 // The geometry is a Quest 2's per-eye panel, matching that window, and for the
 // same reason Build.MODEL is a Quest 2's below: this title branches on Oculus
 // hardware. It is a placeholder in the same sense kl_ndk.c's is — in VR the eye
-// buffers come from the XR runtime (M6) rather than from the Android display,
+// buffers come from the XR runtime rather than from the Android display,
 // and this exists to give Unity a coherent non-zero screen at startup. 72 Hz is
 // the Quest 2's default mode; 90 is opt-in, and claiming it would have Unity
-// pace to a rate M5 cannot yet deliver. Density is a choice rather than a
+// pace to a rate the GL path cannot yet deliver. Density is a choice rather than a
 // measurement — it only scales 2D UI — and xhdpi suits a panel this fine.
 //
 // Macros rather than a struct because g_fields is a static initialiser and a

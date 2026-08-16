@@ -129,13 +129,12 @@ static pthread_mutex_t *mtx_make(void) {
 }
 
 // ---------- condition variables: address-keyed, for the mutex map's reason ----
-// Conds used to live in the slot-in-guest-storage table above, and that design
-// aliases two logical objects onto one host object whenever a guest address
-// carries a stale or copied slot index. For mutexes that produced a
-// manufactured deadlock and was fixed by keying on the guest ADDRESS; conds
-// were left behind, and RE4 is where it cost.
+// Keyed on the guest ADDRESS, like the mutex map above and for the same reason:
+// a slot index stored in guest storage aliases two logical objects onto one host
+// object whenever that storage is stale or copied, which for a mutex is a
+// manufactured deadlock.
 //
-// The failure is worse than a mutex's, because Darwin latches the mutex a
+// For a cond it is worse, because Darwin latches the mutex a
 // condvar is waited on with: two guest condvars sharing one host condvar are
 // waited on with two different host mutexes, the second `pthread_cond_wait`
 // returns EINVAL **without sleeping**, and the guest's `do { wait } while
@@ -149,15 +148,12 @@ static pthread_mutex_t *mtx_make(void) {
 typedef struct {
     _Atomic(uintptr_t)       key;
     _Atomic(pthread_cond_t *) c;
-    // The HOST mutex this cond was last waited on with — §3's regression guard,
-    // and it lives here because that is the only place it can mean anything.
-    // It used to be indexed by a slot read out of the guest's own storage
-    // (`g_cnd_mutex[*(uint32_t *)c]`), which was right while conds were
-    // slot-allocated and became a read of bionic's private cond state the day
-    // they moved to address keys: a number with no relation to this condvar,
-    // so the one check that can recognise the aliasing bug was answering about
-    // an unrelated entry. A diagnostic that survives the design it was keyed on
-    // is worse than none — it is confidently wrong exactly when it is consulted.
+    // The HOST mutex this cond was last waited on with, in the entry itself
+    // because that is the only place it can mean anything. Indexed
+    // by a slot read out of the guest's own storage (`g_cnd_mutex[*(uint32_t *)c]`)
+    // it reads bionic's private cond state instead: a number with no relation to
+    // this condvar, so the one check that can recognise the aliasing bug answers
+    // about an unrelated entry.
     _Atomic(void *)          last_mutex;
 } cnd_entry;
 static cnd_entry g_cnd_map[MTX_MAP_SIZE];
@@ -168,8 +164,8 @@ static pthread_cond_t *cnd_make(void) {
     return fresh;
 }
 
-// The map ENTRY, for callers that need more than the host cond (the §3 guard
-// wants last_mutex). cnd() is this and one field.
+// The map ENTRY, for callers that need more than the host cond (the guard wants
+// last_mutex). cnd() is this and one field.
 static cnd_entry *cnd_entry_for(void *g) {
     uintptr_t want = (uintptr_t)g;
     pthread_cond_t *fresh = NULL;
@@ -191,7 +187,7 @@ static cnd_entry *cnd_entry_for(void *g) {
 
 // The host cond behind an entry, with the mutex map's publication wait: the key
 // is claimed before the cond is stored, so a reader that arrives between the
-// two waits rather than dereferencing NULL (trap 38).
+// two waits rather than dereferencing NULL.
 static pthread_cond_t *cnd_host(cnd_entry *e) {
     pthread_cond_t *c = atomic_load(&e->c);
     while (!c) { sched_yield(); c = atomic_load(&e->c); }
@@ -358,8 +354,8 @@ static void mtx_wait_leave(void) {
 // we returned Darwin's ETIMEDOUT (60), Qt compared against Linux's (110), did
 // not recognise it as a timeout and reported it as a hard failure —
 // `QWaitCondition::wait(): cv wait failure (Operation timed out)`, printed by
-// its own strerror of the number we handed it, over and over. Byte-for-byte the
-// sem_timedwait story already recorded in CLAUDE.md, in the neighbouring API.
+// its own strerror of the number it was handed, over and over — byte for byte
+// IL2CPP's sem_timedwait failure in the neighbouring API.
 //
 // The three that actually differ and are reachable from a pthread call:
 //   EDEADLK   Darwin 11  -> Linux 35   (pthread_join on self, recursive lock)
@@ -394,19 +390,19 @@ int klb_pthread_mutex_init(void *m, const void *a) {
     if (!m) return mtx_null("init");
     // Re-init of an address we already have a host mutex for KEEPS that mutex.
     //
-    // It used to install a fresh one, on the reasoning that POSIX calls
-    // re-initialising a live mutex undefined. That is true of the guest's
-    // object and false of ours: a condition variable latches the mutex it is
-    // waited on with, and on Darwin — unlike Linux — presenting a second one
-    // is EINVAL. So swapping the host mutex under a live condvar makes every
-    // later `pthread_cond_wait` fail INSTANTLY without sleeping, which the
-    // guest reads as a spurious wake and retries forever: a thread that looks
-    // asleep, is spinning, and starves the thread trying to signal it.
+    // Installing a fresh one instead — POSIX calls re-initialising a live mutex
+    // undefined — is true of the GUEST's object and false of this one: a
+    // condition variable latches the mutex it is waited on with, and on Darwin,
+    // unlike Linux, presenting a second one is EINVAL. Swapping the host mutex
+    // under a live condvar makes every later `pthread_cond_wait` fail INSTANTLY
+    // without sleeping, which the guest reads as a spurious wake and retries
+    // forever: a thread that looks asleep, is spinning, and starves the thread
+    // trying to signal it.
     //
-    // RE4 is where it was found. UE4 pools its `FPThreadEvent`s and re-inits
-    // the mutex of a recycled one without re-initing its condvar, so the engine
-    // boot wedged in `FEngineLoop::PreInitPreStartupScreen` with the shader
-    // library's read task waiting on an event nothing could ever trigger.
+    // UE4 pools its `FPThreadEvent`s and re-inits the mutex of a recycled one
+    // without re-initing its condvar, so RE4's engine boot wedges in
+    // `FEngineLoop::PreInitPreStartupScreen` with the shader library's read task
+    // waiting on an event nothing can trigger.
     // Keeping the object is also what the address-keyed map already says
     // everywhere else: a recycled address is the same mutex.
     mtx_entry *e = mtx_entry_for(m);
@@ -674,7 +670,7 @@ int klb_pthread_rwlock_wrlock(void *l) { return px(pthread_rwlock_wrlock(rwl(l))
 int klb_pthread_rwlock_unlock(void *l) { return px(pthread_rwlock_unlock(rwl(l))); }
 // SDL3 reaches for the try- forms; Beat Saber never did. Same side-table
 // indirection as the blocking pair — a bionic rwlock is 56 bytes of 4-byte
-// aligned int32 (trap 3), so what lives in it is an index, not a handle.
+// aligned int32, so what lives in it is an index, not a handle.
 int klb_pthread_rwlock_tryrdlock(void *l) { return px(pthread_rwlock_tryrdlock(rwl(l))); }
 int klb_pthread_rwlock_trywrlock(void *l) { return px(pthread_rwlock_trywrlock(rwl(l))); }
 
@@ -738,7 +734,7 @@ int klb_pthread_once(int *ctl, void (*fn)(void)) {
 }
 
 // ---------- threads ----------
-// Every guest thread needs the bionic stack-guard canary in Darwin TSD slot 5 (S0.1).
+// Every guest thread needs the bionic stack-guard canary in Darwin TSD slot 5.
 //
 // Liveness registry for the mutex-owner dump: a holder whose tid is dead is
 // the signature of a thread that exited holding a mutex (which reads exactly
@@ -870,12 +866,12 @@ int klb_pthread_atfork(void (*p)(void), void (*c)(void), void (*ch)(void)) {
 #define KL_MAX_SEMS 1024
 
 // The count is tracked alongside the dispatch semaphore rather than left to GCD.
-// It has to be: sem_getvalue used to return a constant 0 because "GCD gives no
-// way to read the count", and IL2CPP polls it. The loop at libil2cpp+0x12d57d4
+// It has to be: GCD gives no way to read the count, and IL2CPP POLLS it, so a
+// constant 0 from sem_getvalue is not an answer. The loop at libil2cpp+0x12d57d4
 // is a barrier — usleep(3000), sem_getvalue, compare against a target of
 // initial+N, repeat — so a value that never changes is an infinite spin with the
-// main thread apparently just asleep. Trap 6d again: a silent zero read as an
-// answer rather than as "unknown".
+// main thread apparently just asleep — a silent zero read as an answer rather
+// than as "unknown".
 typedef struct {
     dispatch_semaphore_t d;
     _Atomic int          count;
@@ -885,12 +881,11 @@ typedef struct {
 static kl_sem g_sems[KL_MAX_SEMS];
 static _Atomic int g_nsems = 1;                 // index 0 means "uninitialised"
 
-// The free list. g_nsems was atomic_fetch_add-only against KL_MAX_SEMS, so the
-// table was a ONE-WAY budget for the life of the process: after 1024 sem_init
-// calls every later one returned ENOSPC forever, whatever had been destroyed in
-// between. The bytes are trivial and the failure is not — this is very likely
-// SUPERHOT's "semaphore table that leaks slots ~80 s into play", which lands at
-// about the same point in a run as the OOM and is a different bug.
+// The free list. An atomic_fetch_add-only g_nsems against KL_MAX_SEMS makes the
+// table a ONE-WAY budget for the life of the process: after 1024 sem_init calls
+// every later one answers ENOSPC forever, whatever was destroyed in between —
+// SUPERHOT's slot leak ~80 s into play, which lands at about the same point in a
+// run as the OOM and is a different bug.
 //
 // A dead slot must keep `d` NULL, because sem_of() uses a live `d` as its
 // validity test: a recycled slot holding a stale dispatch_semaphore_t would

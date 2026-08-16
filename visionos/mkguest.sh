@@ -1,7 +1,7 @@
 #!/bin/bash
 # Translate this target's guest libraries and wrap each as an XCFramework.
 #
-# Why frameworks rather than a directory of .dylib files (PLANNING §4.0.1):
+# Why frameworks rather than a directory of .dylib files:
 # Xcode code-signs what it embeds under Frameworks/, and a loose Mach-O
 # anywhere else in the bundle is only *sealed* by the outer signature, which is
 # not the same thing and is not what AMFI accepted in P3/P12. kl_load_auto

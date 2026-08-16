@@ -94,7 +94,7 @@ struct kl_image {
     const char **weak;         // ...and the weak ones, deliberately left NULL
     unsigned    weak_n, weak_cap;
     void       *dl_handle;     // set when the image arrived as a translated
-                               // Mach-O dylib (M1b); then dyld owns the mapping
+                               // Mach-O dylib; then dyld owns the mapping
 };
 
 static void record_missing(kl_image *img, const char *nm) {
@@ -130,11 +130,10 @@ const char *const *kl_weak_imports(kl_image *img, unsigned *count) {
 }
 
 // ---------- unresolved-import stubs ----------
-// Every unresolved import used to resolve to one shared abort stub, so calling
-// one reported "called an unresolved import" and nothing else — the single
-// place in this runtime where an unimplemented thing did not fail by name. That
-// name is exactly where the next milestone starts, so each missing symbol now
-// gets its own cell, which loads the name and tail-calls the reporter:
+// Every unresolved import gets its OWN cell, so calling one fails BY NAME — the
+// name is where the next milestone starts, and one shared abort stub can only
+// report "called an unresolved import". The cell loads the name and tail-calls
+// the reporter:
 //
 //   0:  mov w16, #N              // this cell's index, baked in at build time
 //   4:  b   kl_stub_named_common // loads slots[N] -> x0, slots[N+1] -> x16, br
@@ -147,15 +146,15 @@ const char *const *kl_weak_imports(kl_image *img, unsigned *count) {
 // a cell knows only its own index, and the allocator's whole job is to fill in
 // the { payload, target } pair the shared dispatcher will read.
 //
-// This used to be an mmap'd pool that we generated code into, which is a
-// SIGKILL on visionOS — AMFI answers "namespace CODESIGNING, Invalid Page" for
-// any pc that did not come from a signed file, whatever the page's permissions
-// are. Measured on device 2026-08-07; see kl_stub_cells.S for the report.
+// An mmap'd pool generated into at runtime is a SIGKILL on visionOS instead —
+// AMFI answers "namespace CODESIGNING, Invalid Page" for any pc that did not
+// come from a signed file, whatever the page's permissions are.
+// Measured on device 2026-08-07; see kl_stub_cells.S for the report.
 #define KL_STUB_CELL_BYTES  8              /* mov w16,#i + b — see the .S */
 // 2048 was sized for Beat Saber's five libraries. Steam Link's Qt chain is a
 // different order of magnitude — libQt6Widgets ALONE exhausted it, and past
-// exhaustion an import silently becomes an unnamed stub, i.e. the one thing the
-// whole M4 method depends on (failing BY NAME) stops working. Raised to 16384;
+// exhaustion an import silently becomes an unnamed stub, so failing BY NAME —
+// the property the whole bring-up method rests on — stops working. 16384;
 // the ceiling is 65536, above which `mov w16,#N` stops being a single movz and
 // the cell stride in kl_stub_cells.S would have to change.
 #define KL_STUB_NAMED_CELLS 16384
@@ -180,13 +179,11 @@ static pthread_mutex_t g_stub_mu = PTHREAD_MUTEX_INITIALIZER;
 // argument). `trace` picks which of the two shapes — and therefore which cell
 // array and which dispatcher — the caller wants.
 //
-// The mutex still matters, for the same reason it always did: the dedup scan
-// and the bump counter are racy under M6's concurrent stub traffic (the render
-// thread calling existing stubs while the main thread creates new ones). What
-// it no longer has to protect is a W^X window, because there is no longer any
-// window: the cells are read-only text from the moment the binary is signed,
-// and only the slots array is written. That also retires the SIGBUS this code
-// used to produce when the pool was flipped RW->RX around each write.
+// The mutex covers the dedup scan and the bump counter, which are racy under
+// M6's concurrent stub traffic (the render thread calling existing stubs while
+// the main thread creates new ones). It guards no W^X window: the cells are
+// read-only text from the moment the binary is signed, and only the slots array
+// is written.
 static void *stub_emit(const char *nm, void *payload, void *target, int trace) {
     for (unsigned i = 0; i < g_stub_n; i++)             // shared across images
         if (g_stubs[i].handler == target && strcmp(g_stubs[i].name, nm) == 0)
@@ -248,7 +245,7 @@ void *kl_named_stub(const char *nm, void *handler) {
 // untouched. kl_named_stub puts the name in x0 and never returns to the guest,
 // which is right for "you called something unimplemented" and useless for tracing.
 // Here the payload is a descriptor instead of a bare name, and the branch goes to
-// kl_gl_trace_tramp (runtime/kl_gl_trace.S), which saves the argument registers,
+// kl_gl_trace_tramp (runtime/gfx/kl_gl_trace.S), which saves the argument registers,
 // logs, restores, and tail-branches to the real function.
 //
 //    0: mov w16, #N              // this cell's index
@@ -295,24 +292,23 @@ const void *kl_phdrs(kl_image *i, unsigned *count) {
     return i->base + eh->e_phoff;
 }
 
-// ---------- S0.1: rewrite `mrs xN, tpidr_el0` -> `mrs xN, tpidrro_el0` ----------
+// ---------- rewrite `mrs xN, tpidr_el0` -> `mrs xN, tpidrro_el0` ----------
 // Darwin keeps the thread pointer in TPIDRRO_EL0; TPIDR_EL0 is clobbered by the
 // kernel on preemption. The two encodings differ by exactly one bit (0x20).
 // 98% of these sites are -fstack-protector prologues reading bionic slot 5.
-// It runs on the same chunks as the x18 pass and carries the same trap 0b/0d
-// exposure: a word of a constant table that happens to match this pattern gets
-// a bit flipped, and the corrupted constant surfaces somewhere else entirely.
-// One in 2^27 words matches by chance, so it has not bitten — but the detector
-// exists now, and having one of the two rewriters checked and the other not is
-// how a class comes back. The order matters too: this must consult the
-// unmodified buffer, which it does, since it is the first pass over a chunk.
+// It runs on the same chunks as the x18 pass and carries the same exposure to
+// data inside an executable section: a word of a constant table matching this
+// pattern gets a bit flipped, and the corrupted constant surfaces somewhere
+// else entirely. One in 2^27 words matches by chance. Both rewriters consult
+// the same data detector; this one must read the UNMODIFIED buffer, which it
+// does, being the first pass over a chunk.
 //
 // A refusal here is NOT the free outcome it is on the x18 side, and it must
 // never again be silent: a `mrs xN, tpidr_el0` left alone reads a register the
 // kernel clobbers, so the site returns garbage on every thread and the guest
-// faults dereferencing it somewhere else entirely. That is trap 1, and one
-// zero-padding false positive re-opened it for a whole arc (see
-// klx_looks_like_data). Each one is counted apart from the x18 population and
+// faults dereferencing it somewhere else entirely — so a false positive in
+// klx_looks_like_data reintroduces the very bug the TLS rewrite fixes. Each one
+// is counted apart from the x18 population and
 // named by address, because the address is what makes it a five-minute
 // disassembly instead of a bisect.
 // The guest-patch table's view of this mapping: one contiguous span, so a guest
@@ -333,8 +329,8 @@ static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
             if (kl_x18_is_data(w, n, i)) {
                 st->tls_refused++;
                 fprintf(stderr, "  [klepton] %s: TLS site at +0x%llx left alone — its "
-                                "neighbourhood reads as data (trap 0d). If it IS code, "
-                                "that thread pointer is garbage (trap 1)\n",
+                                "neighbourhood reads as data. If it IS code, "
+                                "that thread pointer is garbage\n",
                         path, (unsigned long long)(va + i * 4));
                 continue;
             }
@@ -414,10 +410,10 @@ static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {
 
 // Walk PT_DYNAMIC and bind the image: symtab/strtab, DT_INIT_ARRAY, and every
 // relocation. Shared by both loaders — the mmap path below and kl_load_dylib()
-// — because this half is identical either way. It is the whole reason M1b can
-// emit a dylib with *zero dyld fixups*: nothing here needs dyld's help, and no
-// relocation target is in __TEXT (M1a's measurement), so the guest image can be
-// mapped read-execute by dyld and still relocate correctly.
+// — because this half is identical either way. It is what lets klepton-ld emit a
+// dylib with ZERO dyld fixups: nothing here needs dyld's help, and no relocation
+// target is in __TEXT (measured across every guest library), so the guest image
+// can be mapped read-execute by dyld and still relocate correctly.
 //
 // `lo` is the lowest PT_LOAD vaddr, so `img->base + p_vaddr - lo` addresses the
 // mapped copy in both cases (it is 0 for every guest library here).
@@ -453,10 +449,10 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
     return 0;
 }
 
-// ---------- M1b: load a klepton-ld-translated Mach-O dylib ----------
+// ---------- load a klepton-ld-translated Mach-O dylib ----------
 // The shipping loader. dyld maps and (on device) AMFI validates the guest text,
-// so nothing here is ever RWX and no guest byte is written by us — the S0.1 TLS
-// rewrite and the S0.5 x18 veneers were applied offline by klepton-ld.
+// so nothing here is ever RWX and no guest byte is written by us — the TLS
+// rewrite and the x18 veneers were applied offline by klepton-ld.
 //
 // The guest ELF image is embedded verbatim in the dylib at a constant shift, and
 // found through the __TEXT,__klelf section rather than an exported symbol: that
@@ -561,7 +557,7 @@ kl_image *kl_load_dylib(const char *path) {
                 free(img); dlclose(h); return NULL;
             }
         }
-        // Trap 26's constant is self-contained — the veneer answers it and
+        // The CTR_EL0 constant is self-contained — the veneer answers it and
         // nothing here has to agree — so a difference is reported rather than
         // refused. It is reported at all because "the CTR_EL0 value in this
         // dylib is not the one this tree defaults to" is otherwise invisible,
@@ -606,10 +602,10 @@ static int dylib_candidate(const char *path, char *out, size_t cap, char *name_o
 
     // Two layouts, because the host and the bundle disagree about what a
     // translated library looks like. `make dylibs` writes bare .dylib files; an
-    // app bundle carries frameworks (§4.0.1), which is also what P3/P12 actually
-    // got past AMFI — Xcode code-signs what it embeds in Frameworks/, and a loose
-    // Mach-O elsewhere in the bundle is only sealed, not signed. Same image
-    // either way.
+    // app bundle carries frameworks, which is also the layout AMFI accepts —
+    // Xcode code-signs what it embeds in Frameworks/, and a loose Mach-O
+    // elsewhere in the bundle is only sealed, not signed. Same image either
+    // way.
     snprintf(out, cap, "%s/%s.dylib", dir, name);
     if (access(out, R_OK) == 0) return 1;
     snprintf(out, cap, "%s/%s.framework/%s", dir, name, name);
@@ -625,7 +621,7 @@ kl_image *kl_load_auto(const char *path) {
                             "to load: %s\n", cand, kl_error());
             return NULL;
         }
-        fprintf(stderr, "  [klepton] %s: loaded as a translated dylib (M1b)\n", name);
+        fprintf(stderr, "  [klepton] %s: loaded as a translated dylib\n", name);
         return img;
     }
     return kl_load(path);
@@ -637,9 +633,8 @@ kl_image *kl_load_auto(const char *path) {
 // bundle (only the translations are, which is 80 MB saved), so the .so path is a
 // name the loader resolves rather than a file that exists.
 //
-// This is what P5.4's first device lifecycle run died on.
-// ClassLoader.findLibrary() stat'ed the .so and returned null for libil2cpp, so
-// Unity never even attempted the dlopen that would have succeeded — and put up
+// A stat(path) here has ClassLoader.findLibrary() return null for libil2cpp, so
+// Unity never attempts the dlopen that would have succeeded, and puts up
 // "Failed to load Il2CPP." three layers away from the stat that caused it. The
 // path stays the .so path in the answer, so there is still exactly one place
 // that resolves it: here.
@@ -655,10 +650,10 @@ int kl_can_load(const char *path) {
 // segment sharing a page — and then resolve the one union that cannot be
 // applied.
 //
-// This used to be a per-segment mprotect() rounded out to the page, which is
-// correct only while no two segments share one. CLAUDE.md recorded that as a
-// measured property of the corpus ("p_align is never smaller than Apple's 16 KB
-// page"): Beat Saber shipped 64 KB, Steam Link 16 KB. Beat Saber 1.40 ships
+// A per-segment mprotect() rounded out to the page is correct only while no two
+// segments share one, which held while every guest's p_align was at least
+// Apple's 16 KB page: Beat Saber 1.28 ships 64 KB, Steam Link 16 KB. Beat Saber
+// 1.40 ships
 // **4 KB** — eleven of its thirteen libraries — so segments now share pages,
 // the last one written wins, and libmain's r-x segment was left RW because the
 // RW segment 0x14e4 bytes above it is processed after it. JNI_OnLoad then took
@@ -758,9 +753,7 @@ static int plan_pages(const Elf64_Ehdr *eh, const Elf64_Phdr *ph, const Elf64_Sh
 
 // ...and the third way out, which is not a protection at all: MOVE THE IMAGE.
 //
-// The refusal above used to be the end of the road, under a comment naming this
-// as "the only general way out" and leaving it undone — because the corpus at
-// the time did not need it. BONELAB does. Its libmain.so has just TWO PT_LOADs,
+// The general way out, and BONELAB needs it. Its libmain.so has just TWO PT_LOADs,
 // r-x at 0 and rw- at 0x2d80, so both live in host page 0; PT_GNU_RELRO covers
 // 0x2d80..0x3000 and the 0x40 bytes above it are ordinary .data. Rule 1 cannot
 // apply (there is real code on the page) and rule 2 cannot (those 0x40 bytes are
@@ -889,19 +882,19 @@ kl_image *kl_load(const char *path) {
     // ...and the x18 veneer pool is reserved WITH the image, on the end of the
     // same mapping.
     //
-    // It used to allocate itself, with an mmap hint just past the code, and that
-    // is only ever a hint: Darwin returns the first free hole at or above it,
+    // A separate mmap with a hint just past the code does NOT work: a hint is
+    // only a hint, Darwin returns the first free hole at or above it,
     // and the address after a guest image is exactly the one guaranteed to be
-    // taken. For libUE4 (172 MB, and every one of its 8038 x18 sites in a 5 MB
-    // band at the top) under a viewer run — ANGLE, Metal and SDL already mapped
-    // — the nearest hole measured **240 MB** away, past `b`'s +/-128 MB, so
-    // every veneer was refused and the library ran against Darwin's reserved
-    // x18. Searching harder does not fix it: there is no free hole in the window
-    // at all. Only a reservation made at the same moment as the image is
-    // guaranteed to be within reach of it.
+    // taken. For libUE4 (172 MB, every one of its 8038 x18 sites in a 5 MB band
+    // at the top) under a viewer run — ANGLE, Metal and SDL already mapped — the
+    // nearest hole measures 240 MB away, past `b`'s +/-128 MB, so every veneer
+    // is refused and the library runs against Darwin's reserved x18. Searching
+    // harder does not help: there is no free hole in the window at all. Only a
+    // reservation made at the same moment as the image is guaranteed to be
+    // within reach of it.
     //
     // Sized by counting the sites in the FILE's executable sections, which is
-    // exact enough to be tight: relocations never touch guest text (§2), so the
+    // exact enough to be tight: relocations never touch guest text, so the
     // words counted here are the words the rewrite pass will see. The count is
     // an over-estimate only in that it includes data words the pass will refuse.
     size_t x18_arena = 0;
@@ -912,7 +905,7 @@ kl_image *kl_load(const char *path) {
     }
     if (x18_arena) {
         // Per-chunk pools each round up to 64 KB and one section can be several
-        // chunks (the data ranges of trap 0b split it), so the reservation
+        // chunks (data ranges inside .text split it), so the reservation
         // carries slack for that rounding rather than exactly the veneer bytes.
         x18_arena = x18_arena * KLX_VEN_MAX_INSN * 4 + (64u << 10) * 64;
         x18_arena = (x18_arena + pg - 1) & ~((size_t)pg - 1);
@@ -940,15 +933,15 @@ kl_image *kl_load(const char *path) {
         munmap(file, sb.st_size); return NULL;
     }
 
-    // ---- rewrite guest text: S0.1 TLS, then S0.5 x18 ----
+    // ---- rewrite guest text: TLS, then x18 ----
     //
     // Executable *sections*, not the executable segment. The r-x LOAD segment of
     // these libraries starts at file offset 0 and runs to the end of
     // .gcc_except_table, so it also spans .hash, .dynsym, .rela.dyn, .rodata and
     // .eh_frame — for libunity that is 1.5 MB of read-only data and 720 KB of
     // relocations sitting behind PF_X. Rewriting a word that merely looks like
-    // an instruction in there would corrupt data, and the x18 pass patches
-    // branches rather than flipping one bit, so it would corrupt it loudly.
+    // an instruction in there corrupts data — the x18 pass patches a branch
+    // rather than flipping one bit, so it corrupts several words at a time.
     // (`sh` is read above — the placement decision needs the same distinction.)
 
     // The authoritative .dynsym entry count, and the reason it is taken from the
@@ -968,7 +961,7 @@ kl_image *kl_load(const char *path) {
                                   // still counts sites when the rewrite is off
     if (!sh)
         fprintf(stderr, "  [klepton] %s: no section headers — cannot separate code "
-                        "from rodata; x18 veneering disabled (see trap 0)\n", path);
+                        "from rodata; x18 veneering disabled\n", path);
 
     for (int i = 0; i < eh->e_phnum && !sh; i++) {
         // Fallback for a stripped image: the old whole-segment scan. Narrower
@@ -1018,17 +1011,14 @@ kl_image *kl_load(const char *path) {
                 veneer = 0;
                 continue;
             }
-            // A REFUSED x18 site is trap 0 live, and it had no error surface at
-            // all: the counters were accumulated here and printed by nobody
-            // (kl_x18_report has never had a caller), so a library whose every
-            // veneer was refused loaded, ran, and read Darwin's reserved x18 —
-            // which is zero after any exception return. RE4's libUE4 is where
-            // that cost a session: 8038 sites, all refused for REACH, surfacing
-            // as an intermittent SIGSEGV inside Oodle's decompressor on a pak
-            // worker thread, hours from the load that caused it.
+            // A REFUSED x18 site runs against Darwin's reserved x18, which is
+            // zero after any exception return, and it has no other error
+            // surface: libUE4's 8038 sites all refused for REACH surface as an
+            // intermittent SIGSEGV inside Oodle's decompressor on a pak worker
+            // thread, hours from the load that caused it.
             //
-            // So it is printed unconditionally when it is non-zero, with the
-            // pool's own distance beside it, because the two refusal kinds want
+            // So it is printed unconditionally when non-zero, with the pool's
+            // own distance beside it, because the two refusal kinds want
             // different fixes and only one of them is about the decoder.
             if (xs.refused) {
                 int64_t d = (int64_t)xs.pool_va - (int64_t)(uintptr_t)p;
@@ -1036,7 +1026,7 @@ kl_image *kl_load(const char *path) {
                         "  [klepton] %s: x18 REFUSED %u of %u sites (%u for REACH"
                         " — pool at %#llx, %+lld MB from the code at %p). Those "
                         "sites run against Darwin's reserved x18 and it is zero "
-                        "after any exception return — see trap 0.\n",
+                        "after any exception return.\n",
                         path, xs.refused, xs.sites, xs.far_refused,
                         (unsigned long long)xs.pool_va,
                         (long long)(d / (1024 * 1024)), (void *)p);
@@ -1078,17 +1068,16 @@ void kl_run_init(kl_image *img) {
 }
 
 void *kl_sym(kl_image *img, const char *name) {
-    // Linear scan of .dynsym. Fine for M1; klepton-ld will emit a hash table.
+    // Linear scan of .dynsym.
     //
-    // The count comes from DT_HASH's nchain. It used to be inferred from the
-    // gap between symtab and strtab, which silently assumes .dynstr directly
-    // follows .dynsym — true of every Beat Saber library and false of every
-    // Steam Link one, where the linker puts .gnu.hash and .hash between them.
-    // libc++_shared.so has 2506 symbols and a gap of 4198 entries, so the scan
-    // ran off the end of .dynsym into the hash tables, read their words as
-    // st_name offsets and dereferenced strtab + garbage. It faulted inside
-    // strcmp during a cross-image import bind — a wild read that a slightly
-    // different layout would have turned into a wrong answer instead.
+    // The count comes from DT_HASH's nchain, never from the gap between symtab
+    // and strtab: that assumes .dynstr directly follows .dynsym, which
+    // is true of every Beat Saber library and false of every Steam Link one,
+    // where the linker puts .gnu.hash and .hash between them. libc++_shared.so
+    // has 2506 symbols and a gap of 4198 entries, so the scan runs off the end
+    // of .dynsym into the hash tables, reads their words as st_name offsets and
+    // dereferences strtab + garbage — a fault inside strcmp during a
+    // cross-image import bind, and a wrong answer under a different layout.
     size_t n = img->nsyms;
     if (!n)     // neither sections nor DT_HASH: infer, rather than bind nothing
         n = ((const char *)img->strtab - (const char *)img->symtab) / sizeof(Elf64_Sym);
@@ -1114,7 +1103,7 @@ void *kl_sym(kl_image *img, const char *name) {
 
 void kl_unload(kl_image *img) {
     if (!img) return;
-    if (img->dl_handle) dlclose(img->dl_handle);   // M1b: dyld owns the mapping
+    if (img->dl_handle) dlclose(img->dl_handle);   // translated: dyld owns it
     else                munmap(img->base - img->map_off,
                                img->map_size + img->x18_arena_size);
     free(img);

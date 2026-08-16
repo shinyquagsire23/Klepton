@@ -1,4 +1,4 @@
-// S0.1 — Darwin arm64 thread-pointer semantics probe
+// Darwin arm64 thread-pointer semantics probe
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

@@ -1,4 +1,4 @@
-// S0.5b — can the x18 veneer spill scratch registers below sp?
+// Can the x18 veneer spill scratch registers below sp?
 //
 // The veneer needs two scratch GP registers, and the only place to save them
 // without already having a scratch register is the stack: arm64 has no absolute

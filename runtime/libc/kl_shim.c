@@ -78,7 +78,7 @@ int getentropy(void *buffer, size_t size);
 #include "kl_ovrplat.h"
 #include "kl_jni.h"
 
-// ---------- S0.1: bionic stack-guard canary in Darwin TSD slot 5 ----------
+// ---------- bionic stack-guard canary in Darwin TSD slot 5 ----------
 #define TLS_SLOT_STACK_GUARD 5
 static uint64_t g_canary = 0x0000BEEFCAFE0000ULL;
 void kl_thread_init(void) {
@@ -127,7 +127,7 @@ __attribute__((noreturn)) void kl_unresolved_named(const char *name) {
 }
 // The guest's -fstack-protector epilogue calls this when the canary it read at
 // entry no longer matches. Naming the caller is most of the diagnosis and costs
-// nothing: bionic keeps the canary in TLS slot 5, which we squat (trap 1), so
+// nothing: bionic keeps the canary in TLS slot 5, which we squat, so
 // "stack smashing detected" here has two quite different causes — a genuine
 // overflow of a guest buffer (often one WE filled), or slot 5 changing under a
 // frame that was holding a copy. Which function it was usually separates them,
@@ -143,18 +143,18 @@ __attribute__((noreturn)) static void kl_stack_chk_fail(void) {
 }
 
 // ---------- bionic FILE ----------
-// The guest computes stderr as &__sF[2] using bionic's sizeof(FILE), which we do not
-// know, so anything landing inside the block routes to stderr.
-// TODO(M3): recover the true stride from the GLOB_DAT addend.
+// The guest computes stderr as &__sF[2] using bionic's sizeof(FILE), which is
+// not known here, so anything landing inside the block routes to stderr. Known
+// gap: the true stride is recoverable from the GLOB_DAT addend.
 static char g_sF[4096] __attribute__((aligned(16)));
 FILE *kl_host_file(void *guest) {
     if ((char *)guest >= g_sF && (char *)guest < g_sF + sizeof g_sF) return stderr;
     // A FILE * small enough to be a page-zero offset is not a FILE * — it is an
-    // argument that landed in the wrong slot (trap 6b) or an uninitialised one.
+    // argument that landed in the wrong slot or an uninitialised one.
     // Passing it through means dying inside flockfile with no idea who called,
     // so it is named here instead and the call is dropped.
     // A FILE * small enough to be a page-zero offset is not a FILE * — it is an
-    // argument that landed in the wrong slot (trap 6b) or an uninitialised one.
+    // argument that landed in the wrong slot or an uninitialised one.
     // Passing it through dies inside flockfile with no clue who called; naming it
     // and routing to stderr keeps the run going, and a write that lands in the
     // log is a better outcome than a dropped one. Reads simply fail, which is
@@ -258,14 +258,14 @@ static int kl_sock_optname(int opt) {
 
 // ...and the IPPROTO_IP / IPPROTO_IPV6 levels diverge too, which an earlier
 // comment here denied. They are not a harmless subset: the numbers OVERLAP, so
-// a forwarded option lands on a DIFFERENT real option rather than on none.
-// Linux IP_TOS is 1 and Darwin's 1 is IP_OPTIONS; Linux IP_TTL is 2 and
-// Darwin's 2 is IP_HDRINCL. Setting a TTL of 4 would ask Darwin to enable raw
-// IP headers — a call that SUCCEEDS and means something else entirely, which is
-// strictly worse than the EINVAL that made trap 4 visible.
+// a forwarded option lands on a DIFFERENT real option rather than on none
+//. Linux IP_TOS is 1 and Darwin's 1 is IP_OPTIONS; Linux IP_TTL is 2
+// and Darwin's 2 is IP_HDRINCL, so setting a TTL of 4 asks Darwin to enable raw
+// IP headers: a call that SUCCEEDS meaning something else, where a merely
+// mismatched flag number would have answered EINVAL.
 //
-// Found through Steam Link: IPV6_V6ONLY is 26 on Linux and 27 on Darwin, so its
-// dual-stack UDP socket failed "Protocol not available" on every start. The
+// IPV6_V6ONLY is 26 on Linux and 27 on Darwin, which fails Steam Link's
+// dual-stack UDP socket with "Protocol not available" on every start. The
 // multicast entries are the ones that matter for LAN host discovery.
 //
 // Only well-established pairs are translated. Anything unrecognised is passed
@@ -497,7 +497,7 @@ static void kl_sa_fmt(char *out, size_t n, const struct sockaddr *sa) {
     }
 }
 
-// ---------- MSG_* flags: trap 16b's class, on the send/recv path ----------
+// ---------- MSG_* flags: overlapping numbers, on the send/recv path --------
 // The four message-passing calls take a flag word, and the two platforms
 // number it differently AND OVERLAPPINGLY, so a forwarded flag does not fail —
 // it asks for a different thing:
@@ -628,9 +628,8 @@ static void kl_bind_conflict_check(int fd, const struct sockaddr *sa, socklen_t 
     // IPv6 wildcard. Darwin lets [::] and 0.0.0.0 hold one port side by side
     // even with no reuse flags, so a family-matched probe cannot see an IPv4
     // owner — but an incoming v4 packet still goes to the AF_INET socket as the
-    // more specific match, which is precisely how the replies were lost. The
-    // first version of this check probed only the guest's own family and was
-    // therefore silent about the one case it exists for.
+    // more specific match, which is how the replies are lost. A probe of the
+    // guest's own family alone is silent about exactly that case.
     if (!busy && sa->sa_family == AF_INET6 &&
         memcmp(&((const struct sockaddr_in6 *)sa)->sin6_addr, &in6addr_any,
                sizeof in6addr_any) == 0) {
@@ -770,7 +769,7 @@ static ssize_t kl_sendto_connected(int fd, const void *buf, size_t n, int dflags
 
 // ---- broadcast, on a platform that will not let an app broadcast ----------
 //
-// Steam Link finds hosts by UDP broadcast to 255.255.255.255:27036 (SL-5). On
+// Steam Link finds hosts by UDP broadcast to 255.255.255.255:27036. On
 // visionOS that needs `com.apple.developer.networking.multicast`, which Apple
 // grants by REQUEST rather than by enabling a capability — so it is not a build
 // setting, it is a wait. Without it the computer list stays empty.
@@ -782,22 +781,18 @@ static ssize_t kl_sendto_connected(int fd, const void *buf, size_t n, int dflags
 // replies come back unicast to the port the guest already bound, so nothing
 // downstream of this changes at all.
 //
-// **Both are sent, and that is deliberate.** The real broadcast is attempted
-// first because on a host run it simply works and is one packet instead of 254.
-// Its result is NOT used to decide whether to fan out, because the failure mode
-// we are working around is a send that *succeeds* and is dropped — Apple's
-// filtering is not required to surface as an errno, and "silent zeros are worse
-// than errors" (trap 6d) cuts both ways: we must not read a successful send as
-// evidence the packet arrived. Duplicate probes are harmless here; a discovery
-// reply is idempotent and the guest already merges hosts by id.
+// BOTH are sent. The real broadcast goes first because on a host run it works
+// and is one packet instead of 254; its result does NOT decide whether to fan
+// out, because the failure being worked around is a send that SUCCEEDS and is
+// dropped — Apple's filtering need not surface as an errno, so a successful send
+// is not evidence the packet arrived. Duplicate probes are harmless: a discovery
+// reply is idempotent and the guest merges hosts by id.
 //
 // KL_NET_BCAST_FANOUT=0 turns it off (the A/B, and what a host run wants once
 // this is understood). KL_SLINK_HOST=<ip>[,<ip>…] replaces the sweep with an
 // explicit list, which is the direct-connect case and costs one packet.
-// 1022 hosts, which is a /22 — measured, because that is what this network
-// turned out to be and a 512 cap swept exactly half of it. The PC happened to
-// be in the half that was covered, which is the kind of luck that makes a bug
-// look like a feature working.
+// 1022 hosts, which is a /22 — measured on this network, where a 512 cap sweeps
+// exactly half.
 #define KLNET_FANOUT_MAX 1024
 
 static int kl_fanout_enabled(void) {
@@ -868,10 +863,9 @@ static unsigned kl_fanout_targets(uint32_t *out, unsigned max) {
             want++;
             if (cached < KLNET_FANOUT_MAX) cache[cached++] = htonl(t);
         }
-        // Never silently. A truncated sweep finds the hosts at the bottom of
+        // Never silently: a truncated sweep finds the hosts at the bottom of
         // the range and not the ones above it, which presents as "discovery
-        // works, except for that one machine" — and the first version of this
-        // capped a /22 at 512 without a word.
+        // works, except for that one machine".
         if (want > cached)
             fprintf(stderr, "  [net] broadcast fan-out: %s has %u hosts and the cap "
                             "is %u — %u address(es) NOT swept; use KL_SLINK_HOST=<ip> "
@@ -1388,7 +1382,7 @@ static int kl_vasprintf(char **o, const char *fmt, void *gva) {
     return vasprintf(o, fmt, (va_list)m);
 }
 // Unity 2018.4 (Beat Saber 1.6.0) imports the unbounded form as well; 2019.4
-// did not. Same trap 2 marshalling as its bounded sibling -- the guest's
+// did not. Same marshalling as its bounded sibling -- the guest's
 // va_list is an AAPCS64 descriptor and cannot be handed to Darwin's vsprintf.
 static int kl_vsprintf(char *b, const char *fmt, void *gva) {
     char m[512] __attribute__((aligned(16)));
@@ -1403,7 +1397,7 @@ static int kl_vsprintf(char *b, const char *fmt, void *gva) {
 // both call them, so they are on the ordinary path rather than a diagnostic
 // one, and refusing them would abort a run that has nothing wrong with it.
 // Nothing here can observe the accounting, so a no-op IS the behaviour --
-// unlike the silent-zero cases in trap 6d, there is no answer being invented.
+// unlike a silent zero, there is no answer being invented.
 static void kl_blocking_region_begin(void) { }
 static void kl_blocking_region_end(void) { }
 
@@ -1433,8 +1427,8 @@ static int kl_vsnprintf_chk(char *d, size_t n, int flags, size_t dl,
     return vsnprintf(d, n, fmt, (va_list)m);
 }
 static size_t kl_malloc_usable_size(const void *p) { return malloc_size(p); }
-// execv would replace the HOST process with an Android binary — the one
-// outcome worse than refusing. execl already answers ENOSYS; match it.
+// execv would replace the HOST process with an Android binary. execl already
+// answers ENOSYS; match it.
 static int kl_execv(const char *p, char *const argv[]) {
     (void)p; (void)argv;
     static int warned;
@@ -1606,7 +1600,7 @@ static const kl_entry g_shim[] = {
     E("clock_gettime", klb_clock_gettime), E("clock_getres", klb_clock_getres),
     E("gettimeofday", klb_gettimeofday),
 
-    // ---- kl_libc_slink.c: the surface Steam Link adds (PLANNING §11.4) ----
+    // ---- kl_libc_slink.c: the surface Steam Link adds ----
     // Every one of these is hand-written for a reason recorded at its
     // definition — a divergent layout, a colliding signature, or no Darwin
     // equivalent at all. None of them may become a direct forward.
@@ -1677,7 +1671,7 @@ static const kl_entry g_shim[] = {
     // the guest binds is the array, offset by one (index -1 is legal).
     E("_ctype_", &klb_ctype_ptr),
     // bionic's LP64 stat aliases must land on the translating shim, never on
-    // Darwin's stat — same struct divergence as `stat` itself (trap 7).
+    // Darwin's stat — same struct divergence as `stat` itself.
     E("stat64", klb_stat), E("lstat64", klb_lstat), E("fstat64", klb_fstat),
 
     // setjmp/longjmp forward directly: bionic's jmp_buf (256B) is LARGER than
@@ -1771,11 +1765,11 @@ void *kl_shim_lookup(const char *name) {
     if (kl_shim_override) { void *o = kl_shim_override(name); if (o) return o; }
     for (size_t i = 0; i < sizeof g_shim / sizeof g_shim[0]; i++)
         if (strcmp(g_shim[i].name, name) == 0) return g_shim[i].fn;
-    // Tier 4: the NDK surface (M3) lives in its own table — it is a different
+    // Tier 4: the NDK surface lives in its own table — it is a different
     // API family with its own lifetimes, not more bionic libc.
     void *ndk = kl_ndk_lookup(name);
     if (ndk) return ndk;
-    // Tier 5: EGL (M5). Same reasoning again, and it is the door to GLES —
+    // Tier 5: EGL. Same reasoning again, and it is the door to GLES —
     // eglGetProcAddress hands out the rest of the graphics surface.
     void *egl = kl_egl_lookup(name);
     if (egl) return egl;
@@ -1803,7 +1797,7 @@ void *kl_shim_lookup(const char *name) {
     if (!strncmp(name, "SL_IID_", 7) || !strcmp(name, "slCreateEngine"))
         return kl_opensl_sym(name);
 
-    // Tier 7: OpenXR (SL-8). libopenxr_loader.so is REPLACED rather than
+    // Tier 7: OpenXR. libopenxr_loader.so is REPLACED rather than
     // translated (kl_openxr.h), so libvrlink_scene's forty-six xr* imports have
     // to bind here at relocation time — the same door libSDL3's gl* imports use
     // above, for the same reason. kl_openxr_lookup returns NULL for a name it
@@ -1812,7 +1806,7 @@ void *kl_shim_lookup(const char *name) {
     if (name[0] == 'x' && name[1] == 'r' && name[2] >= 'A' && name[2] <= 'Z')
         return kl_openxr_lookup(name);
 
-    // Tier 8: libmediandk (SL-10) — AMediaCodec/AMediaFormat/AImageReader/AImage
+    // Tier 8: libmediandk — AMediaCodec/AMediaFormat/AImageReader/AImage
     // and the AHardwareBuffer that joins them to the graphics side. Another
     // DT_NEEDED that has to bind at relocation time, and another lookup that
     // returns NULL for what it does not serve, so the unresolved report keeps
@@ -1824,7 +1818,7 @@ void *kl_shim_lookup(const char *name) {
          !strncmp(name, "AMEDIAFORMAT_", 13)))
         return kl_mediandk_lookup(name);
 
-    // Tier 9: libaaudio (SL-11) — the audio half of the same client. Another
+    // Tier 9: libaaudio — the audio half of the same client. Another
     // DT_NEEDED bound at relocation time, and another lookup that says no to
     // what it does not serve. "AAudio" cannot collide with tier 8's prefixes,
     // so the order of these two tests does not matter.

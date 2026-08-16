@@ -1,18 +1,18 @@
 // The half of the bionic->Darwin surface Beat Saber never asked for.
 //
-// PLANNING §11.4 predicted that the ELF loader, the bionic shim and the pthread
-// layer would "carry over essentially unchanged" for Steam Link. They did — but
-// the shim's *coverage* is a function of what one title imports, and SDL3 plus
-// Valve's own C++ reach for a different set: locale-aware wide character I/O,
-// epoll, the FORTIFY `_chk` family, fenv, and CPU feature detection.
+// The ELF loader, the bionic shim and the pthread layer carry over to Steam
+// Link unchanged. Their COVERAGE does not: it is a function of what one title
+// imports, and SDL3 plus Valve's own C++ reach for a different set — locale-aware
+// wide character I/O, epoll, the FORTIFY `_chk` family, fenv, and CPU feature
+// detection.
 //
 // Everything here is hand-written because a direct forward would be wrong, and
 // the reasons are the same three that recur across this project:
 //
-//   * divergent struct layouts (trap 7). Measured against the NDK's own
+//   * divergent struct layouts. Measured against the NDK's own
 //     headers rather than assumed — see the table above each function.
 //   * a name that exists on both platforms with a different signature
-//     (`sendfile`), which is trap 6b waiting to happen.
+//     (`sendfile`) — an unchecked signature contract waiting to happen.
 //   * a Linux facility with no Darwin equivalent (`epoll`, `getauxval`).
 //
 // Direct forwards for this target live in the generated table as usual.
@@ -61,7 +61,7 @@ void  kl_fatal_prepare(void);
 //
 // So the bits are *measured*, not declared. `hw.optional.*` is Darwin's own
 // answer to the same question, and this is the same posture as the synthetic
-// /proc (trap 6d), which reports the host's real cores rather than a plausible
+// /proc, which reports the host's real cores rather than a plausible
 // number. A feature we cannot confirm is reported absent, which costs
 // performance and never correctness.
 #define AT_PAGESZ   6
@@ -153,7 +153,7 @@ unsigned long klb_getauxval(unsigned long type) {
     case AT_PLATFORM: return (unsigned long)(uintptr_t)"aarch64";
     default:
         // Unknown keys really do return 0 on Linux, so this is the honest
-        // answer rather than a silent zero (trap 6d) — errno is set to match.
+        // answer rather than a silent zero — errno is set to match.
         errno = ENOENT;
         return 0;
     }
@@ -162,12 +162,12 @@ unsigned long klb_getauxval(unsigned long type) {
 // ------------------------------------------------------------------- fenv
 //
 //   fenv_t   bionic 8 bytes   Darwin 16 bytes      (measured with the NDK's
-//                                                   own headers, see PLANNING)
+//                                                   own headers)
 //
 // The guest allocates the fenv_t — SDL3 does it on the stack around float
 // conversions — so calling Darwin's fegetenv on it writes eight bytes past the
-// end. That is trap 7 with a stack smash attached, and the failure would land
-// in whatever local followed it.
+// end: a struct-layout divergence with a stack smash attached, landing in
+// whatever local followed it.
 //
 // The contents are two system registers either way, so rather than translate
 // between two libc representations we read and write FPCR/FPSR directly into
@@ -219,7 +219,7 @@ int klb_feupdateenv(const void *env) {
 // Every count field is a different width and every offset after f_blocks
 // disagrees, so this is filled by hand from statfs(2). Same shape as klb_statfs
 // in kl_libc.c, and the same reason it exists: 120 zero bytes reads as a full
-// disk, not as "unknown" (trap 6d).
+// disk, not as "unknown".
 typedef struct {
     unsigned long f_bsize, f_frsize;
     uint64_t f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail;
@@ -265,8 +265,8 @@ int klb_fstatvfs(int fd, void *out) {
 //                            struct sf_hdtr *hdtr, int flags)
 //
 // Forwarding it would put `offset` (a pointer) in Darwin's `s` (an int) and
-// call it a socket — exactly trap 6b, and this one would be a wild read rather
-// than a wrong number. Darwin's also requires the *destination* to be a socket,
+// call it a socket — a wild read rather than a wrong number. Darwin's also
+// requires the DESTINATION to be a socket,
 // which Linux's does not, so even with the arguments untangled it is not a
 // substitute. A copy loop is.
 ssize_t klb_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
@@ -296,7 +296,7 @@ ssize_t klb_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
 // maps onto cleanly; what does not map is epoll's *level/edge* distinction and
 // EPOLLONESHOT, which are not used here and are refused rather than faked.
 //
-// The lesson from `futex` (trap 6e) applies directly: refusing this does not
+// The lesson from `futex` applies directly: refusing this does not
 // fail loudly, it makes the caller spin. So it is implemented rather than
 // stubbed, and anything it cannot express says so by name.
 #define EPOLL_CTL_ADD 1
@@ -395,9 +395,9 @@ int klb_epoll_wait(int epfd, void *events, int maxevents, int timeout_ms) {
 // Fixed-arity on purpose, not variadic. AAPCS64 passes the first eight
 // arguments of a variadic call in x0-x7, which is exactly where a fixed-arity
 // Darwin function reads its own, so `mode` arrives correctly with no thunk —
-// the same reasoning that made klb_syscall fixed-arity (trap 6e).
+// the same reasoning that made klb_syscall fixed-arity.
 //
-// The flag translation is the point (trap 4): O_* differ between the platforms,
+// The flag translation is the point: O_* differ between the platforms,
 // and openat without it is the same bug that made every guest anonymous mmap a
 // file mapping of fd -1.
 int klb_openat(int dirfd, const char *path, int flags, int mode) {
@@ -418,7 +418,7 @@ int klb___open_2(const char *path, int flags) {
     // door it cannot see reports a file the guest opened as a file it never
     // asked for. FORTIFY rewrites a two-argument open() to this one, so on a
     // guest built with it — UE4 is — this is the ONLY open door, and the trace
-    // was blind to all of it (trap 43's family: the instrument that cannot look).
+    // is otherwise blind to all of it.
     kl_fs_trace_open(_p, flags, fd);
     return fd;
 }
@@ -539,7 +539,7 @@ int klb_ftruncate64(int fd, off_t len) { return ftruncate(fd, len); }
 // __vsprintf_chk takes an already-materialised va_list, which on AAPCS64 is a
 // 32-byte descriptor passed *by reference* — so a kl_va* parameter receives it
 // directly and no asm thunk is needed, exactly as klh_android_log_print does
-// (trap 6b). flags/cap are FORTIFY's and do not participate in the format.
+//. flags/cap are FORTIFY's and do not participate in the format.
 //
 // Bounding the write by `cap` rather than ignoring it is what makes this the
 // checked variant it claims to be: bionic aborts here, and vsprintf into a
@@ -573,7 +573,7 @@ int klb_fdatasync(int fd) { return fsync(fd); }
 
 // (stat64/lstat64/fstat64 are bionic's LP64 aliases for stat and are bound
 // straight to klb_stat & co. in kl_shim.c's table — not to Darwin's stat, whose
-// struct layout differs (trap 7). No wrapper here on purpose: another prototype
+// struct layout differs. No wrapper here on purpose: another prototype
 // for those would be a second copy of a layout that must not drift.)
 
 // Linux's cmsghdr leads with a size_t; Darwin's with a 32-bit socklen_t, so the
@@ -638,7 +638,7 @@ int klb___cxa_thread_atexit_impl(void (*fn)(void *), void *obj, void *dso) {
 // DIFFERENT values (0x00008000L, not 0x01). Reusing those names compiled with a
 // warning and would have built the table out of the host's bit assignments
 // while the guest read it with bionic's — a silent wrong answer of exactly the
-// kind trap 4 describes, caught only because the redefinition was noisy.
+// kind, caught only because the redefinition was noisy.
 #define KLB_CT_U 0x01   /* upper */
 #define KLB_CT_L 0x02   /* lower */
 #define KLB_CT_D 0x04   /* digit */
@@ -654,7 +654,7 @@ static unsigned char g_ctype[257];
 // the *caller's*, and applying it here too shifts the whole table by one
 // character.
 //
-// That is exactly what it did, silently, for the whole project (SL-11): every
+// That is exactly what it did, silently, for the whole project: every
 // inline isalnum/isdigit/ispunct the guest evaluated answered for the character
 // AFTER the one it asked about. Letters and digits mostly survive it — 'A'
 // reads 'B', still alpha — which is why nothing broke for a year. The tell is
@@ -700,8 +700,8 @@ int klb___register_atfork(void (*prep)(void), void (*parent)(void),
 }
 
 // The GNU flavour of strerror_r returns char* and may ignore the buffer; the
-// POSIX one Darwin has returns int. Getting these two confused is trap 6b in
-// miniature — the caller would read an errno as a pointer.
+// POSIX one Darwin has returns int. Confusing the two has the caller read an
+// errno as a pointer.
 char *klb___gnu_strerror_r(int err, char *buf, size_t cap) {
     if (strerror_r(err, buf, cap) != 0) snprintf(buf, cap, "Unknown error %d", err);
     return buf;
@@ -730,7 +730,7 @@ int   klb_fwide(void *f, int mode)         { return fwide(kl_host_file(f), mode)
 // are written against them directly.
 //
 // The rule below is the project's usual one — answer honestly, never with a
-// silent zero (trap 6d). Where Darwin has the facility under another shape we
+// silent zero. Where Darwin has the facility under another shape we
 // build it; where it genuinely has no equivalent we fail with the errno Qt
 // already handles, because Qt has a fallback for every one of these and taking
 // the fallback is a better outcome than pretending.
@@ -814,7 +814,7 @@ int klb_eventfd_write(int fd, uint64_t value) {
 // atomic with the wait here, which is the whole point of ppoll on Linux — but
 // the race it closes is "a signal arrives between unblocking and polling", and
 // nothing in this process delivers signals to the guest's event threads (the
-// guest's own fatal handlers are not installed by default, trap 5). Qt passes
+// guest's own fatal handlers are not installed by default). Qt passes
 // NULL for the mask in the dispatcher path; the mask is honoured for the sake
 // of a caller that does pass one, rather than being silently dropped.
 int klb_ppoll(struct pollfd *fds, unsigned long nfds, const struct timespec *ts,
@@ -841,8 +841,8 @@ int klb_ppoll(struct pollfd *fds, unsigned long nfds, const struct timespec *ts,
 // ---- the three "...and set these flags atomically" variants ----
 // Darwin has the base call and F_SETFD/F_SETFL, so these are the base call plus
 // a follow-up. Not atomic against fork() in another thread; nothing here forks.
-// The flag words are the GUEST's (Linux) numbering — trap 4, and the same
-// values that made fcntl() wrong until it was fixed.
+// The flag words are the GUEST's (Linux) numbering, the same values fcntl()
+// translates.
 #define LX_SOCK_NONBLOCK 0x800
 #define LX_SOCK_CLOEXEC  0x80000
 
@@ -878,7 +878,7 @@ int klb_pipe2(int fds[2], int flags) {
 // to itself; 64 KB of pipe buffer later every writer blocks in write() forever.
 // The abort that followed reported nothing, because the fault reporter's own
 // output went into the same pipe. That is the whole measurement instrument
-// disconnected — an M4 abort-by-name, the gap report, the fault reporter, all
+// disconnected — an abort-by-name, the gap report, the fault reporter, all
 // of it — at exactly the moment it is needed. Silence read as a hang.
 //
 // So the redirection is DECLINED, and both sides get what they were after: the
@@ -889,8 +889,8 @@ int klb_pipe2(int fds[2], int flags) {
 // It reports success (dup2 returns the new descriptor) rather than an error,
 // for klb_sigaction's reason — the guest believes it is installed, and a guest
 // that checks the return value does not take an error path over a diagnostic
-// convenience. Logged once by name: trap 6d, a silent refusal is worse than a
-// loud one.
+// convenience. Logged once by name — a silent refusal is worse than a loud
+// one.
 static int kl_fd_hijack_refused(int to) {
     if (to != STDOUT_FILENO && to != STDERR_FILENO) return 0;
     static int warned[2];
@@ -953,9 +953,8 @@ int klb_inotify_rm_watch(int fd, int wd)  { (void)fd; (void)wd; errno = ENOSYS; 
 int klb_clone(void) { errno = ENOSYS; return -1; }
 
 // ---- __assert2 ----
-// bionic's assert. Fatal by definition, so it goes through kl_fatal_prepare for
-// trap 5's reason: the guest's own signal handlers expect a Linux ucontext and
-// hang on Darwin's.
+// bionic's assert. Fatal by definition, so it goes through kl_fatal_prepare:
+// the guest's own signal handlers expect a Linux ucontext and hang on Darwin's.
 void klb___assert2(const char *file, int line, const char *fn, const char *msg) {
     fprintf(stderr, "  [klepton] guest assertion failed: %s:%d: %s: %s\n",
             file ? file : "?", line, fn ? fn : "?", msg ? msg : "?");

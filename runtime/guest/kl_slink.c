@@ -63,7 +63,7 @@ static const char *const CHAIN_SHELL[] = {
     "libshell_arm64-v8a.so",
 };
 
-// §11.9 measured libvrlink_scene's DT_NEEDED as libopenxr_loader/libaaudio/
+// libvrlink_scene's DT_NEEDED, measured: libopenxr_loader/libaaudio/
 // libmediandk/libandroid/liblog/libEGL/libGLESv3/libm/libdl/libc: no libmain,
 // no libSDL3, no libc++_shared, no Qt. So the "chain" is ONE guest library
 // against system libraries we shim, which is why this array has a single entry
@@ -72,7 +72,8 @@ static const char *const CHAIN_SHELL[] = {
 // libopenxr_loader.so is deliberately ABSENT. It is the Khronos loader and it
 // finds a runtime through an Android `org.khronos.openxr.runtime_broker`
 // service that does not exist here — exactly libOVRPlugin.so's situation in
-// §3.1, and settled the same way: REPLACED, not translated. The xr* names bind
+// situation, and settled the same way: REPLACED, not translated. The xr* names
+// bind
 // against kl_openxr.c through kl_shim_lookup instead. Putting the real loader
 // in this list would map 300 KB of code that can only fail.
 static const char *const CHAIN_VR[] = {
@@ -176,11 +177,11 @@ int kl_slink_configure(kl_slink_door door, const char *libdir, const char *asset
 
     // The JNI surface has to describe THIS app, not Beat Saber. The activity
     // class is the load-bearing one (see above); the paths matter because
-    // trap 6c applies to any guest — Android hands out absolute paths and SDL3's
+    // any guest needs absolute ones — Android hands them out and SDL3's
     // SDL_GetBasePath/SDL_GetPrefPath propagate whatever we say.
     //
     // ...and the VR front door is a DIFFERENT activity in the same package. The
-    // manifest declares the two as peers (§11.9), and this is the one with
+    // manifest declares the two as peers, and this is the one with
     // `category.VR` — Android's stock NativeActivity, whose only app-specific
     // part is the `android.app.lib_name` meta-data.
     kl_jni_set_activity_class(door == KL_SLINK_VR ? "android/app/NativeActivity"
@@ -190,7 +191,7 @@ int kl_slink_configure(kl_slink_door door, const char *libdir, const char *asset
     kl_jni_set_files_dir(files);
     // Printed because this is where the PAIRING CREDENTIAL lives, and a run that
     // silently looks in the wrong place is indistinguishable from a host that
-    // deauthorized us — one costs a re-pair to diagnose (SL-15).
+    // deauthorized us — one costs a re-pair to diagnose.
     if (out) fprintf(out, "  [slink] userdata: %s\n", kl_jni_files_dir());
     // The old APK has no assets/ directory at all — checked, not assumed — so
     // for it this only keeps AAssetManager_open from being a crash, and an
@@ -230,28 +231,27 @@ int kl_slink_configure(kl_slink_door door, const char *libdir, const char *asset
     // The value is the flat native-library directory, NOT a plugins/ tree:
     // Qt-for-Android globs each search path for `libplugins_<subdir>_*.so` (the
     // format string is in libQt6Core), which is exactly how these are named.
-    // Absolute, per trap 6c — the guest chdir()s and a relative path would
-    // resolve somewhere else later.
+    // Absolute: the guest chdir()s and a relative path would resolve somewhere
+    // else later.
     if (door == KL_SLINK_SHELL) {
         char abs[PATH_MAX];
         if (realpath(g_libdir, abs)) setenv("QT_PLUGIN_PATH", abs, 1);
         else if (out) fprintf(out, "  [slink] realpath(%s) failed; Qt will not "
                                    "find its platform plugin\n", g_libdir);
 
-        // **libQt6Core carries PCRE2 with its JIT, and a JIT cannot run here.**
-        //
-        // This is the shell's device crash (SL-19), and it is trap 12 in its
-        // strongest form: AMFI kills any pc not backed by a signed file, so the
-        // moment PCRE2 branches into the ARM64 it just generated the process
+        // libQt6Core carries PCRE2 with its JIT, and a JIT cannot run here:
+        // AMFI kills any pc not backed by a signed file, so the moment PCRE2
+        // branches into the ARM64 it just generated the process
         // dies — `EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE`, termination
         // namespace CODESIGNING, "Invalid Page", into a 64 KB anonymous rw-
         // region. No signal a handler can catch, which is why kl_fault.c had
         // nothing to say about it and why the log simply stopped mid-sentence.
         //
-        // Trap 26's `mrs CTR_EL0` was this same JIT: compiler-rt's
-        // `__clear_cache` is linked into libQt6Core precisely because something
-        // writes instructions and flushes them. Veneering it did not fix the
-        // crash, it advanced it — from the cache flush to the branch.
+        // The veneered `mrs CTR_EL0` in this library is the same JIT:
+        // compiler-rt's `__clear_cache` is linked into libQt6Core precisely
+        // because something writes instructions and flushes them. Veneering it
+        // moves the crash from the cache flush to the branch; it does not
+        // remove it.
         //
         // Qt gives us the switch by name and PCRE2's interpreter is a
         // first-class fallback (`pcre2_jit_compile` failing is an ordinary,
@@ -261,7 +261,7 @@ int kl_slink_configure(kl_slink_door door, const char *libdir, const char *asset
         setenv("QT_ENABLE_REGEXP_JIT", "0", 1);
         if (out) fprintf(out, "  [slink] QT_ENABLE_REGEXP_JIT=0 — PCRE2's JIT "
                               "writes code into anonymous memory and AMFI will "
-                              "not execute it (trap 12); the interpreter is the "
+                              "not execute it; the interpreter is the "
                               "supported fallback\n");
     }
 
@@ -293,12 +293,12 @@ static void report_image(FILE *out, const char *soname, kl_image *img) {
             soname, kl_base(img), kl_span(img) / 1048576.0, total,
             st->tls_rewrites, st->x18_patched, st->x18_sites);
     if (st->x18_refused) fprintf(out, " (refused %u)", st->x18_refused);
-    // Trap 0b: words that decode as x18 sites but sit in data. Named here
+    // Words that decode as x18 sites but sit in data. Named here
     // because the number is how the second detector is watched — silence would
     // make a change of mind about what is code invisible.
     if (st->x18_data_words) fprintf(out, " (data %u)", st->x18_data_words);
     // ...and the same test refusing a TLS site, which is the opposite of free:
-    // that thread pointer is garbage on every thread (trap 1).
+    // that thread pointer is garbage on every thread.
     if (st->tls_refused) fprintf(out, " (TLS REFUSED %u)", st->tls_refused);
     fprintf(out, "  imports %u bound / %u unresolved\n",
             st->imports_bound, st->imports_missing);
@@ -471,7 +471,7 @@ static FILE *g_sdl_out;
 
 static void *sdl_thread_body(void *arg) {
     (void)arg;
-    // Trap 1: any thread that runs guest code seeds bionic's stack-guard canary
+    // Any thread that runs guest code seeds bionic's stack-guard canary
     // into TSD slot 5 first. This thread runs the whole of the guest's main().
     kl_thread_init();
     FILE *out = g_sdl_out;
@@ -489,14 +489,14 @@ static void *sdl_thread_body(void *arg) {
     // SDL dlopens this by path and dlsyms the function out of it. The path has
     // to be the one the image is REGISTERED under or kl_dl's dlopen will try to
     // map a second copy: kl_jni_set_native_lib_dir() and the chain loader both
-    // use g_libdir, so build it the same way. (Trap 6c: absolute would be more
-    // Android-like, but the registry key is what must match.)
+    // use g_libdir, so build it the same way. Absolute would be more
+    // Android-like, but the registry key is what must match.
     char libpath[1024];
     snprintf(libpath, sizeof libpath, "%s/%s", g_libdir, lib);
 
     // argv. SDL3's nativeRunMain takes a String[] and prepends argv[0] itself,
     // so this array is argv[1..]. The real activity fills it from the launching
-    // intent's "sArgs" extra (§11.9) and libmain PARSES IT — --server, --appid,
+    // intent's "sArgs" extra and libmain PARSES IT — --server, --appid,
     // --steamid, --transport and ~40 more. Passing NULL is not "no options
     // chosen", it is the streaming client being asked to stream nothing, which
     // is why it reaches OnStreamError before opening a single socket.

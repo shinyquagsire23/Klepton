@@ -1,7 +1,7 @@
 # The visionOS host app
 
-The Klepton app itself — PLANNING §12.6 (Swift for the platform layer) and
-§12.7 (P4). `spikes/device-probe` stays what it is: a small, disposable thing
+The Klepton app itself: Swift for the platform layer (P4).
+`spikes/device-probe` stays what it is: a small, disposable thing
 for answering device questions. This is the app those answers were for.
 
 ```bash
@@ -84,7 +84,7 @@ Assets carry no code, so they have no such constraint.
 Swift owns the App, and will own the ImmersiveSpace, Compositor Services,
 Metal and ARKit. C owns the guest. The seam is `Sources/kl_app.h` — four
 functions — imported through `Sources/Klepton-Bridging-Header.h`. There is no
-Objective-C anywhere and none is needed; see PLANNING §12.6 for why the
+Objective-C anywhere and none is needed; see below for why the
 boundary lands there.
 
 `Sources/kl_app.c` is `t_boot`'s sequence with the harness removed: no forked

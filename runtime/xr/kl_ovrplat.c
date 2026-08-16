@@ -118,11 +118,11 @@ static uint64_t klplat_drm(const char *name) {
             "\n[klepton] REFUSED: the guest called '%s'.\n"
             "  This is an entitlement / purchase-ownership query. Klepton does not\n"
             "  implement these and does not answer them permissively — inventing a\n"
-            "  result is DRM circumvention, which is out of scope (PLANNING 8).\n"
+            "  result is DRM circumvention, which is out of scope.\n"
             "  The Oculus platform is genuinely absent on this host; that is the\n"
             "  true state of affairs, and it is the app's decision what to do with\n"
             "  it. If this call is unavoidable, the target is wrong: pick an APK\n"
-            "  without entitlement checks (Steam Link, PLANNING 11).\n", name);
+            "  without entitlement checks (Steam Link).\n", name);
     kl_ovrplat_report(stderr);
     kl_fatal_prepare();
     abort();
@@ -318,9 +318,8 @@ static uint64_t klplat_IsPlatformInitialized(void) {
 // false: `UnityException("Oculus Platform failed to initialize.")`. It is not an
 // ovrRequest and not a PlatformInitializeResult — the real export builds a byte
 // (`and w8, w8, #1; strb w8, [sp, ...]`), i.e. a plain bool, checked in both
-// this tree's loaders (superhot +0x51934, beatsaber +0x8aae4). Trap 10's shape
-// exactly: grouped with the request-returning init family it would answer 0,
-// and 0 in a bool is false.
+// this tree's loaders (superhot +0x51934, beatsaber +0x8aae4). Grouped with the
+// request-returning init family it would answer 0, and 0 in a bool is false.
 //
 // Why it answers TRUE, given the file's standing objection to inventing success:
 // that objection is about a request id nothing completes, and it no longer
@@ -890,7 +889,7 @@ void kl_ovrplat_report(FILE *f) {
     fprintf(f, "\n=== Oculus Platform surface ===\n");
     fprintf(f, "  resolved: %u, of which called: %u\n", g_nplat, called);
     if (drm) {
-        fprintf(f, "  --- entitlement / ownership (REFUSED by policy, see PLANNING 8) ---\n");
+        fprintf(f, "  --- entitlement / ownership (REFUSED by policy) ---\n");
         for (unsigned i = 0; i < g_nplat; i++)
             if (g_plat[i].drm)
                 fprintf(f, "    %-52s %s\n", g_plat[i].name,

@@ -26,7 +26,7 @@ What the app links, and why it comes from three places:
                         the app never names would only make dyld load it on
                         every run, including the ones that stay on the null
                         driver.
-  Sources/              the Swift app layer and kl_app.c (PLANNING §12.6).
+  Sources/              the Swift app layer and kl_app.c.
 """
 import os, pathlib, subprocess, sys, re
 
@@ -178,8 +178,8 @@ C_TGT_D = oid("CTGTD"); C_TGT_R = oid("CTGTR")
 F_C = oid("FC"); F_H = oid("FH"); F_BRIDGE = oid("FBRDG")
 B_C = oid("BC")
 
-# The Swift half of §12.6's split: the App/UI, and the Compositor Services
-# renderer P5b adds. A list rather than an id pair each, for the same reason
+# The Swift half of the language split: the App/UI, and the Compositor Services
+# renderer adds. A list rather than an id pair each, for the same reason
 # the guest libraries are one.
 SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
          "KleptonAudio.swift", "KleptonShell.swift"]
@@ -225,9 +225,21 @@ COMMON = f"""
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Info.plist;
+				// One entry per runtime source directory: a runtime header is
+				// included by BARE NAME everywhere, including from
+				// Klepton-Bridging-Header.h, so each directory holding one has
+				// to be on the search path. Same list as the Makefile's
+				// RUNTIME_INC; a new runtime/<area>/ needs a line in both.
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/../runtime",
+					"$(SRCROOT)/../runtime/jni",
+					"$(SRCROOT)/../runtime/libc",
+					"$(SRCROOT)/../runtime/gfx",
+					"$(SRCROOT)/../runtime/xr",
+					"$(SRCROOT)/../runtime/media",
+					"$(SRCROOT)/../runtime/guest",
+					"$(SRCROOT)/../runtime/diag",
 				);
 				// Two levels of escaping, and the first attempt had one. The
 				// pbxproj layer eats a backslash, and the build system then
@@ -255,7 +267,7 @@ COMMON = f"""
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				// VideoToolbox/CoreMedia/CoreVideo are kl_vtdec's (SL-10), and
+				// VideoToolbox/CoreMedia/CoreVideo are kl_vtdec's, and
 				// they were missing here for the whole of the Steam Link arc:
 				// kl_vtdec joined RUNTIME_SHIP, `make xros` kept passing because
 				// its own link line has them, and nothing built the APP until a

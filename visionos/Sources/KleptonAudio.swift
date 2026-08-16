@@ -4,7 +4,7 @@ import Foundation
 /// The audio session — the one part of playback that CoreAudio alone will not
 /// give you on this platform.
 ///
-/// `runtime/kl_audio.c` owns the output unit and the ring, and it is plain C
+/// `runtime/media/kl_audio.c` owns the output unit and the ring, and it is plain C
 /// that compiles unchanged for macOS and visionOS. What does *not* port is the
 /// session: on macOS there is none, and on visionOS an output unit will
 /// initialise, start, report success and produce nothing at all unless an

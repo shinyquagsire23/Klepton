@@ -51,7 +51,7 @@ typedef struct {
 // a method's token RID into an address, and a v29 metadata-usage slot holds
 // `(kind << 29) | (index << 1) | 1` in the FILE until it is initialised — so a
 // string literal decodes back to the `adrp`+`ldr` that reads it, and from there
-// to the method. See notes/VRCHAT.md, Session 8.
+// to the method.
 
 // (1) The "Under Construction" wall.
 //
@@ -113,7 +113,7 @@ static const kl_gp_word k_vrc_minver[] = {
 // (3) The "Going to Error World" transition.
 //
 // The trigger that brought this row up: the APK genuinely does not ship
-// AudioPluginOculusSpatializer (notes/VRCHAT.md, Session 11 §4), so every
+// AudioPluginOculusSpatializer, so every
 // world load raises DllNotFoundException, and the managed response is:
 //
 //     E/Unity: Exception: Going to Error World
@@ -225,8 +225,7 @@ static const kl_gp_word k_vrc_multipass[] = {
 //     contexts and the -1 binds remain).
 //   * IT DOES NOT FIX THE WORLD LOAD. VRChat still fails to instantiate a
 //     scene with this applied — that is a separate cause, and the adjacency of
-//     the two in the log was a coincidence of the kind this file's history is
-//     full of. See notes/VRCHAT.md Session 12.
+//     the two in the log is a coincidence.
 //   * On device it is applied OFFLINE by tools/klepton_ld.c, like every row
 //     here, so the host and the headset agree.
 static const kl_gp_word k_vrc_fbo_ctx[] = {
@@ -275,7 +274,7 @@ static const kl_gp_word k_vrc_fbo_ctx[] = {
 // real hardware too, not just here. Measured: ~1 throw per frame, every frame
 // (587-609 in 600-frame headless runs), and each one costs a full IL2CPP
 // exception raise (our dlopen miss is cached; the throw is not). The call
-// site evaded four static hunts (notes/VRCHAT.md Session 12 §6) because the
+// site evaded four static hunts because the
 // module name lives only in P/Invoke metadata and the resolver is reached
 // indirectly.
 //

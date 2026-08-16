@@ -25,7 +25,7 @@ this file's header warns about, so `make targets` generates
 `kl_libc_table.h` and `kl_jni_slots.h`, so a build never depends on Python.
 
 Two apps built from this tree must not collide, and a bundle ID separates none
-of the things that would (PLANNING §11, "Next up"). So the target also decides
+of the things that would. So the target also decides
 the PRODUCT name — which carries the .xcodeproj, the .app and the derived-data
 directory with it — and the subdirectory the translated guest frameworks are
 staged into. ANGLE is deliberately NOT per-target: it is the same renderer for
@@ -62,8 +62,7 @@ TARGETS = {
         # shares one layout and only the version code in the NAME differs.
         "obb":     "obb",
         # The library the chain STARTS at — libmain's JNI_OnLoad is the whole
-        # entry point for a Unity title (CLAUDE.md, "Facts worth not
-        # rediscovering") — and, on device, the one whose translation being
+        # entry point for a Unity title — and, on device, the one whose translation being
         # present proves this target's guest was embedded rather than the other
         # app's.
         "entry":   "libmain",
@@ -80,7 +79,7 @@ TARGETS = {
         # written against. Its own manifest declares the same
         # com.unity3d.player.UnityPlayerActivity and the same VR intent
         # category, so nothing about the front door differs.
-        #
+        # 
         # Not a split-binary build: the assets are in the APK, so there is no
         # OBB to stage (stage_assets.sh treats one as present-or-absent).
         "libs":    None,
@@ -104,8 +103,8 @@ TARGETS = {
         # (com.unity3d.player.UnityPlayerActivity, the Oculus VR intent
         # category). Two things make it the fourth target rather than a fourth
         # copy of the third:
-        #
-        #   - it is a SPLIT APPLICATION BINARY with TWO obbs. Beat Saber 1.40
+        # 
+        #  - it is a SPLIT APPLICATION BINARY with TWO obbs. Beat Saber 1.40
         #     taught this project that a guest's data can live beside the APK;
         #     this one ships main.2974 AND patch.2974, 6.8 GB together, and the
         #     patch is where the UnitySubsystems manifests and the whole
@@ -119,7 +118,7 @@ TARGETS = {
         #     line says it does not use — so a run that ends up in OpenXR is a
         #     run that fell out of the Oculus path, and that is worth reading as
         #     a symptom rather than as a second front door.
-        #
+        # 
         # libSLZQuestNative and libRF_CNative_andr are the title's own; neither
         # is replaced, so both translate like any other guest library.
         "libs":    None,
@@ -147,19 +146,19 @@ TARGETS = {
         # libUnityOpenXR (the XR SDK provider) and libUnityOpenXRHands — and
         # boot.config says so in one line: `xrsdk-pre-init-library=UnityOpenXR`,
         # where BONELAB's says OculusXRPlugin.
-        #
+        # 
         # That makes it the target that joins the project's two halves: the
         # Unity/IL2CPP path (Beat Saber, SUPERHOT, BONELAB) and the OpenXR
         # runtime written for Steam Link (runtime/xr/kl_openxr.c), which until now
         # only ever had a non-Unity guest on top of it.
-        #
+        # 
         # The front door is stock — com.unity3d.player.UnityPlayerActivity and
         # libmain's JNI_OnLoad — even though the manifest names an OBFUSCATED
         # Application class (aGGhd3.kN5sj1.jrtzH2.r3jyW1), which is the title's
         # own and loads libloader.so from Java. We do not run Java, so nothing
         # here depends on that library; if something ends up demanding it, that
         # is a symptom to read rather than a step to pre-empt.
-        #
+        # 
         # Not a split binary: 317 MB of APK with assets/bin/Data inside it and
         # no OBB beside it. libil2cpp.so alone is 297 MB.
         "libs":    None,
@@ -181,8 +180,8 @@ TARGETS = {
     "openbrush": {
         # Open Brush — Unity 2022.3.62f2 + IL2CPP, and the SIXTH target. Two
         # things make it worth adding rather than a sixth copy of the Unity row:
-        #
-        #   - it is the **OPENXR build**, deliberately, and not the Oculus store
+        # 
+        #  - it is the **OPENXR build**, deliberately, and not the Oculus store
         #     one. Open Brush ships both; this tree is the former, which
         #     boot.config says in the same line VRChat's does
         #     (`xrsdk-pre-init-library=UnityOpenXR`) and the manifest says again
@@ -196,15 +195,15 @@ TARGETS = {
         #     reverse-engineered from a stripped .so, so when this one does
         #     something inexplicable the answer can be READ instead of derived.
         #     Nothing in the build depends on that; it is a debugging lever.
-        #
+        # 
         # The front door is stock — com.unity3d.player.UnityPlayerActivity and
         # libmain's JNI_OnLoad — with no obfuscated Application class of the kind
         # VRChat carries.
-        #
+        # 
         # Not a split binary: 242 MB of APK with assets/bin/Data AND the
         # Addressables catalogue (assets/aa) inside it, so there is no OBB to
         # stage.
-        #
+        # 
         # UNSETTLED and the first thing a run has to answer: the manifest
         # declares `android.hardware.vulkan.version` as REQUIRED. That is
         # BONELAB's question, and BONELAB's recipe answers it — whether the guest
@@ -233,17 +232,17 @@ TARGETS = {
         # here that is not a Unity game and not Steam Link. It is **UNREAL
         # ENGINE 4.25.3** (branch ++VR4+VR4), a Quest exclusive, package
         # com.Armature.VR4.
-        #
+        # 
         # That is the whole reason to add it. Every engine-shaped thing this
         # project knows was learned from Unity: five of the six targets are
         # Unity + IL2CPP, and the sixth (Steam Link) is not a game engine at
         # all. So a whole half of the shim has only ever been exercised in one
         # dialect, and the parts that are genuinely Android rather than Unity
         # have never been asked a second opinion.
-        #
+        # 
         # Three things differ at the door, all measured from the APK:
-        #
-        #   - **the entry is a NativeActivity.** libUE4.so exports
+        # 
+        #  - **the entry is a NativeActivity.** libUE4.so exports
         #     ANativeActivity_onCreate, android_main AND JNI_OnLoad; the
         #     manifest names com.epicgames.ue4.GameActivity with
         #     `android.app.lib_name = UE4`. So the guest is STARTED through the
@@ -253,24 +252,23 @@ TARGETS = {
         #     used this path, and that is one non-Unity library rather than an
         #     engine.
         #   - **input arrives as an AInputQueue.** AInputEvent / AKeyEvent /
-        #     AMotionEvent are in the unresolved set, and CLAUDE.md's "Facts
-        #     worth not rediscovering" records that Beat Saber uses none of
-        #     them: Unity takes its input over JNI. This is the NDK surface
-        #     nothing has needed yet.
+        #     AMotionEvent are in the unresolved set, and Beat Saber uses
+        #     none of them: Unity takes its input over JNI. This is the NDK
+        #     surface nothing has needed yet.
         #   - **assets come through AAssetManager**, not over JNI —
         #     AAsset_getBuffer and AAsset_openFileDescriptor are both
         #     unresolved. The same note records that Unity reads its assets
         #     through Context.getAssets() and a Java InputStream instead.
-        #
+        # 
         # A split application binary with TWO obbs, BONELAB's shape: main.203
         # and patch.203, 8.5 GB together, staged wholesale.
-        #
+        # 
         # XR is VrApi/OVRPlugin — both libraries ship — and NEITHER is in
         # libUE4's DT_NEEDED, so both are dlopen'd and kl_ovrp claims them the
         # way it always has. `bSupportsVulkan` is true in the manifest and
         # there is no libvulkan in the link either, so which graphics API this
         # takes is a question for the first run rather than the table.
-        #
+        # 
         # THE APK CARRIES AN INJECTED PAYLOAD AND IT IS NOT LOADED. libfrda.so
         # is a Frida gadget and libscript.so is its script; libfrda.config.so
         # is plain JSON and says what it is for — `patch_ovrplatformloader`,
@@ -309,11 +307,10 @@ TARGETS = {
     "steamlink-vr": {
         # BOTH front doors, because the app runs both: the 2D shell pairs in a
         # WindowGroup and hands off to the OpenXR half in an ImmersiveSpace, in
-        # one process (PLANNING §11.9 — an app bundle cannot re-exec the way
-        # `build/m_slink` does).
-        #
+        # one process (an app bundle cannot re-exec the way `build/m_slink` does).
+        # 
         # Three groups, and the third is the one that is easy to leave out:
-        #   libvrlink_scene   the VR door. ONE library — its DT_NEEDED is
+        #  libvrlink_scene   the VR door. ONE library — its DT_NEEDED is
         #                     entirely Android system libraries we shim.
         #   the shell chain   fourteen, dependencies first, off libshell's own
         #                     DT_NEEDED (runtime/guest/kl_slink.c's CHAIN_SHELL).
@@ -342,7 +339,7 @@ TARGETS = {
         # The six plugin .so files ALSO go into the container, as ELF, and not
         # as a loader path — kl_load_auto still resolves each of them to its
         # signed framework by basename, so nothing maps guest text from here.
-        #
+        # 
         # **Qt reads a plugin as a FILE before it will load it.** libQt6Core's
         # search is a glob (`libplugins_%1_*.so`), so it lists the directory and
         # then parses each candidate's ELF metadata for the IID and the Qt
@@ -350,7 +347,7 @@ TARGETS = {
         # everything else in this project and is not enough for that: with no
         # real files nothing is ever a candidate, and libshell aborts with
         # `Could not find the Qt platform plugin "virtual"`.
-        #
+        # 
         # Six files, 544 KB — not the whole 75 MB tree, because these are the
         # only libraries anything reads rather than loads.
         "qtplugins": "steamlink-vr/lib/arm64-v8a",
@@ -372,14 +369,14 @@ TARGETS = {
 DEFAULT = "beatsaber"
 
 
-# `"libs": None` means "whatever this tree would translate for that srcdir",
-# which the Makefile already decides — the .so files that are really ELF, minus
+        # `"libs": None` means "whatever this tree would translate for that srcdir",
+        # which the Makefile already decides — the .so files that are really ELF, minus
 # the ones we REPLACE (libOVRPlugin, libovrplatformloader, libvrapi) and the
 # ones that are not part of the application (libfrda, libscript). Asking it
 # rather than restating it keeps one answer: a second copy of those rules here
 # would drift on the next guest, and the failure mode is a bundle missing a
 # library, which on device is a dlopen that cannot fall back to anything.
-#
+# 
 # It is a hard failure rather than a fallback to a pinned list, for the same
 # reason: a quietly incomplete bundle is worse than a build that stops.
 def libs_for(srcdir):
@@ -397,25 +394,25 @@ def libs_for(srcdir):
 
 
 # A bundle id is GLOBAL, so the one in the table is not usable as it stands.
-#
+# 
 # An App ID can be registered to exactly one team, and automatic signing tries to
 # register one on the first build. So the second person to build this tree does
 # not get a warning, they get a signing failure that names neither the cause nor
 # the fix:
-#
+# 
 #   error: Failed Registering Bundle Identifier: the app identifier
-#          "dev.klepton.app" cannot be registered to your development team
-#
+#         "dev.klepton.app" cannot be registered to your development team
+# 
 # ...and because both memory entitlements need an EXPLICIT App ID, that failure
 # takes them down with it — which is the thing that stopped the
 # loading-transition kills on device (see ENTITLEMENTS in gen_xcodeproj.py). One
 # person's registration is enough to block everyone else's build of the same
 # commit.
-#
+# 
 # So the account building it supplies the front of the id. $USER is the right key
 # because it is per-machine-account, always set in a login shell, and needs no
 # configuration at all to be different for different people.
-#
+# 
 # The rest is DERIVED from the target name rather than stored per target:
 #
 #     <user>.dev.klepton.target.<target>
@@ -424,7 +421,7 @@ def libs_for(srcdir):
 # table cannot hold an id that disagrees with the key above it. (The three that
 # used to be there did exactly that — `dev.klepton.app`, `dev.klepton.steamlink`
 # and `dev.klepton.target.superhot` were three conventions for three targets.)
-#
+# 
 # Sanitised, because a bundle id may hold only alphanumerics, hyphens and
 # periods: anything else becomes a hyphen, and a scope that sanitises to nothing
 # (or an unset USER, as in some CI) leaves the id unscoped rather than emitting
@@ -461,7 +458,7 @@ def resolve(name):
 # are here: the visionOS product/bundle/display are the BUILD's business and the
 # app already knows which one it is by the time it runs, and `libs` is discovered
 # per build rather than being a property anything at runtime should believe.
-#
+# 
 # The DEFAULT is emitted too, so `build/m_boot` with no argument and an app built
 # with no -DKL_TARGET_DEFAULT agree about which guest that means.
 def c_table():
@@ -506,8 +503,8 @@ def main(argv):
             return 1
         print(t[argv[2]])
         return 0
-    # Shell-sourceable. Quoted because `libs` has spaces in it and an unquoted
-    # eval would turn one assignment into a command.
+# Shell-sourceable. Quoted because `libs` has spaces in it and an unquoted
+# eval would turn one assignment into a command.
     for k, v in t.items():
         print(f"KLT_{k.upper()}='{v}'")
     return 0

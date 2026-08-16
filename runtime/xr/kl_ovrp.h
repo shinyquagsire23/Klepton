@@ -1,6 +1,6 @@
-// M6 front door — libklepton_ovrp, the replacement for Oculus's OVRPlugin.
+// The XR front door — libklepton_ovrp, the replacement for Oculus's OVRPlugin.
 //
-// PLANNING §3.1 settled this before any code existed: libOVRPlugin.so links
+// Settled before any code existed: libOVRPlugin.so links
 // against libossdk.so / libossdk.oculus.so / libOVRMrcLib.so and NEEDs
 // libvrapi.so, none of which ship in the APK. It cannot be translated, so the XR
 // cut line is *above* VrApi and OVRPlugin is replaced wholesale. That also
@@ -26,7 +26,7 @@ int   kl_ovrp_claims(const char *soname);   // the same test, without opening
 int   kl_ovrp_is_handle(const void *h);
 void *kl_ovrp_sym(const char *name);
 
-// Which ovrp_* the guest resolved and which it called — the M6 work list.
+// Which ovrp_* the guest resolved and which it called — the work list.
 void kl_ovrp_report(FILE *f);
 
 // Which space those poses are in: 0 = eye level, 1 = floor level, 2 = stage,
@@ -90,7 +90,7 @@ void kl_ovrp_frame_latch(void);
 // the same moment the frame is admitted (see kl_ovrp_frame_latch).
 void kl_ovrp_set_frame_pacer(void (*wait)(void));
 
-// M7 — the rest of the pose-in seam: the two Touch controllers. `hand` is
+// The rest of the pose-in seam: the two Touch controllers. `hand` is
 // 0 = left (node 3), 1 = right (node 4). Poses live in the same tracking
 // space as the head. Buttons/touches are ovrpButton/ovrpTouch bit values as
 // the guest's own OVRPlugin enum defines them (the frontend composes final
@@ -121,7 +121,7 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
                                   float stick_x, float stick_y);
 
 // ---------------------------------------------------------------------------
-// M8 — haptics: the one seam that runs OUT of the guest
+// Haptics: the one seam that runs OUT of the guest
 //
 // Everything above is the frontend answering questions. This is the guest
 // giving an order: it queues an amplitude envelope through OVRPlugin's buffered
@@ -164,7 +164,7 @@ void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
 int kl_ovrp_haptics_pull(int hand, float *amplitude, float *seconds);
 
 // ---------------------------------------------------------------------------
-// Timewarp bookkeeping — PLANNING §12.1(3)
+// Timewarp bookkeeping
 //
 // Reprojection needs exactly one thing the compositor cannot work out for
 // itself: the pose each eye-pair framebuffer was *actually* rendered with, and
@@ -316,7 +316,7 @@ int kl_ovrp_overlay_get(int i, kl_ovrp_overlay *out);
 // forever and every frame composites black however good the picture is. Beat
 // Saber files it from ovrp_BeginFrame/ovrp_EndFrame; an OpenXR guest never
 // calls either, which is why the Steam Link immersive space was black with a
-// perfectly healthy compositor (SL-18).
+// perfectly healthy compositor.
 //
 // The pair is the same two moments, and the OpenXR half is the easier one:
 //
@@ -327,7 +327,7 @@ int kl_ovrp_overlay_get(int i, kl_ovrp_overlay *out);
 // **The stage is passed in rather than observed**, and that is the difference
 // between the two guests. Unity picks its stage privately, so kl_glfb has to
 // watch which eye texture it bound as a draw target and klovrp_EndFrame files
-// the frame under whatever was seen (PLANNING §12.19). An OpenXR guest names
+// the frame under whatever was seen. An OpenXR guest names
 // the image it drew — xrReleaseSwapchainImage, then the projection layer at
 // xrEndFrame — so there is nothing to infer and none of that machinery's
 // failure modes (`drew into NO eye stage`, `drew into N stages`) can arise.
@@ -477,7 +477,7 @@ float kl_ovrp_display_frequency(void);
 // eye swapchain when the size changes, which a run's logs show it doing three
 // times before the menu is up. Pushing before the guest boots is still better —
 // it is one fewer rebuild, and each one used to leak a whole generation
-// (PLANNING §12.21).
+//.
 void kl_ovrp_set_eye_texture_size(int w, int h);
 void kl_ovrp_eye_texture_size(int *w, int *h);
 
@@ -533,7 +533,7 @@ void kl_ovrp_get_guest_head_pose(float *px, float *py, float *pz,
 float kl_ovrp_eye_height(void);
 
 // ---------------------------------------------------------------------------
-// The read side of the M7 seam, for the OTHER XR API
+// The read side of the pose seam, for the OTHER XR API
 //
 // Everything above this line is the OVRPlugin ABI answering the OVRPlugin
 // guest. These three are the same measurements handed to `kl_openxr.c`, which

@@ -1,4 +1,4 @@
-// S0.5 verification with a guest we control.
+// x18 veneer verification with a guest we control.
 //
 // Beat Saber can only ever tell us that nothing crashed. That is a weak claim
 // about a register substitution: get a bit-field wrong and the instruction still
@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
     if (bad) return fail("guest and host disagreed under concurrency");
     printf("  %d results, all identical to the host\n", NTHREADS * PER_THREAD * 2);
 
-    printf("\n=== S0.5 VERIFIED: veneered guest code computes the same answers "
+    printf("\n=== VERIFIED: veneered guest code computes the same answers "
            "as unveneered host code, under preemption ===\n");
     return 0;
 }

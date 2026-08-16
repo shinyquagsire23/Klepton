@@ -202,7 +202,7 @@ static void probe_dump_enums(void) {
         if (*tok) probe_dump_enum(tok);
 }
 
-// The axes this title binds (PLANNING M7: parsed out of globalgamemanagers).
+// The axes this title binds (parsed out of globalgamemanagers).
 static const char *const AXES[] = {
     "TriggerLeftHand", "TriggerRightHand",
     "HorizontalLeftHand", "VerticalLeftHand",

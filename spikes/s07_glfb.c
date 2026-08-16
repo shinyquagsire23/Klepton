@@ -1,4 +1,4 @@
-// S0.7 — is there a real, readable framebuffer available on the host at all?
+// Is there a real, readable framebuffer available on the host at all?
 //
 // The null driver in kl_egl.c can tell us which GL calls the guest makes but not
 // what they would produce. Before building any backend, the question worth
@@ -160,7 +160,7 @@ int main(void) {
     const char *out = "build/s07_glfb.png";
     if (!png(out, px, W, H)) { fprintf(stderr, "FAIL: png\n"); return 1; }
     printf("  wrote %s\n", out);
-    printf("%s\n", drawn > 1000 ? "=== S0.7 PASS: offscreen GL context renders and reads back ==="
+    printf("%s\n", drawn > 1000 ? "=== PASS: offscreen GL context renders and reads back ==="
                                 : "FAIL: context works but the draw produced nothing");
     return drawn > 1000 ? 0 : 1;
 }

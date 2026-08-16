@@ -1,4 +1,4 @@
-// Android NDK surface (M3). The base set is what libunity.so imports:
+// Android NDK surface. The base set is what libunity.so imports:
 // ALooper_*, ANativeWindow_*, ASensor*. The Steam Link target (SDL3) adds
 // ANativeWindow_lock/unlockAndPost and the AAssetManager_*/AAsset_* subset —
 // Unity never imported those (its assets arrive over JNI), which is why they
@@ -12,7 +12,7 @@
 // Resolve an NDK import by name. NULL if we do not provide it.
 void *kl_ndk_lookup(const char *name);
 
-// The surface Unity renders into. Placeholder until M5 binds a real drawable;
+// The surface Unity renders into. Placeholder until EGL binds a real drawable;
 // the host sets the true geometry once it has one.
 void kl_ndk_set_window(int32_t width, int32_t height, int32_t format);
 void *kl_ndk_window(void);

@@ -28,7 +28,7 @@
 #include "kl_jni_int.h"
 
 // ------------------------------------------------------------- SDLActivity --
-// Steam Link's half of the M4 surface (PLANNING §11). Every one of these is
+// Steam Link's half of the JNI surface. Every one of these is
 // called by SDL3 itself during SDL_main's startup, not by the app.
 
 #define KLJ_SDLA "org/libsdl/app/SDLActivity"
@@ -291,7 +291,7 @@ const klj_binding klj_bind_sdl[] = {
     // Android would compute, not a stub's shrug.
     //
     // It is also the fork that decides what this run can show. True sends the
-    // shell down the returning-from-VR path (§11.9's handoff, which we have not
+    // shell down the returning-from-VR path (the handoff, which is not
     // synthesized); false is the plain 2D configuration frontend, which is the
     // whole reason for opening this front door.
     {"com/valvesoftware/steamlink/SteamLink", "wasLaunchedFromVRLink", "()Z", klj_SDLA_false},

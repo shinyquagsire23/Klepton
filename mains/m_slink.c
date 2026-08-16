@@ -1,7 +1,7 @@
-// SL-1 gate: the second target (Steam Link, SDL3) enters the guest.
+// The gate for the second target: Steam Link (SDL3) enters the guest.
 //
-// The shape differs from t_boot in exactly the ways PLANNING §11 predicted, and
-// it is worth being explicit about them because they are what this target buys:
+// The shape differs from t_boot in three ways, and they are what this target
+// buys:
 //
 //   - The chain is SEVEN libraries, not one that dlopens another. libmain.so
 //     DT_NEEDEDs libSDL3, libSDL3_ttf, libSDL3_image, the two bitstream helpers
@@ -31,16 +31,16 @@
 #include <unistd.h>
 #include "../runtime/klepton.h"
 #include "../runtime/kl_jni.h"
-#include "../runtime/kl_ndk.h"
+#include "../runtime/guest/kl_ndk.h"
 #include "../runtime/kl_fault.h"
-#include "../runtime/kl_glfb.h"
-#include "../runtime/kl_view.h"
-#include "../runtime/kl_mediandk.h"
-#include "../runtime/kl_aaudio.h"
-#include "../runtime/kl_openxr.h"
-#include "../runtime/kl_egl.h"
-#include "../runtime/kl_slink.h"
-#include "../runtime/kl_ovrp.h"
+#include "../runtime/gfx/kl_glfb.h"
+#include "../runtime/gfx/kl_view.h"
+#include "../runtime/media/kl_mediandk.h"
+#include "../runtime/media/kl_aaudio.h"
+#include "../runtime/xr/kl_openxr.h"
+#include "../runtime/gfx/kl_egl.h"
+#include "../runtime/guest/kl_slink.h"
+#include "../runtime/xr/kl_ovrp.h"
 #include "../tests/t_mtl_provider.h"
 
 static const char *LIBDIR = "steamlink-android/lib/arm64-v8a";
@@ -53,7 +53,7 @@ static int fail(const char *msg) { fprintf(stderr, "FAIL: %s\n", msg); return 1;
 
 // Which front door, resolved once in slink_run() before anything reads it. The
 // chains, the entry points and everything the JNI surface has to say about this
-// app moved to runtime/kl_slink.c when the visionOS app became the second
+// app moved to runtime/guest/kl_slink.c when the visionOS app became the second
 // driver — see that file's header comment for why the split falls where it
 // does. What stays here is policy: the recon phases, KL_GAP_ONLY, the fork, the
 // viewer and the 2D->VR handoff.
@@ -65,7 +65,7 @@ static kl_slink_door g_door;
 // SDLActivity.onCreate's sequence — nativeSetScreenResolution, onNativeResize,
 // onNativeSurfaceCreated, and then mSDLThread, where the guest's main() runs.
 //
-// All of it lives in runtime/kl_slink.c now: it is SDL3's contract with
+// All of it lives in runtime/guest/kl_slink.c now: it is SDL3's contract with
 // Android and therefore a property of *this guest*, and the visionOS app is a
 // second driver that must not be able to describe it differently. What stays
 // here is policy — when to run it, and how long the UI thread waits afterwards.
@@ -99,8 +99,8 @@ static void run_main_sequence(void) {
 // SteamLink.startVRLink(String) is the end of the shell's job: it has paired,
 // the host has authorized, and it now starts the VR activity with the session
 // as `sArgs` and calls finishAndRemoveTask() on itself. Both halves exist here
-// now (SL-9 onward), so there is no reason for a person to carry the string
-// between two runs by hand — but they are two front doors with different
+// now, so there is no reason for a person to carry the string between two runs
+// by hand — but they are two front doors with different
 // chains, different libraries and different lifecycles, and the shell's `main`
 // is on the stack of the thread making this call.
 //
@@ -115,7 +115,7 @@ static void run_main_sequence(void) {
 // Only knobs that are UNSET are filled in, and every one is announced. Two of
 // them are not cosmetic:
 //
-//   KL_OVRP_IPD   — SL-12: on a host run nothing measures the eye offsets, so
+//   KL_OVRP_IPD   — on a host run nothing measures the eye offsets, so
 //                   they are 0, and this client reads an IPD of zero as
 //                   "unchanged" and never sends the host its projection. With
 //                   no picture at all as the alternative, the documented host
@@ -173,14 +173,15 @@ static void slink_vrlink_handoff(const char *sargs) {
 
 // ------------------------------------------------------------- VR front door --
 // The ANativeActivity ABI, the onCreate call and the looper pump all live in
-// runtime/kl_slink.c now — they are Android's contract with this guest, not
+// runtime/guest/kl_slink.c now — they are Android's contract with this guest, not
 // this driver's. What is left here is what a *command-line* run does with them:
 // where it stops (KL_SLINK_MAIN), how long it waits (KL_SLINK_WAIT) and that a
 // windowed run waits on the window instead.
 static void run_vr_sequence(void) {
     // KL_GLFB_MTL=1: the eye swapchain images this guest is about to create get
     // MTLTexture storage from the same provider Compositor Services supplies on
-    // device, so the P5 seam has a host arm at all for this guest. Registered
+    // device, so the compositor seam has a host arm at all for this guest.
+    // Registered
     // before onCreate because the backing happens at the first xrEndFrame, and
     // an unregistered provider there is simply "no eye textures" with nothing
     // saying so. Explicitly on KL_GLFB_MTL and not on KL_VIEW: the 2D shell's
@@ -212,7 +213,7 @@ static void run_vr_sequence(void) {
     printf("  (UI thread waited %.1fs of %us — see above for where the guest got to)\n",
            elapsed, maxs);
 
-    // The P5 seam, measured, on the host — which is the whole point of doing it
+    // The compositor seam, measured on the host — the whole point of doing it
     // here. On device this question ("is there a picture in the eye textures?")
     // costs a fresh Steam pairing to ask and answers only as a black immersive
     // space, which indicts everything from the decoder to the compositor
@@ -220,14 +221,14 @@ static void run_vr_sequence(void) {
     //
     //   stage  -1 means no frame record was ever filed, so a compositor has
     //          nothing to sample whatever the guest drew — the seam, not the
-    //          picture (SL-18's `0 with a picture` was exactly this).
+    //          picture. This reads as `0 lit` beside a drawn frame.
     //   lit    per eye, out of the eye texture the compositor WOULD sample.
     //          0 with a stage means the guest drew black or drew somewhere
     //          else; non-zero means the picture is there and anything still
     //          missing is downstream of this file.
     if (getenv("KL_GLFB_MTL")) {
         int stage = kl_ovrp_last_complete_stage();
-        printf("\n=== the eye textures (P5) ===\n");
+        printf("\n=== the eye textures ===\n");
         printf("  last complete stage: %d%s\n", stage,
                stage < 0 ? "   <-- NO FRAME RECORD; a compositor shows black" : "");
         for (int eye = 0; eye < 2 && stage >= 0; eye++) {
@@ -241,7 +242,7 @@ static void run_vr_sequence(void) {
 }
 
 static int slink_run(void) {
-    // Trap 1, and it bit immediately: every thread that runs guest code must
+    // Every thread that runs guest code must
     // seed bionic's stack-guard canary into TSD slot 5 first. Without it the
     // slot holds whatever Darwin last left there, libSDL3's JNI_OnLoad copies
     // that at entry, something writes the slot during the 68 RegisterNatives
@@ -275,9 +276,9 @@ static int slink_run(void) {
     // Everything the guest is told about itself: the activity class, the four
     // paths, the <meta-data>, Qt's plugin path and the panel size. Shared with
     // the visionOS app, which describes the same guest and must not describe it
-    // differently — runtime/kl_slink.c.
+    // differently — runtime/guest/kl_slink.c.
     // Both front doors share one profile: the pairing credential the shell
-    // stores is exactly what the VR door is handed at SL-15's re-exec, so
+    // stores is exactly what the VR door is handed at the re-exec, so
     // splitting them would make the app re-pair against itself.
     if (kl_slink_configure(g_door, LIBDIR, assets, apk,
                            kl_userdata_dir("steamlink"), stdout) != 0) {
@@ -330,7 +331,7 @@ static int slink_run(void) {
         // of them. Every one of these is reported on the abort path through
         // kl_fault.c, and a VR run that works does not take it. An empty report
         // reads as "nothing happened"; no report at all reads the same way and
-        // takes longer to disbelieve (SL-13 lost a run to exactly that).
+        // takes longer to disbelieve.
         kl_slink_report(stdout);
         return 0;
     }
@@ -338,7 +339,7 @@ static int slink_run(void) {
     // ---- phase 2: the JNI gate ----
     // libSDL3's JNI_OnLoad, the natives SDLActivity.onCreate calls first, and
     // the entry point looked up the way nativeRunMain will look it up. All of
-    // it is SDL3's contract with Android, so it lives in runtime/kl_slink.c
+    // it is SDL3's contract with Android, so it lives in runtime/guest/kl_slink.c
     // where the visionOS app reads the same description.
     printf("\n=== phase 2: libSDL3.so JNI_OnLoad ===\n");
     fflush(NULL);
@@ -368,7 +369,7 @@ static int slink_run(void) {
                nstatic, sizeof STATIC_NATIVES / sizeof *STATIC_NATIVES);
     }
 
-    printf("\n=== SL-1 EXIT CRITERION MET: chain bound, SDL3 JNI_OnLoad ran ===\n");
+    printf("\n=== EXIT CRITERION MET: chain bound, SDL3 JNI_OnLoad ran ===\n");
 
     // ---- phase 3: reconnaissance ----
     // SDLActivity.onCreate calls SDL.setupJNI() first, which caches the
@@ -380,8 +381,8 @@ static int slink_run(void) {
     kl_slink_sdl_setup(stdout);
 
     // ---- phase 4: the rest of onCreate, to SDL_main ----
-    // Behind a knob for the same reason KL_LIFECYCLE gates t_boot: SL-1 is a
-    // gate that must stay green, and everything below here is expected to stop
+    // Behind a knob for the same reason KL_LIFECYCLE gates t_boot: phases 1-3
+    // are a gate that must stay green, and everything below here stops
     // by name until the shim catches up. `make slink` keeps measuring phases
     // 1-3; KL_SLINK_MAIN=1 is the working loop.
     // KL_VIEW implies it: opening a window for a guest whose main never runs
@@ -392,11 +393,11 @@ static int slink_run(void) {
 
     // The video and audio paths report on the abort path through kl_fault.c,
     // which a clean exit never takes — and a clean exit is exactly the run
-    // where "did anything actually decode?" is the question (SL-11).
+    // where "did anything actually decode?" is the question.
     //
     // BEFORE the JNI surface, which is thousands of lines: these few are the
     // answer the run was for, and at the bottom of that they are unfindable —
-    // and worse, indistinguishable from not having printed at all (SL-13).
+    // and worse, indistinguishable from not having printed at all.
     kl_mediandk_report(stdout);
     kl_aaudio_report(stdout);
     printf("\n=== JNI surface ===\n");
@@ -411,7 +412,7 @@ static int slink_run(void) {
 // because macOS requires windowing there.
 //
 // No fork and no re-exec: a windowed app never forks, and Metal's XPC shader
-// compiler refuses forked children anyway (the AGX story in CLAUDE.md).
+// compiler refuses forked children anyway (the AGX abort).
 //
 // The frame path is the READBACK sink, deliberately. The hardware compositor
 // (kl_view_mtl.m) samples eye MTLTextures keyed by (eye, stage) out of kl_ovrp,
@@ -419,7 +420,7 @@ static int slink_run(void) {
 // picture is the default framebuffer of an EGL window surface. Reading that
 // back needs no Metal interop at all, which is why it works today — giving the
 // mono path a zero-copy route means backing the window surface with an
-// EGLImage-bound MTLTexture, the same interop the eye textures use (§12.9).
+// EGLImage-bound MTLTexture, the same interop the eye textures use.
 static void *slink_view_guest(void *arg) {
     (void)arg;
     kl_thread_init();

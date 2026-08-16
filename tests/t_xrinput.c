@@ -1,4 +1,4 @@
-// SL-20 — the OpenXR action-surface gate. `make xrinput`, in `make check`.
+// The OpenXR action-surface gate. `make xrinput`, in `make check`.
 //
 // The check itself lives in kl_openxr.c (kl_openxr_input_selftest) for the same
 // reason `make xrspace`'s does: what it asserts is that file's internal model —
@@ -13,7 +13,7 @@
 // actually hands over.
 #include <stdio.h>
 #include <stdlib.h>
-#include "../runtime/kl_openxr.h"
+#include "../runtime/xr/kl_openxr.h"
 
 int main(void) {
     // The frontend seam in kl_ovrp parks the hands at a head-relative default
@@ -22,7 +22,7 @@ int main(void) {
     // a statement about wherever the default head happened to be.
     setenv("KL_OVRP_EYE_HEIGHT", "0", 0);
 
-    printf("=== OpenXR actions, poses and haptics (SL-20) ===\n");
+    printf("=== OpenXR actions, poses and haptics ===\n");
     int ok = kl_openxr_input_selftest(stdout);
     printf("%s: the action surface reads the input kl_ovrp holds\n",
            ok ? "PASS" : "FAIL");

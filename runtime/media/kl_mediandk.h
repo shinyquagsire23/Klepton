@@ -6,7 +6,7 @@
 // hevc` check the decode with no guest at all.
 //
 // What the guest does with this surface, measured from its own error strings
-// (QSVLCodecNDK::Init, PLANNING §11.15):
+// (QSVLCodecNDK::Init):
 //
 //   AMediaCodec_createDecoderByType("video/hevc")
 //   AMediaFormat_new + setString(mime) + setInt32(width/height/colour/...)

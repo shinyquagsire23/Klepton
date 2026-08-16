@@ -90,8 +90,8 @@ static klj_val klj_Method_getName(void *env, void *self, const klj_val *a, int n
 // same reasoning as the other group answers, applied to a round trip rather than
 // to a set of properties.
 //
-// The strings are copied, not aliased: they arrive as guest jstrings and trap 6
-// is exactly this mistake made once already with RegisterNatives.
+// The strings are copied, not aliased: they arrive as guest jstrings, whose
+// storage the guest reuses the moment this returns.
 static void *klj_new_field(const char *cls, const char *name, const char *sig, int is_static) {
     klj_field_obj *f = calloc(1, sizeof *f);
     if (!f) return NULL;

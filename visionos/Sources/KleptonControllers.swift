@@ -1,5 +1,5 @@
 //
-//  KleptonControllers.swift — the controller seam, P5b/M7 on visionOS.
+//  KleptonControllers.swift — the controller seam on visionOS.
 //
 //  The guest wants two Oculus Touch controllers: poses for nodes 3 and 4, and
 //  `ovrpButton`/`ovrpTouch` raw bits, an index trigger, a hand trigger and a
@@ -77,7 +77,7 @@ struct KleptonHandState {
 /// `PrimaryIndexTrigger` in virtual space and `RThumbstickDown` in raw, so
 /// every "trigger press" became a stick flick and no press ever reached a UI.
 ///
-/// The eight marked (v) are the ones `runtime/kl_view.c` drives on the host and
+/// The eight marked (v) are the ones `runtime/gfx/kl_view.c` drives on the host and
 /// which have been seen to work end to end in gameplay. The rest are the
 /// standard raw layout, consistent with those eight, and are **not** yet
 /// confirmed against the guest's own metadata — if a menu or stick click does
@@ -264,25 +264,25 @@ private func klEulerXYZ(_ degrees: SIMD3<Float>) -> simd_quatf {
 ///
 /// The third is this guest's, and it is the larger one:
 ///
-///   * **`hiltPitch`, -35 degrees about X.** Measured the only way it can be —
+///   * **`hiltPitch`, -37 degrees about X.** Measured the only way it can be —
 ///     by playing, and reading the number back off Beat Saber's own in-game
-///     controller adjustment, where 35 degrees on X is what put the hilts
+///     controller adjustment, where 37 degrees on X is what put the hilts
 ///     straight. It is a *convention* gap rather than a comfort angle: the
 ///     platform's `.grip` is where the hand holds the controller, and what the
 ///     guest is built against is the pose an Oculus Touch would have reported,
 ///     which is not the same frame and cannot be derived from here.
 ///
-///     **Negative**, because the first device run at +35 pitched the hilts
-///     backward — the game's adjustment is applied in Unity's left-handed
+///     **Negative**, because the same magnitude POSITIVE pitches the hilts
+///     backward on device — the game's adjustment is applied in Unity's left-handed
 ///     frame and ours is not, so the magnitude carries over and the sign does
 ///     not.
 ///
-/// Which leaves the two constants pulling opposite ways, for -29.96 total. If
+/// Which leaves the two constants pulling opposite ways, for -31.96 total. If
 /// the residual after a playtest looks like about five degrees *forward*, the
-/// likely reading is that ALVR's PSVR2 tilt wants this frame's sign too: that
-/// would make -40.04, and Beat Saber's own
-/// `OculusVRHelper.AdjustControllerTransform` pitches a Touch controller by 40
-/// degrees. `KL_SENSE_PITCH=-45.037` is that experiment in one run.
+/// likely reading is that ALVR's PSVR2 tilt wants this frame's sign too, for
+/// -42.04. Beat Saber's own `OculusVRHelper.AdjustControllerTransform` pitches
+/// a Touch controller by 40 degrees, and `KL_SENSE_PITCH=-45.037` puts the
+/// total there exactly (-45.037 + 5.037) in one run.
 private struct KLSenseTune {
     /// ALVR's PSVR2 comfort tilt and this guest's hilt pitch, kept apart so the
     /// log line and the source agree on where each degree came from.
@@ -819,10 +819,10 @@ final class KleptonControllers {
             // On an Oculus Touch pair the LEFT controller's Menu button is
             // `Start` and the RIGHT controller's Oculus button is `Home`, and
             // the Oculus button is the one that summons a dashboard. Steam Link
-            // suggests `system/click` for it (SL-20 measured 39 of 41 bindings
-            // taken, and this is one of them) — and nothing in this file set
-            // RAW_BACK at all, so that action was live, active and permanently
-            // false, which has no symptom: it decodes correctly and never fires.
+            // suggests `system/click` for it, one of the 39 of 41 bindings it
+            // takes. Without RAW_BACK set here that action is live, active and
+            // permanently false, which has no symptom: it decodes correctly
+            // and never fires.
             //
             // **`Button Menu` drives both, and that is ALVR's shape** (218ee37
             // moved to exactly this after having each hand's button on one bit).
