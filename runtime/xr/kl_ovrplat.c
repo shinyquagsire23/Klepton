@@ -147,35 +147,30 @@ static uint64_t klplat_called(const char *name) {
 // ---------------------------------------------------------------------------
 // The completion queue — an asynchronous request has to ARRIVE somewhere
 //
-// This is the half the "report the platform as absent" design was missing, and
-// Beat Saber 1.40 is where it stopped being free. Every request-shaped entry
-// point here answered `ovrRequest` 0 under a comment saying that a plausible id
-// "would be a lie with a tail: the caller would then poll ovr_PopMessage
-// forever for a completion that cannot come". The measurement says **0 has the
-// same tail**: the SDK builds its `Request` object either way and awaits it, so
-// what 0 bought was not an error path but silence.
+// An async request gets a real id and a message that arrives via
+// ovr_Message_Get*. Answering `ovrRequest` 0 has the SAME "poll forever" tail
+// as a fabricated id — the SDK builds its `Request` object either way and
+// awaits it — so 0 buys silence, not an error path.
 //
-// 1.40 gates a screen on that silence. Its `HealthWarningFlowCoordinator` hands
-// the epilepsy screen's Continue to `WaitForUserAgeCategory`, a coroutine
-// waiting on a category that `OculusInit.CheckUserAgeCategoryAsync` never sets
-// because `InitializeOculusAsync` is still awaiting the platform init — so the
-// button did nothing, silently, with the frame loop running normally. The whole
-// visible symptom was one un-delivered message.
+// Beat Saber 1.40 gates a screen on that silence: HealthWarningFlowCoordinator
+// hands the epilepsy screen's Continue to WaitForUserAgeCategory, a coroutine
+// waiting on a category OculusInit.CheckUserAgeCategoryAsync never sets because
+// InitializeOculusAsync is still awaiting platform init. The button does
+// nothing, silently, with the frame loop running normally.
 //
-// **What is asserted here, and by whose decision.** Answering the age category
-// at all means claiming an initialized platform, which is a real change from
-// "genuinely absent" — an absent platform cannot answer a demographic question.
-// The user asked for it and declared themselves over 18 (2026-08-12), which is
-// the only place that answer can legitimately come from here: it is a
-// self-declaration by the person running their own copy, not a fact we
-// discovered. **The DRM line does not move with it** — IAP, purchase records,
-// asset details and every delivery call still abort unconditionally, and
-// `check_drm_guard` still asserts both directions. What changes is that the
-// application's own entitlement, already answered yes, is now answered through
-// the channel the guest actually reads.
+// What is asserted, and by whose decision. Answering the age category at all
+// claims an initialized platform, which is a real change from "genuinely
+// absent" — an absent platform cannot answer a demographic question. The user
+// asked for it and declared themselves over 18 (2026-08-12), which is the only
+// place that answer can legitimately come from here: a self-declaration by the
+// person running their own copy, not a discovered fact. THE DRM LINE DOES NOT
+// MOVE WITH IT — IAP, purchase records, asset details and every delivery call
+// still abort unconditionally, and check_drm_guard still asserts both
+// directions. What changes is that the application's own entitlement, already
+// answered yes, is answered through the channel the guest actually reads.
 //
-// The three completions are all this queues, and each is issued only in
-// response to the guest's own request:
+// The three completions are all this queues, each issued only in response to
+// the guest's own request:
 //
 //   ovr_UnityInitWrapperAsynchronous  -> Platform_InitializeAndroidAsynchronous,
 //                                        result Success
@@ -183,12 +178,11 @@ static uint64_t klplat_called(const char *name) {
 //                                        payload; success IS the answer
 //   ovr_UserAgeCategory_Get           -> UserAgeCategory_Get, category Ad(ult)
 //
-// **The numbers are the guest's own**, read out of the running IL2CPP runtime
-// with `KL_PROBE_ENUM` (kl_mprobe.c) rather than taken from an SDK header we do
-// not have — the same move as OVRP_HEADSET_OCULUS_QUEST_2 in kl_ovrp.c, and
-// necessary rather than tidy: `Message.ParseMessageHandle` switches on the type
-// and its `default` arm logs "Unrecognized message type" and produces NO
-// message, so a guessed number is indistinguishable from the silence above.
+// The type numbers are the guest's own, read out of the running IL2CPP runtime
+// with KL_PROBE_ENUM (kl_mprobe.c) rather than from an SDK header. Necessary
+// rather than tidy: Message.ParseMessageHandle switches on the type and its
+// default arm logs "Unrecognized message type" and produces NO message, so a
+// guessed number is indistinguishable from the silence above.
 #define KLPLAT_MSG_PLATFORM_INIT   450037684u   // Message.MessageType
 #define KLPLAT_MSG_ENTITLEMENT     409688241u   //   .Platform_InitializeAndroidAsynchronous
 #define KLPLAT_MSG_AGE_CATEGORY    567009472u   //   .Entitlement_GetIsViewerEntitled

@@ -1,53 +1,26 @@
-// The one-eye compositor, on ANGLE.
+// The one-eye reference renderer, on ANGLE's Metal backend. It produces the
+// known-good frame a real backend is diffed against; it is not the shipping
+// backend. Opt in with KL_GLFB=1 — the null driver in kl_egl.c stays the
+// default, so `make check` is unaffected by anything here.
 //
-// Opt-in with KL_GLFB=1; the null driver in kl_egl.c stays the default, so
-// `make check` and the green path are unaffected by anything here.
+// The Metal backend must be asked for by name. eglGetDisplay(EGL_DEFAULT_DISPLAY)
+// selects ANGLE's OpenGL backend on macOS, which inherits desktop GL's limits
+// and rejects ETC2 0x9279 — a format mandatory in the GLES 3.0 the guest speaks
+// (`make angle`). EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE accepts it with shaders
+// unmodified, so there is no shader rewrite, no format substitution, and no
+// framebuffer impersonation: the guest's default framebuffer is a genuine EGL
+// pbuffer, binding 0 means what it says, and GL_BACK is a valid buffer name.
 //
-// ---------------------------------------------------------------------------
-// Why ANGLE, and what it deleted
-//
-// The first version of this file forwarded to Apple's desktop GL 4.1 (S0.7/S0.8).
-// It worked, but every difference between GLES and desktop GL became a lie this
-// file had to tell: a #version rewrite on every shader, an FBO standing in for the
-// default framebuffer with GL_BACK -> GL_COLOR_ATTACHMENT0 translation on top, and
-// finally a substitution of RGBA8 for ETC2, because Apple's desktop GL cannot
-// allocate a format that is *mandatory* in the GLES 3.0 the guest speaks.
-//
-// S0.9 (`make angle`) measured the alternative on the guest's own artefacts:
-//
-//     ANGLE / GL backend      ETC2 0x9279 REJECTED   shaders unmodified
-//     ANGLE / Metal backend   ETC2 0x9279 accepted   shaders unmodified
-//
-// So ANGLE speaks GLES for real, and every one of those workarounds is gone: no
-// shader rewrite, no format substitution, no framebuffer impersonation. The
-// guest's "default framebuffer" is a genuine EGL pbuffer, so binding 0 means what
-// it says and GL_BACK is a valid buffer name again.
-//
-// Note the backend must be *asked for*: eglGetDisplay(EGL_DEFAULT_DISPLAY) selects
-// ANGLE's OpenGL backend on macOS, which inherits every desktop-GL limitation and
-// fails ETC2 identically. EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE is the whole point.
-//
-// ---------------------------------------------------------------------------
-// Still host-only, and still borrowed
-//
-// This remains a *reference renderer*, not the shipping backend: it produces the
-// known-good frame a real backend gets diffed against. ANGLE narrows the gap — it
-// is the likely device path too — but the dylibs are borrowed out of a Chromium
-// app rather than vendored. PLANNING M5 carries that TODO and why the build system
-// makes vendoring a task of its own.
-//
-// ---------------------------------------------------------------------------
-// The ABI hazard survives the move, because it is about Darwin, not about GL
-//
-// The guest is AAPCS64; ANGLE is a Darwin arm64 dylib. They agree on x0-x7 and
-// disagree on the stack: AAPCS64 gives every stack argument an 8-byte slot, Darwin
-// packs each to its natural size. So the first stack argument lands in the same
-// place and everything after it can diverge. glBlitFramebuffer(8 ints, mask,
-// filter) is the live case — the guest writes filter at sp+8, a Darwin callee
-// reads it at sp+4. The wrappers below declare those parameters as 64-bit so
-// Darwin reproduces AAPCS64's layout, then truncate. The int64_t parameters
-// holding obviously-32-bit values are deliberate; removing the widening silently
-// corrupts the argument after it.
+// ABI hazard, about Darwin rather than about GL: the guest is AAPCS64 and ANGLE
+// is a Darwin arm64 dylib. They agree on x0-x7 and disagree on the stack —
+// AAPCS64 gives every stack argument an 8-byte slot, Darwin packs each to its
+// natural size — so the first stack argument lands in the same place and
+// everything after it can diverge. glBlitFramebuffer(8 ints, mask, filter) is
+// the live case: the guest writes filter at sp+8, a Darwin callee reads sp+4.
+// The wrappers below declare those parameters 64-bit so Darwin reproduces the
+// AAPCS64 layout, then truncate. The int64_t parameters holding obviously
+// 32-bit values are load-bearing; removing the widening silently corrupts the
+// argument after it.
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -497,50 +470,32 @@ void kl_glfb_release_current(void) {
 
 // ------------------------------------------------- the shared-context compile lock
 //
-// THIS DOES NOT FIX THE AGX ABORT. Read that first, because the numbers below are
-// persuasive about a different bug and it would be easy to file them against the
-// wrong one. Under KL_GLFB_SHARED the guest still dies in
-// findOrCreateDriverProgramVariant<BlitComputeProgramVariant>, lock or no lock —
-// measured after this went in. What the lock fixes is a *second*, independent
-// defect that s10 turned up while hunting the first.
-//
-// That second defect: shared contexts are correct, and this build of ANGLE is not
-// thread-safe across them. spikes/s10_shared.c reproduces it with no guest at all
-// — three host threads, shared ANGLE contexts, nothing of Klepton linked — and the
-// failure rate is the measurement that matters:
+// A MITIGATION, not a fix. This build of ANGLE is not thread-safe across shared
+// contexts; spikes/s10_shared.c reproduces it with no guest at all — three host
+// threads, shared ANGLE contexts, nothing of Klepton linked:
 //
 //   no lock                        10/30 runs crash
-//   lock around compile + link      2/60      <- ~10x better, but NOT a fix
+//   lock around compile + link      2/60      <- ~10x better, not a cure
 //   lock around the draws only      1/30
 //   serialised entirely             0/40
 //   one thread only                 0/40
-//   concurrency without sharing     1/20      <- so it is not concurrency as such
+//   concurrency without sharing     1/20      <- not concurrency as such
 //
-// Neither sharing nor concurrency alone, then: it is the combination. The race
-// presents two ways from one code path — a SIGSEGV inside libGLESv2, and a
-// libmalloc "pointer being freed was not allocated" abort, i.e. heap corruption in
-// ANGLE's own state. Both arrive via GL_DrawArrays and share interior frames.
+// Neither sharing nor concurrency alone: the combination. The race presents two
+// ways from one code path — SIGSEGV inside libGLESv2, and a libmalloc "pointer
+// being freed was not allocated" abort (heap corruption in ANGLE's own state).
+// Both arrive via GL_DrawArrays and share interior frames.
 //
-// Serialising compile and link is where most of the risk lives, ANGLE doing its
-// heavy shared-object work at link time, and the improvement is real rather than
-// thread skew: it survives making the draws overlap heavily afterwards (30 draw
-// iterations per thread, 7/15 crashes without the lock and 0/15 with).
+// Compile and link carry most of the risk, ANGLE doing its heavy shared-object
+// work at link time, and the improvement survives making the draws overlap
+// afterwards (30 draw iterations per thread: 7/15 crashes without, 0/15 with).
+// The only configurations clean at 40 runs are the ones that never use shared
+// contexts concurrently, which is what the renderer must do — so the lock
+// guards a real latent race without making the sharing path safe. Cheap,
+// compilation not being hot.
 //
-// But read row two honestly. Its first samples came back 0/30 and then 0/15, which
-// looked like a clean fix; a 60-run sample found two failures. An order of
-// magnitude, not a cure. The only configurations measured clean at 40 runs are the
-// ones that never use shared contexts concurrently — which is exactly the thing
-// the renderer has to do.
-//
-// So this is kept as a mitigation, not a resolution: partial, fixing nothing
-// currently visible, but guarding a real race that is latent on precisely the path
-// the renderer needs and would surface the moment the AGX problem is out of the
-// way. It is cheap, compilation not being hot. It is not a licence to call the
-// sharing path safe.
-//
-// And it is a workaround for the host driver, not a translation decision — nothing
-// about the guest needs it. It lives here, in the host-only reference renderer,
-// and must not be mistaken for something a real backend would inherit.
+// A workaround for the host driver, not a translation decision: nothing about
+// the guest needs it, and a real backend does not inherit it.
 static pthread_mutex_t g_compile_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void (*g_real_CompileShader)(uint32_t);
@@ -550,33 +505,24 @@ static void (*g_real_ShaderSource)(uint32_t, int32_t, const char *const *,
 static void (*g_real_GetShaderiv)(uint32_t, uint32_t, int32_t *);
 static void (*g_real_GetShaderInfoLog)(uint32_t, int32_t, int32_t *, char *);
 
-// The Bloom diagnostic, and the fix it bought. Unity fell back to the 1-pass
-// error shader on "Hidden/PostProcessing/Bloom" — i.e. a variant failed to
-// compile — and neither the null driver (which never sees these calls under
-// KL_GLFB, the guest holding ANGLE's real pointers) nor KHR_debug said why.
-// So capture every glShaderSource, keyed by shader name the way kl_egl's null
-// driver does, and when a compile fails print the info log and the source
-// that produced it, and write both to KL_DUMP_SHADERS/<dir> if one is set.
-// That turned "Invalid pass number (13)" into the actual compiler verdict
-// without a standalone replay step, and the verdict was:
+// The shader capture, and the version rewrite it forced (trap 9).
 //
-//   ERROR: 0:1: '' : unsupported shader version 320
+// Every glShaderSource is kept, keyed by shader name; on a failed compile the
+// info log and the source that produced it are printed, and written to
+// KL_DUMP_SHADERS/<dir> if one is set.
 //
-// The version gap. kl_egl describes the device as GLES 3.2 / GLSL ES 3.20
-// (a deliberate group answer — Unity cross-checks the description against
-// itself, and gates B10G11R11 renderability on the version number itself,
-// so dropping the description to the 3.0 the driver actually is kills
-// post-processing anyway). Unity therefore emits "#version 320 es" variants,
-// and the ANGLE context behind this renderer is ES *3.0* — its Metal backend
-// caps there — and an ES 3.0 context accepts only #version 100/300 es. Every
-// 320 es source failed: 7016 compiles in one run, all two distinct texts
-// (an instancing VS with a layout(binding=) uniform block, and a trivial
-// constant FS), retried forever.
+// The gap it exposed: kl_egl describes the device as GLES 3.2 / GLSL ES 3.20 —
+// a deliberate group answer, since Unity cross-checks the description against
+// itself and gates B10G11R11 renderability on the version number, so describing
+// the 3.0 the driver actually is kills post-processing anyway. Unity therefore
+// emits "#version 320 es" variants, and the ANGLE context here is ES 3.0 (its
+// Metal backend caps there), which accepts only #version 100/300 es. Every 320
+// es source failed: 7016 compiles in one run over two distinct texts, retried
+// forever.
 //
-// The rewrite below repairs the text at the boundary between what we
-// describe and what ANGLE implements. Three mechanical moves, all verified
-// against the vendored ANGLE with the captured Bloom-era sources via
-// build/s09_angle:
+// The rewrite repairs the text at the boundary between what is described and
+// what ANGLE implements. Three mechanical moves, verified against the vendored
+// ANGLE via build/s09_angle:
 //
 //   1. "#version 3xx es" with xx > 00 -> "#version 300 es". Nothing in the
 //      failing corpus uses a real 3.1/3.2 feature; if a later shader does,

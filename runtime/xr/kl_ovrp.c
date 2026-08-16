@@ -989,80 +989,41 @@ void kl_ovrp_set_eye_frustum(int eye, float left, float right, float top, float 
     g_eye_tan[eye][2] = top;   g_eye_tan[eye][3] = bottom;
 }
 
-// **KL_OVRP_UNIFY_FRUSTUM — the frustum union, and it is OFF, because the thing
-// it was covering for is now understood and served properly.**
+// The two knobs over g_eye_tan, both applied on the READ side.
 //
-// What was measured: BONELAB asks `ovrp_GetNodeFrustum2` for node 0 and node 1
-// from the render path itself
-// (`OculusDisplayProvider::GfxThread_PopulateNextFrameDesc`), is handed this
-// display's genuinely mirrored per-eye cones (l=1.732/r=1.000 against
-// l=1.000/r=1.732), and renders both eyes with the SAME cone anyway — the two
-// captured eye layers correlate 0.5% of the width apart, the IPD parallax and
-// nothing else, where honouring the two frusta would put them 26.8% apart.
-// Handing both eyes the UNION of the cones made the picture right, because the
-// composite's quad then matched what was drawn.
+// KL_OVRP_UNIFY_FRUSTUM — hand both eyes the union of the cones. Default 0.
+// Oculus symmetric projection means the PLUGIN computes this union itself:
+// libOculusXRPlugin takes max(L0,L1)/max(R0,R1), renders both eyes with it,
+// widens its own eye texture by the ratio to preserve angular density, and
+// submits a per-eye ovrpLayerSubmit.ViewportRect naming each eye's sub-rect
+// (BONELAB, canted display forced on host: desc 2290x2400 becomes a 2880x2400
+// layer, eye 0 at 0,0 2271x2400, eye 1 at 609,0 2271x2400). Unifying here
+// applies that arithmetic a layer too early: the guest then computes a widening
+// ratio of 1, keeps the original width, and each eye's cone lands on 78.9% of
+// the pixels it should have. The per-eye rects come back full-width, so nothing
+// downstream can detect it. The composite honours the submitted rects instead
+// (kl_reproject.h, grid_per_eye). Set 1 only for a guest that collapses the
+// cones WITHOUT submitting per-eye rects; that case is unservable otherwise.
 //
-// **It is Oculus SYMMETRIC PROJECTION, and the plugin computes that same union
-// itself** — read out of libOculusXRPlugin.so and then reproduced on the host
-// (notes/BONELAB.md). The plugin takes max(L0,L1)/max(R0,R1), renders both eyes
-// with it, WIDENS its own eye texture by the ratio so the angular density is
-// preserved, and submits a per-eye `ViewportRect` naming the sub-rect of that
-// texture holding each eye's own cone — measured on BONELAB with a canted
-// display forced on the host: desc 2290x2400 becomes a 2880x2400 layer, eye 0
-// at 0,0 2271x2400 and eye 1 at 609,0 2271x2400. It turns on for a title that
-// asks for it when the renderer is Vulkan, the stereo mode is Multiview and the
-// headset is not a Quest 1 — which is why it appeared the day
-// ovrp_GetSystemMultiViewSupported2 started answering yes.
+// KL_OVRP_EYE_TAN — push a canted pair of cones on a run with no display to
+// measure one from, which on the host is every run. The default is the
+// symmetric {1,1,1,1}, and a symmetric display makes every asymmetry question
+// unaskable: the union equals each eye's own cone, a guest that collapses the
+// two is indistinguishable from one that honours them, and any per-eye viewport
+// comes out full width. That failure family is invisible on the host.
 //
-// So the union here was the plugin's own arithmetic applied a layer too early,
-// and it COST: told the union, the guest computes a widening ratio of 1, keeps
-// the original texture width, and each eye's own cone lands on 78.9% of the
-// pixels it should have had. The per-eye rects come back full-width, so nothing
-// downstream can tell.
+//   KL_OVRP_EYE_TAN=vision     Vision Pro's, measured off the drawable: eye 0
+//                              l=1.73205 r=1.0 t=1.0 b=1.19175, eye 1 mirrored
+//                              (tan 60/45 out/in, tan 45/50 up/down)
+//   KL_OVRP_EYE_TAN=l,r,t,b    that pair from eye 0's cone, mirrored for eye 1
 //
-// The right answer is to tell the guest the truth and honour what it submits:
-// the composite reads a per-eye viewport (kl_reproject.h, `grid_per_eye`) and
-// places each eye's quad with that eye's own cone. `KL_OVRP_UNIFY_FRUSTUM=1`
-// restores the union as the A/B, and is what to reach for if a guest is ever
-// found that collapses the cones WITHOUT submitting per-eye rects — that one
-// would be unservable any other way.
-//
-// **Decided when the frustum is READ, never when it is written**, and that
-// distinction is the whole reason the first version of this did nothing. The
-// compositor pushes the display's cones from primeDisplay, which runs before the
-// guest has brought Vulkan up — so at write time `kl_ovrp_multiview()` is still
-// false, the union is skipped, and nothing ever revisits it. A mode that is
-// decided later cannot be consulted earlier; reading through this function is
-// what makes the order irrelevant.
-//
-// Every consumer of g_eye_tan goes through here: what the guest is told
-// (ovrp_GetNodeFrustum2, the eye layer desc), what kl_ovrp_eye_view reports, and
-// the frame record the composite builds its quad from. That last one is not
-// optional — it is the half that has to AGREE with what the guest rendered, and
-// a consumer that reads g_eye_tan directly is exactly the bug this is fixing.
-// KL_OVRP_EYE_TAN — push a CANTED pair of cones on a run that has no display to
-// measure one from, which on the host is every run.
-//
-// Without it `g_eye_tan` stays the symmetric {1,1,1,1} default, and a symmetric
-// display makes every question about asymmetry unaskable: the union equals each
-// eye's own cone, a guest that collapses the two is indistinguishable from one
-// that honours them, and any per-eye viewport the guest derives comes out full
-// width. Every failure in this family is therefore invisible on the host and
-// costs a device run — which is exactly the shape `make xrspace` and `make ctr`
-// exist to break.
-//
-//   KL_OVRP_EYE_TAN=vision     Vision Pro's own, measured off the drawable:
-//                              eye 0 l=1.73205 r=1.0 t=1.0 b=1.19175, eye 1 the
-//                              horizontal mirror. (tan 60/45 out/in, tan 45/50
-//                              up/down — CLAUDE.md's table, and the same numbers
-//                              ALVR's visionOS client carries as its defaults.)
-//   KL_OVRP_EYE_TAN=l,r,t,b    that pair, from eye 0's cone, mirrored for eye 1
-//
-// Applied on the READ side with the union, for the reason recorded above it:
-// what a run is told has to be decided after the mode is known, and this is a
-// statement about the display rather than about who pushed it, so it overrides
-// the frontend on device too. That makes it the A/B for "is our idea of this
-// display's cones the thing the guest is reacting to".
+// Read side, not write side: the compositor pushes the display's cones from
+// primeDisplay, before the guest has brought Vulkan up, so at write time
+// kl_ovrp_multiview() is still false and a mode decided later could never be
+// consulted. Every consumer routes through here — what the guest is told
+// (ovrp_GetNodeFrustum2, the eye layer desc), what kl_ovrp_eye_view reports,
+// and the frame record the composite builds its quad from. That last one must
+// AGREE with what the guest rendered; reading g_eye_tan directly is the bug.
 static const float *klovrp_forced_tan(void) {
     static float t[2][4];
     static int state;                        // 0 unread, 1 none, 2 forced
@@ -1931,59 +1892,33 @@ static struct {
     pthread_mutex_t     mu;
 } g_frames = { .last_complete = -1, .mu = PTHREAD_MUTEX_INITIALIZER };
 
-// How many swapchain stages we tell the guest it has.
+// How many swapchain stages the guest is told it has. KL_OVRP_STAGES is the
+// A/B in both directions.
 //
-// **This was 1, and one stage is a bug, not a simplification.** With a single
-// stage the guest renders every frame into the *same* eye texture — the one the
-// compositor is sampling for the frame before it. There is a fence in one
-// direction only (kl_glfb signals at eglSwapBuffers, the composite waits on it),
-// so "the guest has finished frame N" is ordered but "the composite has finished
-// reading frame N" is not: the guest's frame N+1 overwrites the texture while
-// the composite still has it bound, across two Metal queues that order nothing
-// between them. Standing still the two pictures are nearly identical and nothing
-// shows. **Turning your head, they differ — and the composite samples a mixture,
-// which is exactly the judder that should not be there.** It gets worse with
-// resolution, because a longer guest frame overlaps the composite for longer.
+// One stage single-buffers the eye textures. The fence runs in one direction
+// only (kl_glfb signals at eglSwapBuffers, the composite waits on it), so "the
+// guest finished frame N" is ordered but "the composite finished reading frame
+// N" is not: frame N+1 overwrites the texture while the composite still has it
+// bound, across two Metal queues that order nothing between them. Standing
+// still the two pictures are nearly identical; turning the head they differ and
+// the composite samples a mixture. Worse at higher resolution, where a longer
+// guest frame overlaps the composite for longer.
 //
-// Two stages is enough here and not by luck: the guest is driven one frame per
-// published pose (PLANNING §12.12), so it cannot run more than one frame ahead
-// of the compositor, and one spare buffer covers exactly that. KL_OVRP_STAGES
-// is the A/B — `=1` restores the single-buffered behaviour every measurement
-// before this was taken against, `=3` buys slack at the cost of another
-// full-size eye texture (RGBA16F, two slices — over 100 MB at the resolutions
-// this now runs at, which is why 3 is not the default).
+// 3 rather than 2 because the guest is decoupled from the compositor (PLANNING
+// §12.12): one spare buffer only just covers a guest running a frame ahead,
+// leaving nothing for a frame that runs long.
 //
-// The old comment here warned that raising this makes the stage a *guess*:
-// "the stage a frame draws into is derived from our own frame counter, which is
-// only known to agree with libunity's own choice while there is exactly one
-// stage to choose." That warning was right, and the answer is not to guess but
-// to measure — see klovrp_EndFrame, which files each frame's record under the
-// stage kl_glfb watched the guest actually draw into.
+// The stage a frame drew into is MEASURED, not derived from a frame counter —
+// klovrp_EndFrame files each record under the stage kl_glfb watched the guest
+// draw into, windowed by BeginFrame/EndFrame so a frame that drew into no stage
+// is reported as such rather than inheriting the previous frame's answer (the
+// off-by-one that pairs a fresh pose with a stale picture). Host, 300 frames at
+// two and three stages: every frame drew into exactly one stage, on EndFrame's
+// thread, and the guest's frame index % stages agreed on 298 of them.
 //
-// **The association is now proven rather than inferred** (PLANNING §12.19). The
-// observation is windowed — BeginFrame opens it, EndFrame closes it — so a
-// frame that drew into no eye stage is reported as such instead of silently
-// receiving the previous frame's answer, which is the exact off-by-one that
-// pairs a fresh pose with a stale picture. Measured on the host at two and three
-// stages, 300 frames each: every frame drew into exactly one stage, on the same
-// thread as EndFrame, and the guest's own frame index `% stages` agreed with the
-// observation on all 298 of them. Nothing here is a guess any more.
-//
-// **The default is 3, and the doubling that forced it down to 1 is gone.**
-// One stage single-buffers the eye textures: the guest's frame N+1 overwrites
-// the texture while the composite still has frame N bound, across two Metal
-// queues that order nothing between them, and turning your head that reads as
-// tearing. Two stages removed it and revealed the doubling; three made the
-// doubling worse, which is what identified the association as the cause. With
-// the association fixed and proven (above), depth is free to be what it should
-// be — and 3 rather than 2 because the guest is decoupled from the compositor
-// (PLANNING §12.12) and one spare buffer only just covers that, leaving nothing
-// for a frame that runs long.
-//
-// The cost is memory, and it is not small: an eye texture is RGBA16F with two
-// array slices, so at map resolution each stage is on the order of 160 MB and a
-// swapchain re-creation transiently holds two generations. KL_OVRP_STAGES is
-// the A/B in both directions.
+// Cost is memory: an eye texture is RGBA16F with two array slices, so at map
+// resolution each stage is on the order of 160 MB, and a swapchain re-creation
+// transiently holds two generations.
 #define KLOVRP_STAGES_DEFAULT 3
 
 int kl_ovrp_stage_count(void) {
@@ -3149,49 +3084,41 @@ uint64_t klovrp_GetControllerState_impl(int mask, void *out) {
 // ---------------------------------------------------------------------------
 // M8 — haptics: the seam running the OTHER way
 //
-// Every other entry point in this file answers a question the guest asked.
-// These three are the guest telling us to do something to the hardware, so the
-// seam is inverted: the guest fills a queue here, and the frontend drains it
-// once a frame (kl_ovrp_haptics_pull) and plays it on whatever it has.
+// Every other entry point here answers a question the guest asked. These three
+// are the guest acting on the hardware, so the seam inverts: the guest fills a
+// queue, the frontend drains it once a frame (kl_ovrp_haptics_pull).
 //
-// **This title drives the BUFFERED path, not the vibration one.** Its
-// global-metadata.dat carries OVRHaptics / OVRHapticsClip / OVRHapticsOutput
-// and the whole OVRHaptics.Config property set — SampleRateHz,
-// SampleSizeInBytes, MinimumSafeSamplesQueued, MinimumBufferSamplesCount,
-// OptimalBufferSamplesCount, MaximumBufferSamplesCount — which is Oculus's
-// sample-stream API rather than the one-shot OVRInput.SetControllerVibration:
+// This title drives the BUFFERED path, not the one-shot
+// OVRInput.SetControllerVibration: its global-metadata.dat carries OVRHaptics /
+// OVRHapticsClip / OVRHapticsOutput and the whole OVRHaptics.Config property
+// set, which is Oculus's sample-stream API.
 //
 //   ovrp_GetControllerHapticsDesc  -- how fast, how wide, how deep. Read ONCE,
 //                                     at OVRHaptics's static init.
-//   ovrp_GetControllerHapticsState -- how much is still queued and how much
-//                                     room is left. Every frame, per hand.
-//   ovrp_SetControllerHaptics      -- here are N amplitude samples.
+//   ovrp_GetControllerHapticsState -- how much is queued, how much room is
+//                                     left. Every frame, per hand.
+//   ovrp_SetControllerHaptics      -- N amplitude samples.
 //
-// **The descriptor is load-bearing, and zeroing it is not a neutral answer.**
-// OVRHapticsOutput sizes its native sample buffer at MaximumBufferSamplesCount,
-// paces itself to keep OptimalBufferSamplesCount queued, and clamps what it
-// sends to the SamplesAvailable we report. A zeroed descriptor plus a zeroed
-// state is therefore a coherent "this controller cannot vibrate": the managed
-// side keeps queueing clips into a zero-length buffer and never calls
-// SetControllerHaptics at all. That is what was happening, and it is why there
-// was nothing downstream to implement until these two answered honestly.
+// A zeroed descriptor is not a neutral answer. OVRHapticsOutput sizes its
+// native buffer at MaximumBufferSamplesCount, paces to keep
+// OptimalBufferSamplesCount queued, and clamps to the SamplesAvailable
+// reported; zeroed descriptor plus zeroed state is a coherent "this controller
+// cannot vibrate", and the managed side queues clips into a zero-length buffer
+// and never calls SetControllerHaptics at all.
 //
-// The numbers below are Touch's, which is the controller we claim to be
-// everywhere else (Build.MODEL, ovrp_GetSystemHeadsetType) — 320 Hz, one
-// unsigned byte per sample, buffers of 1..256 samples with 20 the pace target
-// and 5 the don't-let-it-run-dry mark. Reporting a Sense controller's real
-// capabilities instead would be more literally true and would put Unity's
-// pacing maths somewhere this title has never been.
+// The numbers are Touch's — the controller claimed everywhere else
+// (Build.MODEL, ovrp_GetSystemHeadsetType): 320 Hz, one unsigned byte per
+// sample, buffers of 1..256 with 20 the pace target and 5 the run-dry mark.
+// A Sense controller's real capabilities would be more literally true and would
+// put Unity's pacing maths somewhere this title has never been.
 //
-// **How to tell we read the two struct layouts the right way round**, which is
-// the one thing here that is an ABI claim rather than a measurement: with the
-// descriptor answered, SetControllerHaptics calls start arriving, and their
-// SamplesCount lands at or below OptimalBufferSamplesCount (20). A transposed
-// descriptor shows up immediately as counts of 1 or 256. For the state struct
-// the failure is silent instead — swap SamplesAvailable and SamplesQueued and
-// the guest computes "0 samples of room" forever and sends nothing — so that
-// one has KL_HAPTICS_SWAP_STATE=1 as its A/B, and KL_HAPTICS_TRACE=1 prints
-// both halves of the conversation.
+// Reading the two struct layouts the right way round is the one ABI claim here
+// rather than a measurement. With the descriptor answered, SetControllerHaptics
+// SamplesCount lands at or below OptimalBufferSamplesCount (20); a transposed
+// descriptor shows up immediately as counts of 1 or 256. The state struct fails
+// SILENTLY instead — swap SamplesAvailable and SamplesQueued and the guest
+// computes "0 samples of room" forever and sends nothing — so it carries
+// KL_HAPTICS_SWAP_STATE=1 as its A/B. KL_HAPTICS_TRACE=1 prints both halves.
 #define KLOVRP_HAP_RATE     320        // samples per second
 #define KLOVRP_HAP_MAX      256        // MaximumBufferSamplesCount, and our ring
 #define KLOVRP_HAP_OPTIMAL  20         // OptimalBufferSamplesCount

@@ -22,6 +22,13 @@ CLAUDE.md
 /notes/
 /planning/
 PLANNING.md
+STYLE.md
+# ...and any COPY of them. The rules above are path-anchored, so a backup
+# directory holding CLAUDE.md/notes/ is not covered by them and `git add -A`
+# will happily stage it — which is how PLANNING.md reached history the first
+# time (purged 2026-08-09).
+.doc-backup*/
+*.bak
 
 # pi coding agent — local session/mesh state
 .pi/
