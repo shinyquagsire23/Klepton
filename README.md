@@ -54,4 +54,18 @@ Where `[target]` is the name of the target, defaulting to `beatsaber`.
 
 ## Status
 
-Beat Saber is working on macOS and visionOS with minor graphical issues for versions 1.6, 1.28, and 1.40, Steam VR Link and improving generalizability/build tooling is still WIP. SUPERHOT VR renders on macOS; it has not been run on a headset yet.
+Currently working well on both macOS and visionOS with minor-to-no graphical issues:
+
+- Beat Saber versions 1.6, 1.28, and 1.40
+- BONELAB
+- SUPERHOT VR
+- Resident Evil 4 VR
+- OpenBrush (OpenXR)
+
+WIP or not in a great state:
+
+- Steam VR Link (low bitrate, networking issues)
+
+Abandoned due to anticheat, JIT mmaping, or other problems:
+
+- VRChat (Steam Frame APK)
