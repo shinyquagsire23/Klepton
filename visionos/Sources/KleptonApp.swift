@@ -152,29 +152,6 @@ struct KleptonApp: App {
             // makes that distinction checkable on a device rather than assumed.
             .onChange(of: scenePhase) { _, phase in Lifecycle.scenePhaseChanged(to: phase) }
 
-        // The floor test — KL_TEMPLATE=1. Its own space and its own renderer,
-        // sharing nothing with the one below, so a picture here says the
-        // platform and the app are fine and a black here says they are not.
-        // See KleptonTemplate.swift.
-        // KL_TPL_MIXED=1 puts the floor test in .mixed instead of .full, and it
-        // is the more informative of the two right now. In .full, "our content
-        // is not compositing" and "our content is black" look identical — both
-        // are a black field, which is exactly the ambiguity that has cost this
-        // hunt several runs. In .mixed the room shows through, so an opaque blue
-        // clear is unmistakable: blue means the layer composites, passthrough
-        // means it does not, and there is no third reading.
-        // The template's own scene shape: a CompositorContent struct, not a bare
-        // CompositorLayer in this closure. See KleptonTemplate.swift.
-        ImmersiveSpace(id: Template.id) {
-            TemplateImmersiveContent()
-        }
-        .immersionStyle(selection: .constant(Template.mixed ? .mixed : .full),
-                        in: .mixed, .full)
-        // The floor test gets it too, and deliberately: it is the control for
-        // the space below, and a control that differs in what the system draws
-        // over it is not one.
-        .persistentSystemOverlays(Immersive.systemOverlays)
-
         ImmersiveSpace(id: Immersive.id) {
             CompositorLayer(configuration: KleptonStageConfiguration()) { layerRenderer in
                 // How many times this closure runs, and for which renderer. If
@@ -309,28 +286,6 @@ struct BootView: View {
         // restores the button-only shape for hand-driven debugging, where the
         // point is to attach or start a capture before the guest runs.
         .task {
-            // The floor test runs INSTEAD of booting. No guest is loaded at
-            // all, so a black result here cannot be blamed on anything the
-            // guest, ANGLE or the runtime did — which is the whole reason it
-            // exists. See KleptonTemplate.swift.
-            if Template.wanted {
-                status = "template immersive space"
-                log = "KL_TEMPLATE=1 — the floor test. No guest is booted.\n"
-                // Configure but do NOT boot. This only resolves the two roots
-                // and redirects stderr into Documents/klepton-boot.log, which is
-                // where every [tpl] line has to land to be readable afterwards —
-                // NSLog alone would only reach the system log. No guest library
-                // is touched, so the floor stays a floor.
-                _ = kl_app_configure(Paths.resources, Paths.container)
-                // ...and open the log, which kl_app_boot would normally do.
-                // Without this the container keeps the previous run's file and
-                // the floor test looks like it produced nothing.
-                _ = kl_app_open_log()
-                NSLog("[tpl] KL_TEMPLATE=1 — floor test, no guest will be booted")
-                let r = await openImmersiveSpace(id: Template.id)
-                NSLog("[tpl] openImmersiveSpace -> \(r)")
-                return
-            }
             if klEnvOn("KL_AUTOBOOT", default: true) { boot() }
         }
     }

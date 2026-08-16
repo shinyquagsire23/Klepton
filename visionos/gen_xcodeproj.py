@@ -182,7 +182,7 @@ B_C = oid("BC")
 # renderer P5b adds. A list rather than an id pair each, for the same reason
 # the guest libraries are one.
 SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
-         "KleptonTemplate.swift", "KleptonAudio.swift", "KleptonShell.swift"]
+         "KleptonAudio.swift", "KleptonShell.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(
