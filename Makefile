@@ -5,7 +5,7 @@ CC      := clang
 # missing dependency BY NAME when a guest asks for Vulkan, rather than failing
 # the build for everyone who does not need it.
 MVK_INC := -Ivendor-moltenvk/out/include
-CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC)
+CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) -Iruntime -Iruntime/jni
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
 # RUNTIME_SHIP — everything that links the runtime needs them.
@@ -25,10 +25,23 @@ LDLIBS  := -lz -framework AudioToolbox \
 # tests/m_boot.c does), so the boundary holds by construction rather than by
 # discipline. runtime/kl_view.c (SDL viewer) is host-only too and is named by
 # the m_boot rule alone.
+# The synthetic JavaVM/JNIEnv. kl_jni.c is the mechanism (registries, dispatch,
+# id interning); each kl_jni_<family>.c owns one block of the guest's Java
+# classes and exports its binding table through runtime/jni/kl_jni_int.h.
+RUNTIME_JNI := runtime/kl_jni.c \
+           runtime/jni/kl_jni_lang.c runtime/jni/kl_jni_android.c \
+           runtime/jni/kl_jni_looper.c runtime/jni/kl_jni_display.c \
+           runtime/jni/kl_jni_bridge.c runtime/jni/kl_jni_window.c \
+           runtime/jni/kl_jni_net.c runtime/jni/kl_jni_softinput.c \
+           runtime/jni/kl_jni_services.c runtime/jni/kl_jni_io.c \
+           runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
+           runtime/jni/kl_jni_ue4.c
+
 RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/kl_shim.c runtime/kl_va.c \
            runtime/kl_va_handlers.c runtime/kl_va_thunks.S \
            runtime/kl_libc.c runtime/kl_libc_slink.c runtime/kl_pthread.c runtime/kl_dl.c \
-           runtime/kl_ndk.c runtime/kl_jni.c runtime/kl_x18.c runtime/kl_target.c \
+           runtime/kl_ndk.c runtime/kl_x18.c runtime/kl_target.c \
+           $(RUNTIME_JNI) \
            runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
            runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
            runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_vtdec.c runtime/kl_avdec.m \
@@ -56,7 +69,7 @@ RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 # that measured a build nobody has.
 # kl_phonon_hrtf.S .incbins the SOFA blob, so the data file is a prerequisite
 # of everything too — same missed-FAILURE argument as the generated tables.
-RUNTIME_HDRS := $(wildcard runtime/*.h) $(wildcard tests/*.h) \
+RUNTIME_HDRS := $(wildcard runtime/*.h) $(wildcard runtime/jni/*.h) $(wildcard tests/*.h) \
                 runtime/data/phonon_hrtf_cipic_124.sofa
 
 .PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
@@ -688,7 +701,7 @@ XRSIM_SDK := $(shell xcrun --sdk xrsimulator --show-sdk-path)
 # fails; a Vulkan guest simply reports that the hardware does not meet its
 # requirements, on device only). Nothing links against MoltenVK either way —
 # kl_vulkan.c is VK_NO_PROTOTYPES and dlopens it — so this is headers only.
-XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC)
+XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) -Iruntime -Iruntime/jni
 
 .PHONY: xros xros-device xros-sim swiftcheck
 xros: xros-device xros-sim build/Klepton.xcframework swiftcheck
