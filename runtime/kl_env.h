@@ -9,7 +9,7 @@
 int kl_env_on(const char *name, int dflt);
 
 // env var helper: unset gives `dflt`, set gives the string value
-char* kl_env_str(const char *name, const char *dflt);
+const char *kl_env_str(const char *name, const char *dflt);
 
 // env var helper: unset gives `dflt`, set gives the value via strtol
 int kl_env_int(const char *name, int dflt);

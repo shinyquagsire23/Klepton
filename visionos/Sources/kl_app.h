@@ -31,14 +31,6 @@
 // missing asset tree otherwise presents as a shim bug deep inside Unity.
 int kl_app_configure(const char *resources, const char *container);
 
-// Redirect stdout/stderr into the run's log file without booting a guest.
-// kl_app_boot() already does this; this is for callers that want the log and
-// deliberately do not want a guest — the KL_TEMPLATE floor test. Returns 0 on
-// success. Without it such a run leaves the PREVIOUS run's log in place, which
-// reads as "the new run produced nothing" rather than "the new run could not
-// write anything".
-int kl_app_open_log(void);
-
 // Run the boot sequence. Returns 0 if initJni completed with no unimplemented
 // JNI call. Everything printed goes to the log file below as well as stdout,
 // because an unimplemented JNI slot aborts the process by design and the

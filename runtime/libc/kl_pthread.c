@@ -237,8 +237,6 @@ static mtx_entry *mtx_entry_for(void *g) {
     }
 }
 
-static pthread_mutex_t *mtx(void *g) { return mtx_host(mtx_entry_for(g)); }
-
 static mtx_entry *mtx_find(void *g) {
     uintptr_t want = (uintptr_t)g;
     for (unsigned i = mtx_hash(want) & (MTX_MAP_SIZE - 1); ; i = (i + 1) & (MTX_MAP_SIZE - 1)) {

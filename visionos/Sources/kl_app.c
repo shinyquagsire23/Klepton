@@ -430,18 +430,6 @@ static int fail(const char *msg) {
     return 1;
 }
 
-// Open the log WITHOUT booting. kl_app_boot() does this itself, and for the
-// whole life of this file that was the only way to get one — which is fine
-// until something wants a log and deliberately does not want a guest. The
-// KL_TEMPLATE floor test is exactly that, and its absence was not a quiet
-// inconvenience: it left the container holding the PREVIOUS run's log, so the
-// floor test looked like it had produced no output when it had simply never
-// been able to write any, and the stale file read as a current result.
-int kl_app_open_log(void) {
-    if (!*g_log) return 1;                 // kl_app_configure was not called
-    return open_log();
-}
-
 // --- Steam Link, both front doors -------------------------------------------
 //
 // The Steam Link half of kl_app_boot: map a chain, print the shim gap, run the

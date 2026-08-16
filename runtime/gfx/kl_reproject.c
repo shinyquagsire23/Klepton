@@ -11,39 +11,6 @@
 #include "kl_reproject.h"
 #include "kl_env.h"
 
-// KL_REPROJECT_MODE — the bisection this pass never had.
-//
-// "The picture is unstable when the head turns" indicts the whole chain at
-// once, and three rounds of reasoning about which end is wrong is what these
-// two rungs replace:
-//
-//   normal (default)  correct from the recorded pose to the display pose
-//   off               correct NOTHING — the delta is dropped and the pass
-//                     becomes the frustum fit alone. If the instability
-//                     survives this, our timewarp is not causing it and the
-//                     search moves to the system's own reprojection or to the
-//                     guest; if it goes away, it is ours.
-//   inverse           apply the delta the other way round. If THIS is the
-//                     stable one, the sign is wrong somewhere upstream and the
-//                     question becomes which input, not whether.
-//
-// Diagnostic only: `off` and `inverse` are both wrong pictures by construction.
-enum { KLR_NORMAL = 0, KLR_OFF = 1, KLR_INVERSE = 2 };
-
-static int klr_mode(void) {
-    static int m = -1;
-    if (m < 0) {
-        const char *e = kl_env_str("KL_REPROJECT_MODE", "normal");
-        m = KLR_NORMAL;
-        if (!strcmp(e, "off"))          m = KLR_OFF;
-        else if (!strcmp(e, "inverse")) m = KLR_INVERSE;
-        if (m != KLR_NORMAL)
-            fprintf(stderr, "  [reproject] MODE %s — DIAGNOSTIC, the picture is "
-                            "wrong by construction\n", e);
-    }
-    return m;
-}
-
 // KL_REPROJECT_NOCANT=1 — treat device_from_view as having no rotation.
 //
 // The guest is told where each eye *is* (kl_ovrp_set_eye_offset pushes
@@ -618,18 +585,6 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     simd_float4x4 render_rot = rendered && rendered->serial
         ? klr_rotation_of_quat(rendered->qx, rendered->qy, rendered->qz, rendered->qw)
         : device_rot;
-    switch (klr_mode()) {
-    case KLR_OFF:                                   // correct nothing
-        render_rot = device_rot;
-        break;
-    case KLR_INVERSE: {                             // correct the other way
-        simd_float4x4 t = render_rot;
-        render_rot = device_rot;
-        device_rot = t;
-        break;
-    }
-    default: break;
-    }
     // device_from_view loses its translation too, and that is a correction of a
     // real double-count rather than a simplification. The guest rendered THIS
     // eye's picture from THIS eye's position — the offset is already in the

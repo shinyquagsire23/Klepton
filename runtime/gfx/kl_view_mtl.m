@@ -10,11 +10,10 @@
 // CAMetalLayer drawable here, a cp_drawable there.
 //
 // It is also the only place the reprojection math can be *run* before the
-// device is available: KL_VIEW_TIMEWARP=1 feeds the pass the pose the guest
-// actually rendered with (kl_ovrp's stage-keyed record) instead of the current
-// one, so mouse-look motion between the guest's frame and this composite is
-// corrected here exactly as head motion will be corrected on device. Default
-// off, so the viewer path that reached gameplay is untouched.
+// device is available: the pass is fed the pose the guest actually rendered
+// with (kl_ovrp's stage-keyed record) instead of the current one, so mouse-look
+// motion between the guest's frame and this composite is corrected here exactly
+// as head motion is corrected on device.
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <stdio.h>
@@ -37,10 +36,9 @@
 
 static id<MTLDevice>              g_dev;
 static id<MTLCommandQueue>        g_queue;
-static id<MTLRenderPipelineState> g_pipe;      // the plain blit
-static id<MTLRenderPipelineState> g_pipe_rp;   // the reprojection pass, KL_VIEW_TIMEWARP
+static id<MTLRenderPipelineState> g_pipe;      // the plain blit, for the liveness downsample
+static id<MTLRenderPipelineState> g_pipe_rp;   // the reprojection pass
 static id<MTLRenderPipelineState> g_pipe_ov;   // the GUEST's layers, blended, KL_GUEST_OVERLAYS
-static int                        g_timewarp;
 static id<MTLSamplerState>        g_samp;
 static id<MTLSharedEvent>         g_event;
 static id<MTLTexture>             g_stat;
@@ -329,16 +327,16 @@ static void klvm_draw_overlays(id<MTLRenderCommandEncoder> enc, int eye, int sta
     int n = kl_ovrp_overlay_count();
     // The two passes have to agree about where the head is. An overlay is placed
     // against the CURRENT head pose; the plain blit places the eye picture
-    // nowhere at all (it fills the window). So with KL_VIEW_TIMEWARP=0 the
-    // overlay slides across a picture that does not move, which looks like a
-    // placement bug and is not one.
+    // nowhere at all (it fills the window). So on the blit fallback the overlay
+    // slides across a picture that does not move, which looks like a placement
+    // bug and is not one.
     if (n > 0 && !g_pipe_rp) {
         static int said;
         if (!said) {
             said = 1;
-            fprintf(stderr, "  [vmtl] KL_VIEW_TIMEWARP=0: the eye picture is a flat "
-                            "blit and the overlay below is POSED, so the two will "
-                            "disagree as the head moves\n");
+            fprintf(stderr, "  [vmtl] the eye picture is a flat blit and the overlay "
+                            "below is POSED, so the two will disagree as the head "
+                            "moves\n");
         }
     }
     for (int i = 0; i < n; i++) {
@@ -400,16 +398,12 @@ static kl_reproject_uniforms klvm_uniforms(int stage, uint32_t slice, int flip_y
     kl_ovrp_render_pose r;
     int have = kl_ovrp_stage_render_pose(stage, &r);
 
-    // Where the head is now. Without KL_VIEW_TIMEWARP this is *defined* to be
-    // where the frame was rendered from, which makes the delta identically zero
-    // — the A/B, and the reason the default path cannot regress.
+    // Where the head is now; the delta against r is what this pass corrects.
     simd_float4x4 device = matrix_identity_float4x4;
-    if (g_timewarp && have) {
+    if (have) {
         float px, py, pz, qx, qy, qz, qw;
         kl_ovrp_get_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
         device = simd_matrix4x4(simd_quaternion(qx, qy, qz, qw));
-    } else if (have) {
-        device = simd_matrix4x4(simd_quaternion(r.qx, r.qy, r.qz, r.qw));
     }
 
     int eye = klvm_eye();
@@ -485,43 +479,23 @@ int kl_viewmtl_start(void *metal_layer) {
         return 0;
     }
 
-    // The blit is built either way: the liveness downsample uses it (its
-    // geometry is irrelevant to counting lit pixels) and it is the A/B for a
-    // reprojected picture that comes out wrong.
+    // The blit drives the liveness downsample, whose geometry is irrelevant to
+    // counting lit pixels, and stands in if the reprojection shader fails.
     g_pipe = klvm_pipeline(kl_reproject_blit_msl(), "kl_blit_v", "kl_blit_f", "blit");
     if (!g_pipe) return 0;
 
-    // The GUEST's non-eye layers, and it is built UNCONDITIONALLY — it used to
-    // sit inside the `if (g_timewarp)` below, which is how RE4's splash and
-    // menus composited on device and not in the viewer: `KL_VIEW_TIMEWARP`
-    // defaulted off, so `g_pipe_ov` was nil, and klvm_draw_overlays' first line
-    // returned before either of its two diagnostics could name a thing. Two
-    // unrelated features sharing one knob is a bug with no error surface.
+    // The GUEST's non-eye layers.
     g_pipe_ov = klvm_pipeline_blend(kl_reproject_overlay_msl(), "kl_ov_v", "kl_ov_f",
                                     "overlay", 1);
-    // **Default ON**, which is a change: it was off because the plain blit was
-    // the path that reached gameplay and this was its A/B. Two things now
-    // depend on the reprojection pass rather than on that history — the render
-    // viewport crop (DEBUG_ENV_VARS, KL_OVRP_VIEWPORT) and the overlay
-    // placement, whose quad is posed against the head and therefore disagrees
-    // with an eye picture that was blitted flat. It is also what the visionOS
-    // compositor does, so the viewer stops being a different composite from
-    // the one being debugged. `KL_VIEW_TIMEWARP=0` is still the A/B.
-    g_timewarp = kl_env_on("KL_VIEW_TIMEWARP", 1);
-    if (g_timewarp) {
-        g_pipe_rp = klvm_pipeline(kl_reproject_msl(), "kl_reproject_v",
-                                  "kl_reproject_f", "reprojection");
-        // Fall back rather than refuse to start. This is retried every frame,
-        // so returning 0 on a shader that will never compile is a viewer that
-        // stays black forever and says why exactly once — where the blit is a
-        // picture, correct whenever the head has not moved since the guest
-        // rendered.
-        if (!g_pipe_rp) {
-            fprintf(stderr, "  [vmtl] compositing through the plain BLIT instead — "
-                            "no reprojection, no viewport crop\n");
-            g_timewarp = 0;
-        }
-    }
+    g_pipe_rp = klvm_pipeline(kl_reproject_msl(), "kl_reproject_v",
+                              "kl_reproject_f", "reprojection");
+    // Fall back rather than refuse to start. This is retried every frame, so
+    // returning 0 on a shader that will never compile is a viewer that stays
+    // black forever and says why exactly once — where the blit is a picture,
+    // correct whenever the head has not moved since the guest rendered.
+    if (!g_pipe_rp)
+        fprintf(stderr, "  [vmtl] compositing through the plain BLIT instead — "
+                        "no reprojection, no viewport crop\n");
 
     MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
     sd.minFilter = MTLSamplerMinMagFilterLinear;
@@ -560,7 +534,7 @@ int kl_viewmtl_start(void *metal_layer) {
                     "no CPU copies%s%s\n", g_dev.name.UTF8String,
             gl ? "" : ", VULKAN guest (the eye texture is MoltenVK's and the "
                       "frame seam is kl_vulkan's serial)",
-            g_timewarp ? ", reprojecting against the guest's render pose" : "");
+            g_pipe_rp ? ", reprojecting against the guest's render pose" : "");
     return 1;
 }
 

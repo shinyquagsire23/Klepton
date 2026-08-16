@@ -32,7 +32,6 @@
 #   ./build_run_vpro.sh --null          # the null GL driver instead of ANGLE
 #   ./build_run_vpro.sh --stage         # re-upload the 2.2 GB of assets (first run only)
 #   ./build_run_vpro.sh --sync          # drive the guest on the compositor thread
-#   ./build_run_vpro.sh --quest-fov     # A/B: Quest 2's 90°/72 Hz, not the display's
 #   ./build_run_vpro.sh --log           # pull + summarise the last run, build nothing
 #
 # Anything already set in the environment wins, so a one-off knob the flags do
@@ -63,7 +62,6 @@ while [ $# -gt 0 ]; do
     --null)       GLFB=0; shift ;;
     --stage)      STAGE=1; shift ;;
     --sync)       export KL_SYNC_GUEST=1; shift ;;
-    --quest-fov)  export KL_OVRP_QUEST_FOV=1; shift ;;
     --log)        LOG_ONLY=1; shift ;;
     -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
     -*)           echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
@@ -203,7 +201,7 @@ export KL_LOG_OUT="$LOCAL_LOG"
 
 echo "target    : $KLT_NAME ($BUNDLE_ID, $KLT_PRODUCT.app)"
 echo "device    : $DEVID"
-echo "knobs     : ${KL_FRAMES:+KL_FRAMES=$KL_FRAMES }${KL_IMMERSIVE:+KL_IMMERSIVE=$KL_IMMERSIVE }${KL_GLFB:+KL_GLFB=$KL_GLFB }KL_ALARM=$KL_ALARM${KL_SYNC_GUEST:+ KL_SYNC_GUEST=1}${KL_OVRP_QUEST_FOV:+ KL_OVRP_QUEST_FOV=1}${KL_SKIP_STAGE:+ (assets not re-staged)}"
+echo "knobs     : ${KL_FRAMES:+KL_FRAMES=$KL_FRAMES }${KL_IMMERSIVE:+KL_IMMERSIVE=$KL_IMMERSIVE }${KL_GLFB:+KL_GLFB=$KL_GLFB }KL_ALARM=$KL_ALARM${KL_SYNC_GUEST:+ KL_SYNC_GUEST=1}${KL_SKIP_STAGE:+ (assets not re-staged)}"
 echo "            (unset knobs take the app's defaults: immersive + ANGLE, autoboot)"
 echo
 

@@ -345,7 +345,7 @@ int kl_ovrp_overlay_get(int i, kl_ovrp_overlay *out);
 // did, and as an arc on any rotation, because a head turn translates the eyes.
 // A guest that does NOT pre-warp submits the pose it was given, and this is
 // then identical to the latch. Strictly better in both cases, so it is not a
-// knob; KL_REPROJECT_MODE=off remains the blunt A/B.
+// knob.
 void kl_ovrp_frame_begin_external(void);
 void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8);
 

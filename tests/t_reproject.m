@@ -336,11 +336,9 @@ static void check_pixels(void) {
        "...and that is NOT the same output as flip_y = 0");
     u.flip_y = 0;
 
-    // ...and the same two answers through the BLIT, which is a separate shader
-    // with a separate uv convention and is the viewer's DEFAULT path — the one
-    // that actually ran when BONELAB's loading screen first appeared in a
-    // window. Checking only the reprojection pass would leave the flip proven
-    // in the shader nobody runs unless KL_VIEW_TIMEWARP is set.
+    // ...and the same two answers through the BLIT, a separate shader with a
+    // separate uv convention: it drives the viewer's liveness downsample and
+    // stands in whenever the reprojection shader fails to compile.
     {
         NSError *berr = nil;
         id<MTLLibrary> blib = [dev newLibraryWithSource:

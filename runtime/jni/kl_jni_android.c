@@ -1101,7 +1101,7 @@ static klj_val klj_String_length(void *env, void *self, const klj_val *a, int n)
 // visionOS is unaffected: the app container is the only writable location there
 // and kl_app.c passes it in explicitly, so this default is the host's.
 const char *kl_userdata_dir(const char *guest) {
-    char *env = kl_env_str("KL_FILES_DIR", NULL);
+    const char *env = kl_env_str("KL_FILES_DIR", NULL);
     if (env && *env) return klj_abspath(env);
     const char *home = getenv("HOME");
     size_t n = (home ? strlen(home) : 0) + strlen(guest) + 64;

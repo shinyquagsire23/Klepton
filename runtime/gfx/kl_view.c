@@ -180,7 +180,7 @@ static int32_t view_mono_keycode(SDL_Scancode sc) {
     }
 }
 
-// KL_VIEW_POKE lives in runtime/guest/kl_mono.c now — the fractions are of the
+// KL_VIEW_POKE lives in runtime/guest/kl_mono.c: its fractions are of the
 // guest's own surface, which both frontends scale into, so one implementation
 // serves the SDL window and the visionOS one and a click means the same thing
 // on each. See kl_mono.h for what it is for.
@@ -366,7 +366,6 @@ int kl_view_main(const char *libdir, int hw) {
     int mouselook = 0;
     int mouse_l = 0, mouse_r = 0;   // right-hand trigger / grip
     int32_t mono_buttons = 0;       // the flat path's Android button-state mask
-    uint64_t t_mono = 0;            // when the guest went mono — KL_VIEW_POKE's zero
 
     view_cpu_disp disp = {0};      // the readback path's staging; unused when hw
     int hw_up = 0, hw_warned = 0;  // the compositor starts lazily — see the loop
@@ -429,7 +428,6 @@ int kl_view_main(const char *libdir, int hw) {
                 // the window is interactive instead of only the runs someone
                 // moved the mouse in.
                 (void)kl_mono_input_available();
-                t_mono = t_now;
             } else if (m == KL_PRESENT_STEREO) {
                 // Symmetric with the mono branch, and it had no counterpart:
                 // a guest that goes mono and THEN stereo (every Unity OpenXR

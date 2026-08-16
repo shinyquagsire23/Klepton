@@ -14,7 +14,7 @@ int kl_env_on(const char *name, int dflt) {
              || !strcasecmp(v, "off") || !strcasecmp(v, "false"));
 }
 
-char* kl_env_str(const char *name, const char *dflt) {
+const char *kl_env_str(const char *name, const char *dflt) {
     const char *v = getenv(name);
     if (!v) return dflt;
     return v;

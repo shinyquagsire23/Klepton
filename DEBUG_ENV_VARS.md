@@ -80,10 +80,10 @@ answers GL and kl_glfb never initializes.
   only API in its list is Vulkan.
 - `KL_ANGLE_DIR=<dir>` — where to load `libEGL.dylib`/`libGLESv2.dylib` from.
   Default: `vendor/out/Debug` when its libEGL is present, else Google Chrome's
-  framework Libraries dir. Also read by spikes s09, s10, s11.
-- `KL_ANGLE_BACKEND=gl` — select ANGLE's OpenGL backend instead of Metal (the
-  default, asked for by name). Only the exact string `gl` switches. Also read
-  by spikes s09, s10, s11.
+  framework Libraries dir. Also read by spikes s09, s10, s11, s12, s13.
+- `KL_ANGLE_BACKEND=gl` — select ANGLE's OpenGL backend instead of Metal. Only
+  the exact string `gl` switches, and only spikes s09 and s10 read it: the
+  runtime asks for Metal by name and has no GL path.
 - `KL_GLFB_SIZE=WxH` — override the eye/pbuffer size (default 1832x1920, the
   Quest 2 per-eye size). Applied both at init and in `kl_glfb_set_size`.
 - `KL_GLFB_SHARED=1` — per-thread ANGLE contexts sharing one object namespace,
@@ -185,12 +185,6 @@ answers GL and kl_glfb never initializes.
   so the same attachment is carried on a framebuffer of ours and bound as READ;
   the guest's next read bind takes it away. `=0` restores the failing
   configuration.
-- `KL_GLFB_BLIT_READ_FIX=1` — an earlier EXPERIMENT, off by default, kept
-  because it is the measurement that pointed at the read binding at all: it
-  substitutes the framebuffer the guest was drawing into immediately before.
-  `KL_GLFB_READ_ATTACH_FIX` supersedes it and is the one to use — this
-  substitutes a framebuffer WE chose, that one carries the attachment the
-  GUEST named.
 - `KL_GLFB_NO_INVALIDATE=1` — don't forward `glInvalidateFramebuffer`.
   ANGLE/Metal actually discards (memoryless attachments), so this tests
   whether an invalidate is the eraser. Diagnostic only.
@@ -340,9 +334,6 @@ gamelift region probes failed EINVAL in a retry storm.
   The abort this used to cause was *not* a DNS bug — it was the empty
   `dl_iterate_phdr` breaking the guest's unwinder, so the `SocketException`
   could never reach its handler. See trap 8.
-- `KL_NO_DL_PHDR=1` — restore the old empty `dl_iterate_phdr`. Any guest
-  throw then aborts in `_Unwind_RaiseException` instead of being caught;
-  this is the A/B for trap 8.
 
 ## TLS trust store (`runtime/kl_cacerts.c`)
 
@@ -393,6 +384,13 @@ Built for the loading-pace investigation; all default off.
   **isolation** — `KL_DLOPEN_REFUSE=phonon` takes Steam Audio out of a VRChat
   run, which is the difference between reaching the frame loop and not.
   Nothing is refused by default and every refusal is named.
+- `KL_TRACE_DLOPEN_FRAMES=1` — on a FAILED guest `dlopen`, walk the guest stack
+  and print it. A P/Invoke that cannot resolve throws from IL2CPP's resolver and
+  the managed method that declared it is named nowhere in the exception; the
+  resolver runs on the guest's own stack, so the frame walk reaches the
+  generated wrapper and `tools/vrc_code.py --whois` turns that address into a
+  method. Prints the conservative all-stack-words version too, because an
+  obfuscated `.text` keeps no frame chain.
 - `KL_X18_MAP=<file>` — append "veneer_addr site_addr" per patched x18 site,
   so a guest pc captured in a shim maps back to its call site.
 - `KL_TRACE_IMAGES=1` — per-image base/span; needed to turn a guest pc into a
@@ -422,6 +420,14 @@ every time they fire, with the address and the instruction each replaces.
   Managed code resolves a P/Invoke by name through `klb_dlsym`, so a wrapper
   handed back there sits on the seam with the real function one call away. This
   is what showed that `size == 1` is not the frame size we supply.
+- `KL_PHONON_HRTF=0` — do not substitute an HRTF. On by default, and only for a
+  guest whose `libphonon.so` cannot answer its own default: VRChat's ships a
+  40-byte `gDefaultHrtfData` stub instead of Steam Audio's ~1 MiB table, so
+  type=DEFAULT yields `numSamples == 1` and PFFFT refuses it (`Unable to create
+  PFFFT setup (size == 1)`). `iplHRTFCreate`'s settings are rewritten to
+  type=SOFA pointing at CIPIC subject 124, vendored from Valve's steam-audio
+  tree and baked in by `runtime/media/kl_phonon_hrtf.S`. `KL_TRACE_HRTF=1`
+  prints the arguments either way.
 
 - `KL_TRACE_WMEMCHR=1` — print every `wmemchr`, with the haystack on a miss.
   Steam Audio picks its HRIR length by `std::find` over an int array, which
@@ -943,6 +949,14 @@ puts the camera on the ground with its hands underneath it.
   measurement was taken against, and its tearing; each extra stage costs a
   full-size RGBA16F two-slice eye texture (~160 MB at map resolution). The
   A/B in both directions.
+- `KL_OVRP_TRACE=1` — log the live call SEQUENCE, with a global ordinal and the
+  caller's image+offset, for the frame/layer/display family; `=all` for every
+  entry point (the input pollers run thousands of times a frame and bury it).
+  The end-of-run work list prints TOTALS per name, and totals cannot say
+  whether the guest re-enters the submit path per frame or entered it once and
+  left: with the sequence, `BeginFrame4` once then `DestroyLayer` reads as a
+  teardown; without it, as a call count of 1. A print and nothing else — no
+  register capture, no reads of guest memory.
 - `KL_OVRP_LAYERS=1` — census the whole `ovrp_EndFrame4` submit list: one line
   per distinct `(layer, shape, stage, viewport, pose, flags)`, printed when it
   first appears and when it changes, plus the union's per-shape tail. Every
@@ -980,10 +994,6 @@ puts the camera on the ground with its hands underneath it.
   (2026-08-13, user-confirmed), so 1 is now purely the A/B — and the answer for
   any guest ever found that collapses the cones without submitting per-eye
   rects, which would be unservable any other way.
-- `KL_OVRP_QUEST_FOV=1` — keep the synthetic symmetric 90° frustum and the
-  Quest 2's 72 Hz instead of the display's own measured numbers (the visionOS
-  compositor's priming pass measures and logs both either way). A free A/B if
-  the real numbers send Unity somewhere unexpected.
 - `KL_VRR` — **foveated guest rendering** (host: `tests/t_mtl_provider.m`;
   device: `KleptonCompositor.swift`). **On by default**; `KL_VRR=0` is the A/B.
   Builds an `MTLRasterizationRateMap` for the eye size and hands it to
@@ -1106,8 +1116,6 @@ puts the camera on the ground with its hands underneath it.
   guest submitted), `[view]`/`[cp] first render viewport read from the frame
   record` (what the compositor read), and `[view]`/`[cp] render viewport … —
   compositing that sub-rect` (what it did with it).
-  **On the macOS viewer this needs `KL_VIEW_TIMEWARP=1`**: the default viewer
-  path is the plain blit, which has no unwarp grid and therefore no crop.
 
 ### Haptics (`runtime/xr/kl_ovrp.c` — the seam that runs OUT of the guest)
 
@@ -1238,12 +1246,6 @@ The composite/timewarp pass — one file, compiled by both compositors
   drawable reports `depthRange = (far inf, near 0.1)`, so nothing is ever
   discarded for being too far; a frame that vanishes is depth WRITES being off,
   not this number.
-- `KL_REPROJECT_MODE=off|inverse` — the bisection the pass never had. `off`
-  corrects nothing (the delta is dropped and the pass becomes the frustum fit
-  alone — if instability survives this, the timewarp is not causing it);
-  `inverse` applies the delta backwards (if THIS is the stable one, a sign is
-  wrong upstream and the question becomes which input). Both are wrong
-  pictures by construction; diagnostic only.
 - `KL_REPROJECT_NOCANT=1` — treat `device_from_view` as having no rotation;
   the A/B for the eye-cant handling.
 - `KL_SRGB_DECODE=0|1` — force the composite's sRGB→linear decode on or off,
@@ -1345,28 +1347,8 @@ The composite/timewarp pass — one file, compiled by both compositors
   shows one eye, and which one is not a detail: a guest under Oculus symmetric
   projection renders the two eyes into different sub-rects of one texture, so
   eye 1 is the one whose crop and whose quad can be wrong
-  while eye 0 looks perfect. With `KL_OVRP_EYE_TAN=vision` and
-  `KL_VIEW_TIMEWARP=1` this is the whole canted-stereo failure, on macOS.
-- `KL_VIEW_TIMEWARP=1` — composite the viewer's frame through the reprojection
-  pass, against the pose the guest *actually rendered it with* (`kl_ovrp`'s
-  stage-keyed record) instead of the current one — mouse-look motion between
-  the guest's frame and the composite is corrected here exactly as head motion
-  is on device. **Default ON since 2026-08-15**, and `=0` is the A/B back to the
-  plain blit. Prints the delta in degrees every 120 composites — 0.00
-  means the guest is keeping up and the pass is a blit, which is a proven
-  identity (`make reproject`).
-  **Being off was why the viewer was not a stand-in for the device composite.**
-  The visionOS compositor has no blit path — it is always the reprojection pass
-  — so everything that lives only in that pass (the unwarp grid, the foveation
-  correction, the render-viewport crop, `visible`, the sRGB decode) was
-  unexercised by a default viewer run, and "it looks right in the viewer" was
-  not evidence about any of them. The overlay pass is the case that forced the
-  default over: `g_pipe_ov` was built inside this knob's branch, so RE4's splash
-  and menus composited on device and not in the viewer, with neither of
-  klvm_draw_overlays' two diagnostics reached. The overlay pipeline is built
-  unconditionally now; with this off the eye picture is flat and the overlay is
-  posed, so they disagree as the head moves — which the viewer says once rather
-  than leaving it to look like a placement bug.
+  while eye 0 looks perfect. With `KL_OVRP_EYE_TAN=vision` this is the whole
+  canted-stereo failure, on macOS.
 
 ## Audio (`runtime/media/kl_audio.c`)
 
@@ -1615,6 +1597,12 @@ The wrapper's flags map onto these: `--gap` → `KL_GAP_ONLY=1 KL_NOFORK=1`,
   `.../output/haptic`, and 15 input actions — so the map can be read offline
   without a run at all. The seventh "type" in the older count is the hand
   profile (`svl_hand_interaction_augmented`), which is not in that table.
+- `KL_XR_LOCATE_EVERY=<n>` — how often a repeated `(call, space, base)` triple
+  is re-printed by the locate census, default 600; `=0` prints each triple once
+  only. The repeat is what makes it a measurement rather than a census: the
+  first call happens before the head has moved, so every position reads 0 and a
+  space leaking the head's own position is indistinguishable from one that does
+  not.
 - `KL_XR_PROFILE=0` — answer `xrGetCurrentInteractionProfile` with
   `XR_NULL_PATH` again, i.e. "no controller is bound". Default on
   (`/interaction_profiles/oculus/touch_controller`, SL-20).
@@ -1841,12 +1829,6 @@ except its own control vars (next section).
   `.hidden` is a request rather than a guarantee (the system still shows the
   indicator when it considers it mandatory), so turn this on when the question
   is whether the system still thinks our space is on screen at all.
-- `KL_TEMPLATE=1` — the **floor test**: Apple's `MetalImmersiveTemplate` with a
-  blue fragment shader in its own immersive space, sharing nothing with the
-  compositor (`KleptonTemplate.swift`). Runs INSTEAD of booting the guest —
-  the known-good pixel on that display; reach for it before doubting
-  `KleptonCompositor`. `KL_TPL_MIXED=1` puts it in `.mixed`, `KL_TPL_NOMSAA=1`
-  renders straight into the drawable instead of resolving.
 - `KL_HAND_ROT="x,y,z"` — extra rotation in degrees, applied in the **grip's
   own frame** to every hand pose after the wrist→grip correction — for the
   part that is not a basis error (Beat Saber's `AdjustControllerTransform`
@@ -1935,8 +1917,6 @@ except its own control vars (next section).
 - `KL_CP_QUALITY=<0..1>` — the render quality to request (default 1.0). The
   ceiling costs memory and per-frame GPU time; the *running* quality is set
   separately by the render loop.
-- `KL_CP_LOSSY=1` — lossy texture compression on the drawable-adjacent
-  textures; an experiment, default off.
 
 ## Wrapper-script control vars (`visionos/run.sh`, `build_run_vpro.sh`)
 

@@ -60,7 +60,6 @@
 #define EGL_PLATFORM_ANGLE_ANGLE             0x3202
 #define EGL_PLATFORM_ANGLE_TYPE_ANGLE        0x3203
 #define EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE  0x3489
-#define EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE 0x320D
 
 #define GL_NO_ERROR      0
 #define GL_RGBA          0x1908
@@ -219,12 +218,8 @@ int kl_glfb_init(void) {
 
     // Metal by name. The default display selects ANGLE's OpenGL backend, and with
     // it every limitation this move exists to escape.
-    const char *want = kl_env_str("KL_ANGLE_BACKEND", "angle");
-    int use_gl = want && strcmp(want, "gl") == 0;
     const int32_t dpy_attrs[] = {
-        EGL_PLATFORM_ANGLE_TYPE_ANGLE,
-        use_gl ? EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE
-               : EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE,
+        EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE,
         EGL_NONE,
     };
     g_dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE, EGL_DEFAULT_DISPLAY,
@@ -1489,10 +1484,6 @@ static void klfb_map_fbo(uint32_t fbo, uint32_t tex);
 static void klfb_note_render_stage(int stage);
 static void klfb_note_eye_fbo(uint32_t fbo, uint32_t touched);
 static uint32_t g_draw_fb;
-// ...and the one before it, which is the only record of the framebuffer a guest
-// was drawing into when it binds another one to blit INTO. See the read-binding
-// experiment in klfb_BlitFramebuffer.
-static uint32_t g_prev_draw_fb;
 // ...and the framebuffer the last draw CALL targeted, which is a different
 // question from the last binding — see klfb_note_draw.
 static uint32_t g_last_draw_fb;
@@ -1570,7 +1561,6 @@ static void klfb_BindFramebuffer(uint32_t target, uint32_t fb) {
     }
     if (klfb_is_read_target(target)) g_read_fb = fb;
     if (klfb_is_draw_target(target)) {
-        if (fb != g_draw_fb) g_prev_draw_fb = g_draw_fb;
         g_draw_fb = fb;
         // Which stage this frame is going into. Sticky: a guest that binds an
         // eye FBO and then bounces through others (shadow maps, post) has still
@@ -3358,31 +3348,14 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
             bindfb_(0x8CA9, dfb);
         }
     }
-    // KL_GLFB_BLIT_READ_FIX=1 — an EXPERIMENT, not a fix, and it is here to
-    // answer one question: when VRChat's Unity blits into its OpenXR eye
-    // swapchain it passes framebuffer 0 as the source (confirmed in libunity's
-    // own code — the read bind is skipped by the redundant-bind check, which is
-    // only reachable with a requested name of 0), so the eye receives the
-    // default framebuffer instead of the array texture Unity just rendered
-    // thousands of draws into. Substituting the framebuffer the guest was
-    // drawing into immediately before says whether that IS what it meant.
-    // A wrong answer here is a picture; the right one is a cause.
-    //
-    // It runs BEFORE the probe below so that the probe's "before" line reports
-    // the substituted source rather than the one being replaced.
-    static int read_fix = -1;
-    if (read_fix < 0) read_fix = kl_env_on("KL_GLFB_BLIT_READ_FIX", 0);
-    int32_t fixed_from = -1;
+    // A blit whose read framebuffer is 0 is counted, not repaired: the repair
+    // lives at the attach (KL_GLFB_READ_ATTACH_FIX), which carries the
+    // attachment the guest named rather than a framebuffer chosen here.
     if (a_glGetIntegerv) {
         int32_t rfb2 = -1;
         a_glGetIntegerv(0x8CAA, &rfb2);
         g_blits++;
         if (rfb2 == 0) g_blits_read0++;
-        if (read_fix && rfb2 == 0 && g_prev_draw_fb) {
-            static void (*rf_bind)(uint32_t, uint32_t);
-            if (!rf_bind) rf_bind = asym("glBindFramebuffer");
-            if (rf_bind) { rf_bind(0x8CA8, g_prev_draw_fb); fixed_from = (int32_t)g_prev_draw_fb; }
-        }
     }
     // KL_GLFB_BLIT_PROBE=1: probe the blit's source BEFORE the blit and its
     // destination AFTER — the swap-time capture found every FBO black, which
@@ -3461,15 +3434,6 @@ static void klfb_BlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
     if (g_real_BlitFramebuffer)
         g_real_BlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
                                (uint32_t)mask, (uint32_t)filter);
-    if (fixed_from >= 0) {
-        static void (*rf_bind)(uint32_t, uint32_t);
-        if (!rf_bind) rf_bind = asym("glBindFramebuffer");
-        if (rf_bind) rf_bind(0x8CA8, 0);       // put back what the guest had
-        static int said_fix;
-        if (!said_fix++)
-            fprintf(stderr, "  [glfb] BLIT_READ_FIX: the guest blitted with read "
-                            "framebuffer 0; read it from fb %d instead\n", fixed_from);
-    }
     if (blit_probe && a_glGetError) {
         uint32_t be = a_glGetError();
         if (be)
@@ -3643,10 +3607,8 @@ static unsigned g_ndraw_fbs;
 static void klfb_note_draw(void) {
     int32_t fb = -1;
     if (a_glGetIntegerv) a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
-    // The framebuffer the last DRAW CALL went to. g_prev_draw_fb is a different
-    // thing — the binding before the current one — and at a blit the two are
-    // usually equal, which silently hid the comparison that matters: this guest
-    // draws into one framebuffer and blits out of another.
+    // The framebuffer the last DRAW CALL went to, which is not the last binding:
+    // this guest draws into one framebuffer and blits out of another.
     if (fb > 0) g_last_draw_fb = (uint32_t)fb;
     // The same timeline the blit probe reads: order the draws against the
     // clears/invalidates/blits, because "black at blit time" is meaningless
@@ -4449,12 +4411,12 @@ static void klfb_ActiveTexture(uint32_t unit) {
     // unit" check rejects above its own cap — if that preempts the bind, no
     // high unit ever reaches GL, and measuring the request stream proves it.
     {
-        static int logu = -1, saidu;
+        static int logu = -1;
         static uint8_t seen[64];
         if (logu < 0) logu = kl_env_on("KL_GLFB_LOG_UNITS", 0);
         int u = (int)(unit - 0x84C0);
         if (logu && u >= 0 && u < 64 && !seen[u]) {
-            seen[u] = 1; saidu++;
+            seen[u] = 1;
             fprintf(stderr, "  [glfb] glActiveTexture: first use of unit %d\n", u);
         }
     }
