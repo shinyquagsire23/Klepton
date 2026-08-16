@@ -23,7 +23,7 @@ LDLIBS  := -lz -framework AudioToolbox \
 # managed-side probe and the metadata dump. Nothing in RUNTIME_SHIP includes
 # their headers (only
 # tests/m_boot.c does), so the boundary holds by construction rather than by
-# discipline. runtime/kl_view.c (SDL viewer) is host-only too and is named by
+# discipline. runtime/gfx/kl_view.c (SDL viewer) is host-only too and is named by
 # the m_boot rule alone.
 # The synthetic JavaVM/JNIEnv. kl_jni.c is the mechanism (registries, dispatch,
 # id interning); each kl_jni_<family>.c owns one block of the guest's Java
@@ -37,22 +37,22 @@ RUNTIME_JNI := runtime/kl_jni.c \
            runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
            runtime/jni/kl_jni_ue4.c
 
-RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/kl_shim.c runtime/kl_va.c \
-           runtime/kl_va_handlers.c runtime/kl_va_thunks.S \
-           runtime/kl_libc.c runtime/kl_libc_slink.c runtime/kl_pthread.c runtime/kl_dl.c \
-           runtime/kl_ndk.c runtime/kl_x18.c runtime/kl_target.c \
+RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
+           runtime/libc/kl_va_handlers.c runtime/libc/kl_va_thunks.S \
+           runtime/libc/kl_libc.c runtime/libc/kl_libc_slink.c runtime/libc/kl_pthread.c runtime/kl_dl.c \
+           runtime/guest/kl_ndk.c runtime/kl_x18.c runtime/kl_target.c \
            $(RUNTIME_JNI) \
-           runtime/kl_egl.c runtime/kl_opensl.c runtime/kl_audio.c runtime/kl_ovrp.c \
-           runtime/kl_ovrp_sret.S runtime/kl_reproject.c runtime/kl_present.c \
-           runtime/kl_ovrplat.c runtime/kl_openxr.c runtime/kl_mediandk.c runtime/kl_vtdec.c runtime/kl_avdec.m \
-           runtime/kl_vulkan.c \
-           runtime/kl_nativeactivity.c runtime/kl_slink.c runtime/kl_ue4.c \
-           runtime/kl_aaudio.c \
-           runtime/kl_glfb.c runtime/kl_gl_trace.S runtime/kl_gl_lock.S \
-           runtime/kl_mono.c \
-           runtime/kl_il2cpp.c runtime/kl_fault.c runtime/kl_guestpatch.c \
-           runtime/kl_guestpoke.c runtime/kl_cacerts.c runtime/kl_phonon_hrtf.S
-RUNTIME_DIAG := runtime/kl_sample.c runtime/kl_mprobe.c runtime/kl_metadump.c
+           runtime/gfx/kl_egl.c runtime/media/kl_opensl.c runtime/media/kl_audio.c runtime/xr/kl_ovrp.c \
+           runtime/xr/kl_ovrp_sret.S runtime/gfx/kl_reproject.c runtime/gfx/kl_present.c \
+           runtime/xr/kl_ovrplat.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
+           runtime/gfx/kl_vulkan.c \
+           runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c \
+           runtime/media/kl_aaudio.c \
+           runtime/gfx/kl_glfb.c runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
+           runtime/guest/kl_mono.c \
+           runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
+           runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S
+RUNTIME_DIAG := runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c runtime/diag/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
 # ...and every header they include, as a PREREQUISITE (never as a compiler
@@ -198,12 +198,12 @@ guestlibs-list:
 # kl_view.c references both; the mono path uses neither (no eye textures to
 # provide, and the readback sink needs no Metal interop), but the symbols must
 # resolve.
-build/m_slink: mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
-               runtime/kl_view_mtl.m $(RUNTIME_HDRS)
+build/m_slink: mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
+               runtime/gfx/kl_view_mtl.m $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
-	  mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
-	  runtime/kl_view_mtl.m \
+	  mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
+	  runtime/gfx/kl_view_mtl.m \
 	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
 	  $(shell pkg-config --libs sdl3)
 
@@ -372,12 +372,12 @@ vatest: build/t_variadic
 # Objective-C because it has to *create* MTLTextures. Host-only and diagnostic —
 # named here and never in RUNTIME_SHIP, which is why the shipping runtime stays
 # plain C and takes an opaque texture pointer.
-build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
-              runtime/kl_view_mtl.m $(RUNTIME_HDRS)
+build/m_boot: mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
+              runtime/gfx/kl_view_mtl.m $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
-	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/kl_view.c \
-	  runtime/kl_view_mtl.m \
+	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
+	  runtime/gfx/kl_view_mtl.m \
 	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
 	  $(shell pkg-config --libs sdl3)
 
@@ -591,10 +591,10 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 # forced a rebuild. A stale translator is not a harmless one: it bakes
 # KLX_TSD_SLOT into every veneer it emits.
 build/klepton-ld: tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c runtime/kl_x18.h \
-                  runtime/kl_guestpatch.c runtime/kl_guestpatch.h
+                  runtime/guest/kl_guestpatch.c runtime/kl_guestpatch.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/klepton_ld.c runtime/kl_x18.c runtime/kl_env.c \
-	    runtime/kl_guestpatch.c
+	    runtime/guest/kl_guestpatch.c
 
 # P1 — the same t_opus roundtrip that M1a passes, through the translated dylib.
 # t_opus picks its loader from the file's magic, so this is one test over two
@@ -875,9 +875,9 @@ vrr: build/s12_vrr
 # matrices, and that the shared shader actually compiles. Separate from `make
 # check` on purpose; it needs Metal's compiler service and the gate should not
 # take a dependency on that. See tests/t_reproject.m.
-build/t_reproject: tests/t_reproject.m runtime/kl_reproject.c runtime/kl_reproject.h \
+build/t_reproject: tests/t_reproject.m runtime/gfx/kl_reproject.c runtime/kl_reproject.h \
                    runtime/kl_env.c runtime/kl_ovrp.h
-	$(CC) $(CFLAGS) -fobjc-arc -Iruntime -o $@ $< runtime/kl_reproject.c \
+	$(CC) $(CFLAGS) -fobjc-arc -Iruntime -o $@ $< runtime/gfx/kl_reproject.c \
 	  runtime/kl_env.c -framework Metal -framework Foundation
 
 .PHONY: reproject
@@ -907,7 +907,7 @@ haptics: build/t_haptics
 # says so and passes.
 .PHONY: ovrpabi
 ovrpabi:
-	@python3 tools/ovrp_abi.py $(LIBS)/libOVRPlugin.so runtime/kl_ovrp.c
+	@python3 tools/ovrp_abi.py $(LIBS)/libOVRPlugin.so runtime/xr/kl_ovrp.c
 
 # A *vendored debug build* of ANGLE lives in vendor/ (gitignored) — the Metal
 # backend can be stepped into, which is what the AGX-abort investigation needs.
@@ -1140,7 +1140,7 @@ shared: build/s10_shared
 	 run "one worker thread (control)" S10_STAGE=7 S10_THREADS=1; \
 	 echo "  (expected: row 1 ~1 in 3, row 2 ~1 in 30, rows 3-5 clean)"
 
-# The GL tracing trampoline's ABI contract (runtime/kl_gl_trace.S). It forwards an
+# The GL tracing trampoline's ABI contract (runtime/gfx/kl_gl_trace.S). It forwards an
 # unknown signature, so nothing else can check it — and a trampoline that drops a
 # register produces a wrong picture rather than a crash.
 build/t_trace: tests/t_trace.c $(RUNTIME) $(RUNTIME_HDRS)

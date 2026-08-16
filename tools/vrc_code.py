@@ -40,7 +40,7 @@ Usage
     vrc_code.py --modules                    every image, with its method count
 
 Addresses are guest vaddrs in `libil2cpp.so` — the same numbers `objdump
---start-address` wants, and the same ones runtime/kl_guestpatch.c records.
+--start-address` wants, and the same ones runtime/guest/kl_guestpatch.c records.
 """
 import argparse
 import importlib.util

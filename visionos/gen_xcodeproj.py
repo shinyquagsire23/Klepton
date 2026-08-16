@@ -98,7 +98,7 @@ ENTITLEMENTS = os.environ.get("KLEPTON_ENTITLEMENTS", "1") != "0"
 #       grant you must be given) or with an unknown-entitlement error (a key the
 #       platform does not know), set KLEPTON_LOW_LATENCY=0 and the memory keys
 #       survive. Do not diagnose a stream problem from its presence alone —
-#       runtime/kl_openxr.c's KL_XR_PROFILE is the A/B for the change that
+#       runtime/xr/kl_openxr.c's KL_XR_PROFILE is the A/B for the change that
 #       actually altered what the client publishes.
 OPTIONAL_ENTITLEMENTS = {
     "com.apple.developer.low-latency-streaming": "KLEPTON_LOW_LATENCY",
@@ -123,7 +123,7 @@ GUEST = KLT["libs"].split()
 ANGLE = ["ANGLE_libEGL", "ANGLE_libGLESv2"]
 # ...and the OTHER renderer, for a guest whose graphics API is Vulkan (BONELAB).
 # Same treatment as ANGLE for the same reasons: one driver for every guest that
-# asks, dlopened by path at runtime (runtime/kl_vulkan.c), and 4.6 MB a slice —
+# asks, dlopened by path at runtime (runtime/gfx/kl_vulkan.c), and 4.6 MB a slice —
 # so making it per-target would cost a table row to save less than the row.
 #
 # OPTIONAL, unlike ANGLE, and that is the only difference: MoltenVK is a

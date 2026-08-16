@@ -2,7 +2,7 @@
 # Wrap the vendored MoltenVK slices as an XCFramework for the app to embed.
 #
 # The Vulkan twin of mkangle.sh, and deliberately the same shape: embedded, not
-# linked. Nothing in the app references a Vulkan symbol — runtime/kl_vulkan.c
+# linked. Nothing in the app references a Vulkan symbol — runtime/gfx/kl_vulkan.c
 # dlopens it by path at runtime, and mvk_open() already understands both the
 # bare-dylib layout the host stages and the `@rpath/MoltenVK.framework/MoltenVK`
 # that resolves to @executable_path/Frameworks inside a bundle, which is the ONLY

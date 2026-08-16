@@ -150,7 +150,7 @@ TARGETS = {
         #
         # That makes it the target that joins the project's two halves: the
         # Unity/IL2CPP path (Beat Saber, SUPERHOT, BONELAB) and the OpenXR
-        # runtime written for Steam Link (runtime/kl_openxr.c), which until now
+        # runtime written for Steam Link (runtime/xr/kl_openxr.c), which until now
         # only ever had a non-Unity guest on top of it.
         #
         # The front door is stock — com.unity3d.player.UnityPlayerActivity and
@@ -316,7 +316,7 @@ TARGETS = {
         #   libvrlink_scene   the VR door. ONE library — its DT_NEEDED is
         #                     entirely Android system libraries we shim.
         #   the shell chain   fourteen, dependencies first, off libshell's own
-        #                     DT_NEEDED (runtime/kl_slink.c's CHAIN_SHELL).
+        #                     DT_NEEDED (runtime/guest/kl_slink.c's CHAIN_SHELL).
         #   the Qt plugins    six, in NOBODY's DT_NEEDED. Qt dlopens them by
         #                     path at runtime — the platform QPA first, and
         #                     libshell aborts without it. A dlopen that finds no

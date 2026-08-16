@@ -354,7 +354,7 @@ def main():
     for imports, exports in per_tree:
         allu |= imports - exports
     allu -= replaced
-    shim = open(os.path.join(ROOT, 'runtime/kl_shim.c')).read()
+    shim = open(os.path.join(ROOT, 'runtime/libc/kl_shim.c')).read()
     listed = set(re.findall(r'E\("([^"]+)"', shim))
 
     fwd = sorted(s for s in allu
@@ -429,7 +429,7 @@ def main():
         bad, err = set(), ''
         for label, cmd in platforms:
             p = subprocess.run(cmd + ['-I', os.path.join(ROOT, 'runtime'),
-                                      os.path.join(ROOT, 'runtime/kl_shim.c')],
+                                      os.path.join(ROOT, 'runtime/libc/kl_shim.c')],
                                capture_output=True, text=True)
             if p.returncode == 0:
                 continue

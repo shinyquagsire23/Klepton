@@ -86,7 +86,7 @@ def ours(src):
 
 def main(argv):
     so  = argv[1] if len(argv) > 1 else "beatsaber/lib/arm64-v8a/libOVRPlugin.so"
-    csrc = argv[2] if len(argv) > 2 else "runtime/kl_ovrp.c"
+    csrc = argv[2] if len(argv) > 2 else "runtime/xr/kl_ovrp.c"
     syms = real_symbols(so)
     if not syms:
         print(f"  ovrp ABI: no real libOVRPlugin.so at {so} — nothing to compare against")
