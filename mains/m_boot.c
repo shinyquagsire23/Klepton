@@ -39,6 +39,7 @@
 #include "../runtime/kl_fault.h"
 #include "../runtime/kl_target.h"
 #include "../runtime/guest/kl_ue4.h"
+#include "../runtime/guest/kl_jkxr.h"
 #include "../tests/t_mtl_provider.h"
 
 // Which guest, and where its libraries are. Both come from the target table
@@ -298,6 +299,58 @@ static void report_eye_interop(void) {
             }
         }
     }
+    // ...and the layers that are NOT an eye. A guest can present its whole
+    // frame as an OpenXR quad — JKXR submits nothing else — and for that guest
+    // every number above is 0 and says nothing: the eye table is empty because
+    // there is no eye. This is the same measurement asked of the storage the
+    // overlay pass samples, and it is the only evidence on host that the
+    // picture reached the compositor at all.
+    for (int i = 0; i < kl_ovrp_overlay_count(); i++) {
+        kl_ovrp_overlay ov;
+        if (!kl_ovrp_overlay_get(i, &ov)) continue;
+        // EVERY image of the layer's swapchain, not just the one the last frame
+        // named. The guest rotates through them and the compositor follows, so
+        // a single image that stopped receiving the guest's rendering is a
+        // FROZEN picture alternating with live ones — which is what a stale
+        // frame flickering over a correct one looks like, and what no
+        // measurement of one image can see. `stages` here is the record ring's
+        // count, which is the same 3 an OpenXR swapchain has.
+        for (int st = 0; st < stages; st++) {
+            int w = 0, h = 0;
+            if (!kl_glfb_layer_mtl_texture(ov.layer_id, st, NULL, NULL)) {
+                if (st == ov.stage)
+                    printf("  layer %d stage %d (%.2fx%.2f m): no MTLTexture — "
+                           "NOT composited\n", ov.layer_id, st,
+                           (double)ov.size[0], (double)ov.size[1]);
+                continue;
+            }
+            unsigned long lit = kl_mtl_count_lit_layer(ov.layer_id, st, &w, &h);
+            unsigned long n = w && h ? ((unsigned long)((w + 7) / 8)
+                                      * (unsigned long)((h + 7) / 8)) : 0;
+            // Alpha, beside the luma, because a quad layer is BLENDED: a guest
+            // that leaves it at 0 (trap 33) submits a perfect picture that
+            // composites to nothing, and that is the same display as black with
+            // every other number here healthy.
+            unsigned alpha = kl_mtl_mean_alpha();
+            printf("  layer %d stage %d MTLTexture %dx%d (%.2fx%.2f m at "
+                   "%.2f %.2f %.2f): %lu/%lu lit, mean luma %u, mean alpha %u%s%s%s\n",
+                   ov.layer_id, st, w, h, (double)ov.size[0], (double)ov.size[1],
+                   (double)ov.pose[4], (double)ov.pose[5], (double)ov.pose[6],
+                   lit, n, kl_mtl_mean_luma(), alpha,
+                   st == ov.stage ? "   <- LAST SUBMITTED" : "",
+                   lit ? "" : "  <<< BLACK",
+                   lit && alpha < 8 ? "  <<< TRANSPARENT: a blended layer with "
+                                      "this alpha composites to nothing" : "");
+            const char *out = getenv("KL_GLFB_OUT");
+            if (out) {
+                char p[1200];
+                snprintf(p, sizeof p, "%s/mtl_layer%d_s%d.png", out, ov.layer_id, st);
+                printf("    -> %s%s\n", p,
+                       kl_mtl_dump_png_layer(ov.layer_id, st, p) ? ""
+                                                                : "  (write FAILED)");
+            }
+        }
+    }
 }
 
 // The Unreal Engine 4 door. A different ENTRY, not a different lifecycle: the
@@ -355,6 +408,60 @@ static int ue4_run(void) {
     return 0;
 }
 
+// The JKXR door. Neither of the two above: the guest's natives are static
+// exports on a plain Activity, so this drives them in the Activity's own order
+// — onCreate builds the engine and hands back the handle every later call is
+// keyed on — and then pumps the Android side while the engine's own render
+// thread runs.
+//
+// Shaped like ue4_run deliberately, down to KL_GAP_ONLY and the seconds-rather-
+// than-frames budget: both doors hand the guest its own frame loop, so neither
+// has a render call to count, and the two runs should be readable side by side.
+static int jkxr_run(void) {
+    // Before any guest code: x18 and the TLS veneer's slot. The Unity path gets
+    // this from kl_app_boot.
+    kl_thread_init();
+
+    if (kl_jkxr_configure(LIBDIR, TARGET->entry_lib, stdout) != 0)
+        return fail(kl_jkxr_error());
+    if (kl_jkxr_load(stdout) != 0) return fail(kl_jkxr_error());
+
+    printf("\n=== the shim gap ===\n");
+    kl_jkxr_gap(stdout);
+    if (getenv("KL_GAP_ONLY")) { fflush(NULL); return 0; }
+
+    // Before the engine builds its OpenXR swapchains, which is where the images
+    // that need MTLTexture storage are created. The Unity path registers this
+    // inside its lifecycle (ovrp_SetupEyeTexture2 arrives there) and the UE4
+    // door needs no provider at all — its eye images come from MoltenVK — so
+    // this door is the first that has to ask for itself. Self-guarding on
+    // KL_GLFB_MTL / KL_VIEW, so a plain run is unchanged.
+    kl_mtl_provider_install();
+
+    printf("\n=== GLES3JNILib.onCreate ===\n");
+    fflush(NULL);
+    const char *aenv = getenv("KL_ALARM");
+    alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : 20);
+    if (kl_jkxr_create(stdout) != 0) { alarm(0); return fail(kl_jkxr_error()); }
+    kl_jkxr_start(stdout);
+    alarm(0);
+
+    const char *wenv = getenv("KL_JKXR_WAIT");
+    double want = wenv ? strtod(wenv, NULL) : 5.0;
+    printf("\n=== pumping the looper for %.1f s ===\n", want);
+    fflush(NULL);
+    alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : (unsigned)(want + 30));
+    double spent = kl_jkxr_pump(want, NULL);
+    alarm(0);
+    printf("  pumped %.2f s\n", spent);
+
+    printf("\n=== reports ===\n");
+    kl_jkxr_report(stdout);
+    report_eye_interop();
+    fflush(NULL);
+    return 0;
+}
+
 static int recon_run(int view_pump) {
     install_fault_reporter();
     kl_mem_pressure_init();
@@ -379,6 +486,7 @@ static int recon_run(int view_pump) {
     // that happens to fit every guest — it names libmain, NativeLoader and
     // UnityPlayer.initJni — so a UE4 target has to branch before any of it.
     if (TARGET && TARGET->kind == KL_GUEST_UE4) return ue4_run();
+    if (TARGET && TARGET->kind == KL_GUEST_JKXR) return jkxr_run();
 
     char path[1024];
     snprintf(path, sizeof path, "%s/libmain.so", LIBDIR);
@@ -825,8 +933,9 @@ int main(int argc, char **argv) {
     // this tree keeps having to unlearn (the getrandom stop that reported
     // itself as "an unimplemented JNI call" is the same shape).
     printf("\n=== EXIT CRITERION MET: %s ===\n",
-           TARGET && TARGET->kind == KL_GUEST_UE4
-               ? "the NativeActivity lifecycle ran with no unimplemented JNI calls"
-               : "initJni completed with no unimplemented JNI calls");
+           !TARGET                             ? "initJni completed with no unimplemented JNI calls"
+           : TARGET->kind == KL_GUEST_UE4      ? "the NativeActivity lifecycle ran with no unimplemented JNI calls"
+           : TARGET->kind == KL_GUEST_JKXR     ? "the GLES3JNILib lifecycle ran with no unimplemented JNI calls"
+                                               : "initJni completed with no unimplemented JNI calls");
     return 0;
 }

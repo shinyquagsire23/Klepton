@@ -59,6 +59,7 @@ KL_VTHUNK klv_snprintf,           klh_snprintf,          3
 KL_VTHUNK klv_asprintf,           klh_asprintf,          2
 KL_VTHUNK klv_dprintf,            klh_dprintf,           2
 KL_VTHUNK klv_syslog,             klh_syslog,            2
+KL_VTHUNK klv_warnx,              klh_warnx,             1
 KL_VTHUNK klv_android_log_print,  klh_android_log_print, 3
 KL_VTHUNK klv_sscanf,             klh_sscanf,            2
 KL_VTHUNK klv_fscanf,             klh_fscanf,            2

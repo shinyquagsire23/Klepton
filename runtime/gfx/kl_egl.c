@@ -97,12 +97,27 @@ static struct { int initialised; } g_display;
 // not. A device that offers only depth-24 configs is an unusual device; every
 // real GLES driver offers both.
 //
-// Order matters only to the extent that eglChooseConfig picks by index, so the
-// depth-16 entry goes LAST and Unity's answer is unchanged.
-static struct { int id, es_bits, samples, depth; } g_configs[] = {
-    {1, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 0, 24},   // the one Unity will pick
-    {2, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 4, 24},   // 4x MSAA
-    {3, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 0, 16},   // what libvrlink_scene requires
+// STENCIL is per-config for the same reason, and the guest that forced it is
+// JKXR: the Oculus VrCubeWorld sample its front end is built from filters for
+// an EXACT match on seven attributes, and the two it wants that no entry here
+// offered are DEPTH 0 and STENCIL 0. That is not an odd request — an OpenXR app
+// renders into swapchain images and needs no depth or stencil on the EGL config
+// at all, so the sample asks for the cheapest one that exists — and its failure
+// is the one this whole comment block is about: it logs
+// `eglChooseConfig() failed` (its own message; it enumerates by hand), carries
+// on with a null EGLContext, hands that to xrCreateSession, and dies inside the
+// first glGenTextures of xrCreateSwapchain with nothing naming EGL.
+//
+// The attribute list is READ FROM THE BINARY rather than assumed
+// (`libopenjk_ja.so+0x15cee0`: RGBA8888, depth 0, stencil 0, samples 0).
+//
+// Order matters only to the extent that eglChooseConfig picks by index, so
+// every entry added after the first goes LAST and Unity's answer is unchanged.
+static struct { int id, es_bits, samples, depth, stencil; } g_configs[] = {
+    {1, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 0, 24, 8},  // the one Unity will pick
+    {2, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 4, 24, 8},  // 4x MSAA
+    {3, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 0, 16, 8},  // what libvrlink_scene requires
+    {4, EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES2_BIT, 0,  0, 0},  // ...and what JKXR requires
 };
 #define NCONFIGS ((int)(sizeof g_configs / sizeof g_configs[0]))
 
@@ -1162,7 +1177,7 @@ static unsigned klegl_GetConfigAttrib(EGLDisplay dpy, EGLConfig cfg,
     case EGL_ALPHA_SIZE:        *value = 8; break;
     case EGL_BUFFER_SIZE:       *value = 32; break;
     case EGL_DEPTH_SIZE:        *value = c->depth; break;
-    case EGL_STENCIL_SIZE:      *value = 8; break;
+    case EGL_STENCIL_SIZE:      *value = c->stencil; break;
     case EGL_SAMPLES:           *value = c->samples; break;
     case EGL_SAMPLE_BUFFERS:    *value = c->samples ? 1 : 0; break;
     case EGL_CONFIG_ID:         *value = c->id; break;

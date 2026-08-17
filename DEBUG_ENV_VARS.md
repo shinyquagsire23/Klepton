@@ -1086,6 +1086,25 @@ puts the camera on the ground with its hands underneath it.
   one-time shader optimization takes about a minute of host wall clock and the
   eye reads `91/86100 lit` while it runs, which is a real frame that looks like
   a broken pipeline.
+- `KL_JKXR_WAIT=<seconds>` — the same budget for the JKXR door, default 5. Same
+  reason there is no frame count: the engine owns its own render thread. A menu
+  reached and rendering wants about 45. It bounds the app's window-and-report
+  run (`KL_IMMERSIVE=0`) as well as `build/m_boot`'s; the immersive space pumps
+  until it is dismissed and ignores it, exactly as it does `KL_UE4_WAIT`.
+- `KL_JKXR_DATA=<dir>` — a directory holding the RETAIL game data
+  (`assets0.pk3` and up), which is neither in the APK nor an OBB: JKXR is an
+  engine port and the user supplies the game they own. Read ONCE per userdata
+  — the pk3s are symlinked into `<userdata>/JKXR/<JK3|JK2>/base` and the links
+  persist, so later runs need no knob. Only `assets*.pk3` is taken, so a
+  directory holding mods and configs beside them is left alone. Without it the
+  engine stops with "Couldn't load default.cfg" and says nothing about where it
+  looked; the staging census says so first, by name.
+- `KL_JKXR_ARGS="<args>"` — appended to the engine's command line, after the
+  game token. It reaches the engine both ways it can (the string handed to
+  `GLES3JNILib.onCreate` and the `JKXR/commandline.txt` the engine re-reads),
+  so the two cannot disagree. `+set developer 1` is the useful one; note that
+  this port's `Sys_Print` writes to a buffer and drops it, so console output
+  does not reach the log however verbose it is asked to be.
 - `KL_OVRP_EYE_SCALE=<x>` — scale the per-eye render target size the guest is
   told to use (`ovrp_GetEyeTextureSize`), default 1.0, accepted in 0.05..4.0.
   Applies to whatever the frontend measured off the display
@@ -1185,19 +1204,31 @@ that reports what came due since the frontend last asked. Platform-independent
   searching for an FBO by texture name — the search read the eye at the
   window's size and produced the window, and a GL name is a slot rather than
   an identity anyway (trap 31).
-- `KL_XR_EYE_MIRROR=0` — stop copying an ARRAY eye swapchain into storage the
-  compositor can sample (`runtime/xr/kl_openxr.c` →
-  `kl_glfb_mirror_eye_layer`), which restores the configuration in which the
-  visionOS immersive space is BLACK for a Unity OpenXR guest.
-  Every Unity OpenXR guest asks for one 2-slice swapchain and renders both eyes
-  into it, and that shape cannot be re-pointed at an MTLTexture at all:
+- `KL_XR_EYE_MIRROR=0` — stop copying the guest's presented eye image into
+  storage the compositor can sample (`runtime/xr/kl_openxr.c` →
+  `kl_glfb_mirror_eye_layer`), and re-point the guest's own swapchain texture at
+  an MTLTexture instead.
+  **The default moved to the copy on 2026-08-16, on a measurement**, and the
+  re-point is kept only as this A/B. Re-pointing calls
+  `glEGLImageTargetTexture2DOES` over a texture the guest has ALREADY attached
+  to a framebuffer of its own, and one guest's rendering does not survive it:
+  the same scene, the same frame of an id Tech 3 port, came out 2,875,392 of
+  5,496,000 lit with the top row and the right-hand column of the picture simply
+  missing, where the same run with no provider registered — and the same run
+  with the copy — is 5,496,000 of 5,496,000 and correct block for block. Every
+  GL call succeeded in all three. Nothing visible from this side distinguishes a
+  guest that keeps its framebuffers from one that rebuilds them, so the route
+  that cannot fail that way is the default: the destination is a texture of ours
+  that nothing has ever attached. Use 0 on a target where the per-frame blit
+  costs more than it buys — Steam Link streams video and is the one measured on
+  device — and expect a black eye rather than a re-point for an ARRAY swapchain,
+  which cannot be re-pointed at all:
   `glEGLImageTargetTexture2DOES` takes only a `GL_TEXTURE_2D`, and ANGLE's Metal
   backend reduces every EGLImage sibling to a slice view
   (`TextureImageSiblingMtl::initImpl`), so an EGLImage is always 2D. The copy is
-  one `glBlitFramebuffer` per eye per frame, from the layer the guest presented
+  one `glBlitFramebuffer` per eye per frame, from the image the guest presented
   into the provider slice a Unity/OVRPlugin guest would have been handed
-  directly — so nothing downstream of the eye table changes. On by default;
-  this is the A/B for anything that costs per frame on the XR path.
+  directly — so nothing downstream of the eye table changes.
   **Foveation is refused while it is in use** and says so once: a rate map only
   pays when the GUEST's rasterizer writes fewer fragments, and here the guest
   renders into a swapchain of its own that carries no map, so the map could only
@@ -1820,6 +1851,11 @@ except its own control vars (next section).
   and nothing else. Every guest before it submitted only a 1x1 dummy, so it
   costs them nothing either way. Both compositors read it. Pair it with
   `KL_OVRP_LAYERS=1`, which says what the guest actually submitted.
+  It covers an OpenXR guest's `XR_TYPE_COMPOSITION_LAYER_QUAD` too — the same
+  records, filed from `xrEndFrame` instead — and for a guest that presents its
+  whole frame as a quad and submits no projection layer at all (JKXR does, every
+  frame) this is not a decoration on top of the picture, it IS the picture: with
+  it off the display is black and the run is otherwise identical.
 - `KL_OVERLAYS=1` — put the system's persistent overlays back. Both immersive
   spaces pass `.persistentSystemOverlays(.hidden)` by default: the Home
   indicator and the hand-gesture affordance beneath it are drawn by the system
@@ -1976,6 +2012,19 @@ Read by the scripts themselves, never forwarded to the app.
 - `KL_SKIP_OBB=1` — stage everything except the OBB. It is the largest single
   file by far and it changes only with the APK, so this is the knob for the
   second upload onward.
+- `KL_JKXR_DIR=<dir>` — where `stage_assets.sh` finds the RETAIL game data for
+  an engine-port guest, default
+  `~/Library/Application Support/Klepton/userdata/<guest>/JKXR` — the host run's
+  own external storage. JKXR ships only the port's VR pk3s in its APK and
+  expects `assets0.pk3` and up beside them, so `<dir>/<JK2|JK3>/base/assets*.pk3`
+  is what goes across, at the same relative path, into
+  `<container>/android-files/JKXR/…`. The pk3s there are symlinks into the
+  user's install and are staged through their resolved paths — a symlink copied
+  as a symlink puts correctly named 72-byte files on the device and the engine
+  reports the game data missing anyway. `KL_JKXR_DATA` stays a HOST-side knob
+  (set it once for a host run; a Mac path names nothing on device).
+- `KL_SKIP_RETAIL=1` — stage everything except that retail data. Same reasoning
+  as `KL_SKIP_OBB`: 1.2 GB that changes only when the user's install does.
 - `KL_LOG_OUT=<file>` — where the pulled log lands (device runs default
   `/tmp/klepton-device.log`; `build_run_slink.sh` uses it too, default
   `/tmp/slink.log`).

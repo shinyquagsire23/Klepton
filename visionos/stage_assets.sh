@@ -62,6 +62,40 @@ if [ "${KL_SKIP_OBB:-0}" = 1 ] || ! compgen -G "$OBB/*.obb" > /dev/null 2>&1; th
   OBB=""
 fi
 
+# The RETAIL game data, for an engine-port guest. JKXR is one: it is OpenJK, so
+# the APK carries the port's own VR pk3s (28 MB, in assets/, which the runtime
+# copies into external storage itself) and expects the GAME's assets0.pk3 and up
+# — 1.2 GB the user supplies from a copy they own — beside them. They are
+# neither in the APK nor an OBB, so nothing above stages them and the engine
+# reports them missing the way Quake 3 always has: it refuses to start, without
+# naming the directory it looked in.
+#
+# The source is the host's userdata, which IS the host run's external storage:
+# `KL_JKXR_DATA` points a HOST run at an install once, the runtime links the
+# pk3s into <userdata>/JKXR/<JK2|JK3>/base, and that directory is what comes
+# across. So the knob stays a host-side, once-per-machine thing — pointing it at
+# a Mac path on device would name nothing — and this script needs no copy of the
+# engine's game-directory table: the host run already made the directory with
+# the name the engine reads, and the relative path is preserved verbatim.
+#
+# Only the `assets*.pk3` set, matching what the runtime links: the port's own
+# pk3s are refreshed out of the staged assets on every launch, so uploading them
+# too would be 26 MB the guest immediately overwrites.
+RETAIL=""
+if [ "$KLT_KIND" = jkxr ]; then
+  RETAIL="${KL_JKXR_DIR:-$HOME/Library/Application Support/Klepton/userdata/$KLT_NAME/JKXR}"
+  if [ "${KL_SKIP_RETAIL:-0}" = 1 ]; then
+    RETAIL=""
+  elif ! compgen -G "$RETAIL/*/base/assets*.pk3" > /dev/null 2>&1; then
+    # Loud, because this is the whole game: an app staged without it installs,
+    # launches, and dies inside the engine with a message about assets0.pk3.
+    echo "!! [stage] no retail pk3s under $RETAIL"
+    echo "!!         Run the target on the host once with KL_JKXR_DATA=<dir holding"
+    echo "!!         assets0.pk3 …> to populate it, then stage again."
+    RETAIL=""
+  fi
+fi
+
 # The two files the unpacker left BESIDE assets/, which the guest reads through
 # `<assets>/../` and which are not part of the asset tree, so nothing staged
 # them. Both are small, both are read, and each one's absence is silent:
@@ -127,6 +161,18 @@ if [ -z "$TARGET" ]; then
     mkdir -p "$DEST/android-files/$(dirname "$OBB_REL")"
     cp -RL "$OBB" "$DEST/android-files/$OBB_REL"
   fi
+  if [ -n "$RETAIL" ]; then
+    # -L, because what userdata holds are symlinks into the user's install.
+    n=0
+    for f in "$RETAIL"/*/base/assets*.pk3; do
+      [ -e "$f" ] || continue
+      rel="JKXR/${f#"$RETAIL"/}"
+      mkdir -p "$DEST/android-files/$(dirname "$rel")"
+      cp -L "$f" "$DEST/android-files/$rel"
+      n=$((n + 1))
+    done
+    echo "[stage] $n retail pk3(s) -> $DEST/android-files/JKXR"
+  fi
   if [ -n "$KLT_QTPLUGINS" ]; then
     rm -rf "$DEST/$TREE/qtplugins"
     mkdir -p "$DEST/$TREE/qtplugins"
@@ -157,7 +203,10 @@ fi
 # Beat Saber's 2.2 GB is the reason any of this exists; Steam Link's is 44 MB
 # and takes seconds. Saying which is which up front is the difference between
 # waiting and wondering.
-echo "[stage] device $TARGET, $KLT_NAME ($(du -shc "$ASSETS" "$APK" ${OBB:+"$OBB"} | tail -1 | cut -f1))"
+# -L: both the OBB directory and the retail one are deliberately symlinks into
+# an install elsewhere on this machine, and what is uploaded is what they point
+# at. Without it this line says 44 MB and then spends twenty minutes.
+echo "[stage] device $TARGET, $KLT_NAME ($(du -shcL "$ASSETS" "$APK" ${OBB:+"$OBB"} ${RETAIL:+"$RETAIL"} 2>/dev/null | tail -1 | cut -f1))"
 copy "$ASSETS" "Documents/$TREE/assets"
 copy "$APK"    "Documents/$KLT_APK"
 copy_meta
@@ -182,6 +231,21 @@ if [ -n "$OBB" ]; then
     real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$f")
     copy "$real" "Documents/android-files/$OBB_REL/$(basename "$f")"
     echo "[stage] done $f"
+  done
+fi
+# The retail pk3s, file by file and through the RESOLVED path, for the reason
+# the OBB is staged that way: what userdata holds are symlinks into the user's
+# own install, `devicectl device copy to` copies a symlink AS a symlink, and the
+# device would then hold four correctly named 72-byte files pointing at a Mac
+# path. Every name-based check passes and the engine reports the game data
+# missing anyway.
+if [ -n "$RETAIL" ]; then
+  for f in "$RETAIL"/*/base/assets*.pk3; do
+    [ -e "$f" ] || continue          # a dangling link on THIS machine too
+    real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$f")
+    echo "[stage] device $TARGET, $KLT_NAME $(basename "$f") ($(du -h "$real" | cut -f1))"
+    copy "$real" "Documents/android-files/JKXR/${f#"$RETAIL"/}"
+    echo "[stage] done $(basename "$f")"
   done
 fi
 # The Qt plugin .so files, when the target asks for them. They are DATA, not a

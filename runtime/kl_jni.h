@@ -117,6 +117,12 @@ void kl_jni_set_guest_native_resolver(void *(*resolve)(const char *symbol));
 // Root for Context.getAssets()/AssetManager.open(). Defaults to "beatsaber/assets".
 // With no AAssetManager_* import, this JNI path is how assets reach Unity.
 void kl_jni_set_assets_dir(const char *dir);
+// ...and what it resolved to, absolute. A guest whose Java copies its own
+// assets out of the APK before the engine starts — JKXR's Activity writes six
+// pk3s into external storage on first run — needs to read the source side of
+// that copy, and deriving it from the target row a second time is how two
+// descriptions of one directory start to disagree.
+const char *kl_jni_assets_dir(void);
 // Writable root behind getExternalFilesDir/getFilesDir/getCacheDir — where
 // Application.persistentDataPath lands. Created on demand. Defaults to
 // kl_userdata_dir("beatsaber") if nothing sets it.

@@ -343,12 +343,15 @@ static void klvm_draw_overlays(id<MTLRenderCommandEncoder> enc, int eye, int sta
         kl_ovrp_overlay ov;
         if (!kl_ovrp_overlay_get(i, &ov)) continue;
         int tw = 0, th = 0;
+        // Two producers, one consumer, in the order they can answer: a Vulkan
+        // guest's layer image belongs to kl_vulkan, and everything else reaches
+        // a compositor through kl_glfb's layer table — an OpenXR quad on GL is
+        // bound there, and a Vulkan one is recorded there too. Asking kl_vulkan
+        // first keeps RE4's path exactly as it was.
         void *texp = kl_vulkan_layer_mtl_texture(ov.layer_id, ov.stage, eye, &tw, &th);
+        if (!texp) texp = kl_glfb_layer_mtl_texture(ov.layer_id, ov.stage, &tw, &th);
         // Named once per layer, because "the guest submitted a layer we cannot
-        // reach" and "the guest submitted no layers" are the same picture. The
-        // GL path has no layer storage of its own — a GLES guest's overlays
-        // would come through kl_glfb, which nothing has needed yet — so this
-        // also says which half is missing.
+        // reach" and "the guest submitted no layers" are the same picture.
         if (!texp) {
             static int said[8];
             int k = ov.layer_id & 7;
@@ -357,9 +360,10 @@ static void klvm_draw_overlays(id<MTLRenderCommandEncoder> enc, int eye, int sta
                 fprintf(stderr, "  [vmtl] overlay layer %d (shape %d, stage %d) has no "
                                 "MTLTexture — not composited%s\n",
                         ov.layer_id, ov.shape, ov.stage,
-                        kl_vulkan_guest_active() ? ""
-                            : " (this guest is not on Vulkan; only that path "
-                              "backs a non-eye layer today)");
+                        kl_vulkan_guest_active() || kl_glfb_has_mtl_layer_provider()
+                            ? ""
+                            : " (no Metal layer provider is registered, so the "
+                              "guest's own GL storage is all there is)");
             }
             continue;
         }
@@ -436,6 +440,22 @@ static uint64_t klvm_frame_value(int *fenced) {
     return v ? v : (uint64_t)kl_vulkan_frame_serial();
 }
 
+// The first non-eye layer's MTLTexture, or NULL. Both producers, in the order
+// klvm_draw_overlays asks them — this exists so the compositor can be STARTED
+// by a guest that has no eye at all, and it has to find the same storage that
+// pass will sample or the device would be picked from a texture nothing draws.
+static void *klvm_first_layer_texture(void) {
+    for (int i = 0; i < kl_ovrp_overlay_count(); i++) {
+        kl_ovrp_overlay ov;
+        if (!kl_ovrp_overlay_get(i, &ov)) continue;
+        int w = 0, h = 0;
+        void *t = kl_vulkan_layer_mtl_texture(ov.layer_id, ov.stage, 0, &w, &h);
+        if (!t) t = kl_glfb_layer_mtl_texture(ov.layer_id, ov.stage, &w, &h);
+        if (t) return t;
+    }
+    return NULL;
+}
+
 int kl_viewmtl_start(void *metal_layer) {
     if (g_started) return 1;
     if (!metal_layer) return 0;
@@ -443,7 +463,13 @@ int kl_viewmtl_start(void *metal_layer) {
     // Nothing to composite until the guest has taken its eye textures, which
     // happens inside nativeRecreateGfxState. Returning 0 here is not a failure,
     // it is "not yet" — kl_view.c retries every frame.
+    //
+    // ...or until it has submitted a LAYER, which for a guest presenting its
+    // whole frame as an OpenXR quad is the only thing it will ever do. Waiting
+    // for an eye there is waiting forever, with a window that never opens and
+    // a picture arriving intact the whole time.
     void *eyep = kl_glfb_eye_mtl_texture(0, 0, NULL);
+    if (!eyep) eyep = klvm_first_layer_texture();
     if (!eyep) return 0;
 
     // **The device is the EYE TEXTURE's, not MTLCreateSystemDefaultDevice() and
@@ -601,9 +627,21 @@ int kl_viewmtl_present(int win_w, int win_h) {
     if (stage < 0) stage = 0;
     int slice = 0;
     int eye = klvm_eye();
-    void *texp = kl_glfb_eye_mtl_texture(eye, stage, &slice);
-    if (!texp) return 0;
-    id<MTLTexture> src = (__bridge id<MTLTexture>)texp;
+    // Only when the guest's last frame actually carried one. The eye textures
+    // outlive the frame that filled them, so without this the eye keeps being
+    // drawn after the guest has stopped submitting a projection layer — and on
+    // a guest that alternates (JKXR: a projection pair in the world, a quad in
+    // the menu, out of the SAME swapchains) that is the menu composited twice,
+    // once full-field underneath and once on its panel.
+    void *texp = kl_ovrp_eye_layer_live()
+                     ? kl_glfb_eye_mtl_texture(eye, stage, &slice) : NULL;
+    // No eye picture is not the same as no picture. A guest can present its
+    // whole frame as an OpenXR quad layer and submit no projection layer at all
+    // — JKXR does for its entire menu — and returning here showed a black window
+    // for a run whose panel was arriving intact. The eye pass is skipped in that
+    // case and the overlay pass below is the composite.
+    if (!texp && kl_ovrp_overlay_count() == 0) return 0;
+    id<MTLTexture> src = texp ? (__bridge id<MTLTexture>)texp : nil;
     // Every shader in kl_reproject.c samples a `texture2d_array<float>`, so a
     // source that is NOT an array is a bound type the shader cannot read — and
     // Metal does not refuse it, it returns nothing useful, which composites as a
@@ -614,18 +652,23 @@ int kl_viewmtl_present(int win_w, int win_h) {
         static int said;
         if (!said) {
             said = 1;
-            fprintf(stderr, "  [vmtl] eye source is MTLTexture type %u, %ux%u, "
-                            "%lu array layer(s)%s\n",
-                    (unsigned)src.textureType, (unsigned)src.width,
-                    (unsigned)src.height, (unsigned long)src.arrayLength,
-                    src.textureType == MTLTextureType2DArray
-                        ? "" : "  <- NOT an array; sampled through an array view");
+            if (!src)
+                fprintf(stderr, "  [vmtl] no eye texture — this guest's picture is "
+                                "its composition layers alone; the eye pass is "
+                                "skipped\n");
+            else
+                fprintf(stderr, "  [vmtl] eye source is MTLTexture type %u, %ux%u, "
+                                "%lu array layer(s)%s\n",
+                        (unsigned)src.textureType, (unsigned)src.width,
+                        (unsigned)src.height, (unsigned long)src.arrayLength,
+                        src.textureType == MTLTextureType2DArray
+                            ? "" : "  <- NOT an array; sampled through an array view");
         }
     }
     // ...and this is that view. Dimensions, format and device are unchanged, so
     // everything below — the letterbox, the grid, the viewport guard — reads the
     // same numbers it always did.
-    src = klvm_array_view(src);
+    if (src) src = klvm_array_view(src);
     // Which way up the guest drew it, recorded with the texture — see
     // kl_reproject.h. Read per (eye, stage) rather than decided once, because
     // it is a property of the storage and not of this compositor.
@@ -657,7 +700,21 @@ int kl_viewmtl_present(int win_w, int win_h) {
     if (fenced) [cmd encodeWaitForEvent:g_event value:v];
 
     // Letterbox: the eye is ~1832x1920, the window is not.
-    NSUInteger sw = src.width, sh = src.height;
+    //
+    // With no eye texture there is no picture to fit, but the overlay pass still
+    // projects through the frustum the guest was given, so the viewport has to
+    // keep THAT aspect or a panel comes out stretched by the window's shape.
+    // The tangents are the frustum, so their ratio is the aspect.
+    double sw = 1832, sh = 1920;
+    if (src) { sw = (double)src.width; sh = (double)src.height; }
+    else {
+        kl_ovrp_render_pose r;
+        const float *t = kl_ovrp_stage_render_pose(stage, &r) ? r.tangents[eye] : NULL;
+        if (t && t[0] + t[1] > 0 && t[2] + t[3] > 0) {
+            sw = t[0] + t[1];
+            sh = t[2] + t[3];
+        }
+    }
     double scale = fmin((double)win_w / sw, (double)win_h / sh);
     double dw = sw * scale, dh = sh * scale;
 
@@ -677,11 +734,16 @@ int kl_viewmtl_present(int win_w, int win_h) {
     // no-op here. It is bound rather than left dangling because a fragment
     // function that DECLARES a texture and is given none samples undefined
     // storage, and the blit pipeline that ignores slot 1 costs nothing for it.
-    [enc setFragmentTexture:src atIndex:0];
-    [enc setFragmentTexture:src atIndex:1];
+    if (src) {
+        [enc setFragmentTexture:src atIndex:0];
+        [enc setFragmentTexture:src atIndex:1];
+    }
     [enc setFragmentSamplerState:g_samp atIndex:0];
     kl_blit_uniforms bu = { (uint32_t)slice, (uint32_t)(flip ? 1 : 0) };
-    if (g_pipe_rp) {
+    if (!src) {
+        // Nothing to draw here; the cleared drawable is the background the
+        // overlay pass draws its panel onto.
+    } else if (g_pipe_rp) {
         kl_reproject_uniforms u = klvm_uniforms(stage, bu.slice, flip);
         [enc setRenderPipelineState:g_pipe_rp];
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
@@ -756,7 +818,21 @@ int kl_viewmtl_present(int win_w, int win_h) {
     // pass rather than a readback of the drawable because a drawable with
     // framebufferOnly=YES cannot be read at all, and dropping that would cost
     // more than this pass does.
-    if (g_stat) {
+    // The liveness downsample: the HUD's `lit`, and the only number in the
+    // viewer that says a blank window is a blank PICTURE rather than a dead
+    // pipeline. So it must have something to look at even when there is no eye
+    // — a guest whose whole frame is a quad would otherwise report lit=0 for a
+    // panel that is arriving intact, which is an instrument answering
+    // confidently about a subject it cannot see.
+    id<MTLTexture> stat_src = src;
+    if (!stat_src) {
+        void *lp = klvm_first_layer_texture();
+        // Through the array view for the same reason the eye is: every shader
+        // in kl_reproject.c samples a texture2d_array, and a plain 2D bound to
+        // one returns nothing with no error.
+        if (lp) stat_src = klvm_array_view((__bridge id<MTLTexture>)lp);
+    }
+    if (g_stat && stat_src) {
         MTLRenderPassDescriptor *sp = [MTLRenderPassDescriptor renderPassDescriptor];
         sp.colorAttachments[0].texture = g_stat;
         sp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -764,13 +840,18 @@ int kl_viewmtl_present(int win_w, int win_h) {
         id<MTLRenderCommandEncoder> se = [cmd renderCommandEncoderWithDescriptor:sp];
         se.label = @"klepton viewer liveness";
         [se setRenderPipelineState:g_pipe];
-        [se setFragmentTexture:src atIndex:0];
-        [se setFragmentTexture:src atIndex:1];
+        [se setFragmentTexture:stat_src atIndex:0];
+        [se setFragmentTexture:stat_src atIndex:1];
         [se setFragmentSamplerState:g_samp atIndex:0];
-        [se setFragmentBytes:&bu length:sizeof bu atIndex:0];
+        kl_blit_uniforms sbu = { src ? bu.slice : 0u, bu.flip_y };
+        [se setFragmentBytes:&sbu length:sizeof sbu atIndex:0];
         [se drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [se endEncoding];
-        int cw = (int)sw, ch = (int)sh;
+        // The SOURCE's own size, which is what the fraction is scaled back up
+        // to. `sw`/`sh` is the letterbox's aspect and is the eye's size only
+        // when there is an eye — with a layer it is a ratio of tangents, and
+        // scaling a fraction by 4 rounds every real picture down to lit=0.
+        int cw = (int)stat_src.width, ch = (int)stat_src.height;
         [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
             (void)b;
             klvm_read_stats(cw, ch);

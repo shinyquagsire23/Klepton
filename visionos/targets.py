@@ -304,6 +304,91 @@ TARGETS = {
         "product": "KleptonRE4",
         "display": "Klepton RE4",
     },
+    # ---- JKXR: ONE APK, TWO GAMES, TWO ROWS ----
+    #
+    # JKXR is Team Beef's VR port of Jedi Knight II: Jedi Outcast and Jedi
+    # Knight: Jedi Academy, built on OpenJK. It is the EIGHTH target and the
+    # smallest surface any of them has presented: ten guest libraries, 22 MB of
+    # engine, and NINE unresolved imports across the whole tree (eight libc
+    # names and one that resolves inside the chain).
+    #
+    # It is here because it is a THIRD engine and a second shape of front door,
+    # and both are cheap:
+    #
+    #  - **the natives are static exports.** The manifest names
+    #     com.drbeef.jkxr.GLES3JNIActivity, a plain Activity that is also a
+    #     SurfaceHolder.Callback, and its nine natives are declared on
+    #     com.drbeef.jkxr.GLES3JNILib and exported by both engines as
+    #     `Java_com_drbeef_jkxr_GLES3JNILib_*`. So there is no RegisterNatives
+    #     census to read and no NativeActivity glue: the driver stands in for
+    #     the Java by calling those exports in the order the Activity calls
+    #     them, and the handle onCreate returns is the argument to every one
+    #     after it.
+    #   - **OpenXR over GLES**, which is the pairing this project has only ever
+    #     had under Steam Link. The engine's forty-odd xr* imports bind at
+    #     relocation time through kl_shim's OpenXR tier, and the pixels go
+    #     through libgl4es — a GL 1.x-to-GLES translator the port carries
+    #     because the Quake 3 renderer is fixed-function. That makes gl4es, not
+    #     the game, the thing on the far side of kl_egl.
+    #
+    # TWO ROWS OVER ONE TREE, which no other target here does. The APK ships
+    # BOTH engines and both games' VR pk3s; the Java picks between them by
+    # reading `/sdcard/JKXR/commandline.txt` and appending the result to
+    # "openjk_", so which library is the entry is a property of a FILE rather
+    # than of the APK. Splitting it into two rows is what gives each game its
+    # own userdata directory, bundle id, .app and translated-guest directory —
+    # which matters here more than usual, because the two games' data
+    # directories are DIFFERENT (JK3/base vs JK2/base) and each holds retail
+    # assets the other cannot read. Everything a row differs in is derived from
+    # `entry`: kl_jkxr takes the token after "libopenjk_" and it names the
+    # renderer, the game module, the data directory and the command line, so
+    # the row and the file the guest reads cannot disagree.
+    #
+    # One consequence worth knowing: the two rows share a libdir, and
+    # kl_target_resolve takes the FIRST row matching a path, so the path form
+    # (`jkxr/lib/arm64-v8a`, which is what the Makefile gates pass) means
+    # Academy. Name the target — `TARGET=jkxr_jo` — to get the other one.
+    #
+    # THE ASSETS ARE NOT IN THE APK and are not an OBB either. This is an engine
+    # port, so it ships the VR-specific pk3s (28 MB, in assets/) and expects the
+    # RETAIL GAME DATA beside them — assets0.pk3 and up, which the user owns and
+    # supplies. The Java copies its own pk3s to <ext>/JKXR/JK3/base on first
+    # run; kl_jkxr does that half, and KL_JKXR_DATA points once at an existing
+    # install so it can link the retail half in beside them. Nothing here can
+    # fabricate them, and the engine reports them missing the way Quake 3 always
+    # has: it refuses to start.
+    "jkxr_ja": {
+        "libs":    None,
+        "srcdir":  "jkxr/lib/arm64-v8a",
+        "tree":    "jkxr",
+        "apk":     "jkxr.apk",
+        "assets":  "jkxr/assets",
+        "qtplugins": "",
+        # No OBB. The field is not optional and "obb" is what every non-UE4
+        # target says, so it stays the shared answer rather than becoming a
+        # third layout that means "there is nothing here".
+        "obb":     "obb",
+        # Jedi Academy. The token after "libopenjk_" is the whole of what this
+        # row differs in — see the block comment above.
+        "entry":   "libopenjk_ja",
+        "kind":    "jkxr",
+        "product": "KleptonJKXRAcademy",
+        "display": "Klepton JK Academy",
+    },
+    "jkxr_jo": {
+        "libs":    None,
+        "srcdir":  "jkxr/lib/arm64-v8a",
+        "tree":    "jkxr",
+        "apk":     "jkxr.apk",
+        "assets":  "jkxr/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        # Jedi Outcast.
+        "entry":   "libopenjk_jo",
+        "kind":    "jkxr",
+        "product": "KleptonJKXROutcast",
+        "display": "Klepton JK Outcast",
+    },
     "steamlink-vr": {
         # BOTH front doors, because the app runs both: the 2D shell pairs in a
         # WindowGroup and hands off to the OpenXR half in an ImmersiveSpace, in

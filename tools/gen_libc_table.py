@@ -64,6 +64,12 @@ UNITY_TREES = _unity_trees()
 # the 2D configuration frontend. See the third Steam Link entry for why the
 # frontend is no longer excluded.
 TARGETS = [(d, None) for d in UNITY_TREES] + [
+    # JKXR — an OpenJK engine port, so its libc surface is a 2003 id-Tech-3
+    # codebase's rather than a Unity runtime's, and it is the only guest here
+    # that asks for the LFS aliases (fopen64/fseeko64/ftello64) and BSD err.h.
+    # Whole tree, like the Unity rows: both games ship in one APK and the
+    # renderer, the game module and gl4es are all the application.
+    (os.path.join(ROOT, 'jkxr/lib/arm64-v8a'), None),
     (os.path.join(ROOT, 'steamlink-android/lib/arm64-v8a'),
      ['libmain', 'libSDL3', 'libSDL3_ttf', 'libSDL3_image',
       'libh264bitstream', 'libhevcbitstream', 'libc++_shared']),
@@ -216,6 +222,7 @@ vsprintf
 __google_potentially_blocking_region_begin __google_potentially_blocking_region_end
 getrandom isnan
 mmap madvise sysinfo
+warnx fopen64 fseeko64 ftello64 __fwrite_chk exit _exit chdir
 """.split())
 
 # Excluded from the table but NOT hand-written anywhere: names we deliberately
@@ -409,6 +416,17 @@ def main():
     # Both diagnostics are collected, because "undeclared identifier" and
     # "is unavailable" are different errors and only the second one appears on
     # the visionOS pass.
+    # One -I per runtime directory, which is what lets every #include in the
+    # tree be a bare name. GLOBBED rather than listed: the Makefile, the
+    # xcodeproj generator and compile_flags.txt already carry that list and have
+    # to be edited together, and a fourth copy here would go stale silently —
+    # this one did, and the symptom was the whole generator refusing to run
+    # with `'kl_ndk.h' file not found` after the sources folded into
+    # runtime/<area>/.
+    incs = ['-I' + os.path.join(ROOT, 'runtime')]
+    incs += ['-I' + d for d in sorted(glob.glob(os.path.join(ROOT, 'runtime', '*')))
+             if os.path.isdir(d)]
+
     platforms = [("Darwin", ['cc', '-fsyntax-only', '-arch', 'arm64'])]
     xros_sdk = subprocess.run(['xcrun', '--sdk', 'xros', '--show-sdk-path'],
                               capture_output=True, text=True)
@@ -428,8 +446,8 @@ def main():
         write(fwd, dropped)
         bad, err = set(), ''
         for label, cmd in platforms:
-            p = subprocess.run(cmd + ['-I', os.path.join(ROOT, 'runtime'),
-                                      os.path.join(ROOT, 'runtime/libc/kl_shim.c')],
+            p = subprocess.run(cmd + incs +
+                                     [os.path.join(ROOT, 'runtime/libc/kl_shim.c')],
                                capture_output=True, text=True)
             if p.returncode == 0:
                 continue

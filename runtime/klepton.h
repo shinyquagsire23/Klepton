@@ -195,6 +195,25 @@ extern kl_file_watch_fn kl_file_watch;
 // NULL for a name the diagnostic does not want, which is all of them.
 extern void *(*kl_shim_override)(const char *name);
 
+// A guest library that IS the GL implementation, consulted for `gl*`/`egl*`
+// before the shim's own graphics tiers. NULL for every target but JKXR.
+//
+// It has to be NAMED by the door rather than found by rule. The rule looks
+// obvious — "prefer a loaded guest image that exports the symbol" — and it is
+// wrong three times over in this tree: libvrlink_scene defines 150 gl* names as
+// its OWN loader's wrappers (each calling through an fnptr it initialises
+// itself), libAVProMovieCaptureNative defines glActiveTexture and friends as
+// weak DATA pointers, and libUE4 defines a hundred more. Binding another
+// library's import to any of those is a null call or a jump into a pointer
+// variable, and it would happen on the two targets that currently work best.
+//
+// JKXR is the case that needs it: libgl4es translates fixed-function GL 1.x
+// into GLES, its renderer's DT_NEEDED puts it before libGLESv3, and gl4es only
+// works if it sees the WHOLE stream — the fixed-function state it is
+// translating is what decides which generated shader a draw uses. Split the
+// stream and every draw runs with no program bound.
+void kl_shim_set_guest_gl(kl_image *img);
+
 // Mutex owner table dump (kl_pthread.c): who holds each translated guest
 // mutex and from where it was locked. Called from t_boot's fault handler so
 // a hang names the contested mutex's owner, not just its waiters.

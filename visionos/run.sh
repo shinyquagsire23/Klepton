@@ -23,6 +23,23 @@ BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
 PRODUCT="$KLT_PRODUCT"
 MODE="${1:-sim}"
 
+# Build the slice THIS run will install and not the other one. A device build
+# never loads the simulator's runtime and vice versa, and each slice is a full
+# compile of the shipping runtime — 14.5 s of a 30 s incremental `make xros` on
+# an M1 Max. Exported rather than passed, because mkguest.sh reads the same
+# variable and the two must agree: an app whose runtime is device-only and whose
+# guest is simulator-only fails as an arch mismatch that names neither.
+#
+# `make xros` on its own still builds both, and still says so — that pair IS the
+# gate (the simulator is a macOS kernel behind an iOS-shaped SDK, so a header
+# present only there passes the simulator and fails the device), and this is a
+# run of the app rather than a run of the gate.
+export XROS_PLATFORMS
+case "$MODE" in
+  device) XROS_PLATFORMS=xros  ;;
+  *)      XROS_PLATFORMS=xrsim ;;
+esac
+
 # --- Staging: skip by default, but not blindly ------------------------------
 #
 # The 2.2 GB upload is a ~20 minute step and the assets change only when the APK
@@ -47,7 +64,7 @@ STAMP_DIR="build/staged"
 # this target — a shell that aborts with `Could not find the Qt
 # platform plugin "virtual"` and a run.sh that says the assets are already
 # there. Bump this whenever stage_assets.sh stages something new.
-STAGE_SCHEMA=3
+STAGE_SCHEMA=4
 stage_stamp() {   # <target-key>
   local apk="../$KLT_APK" sig=""
   [ -f "$apk" ] && sig=$(stat -f '%z-%m' "$apk" 2>/dev/null || true)
@@ -109,7 +126,7 @@ echo "[1/5] runtime + guest translations ($KLT_NAME)…"
 # fresh runtime refuses — "translated against TSD slot 300 but this runtime uses
 # 500". The loader catches it by name, which is the right failure, but it is not
 # a failure anyone should have to have.
-(cd .. && make -s build/klepton-ld xros)
+(cd .. && make -s build/klepton-ld xros XROS_PLATFORMS="$XROS_PLATFORMS")
 # Keep the embedded ANGLE current, but only when the checkout is already
 # there: this must not turn `run.sh` into a surprise 12 GB clone. Without it,
 # mkangle.sh below stops and names the bootstrap command instead.

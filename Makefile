@@ -42,7 +42,7 @@ RUNTIME_JNI := runtime/kl_jni.c \
            runtime/jni/kl_jni_net.c runtime/jni/kl_jni_softinput.c \
            runtime/jni/kl_jni_services.c runtime/jni/kl_jni_io.c \
            runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
-           runtime/jni/kl_jni_ue4.c
+           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_jkxr.c
 
 RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
            runtime/libc/kl_va_handlers.c runtime/libc/kl_va_thunks.S \
@@ -54,6 +54,7 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/xr/kl_ovrplat.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
            runtime/gfx/kl_vulkan.c \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c \
+           runtime/guest/kl_jkxr.c \
            runtime/media/kl_aaudio.c \
            runtime/gfx/kl_glfb.c runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
            runtime/guest/kl_mono.c \
@@ -696,11 +697,28 @@ loaddylib: dylibs build/t_load
 # -all_load forces every object in and -undefined error refuses to defer, so a
 # missing symbol inside a function nothing calls yet still fails the build.
 #
-# Both platforms are built, because they diverge: xrsimulator is a macOS-kernel
-# host with an iOS-shaped SDK, so a header present only there would pass the
-# simulator and fail the device.
+# Both platforms are built BY DEFAULT, because they diverge: xrsimulator is a
+# macOS-kernel host with an iOS-shaped SDK, so a header present only there would
+# pass the simulator and fail the device. That is the GATE's reason and it stays
+# the default.
+#
+# `XROS_PLATFORMS=xros` (or `=xrsim`) builds one, which is what a run of the app
+# actually needs — a device build never loads the simulator slice — and it is
+# half the work: 14.5 s of a 30 s incremental `make xros` on this hardware.
+# `visionos/run.sh` asks for the one its mode will install. Building one is NOT
+# the gate and the line at the end of the rule says so rather than claiming
+# both.
+XROS_PLATFORMS ?= xros xrsim
+$(foreach p,$(XROS_PLATFORMS),$(if $(filter xros xrsim,$(p)),,\
+  $(error XROS_PLATFORMS: '$(p)' is not one of xros xrsim)))
 XROS_SDK  := $(shell xcrun --sdk xros --show-sdk-path)
 XRSIM_SDK := $(shell xcrun --sdk xrsimulator --show-sdk-path)
+# The gate name and the archive for each platform, so nothing below repeats the
+# mapping.
+XROS_GATE_xros  := xros-device
+XROS_GATE_xrsim := xros-sim
+XROS_GATES := $(foreach p,$(XROS_PLATFORMS),$(XROS_GATE_$(p)))
+XROS_LIBS  := $(foreach p,$(XROS_PLATFORMS),build/$(p)/libklepton.a)
 # $(MVK_INC) for the same reason CFLAGS carries it, and its absence here was a
 # real hole rather than an omission: kl_vulkan.c is guarded by __has_include, so
 # without the Vulkan headers on the command line it still COMPILES — as the stub
@@ -712,8 +730,13 @@ XRSIM_SDK := $(shell xcrun --sdk xrsimulator --show-sdk-path)
 XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 
 .PHONY: xros xros-device xros-sim swiftcheck
-xros: xros-device xros-sim build/Klepton.xcframework swiftcheck
-	@echo "  gate: the shipping runtime compiles and links for both visionOS platforms."
+xros: $(XROS_GATES) build/Klepton.xcframework swiftcheck
+	@if [ "$(words $(XROS_PLATFORMS))" = 2 ]; then \
+	  echo "  gate: the shipping runtime compiles and links for both visionOS platforms."; \
+	else \
+	  echo "  XROS_PLATFORMS=$(XROS_PLATFORMS) — built for that platform ONLY; the"; \
+	  echo "  gate is the pair, and the other half is unproven by this run."; \
+	fi
 
 # ...and the OTHER half of that seam, which had no gate at all: the Swift app
 # against the C headers it imports through the bridging header.
@@ -801,14 +824,25 @@ xros-sim: build/xrsim/libklepton.dylib
 # function that is plainly declared in runtime/. This is the same stale-artifact
 # trap visionos/README.md records for libklepton.a; the fix there stopped at the
 # archives and left the headers behind it.
-build/Klepton.xcframework: build/xros/libklepton.a build/xrsim/libklepton.a \
-                           $(RUNTIME_ALL_HDRS)
+# ...and WHICH SLICES it holds is a prerequisite too, for the same reason and
+# with a sharper edge: with XROS_PLATFORMS selectable, an xcframework built for
+# the device is up to date by every timestamp rule when the next build wants the
+# simulator, and Xcode then fails on an arch mismatch that names neither this
+# file nor the variable. The stamp holds the slice list, so changing it rebuilds
+# and nothing else does.
+build/.xcframework-slices: FORCE
+	@mkdir -p build
+	@printf '%s\n' '$(XROS_PLATFORMS)' | cmp -s - $@ 2>/dev/null || \
+	  printf '%s\n' '$(XROS_PLATFORMS)' > $@
+.PHONY: FORCE
+FORCE:
+
+build/Klepton.xcframework: $(XROS_LIBS) $(RUNTIME_ALL_HDRS) build/.xcframework-slices
 	@rm -rf $@
 	@xcodebuild -create-xcframework \
-	   -library build/xros/libklepton.a -headers runtime \
-	   -library build/xrsim/libklepton.a -headers runtime \
+	   $(foreach l,$(XROS_LIBS),-library $(l) -headers runtime) \
 	   -output $@ > /dev/null
-	@echo "  build/Klepton.xcframework"
+	@echo "  build/Klepton.xcframework ($(XROS_PLATFORMS))"
 
 # ANGLE for visionOS. The vendored checkout's gn has no xros target and does not
 # need one: build for iOS — which already enables the Metal backend — and rewrite

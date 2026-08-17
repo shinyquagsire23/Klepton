@@ -70,6 +70,7 @@ to override the the whole id.
 | VRChat 2026.2.3 | `vrchat.apk` | `vrchat/` | GLES (ANGLE) | — |
 | Open Brush 2.30.0 | `openbrush.apk` | `openbrush/` | Vulkan (MoltenVK) | — |
 | RE4 VR 2.3 | `re4.apk` | `re4/` | Vulkan (MoltenVK) | two OBBs, 7.9 GB |
+| JKXR 1.1.28 | `jkxr.apk` | `jkxr/` | GLES (ANGLE, via gl4es) | retail game pk3s |
 | Steam Link 2.0.20 (VR) | `steamlink-vr.apk` | `steamlink-vr/` | GLES (ANGLE) | — |
 | Steam Link (flat) | `steamlink-android.apk` | `steamlink-android/` | — | `make x18-slink` only |
 

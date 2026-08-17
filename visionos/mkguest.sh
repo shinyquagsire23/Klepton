@@ -8,9 +8,14 @@
 # knows both layouts, so `make dylibs` can keep writing bare .dylib files for
 # the host.
 #
-# Both slices are built because they are genuinely different images: the
-# platform goes into LC_BUILD_VERSION, and a visionos-stamped dylib is refused
-# by the simulator's dyld and vice versa.
+# Both slices are built BY DEFAULT because they are genuinely different images:
+# the platform goes into LC_BUILD_VERSION, and a visionos-stamped dylib is
+# refused by the simulator's dyld and vice versa. `XROS_PLATFORMS=xros` (or
+# `=xrsim`) translates only one, which is what a run of the app needs and half
+# the work — run.sh passes the one its mode will install. The name matches the
+# make variable that selects the runtime's slices, because they must agree: an
+# app whose runtime is device-only and whose guest is simulator-only fails as an
+# arch mismatch naming neither.
 #
 # Which guest comes from KLEPTON_TARGET (visionos/targets.py). The output goes
 # into a per-target subdirectory of Frameworks/ so that building the second app
@@ -24,6 +29,19 @@ eval "$(python3 targets.py "${KLEPTON_TARGET:-}")"
 SRC="$ROOT/$KLT_SRCDIR"
 OUT="Frameworks/$KLT_NAME"
 LIBS="$KLT_LIBS"
+
+# Which slices — see the header. The names are the make variable's (xros,
+# xrsim); klepton-ld and the framework directories speak xrsimulator, so the
+# mapping is here and nowhere else.
+PLATS=""
+for P in ${XROS_PLATFORMS:-xros xrsim}; do
+  case "$P" in
+    xros)  PLATS="$PLATS xros" ;;
+    xrsim) PLATS="$PLATS xrsimulator" ;;
+    *)     echo "!! XROS_PLATFORMS: '$P' is not one of xros xrsim"; exit 1 ;;
+  esac
+done
+FIRST_PLAT=$(printf '%s' "$PLATS" | awk '{print $1}')
 
 [ -x "$LD" ] || { echo "!! $LD missing — run 'make build/klepton-ld' first"; exit 1; }
 
@@ -40,7 +58,7 @@ for NAME in $LIBS; do
   # underscores-only rewrite let through, and Xcode rejects at the EMBED step
   # rather than at build: "had an invalid CFBundleIdentifier in its Info.plist".
   ID_NAME=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9.-' '-')
-  for PLAT in xros xrsimulator; do
+  for PLAT in $PLATS; do
     case "$PLAT" in
       xros)        KLPLAT=visionos    ;;
       xrsimulator) KLPLAT=visionossim ;;
@@ -64,12 +82,14 @@ for NAME in $LIBS; do
 EOF
   done
   rm -rf "$OUT/$NAME.xcframework"
-  xcodebuild -create-xcframework \
-      -framework "build/guest/$KLT_NAME/xros/$NAME.framework" \
-      -framework "build/guest/$KLT_NAME/xrsimulator/$NAME.framework" \
+  FWARGS=()
+  for PLAT in $PLATS; do
+    FWARGS+=(-framework "build/guest/$KLT_NAME/$PLAT/$NAME.framework")
+  done
+  xcodebuild -create-xcframework "${FWARGS[@]}" \
       -output "$OUT/$NAME.xcframework" > /dev/null
   printf '  %-22s %s bytes\n' "$NAME.xcframework" \
-      "$(stat -f%z "build/guest/$KLT_NAME/xros/$NAME.framework/$NAME")"
+      "$(stat -f%z "build/guest/$KLT_NAME/$FIRST_PLAT/$NAME.framework/$NAME")"
 done
 
 echo "[mkguest] $KLT_NAME done -> $OUT/"

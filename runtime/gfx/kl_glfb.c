@@ -2588,6 +2588,381 @@ int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
 }
 
 // ---------------------------------------------------------------------------
+// The NON-EYE layer's storage — see kl_glfb.h. Everything here is the eye path
+// above with the key widened and the eye-specific parts left out: no rate map
+// (foveation is a property of the eye render, and a UI panel is not rendered
+// through one), no sRGB settle (that decides how the EYE picture is decoded),
+// and no vram census key of its own.
+#define KL_MTL_MAX_LAYERS 4
+static kl_glfb_mtl_layer_provider g_mtl_layer_provider;
+static void *g_mtl_layer_provider_ctx;
+// Keyed rather than indexed: a layer id is the caller's own (kl_openxr uses the
+// swapchain's slot, which is 0..63), so the row carries the key it was filed
+// under. `layer` is -1 in a free row, which is a valid id nowhere.
+static struct { int layer, stage; void *tex; int slice; void *image;
+                uint32_t gl_tex; int w, h; }
+    g_layer_mtl[KL_MTL_MAX_LAYERS * KL_MTL_MAX_STAGES];
+static int g_layer_mtl_init;
+
+static void klfb_layer_rows_init(void) {
+    if (g_layer_mtl_init) return;
+    g_layer_mtl_init = 1;
+    for (unsigned i = 0; i < sizeof g_layer_mtl / sizeof *g_layer_mtl; i++)
+        g_layer_mtl[i].layer = -1;
+}
+
+// The row for (layer, stage), or the first free one when `make_room` is set.
+static int klfb_layer_row(int layer, int stage, int make_room) {
+    klfb_layer_rows_init();
+    int free_row = -1;
+    for (unsigned i = 0; i < sizeof g_layer_mtl / sizeof *g_layer_mtl; i++) {
+        if (g_layer_mtl[i].layer == layer && g_layer_mtl[i].stage == stage)
+            return (int)i;
+        if (g_layer_mtl[i].layer < 0 && free_row < 0) free_row = (int)i;
+    }
+    return make_room ? free_row : -1;
+}
+
+void kl_glfb_set_mtl_layer_provider(kl_glfb_mtl_layer_provider fn, void *ctx) {
+    g_mtl_layer_provider = fn;
+    g_mtl_layer_provider_ctx = ctx;
+}
+int kl_glfb_has_mtl_layer_provider(void) { return g_mtl_layer_provider != NULL; }
+
+// The GL a blit needs, resolved once. Split out because BOTH mirrors use it —
+// the array eye's and the non-eye layer's — and two copies of an entry-point
+// table is two chances for one of them to be missing a null check.
+static void (*r_GenFramebuffers)(int32_t, uint32_t *);
+static void (*r_BindFramebuffer)(uint32_t, uint32_t);
+static void (*r_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+static void (*r_FramebufferTextureLayer)(uint32_t, uint32_t, uint32_t, int32_t, int32_t);
+static void (*r_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t,
+                                 int32_t, int32_t, int32_t, int32_t,
+                                 uint32_t, uint32_t);
+static uint32_t (*r_CheckFramebufferStatus)(uint32_t);
+static void (*r_GenTextures)(int32_t, uint32_t *);
+static void (*r_DeleteTextures)(int32_t, const uint32_t *);
+static uint8_t (*r_IsEnabled)(uint32_t);
+static void (*r_Enable)(uint32_t);
+static void (*r_Disable)(uint32_t);
+
+static int klfb_mirror_resolve(int need_layer) {
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        r_GenFramebuffers        = asym("glGenFramebuffers");
+        r_BindFramebuffer        = asym("glBindFramebuffer");
+        r_FramebufferTexture2D   = asym("glFramebufferTexture2D");
+        r_FramebufferTextureLayer= asym("glFramebufferTextureLayer");
+        r_BlitFramebuffer        = asym("glBlitFramebuffer");
+        r_CheckFramebufferStatus = asym("glCheckFramebufferStatus");
+        r_GenTextures            = asym("glGenTextures");
+        r_DeleteTextures         = asym("glDeleteTextures");
+        r_IsEnabled              = asym("glIsEnabled");
+        r_Enable                 = asym("glEnable");
+        r_Disable                = asym("glDisable");
+    }
+    if (!r_GenFramebuffers || !r_BindFramebuffer || !r_BlitFramebuffer ||
+        !r_FramebufferTexture2D || !r_GenTextures) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] mirror: ANGLE is missing a blit entry point — "
+                            "the guest's picture cannot be copied\n");
+        return 0;
+    }
+    if (need_layer && !r_FramebufferTextureLayer) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] mirror: no glFramebufferTextureLayer — an array "
+                            "slice cannot be read\n");
+        return 0;
+    }
+    if (!a_glGetIntegerv) {
+        // Before anything touches GL state, because everything below has to put
+        // it back: the framebuffer bindings and the texture binding are all read
+        // through this. Restoring them to 0 instead would hand the guest the
+        // default framebuffer as its render target partway through its own
+        // frame. Refusing costs a black picture; guessing costs the whole one.
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] mirror: no glGetIntegerv, so the guest's GL "
+                            "state cannot be restored — refusing\n");
+        return 0;
+    }
+    return 1;
+}
+
+// One texture (or one array slice of one) into another, same size, same format.
+// Returns the GL error, or 0.
+//
+// The guest's state is the guest's. A blit is affected by the scissor test (and
+// by nothing else in the fragment pipeline — the write masks do not apply), so
+// that is what has to come off, and the two framebuffer bindings are read back
+// rather than assumed: this runs inside the guest's frame, between its own
+// calls.
+static uint32_t klfb_mirror_blit(uint32_t src_tex, int src_layer,
+                                 uint32_t dst_tex, int w, int h) {
+    int32_t save_read = 0, save_draw = 0;
+    a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &save_read);
+    a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &save_draw);
+    int scissor = r_IsEnabled ? (int)r_IsEnabled(0x0C11 /* SCISSOR_TEST */) : 0;
+    if (scissor && r_Disable) r_Disable(0x0C11);
+
+    static uint32_t read_fb, draw_fb;
+    if (!read_fb) r_GenFramebuffers(1, &read_fb);
+    if (!draw_fb) r_GenFramebuffers(1, &draw_fb);
+
+    r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, read_fb);
+    if (src_layer >= 0)
+        r_FramebufferTextureLayer(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */,
+                                  src_tex, 0, src_layer);
+    else
+        r_FramebufferTexture2D(0x8CA8, 0x8CE0, 0x0DE1 /* TEXTURE_2D */, src_tex, 0);
+    r_BindFramebuffer(0x8CA9 /* DRAW_FRAMEBUFFER */, draw_fb);
+    r_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, dst_tex, 0);
+
+    // Both sides checked once. An incomplete framebuffer makes the blit a no-op
+    // that raises INVALID_FRAMEBUFFER_OPERATION, i.e. a black picture and one
+    // error in a log full of them — the failure this whole path exists to end.
+    static int checked;
+    if (!checked && r_CheckFramebufferStatus) {
+        checked = 1;
+        uint32_t rs = r_CheckFramebufferStatus(0x8CA8);
+        uint32_t ds = r_CheckFramebufferStatus(0x8CA9);
+        if (rs != 0x8CD5 || ds != 0x8CD5)
+            fprintf(stderr, "  [glfb] mirror: read fb status 0x%x, draw fb status 0x%x "
+                            "(0x8CD5 is complete) — the picture will stay black\n",
+                    rs, ds);
+    }
+
+    if (a_glGetError) while (a_glGetError()) {}
+    // Source and destination are the same format, so the sRGB decode on read and
+    // encode on write are each other's inverse and this is a copy. NEAREST for
+    // the same reason: the rectangles are identical, so no filter is consulted.
+    r_BlitFramebuffer(0, 0, w, h, 0, 0, w, h,
+                      0x4000 /* COLOR_BUFFER_BIT */, 0x2600 /* NEAREST */);
+    uint32_t e = a_glGetError ? a_glGetError() : 0;
+
+    r_BindFramebuffer(0x8CA8, (uint32_t)save_read);
+    r_BindFramebuffer(0x8CA9, (uint32_t)save_draw);
+    if (scissor && r_Enable) r_Enable(0x0C11);
+    return e;
+}
+
+// Give one GL name storage the layer provider owns. Internal: the only caller
+// is kl_glfb_mirror_layer below, and the name it passes is one of OURS — see
+// that function's header comment for why the guest's own name must not be
+// handed to this.
+static int klfb_bind_layer_mtl_texture(int layer, int stage, uint32_t gl_tex,
+                                       int w, int h, uint32_t internal_fmt) {
+    if (!g_mtl_layer_provider || layer < 0 || !gl_tex || w <= 0 || h <= 0) return 0;
+    if (stage < 0 || stage >= KL_MTL_MAX_STAGES) {
+        fprintf(stderr, "  [glfb] layer stage %d is beyond KL_MTL_MAX_STAGES (%d)\n",
+                stage, KL_MTL_MAX_STAGES);
+        return 0;
+    }
+    if (!kl_glfb_init() || !mtl_resolve()) {
+        fprintf(stderr, "  [glfb] a Metal layer provider is registered but ANGLE's "
+                        "interop entry points are missing — falling back to GL "
+                        "storage, so this layer is not composited\n");
+        return 0;
+    }
+    int row = klfb_layer_row(layer, stage, 1);
+    if (row < 0) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [glfb] no room for layer %d stage %d — %u (layer, "
+                            "stage) pairs fit and this one is NOT composited\n",
+                    layer, stage,
+                    (unsigned)(sizeof g_layer_mtl / sizeof *g_layer_mtl));
+        }
+        return 0;
+    }
+    // Already backed by this same GL name and size: the caller re-asserts it
+    // every frame (a quad's swapchain is only known to be a quad at submission),
+    // so answering from the row is what keeps that from being an allocation and
+    // an eglCreateImageKHR per frame.
+    if (g_layer_mtl[row].gl_tex == gl_tex && g_layer_mtl[row].w == w &&
+        g_layer_mtl[row].h == h && g_layer_mtl[row].tex)
+        return 1;
+
+    kl_mtl_eye_texture t = { NULL, 0, 0, 0 };
+    if (!g_mtl_layer_provider(layer, stage, w, h, internal_fmt, &t,
+                              g_mtl_layer_provider_ctx) || !t.texture) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [glfb] provider declined layer=%d stage=%d %dx%d "
+                            "fmt 0x%x\n", layer, stage, w, h, internal_fmt);
+        }
+        return 0;
+    }
+    // The same refusal the eye path makes, for the same reason: the extension
+    // takes the size from the MTLTexture and succeeds whatever we asked for, so
+    // a mismatch is a guest rendering into storage it does not have.
+    if (t.w != w || t.h != h) {
+        fprintf(stderr, "  [glfb] provider returned a %dx%d texture for a %dx%d "
+                        "layer (layer=%d stage=%d) — refusing\n",
+                t.w, t.h, w, h, layer, stage);
+        return 0;
+    }
+    const int32_t attrs[] = {
+        EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE_, t.slice,
+        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE_,   (int32_t)internal_fmt,
+        EGL_NONE_,
+    };
+    void *img = a_eglCreateImageKHR(g_dpy, EGL_NO_CONTEXT_, EGL_METAL_TEXTURE_ANGLE_,
+                                    t.texture, attrs);
+    if (img == EGL_NO_IMAGE_) {
+        fprintf(stderr, "  [glfb] eglCreateImageKHR(EGL_METAL_TEXTURE_ANGLE) failed "
+                        "for layer=%d stage=%d — was the texture made on "
+                        "kl_glfb_mtl_device()?\n", layer, stage);
+        return 0;
+    }
+    a_glBindTexture_mtl(0x0DE1 /* GL_TEXTURE_2D */, gl_tex);
+    while (a_glGetError && a_glGetError() != 0) {}
+    a_glEGLImageTargetTexture2DOES(0x0DE1, img);
+    uint32_t e = a_glGetError ? a_glGetError() : 0;
+    if (e) {
+        fprintf(stderr, "  [glfb] glEGLImageTargetTexture2DOES -> GL error 0x%x "
+                        "(layer=%d stage=%d)\n", e, layer, stage);
+        if (a_eglDestroyImageKHR) a_eglDestroyImageKHR(g_dpy, img);
+        return 0;
+    }
+    if (g_layer_mtl[row].image && a_eglDestroyImageKHR)
+        a_eglDestroyImageKHR(g_dpy, g_layer_mtl[row].image);
+    g_layer_mtl[row].layer  = layer;
+    g_layer_mtl[row].stage  = stage;
+    g_layer_mtl[row].tex    = t.texture;
+    g_layer_mtl[row].slice  = t.slice;
+    g_layer_mtl[row].image  = img;
+    g_layer_mtl[row].gl_tex = gl_tex;
+    g_layer_mtl[row].w      = w;
+    g_layer_mtl[row].h      = h;
+    // As on the eye path: an EGLImage-backed name never passes through the
+    // glTexStorage2D thunk, so nothing else records what size this texture is,
+    // and the capture would read it at the pbuffer's size.
+    klfb_note_tex_storage(gl_tex, internal_fmt, w, h);
+    fprintf(stderr, "  [glfb] layer=%d stage=%d tex=%u is now backed by MTLTexture "
+                    "%p slice %d (%dx%d fmt 0x%x)\n",
+            layer, stage, gl_tex, t.texture, t.slice, w, h, internal_fmt);
+    return 1;
+}
+
+// The guest's presented image, copied into storage the compositor can sample.
+// See kl_glfb.h for why this is a copy and not the eye path's re-point.
+//
+// The destination is one GL name per (layer, stage), created here and given
+// provider storage by the call above — so the layer table, the compositors and
+// the readback all see what they would have seen from a re-point, and the
+// guest's own texture is never touched.
+static struct { int layer, stage; uint32_t tex; int w, h; uint32_t fmt; }
+    g_layer_mirror[KL_MTL_MAX_LAYERS * KL_MTL_MAX_STAGES];
+
+int kl_glfb_mirror_layer(int layer, int stage, uint32_t src_tex, int src_layer,
+                         int w, int h, uint32_t internal_fmt) {
+    if (!g_mtl_layer_provider || !src_tex || w <= 0 || h <= 0) return 0;
+    if (layer < 0 || stage < 0 || stage >= KL_MTL_MAX_STAGES) return 0;
+    if (!kl_glfb_init() || !mtl_resolve()) return 0;
+    if (!klfb_mirror_resolve(src_layer >= 0)) return 0;
+
+    int row = -1, freerow = -1;
+    for (unsigned i = 0; i < sizeof g_layer_mirror / sizeof *g_layer_mirror; i++) {
+        if (g_layer_mirror[i].tex && g_layer_mirror[i].layer == layer &&
+            g_layer_mirror[i].stage == stage) { row = (int)i; break; }
+        if (!g_layer_mirror[i].tex && freerow < 0) freerow = (int)i;
+    }
+    if (row < 0) row = freerow;
+    if (row < 0) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] no room to mirror layer %d stage %d — %u "
+                            "(layer, stage) pairs fit and this one is NOT "
+                            "composited\n", layer, stage,
+                    (unsigned)(sizeof g_layer_mirror / sizeof *g_layer_mirror));
+        return 0;
+    }
+    __typeof__(g_layer_mirror[0]) *m = &g_layer_mirror[row];
+    // A size or format change means the guest rebuilt its swapchain, and the old
+    // destination describes a picture that no longer exists — the blit would
+    // happily scale one into the other.
+    if (m->tex && (m->w != w || m->h != h || m->fmt != internal_fmt)) {
+        fprintf(stderr, "  [glfb] mirror layer=%d stage=%d: %dx%d fmt 0x%x -> %dx%d "
+                        "fmt 0x%x, reallocating\n",
+                layer, stage, m->w, m->h, m->fmt, w, h, internal_fmt);
+        if (r_DeleteTextures) r_DeleteTextures(1, &m->tex);
+        *m = (__typeof__(*m)){0};
+    }
+    if (!m->tex) {
+        uint32_t t = 0;
+        r_GenTextures(1, &t);
+        if (!t) return 0;
+        // klfb_bind_layer_mtl_texture leaves GL_TEXTURE_2D bound to what it was
+        // given, and this runs inside the guest's frame, between its calls — so
+        // the binding is put back. Once per (layer, stage), not per frame.
+        int32_t save_tex = 0;
+        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &save_tex);
+        int ok = klfb_bind_layer_mtl_texture(layer, stage, t, w, h, internal_fmt);
+        if (a_glBindTexture_mtl) a_glBindTexture_mtl(0x0DE1, (uint32_t)save_tex);
+        if (!ok) {
+            if (r_DeleteTextures) r_DeleteTextures(1, &t);
+            return 0;
+        }
+        m->layer = layer; m->stage = stage; m->tex = t;
+        m->w = w; m->h = h; m->fmt = internal_fmt;
+        fprintf(stderr, "  [glfb] mirror layer=%d stage=%d: %dx%d fmt 0x%x <- guest "
+                        "tex %u (one blit a frame; the guest's own storage is left "
+                        "alone)\n", layer, stage, w, h, internal_fmt, src_tex);
+    }
+
+    uint32_t e = klfb_mirror_blit(src_tex, src_layer, m->tex, w, h);
+    if (e) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] mirror layer=%d stage=%d: glBlitFramebuffer -> "
+                            "GL error 0x%x\n", layer, stage, e);
+        return 0;
+    }
+    return 1;
+}
+
+void kl_glfb_note_layer_mtl_texture(int layer, int stage, void *texture,
+                                    int w, int h) {
+    if (layer < 0 || !texture) return;
+    if (stage < 0 || stage >= KL_MTL_MAX_STAGES) return;
+    int row = klfb_layer_row(layer, stage, 1);
+    if (row < 0) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [glfb] no room for layer %d stage %d — %u (layer, "
+                            "stage) pairs fit and this one is NOT composited\n",
+                    layer, stage,
+                    (unsigned)(sizeof g_layer_mtl / sizeof *g_layer_mtl));
+        }
+        return;
+    }
+    if (g_layer_mtl[row].tex == texture && g_layer_mtl[row].w == w) return;
+    g_layer_mtl[row].layer = layer;
+    g_layer_mtl[row].stage = stage;
+    g_layer_mtl[row].tex   = texture;
+    g_layer_mtl[row].slice = 0;
+    g_layer_mtl[row].w     = w;
+    g_layer_mtl[row].h     = h;
+    fprintf(stderr, "  [glfb] layer=%d stage=%d is MTLTexture %p (%dx%d), the "
+                    "guest's own image\n", layer, stage, texture, w, h);
+}
+
+void *kl_glfb_layer_mtl_texture(int layer, int stage, int *out_w, int *out_h) {
+    int row = klfb_layer_row(layer, stage, 0);
+    if (row < 0 || !g_layer_mtl[row].tex) return NULL;
+    if (out_w) *out_w = g_layer_mtl[row].w;
+    if (out_h) *out_h = g_layer_mtl[row].h;
+    return g_layer_mtl[row].tex;
+}
+
+// ---------------------------------------------------------------------------
 // The ARRAY swapchain's way onto the compositor — see kl_glfb.h for why a copy
 // is the only route and what it costs.
 //
@@ -2621,61 +2996,7 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
         if (g_eye_rate_map) kl_glfb_set_eye_rate_map(0, 0, 0, 0, NULL);
     }
 
-    static void (*r_GenFramebuffers)(int32_t, uint32_t *);
-    static void (*r_BindFramebuffer)(uint32_t, uint32_t);
-    static void (*r_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
-    static void (*r_FramebufferTextureLayer)(uint32_t, uint32_t, uint32_t, int32_t, int32_t);
-    static void (*r_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t,
-                                     int32_t, int32_t, int32_t, int32_t,
-                                     uint32_t, uint32_t);
-    static uint32_t (*r_CheckFramebufferStatus)(uint32_t);
-    static void (*r_GenTextures)(int32_t, uint32_t *);
-    static void (*r_DeleteTextures)(int32_t, const uint32_t *);
-    static uint8_t (*r_IsEnabled)(uint32_t);
-    static void (*r_Enable)(uint32_t);
-    static void (*r_Disable)(uint32_t);
-    static int resolved;
-    if (!resolved) {
-        resolved = 1;
-        r_GenFramebuffers        = asym("glGenFramebuffers");
-        r_BindFramebuffer        = asym("glBindFramebuffer");
-        r_FramebufferTexture2D   = asym("glFramebufferTexture2D");
-        r_FramebufferTextureLayer= asym("glFramebufferTextureLayer");
-        r_BlitFramebuffer        = asym("glBlitFramebuffer");
-        r_CheckFramebufferStatus = asym("glCheckFramebufferStatus");
-        r_GenTextures            = asym("glGenTextures");
-        r_DeleteTextures         = asym("glDeleteTextures");
-        r_IsEnabled              = asym("glIsEnabled");
-        r_Enable                 = asym("glEnable");
-        r_Disable                = asym("glDisable");
-    }
-    if (!r_GenFramebuffers || !r_BindFramebuffer || !r_BlitFramebuffer ||
-        !r_FramebufferTexture2D || !r_GenTextures) {
-        static int said;
-        if (!said++)
-            fprintf(stderr, "  [glfb] mirror: ANGLE is missing a blit entry point — "
-                            "the array eye cannot be composited\n");
-        return 0;
-    }
-    if (src_layer >= 0 && !r_FramebufferTextureLayer) {
-        static int said;
-        if (!said++)
-            fprintf(stderr, "  [glfb] mirror: no glFramebufferTextureLayer — an array "
-                            "slice cannot be read\n");
-        return 0;
-    }
-    if (!a_glGetIntegerv) {
-        // Before anything touches GL state, because everything below has to put
-        // it back: the framebuffer bindings and the texture binding are all read
-        // through this. Restoring them to 0 instead would hand the guest the
-        // default framebuffer as its render target partway through its own
-        // frame. Refusing costs a black eye; guessing costs the whole picture.
-        static int said;
-        if (!said++)
-            fprintf(stderr, "  [glfb] mirror: no glGetIntegerv, so the guest's GL "
-                            "state cannot be restored — refusing\n");
-        return 0;
-    }
+    if (!klfb_mirror_resolve(src_layer >= 0)) return 0;
 
     // (Re)allocate the destination. A size or format change means the guest
     // rebuilt its swapchain, and the old destination describes a picture that no
@@ -2723,55 +3044,7 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
                 eye, stage, w, h, internal_fmt, src_tex, src_layer);
     }
 
-    // The guest's state is the guest's. A blit is affected by the scissor test
-    // (and by nothing else in the fragment pipeline — the write masks do not
-    // apply), so that is what has to come off, and the two framebuffer bindings
-    // are read back rather than assumed: this runs inside the guest's frame,
-    // between its own calls.
-    int32_t save_read = 0, save_draw = 0;
-    a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &save_read);
-    a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &save_draw);
-    int scissor = r_IsEnabled ? (int)r_IsEnabled(0x0C11 /* SCISSOR_TEST */) : 0;
-    if (scissor && r_Disable) r_Disable(0x0C11);
-
-    static uint32_t read_fb, draw_fb;
-    if (!read_fb) r_GenFramebuffers(1, &read_fb);
-    if (!draw_fb) r_GenFramebuffers(1, &draw_fb);
-
-    r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, read_fb);
-    if (src_layer >= 0)
-        r_FramebufferTextureLayer(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */,
-                                  src_tex, 0, src_layer);
-    else
-        r_FramebufferTexture2D(0x8CA8, 0x8CE0, 0x0DE1 /* TEXTURE_2D */, src_tex, 0);
-    r_BindFramebuffer(0x8CA9 /* DRAW_FRAMEBUFFER */, draw_fb);
-    r_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, m->tex, 0);
-
-    // Both sides checked once. An incomplete framebuffer makes the blit a no-op
-    // that raises INVALID_FRAMEBUFFER_OPERATION, i.e. a black eye and one error
-    // in a log full of them — the same failure this whole path exists to end.
-    static int checked;
-    if (!checked && r_CheckFramebufferStatus) {
-        checked = 1;
-        uint32_t rs = r_CheckFramebufferStatus(0x8CA8);
-        uint32_t ds = r_CheckFramebufferStatus(0x8CA9);
-        if (rs != 0x8CD5 || ds != 0x8CD5)
-            fprintf(stderr, "  [glfb] mirror: read fb status 0x%x, draw fb status 0x%x "
-                            "(0x8CD5 is complete) — the eye will stay black\n", rs, ds);
-    }
-
-    if (a_glGetError) while (a_glGetError()) {}
-    // Source and destination are the same format, so the sRGB decode on read and
-    // encode on write are each other's inverse and this is a copy. NEAREST for
-    // the same reason: the rectangles are identical, so no filter is consulted.
-    r_BlitFramebuffer(0, 0, w, h, 0, 0, w, h,
-                      0x4000 /* COLOR_BUFFER_BIT */, 0x2600 /* NEAREST */);
-    uint32_t e = a_glGetError ? a_glGetError() : 0;
-
-    r_BindFramebuffer(0x8CA8, (uint32_t)save_read);
-    r_BindFramebuffer(0x8CA9, (uint32_t)save_draw);
-    if (scissor && r_Enable) r_Enable(0x0C11);
-
+    uint32_t e = klfb_mirror_blit(src_tex, src_layer, m->tex, w, h);
     if (e) {
         static int said;
         if (!said++)

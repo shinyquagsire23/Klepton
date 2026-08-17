@@ -70,6 +70,8 @@ void kl_jni_set_assets_dir(const char *dir) {
     kl_ndk_set_assets_dir(g_assets_dir);
 }
 
+const char *kl_jni_assets_dir(void) { return g_assets_dir; }
+
  klj_val klj_singleton(const char *cls, void **slot) {
     if (!*slot) {
         *slot = kl_jni_new_object(cls);

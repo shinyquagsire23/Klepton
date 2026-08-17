@@ -1452,7 +1452,7 @@ static void kl_android_log_write(int p, const char *t, const char *m) {
 // ---------- externs ----------
 #define X(n) extern int n(void);
 X(klv_printf) X(klv_fprintf) X(klv_sprintf) X(klv_snprintf) X(klv_asprintf)
-X(klv_dprintf) X(klv_syslog) X(klv_android_log_print) X(klv_sscanf) X(klv_fscanf)
+X(klv_dprintf) X(klv_syslog) X(klv_warnx) X(klv_android_log_print) X(klv_sscanf) X(klv_fscanf)
 X(klv_open) X(klv_fcntl) X(klv_ioctl) X(klv_strtold) X(klv_wcstold) X(klv_strtold_l)
 X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_read)
 X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
@@ -1497,7 +1497,8 @@ X(klb_openat) X(klb___open_2)
 X(klb___memmove_chk) X(klb___strncpy_chk) X(klb___strncpy_chk2) X(klb___strcat_chk)
 X(klb___read_chk) X(klb___vsprintf_chk)
 X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk) X(klb_pread64)
-X(klb___strncat_chk) X(klb_ftruncate64)
+X(klb___strncat_chk) X(klb_ftruncate64) X(klb___fwrite_chk)
+X(klb_fopen64) X(klb_fseeko64) X(klb_ftello64) X(klb_exit) X(klb__exit) X(klb_chdir)
 X(klb_sincosf) X(klb_sincos) X(klb_putchar) X(klb_getchar) X(klb_fdatasync)
 X(klb___cmsg_nxthdr) X(klb___cxa_thread_atexit_impl)
 X(klb_fileno) X(klb_fgetc) X(klb_ungetc) X(klb_getwc) X(klb_fgetwc)
@@ -1536,6 +1537,10 @@ static const kl_entry g_shim[] = {
     E("printf", klv_printf), E("fprintf", klv_fprintf), E("sprintf", klv_sprintf),
     E("snprintf", klv_snprintf), E("asprintf", klv_asprintf), E("dprintf", klv_dprintf),
     E("sscanf", klv_sscanf), E("fscanf", klv_fscanf), E("syslog", klv_syslog),
+    // BSD err.h. Darwin declares warnx, but in a header kl_shim.c does not
+    // include, so the generator cannot see it — and it is variadic, so it was
+    // never a candidate for a direct forward either.
+    E("warnx", klv_warnx),
     E("__android_log_print", klv_android_log_print),
     E("open", klv_open), E("fcntl", klv_fcntl), E("ioctl", klv_ioctl),
     E("setsockopt", kl_setsockopt), E("getsockopt", kl_getsockopt),
@@ -1624,7 +1629,22 @@ static const kl_entry g_shim[] = {
     // built without it would otherwise find this unresolved.
     E("pread64", klb_pread64),
     E("__strrchr_chk", klb___strrchr_chk), E("__strncat_chk", klb___strncat_chk),
+    E("__fwrite_chk", klb___fwrite_chk),
     E("ftruncate64", klb_ftruncate64),
+    // The stdio LFS spellings. Same reason pread64 is here: Darwin's off_t has
+    // always been 64-bit so it declares no `*64` name, and the generator can
+    // only forward what Darwin declares. fopen64 in particular must NOT become
+    // a direct forward even if one existed — klb_fopen is where the guest's
+    // path is translated (JKXR hardcodes /sdcard/JKXR).
+    E("fopen64", klb_fopen64), E("fseeko64", klb_fseeko64),
+    E("ftello64", klb_ftello64),
+    // Not a translation — the real exit runs immediately after. These say WHO
+    // called, because a guest that exits during startup leaves a log with
+    // nothing in it and a driver that can only report "no signal".
+    E("exit", klb_exit), E("_exit", klb__exit),
+    // ...and the fifth path door, which decides where an id Tech 3 guest
+    // thinks its whole installation is.
+    E("chdir", klb_chdir),
     E("__sched_cpucount", klb___sched_cpucount),
     E("__libc_current_sigrtmin", klb___libc_current_sigrtmin),
     E("__libc_current_sigrtmax", klb___libc_current_sigrtmax),
@@ -1761,6 +1781,10 @@ static const kl_entry g_shim[] = {
 // the diagnostic's own business.
 void *(*kl_shim_override)(const char *name);
 
+// See kl_shim_set_guest_gl in klepton.h. NULL for every target but JKXR.
+static kl_image *g_guest_gl;
+void kl_shim_set_guest_gl(kl_image *img) { g_guest_gl = img; }
+
 void *kl_shim_lookup(const char *name) {
     if (kl_shim_override) { void *o = kl_shim_override(name); if (o) return o; }
     for (size_t i = 0; i < sizeof g_shim / sizeof g_shim[0]; i++)
@@ -1769,6 +1793,42 @@ void *kl_shim_lookup(const char *name) {
     // API family with its own lifetimes, not more bionic libc.
     void *ndk = kl_ndk_lookup(name);
     if (ndk) return ndk;
+    // Tier 4b: A GUEST THAT SHIPS ITS OWN GL IMPLEMENTATION BEATS OURS.
+    //
+    // Everything below this point answers graphics names by PREFIX, and a
+    // prefix rule cannot tell "the guest is asking the platform for GL" from
+    // "the guest brought its own GL and is asking for a piece of it". JKXR is
+    // the second: it carries libgl4es, a GL 1.x-over-GLES translator, because
+    // the Quake 3 renderer is fixed-function — librd-gles-ja_arm.so imports
+    // glMatrixMode, glVertexPointer, glEnableClientState and fifty more names
+    // no GLES driver has.
+    //
+    // Its DT_NEEDED names libgl4es BEFORE libGLESv3, so Android's linker binds
+    // every one of that renderer's gl* imports to gl4es — including the ~20
+    // that a real GLES driver also has (glDrawArrays, glBindTexture,
+    // glTexImage2D, glClear). That is not incidental: gl4es only works if it
+    // sees the WHOLE stream, because the fixed-function state it is translating
+    // is what decides which generated shader a draw uses.
+    //
+    // Answering those from ANGLE splits the stream in half, and the failure has
+    // no error surface worth the name: the matrix and array calls go to gl4es
+    // while the draws go straight to ANGLE with no program ever bound, so every
+    // draw is GL_INVALID_OPERATION and every eye texture is uniformly black
+    // while every counter — draws issued, frames submitted, swapchains
+    // rotated — reads healthy. The tell is `program=0` at a draw
+    // (KL_GLFB_ERRPROBE=1).
+    //
+    // ONE NAMED IMAGE, set by the door that knows (kl_jkxr_load) — see
+    // kl_shim_set_guest_gl in klepton.h for why searching the registry instead
+    // breaks Steam Link, VRChat and RE4.
+    if (g_guest_gl &&
+        ((name[0] == 'g' && name[1] == 'l' && name[2] >= 'A' && name[2] <= 'Z') ||
+         (name[0] == 'e' && name[1] == 'g' && name[2] == 'l' &&
+          name[3] >= 'A' && name[3] <= 'Z'))) {
+        void *own = kl_sym(g_guest_gl, name);
+        if (own) return own;
+    }
+
     // Tier 5: EGL. Same reasoning again, and it is the door to GLES —
     // eglGetProcAddress hands out the rest of the graphics surface.
     void *egl = kl_egl_lookup(name);

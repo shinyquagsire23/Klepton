@@ -383,6 +383,18 @@ typedef struct { int32_t type; const void *next;
                  const XrCompositionLayerProjectionView *views;
                } XrCompositionLayerProjection;
 
+// A flat panel in space: one swapchain image, one pose, one size in metres.
+// `eyeVisibility` is BOTH(0) / LEFT(1) / RIGHT(2) — a guest showing different
+// pixels to each eye submits two of these rather than one with two views, which
+// is why there is no viewCount here.
+typedef struct { int32_t type; const void *next;
+                 uint64_t layerFlags; void *space;
+                 int32_t eyeVisibility;
+                 XrSwapchainSubImage subImage;
+                 XrPosef pose;
+                 struct { float width, height; } size;
+               } XrCompositionLayerQuad;
+
 typedef struct { int32_t type; const void *next;
                  int64_t displayTime;
                  int32_t environmentBlendMode;
@@ -525,7 +537,10 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     X(xrGetVulkanGraphicsDeviceKHR)                                            \
     X(xrEnumerateDisplayRefreshRatesFB) X(xrGetDisplayRefreshRateFB)           \
     X(xrRequestDisplayRefreshRateFB)                                           \
-    X(xrConvertTimespecTimeToTimeKHR) X(xrConvertTimeToTimespecTimeKHR)
+    X(xrConvertTimespecTimeToTimeKHR) X(xrConvertTimeToTimespecTimeKHR)         \
+    X(xrPerfSettingsSetPerformanceLevelEXT)                                    \
+    X(xrSetAndroidApplicationThreadKHR)                                        \
+    X(xrEnumerateColorSpacesFB) X(xrSetColorSpaceFB)
 
 // ------------------------------------------------------------------ bookkeeping
 // One row per entry point: resolved counts lookups, called counts calls. The
@@ -557,6 +572,8 @@ static klxr_row *klxr_row_for(const char *name) {
 // says whether any of them ever carried a controller.
 static void klxr_input_report(FILE *f);
 
+static void klxr_report_frames(FILE *f);
+
 void kl_openxr_report(FILE *f) {
     unsigned nres = 0, ncall = 0;
     for (int i = 0; i < KLXR_COUNT; i++) {
@@ -566,6 +583,14 @@ void kl_openxr_report(FILE *f) {
     fprintf(f, "\n=== OpenXR surface (libklepton_openxr) ===\n");
     fprintf(f, "  %d entry points served; %u resolved by the guest, "
                "%u refused by name\n", KLXR_COUNT, nres, ncall);
+    // The frame accounting, which was kept and never printed. An entry-point
+    // census says the guest CAN present; only these say whether it DID — and
+    // `layers ignored` is the one number that separates "the compositor showed
+    // nothing" from "the guest submitted nothing a projection layer could be
+    // read out of", which is otherwise a black eye texture with every counter
+    // healthy. Through a helper because the session lives further down this
+    // file than the report does.
+    klxr_report_frames(f);
     if (ncall) {
         fprintf(f, "  --- refused (the work list, in refusal count order) ---\n");
         for (int i = 0; i < KLXR_COUNT; i++)
@@ -784,6 +809,35 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     // understating it invites an app to take a compatibility path it does not
     // need.
     { "XR_KHR_vulkan_enable",           8, KLXR_GATE_VULKAN },
+    // XR_EXT_performance_settings — JKXR, and it is the counter-example to the
+    // paragraph at the top of this table: this guest lists it as a REQUIRED
+    // extension in xrCreateInstance rather than probing for it, so withholding
+    // it is XR_ERROR_EXTENSION_NOT_PRESENT and the engine exits before it has
+    // drawn anything.
+    //
+    // Claiming it is honest because the whole extension is a HINT. Its one
+    // entry point asks the runtime to bias CPU or GPU clocks; there is no such
+    // control here — visionOS manages the clocks and does not expose them — so
+    // the truthful implementation is to accept the hint, record it and change
+    // nothing. That is the same answer a real runtime is permitted to give: the
+    // spec makes the level advisory and the notification event optional, so an
+    // app cannot distinguish "noted and ignored" from "noted and unhelpful".
+    { "XR_EXT_performance_settings",    4, KLXR_GATE_ALWAYS },
+    // XR_KHR_android_thread_settings — JKXR again, and required by it for the
+    // same reason and with the same shape: one entry point, carrying a hint.
+    // The app names a thread by tid and says what it is for (its main thread,
+    // its renderer, a worker) so that Android can pin it to a big core and
+    // raise its priority.
+    //
+    // Nothing here can act on it, and that is already this project's recorded
+    // position rather than a new one: Process.setThreadPriority is recorded and
+    // not applied, because Darwin sets scheduling through pthread QoS on the
+    // thread ITSELF and a tid is not a handle we can act through. So this is
+    // recorded and named, like the perf hint above it.
+    { "XR_KHR_android_thread_settings", 5, KLXR_GATE_ALWAYS },
+    // XR_FB_color_space — JKXR, required. See the implementation for why the
+    // enumerated list is two entries rather than the extension's eight.
+    { "XR_FB_color_space",              3, KLXR_GATE_ALWAYS },
 };
 #define KLXR_EXT_ALL ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
 
@@ -1400,7 +1454,7 @@ typedef struct {
     int   action_sets_attached;   // xrAttachSessionActionSets is once, and final
     int      frame_begun;         // between xrBeginFrame and xrEndFrame
     int64_t  frame_predicted_time;// what the last xrWaitFrame promised
-    uint64_t frames_waited, frames_ended, layers_ignored;
+    uint64_t frames_waited, frames_ended, layers_ignored, layers_quad;
     // Pending events, in order. Each carries a KIND as well as a payload (a
     // state, for a session-state change; unused otherwise): a queue of bare
     // states cannot deliver the second event type — the interaction profile
@@ -1413,6 +1467,21 @@ typedef struct {
 enum { KLXR_EV_SESSION_STATE = 0, KLXR_EV_INTERACTION_PROFILE = 1 };
 
 static klxr_session g_session;
+
+static void klxr_report_frames(FILE *f) {
+    if (!g_session.frames_waited && !g_session.frames_ended &&
+        !g_session.layers_ignored && !g_session.layers_quad) return;
+    // The two counts are the whole of what a frame's layer list came to: a quad
+    // reaches the compositor's overlay list, anything else reaches nothing. They
+    // are separate because "the picture is a panel we placed" and "the picture
+    // was dropped" look identical from every other line here.
+    fprintf(f, "  frames: %llu waited, %llu ended; %llu quad layer(s) composited, "
+               "%llu other non-projection layer(s) ignored\n",
+            (unsigned long long)g_session.frames_waited,
+            (unsigned long long)g_session.frames_ended,
+            (unsigned long long)g_session.layers_quad,
+            (unsigned long long)g_session.layers_ignored);
+}
 
 static klxr_session *klxr_sess(void *h) {
     klxr_session *s = (klxr_session *)h;
@@ -1457,6 +1526,110 @@ static XrResult klxr_RequestDisplayRefreshRateFB(void *session, float rate) {
                         "runs at %.1f; refused\n", (double)rate, (double)have);
         return KLXR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB;
     }
+    return KLXR_SUCCESS;
+}
+
+
+// ---------------------------------------------------------- XR_FB_color_space
+//
+// The app declares which colour space its SUBMITTED CONTENT is in, so the
+// compositor can convert. Required by JKXR at instance creation, like the two
+// below it.
+//
+// We enumerate exactly what this compositor genuinely does: UNMANAGED (pass the
+// texture through) and REC709, which is sRGB primaries and transfer — the
+// assumption the composite pass already encodes (it does the sRGB decode
+// itself). Claiming Rift, Quest or P3 would promise a gamut conversion no pass
+// in this project performs.
+//
+// A guest that sets one of the other spaces is ACCEPTED and told so by name,
+// rather than refused. Refusing is the spec-correct answer for a space we do
+// not support, and it is the wrong one here: an app that treats the failure as
+// fatal loses the whole run over a gamut approximation, and the visible cost of
+// treating Quest's space as sRGB is slightly off saturation, not a broken
+// frame. Naming it means the day someone asks why the colours are a little
+// flat, the answer is in the log rather than in this comment.
+enum { KLXR_COLOR_SPACE_UNMANAGED = 0, KLXR_COLOR_SPACE_REC709 = 2 };
+
+static XrResult klxr_EnumerateColorSpacesFB(void *session, uint32_t capacity,
+                                            uint32_t *count_out, int *spaces) {
+    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    XrResult r = klxr_two_call(capacity, count_out, 2);
+    if (r == KLXR_SUCCESS && capacity >= 2 && spaces) {
+        spaces[0] = KLXR_COLOR_SPACE_UNMANAGED;
+        spaces[1] = KLXR_COLOR_SPACE_REC709;
+    }
+    return r;
+}
+
+static XrResult klxr_SetColorSpaceFB(void *session, int space) {
+    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    static const char *const NAMES[] = { "unmanaged", "rec2020", "rec709",
+                                         "rift-cv1", "rift-s", "quest", "p3",
+                                         "adobe-rgb" };
+    const char *nm = (space >= 0 && space <= 7) ? NAMES[space] : "?";
+    if (space == KLXR_COLOR_SPACE_UNMANAGED || space == KLXR_COLOR_SPACE_REC709) {
+        fprintf(stderr, "  [xr] colour space: %s\n", nm);
+        return KLXR_SUCCESS;
+    }
+    fprintf(stderr, "  [xr] colour space: %s — not one this compositor converts "
+                    "from; treated as sRGB (accepted, so a gamut approximation "
+                    "does not end the run)\n", nm);
+    return KLXR_SUCCESS;
+}
+
+
+// ---------------------------------------------------------- XR_EXT_performance_settings
+//
+// The extension's whole surface: one call, asking the runtime to bias a domain
+// (CPU or GPU) towards a level (power-savings, sustained-low, sustained-high,
+// boost). It is ADVISORY in the spec, and there is nothing behind it here —
+// visionOS owns the clocks and exposes no equivalent — so this records the hint
+// and returns success.
+//
+// Named on every change rather than counted silently, because the levels a
+// guest asks for are a readable description of what it thinks it is doing: JKXR
+// raises the GPU domain when it enters a level and drops it in menus, so this
+// line is a free marker for where the engine believes it is.
+enum { KLXR_PERF_DOMAIN_CPU = 1, KLXR_PERF_DOMAIN_GPU = 2 };
+
+static XrResult klxr_PerfSettingsSetPerformanceLevelEXT(void *session,
+                                                        int domain, int level) {
+    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    static const char *const LEVELS[] = { "?", "power-savings", "sustained-low",
+                                          "sustained-high", "boost" };
+    static int last_cpu = -1, last_gpu = -1;
+    int *last = domain == KLXR_PERF_DOMAIN_CPU ? &last_cpu
+              : domain == KLXR_PERF_DOMAIN_GPU ? &last_gpu : NULL;
+    if (!last) return KLXR_ERROR_VALIDATION_FAILURE;
+    if (*last == level) return KLXR_SUCCESS;
+    *last = level;
+    fprintf(stderr, "  [xr] perf hint: %s -> %s (advisory; visionOS owns the "
+                    "clocks, nothing is changed)\n",
+            domain == KLXR_PERF_DOMAIN_CPU ? "CPU" : "GPU",
+            (level >= 1 && level <= 4) ? LEVELS[level] : "?");
+    return KLXR_SUCCESS;
+}
+
+
+// ---------------------------------------------------------- XR_KHR_android_thread_settings
+//
+// "This tid is my renderer thread, treat it accordingly." Recorded and not
+// acted on, for the reason in the extension table: Darwin has no door that
+// changes another thread's scheduling by tid — QoS is set by the thread on
+// itself — so the only implementation available would be to lie.
+//
+// The tid IS worth printing. This guest spawns its render thread inside
+// onCreate and nothing else names it, so the line joins a tid in `sample <pid>`
+// output to the role the engine believes that thread has.
+static XrResult klxr_SetAndroidApplicationThreadKHR(void *session, int type,
+                                                    uint32_t tid) {
+    if (!klxr_sess(session)) return KLXR_ERROR_HANDLE_INVALID;
+    static const char *const KINDS[] = { "?", "app-main", "app-worker",
+                                         "renderer-main", "renderer-worker" };
+    fprintf(stderr, "  [xr] thread hint: tid %u is the guest's %s "
+                    "(recorded; Darwin sets scheduling on the thread itself)\n",
+            tid, (type >= 1 && type <= 4) ? KINDS[type] : "?");
     return KLXR_SUCCESS;
 }
 
@@ -3593,21 +3766,40 @@ static void klxr_back_eye_images(klxr_swapchain *sc, int eye) {
 // destinations rotate exactly as its images do — and it is the same number
 // `drawn_stage` files the frame record under, which is what keeps the pose and
 // the picture the compositor pairs belonging to one frame.
+// KL_XR_EYE_MIRROR: copy the guest's presented eye image (1, the default) or
+// re-point its own swapchain texture at MTLTexture storage (0).
+//
+// **The default moved to the copy on 2026-08-16, on a measurement.** The
+// re-point is what klxr_back_eye_images does and it BREAKS JKXR's rendering:
+// the same scene, the same frame, with the provider registered comes out
+// 2875392 of 5496000 lit with the top row and the right-hand column of the
+// picture missing, and with it not registered comes out 5496000 of 5496000 and
+// correct. That guest attaches its swapchain images to framebuffers it builds
+// once and keeps; replacing the storage under a live attachment is not
+// something ES promises anything about, and nothing visible from here
+// distinguishes a guest that does it from one that does not. The copy cannot
+// fail that way — the destination is a texture of ours nothing has attached —
+// and it is the same blit every array-swapchain guest has always paid.
+//
+// 0 restores the re-point, which is the A/B for a target where the copy's
+// per-frame cost matters (Steam Link streams video and is the one measured on
+// device). An ARRAY swapchain cannot be re-pointed at all, so there 0 means no
+// eye texture and a black display, which is the state this knob's old name
+// described.
+static int klxr_eye_mirror_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = kl_env_on("KL_XR_EYE_MIRROR", 1);
+        if (!on)
+            fprintf(stderr, "  [xr] KL_XR_EYE_MIRROR=0 — the guest's own swapchain "
+                            "textures are re-pointed at MTLTextures instead of "
+                            "being copied\n");
+    }
+    return on;
+}
+
 static void klxr_mirror_eye_image(klxr_swapchain *sc, int eye, int layer) {
     if (!kl_glfb_has_mtl_provider()) return;
-    // KL_XR_EYE_MIRROR=0 restores the failing configuration exactly: no eye
-    // MTLTexture, so both compositors show black for this guest. Worth a knob
-    // because the copy is the one thing on this path that costs per frame, and
-    // "is the mirror why X" should be one run rather than a rebuild.
-    static int on = -1;
-    if (on < 0) on = kl_env_on("KL_XR_EYE_MIRROR", 1);
-    if (!on) {
-        static int said;
-        if (!said++)
-            fprintf(stderr, "  [xr] KL_XR_EYE_MIRROR=0 — the array eye swapchain is "
-                            "not copied, so the compositor has nothing to sample\n");
-        return;
-    }
     if (klxr_format_is_depth(sc->session, sc->format)) return;
     if (sc->last_released < 0 || sc->last_released >= sc->count) return;
     if (sc->mip_count != 1) {
@@ -3622,6 +3814,203 @@ static void klxr_mirror_eye_image(klxr_swapchain *sc, int eye, int layer) {
                              sc->array_size > 1 ? layer : -1,
                              (int)sc->width, (int)sc->height,
                              (uint32_t)sc->format);
+}
+
+// ---------------------------------------------------------------------------
+// The QUAD layer — a flat panel with a pose and a size in metres, which for
+// JKXR is the entire frame: 7381 of 7381 layers in a host run, one per frame,
+// 6.00 x 5.50 m at (0, 1, -5.5) in STAGE space, both eyes from one image. An
+// engine in "cinematic" mode presents its whole picture this way and a
+// projection layer never appears at all.
+//
+// It is composited through the OVERLAY pass (kl_reproject.h), which already
+// existed for RE4's UI quads and wants exactly this: a pose in the tracking
+// space, a size in metres, a texture rect and an MTLTexture. So the work here is
+// the two things OpenXR states that OVRPlugin does not — which space the pose is
+// in, and which eyes the layer is for — plus giving the guest's swapchain images
+// storage a compositor can sample.
+//
+// A layer's identity, for the record and for the texture table, is its
+// SWAPCHAIN's slot. The submission has no id of its own, the slot is unique
+// while the swapchain lives, and a guest that moves a panel keeps its swapchain.
+static int klxr_layer_id(const klxr_swapchain *sc) {
+    return (int)(sc - g_swapchains);
+}
+
+// Storage for a quad's image, one route per graphics API, both ending in
+// kl_glfb's layer table. Vulkan's image already IS an MTLTexture and is only
+// recorded; GL has to be COPIED into storage of ours — see kl_glfb_mirror_layer
+// for why a copy and not the eye path's re-point, which broke this guest's
+// rendering outright.
+//
+// The Vulkan half publishes every image of the swapchain, because the guest
+// rotates through them and each one is its own MTLTexture. The GL half copies
+// only the image the guest just presented, per frame, into the destination that
+// image's stage owns — so the destinations rotate exactly as the guest's own
+// images do, which is what keeps the compositor from sampling a stage the guest
+// is currently drawing into.
+static void klxr_back_layer_images(klxr_swapchain *sc, int slice) {
+    int id = klxr_layer_id(sc);
+    if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN) {
+        for (int k = 0; k < sc->count; k++) {
+            void *tex = kl_vulkan_xr_image_mtl(sc->vk_img[k]);
+            if (tex) kl_glfb_note_layer_mtl_texture(id, k, tex,
+                                                    (int)sc->width, (int)sc->height);
+        }
+        return;
+    }
+    if (!kl_glfb_has_mtl_layer_provider()) {
+        // Named once, and not fatal: the guest keeps rendering into its own GL
+        // storage and the panel simply does not reach the display. A run with no
+        // frontend (make check, a headless host run) is the ordinary case for
+        // this, which is why it says which half is missing rather than sounding
+        // like a failure.
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [xr] no Metal layer provider — the guest's quad "
+                            "layer(s) are captured but not composited (a host run "
+                            "without KL_VIEW has no frontend to allocate them)\n");
+        }
+        return;
+    }
+    if (sc->mip_count != 1) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [xr] quad swapchain has %u mips — only level 0 is "
+                            "copied to the compositor\n", sc->mip_count);
+    }
+    kl_glfb_mirror_layer(id, sc->last_released, sc->tex[sc->last_released],
+                         sc->array_size > 1 ? slice : -1,
+                         (int)sc->width, (int)sc->height, (uint32_t)sc->format);
+}
+
+// One quad, as the record both compositors read. Returns 0 for a submission
+// that cannot be placed, which is then counted as ignored rather than drawn
+// somewhere invented.
+static int klxr_quad_record(const XrCompositionLayerQuad *q, klxr_swapchain *sc,
+                            kl_ovrp_overlay *o) {
+    if (!(q->size.width > 0.0f) || !(q->size.height > 0.0f)) return 0;
+    memset(o, 0, sizeof *o);
+    o->layer_id = klxr_layer_id(sc);
+    o->shape    = 0;                          // ovrpShape Quad, the record's vocabulary
+    o->stage    = sc->last_released;
+    o->tex_w    = (int)sc->width;
+    o->tex_h    = (int)sc->height;
+    // The rect is stated in the guest's OWN framebuffer convention — the origin
+    // is the lower left for a GL swapchain and the upper left for a Vulkan one —
+    // and so is the v axis of the texture it indexes. The two therefore agree
+    // without a mirror on either path, and `origin_top_left` below is the single
+    // place the difference is expressed. (Measured only on a full-image rect;
+    // JKXR submits the whole image every frame.)
+    const XrRect2Di *r = &q->subImage.imageRect;
+    for (int e = 0; e < 2; e++) {
+        o->viewport[e][0] = r->offset.x;
+        o->viewport[e][1] = r->offset.y;
+        o->viewport[e][2] = r->extent.width;
+        o->viewport[e][3] = r->extent.height;
+    }
+    // The layer states its pose in ITS space, which need not be the tracking
+    // space, so it is composed out of that one exactly as a projection layer's
+    // views are. A quad in VIEW space comes out head-locked at the pose the
+    // frame was latched with, which is what that space MEANS.
+    klxr_space *lsp = klxr_space_of(((const XrCompositionLayerBaseHeader *)q)->space);
+    XrPosef in_tracking = klxr_pose_apply(
+        lsp ? klxr_space_pose(lsp) : (XrPosef){{0,0,0,1},{0,0,0}}, q->pose);
+    o->pose[0] = in_tracking.orientation.x;
+    o->pose[1] = in_tracking.orientation.y;
+    o->pose[2] = in_tracking.orientation.z;
+    o->pose[3] = in_tracking.orientation.w;
+    o->pose[4] = in_tracking.position.x;
+    o->pose[5] = in_tracking.position.y;
+    o->pose[6] = in_tracking.position.z;
+    o->size[0] = q->size.width;
+    o->size[1] = q->size.height;
+    o->flags   = (int)q->layerFlags;
+    // Already resolved into the tracking space above, so the compositor must
+    // NOT apply the head pose a second time. Head-locking is a property of the
+    // SPACE in OpenXR, not of a flag.
+    o->head_locked = 0;
+    o->eye_visibility = q->eyeVisibility;
+    o->origin_top_left = sc->session && sc->session->gfx == KLXR_GFX_VULKAN;
+    return 1;
+}
+
+// The SHAPE of a frame's submission — how many layers, of which types, naming
+// which swapchains — printed when it changes and not otherwise.
+//
+// This is the question no other line here answers. "This guest submits one quad
+// and nothing else" was measured over 5000 frames of the intro and the menu and
+// is FALSE somewhere else in the run: a projection layer appearing for one scene
+// puts the eye pass on screen underneath the panel, and from the compositor's
+// side that is indistinguishable from a bug in the panel. A frame shape that
+// changes at a scene transition says which of the two is happening, in one line,
+// on the run where it happens.
+static void klxr_frame_shape(const XrFrameEndInfo *info) {
+    char shape[256];
+    int n = 0;
+    for (uint32_t i = 0; i < info->layerCount && n < (int)sizeof shape - 32; i++) {
+        const XrCompositionLayerBaseHeader *l = info->layers[i];
+        if (!l) { n += snprintf(shape + n, sizeof shape - (size_t)n, " null"); continue; }
+        if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+            const XrCompositionLayerProjection *p =
+                (const XrCompositionLayerProjection *)l;
+            n += snprintf(shape + n, sizeof shape - (size_t)n, " proj(%u views:",
+                          p->viewCount);
+            for (uint32_t v = 0; v < p->viewCount && v < 2; v++) {
+                klxr_swapchain *sc = klxr_swapchain_of(p->views[v].subImage.swapchain);
+                n += snprintf(shape + n, sizeof shape - (size_t)n, " sc%d",
+                              sc ? klxr_layer_id(sc) : -1);
+            }
+            n += snprintf(shape + n, sizeof shape - (size_t)n, ")");
+        } else if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+            const XrCompositionLayerQuad *q = (const XrCompositionLayerQuad *)l;
+            klxr_swapchain *sc = klxr_swapchain_of(q->subImage.swapchain);
+            n += snprintf(shape + n, sizeof shape - (size_t)n, " quad(sc%d eyes%d)",
+                          sc ? klxr_layer_id(sc) : -1, q->eyeVisibility);
+        } else {
+            n += snprintf(shape + n, sizeof shape - (size_t)n, " type%d", l->type);
+        }
+    }
+    static char last[256];
+    static uint64_t since;
+    since++;
+    if (strcmp(shape, last) == 0) return;
+    if (last[0])
+        fprintf(stderr, "  [xr] frame shape changed after %llu frames:%s ->%s\n",
+                (unsigned long long)since, last, shape);
+    else
+        fprintf(stderr, "  [xr] frame shape:%s\n", shape);
+    snprintf(last, sizeof last, "%s", shape);
+    since = 0;
+}
+
+// What is being composited, said when it CHANGES rather than per frame: a
+// static panel costs one line for the run and a menu that moves says so. Same
+// argument as klovrp_census_submits, which is the OVRPlugin half of this.
+static void klxr_quad_census(const kl_ovrp_overlay *o, int placed) {
+    static kl_ovrp_overlay last[4];
+    static int last_placed[4];
+    // Everything but the STAGE, which is the swapchain image the guest just
+    // released and therefore changes every frame — a census keyed on it is a
+    // per-frame trace. It is still printed, because which image the first frame
+    // landed in is worth one line.
+    kl_ovrp_overlay key = *o;
+    key.stage = 0;
+    int k = o->layer_id & 3;
+    if (last_placed[k] == placed && memcmp(&last[k], &key, sizeof key) == 0) return;
+    last[k] = key;
+    last_placed[k] = placed;
+    fprintf(stderr, "  [xr] quad layer %d stage %d: %.2fx%.2f m at (%.2f %.2f %.2f) "
+                    "in the tracking space, %ux%u image rect %dx%d+%d+%d, eyes %s, "
+                    "origin %s, flags 0x%x — %s\n",
+            o->layer_id, o->stage, (double)o->size[0], (double)o->size[1],
+            (double)o->pose[4], (double)o->pose[5], (double)o->pose[6],
+            (unsigned)o->tex_w, (unsigned)o->tex_h,
+            o->viewport[0][2], o->viewport[0][3], o->viewport[0][0], o->viewport[0][1],
+            o->eye_visibility == 1 ? "LEFT" : o->eye_visibility == 2 ? "RIGHT" : "both",
+            o->origin_top_left ? "top left" : "bottom left", (unsigned)o->flags,
+            placed ? "composited" : "NOT composited (no MTLTexture for it)");
 }
 
 static XrResult klxr_DestroySwapchain(void *swapchain) {
@@ -3850,14 +4239,78 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // has already corrected.
     int   have_layer_pose = 0;
     float layer_pose[7], layer_tan[8];
+    // The frame's non-projection layers, filed whole at the end — see
+    // kl_ovrp_overlays_external. Built here rather than published as they are
+    // found, because the list REPLACES the previous frame's: a compositor
+    // reading it half-written would draw one frame's panel with another's.
+    kl_ovrp_overlay quads[4];
+    int nquads = 0;
+    klxr_frame_shape(info);
 
     for (uint32_t i = 0; i < info->layerCount; i++) {
         const XrCompositionLayerBaseHeader *layer = info->layers[i];
         if (!layer) continue;
         if (layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-            // Quad layers are the UI panels; nothing composites them yet, so
-            // they are counted rather than dropped silently — a layer we ignore
-            // is content the user will not see, and the count is what says so.
+            // Every type but the quad below is counted and dropped, and NAMED
+            // once per distinct type. A count alone says content was dropped; it
+            // does not say what to implement, and "every frame ignored exactly
+            // one layer" is indistinguishable from "the guest composites nothing
+            // we understand" — which is the state JKXR was in until the quad was
+            // drawn. Cylinder and equirect are the two that would come next.
+            if (layer->type != XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                static int said[8];
+                static int said_n;
+                int seen = 0;
+                for (int k = 0; k < said_n; k++)
+                    if (said[k] == (int)layer->type) { seen = 1; break; }
+                if (!seen && said_n < (int)(sizeof said / sizeof said[0])) {
+                    said[said_n++] = (int)layer->type;
+                    fprintf(stderr, "  [xr] xrEndFrame: composition layer type %d "
+                                    "is neither a projection layer nor a quad — "
+                                    "counted and NOT composited (nothing here "
+                                    "draws that type)\n",
+                            (int)layer->type);
+                }
+            }
+            // A quad IS the picture for a guest that submits nothing else, so
+            // it is both captured and composited — the capture through the eye
+            // image (which is what KL_GLFB_OUT reads), the composite through
+            // the overlay record built below.
+            if (layer->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                const XrCompositionLayerQuad *q =
+                    (const XrCompositionLayerQuad *)layer;
+                klxr_swapchain *sc = klxr_swapchain_of(q->subImage.swapchain);
+                if (sc && sc->last_released >= 0 &&
+                    sc->last_released < sc->count) {
+                    // eyeVisibility BOTH means one image for both eyes; LEFT
+                    // and RIGHT each name one. Stated for the eye it belongs
+                    // to so a two-quad guest captures the right one.
+                    int eye = q->eyeVisibility == 2 ? 1 : 0;
+                    kl_glfb_set_live_eye_image(eye, sc->tex[sc->last_released],
+                                               (int32_t)sc->width,
+                                               (int32_t)sc->height,
+                                               sc->array_size > 1
+                                                 ? (int)q->subImage.imageArrayIndex
+                                                 : -1);
+                    if (drawn_stage < 0) drawn_stage = sc->last_released;
+                    if (nquads < (int)(sizeof quads / sizeof *quads) &&
+                        klxr_quad_record(q, sc, &quads[nquads])) {
+                        klxr_back_layer_images(sc, sc->array_size > 1
+                            ? (int)q->subImage.imageArrayIndex : -1);
+                        int placed = kl_glfb_layer_mtl_texture(
+                                         quads[nquads].layer_id,
+                                         quads[nquads].stage, NULL, NULL) != NULL;
+                        klxr_quad_census(&quads[nquads], placed);
+                        nquads++;
+                        s->layers_quad++;
+                        // Counted as composited rather than ignored: the layer
+                        // reaches the compositor's list either way, and what
+                        // the ignored count has always meant is content nothing
+                        // downstream will ever see.
+                        continue;
+                    }
+                }
+            }
             s->layers_ignored++;
             continue;
         }
@@ -3931,14 +4384,16 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             }
             // The eye textures the compositor samples, provided retroactively:
             // this call is the first moment anything knows which swapchain is
-            // an eye. Only the composited layer's, and only once per (swapchain,
-            // eye) — klxr_back_eye_images returns immediately after that.
+            // an eye.
             //
-            // Which of the two routes depends on the shape the guest asked for,
-            // and it is not a preference: a 2-slice swapchain (every Unity
-            // OpenXR guest, one texture for both eyes) cannot be re-pointed at
-            // an MTLTexture at all, so it is copied instead — every frame,
-            // rather than once.
+            // Three routes, and which one is taken is measurement rather than
+            // preference. Vulkan exports the guest's own image and copies
+            // nothing. GL copies the presented image (every frame), because
+            // re-pointing the guest's own texture breaks some guests' rendering
+            // outright — klxr_eye_mirror_on has the numbers — and because an
+            // ARRAY swapchain (every Unity OpenXR guest, one texture for both
+            // eyes) cannot be re-pointed at all. KL_XR_EYE_MIRROR=0 is the
+            // re-point, kept as the A/B.
             if ((int)li == cap_layer) {
                 if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN)
                     // One route for both shapes here: an array swapchain is a
@@ -3946,7 +4401,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     // GL path's array-vs-2D split has no counterpart.
                     klxr_publish_eye_vulkan(sc, (int)v,
                                             (int)proj->views[v].subImage.imageArrayIndex);
-                else if (sc->array_size > 1)
+                else if (klxr_eye_mirror_on() || sc->array_size > 1)
                     klxr_mirror_eye_image(sc, (int)v,
                                           (int)proj->views[v].subImage.imageArrayIndex);
                 else
@@ -3988,6 +4443,16 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         kl_ovrp_frame_end_external(drawn_stage,
                                    have_layer_pose ? layer_pose : NULL,
                                    have_layer_pose ? layer_tan : NULL);
+
+    // ...and this frame's panels, replaced whole — including with none, which is
+    // how a guest taking a menu down is expressed. Unconditional rather than
+    // guarded on nquads: leaving the previous frame's list standing would keep
+    // drawing a layer the guest has stopped submitting.
+    kl_ovrp_overlays_external(quads, nquads);
+    // The same statement for the eye, which had no way to be told "not this
+    // frame" — see kl_ovrp.h. A guest that alternates between a projection pair
+    // and a quad shows one or the other, not both at once.
+    kl_ovrp_eye_layer_external(proj_layers > 0);
 
     // The Vulkan frame seam, and BONELAB's trap (c) reached through the other
     // API: a compositor's "is there a new frame?" test is a SERIAL, and on the
@@ -4260,6 +4725,12 @@ static void klxr_install(void) {
                                    (void *)klxr_ConvertTimespecTimeToTimeKHR},
         {"xrConvertTimeToTimespecTimeKHR",
                                    (void *)klxr_ConvertTimeToTimespecTimeKHR},
+        {"xrPerfSettingsSetPerformanceLevelEXT",
+                                   (void *)klxr_PerfSettingsSetPerformanceLevelEXT},
+        {"xrSetAndroidApplicationThreadKHR",
+                                   (void *)klxr_SetAndroidApplicationThreadKHR},
+        {"xrEnumerateColorSpacesFB", (void *)klxr_EnumerateColorSpacesFB},
+        {"xrSetColorSpaceFB",        (void *)klxr_SetColorSpaceFB},
         // the session, and the state machine xrPollEvent drives
         {"xrCreateSession",        (void *)klxr_CreateSession},
         {"xrDestroySession",       (void *)klxr_DestroySession},

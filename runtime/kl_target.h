@@ -35,6 +35,13 @@ typedef enum {
     // JNI_OnLoad and driven by calling natives it registered. Everything after
     // the door — the looper, the Choreographer, EGL, the XR seam — is shared.
     KL_GUEST_UE4,
+    // JKXR — kl_jkxr's door. Neither of the two above: the guest's natives are
+    // static `Java_*` exports on a plain Activity, so there is no
+    // RegisterNatives census to drive and no NativeActivity glue to enter
+    // through. The driver stands in for the Java by calling those exports in
+    // the Activity's own order, threading the handle onCreate returned through
+    // every one after it.
+    KL_GUEST_JKXR,
 } kl_guest_kind;
 
 typedef struct {

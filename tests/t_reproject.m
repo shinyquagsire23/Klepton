@@ -963,6 +963,210 @@ static void check_viewport(void) {
        "an unset viewport is the whole texture, not an empty one");
 }
 
+// ---------------------------------------------------------------------------
+// The OVERLAY pass — a guest's non-eye layer, which for a guest in cinematic
+// mode is the whole picture (JKXR submits one quad and nothing else).
+//
+// It is a different pass from the reprojection above and it differs in exactly
+// the two ways that have no error surface at all:
+//
+//   * it KEEPS translation. The eye quad is eye-centred on purpose, so a
+//     placement bug there is invisible; an overlay is somewhere, and a
+//     model-view that dropped the translation would put every panel dead ahead
+//     no matter where the guest asked for it — which reads as "the menu follows
+//     you" rather than as a matrix error.
+//   * its `flip_y` means the same thing as the reprojection pass's. It used to
+//     mean the opposite (the base mapping was top-left there and bottom-left
+//     here), and both records are read out of one struct — so one field, two
+//     polarities, and the only instrument is a person seeing an upside-down
+//     menu.
+static simd_float4 overlay_corner_ndc(kl_overlay_uniforms u, float cx, float cy) {
+    simd_float4 p = simd_mul(simd_mul(u.projection, u.model_view),
+                             simd_make_float4(cx * u.half_size.x,
+                                              cy * u.half_size.y, 0, 1));
+    return simd_make_float4(p.x / p.w, p.y / p.w, p.z / p.w, p.w);
+}
+
+// A head pose as a matrix, the way both compositors build one.
+static simd_float4x4 head_at(float x, float y, float z) {
+    simd_float4x4 m = matrix_identity_float4x4;
+    m.columns[3] = simd_make_float4(x, y, z, 1);
+    return m;
+}
+
+static void check_overlay_math(void) {
+    printf("=== overlay (quad layer) placement ===\n");
+    simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
+
+    // A 2x2 m panel one metre in front of a head at the origin: through a
+    // 90-degree frustum its corners land exactly on the viewport edges, which
+    // is the same "reduces to a blit" property the eye pass is pinned by and
+    // for the same reason — every other number here is checked against it.
+    kl_ovrp_overlay ov = {0};
+    ov.shape = 0;
+    ov.tex_w = 100; ov.tex_h = 100;
+    for (int e = 0; e < 2; e++) {
+        ov.viewport[e][2] = 100; ov.viewport[e][3] = 100;
+    }
+    ov.pose[3] = 1;                       // identity orientation
+    ov.pose[6] = -1.0f;                   // one metre down -Z
+    ov.size[0] = 2.0f; ov.size[1] = 2.0f;
+
+    kl_overlay_uniforms u = kl_overlay_build(&ov, 0, matrix_identity_float4x4,
+                                             matrix_identity_float4x4, P);
+    ok(u.visible != 0, "a quad with a size is placed");
+    simd_float4 tl = overlay_corner_ndc(u, -1, 1), br = overlay_corner_ndc(u, 1, -1);
+    ok(fabsf(tl.x + 1) < 1e-5f && fabsf(tl.y - 1) < 1e-5f &&
+       fabsf(br.x - 1) < 1e-5f && fabsf(br.y + 1) < 1e-5f,
+       "a 2x2 m quad at 1 m fills a 90-degree viewport exactly");
+
+    // ...and the whole difference from the eye pass: MOVE THE HEAD. A metre to
+    // the right, and the panel must move a full viewport to the left, because
+    // it is at a place and the head is not there any more.
+    kl_overlay_uniforms moved = kl_overlay_build(&ov, 0, head_at(1, 0, 0),
+                                                 matrix_identity_float4x4, P);
+    simd_float4 c = overlay_corner_ndc(moved, 0, 0);
+    ok(fabsf(c.x + 1) < 1e-5f && fabsf(c.y) < 1e-5f,
+       "the head moving 1 m right moves the panel a full viewport left "
+       "(translation is KEPT, unlike the eye quad)");
+
+    // The eye's own offset counts too — that is what gives a panel at a few
+    // metres the disparity that makes it look like it is there.
+    kl_overlay_uniforms right_eye =
+        kl_overlay_build(&ov, 1, matrix_identity_float4x4, head_at(0.032f, 0, 0), P);
+    simd_float4 rc = overlay_corner_ndc(right_eye, 0, 0);
+    ok(rc.x < -0.03f && rc.x > -0.04f,
+       "the display's eye offset shifts the panel, which is its stereo");
+
+    // eyeVisibility. LEFT and RIGHT are how a guest shows different pixels to
+    // each eye, and drawing one of those in both eyes is the other eye's
+    // picture on top of this one's.
+    ov.eye_visibility = 2;                                   // RIGHT only
+    ok(kl_overlay_build(&ov, 0, matrix_identity_float4x4,
+                        matrix_identity_float4x4, P).visible == 0 &&
+       kl_overlay_build(&ov, 1, matrix_identity_float4x4,
+                        matrix_identity_float4x4, P).visible != 0,
+       "eyeVisibility RIGHT draws in the right eye only");
+    ov.eye_visibility = 0;
+
+    // A shape this pass cannot draw is REFUSED rather than drawn as a flat
+    // rectangle — see kl_overlay_build. Cylinder is the one a guest is most
+    // likely to submit next.
+    ov.shape = 1;
+    ok(kl_overlay_build(&ov, 0, matrix_identity_float4x4,
+                        matrix_identity_float4x4, P).visible == 0,
+       "a cylinder is refused, not drawn as a quad");
+    ov.shape = 0;
+
+    // The flip, stated by the record and meaning what it means everywhere else.
+    ov.origin_top_left = 1;
+    ok(kl_overlay_build(&ov, 0, matrix_identity_float4x4,
+                        matrix_identity_float4x4, P).flip_y == 1,
+       "a top-left-origin (Vulkan) layer asks the shader to flip");
+    ov.origin_top_left = 0;
+    ok(kl_overlay_build(&ov, 0, matrix_identity_float4x4,
+                        matrix_identity_float4x4, P).flip_y == 0,
+       "...and a GL one does not");
+}
+
+// The overlay shader, run: the same source the eye pass reads, through the
+// other pipeline, so the two passes are pinned to ONE answer about which way up
+// a GL-authored picture is.
+static void check_overlay_pixels(void) {
+    printf("=== the overlay pass, run ===\n");
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    if (!dev || !q) { printf("  no Metal device — skipped\n"); return; }
+
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:
+                              [NSString stringWithUTF8String:kl_reproject_overlay_msl()]
+                                           options:nil error:&err];
+    if (!lib) {
+        printf("  %s\n", err.localizedDescription.UTF8String);
+        ok(0, "the overlay shader compiles");
+        return;
+    }
+    ok(1, "the overlay shader compiles");
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"kl_ov_v"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"kl_ov_f"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd
+                                                                       error:&err];
+    if (!ps) { ok(0, "the overlay pipeline links"); return; }
+
+    // A plain 2D source — the overlay fragment shader samples texture2d, not an
+    // array, because a layer image is the guest's own and has no eye slices.
+    // Authored bottom-up, as GL writes one: memory row 0 is the picture's
+    // BOTTOM (see check_pixels).
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:2 height:2 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> src = [dev newTextureWithDescriptor:td];
+    uint8_t s0[16] = { 0,0,255,255,   255,255,255,255,      // row 0 = picture BOTTOM
+                       255,0,0,255,   0,255,0,255 };        // row 1 = picture TOP
+    [src replaceRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0
+             withBytes:s0 bytesPerRow:8];
+
+    MTLTextureDescriptor *rd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:2 height:2 mipmapped:NO];
+    rd.usage = MTLTextureUsageRenderTarget;
+    rd.storageMode = MTLStorageModeShared;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:rd];
+
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.minFilter = MTLSamplerMinMagFilterNearest;
+    sd.magFilter = MTLSamplerMinMagFilterNearest;
+    sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    id<MTLSamplerState> samp = [dev newSamplerStateWithDescriptor:sd];
+
+    kl_ovrp_overlay ov = {0};
+    ov.tex_w = 2; ov.tex_h = 2;
+    for (int e = 0; e < 2; e++) { ov.viewport[e][2] = 2; ov.viewport[e][3] = 2; }
+    ov.pose[3] = 1;
+    ov.pose[6] = -1.0f;
+    ov.size[0] = 2.0f; ov.size[1] = 2.0f;
+    simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
+
+    uint8_t want[16];
+    memcpy(want,     s0 + 8, 8);        // picture top    -> output row 0
+    memcpy(want + 8, s0,     8);        // picture bottom -> output row 1
+
+    for (int pass = 0; pass < 2; pass++) {
+        ov.origin_top_left = pass;      // GL first, then Vulkan
+        kl_overlay_uniforms u = kl_overlay_build(&ov, 0, matrix_identity_float4x4,
+                                                 matrix_identity_float4x4, P);
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = dst;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        id<MTLCommandBuffer> cmd = [q commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:ps];
+        [enc setFragmentTexture:src atIndex:0];
+        [enc setFragmentSamplerState:samp atIndex:0];
+        [enc setVertexBytes:&u length:sizeof u atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        uint8_t out[16] = {0};
+        [dst getBytes:out bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
+        // The panel covers the viewport exactly (proved above), so the output IS
+        // the picture: rows reversed for a GL source, memory order for a Vulkan
+        // one. Identical to the eye pass's two answers, which is the point.
+        ok(memcmp(out, pass ? s0 : want, 16) == 0,
+           pass ? "the overlay reads a top-left-origin (Vulkan) layer the right way up"
+                : "the overlay reads a GL layer the right way up");
+    }
+}
+
 int main(void) {
     @autoreleasepool {
         check_math();
@@ -972,6 +1176,8 @@ int main(void) {
         check_crop_pixels();
         check_split_crop_pixels();
         check_two_textures();
+        check_overlay_math();
+        check_overlay_pixels();
     }
     printf(g_fail ? "\n=== t_reproject FAILED ===\n"
                   : "\n=== t_reproject: the composite pass is a blit when nothing "

@@ -1848,6 +1848,7 @@ const klj_binding *const klj_binding_tables[] = {
     klj_bind_prefs,
     klj_bind_sdl,
     klj_bind_ue4,
+    klj_bind_jkxr,
     NULL,
 };
 

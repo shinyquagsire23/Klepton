@@ -4125,6 +4125,12 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
         memcpy(o->pose, s->pose, sizeof o->pose);
         o->flags       = s->submit_flags;
         o->head_locked = (s->submit_flags & KLOVRP_SUBMIT_HEAD_LOCKED) != 0;
+        // An OVRPlugin layer's storage is the guest's own, and which way up it
+        // is follows from the API it rendered with — the same question, and the
+        // same answer, as the eye textures beside it. Only the Vulkan path
+        // backs a non-eye layer with anything a compositor can sample today
+        // (kl_vulkan_layer_mtl_texture), and Vulkan's origin is the top left.
+        o->origin_top_left = kl_vulkan_guest_active();
 // The quad's world size, out of the union's own arm. The OFFSET is read
 // from Compositor::ImportLayerSubmit rather than from our struct's end
         // — see klovrp_probe_submit_tail, which is where that measurement lives.
@@ -4139,6 +4145,45 @@ static void klovrp_record_overlays(const void *layer_submits, int count) {
     g_overlays.n = n;
     pthread_mutex_unlock(&g_frames.mu);
 }
+
+// ...and the same list, filed by a guest that never speaks OVRPlugin. See
+// kl_ovrp.h. One storage, one lock, one reader: a second list filled by a
+// second producer is how the two answers drift, and no process runs both.
+void kl_ovrp_overlays_external(const kl_ovrp_overlay *v, int n) {
+    if (n < 0) n = 0;
+    if (n > KLOVRP_MAX_LAYERS) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [ovrp] %d non-eye layers submitted and only %d fit "
+                            "the record — the rest are NOT composited\n",
+                    n, KLOVRP_MAX_LAYERS);
+        }
+        n = KLOVRP_MAX_LAYERS;
+    }
+    pthread_mutex_lock(&g_frames.mu);
+    if (n && v) memcpy(g_overlays.v, v, (size_t)n * sizeof *v);
+    g_overlays.n = n;
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
+// See kl_ovrp.h. One int, no lock: it is written by the guest's frame thread and
+// read by the compositor's, an aligned int is not torn on any platform this
+// runs on, and a compositor that reads the previous frame's answer draws the
+// previous frame's layer set — which is what it does with the overlay list
+// beside it anyway.
+static int g_eye_layer_live = 1;
+void kl_ovrp_eye_layer_external(int submitted) {
+    if (g_eye_layer_live == !!submitted) return;
+    g_eye_layer_live = !!submitted;
+    // Both directions, because both are scene transitions and this is the line
+    // that says which one the compositor is in.
+    fprintf(stderr, "  [ovrp] the guest's frame %s an eye picture — the eye pass "
+                    "is %s\n",
+            g_eye_layer_live ? "now carries" : "no longer carries",
+            g_eye_layer_live ? "on" : "off, leaving only its composition layers");
+}
+int kl_ovrp_eye_layer_live(void) { return g_eye_layer_live; }
 
 int kl_ovrp_overlay_count(void) {
     pthread_mutex_lock(&g_frames.mu);

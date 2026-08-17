@@ -180,6 +180,7 @@ extern const klj_binding klj_bind_prefs[];
 extern const klj_binding klj_bind_io[];
 extern const klj_binding klj_bind_sdl[];
 extern const klj_binding klj_bind_ue4[];
+extern const klj_binding klj_bind_jkxr[];
 extern const klj_binding klj_bind_services[];
 extern const klj_binding *const klj_binding_tables[];
 

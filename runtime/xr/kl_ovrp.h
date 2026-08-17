@@ -297,6 +297,17 @@ typedef struct {
     float size[2];       // Quad: width and height in METRES
     int   flags;         // ovrpLayerSubmitFlags, as submitted
     int   head_locked;   // the flag above, decoded — see kl_ovrp.c
+    // Which eyes see this layer: 0 both, 1 left only, 2 right only. OpenXR's
+    // XrCompositionLayerQuad.eyeVisibility, and the reason a guest showing
+    // different pixels to each eye submits TWO quads rather than one layer with
+    // two views. An OVRPlugin submit has no counterpart and files 0, which is
+    // what every layer that ran here before this field was both of.
+    int   eye_visibility;
+    // 1 when row 0 of the layer's texture is the TOP of the picture — Vulkan
+    // and Metal — and 0 for a picture GL rendered, whose origin is the bottom
+    // left. The same question kl_glfb_eye_mtl_origin_top_left answers for an
+    // eye, with the same polarity, so one convention covers both passes.
+    int   origin_top_left;
 } kl_ovrp_overlay;
 
 // How many non-eye layers the guest submitted with its most recent frame, and
@@ -348,6 +359,39 @@ int kl_ovrp_overlay_get(int i, kl_ovrp_overlay *out);
 // knob.
 void kl_ovrp_frame_begin_external(void);
 void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8);
+
+// ...and the same for the OTHER layers, which for an OpenXR guest is the whole
+// of `xrEndFrame`'s list that is not a projection layer.
+//
+// The list is replaced whole under the frame lock, exactly as ovrp_EndFrame4's
+// is, and n = 0 is the ordinary case rather than an error: a frame that submits
+// no quad has none, and leaving the previous frame's list standing would show a
+// panel the guest has taken down. Records past the array are DROPPED and named,
+// because a layer that silently does not reach the compositor is content the
+// user cannot see.
+//
+// The caller fills every field, including `origin_top_left` and
+// `eye_visibility` — this half of the seam knows which API drew the picture and
+// which eyes were named, and nothing downstream can recover either.
+void kl_ovrp_overlays_external(const kl_ovrp_overlay *v, int n);
+
+// ...and whether the guest's most recent frame carried an EYE PICTURE at all.
+//
+// A compositor draws the layers the guest submitted THIS frame, and the eye
+// pass had no way to be told "not this one": the frame record and the eye
+// textures both persist, so once anything had ever filed them the eye was drawn
+// for the rest of the run. That is right for every guest that submits a
+// projection layer every frame — which is all of them until JKXR, whose engine
+// SWITCHES: a projection pair in the world and a single quad in the menu, out
+// of the same two swapchains (measured: `[xr] frame shape changed after 8106
+// frames: quad(sc0 eyes0) -> proj(2 views: sc0 sc1)`). With the eye latched on
+// from the first world frame, its menu came back as a full-field picture
+// UNDERNEATH the panel showing the same thing — one screen composited twice.
+//
+// Defaults to live, so a guest that never files it (every OVRPlugin guest, and
+// every OpenXR guest that submits a projection layer every frame) is unchanged.
+void kl_ovrp_eye_layer_external(int submitted);
+int  kl_ovrp_eye_layer_live(void);
 
 // How many swapchain stages we tell the guest it has (KL_OVRP_STAGES). The
 // answer to ovrp_GetEyeTextureStageCount, so it bounds every (eye, stage) key

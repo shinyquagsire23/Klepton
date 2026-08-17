@@ -19,6 +19,7 @@
 #include "kl_openxr.h"    // kl_openxr_set_pacer — the OpenXR guest's frame clock
 #include "kl_slink.h"
 #include "kl_ue4.h"       // the NativeActivity door for an Unreal guest
+#include "kl_jkxr.h"      // ...and the static-exports door for an OpenJK guest
 #include "kl_mono.h"      // the flat guest's window seam — frame out, pointer in
 #include "kl_glfb.h"      // kl_glfb_release_current — the handoff hands the context on
 #include "kl_x18.h"       // claim the veneers' TSD slot before anything else can
@@ -71,8 +72,16 @@ int kl_app_target_is_steamlink(void) {
 static int target_is_ue4(void) {
     return g_target && g_target->kind == KL_GUEST_UE4;
 }
+static int target_is_jkxr(void) {
+    return g_target && g_target->kind == KL_GUEST_JKXR;
+}
+// Whether the guest brought its own render thread, and therefore whether there
+// is any such thing as an inline frame here. Three of the four kinds do: Steam
+// Link spawns one inside onCreate, an Unreal guest inside android_main, and an
+// OpenJK guest inside its own onCreate. Only a Unity guest hands us
+// nativeRender to call.
 int kl_app_target_owns_frame_loop(void) {
-    return kl_app_target_is_steamlink() || target_is_ue4();
+    return kl_app_target_is_steamlink() || target_is_ue4() || target_is_jkxr();
 }
 
 static char g_libdir[1024];
@@ -220,6 +229,25 @@ int kl_app_configure(const char *resources, const char *container) {
         kl_jni_set_assets_dir(g_assets);
         kl_jni_set_apk_path(g_apk);
         kl_jni_set_files_dir(g_files);
+        // ...and HOME, for a guest that is a UNIX PORT wearing an Android
+        // manifest rather than an Android app. OpenJK derives fs_homepath from
+        // $HOME and then walks it with mkdir -p (FS_CreatePath), which is fatal
+        // on the first component it cannot make. The OS sets HOME to the app's
+        // data container ROOT, and that directory is not ours to extend: the
+        // system provisions Documents/, Library/ and tmp/ inside it and refuses
+        // anything else. So the engine walked seven directories that already
+        // existed and died on mkdir("<container>/.local") with EPERM.
+        //
+        // The guest's external storage is the writable tree it keeps everything
+        // else in, so point HOME there and fs_homepath becomes
+        // <ext>/.local/share/openjk, beside <ext>/JKXR.
+        //
+        // Only for this target. HOME is the OS's own answer to a sandboxed
+        // process, Foundation resolves the container through it, and the other
+        // guests here reach it through Qt — none of which needs redirecting.
+        // Safe at this point for the same reason: the caller resolves the
+        // container once, before kl_app_configure runs.
+        if (target_is_jkxr()) setenv("HOME", g_files, 1);
         // Raw "<apk>/assets/..." opens: Unity mounts the APK into its VFS and
         // then resolves entries by concatenating onto the mount point.
         kl_guest_path_map(g_apk, g_assets);
@@ -626,6 +654,38 @@ static int boot_ue4(void) {
     return 0;
 }
 
+// The OpenJK door — a THIRD entry shape, and the reason this arm exists rather
+// than the Unity path being a default that happens to fit. There is no libmain
+// and no NativeLoader here either: the guest's natives are static `Java_*`
+// exports on a plain Activity, so the chain (libgl4es, then the engine) is
+// loaded whole and driven by calling those exports in the Activity's own order
+// from kl_app_lifecycle_begin.
+//
+// Shared verbatim with `build/m_boot`, for kl_slink's reason: a guest described
+// differently by two drivers is a bug with no error surface.
+static int boot_jkxr(void) {
+    g_phase = "jkxr configure";
+    // The libdir is ABSOLUTE here already (the container's), which this door
+    // needs: the engine chdirs into its own data directory, and every relative
+    // path handed to it stops resolving at that moment.
+    if (kl_jkxr_configure(g_libdir, g_target->entry_lib, stdout) != 0)
+        return fail(kl_jkxr_error());
+    g_phase = "jkxr chain";
+    if (kl_jkxr_load(stdout) != 0) return fail(kl_jkxr_error());
+
+    printf("\n=== the shim gap ===\n");
+    kl_jkxr_gap(stdout);
+
+    printf("\n=== EXIT CRITERION MET: the OpenJK chain is bound and "
+           "initialised on visionOS ===\n");
+    g_phase = "boot report";
+    kl_jni_report(stdout);
+    fflush(NULL);
+    g_phase = "boot done";
+    snprintf(g_status, sizeof g_status, "the OpenJK chain initialised");
+    return 0;
+}
+
 int kl_app_boot(void) {
     // Once, and never concurrently. The Boot button invites a second press,
     // and the second entry is not merely redundant: the runtime's JNI tables
@@ -692,6 +752,7 @@ int kl_app_boot(void) {
 
     if (kl_app_target_is_steamlink()) return boot_steamlink();
     if (target_is_ue4())              return boot_ue4();
+    if (target_is_jkxr())             return boot_jkxr();
 
     char path[1200];
     snprintf(path, sizeof path, "%s/libmain.so", g_libdir);
@@ -867,6 +928,50 @@ int kl_app_lifecycle_begin(void) {
         return 0;
     }
 
+    // The OpenJK guest, which has the same constraint again and one more of its
+    // own: onCreate is where the engine spawns its render thread, and the
+    // surface calls that follow are what it stops waiting on. Create and pump
+    // must be one thread because the looper this drives is
+    // ALooper_forThread()'s.
+    if (target_is_jkxr()) {
+        g_phase = "proc";
+        report_proc();
+        g_alarm_secs = kl_env_int("KL_ALARM", 120);
+
+        g_phase = "GLES3JNILib.onCreate";
+        printf("\n=== GLES3JNILib.onCreate ===\n");
+        fflush(NULL);
+        alarm(g_alarm_secs);
+        if (kl_jkxr_create(stdout) != 0) { alarm(0); return fail(kl_jkxr_error()); }
+        // What the engine's filesystem will take as fs_basepath, printed
+        // because nothing else in a device run can say it. The guest chdirs
+        // into its data directory from inside onCreate and id Tech 3 derives
+        // fs_basepath from the cwd, so a chdir that failed leaves the process
+        // where an app bundle starts — at `/` — and every pk3 is then looked
+        // for in `/base`. The engine reports that as Com_Error("Couldn't load
+        // default.cfg") and this port drops its own console output, so the
+        // whole failure reaches the log as `_exit(3)` and nothing else.
+        // Compare this line with the retail census above it: they are the same
+        // directory on a run that can work.
+        char cwd[1200];
+        printf("  [jkxr] cwd after onCreate (the engine's fs_basepath): %s\n",
+               getcwd(cwd, sizeof cwd) ? cwd : strerror(errno));
+        // The other half of where this engine will look, and the one that is
+        // not visible from anywhere else: fs_homepath is built from $HOME, and
+        // a HOME the guest cannot create under is fatal rather than merely
+        // empty (FS_CreatePath calls Com_Error on the first mkdir it cannot
+        // make).
+        printf("  [jkxr] HOME (the engine's fs_homepath root): %s\n",
+               getenv("HOME") ? getenv("HOME") : "(unset)");
+        // onStart / onResume / surfaceCreated / surfaceChanged. The surface is
+        // where the engine stops waiting — its render thread blocks until one
+        // arrives — so a begin that stopped at onCreate would look like a hang.
+        kl_jkxr_start(stdout);
+        alarm(0);
+        g_phase = "looper pump";
+        return 0;
+    }
+
     void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
     if (!thiz) return fail("kl_app_boot must run first");
     g_thiz = thiz;
@@ -998,6 +1103,13 @@ void kl_app_lifecycle_report(void) {
         snprintf(g_status, sizeof g_status, "the Unreal run ended");
         return;
     }
+    if (target_is_jkxr()) {
+        printf("\n=== the OpenJK run ===\n");
+        kl_jkxr_report(stdout);
+        fflush(NULL);
+        snprintf(g_status, sizeof g_status, "the OpenJK run ended");
+        return;
+    }
     printf("  pumped %u frames\n", g_frames_pumped);
     printf("\n=== the lifecycle ran on device ===\n");
     kl_jni_report(stdout);
@@ -1059,6 +1171,19 @@ int kl_app_lifecycle(unsigned frames) {
         printf("\n=== pumping the looper for %.1f s ===\n", secs);
         fflush(NULL);
         printf("  pumped %.2f s\n", kl_ue4_pump(secs, &g_guest_quit));
+        kl_app_lifecycle_report();
+        return 0;
+    }
+
+    // ...and the same again for OpenJK, in the same unit and for the same
+    // reason. KL_JKXR_WAIT is the budget on the command line too, and its
+    // default is the same 5 s: this guest reaches its first frame quickly, so
+    // what the number bounds is how much of the run there is to read.
+    if (target_is_jkxr()) {
+        double secs = kl_env_str("KL_JKXR_WAIT", NULL) ? strtod(getenv("KL_JKXR_WAIT"), NULL) : 5.0;
+        printf("\n=== pumping the looper for %.1f s ===\n", secs);
+        fflush(NULL);
+        printf("  pumped %.2f s\n", kl_jkxr_pump(secs, &g_guest_quit));
         kl_app_lifecycle_report();
         return 0;
     }
@@ -1179,8 +1304,9 @@ static void *guest_thread(void *unused) {
     if (kl_app_target_owns_frame_loop()) {
         printf("\n=== guest thread pumping the activity's looper ===\n");
         fflush(NULL);
-        double secs = target_is_ue4() ? kl_ue4_pump(-1.0, &g_guest_quit)
-                                      : kl_slink_vr_pump(-1.0, &g_guest_quit);
+        double secs = target_is_ue4()  ? kl_ue4_pump(-1.0, &g_guest_quit)
+                    : target_is_jkxr() ? kl_jkxr_pump(-1.0, &g_guest_quit)
+                                       : kl_slink_vr_pump(-1.0, &g_guest_quit);
         printf("[guest] pumped for %.1fs\n", secs);
         fflush(NULL);
         kl_app_lifecycle_report();
@@ -1241,7 +1367,14 @@ int kl_app_guest_start(void) {
     // pacer installed there would block the guest on a pose nobody will ever
     // publish. Installing it here also closes the window in which the guest could
     // reach its first xrWaitFrame unpaced, because the guest does not exist yet.
-    if (kl_app_target_is_steamlink()) kl_openxr_set_frame_pacer(guest_pace_wait);
+    // ...and the OpenJK guest takes the same one, because it is the same API:
+    // its frame clock is xrWaitFrame, wherever the engine calls it from. Which
+    // pacer a guest wants is a property of the XR RUNTIME it drives, not of the
+    // door it came through — Steam Link and JKXR are both OpenXR, RE4 is
+    // OVRPlugin, and pairing a door with the wrong one is a guest that blocks
+    // forever on a pose nobody publishes to it.
+    if (kl_app_target_is_steamlink() || target_is_jkxr())
+        kl_openxr_set_frame_pacer(guest_pace_wait);
     // ...and the same clock on the OVRPlugin side, for the other guest that
     // owns its loop. ovrp_WaitToBeginFrame is this API's xrWaitFrame. It is
     // installed ONLY here: every Unity guest reaches that call from inside a

@@ -121,11 +121,13 @@ const char *kl_app_target_name(void);
 int         kl_app_target_is_steamlink(void);
 
 // ...and the question the COMPOSITOR is really asking, which is not the same
-// one. Two of the doors here hand the frame loop to the guest: Steam Link
-// spawns a thread inside onCreate and runs OpenXR on it, and a UE4 guest is a
-// NativeActivity that spawns its own game thread inside android_main. For both
-// of those `kl_app_frame()` returns -1 by design and what our thread owes the
-// guest is a turning looper.
+// one. Three of the four doors here hand the frame loop to the guest: Steam
+// Link spawns a thread inside onCreate and runs OpenXR on it, a UE4 guest is a
+// NativeActivity that spawns its own game thread inside android_main, and an
+// OpenJK guest spawns its render thread inside its own onCreate. For all of
+// those `kl_app_frame()` returns -1 by design and what our thread owes the
+// guest is a turning looper. Only a Unity guest hands us a nativeRender to
+// call.
 //
 // It was spelled `is_steamlink` at all three of its call sites, which is a
 // predicate that answers the right thing for the wrong reason and stops being

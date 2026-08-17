@@ -13,6 +13,8 @@
 
 KL_TARGET_ROW("beatsaber", "beatsaber", "beatsaber.apk", "beatsaber/assets", "beatsaber/lib/arm64-v8a", "libmain", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("bonelab", "bonelab", "bonelab.apk", "bonelab/assets", "bonelab/lib/arm64-v8a", "libmain", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("jkxr_ja", "jkxr", "jkxr.apk", "jkxr/assets", "jkxr/lib/arm64-v8a", "libopenjk_ja", "obb", KL_GUEST_JKXR)
+KL_TARGET_ROW("jkxr_jo", "jkxr", "jkxr.apk", "jkxr/assets", "jkxr/lib/arm64-v8a", "libopenjk_jo", "obb", KL_GUEST_JKXR)
 KL_TARGET_ROW("openbrush", "openbrush", "openbrush.apk", "openbrush/assets", "openbrush/lib/arm64-v8a", "libmain", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("re4", "re4", "re4.apk", "re4/assets", "re4/lib/arm64-v8a", "libUE4", "Android/obb/com.Armature.VR4", KL_GUEST_UE4)
 KL_TARGET_ROW("steamlink-vr", "steamlink-vr", "steamlink-vr.apk", "steamlink-vr/assets", "steamlink-vr/lib/arm64-v8a", "libvrlink_scene", "obb", KL_GUEST_STEAMLINK)

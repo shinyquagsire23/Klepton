@@ -39,6 +39,7 @@ int getentropy(void *buf, size_t buflen);
 #include "klepton.h"
 #include "kl_va.h"
 #include "kl_jni.h"     // kl_jni_build_string — the Build.* half of the system
+#include "kl_fault.h"   // kl_fault_print_frames — who called exit()
                         // properties below, so the two cannot drift apart
 
 static void warn_once(const char *what) {
@@ -964,9 +965,33 @@ int klb_access(const char *path, int mode) {
 // external storage tree the guest OWNS is the first mapping where the write
 // half matters, and a mkdir that misses the map is the whole difference between
 // a user directory and an EACCES.
+// A SANDBOX ANSWERS THE DENIAL BEFORE THE FILESYSTEM ANSWERS THE TRUTH, and
+// the two errnos mean opposite things to the caller. `mkdir("/var")` is EEXIST
+// on Linux and on macOS; inside a visionOS app it is EPERM, because the sandbox
+// refuses the write before anything looks at what is there. A guest creating a
+// path one component at a time — mkdir -p, which is id Tech 3's FS_CreatePath
+// and most Android setup code — tolerates EEXIST and treats every other errno
+// as fatal, so the denial reads as "this directory cannot be made" for a
+// directory that has existed since the OS was installed. That is how JKXR died
+// on the headset while running to a menu on the host: Com_Error(ERR_FATAL,
+// "FS_CreatePath: failed to create path"), on the first component of its home
+// path, with the engine's own console output dropped so nothing named it.
+//
+// So: when the call failed and the target is already a directory, report the
+// reason that is TRUE. This invents no success — mkdir still returns -1 — it
+// only refuses to blame a denial for a directory that is there.
 int klb_mkdir(const char *path, mode_t mode) {
     KL_GUEST_PATH(path);
     int r = mkdir(_p, mode);
+    if (r != 0) {
+        // stat() would clobber the original errno on its own failure path.
+        int why = errno;
+        if (why != EEXIST) {
+            struct stat st;
+            if (stat(_p, &st) == 0 && S_ISDIR(st.st_mode)) why = EEXIST;
+        }
+        errno = why;
+    }
     kl_fs_trace("mkdir", path, NULL, r != 0);
     return r;
 }
@@ -974,6 +999,24 @@ int klb_unlink(const char *path) {
     KL_GUEST_PATH(path);
     int r = unlink(_p);
     kl_fs_trace("unlink", path, NULL, r != 0);
+    return r;
+}
+// chdir is the fifth member of that family, and it fails more quietly than any
+// of them: the guest that needs it is JKXR, whose whole notion of where its
+// game data lives is THE WORKING DIRECTORY. Its thread entry calls
+// `chdir("/sdcard/JKXR/JK3")` and discards the result, and the id Tech 3
+// filesystem then builds fs_basepath out of the cwd — so an untranslated chdir
+// leaves the engine looking for `base/default.cfg` beside whatever binary
+// launched it, and it stops with "Couldn't load default.cfg", which is the same
+// message it gives for a genuinely missing installation.
+//
+// A failing chdir is TRACED, not just returned. Nothing checked the return
+// value in this guest and nothing had to: the failure only becomes visible
+// several thousand file operations later, as an absence.
+int klb_chdir(const char *path) {
+    KL_GUEST_PATH(path);
+    int r = chdir(_p);
+    kl_fs_trace("chdir", path, NULL, r != 0);
     return r;
 }
 int klb_rename(const char *a, const char *b) {
@@ -1112,11 +1155,47 @@ int klb_uname(bionic_utsname *u) {
     return 0;
 }
 
+// ---------- exit ----------
+//
+// A guest that calls exit() takes the whole process with it and leaves nothing
+// behind, and on a new target that is the least legible stop available: the
+// driver can only report "the guest EXITED on its own (no signal)", and if the
+// engine's own console output has not reached anywhere readable yet — which is
+// exactly the state a guest is in during startup — there is no other evidence
+// at all. JKXR exits 3 out of its startup path with an empty log.
+//
+// So the two doors are intercepted to say WHO called, using the same frame walk
+// the fault reporter does for a signal. Nothing about the semantics changes:
+// the real exit runs immediately after, so atexit handlers, static destructors
+// and the status code are all exactly as they were.
+//
+// `_exit` gets the same treatment and then bypasses the handlers, as it must.
+static void klb_exit_report(const char *which, int status) {
+    fprintf(stderr, "\n[klepton] the guest called %s(%d) — the process is ending "
+                    "here, on purpose, from:\n", which, status);
+    kl_fault_print_frames(stderr, NULL);
+    fflush(NULL);
+}
+void klb_exit(int status)  { klb_exit_report("exit", status);  exit(status); }
+void klb__exit(int status) { klb_exit_report("_exit", status); _exit(status); }
+
 // ---------- misc ----------
 int    klb_FD_ISSET_chk(int fd, void *set) { return FD_ISSET(fd, (fd_set *)set); }
 void   klb_FD_SET_chk(int fd, void *set)   { FD_SET(fd, (fd_set *)set); }
 size_t klb_ctype_mb_cur_max(void)          { return MB_CUR_MAX; }
 off_t  klb_lseek64(int fd, off_t o, int w) { return lseek(fd, o, w); }
+// The stdio half of the same family: 32-bit Linux needed a second spelling for
+// every off_t call and bionic keeps both, while Darwin's off_t has always been
+// 64-bit. OpenJK is a 2003 codebase and reaches for the explicit names.
+//
+// fopen64 goes through klb_fopen rather than fopen for the reason a second door
+// on one resource always has to: klb_fopen is where the guest's path is
+// translated (/sdcard/... and the assets root) and where the file registry is
+// written. A direct forward here would open a DIFFERENT file — an unmapped
+// absolute path — and succeed or fail on its own terms.
+FILE  *klb_fopen64(const char *path, const char *mode) { return klb_fopen(path, mode); }
+int    klb_fseeko64(FILE *f, off_t o, int w) { return fseeko(f, o, w); }
+off_t  klb_ftello64(FILE *f)                 { return ftello(f); }
 void  *klb_getpwuid(unsigned uid)          { (void)uid; warn_once("getpwuid"); return NULL; }
 int    klb_getpwuid_r(unsigned uid, void *pw, char *buf, size_t n, void **res) {
     (void)uid; (void)pw; (void)buf; (void)n; if (res) *res = NULL;

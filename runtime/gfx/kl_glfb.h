@@ -288,6 +288,68 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
 int kl_glfb_eye_mtl_origin_top_left(int eye, int stage);
 
 // ---------------------------------------------------------------------------
+// The same seam for a layer that is NOT an eye.
+//
+// An OpenXR guest can present its whole frame as an XR_TYPE_COMPOSITION_LAYER_
+// QUAD — a flat panel with a pose and a size in metres — and JKXR presents
+// nothing else: 7381 of 7381 layers in a host run, one per frame. The
+// compositor's overlay pass (kl_reproject.h) draws exactly that, and what it
+// needs is an MTLTexture, which on the GL path only exists if the swapchain's
+// images were given one. That is this pair, and it is the eye pair with the key
+// widened: `layer` is the caller's own identifier for the layer (kl_openxr uses
+// the swapchain's slot), and the record a compositor reads is
+// kl_ovrp_overlay.layer_id.
+//
+// A SEPARATE provider from the eye one, rather than the same callback with a
+// third meaning for `eye`: an eye is one of two slices of one shared array
+// texture and a layer is a plain 2D texture of the guest's own size, so a
+// frontend serving both from one allocator would have to tell them apart by a
+// convention no signature states. Registering none is legal and means a quad
+// layer has no MTLTexture, which every frontend that predates this did.
+typedef int (*kl_glfb_mtl_layer_provider)(int layer, int stage, int w, int h,
+                                          uint32_t internal_fmt,
+                                          kl_mtl_eye_texture *out, void *ctx);
+void kl_glfb_set_mtl_layer_provider(kl_glfb_mtl_layer_provider fn, void *ctx);
+int  kl_glfb_has_mtl_layer_provider(void);
+
+// Copy the guest's presented image into storage the provider owns, and return 1
+// if (layer, stage) now holds that picture. One blit per submitted frame.
+//
+// **A copy, and NOT the eye path's re-point, and that is a measurement rather
+// than a preference.** Giving the guest's own swapchain texture MTLTexture
+// storage (`glEGLImageTargetTexture2DOES` over the name it is already
+// rendering into) is what the eye path does, and on JKXR it BROKE the guest's
+// rendering: with the re-point the intro movie came out as a small copy in one
+// corner of the image plus a flipped one in another, and with the provider
+// simply not registered — the same run, same frame — it is a correct
+// full-screen picture. Every GL call succeeded either way. That guest attaches
+// its swapchain images to framebuffers it builds once and keeps, and replacing
+// the storage underneath a live attachment is not something the ES spec
+// promises anything about.
+//
+// So the guest's storage is left alone and its finished image is copied. The
+// destination is a GL name of OURS, which nothing else has ever attached, so
+// the hazard cannot arise; everything downstream — the layer table, the
+// compositors, the readback — sees exactly what the re-point produced when the
+// re-point worked.
+int kl_glfb_mirror_layer(int layer, int stage, uint32_t src_tex, int src_layer,
+                         int w, int h, uint32_t internal_fmt);
+
+// Record an MTLTexture that IS a layer's storage but did not come through the
+// GL path above — the Vulkan one, where MoltenVK backs the guest's own image and
+// there is nothing to re-point. The eye table's `note` twin, and for the same
+// reason: one table, so every consumer of the lookup below is unchanged.
+// Takes no reference; the image belongs to kl_vulkan.c.
+void kl_glfb_note_layer_mtl_texture(int layer, int stage, void *texture,
+                                    int w, int h);
+
+// ...and what the compositor samples. NULL when nothing was bound for that
+// (layer, stage) — which is the ordinary answer on a run with no provider, and
+// the one the compositors name once per layer rather than drawing nothing
+// silently. `out_w`/`out_h` may be NULL.
+void *kl_glfb_layer_mtl_texture(int layer, int stage, int *out_w, int *out_h);
+
+// ---------------------------------------------------------------------------
 // The decoded-video image — the guest's eglCreateImageKHR over an
 // AHardwareBuffer, which here is a VideoToolbox CVPixelBuffer. kl_egl.c serves
 // the guest-facing entry points; the ANGLE work is here because this file owns

@@ -56,6 +56,23 @@ int klh_android_log_print(int prio, const char *tag, const char *fmt, kl_va *va)
     fputc('\n', stderr);
     return n;
 }
+// BSD err.h, which bionic has and the generated table cannot reach: Darwin
+// declares warnx in <err.h>, kl_shim.c does not include it, and the generator's
+// answer to "does Darwin declare this" is therefore no. It would be a variadic
+// anyway, so a direct forward was never available (AAPCS64 registers vs
+// Darwin's stack slots).
+//
+// The real warnx prefixes the program name and appends a newline, and does NOT
+// append strerror the way warn does. OpenJK uses it for its own diagnostics, so
+// the prefix says which side of the shim the line came from rather than
+// restating a host program name the guest never chose.
+int klh_warnx(const char *fmt, kl_va *va) {
+    KL_MARSHAL(fmt, va, KL_VA_PRINTF);
+    fputs("[guest warnx] ", stderr);
+    int n = vfprintf(stderr, fmt, _ap);
+    fputc('\n', stderr);
+    return n;
+}
 int klh_sscanf(const char *s, const char *fmt, kl_va *va) {
     KL_MARSHAL(fmt, va, KL_VA_SCANF);
     return vsscanf(s, fmt, _ap);

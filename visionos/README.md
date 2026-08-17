@@ -15,7 +15,10 @@ KLEPTON_TARGET=superhot ./run.sh device      # ...for another guest
 
 Both do the same five steps: build the runtime (`make xros`), translate the
 guest libraries (`mkguest.sh`), regenerate the project, install, stage
-assets, launch. `KL_SKIP_STAGE=1` skips the upload when the assets are already
+assets, launch. Each builds only the slice it will install — `XROS_PLATFORMS`,
+exported by `run.sh` and read by both — because a device build never loads the
+simulator's runtime and each slice is a full compile of it. `make xros` on its
+own still builds the pair, which is the gate. `KL_SKIP_STAGE=1` skips the upload when the assets are already
 there, which on device is the difference between a 20-second loop and a
 20-minute one.
 
@@ -70,7 +73,7 @@ misbehaving.
 
 |  | where | why |
 |---|---|---|
-| C runtime | `build/Klepton.xcframework`, linked **statically** | `make xros` builds both slices. Static, so it is inside the app binary — no load-time cost, and nothing for dyld to resolve. |
+| C runtime | `build/Klepton.xcframework`, linked **statically** | `make xros` builds both slices; `run.sh` passes `XROS_PLATFORMS=xros` or `=xrsim` so a run builds only the one it will install, which halves it. Static, so it is inside the app binary — no load-time cost, and nothing for dyld to resolve. |
 | guest libraries | `Frameworks/<name>.xcframework`, **embedded, not linked** | klepton-ld output. Embedded so Xcode code-signs them; a loose Mach-O elsewhere in the bundle is only *sealed* by the outer signature, which is not the same thing and is not what AMFI accepted in P3. Not *linked*, because nothing references their symbols — the runtime `dlopen`s them by path, and linking would make dyld want an exports trie klepton-ld deliberately does not emit. |
 | APK assets (2.2 GB) | the app's **Documents container**, staged once | They change only when the APK does; the code changes every few minutes. Bundling them would put a multi-minute upload in front of every build. |
 

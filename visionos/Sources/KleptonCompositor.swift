@@ -283,6 +283,13 @@ final class KleptonCompositor {
     private let eyesLock = NSLock()
     private static func key(_ eye: Int, _ stage: Int) -> Int { eye &* 64 &+ stage }
 
+    /// The same storage for a layer that is NOT an eye — an OpenXR quad, which
+    /// for a guest in cinematic mode is the whole picture. Its own table because
+    /// the shapes differ: an eye is one slice of a shared 2-slice array, a layer
+    /// is a plain 2D texture of whatever size the guest's swapchain is.
+    private var layers: [Int: MTLTexture] = [:]
+    private let layersLock = NSLock()
+
     // The GUEST's foveation map (KL_VRR=1), and the eye size it was built for.
     //
     // Not to be confused with `drawable.rasterizationRateMaps` — that is the
@@ -563,7 +570,16 @@ final class KleptonCompositor {
             return me.provideEyeTexture(eye: Int(eye), stage: Int(stage),
                                         w: Int(w), h: Int(h), format: fmt, out: out)
         }, ctx)
-        NSLog("[cp] MTL provider installed on \(device.name) "
+        // ...and the same for the layers that are not eyes, without which a
+        // guest whose whole frame is a quad has nothing for the overlay pass to
+        // sample (kl_glfb.h).
+        kl_glfb_set_mtl_layer_provider({ (layer, stage, w, h, fmt, out, ctx) -> Int32 in
+            guard let ctx, let out else { return 0 }
+            let me = Unmanaged<KleptonCompositor>.fromOpaque(ctx).takeUnretainedValue()
+            return me.provideLayerTexture(layer: Int(layer), stage: Int(stage),
+                                          w: Int(w), h: Int(h), format: fmt, out: out)
+        }, ctx)
+        NSLog("[cp] MTL eye and layer providers installed on \(device.name) "
               + "(vertex amplification \(amplification))")
     }
 
@@ -994,6 +1010,54 @@ final class KleptonCompositor {
 
         out.pointee = kl_mtl_eye_texture(texture: Unmanaged.passUnretained(final).toOpaque(),
                                          slice: Int32(eye),
+                                         w: Int32(final.width), h: Int32(final.height))
+        return 1
+    }
+
+    /// Storage for a guest's non-eye LAYER. See `layers` above and kl_glfb.h.
+    ///
+    /// Simpler than the eye allocator in every respect that made that one
+    /// complicated: nothing is shared between two callers, there is no slice and
+    /// no rate map. What it keeps is the identity rule — size and format are
+    /// part of it, so a guest that rebuilds its swapchain is not handed the
+    /// previous allocation and left rendering into storage it does not have.
+    private func provideLayerTexture(layer: Int, stage: Int, w: Int, h: Int,
+                                     format: UInt32,
+                                     out: UnsafeMutablePointer<kl_mtl_eye_texture>) -> Int32 {
+        guard let pixelFormat = klEyePixelFormat(format) else {
+            NSLog("[cp] layer \(layer) stage \(stage) asks for GL internalformat "
+                  + String(format: "0x%x", format)
+                  + ", which has no MTLPixelFormat here — declining, so the layer "
+                  + "renders into GL storage nothing composites")
+            return 0
+        }
+        let k = layer &* 64 &+ stage
+        layersLock.lock()
+        let cached = layers[k]
+        layersLock.unlock()
+        var tex = cached
+        if tex == nil || tex!.width != w || tex!.height != h ||
+           tex!.pixelFormat != pixelFormat {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: pixelFormat, width: w, height: h, mipmapped: false)
+            desc.usage = [.renderTarget, .shaderRead]
+            desc.storageMode = .private
+            guard let t = device.makeTexture(descriptor: desc) else {
+                NSLog("[cp] could not allocate layer \(layer) stage \(stage) \(w)x\(h)")
+                return 0
+            }
+            t.label = "klepton layer \(layer) stage \(stage)"
+            tex = t
+            layersLock.lock()
+            layers[k] = t
+            layersLock.unlock()
+            NSLog("[cp] layer \(layer) stage \(stage): GL "
+                  + String(format: "0x%x", format) + " \(w)x\(h) — "
+                  + "\(t.allocatedSize / (1024 * 1024)) MiB allocated")
+        }
+        let final = tex!
+        out.pointee = kl_mtl_eye_texture(texture: Unmanaged.passUnretained(final).toOpaque(),
+                                         slice: 0,
                                          w: Int32(final.width), h: Int32(final.height))
         return 1
     }
@@ -1740,7 +1804,15 @@ final class KleptonCompositor {
             // without being written shows whatever was in that texture last, and
             // with the guest taking its own time to start there are a great many
             // such frames.
-            let alloc = completeStage < 0 ? nil : a
+            // ...and nil again when the guest's last frame carried no eye
+            // picture at all. The eye textures outlive the frame that filled
+            // them, so without this the eye keeps being drawn after the guest
+            // has stopped submitting a projection layer — and on a guest that
+            // alternates (JKXR: a projection pair in the world, a quad in the
+            // menu, out of the SAME swapchains) that is one screen composited
+            // twice, full-field underneath its own panel. kl_ovrp.h has the
+            // measurement.
+            let alloc = (completeStage < 0 || kl_ovrp_eye_layer_live() == 0) ? nil : a
             var u = withUnsafePointer(to: rendered) { r in
                 kl_reproject_build(haveRendered ? r : nil, Int32(vi),
                                    originFromDevice, view.transform,
@@ -1789,8 +1861,16 @@ final class KleptonCompositor {
         // bit, for every guest that has run here.
         let bind0 = sources.first.flatMap { $0 } ?? sources.compactMap { $0 }.first
         let bind1 = (sources.count > 1 ? sources[1] : nil) ?? bind0
-        guard let bind0, let bind1 else { enc.endEncoding(); return 0 }
-        for n in uniforms.indices where uniforms[n].visible != 0 {
+        // No eye texture is not the same as no picture, and this used to return
+        // here as if it were. A guest can present its whole frame as an OpenXR
+        // QUAD layer and submit no projection layer at all — JKXR does, every
+        // frame — so the eye pass is skipped and the overlay pass at the end of
+        // this function is the composite. Everything between is the eye's.
+        let haveEyes = bind0 != nil && bind1 != nil
+        if !haveEyes {
+            for n in uniforms.indices { uniforms[n].visible = 0 }
+        }
+        for n in uniforms.indices where haveEyes && uniforms[n].visible != 0 {
             // What the fragment stage will actually sample for this view. A
             // third distinct texture cannot be named — there are two slots —
             // so it is dropped rather than shown another eye's picture, which
@@ -1807,114 +1887,6 @@ final class KleptonCompositor {
                 }
             }
         }
-        guard visible > 0 else { enc.endEncoding(); return 0 }
-        if !loggedEyeTextures {
-            loggedEyeTextures = true
-            NSLog("[cp] eye textures: slot0 \(bind0.width)x\(bind0.height) "
-                  + "type \(bind0.textureType.rawValue), slot1 "
-                  + (bind1 === bind0 ? "= slot0 (the eyes share one texture)"
-                                     : "\(bind1.width)x\(bind1.height) "
-                                       + "type \(bind1.textureType.rawValue) "
-                                       + "(one swapchain per eye)"))
-        }
-
-        // What each eye is ACTUALLY being placed with, said once per pass shape.
-        //
-        // This exists because a stereo geometry error has no error surface at
-        // all: every call succeeds, the counters stay healthy, and the only
-        // instrument is a person wearing the headset saying one eye looks wrong
-        // — which cannot say WHICH of three things is wrong. The three are
-        // separable from these numbers alone:
-        //
-        //   * `slice` — eye 1 sampling slice 0 is the right eye showing the
-        //     LEFT eye's picture. Placed with eye 1's quad, that is a ~20 degree
-        //     horizontal shift, because the display's per-eye tangents are
-        //     mirror images (l=1.73/r=1.00 against l=1.00/r=1.73).
-        //   * `tan` — the same shift with the pictures the right way round, if
-        //     the quad is built with the other eye's frustum.
-        //   * `rec=no` — no frame record, so BOTH quads fall back to the
-        //     symmetric 90 degree default while the guest rendered asymmetric
-        //     pictures. That one is wrong in both eyes, unequally.
-        //
-        // Keyed on the values rather than a bare `once`: the interesting case is
-        // the one where they CHANGE (a stage re-created, a swapchain rebuilt),
-        // and a first-frame-only line is exactly what would miss it.
-        let shape = viewIndices.map { vi -> String in
-            let u = uniforms[viewIndices.firstIndex(of: vi)!]
-            return String(format: "v%d slice=%u tan(l%.3f r%.3f t%.3f b%.3f) vis=%u flip=%u",
-                          vi, u.slice, u.tangents.x, u.tangents.y, u.tangents.z,
-                          u.tangents.w, u.visible, u.flip_y)
-        }.joined(separator: " | ")
-        if shape != lastEyeShape {
-            lastEyeShape = shape
-            NSLog("[cp] eye placement: \(shape) | rec=\(haveRendered ? "yes" : "no") "
-                  + "layered=\(layered) stage=\(stage)")
-        }
-
-        // ---------------------------------------------------------------
-        // The crop, from the same frame record `rendered` came from — and it is
-        // read PER EYE.
-        //
-        // The comment that stood here said one grid serves the amplified pass,
-        // so two eyes with different viewports could not both be honoured, took
-        // eye 0's, and justified it: Unity derives both from a single
-        // `renderViewportScale`, so they are equal in every measured run. That
-        // is true of a title that scales its resolution and FALSE of one using
-        // Oculus symmetric projection, where both eyes are rendered with one
-        // union frustum into a widened texture and each eye's own cone is a
-        // different sub-rect of it — measured on BONELAB, eye 0 at x=0 and eye 1
-        // at x=609, both 2271 wide of 2880. Eye 1 read
-        // through eye 0's crop is its picture shifted by that offset, with every
-        // call on the path returning success.
-        //
-        // So the grid carries a BLOCK PER EYE when the two rects differ, and one
-        // block when they do not — which is bit-for-bit the old path for every
-        // guest that has ever run here.
-        var vp0 = SIMD4<Float>.zero
-        var vp1 = SIMD4<Float>.zero
-        var vpOf = SIMD2<Float>.zero
-        if haveRendered {
-            let l = rendered.viewport.0, r = rendered.viewport.1
-            vp0 = SIMD4<Float>(Float(l.0), Float(l.1), Float(l.2), Float(l.3))
-            vp1 = SIMD4<Float>(Float(r.0), Float(r.1), Float(r.2), Float(r.3))
-            vpOf = SIMD2<Float>(Float(rendered.viewport_of.0),
-                                Float(rendered.viewport_of.1))
-            // Said once, and said even when it is ZERO — which is the whole
-            // point. `[ovrp] render viewport` is printed by the guest's own
-            // EndFrame4 on the guest's thread, and until this line existed there
-            // was nothing anywhere saying whether the number reached the
-            // COMPOSITE. Those are different failures with one symptom: a rect
-            // the submit never carried, a rect filed against another stage, and
-            // a rect read correctly and cropped wrongly all look identical from
-            // inside the headset. Zeroes here beside a non-100% line there is
-            // the first; agreement is the third.
-            if !loggedReadViewport {
-                loggedReadViewport = true
-                NSLog("[cp] first render viewport read from the frame record: "
-                      + "\(l.0),\(l.1) \(l.2)x\(l.3) (stage \(stage), serial "
-                      + "\(rendered.serial))"
-                      + (l.2 <= 0 ? " — ZERO, so no crop is applied; compare "
-                                  + "against the [ovrp] render viewport line" : ""))
-            }
-        }
-        // Built from slot 0. The grid is a function of the eye texture's SIZE
-        // and its rate map, and the two eyes agree on both — a guest that
-        // rendered them at different sizes would already be failing the
-        // viewport arithmetic below.
-        let (gridBuf, gridVerts, gridPerEye) =
-            unwarpGrid(bind0, viewport0: vp0, viewport1: vp1, viewportOf: vpOf)
-        // ...and which block each view reads. Assigned here rather than passed
-        // to kl_reproject_build above because the decision needs the eye
-        // texture, which is not known until the loop that builds the uniforms
-        // has run — so the uniforms are built for a shared grid (grid_per_eye
-        // 0, the default and the old behaviour) and only a grid that really
-        // carries two blocks moves eye 1 onto its own.
-        if gridPerEye {
-            for (n, vi) in viewIndices.enumerated() where vi == 1 {
-                uniforms[n].grid_eye = 1
-            }
-        }
-
         // The viewport matters here in a way it did not for a full-screen
         // triangle: the quad is projected, so it lands where the projection
         // says, and the view's own bounds within a shared texture are part of
@@ -1929,26 +1901,145 @@ final class KleptonCompositor {
             }
             enc.setVertexAmplificationCount(viewIndices.count, viewMappings: &mappings)
         }
-        enc.setRenderPipelineState(probePipeline ?? pipeline)
-        if let depthState { enc.setDepthStencilState(depthState) }
-        enc.setFragmentTexture(bind0, index: 0)
-        enc.setFragmentTexture(bind1, index: 1)
-        enc.setFragmentSamplerState(sampler, index: 0)
-        uniforms.withUnsafeBytes { buf in
-            // Vertex only: the fragment stage has no amplification_id to index
-            // this array with, so the one thing it needs — the eye's array
-            // slice — arrives as a flat varying instead (kl_reproject.c).
-            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+
+        // The EYE pass, and only when there is an eye. `haveEyes` is false for
+        // a guest whose whole picture is a composition layer (see above), and
+        // the overlay pass below is then the entire composite rather than a
+        // decoration on top of one.
+        if visible > 0, let bind0, let bind1 {
+            if !loggedEyeTextures {
+                loggedEyeTextures = true
+                NSLog("[cp] eye textures: slot0 \(bind0.width)x\(bind0.height) "
+                      + "type \(bind0.textureType.rawValue), slot1 "
+                      + (bind1 === bind0 ? "= slot0 (the eyes share one texture)"
+                                         : "\(bind1.width)x\(bind1.height) "
+                                           + "type \(bind1.textureType.rawValue) "
+                                           + "(one swapchain per eye)"))
+            }
+
+            // What each eye is ACTUALLY being placed with, said once per pass shape.
+            //
+            // This exists because a stereo geometry error has no error surface at
+            // all: every call succeeds, the counters stay healthy, and the only
+            // instrument is a person wearing the headset saying one eye looks wrong
+            // — which cannot say WHICH of three things is wrong. The three are
+            // separable from these numbers alone:
+            //
+            //   * `slice` — eye 1 sampling slice 0 is the right eye showing the
+            //     LEFT eye's picture. Placed with eye 1's quad, that is a ~20 degree
+            //     horizontal shift, because the display's per-eye tangents are
+            //     mirror images (l=1.73/r=1.00 against l=1.00/r=1.73).
+            //   * `tan` — the same shift with the pictures the right way round, if
+            //     the quad is built with the other eye's frustum.
+            //   * `rec=no` — no frame record, so BOTH quads fall back to the
+            //     symmetric 90 degree default while the guest rendered asymmetric
+            //     pictures. That one is wrong in both eyes, unequally.
+            //
+            // Keyed on the values rather than a bare `once`: the interesting case is
+            // the one where they CHANGE (a stage re-created, a swapchain rebuilt),
+            // and a first-frame-only line is exactly what would miss it.
+            let shape = viewIndices.map { vi -> String in
+                let u = uniforms[viewIndices.firstIndex(of: vi)!]
+                return String(format: "v%d slice=%u tan(l%.3f r%.3f t%.3f b%.3f) vis=%u flip=%u",
+                              vi, u.slice, u.tangents.x, u.tangents.y, u.tangents.z,
+                              u.tangents.w, u.visible, u.flip_y)
+            }.joined(separator: " | ")
+            if shape != lastEyeShape {
+                lastEyeShape = shape
+                NSLog("[cp] eye placement: \(shape) | rec=\(haveRendered ? "yes" : "no") "
+                      + "layered=\(layered) stage=\(stage)")
+            }
+
+            // ---------------------------------------------------------------
+            // The crop, from the same frame record `rendered` came from — and it is
+            // read PER EYE.
+            //
+            // The comment that stood here said one grid serves the amplified pass,
+            // so two eyes with different viewports could not both be honoured, took
+            // eye 0's, and justified it: Unity derives both from a single
+            // `renderViewportScale`, so they are equal in every measured run. That
+            // is true of a title that scales its resolution and FALSE of one using
+            // Oculus symmetric projection, where both eyes are rendered with one
+            // union frustum into a widened texture and each eye's own cone is a
+            // different sub-rect of it — measured on BONELAB, eye 0 at x=0 and eye 1
+            // at x=609, both 2271 wide of 2880. Eye 1 read
+            // through eye 0's crop is its picture shifted by that offset, with every
+            // call on the path returning success.
+            //
+            // So the grid carries a BLOCK PER EYE when the two rects differ, and one
+            // block when they do not — which is bit-for-bit the old path for every
+            // guest that has ever run here.
+            var vp0 = SIMD4<Float>.zero
+            var vp1 = SIMD4<Float>.zero
+            var vpOf = SIMD2<Float>.zero
+            if haveRendered {
+                let l = rendered.viewport.0, r = rendered.viewport.1
+                vp0 = SIMD4<Float>(Float(l.0), Float(l.1), Float(l.2), Float(l.3))
+                vp1 = SIMD4<Float>(Float(r.0), Float(r.1), Float(r.2), Float(r.3))
+                vpOf = SIMD2<Float>(Float(rendered.viewport_of.0),
+                                    Float(rendered.viewport_of.1))
+                // Said once, and said even when it is ZERO — which is the whole
+                // point. `[ovrp] render viewport` is printed by the guest's own
+                // EndFrame4 on the guest's thread, and until this line existed there
+                // was nothing anywhere saying whether the number reached the
+                // COMPOSITE. Those are different failures with one symptom: a rect
+                // the submit never carried, a rect filed against another stage, and
+                // a rect read correctly and cropped wrongly all look identical from
+                // inside the headset. Zeroes here beside a non-100% line there is
+                // the first; agreement is the third.
+                if !loggedReadViewport {
+                    loggedReadViewport = true
+                    NSLog("[cp] first render viewport read from the frame record: "
+                          + "\(l.0),\(l.1) \(l.2)x\(l.3) (stage \(stage), serial "
+                          + "\(rendered.serial))"
+                          + (l.2 <= 0 ? " — ZERO, so no crop is applied; compare "
+                                      + "against the [ovrp] render viewport line" : ""))
+                }
+            }
+            // Built from slot 0. The grid is a function of the eye texture's SIZE
+            // and its rate map, and the two eyes agree on both — a guest that
+            // rendered them at different sizes would already be failing the
+            // viewport arithmetic below.
+            let (gridBuf, gridVerts, gridPerEye) =
+                unwarpGrid(bind0, viewport0: vp0, viewport1: vp1, viewportOf: vpOf)
+            // ...and which block each view reads. Assigned here rather than passed
+            // to kl_reproject_build above because the decision needs the eye
+            // texture, which is not known until the loop that builds the uniforms
+            // has run — so the uniforms are built for a shared grid (grid_per_eye
+            // 0, the default and the old behaviour) and only a grid that really
+            // carries two blocks moves eye 1 onto its own.
+            if gridPerEye {
+                for (n, vi) in viewIndices.enumerated() where vi == 1 {
+                    uniforms[n].grid_eye = 1
+                }
+            }
+            enc.setRenderPipelineState(probePipeline ?? pipeline)
+            if let depthState { enc.setDepthStencilState(depthState) }
+            enc.setFragmentTexture(bind0, index: 0)
+            enc.setFragmentTexture(bind1, index: 1)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            uniforms.withUnsafeBytes { buf in
+                // Vertex only: the fragment stage has no amplification_id to index
+                // this array with, so the one thing it needs — the eye's array
+                // slice — arrives as a flat varying instead (kl_reproject.c).
+                enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            }
+            // The unwarp grid, bound to the VERTEX stage. Identity until the guest's
+            // eye textures are foveated; after that it carries the squeeze this pass
+            // has to undo. See unwarpGrid and kl_reproject.h.
+            enc.setVertexBuffer(gridBuf, offset: 0, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
         }
-        // The unwarp grid, bound to the VERTEX stage. Identity until the guest's
-        // eye textures are foveated; after that it carries the squeeze this pass
-        // has to undo. See unwarpGrid and kl_reproject.h.
-        enc.setVertexBuffer(gridBuf, offset: 0, index: 1)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
-        encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
-                       originFromDevice: originFromDevice)
+        let panels = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
+                                    originFromDevice: originFromDevice,
+                                    writeDepth: visible == 0)
         enc.endEncoding()
-        return visible
+        // "How many eyes got a picture", which is what the caller counts black
+        // frames with — and a panel IS a picture. Without this a guest that
+        // composites only quad layers reports every frame black while showing
+        // its menu correctly, which is an instrument contradicting the display.
+        if visible > 0 { return visible }
+        return panels > 0 ? viewIndices.count : 0
     }
 
     /// The layers that are NOT the eye, drawn on top of it in the same encoder.
@@ -1966,13 +2057,43 @@ final class KleptonCompositor {
     /// already the SYSTEM overlays (the Home indicator, KleptonApp.swift) — two
     /// knobs one letter apart, fighting over one name, is a bug with no error
     /// surface at all.
+    ///
+    /// Returns how many layers were actually drawn — for a guest whose whole
+    /// frame is a quad that IS the picture, and the caller's black-frame count
+    /// depends on knowing it.
+    ///
+    /// `writeDepth` is set when the overlays ARE the frame — the eye pass drew
+    /// nothing, so nothing else in this pass will write depth.
+    ///
+    /// That distinction is the whole of it. visionOS reprojects the submitted
+    /// frame using its depth buffer, and the encoder's default state writes no
+    /// depth at all, so a frame whose only content is a quad layer arrives as
+    /// perfect colour over a depth buffer still holding the reverse-Z clear of
+    /// 0 — "nothing is here at any finite distance" — and the compositor
+    /// honours that literally. It is the same measurement the eye pipeline's
+    /// depth state records: a quad with writes off is invisible, the same quad
+    /// with writes on appears. It never showed on the guest this pass was
+    /// written for, because an Unreal title draws its eye first and its UI
+    /// second, so the depth was already there to ride on.
+    ///
+    /// Left OFF when the eye pass did draw, which is not timidity: an overlay
+    /// blends, so a transparent region of a UI quad would otherwise stamp the
+    /// quad's near depth over the world behind it and reproject that patch of
+    /// the world at the panel's distance.
+    @discardableResult
     private func encodeOverlays(_ enc: MTLRenderCommandEncoder,
                                 viewIndices: [Int],
                                 drawable: LayerRenderer.Drawable,
-                                originFromDevice: simd_float4x4) {
-        guard overlaysEnabled, let pipe = overlayPipeline else { return }
+                                originFromDevice: simd_float4x4,
+                                writeDepth: Bool) -> Int {
+        guard overlaysEnabled, let pipe = overlayPipeline else { return 0 }
+        // .greater against that same clear, and the shader's own projected
+        // position carries the quad's real distance, so what lands in the
+        // buffer is where the panel actually is.
+        if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
         let n = Int(kl_ovrp_overlay_count())
-        if n == 0 { return }
+        if n == 0 { return 0 }
+        var drawn = 0
         for i in 0..<n {
             var ov = kl_ovrp_overlay()
             guard kl_ovrp_overlay_get(Int32(i), &ov) != 0 else { continue }
@@ -1984,7 +2105,14 @@ final class KleptonCompositor {
             var texture: MTLTexture? = nil
             for vi in viewIndices {
                 var w: Int32 = 0, h: Int32 = 0
+                // Two producers, one consumer, asked in the order they can
+                // answer: a Vulkan guest's layer image belongs to kl_vulkan, and
+                // everything else reaches a compositor through kl_glfb's layer
+                // table — an OpenXR quad on GL is bound there and a Vulkan one
+                // is recorded there too. Vulkan first, so RE4's path is
+                // untouched.
                 let t = kl_vulkan_layer_mtl_texture(ov.layer_id, ov.stage, Int32(vi), &w, &h)
+                    ?? kl_glfb_layer_mtl_texture(ov.layer_id, ov.stage, &w, &h)
                 if texture == nil, let t { texture = Unmanaged<MTLTexture>
                     .fromOpaque(t).takeUnretainedValue() }
                 var u = kl_overlay_build(&ov, Int32(vi), originFromDevice,
@@ -2012,6 +2140,7 @@ final class KleptonCompositor {
                 enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
             }
             enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            drawn += 1
             if !loggedOverlayDraw.contains(ov.layer_id) {
                 loggedOverlayDraw.insert(ov.layer_id)
                 NSLog("[cp] compositing overlay layer \(ov.layer_id): "
@@ -2020,6 +2149,7 @@ final class KleptonCompositor {
                       + (ov.head_locked != 0 ? ", HEAD-LOCKED" : ""))
             }
         }
+        return drawn
     }
     private let overlaysEnabled = klEnvOn("KL_GUEST_OVERLAYS", default: true)
     private var loggedOverlayMiss = Set<Int32>()

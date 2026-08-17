@@ -350,7 +350,12 @@ static const char kl_msl_overlay[] =
 "    float2 c = float2((vid & 1) ? 1.0 : -1.0, (vid & 2) ? -1.0 : 1.0);\n"
 "    float4 p = float4(c * u.half_size, 0.0, 1.0);\n"
 "    o.pos = u.projection * (u.model_view * p);\n"
-"    float2 t = float2((c.x + 1.0) * 0.5, (1.0 - c.y) * 0.5);\n"
+// Bottom-left origin as the base, and `flip_y` meaning "the picture's origin is
+// the TOP left" — the same convention as the reprojection pass above and as
+// kl_glfb_eye_mtl_origin_top_left, rather than the mirror image of it. The two
+// passes read the same field off two records and a flag that means opposite
+// things in each is a wrong picture with nothing to catch it.
+"    float2 t = float2((c.x + 1.0) * 0.5, (c.y + 1.0) * 0.5);\n"
 "    if (u.flip_y != 0u) t.y = 1.0 - t.y;\n"
 "    o.uv = u.uv_rect.xy + t * u.uv_rect.zw;\n"
 "    return o;\n"
@@ -625,6 +630,12 @@ kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
     if (ov->shape != 0) return u;
     if (!(ov->size[0] > 0.0f) || !(ov->size[1] > 0.0f)) return u;
 
+    // Which eyes were named. LEFT(1) and RIGHT(2) are how a guest shows
+    // different pixels to each eye — two quads, one per eye — so drawing one of
+    // those in both is the other eye's picture on top of this one's.
+    if (ov->eye_visibility == 1 && eye != 0) return u;
+    if (ov->eye_visibility == 2 && eye != 1) return u;
+
     u.half_size = simd_make_float2(ov->size[0] * 0.5f, ov->size[1] * 0.5f);
 
     // Which part of the layer texture this eye reads. The guest states it in
@@ -651,6 +662,7 @@ kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
     simd_float4x4 world_from_view = simd_mul(origin_from_device, device_from_view);
     u.model_view = simd_mul(simd_inverse(world_from_view), world_from_quad);
     u.srgb_decode = (uint32_t)kl_reproject_srgb_decode();
+    u.flip_y = ov->origin_top_left ? 1u : 0u;
     u.visible = 1;
     return u;
 }

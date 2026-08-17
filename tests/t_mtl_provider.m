@@ -183,6 +183,77 @@ static int provide(int eye, int stage, int w, int h, uint32_t internal_fmt,
 }
 
 
+// ---------------------------------------------------------------------------
+// The same allocator for a NON-EYE layer — an OpenXR quad, which for JKXR is
+// the whole picture. Separate from the eye one because the shapes differ: an
+// eye is one slice of a shared 2-slice array (that is what a layered drawable
+// looks like) and a layer is a plain 2D texture of the guest's own size.
+//
+// Keyed rather than indexed: the layer id is the runtime's own (kl_openxr uses
+// the swapchain's slot, 0..63), so each row carries the key it holds.
+static struct { int layer, stage; id<MTLTexture> tex; int w, h; uint32_t fmt; }
+    g_layers[8];
+
+static int provide_layer(int layer, int stage, int w, int h, uint32_t internal_fmt,
+                         kl_mtl_eye_texture *out, void *ctx) {
+    (void)ctx;
+    if (layer < 0 || stage < 0 || !out) return 0;
+    MTLPixelFormat pf = klmtl_pixel_format(internal_fmt);
+    if (pf == MTLPixelFormatInvalid) {
+        fprintf(stderr, "  [mtl] layer %d stage %d asks for GL internalformat 0x%x, "
+                        "which this provider has no MTLPixelFormat for — declining\n",
+                layer, stage, internal_fmt);
+        return 0;
+    }
+    void *devp = kl_glfb_mtl_device();
+    if (!devp) {
+        fprintf(stderr, "  [mtl] no MTLDevice from ANGLE — cannot provide layer "
+                        "textures\n");
+        return 0;
+    }
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)devp;
+    int row = -1, freerow = -1;
+    for (unsigned i = 0; i < sizeof g_layers / sizeof *g_layers; i++) {
+        if (g_layers[i].tex && g_layers[i].layer == layer && g_layers[i].stage == stage)
+            { row = (int)i; break; }
+        if (!g_layers[i].tex && freerow < 0) freerow = (int)i;
+    }
+    if (row < 0) row = freerow;
+    if (row < 0) {
+        fprintf(stderr, "  [mtl] no room for layer %d stage %d — %u fit\n",
+                layer, stage, (unsigned)(sizeof g_layers / sizeof *g_layers));
+        return 0;
+    }
+    // Size and format are part of the identity, exactly as for an eye: a guest
+    // that rebuilds its swapchain at another size would otherwise be handed the
+    // previous allocation and render into storage it does not have.
+    if (!g_layers[row].tex || g_layers[row].w != w || g_layers[row].h != h ||
+        g_layers[row].fmt != internal_fmt) {
+        MTLTextureDescriptor *d =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
+                                                               width:(NSUInteger)w
+                                                              height:(NSUInteger)h
+                                                           mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModeShared;      // so the readback below works
+        id<MTLTexture> t = [dev newTextureWithDescriptor:d];
+        if (!t) {
+            fprintf(stderr, "  [mtl] newTextureWithDescriptor 0x%x %dx%d FAILED "
+                            "(layer %d)\n", internal_fmt, w, h, layer);
+            return 0;
+        }
+        g_layers[row] = (typeof(g_layers[0])){ layer, stage, t, w, h, internal_fmt };
+        fprintf(stderr, "  [mtl] layer %d stage %d: GL 0x%x %dx%d (%.1f MB)\n",
+                layer, stage, internal_fmt, w, h,
+                (double)w * h * 4 / (1024 * 1024));
+    }
+    out->texture = (__bridge void *)g_layers[row].tex;
+    out->slice   = 0;
+    out->w       = g_layers[row].w;
+    out->h       = g_layers[row].h;
+    return 1;
+}
+
 void kl_mtl_provider_install(void) {
     // KL_VIEW implies it: the viewer's hardware compositor samples exactly
     // these textures, so without a provider there is nothing to composite and
@@ -195,7 +266,10 @@ void kl_mtl_provider_install(void) {
         return;
     }
     kl_glfb_set_mtl_provider(provide, NULL);
-    fprintf(stderr, "  [mtl] eye textures will be MTLTexture-backed\n");
+    // The non-eye layers too, or a guest whose whole picture is a quad (JKXR)
+    // has nothing for the viewer's overlay pass to sample.
+    kl_glfb_set_mtl_layer_provider(provide_layer, NULL);
+    fprintf(stderr, "  [mtl] eye and layer textures will be MTLTexture-backed\n");
 }
 
 // Read (eye, stage) back through Metal and count lit pixels, on a stride so a
@@ -307,15 +381,31 @@ static id<MTLTexture> klmtl_readable(id<MTLTexture> t, NSUInteger slice,
 
 static unsigned long long g_mtl_lum_sum;
 static unsigned long long g_mtl_lum_n;
+static unsigned long long g_mtl_alpha_sum;
 
 unsigned kl_mtl_mean_luma(void) {
     return g_mtl_lum_n ? (unsigned)(g_mtl_lum_sum / g_mtl_lum_n) : 0;
 }
 
-unsigned long kl_mtl_count_lit(int eye, int stage, int *out_w, int *out_h) {
-    g_mtl_lum_sum = g_mtl_lum_n = 0;
-    int slice = 0;
-    void *texp = kl_glfb_eye_mtl_texture(eye, stage, &slice);
+// Mean ALPHA over the same samples, 0..255. Trap 33 is why it is here and why
+// it is reported beside the lit count rather than only when someone suspects
+// it: a guest leaves the eye texture's alpha at 0 because the runtime composites
+// that layer opaque, and a QUAD layer asking for source-alpha blending
+// (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, which JKXR sets) is then
+// a perfectly rendered picture that composites to nothing. Fully transparent and
+// black are the same display, and no other number here can tell them apart.
+unsigned kl_mtl_mean_alpha(void) {
+    return g_mtl_lum_n ? (unsigned)(g_mtl_alpha_sum / g_mtl_lum_n) : 0;
+}
+
+// One MTLTexture's lit count, whatever it is a texture OF. The eye and the
+// layer readbacks differ only in how the texture is found, and a second copy of
+// the tone map is a second chance for the two to disagree about what "lit"
+// means — which is the one thing kl_mtl_count_lit's own comment says must not
+// happen.
+static unsigned long klmtl_count_lit_tex(void *texp, int slice,
+                                         int *out_w, int *out_h) {
+    g_mtl_lum_sum = g_mtl_lum_n = g_mtl_alpha_sum = 0;
     if (!texp) return 0;
     id<MTLTexture> t = (__bridge id<MTLTexture>)texp;
     NSUInteger w = t.width, h = t.height;
@@ -348,6 +438,7 @@ unsigned long kl_mtl_count_lit(int eye, int stage, int *out_w, int *out_h) {
             for (int k = 0; k < 3; k++)
                 lum += klmtl_chan8(row, x, k, is_half);
             g_mtl_lum_sum += lum;
+            g_mtl_alpha_sum += klmtl_chan8(row, x, 3, is_half);
             g_mtl_lum_n++;
             if (lum > 12) lit++;                    // kl_glfb's own threshold
         }
@@ -356,16 +447,28 @@ unsigned long kl_mtl_count_lit(int eye, int stage, int *out_w, int *out_h) {
     return lit;
 }
 
+unsigned long kl_mtl_count_lit(int eye, int stage, int *out_w, int *out_h) {
+    int slice = 0;
+    void *texp = kl_glfb_eye_mtl_texture(eye, stage, &slice);
+    return klmtl_count_lit_tex(texp, slice, out_w, out_h);
+}
+
+// ...and the same measurement for a non-eye LAYER. This is the whole of the
+// evidence that a quad-only guest's picture reached storage a compositor can
+// sample: the eye table is empty for such a guest, so every eye number is 0 and
+// says nothing about it.
+unsigned long kl_mtl_count_lit_layer(int layer, int stage, int *out_w, int *out_h) {
+    void *texp = kl_glfb_layer_mtl_texture(layer, stage, NULL, NULL);
+    return klmtl_count_lit_tex(texp, 0, out_w, out_h);
+}
+
 // The eye's MTLTexture as a PNG, tone-mapped exactly as kl_glfb's capture is, so
 // the two files can be looked at side by side. This is what a lit count cannot
 // answer: not "did pixels arrive" but "are they the same picture".
 // Full resolution, no stride — it runs once at the end of a run.
-int kl_mtl_dump_png(int eye, int stage, const char *path) {
-    int slice = 0;
-    void *texp = kl_glfb_eye_mtl_texture(eye, stage, &slice);
+static int klmtl_dump_png_tex(void *texp, int slice, int top_left, const char *path) {
     if (!texp || !path) return 0;
     id<MTLTexture> t = (__bridge id<MTLTexture>)texp;
-    int top_left = kl_glfb_eye_mtl_origin_top_left(eye, stage);
     NSUInteger rslice = 0;
     t = klmtl_readable(t, (NSUInteger)slice, &rslice);
     if (!t) return 0;
@@ -440,4 +543,19 @@ int kl_mtl_dump_png(int eye, int stage, const char *path) {
     fclose(f);
     free(cb);
     return 1;
+}
+
+int kl_mtl_dump_png(int eye, int stage, const char *path) {
+    int slice = 0;
+    void *texp = kl_glfb_eye_mtl_texture(eye, stage, &slice);
+    return klmtl_dump_png_tex(texp, slice, kl_glfb_eye_mtl_origin_top_left(eye, stage),
+                              path);
+}
+
+// ...and the same for a non-eye LAYER, which is the only picture a quad-only
+// guest produces. A GL guest's layer is bottom-up like its eye, so the flip is
+// the same question asked of the same table.
+int kl_mtl_dump_png_layer(int layer, int stage, const char *path) {
+    void *texp = kl_glfb_layer_mtl_texture(layer, stage, NULL, NULL);
+    return klmtl_dump_png_tex(texp, 0, 0, path);
 }

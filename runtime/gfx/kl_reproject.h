@@ -168,6 +168,11 @@ typedef struct {
     // the same argument kl_ovrp_render_pose.viewport_of makes at length.
     simd_float4   uv_rect;      // x, y, w, h
     uint32_t      slice;
+    // 1 = the layer's picture has its origin at the TOP left, so its v is
+    // flipped before it is read — the same meaning and the same polarity as the
+    // reprojection pass's field above, read from kl_ovrp_overlay.origin_top_left
+    // rather than decided here. It is 1 for a Vulkan guest (RE4's UI quads) and
+    // 0 for one that drew through GL.
     uint32_t      flip_y;
     uint32_t      srgb_decode;
     // 0 = draw nothing. Set for a layer whose SHAPE is not implemented, or

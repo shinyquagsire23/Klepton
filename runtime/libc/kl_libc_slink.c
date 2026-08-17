@@ -986,6 +986,22 @@ char *klb___fgets_chk(char *dst, int supplied, void *stream, size_t dst_len) {
     return fgets(dst, supplied, kl_host_file(stream));
 }
 
+// The stdio half of the FORTIFY family. bionic checks the WHOLE transfer
+// against the object size, so the multiply is the check — `size * count` is
+// what leaves the buffer, and a guest passing (1, n) and one passing (n, 1) are
+// the same call to fortify. Overflow is checked first for the same reason
+// bionic checks it: a product that wraps is a bounds test that passes.
+//
+// The FILE* is a GUEST one and goes through kl_host_file, like every other
+// stdio entry here — bionic's `&__sF[n]` is not a host FILE*.
+size_t klb___fwrite_chk(const void *buf, size_t size, size_t count,
+                        void *stream, size_t cap) {
+    if (size && count > (size_t)-1 / size) chk_fail("__fwrite_chk", (size_t)-1, cap);
+    size_t want = size * count;
+    if (want > cap) chk_fail("__fwrite_chk", want, cap);
+    return fwrite(buf, size, count, kl_host_file(stream));
+}
+
 // ---- __pthread_cleanup_push / _pop ----
 //
 // bionic's shape, and it is not glibc's: the cleanup record is allocated by the
