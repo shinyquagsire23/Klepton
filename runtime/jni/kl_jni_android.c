@@ -376,6 +376,7 @@ static klj_val klj_Intent_getExtras(void *env, void *self, const klj_val *a, int
         // whole point of the synthesized Intent is to be the one the shell
         // would have sent.
         if (!getenv("KL_SLINK_START_INFO")) {
+            const char *si = NULL;
             const char *args = getenv("KL_SLINK_SARGS");
             if (args && *args) {
                 const char *p = args;
@@ -385,15 +386,22 @@ static klj_val klj_Intent_getExtras(void *env, void *self, const klj_val *a, int
                     const char *end = strchr(p, '~');
                     size_t len = end ? (size_t)(end - p) : strlen(p);
                     if (len) {
-                        char *si = malloc(len + 1);
-                        if (si) {
-                            memcpy(si, p, len);
-                            si[len] = '\0';
-                            kv[k].key = "sStartInfo"; kv[k].val = si; k++;
+                        char *owned = malloc(len + 1);
+                        if (owned) {
+                            memcpy(owned, p, len);
+                            owned[len] = '\0';
+                            si = owned;
                         }
                     }
                 }
             }
+            // Default to the "0,0,1" a real handoff carries in field 3 (a
+            // head-relative launch, no seated recenter). A direct launch with no
+            // sArgs — or one whose sArgs is too short to carry it — would
+            // otherwise leave sStartInfo empty, which is the run that needed
+            // KL_SLINK_START_INFO=0,0,1 passed by hand. Now it does not.
+            if (!si) si = "0,0,1";
+            kv[k].key = "sStartInfo"; kv[k].val = si; k++;
         }
         kv[k].key = kv[k].val = NULL;
         if (k) {
@@ -608,6 +616,37 @@ static klj_val klj_ComponentName_getClassName(void *env, void *self, const klj_v
 static klj_val klj_ComponentName_getPackageName(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.l = kl_jni_new_string(klj_guest_package())};
+}
+// Intent.toUri(flags) — the launch Intent, SERIALIZED. AC Nexus is the caller,
+// through ReflectionHelper off getIntent(): Ubisoft's own bootstrap re-reads
+// how it was started as a URI (deep-link plumbing), and it does so on the very
+// first frame, so a refusal here is the whole game not loading.
+//
+// Answered as Android would answer for the Intent this process stands in for —
+// getComponent() above already commits to "started EXPLICITLY, by the
+// manifest's launcher activity", and this is that same claim in Android's wire
+// format: action MAIN, category LAUNCHER, the component spelled
+// package/dotted.Class. No data URI and no extras, for getExtras()'s reason —
+// the launch genuinely carries none — and no launchFlags, which toUri only
+// emits when the intent has flags set. Bit 1 of the argument
+// (URI_INTENT_SCHEME) selects the "intent:" scheme prefix; the other flag bits
+// change nothing about a data-less intent's serialization.
+static klj_val klj_Intent_toUri(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    long flags = n > 0 ? (long)(int)a[0].j : 0;   // the argument is a jint
+    char dotted[256];
+    const char *internal = klj_activity_class();
+    size_t i = 0;
+    for (; internal[i] && i < sizeof dotted - 1; i++)
+        dotted[i] = internal[i] == '/' ? '.' : internal[i];
+    dotted[i] = 0;
+    char uri[1024];
+    snprintf(uri, sizeof uri,
+             "%s#Intent;action=android.intent.action.MAIN;"
+             "category=android.intent.category.LAUNCHER;component=%s/%s;end",
+             (flags & 1) ? "intent:" : "", klj_guest_package(), dotted);
+    KLJ_LOG("Intent.toUri(%ld) -> %s", flags, uri);
+    return (klj_val){.l = kl_jni_new_string(uri)};
 }
 // ---- WebView, and what it honestly is here ----------------------------------
 //
@@ -1409,6 +1448,7 @@ const klj_binding klj_bind_android[] = {
 
     {"android/content/Intent", "setPackage",  "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_setPackage},
     {"android/content/Intent", "addFlags",    "(I)Landroid/content/Intent;",                 klj_Intent_addFlags},
+    {"android/content/Intent", "toUri",       "(I)Ljava/lang/String;",                       klj_Intent_toUri},
     {"android/content/Context", "getPackageManager", "()Landroid/content/pm/PackageManager;", klj_Context_getPackageManager},
     {"android/content/Context", "getPackageName", "()Ljava/lang/String;", klj_Context_getPackageName},
     {"android/content/Context", "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", klj_Context_getSystemService},

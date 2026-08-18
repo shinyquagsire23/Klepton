@@ -43,6 +43,12 @@ void kl_audio_flush(void);
 // caller should treat as "fall back to your own clock for this buffer".
 size_t kl_audio_write(const void *pcm, size_t bytes);
 
+// Same, but tagged with an opaque per-producer key so several producers can feed
+// ONE device and be MIXED rather than corrupt each other's writes. Steam Link's
+// VR client opens two output streams at once; each passes its stream pointer as
+// `src`. kl_audio_write(pcm,bytes) is exactly this with src == NULL (one source).
+size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes);
+
 // True once a device is open and running, i.e. kl_audio_write is the clock.
 int  kl_audio_active(void);
 
@@ -75,5 +81,11 @@ void kl_audio_session_ready(double sample_rate);
 unsigned kl_audio_underruns(void);
 
 void kl_audio_report(FILE *f);
+
+// Raise the fill-target floor (ms) for a guest whose audio arrives over a
+// jittery link (Steam Link's network stream), so a short stall is buffered
+// rather than heard as a dropout. 0 leaves the 80 ms default. KL_AUDIO_LATENCY_MS
+// still overrides. Set before the guest opens its audio device.
+void kl_audio_set_latency_ms(unsigned ms);
 
 #endif
