@@ -4139,6 +4139,11 @@ static XrResult klxr_ReleaseSwapchainImage(void *swapchain,
 static void (*g_frame_pacer)(void);
 void kl_openxr_set_frame_pacer(void (*wait)(void)) { g_frame_pacer = wait; }
 
+// Set by a driver whose guest stacks projection layers (Steam Link): capture
+// the topmost layer rather than layer 0. See kl_openxr.h. Read in xrEndFrame.
+static int g_capture_topmost_layer;
+void kl_openxr_set_capture_topmost_layer(int on) { g_capture_topmost_layer = on ? 1 : 0; }
+
 static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
                                XrFrameState *state) {
     klxr_session *s = klxr_sess(session);
@@ -4216,23 +4221,89 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     s->frame_begun = 0;
     s->frames_ended++;
 
-    // Which projection layer the capture reads. This guest submits more than
-    // one — measured: two, each with a left and a right view — and only one of
-    // them holds the streamed picture. Nothing in the submission says which, so
-    // the capture takes the first (the base layer, composited furthest back)
-    // and KL_XR_CAPTURE_LAYER moves it without a rebuild, because a run that
-    // reads the wrong one costs a fresh Steam pairing to repeat.
+    // Which projection layer the capture reads. Some guests submit more than
+    // one — Steam Link submits several, each with a left and a right view — and
+    // only one of them holds the streamed picture. Nothing in a single layer's
+    // submission says which, but their ORDER does: OpenXR draws projection
+    // layers back-to-front, so layer 0 is the backdrop (Steam Link's room,
+    // measured black in an empty space) and the LAST one is the picture on top.
     //
-    // It is now also which layer the COMPOSITOR shows, which makes it more than
-    // a capture knob: the compositor draws one quad per eye out of one array
-    // texture, so it can show exactly one projection layer, and layering the
-    // rest is real work (their own quads, their own depths, in submission
-    // order) rather than a parameter. Until then this is the one that reaches
-    // the display, and the name says only half of what it does.
-    static int cap_layer = -1;
-    if (cap_layer < 0) cap_layer = kl_env_int("KL_XR_CAPTURE_LAYER", 0);
+    // Three ways to pick, in priority order:
+    //   1. KL_XR_CAPTURE_LAYER=N pins index N (the debug override, and the way a
+    //      run that read the wrong one is retried without a rebuild — a miss
+    //      costs a fresh Steam pairing).
+    //   2. A driver that knows its guest stacks layers
+    //      (kl_openxr_set_capture_topmost_layer) → the topmost submitted this
+    //      frame, computed below once the count is known.
+    //   3. Otherwise layer 0, which is every single-layer guest and the old
+    //      behaviour unchanged.
+    //
+    // This is also which layer the COMPOSITOR shows: it draws one quad per eye
+    // out of one array texture, so it can show exactly one projection layer.
+    // Layering the rest (their own quads, depths, submission order) is real work
+    // for later; until then the topmost is the closest single-layer answer.
+    int env_cap = kl_env_int("KL_XR_CAPTURE_LAYER", -1);
+    // Pre-pass over the projection layers, so "which one" has an answer before
+    // the loop that walks them. Two facts per layer, by its running index:
+    // whether it exists at all, and its horizontal field of view — because
+    // "topmost" alone picked the wrong one. Steam Link stacks, per eye, a
+    // full-FOV eye view (~105°, the immersive picture) AND a narrow ~60° panel
+    // (the flat "screen" / HUD) composited on top. The literal topmost is that
+    // narrow panel — a small square that follows the head — so topmost has to
+    // mean "topmost of the layers that fill the eye", skipping the panels.
+    uint32_t proj_layer_count = 0;
+    float    max_span = 0.0f;
+    for (uint32_t i = 0; i < info->layerCount; i++) {
+        const XrCompositionLayerBaseHeader *l = info->layers[i];
+        if (!l || l->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
+        proj_layer_count++;
+        const XrCompositionLayerProjection *p =
+            (const XrCompositionLayerProjection *)l;
+        if (p->viewCount >= 1) {
+            float span = fabsf(p->views[0].fov.angleLeft) +
+                         fabsf(p->views[0].fov.angleRight);
+            if (span > max_span) max_span = span;
+        }
+    }
+    int cap_layer;
+    if (env_cap >= 0) {
+        cap_layer = env_cap;                       // pinned override
+    } else if (g_capture_topmost_layer && proj_layer_count > 0) {
+        // Topmost layer whose FOV is within 80% of the widest — i.e. the
+        // topmost that actually fills the eye, not a narrow panel on top of it.
+        cap_layer = 0;
+        int j = 0;
+        for (uint32_t i = 0; i < info->layerCount; i++) {
+            const XrCompositionLayerBaseHeader *l = info->layers[i];
+            if (!l || l->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
+            const XrCompositionLayerProjection *p =
+                (const XrCompositionLayerProjection *)l;
+            float span = p->viewCount >= 1
+                ? fabsf(p->views[0].fov.angleLeft) +
+                  fabsf(p->views[0].fov.angleRight)
+                : 0.0f;
+            if (max_span <= 0.0f || span >= 0.80f * max_span) cap_layer = j;
+            j++;
+        }
+    } else {
+        cap_layer = 0;                             // base layer / single-layer guests
+    }
     uint32_t proj_layers = 0;
     int drawn_stage = -1;
+    // Foveal-inset composite (KL_XR_FOVEA, on by default with the layer-stacking
+    // guests). Steam Link streams a wide low-detail base layer plus a narrow
+    // high-detail centre inset; cap_layer captures the base, and these remember,
+    // per eye, the base's stage and its signed FOV tangents so a later narrow
+    // layer can be laid over the centre where its own frustum falls. Set as the
+    // base layer's views are walked, read as the inset's are. KL_XR_FOVEA_FLIP
+    // inverts the vertical mapping if the guest's image rows run bottom-up.
+    static int fovea_on = -1, fovea_flip = -1;
+    if (fovea_on < 0)   fovea_on   = g_capture_topmost_layer &&
+                                     kl_env_on("KL_XR_FOVEA", 1);
+    if (fovea_flip < 0) fovea_flip = kl_env_on("KL_XR_FOVEA_FLIP", 0);
+    int   base_stage_eye[2] = { -1, -1 };
+    float base_tan[2][4];   // signed tan(L,R,U,D) per eye — the base frustum
+    float base_eye_x[2] = { 0, 0 };   // the base VIEW's x position, for parallax
     // What the composited layer SAYS it was drawn with. See kl_ovrp.h's
     // kl_ovrp_frame_end_external: taking these from the submission rather than
     // from our latch is what stops the compositor correcting a delta the guest
@@ -4320,6 +4391,49 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         for (uint32_t v = 0; v < proj->viewCount && v < 2; v++) {
             klxr_swapchain *sc = klxr_swapchain_of(proj->views[v].subImage.swapchain);
             if (!sc) continue;
+            // Diagnostic (KL_GLFB_PROBE_VIDEO): read back EVERY projection
+            // layer's released image, not just the one the compositor mirrors.
+            // A multi-projection-layer guest (Steam Link submits three) hides
+            // its picture in whichever layer we are NOT capturing, and the only
+            // way to tell which is to look at all of them in one frame.
+            static int probe_layers = -1;
+            if (probe_layers < 0) probe_layers = kl_env_on("KL_GLFB_PROBE_VIDEO", 0);
+            if (probe_layers && sc->last_released >= 0 && sc->last_released < sc->count) {
+                char ptag[24];
+                snprintf(ptag, sizeof ptag, "PLYR%uE%u", li, v);
+                kl_glfb_probe_tex(ptag, sc->tex[sc->last_released],
+                                  sc->array_size > 1
+                                    ? (int)proj->views[v].subImage.imageArrayIndex
+                                    : -1,
+                                  (int)sc->width, (int)sc->height);
+            }
+            // One-time geometry census: every projection layer's reference
+            // space, field of view and pose. A layer in VIEW space is
+            // head-locked (a HUD/screen that follows the head); a narrow FOV is
+            // a small floating panel rather than the full eye view. This is what
+            // tells apart "the base layer is the immersive eye, the top ones are
+            // screens" from "the top layer IS the eye" — without capturing each
+            // in turn. Printed for the first few (layer,eye) pairs seen.
+            {
+                static uint16_t said_geo;
+                int slot = (int)(li * 2 + v);
+                if (slot < 16 && !(said_geo & (1u << slot))) {
+                    said_geo |= (uint16_t)(1u << slot);
+                    klxr_space *lsp0 = klxr_space_of(layer->space);
+                    const XrFovf *fv = &proj->views[v].fov;
+                    const XrVector3f *lp = &proj->views[v].pose.position;
+                    fprintf(stderr,
+                        "  [xr] GEO layer %u eye %u: space %s  fov deg "
+                        "L%.1f R%.1f U%.1f D%.1f  pose (%.2f %.2f %.2f)  "
+                        "%ux%u%s\n",
+                        li, v,
+                        lsp0 ? klxr_ref_space_name(lsp0->reference_type) : "action/?",
+                        fv->angleLeft  * 57.2958f, fv->angleRight * 57.2958f,
+                        fv->angleUp    * 57.2958f, fv->angleDown  * 57.2958f,
+                        lp->x, lp->y, lp->z, sc->width, sc->height,
+                        (int)li == cap_layer ? " [captured]" : "");
+                }
+            }
             // The image the guest DREW is the one it released, not the one its
             // framebuffer still points at — the swapchain has three and the
             // next acquire has not happened yet. Named every frame, because the
@@ -4381,6 +4495,15 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 t[1] = fabsf(tanf(f->angleRight));
                 t[2] = fabsf(tanf(f->angleUp));
                 t[3] = fabsf(tanf(f->angleDown));
+                // Signed tangents + the stage the base landed in, for the foveal
+                // inset below: it needs the base's real (asymmetric) frustum and
+                // the eye texture the base was mirrored into.
+                base_tan[v][0] = tanf(f->angleLeft);
+                base_tan[v][1] = tanf(f->angleRight);
+                base_tan[v][2] = tanf(f->angleUp);
+                base_tan[v][3] = tanf(f->angleDown);
+                base_eye_x[v] = proj->views[v].pose.position.x;
+                base_stage_eye[v] = sc->last_released;
             }
             // The eye textures the compositor samples, provided retroactively:
             // this call is the first moment anything knows which swapchain is
@@ -4406,6 +4529,77 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                                           (int)proj->views[v].subImage.imageArrayIndex);
                 else
                     klxr_back_eye_images(sc, (int)v);
+            }
+            // Foveal inset: a NON-captured projection layer that is strictly
+            // narrower than the base and centred inside it is the high-detail
+            // centre of a foveated stream. Lay it over the base eye where its
+            // frustum falls. GL path only (the composite is kl_glfb's blit); the
+            // base for this eye must already be captured this frame.
+            if (fovea_on && (int)li != cap_layer && base_stage_eye[v] >= 0 &&
+                sc->last_released >= 0 && sc->last_released < sc->count &&
+                (!sc->session || sc->session->gfx != KLXR_GFX_VULKAN)) {
+                const XrFovf *f = &proj->views[v].fov;
+                float il = tanf(f->angleLeft),  ir = tanf(f->angleRight);
+                float iu = tanf(f->angleUp),    id = tanf(f->angleDown);
+                float bl = base_tan[v][0], br = base_tan[v][1];
+                float bu = base_tan[v][2], bd = base_tan[v][3];
+                float bw = br - bl, bh = bu - bd, ispan = ir - il;
+                if (bw > 0 && bh > 0 && ispan > 0 && ispan < 0.80f * bw) {
+                    float nx0 = (il - bl) / bw, nx1 = (ir - bl) / bw;
+                    float ny0, ny1;
+                    if (!fovea_flip) { ny0 = (bu - iu) / bh; ny1 = (bu - id) / bh; }
+                    else             { ny0 = (id - bd) / bh; ny1 = (iu - bd) / bh; }
+                    // Parallax alignment. The inset is rendered from the HEAD
+                    // CENTRE (pose x≈0) and the base from this EYE (pose x≈±IPD/2),
+                    // so the same angular direction points at different content
+                    // for anything not at infinity — seen as a doubled edge where
+                    // the sharp inset and the parallax-offset base overlap. A point
+                    // at depth D shifts by (inset_x - base_x)/D in tangent between
+                    // the two viewpoints; shifting the inset placement by that lands
+                    // the sharp centre on the base for content around D metres.
+                    // KL_XR_FOVEA_DEPTH sets D (a large value ≈ off).
+                    static int depth_cm = -1;
+                    if (depth_cm < 0) depth_cm = kl_env_int("KL_XR_FOVEA_DEPTH_CM", 200);
+                    float D = depth_cm / 100.0f;
+                    if (D >= 0.2f) {
+                        float dtan = (proj->views[v].pose.position.x - base_eye_x[v]) / D;
+                        nx0 += dtan / bw;
+                        nx1 += dtan / bw;
+                    }
+                    // Manual fine-alignment, for the residual the depth model does
+                    // not reach (in the streamed state both layers are centred, so
+                    // the parallax term above is zero). A direct nudge of the inset
+                    // placement, in THOUSANDTHS of the eye, tuned by eye until the
+                    // sharp centre sits exactly on the blurry base. Same shift both
+                    // eyes; KL_XR_FOVEA_SHIFT_Y for vertical.
+                    static int shx = -32768, shy = -32768;
+                    if (shx == -32768) shx = kl_env_int("KL_XR_FOVEA_SHIFT_X", 0);
+                    if (shy == -32768) shy = kl_env_int("KL_XR_FOVEA_SHIFT_Y", 0);
+                    nx0 += shx / 1000.0f; nx1 += shx / 1000.0f;
+                    ny0 += shy / 1000.0f; ny1 += shy / 1000.0f;
+                    // Scale trim about the inset's own centre. The doubling grows
+                    // from nothing at the centre to worst at the edge, which is a
+                    // SCALE mismatch — the inset image does not fill exactly the
+                    // field of view it states, so its content drifts off the base
+                    // the further out you look. This shrinks/grows the placement to
+                    // make the edges land on the base too. 1000 = no change; try a
+                    // little either side (e.g. 970 or 1030) until an edge feature
+                    // stops doubling as it crosses into the fovea.
+                    static int fsc = -1;
+                    if (fsc < 0) fsc = kl_env_int("KL_XR_FOVEA_SCALE", 1000);
+                    if (fsc > 0 && fsc != 1000) {
+                        float s = fsc / 1000.0f;
+                        float cx = (nx0 + nx1) * 0.5f, cy = (ny0 + ny1) * 0.5f;
+                        nx0 = cx + (nx0 - cx) * s; nx1 = cx + (nx1 - cx) * s;
+                        ny0 = cy + (ny0 - cy) * s; ny1 = cy + (ny1 - cy) * s;
+                    }
+                    int ilayer = sc->array_size > 1
+                        ? (int)proj->views[v].subImage.imageArrayIndex : -1;
+                    kl_glfb_overlay_eye_inset((int)v, base_stage_eye[v],
+                                              sc->tex[sc->last_released], ilayer,
+                                              (int)sc->width, (int)sc->height,
+                                              nx0, ny0, nx1, ny1);
+                }
             }
             if (sc->eye == (int)v) continue;            // already this eye
             sc->eye = (int)v;

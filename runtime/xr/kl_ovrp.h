@@ -462,6 +462,11 @@ void kl_ovrp_set_eye_rotation(int eye, float qx, float qy, float qz, float qw);
 // failed measurement rather than passed on, because this one is a divisor.
 void kl_ovrp_set_display_frequency(float hz);
 
+// Pin the display rate for a target known to mishandle a measured one (Steam
+// Link's VR client crashes on anything but a value stated up front), so the run
+// need not pass KL_DISPLAY_HZ by hand. The env still wins. Set before boot.
+void kl_ovrp_set_forced_hz_hint(float hz);
+
 // Battery telemetry, as one source of truth. The defaults are the Quest-2
 // fiction (95% / not charging) — on the host there is no battery. A visionOS
 // frontend that reads the real level off UIDevice pushes it through

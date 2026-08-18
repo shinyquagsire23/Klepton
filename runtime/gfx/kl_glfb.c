@@ -2749,6 +2749,286 @@ static uint32_t klfb_mirror_blit(uint32_t src_tex, int src_layer,
     return e;
 }
 
+// Blit src_tex (full sw×sh) into a SUB-RECTANGLE of dst_tex, scaling. The
+// foveal-inset composite: the base eye is already in dst_tex, and this lays the
+// narrow high-resolution centre image over the middle of it, where its field of
+// view maps. LINEAR because the inset is scaled UP into the base (a filter IS
+// consulted, unlike the identity copy klfb_mirror_blit does).
+static uint32_t klfb_blit_subrect(uint32_t src_tex, int src_layer, uint32_t dst_tex,
+                                  int sw, int sh, int dx0, int dy0, int dx1, int dy1) {
+    int32_t save_read = 0, save_draw = 0;
+    a_glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &save_read);
+    a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &save_draw);
+    int scissor = r_IsEnabled ? (int)r_IsEnabled(0x0C11 /* SCISSOR_TEST */) : 0;
+    if (scissor && r_Disable) r_Disable(0x0C11);
+
+    static uint32_t iread_fb, idraw_fb;
+    if (!iread_fb) r_GenFramebuffers(1, &iread_fb);
+    if (!idraw_fb) r_GenFramebuffers(1, &idraw_fb);
+
+    r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, iread_fb);
+    if (src_layer >= 0)
+        r_FramebufferTextureLayer(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */,
+                                  src_tex, 0, src_layer);
+    else
+        r_FramebufferTexture2D(0x8CA8, 0x8CE0, 0x0DE1 /* TEXTURE_2D */, src_tex, 0);
+    r_BindFramebuffer(0x8CA9 /* DRAW_FRAMEBUFFER */, idraw_fb);
+    r_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, dst_tex, 0);
+
+    if (a_glGetError) while (a_glGetError()) {}
+    r_BlitFramebuffer(0, 0, sw, sh, dx0, dy0, dx1, dy1,
+                      0x4000 /* COLOR_BUFFER_BIT */, 0x2601 /* LINEAR */);
+    uint32_t e = a_glGetError ? a_glGetError() : 0;
+
+    r_BindFramebuffer(0x8CA8, (uint32_t)save_read);
+    r_BindFramebuffer(0x8CA9, (uint32_t)save_draw);
+    if (scissor && r_Enable) r_Enable(0x0C11);
+    return e;
+}
+
+// Feathered inset: draw src_tex into the dest rect of dst_tex as a textured quad
+// with a RADIAL alpha falloff, blended over what is already there (the base).
+// This is what turns the hard square edge of a straight blit into a soft round
+// centre that fades into the periphery — the eye sees "sharper toward the middle"
+// rather than "a sharp rectangle stuck on". `inner` is the fraction of the radius
+// that stays fully opaque before the fade begins (0..1). Returns 0 on success;
+// nonzero means the caller should fall back to the plain blit. All GL state it
+// touches is saved and restored — it runs inside the guest's own frame.
+static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
+                             uint32_t src_tex, int dx0, int dy0, int dx1, int dy1,
+                             float inner) {
+    static int tried, ok_program;
+    static uint32_t prog, vao, vbo;
+    static int loc_tex, loc_inner, loc_pos, loc_uv;
+    static uint32_t (*r_CreateShader)(uint32_t);
+    static void (*r_ShaderSource)(uint32_t, int32_t, const char *const *, const int32_t *);
+    static void (*r_CompileShader)(uint32_t);
+    static void (*r_GetShaderiv)(uint32_t, uint32_t, int32_t *);
+    static uint32_t (*r_CreateProgram)(void);
+    static void (*r_AttachShader)(uint32_t, uint32_t);
+    static void (*r_LinkProgram)(uint32_t);
+    static void (*r_GetProgramiv)(uint32_t, uint32_t, int32_t *);
+    static void (*r_UseProgram)(uint32_t);
+    static int32_t (*r_GetUniformLocation)(uint32_t, const char *);
+    static int32_t (*r_GetAttribLocation)(uint32_t, const char *);
+    static void (*r_Uniform1i)(int32_t, int32_t);
+    static void (*r_Uniform1f)(int32_t, float);
+    static void (*r_GenVertexArrays)(int32_t, uint32_t *);
+    static void (*r_BindVertexArray)(uint32_t);
+    static void (*r_GenBuffers)(int32_t, uint32_t *);
+    static void (*r_BindBuffer)(uint32_t, uint32_t);
+    static void (*r_BufferData)(uint32_t, long, const void *, uint32_t);
+    static void (*r_VertexAttribPointer)(uint32_t, int32_t, uint32_t, uint8_t,
+                                         int32_t, const void *);
+    static void (*r_EnableVertexAttribArray)(uint32_t);
+    static void (*r_DrawArrays)(uint32_t, int32_t, int32_t);
+    static void (*r_ActiveTexture)(uint32_t);
+    static void (*r_BindTexture)(uint32_t, uint32_t);
+    static void (*r_TexParameteri)(uint32_t, uint32_t, int32_t);
+    static void (*r_GetTexParameteriv)(uint32_t, uint32_t, int32_t *);
+    static void (*r_Enable)(uint32_t);
+    static void (*r_Disable)(uint32_t);
+    static uint8_t (*r_IsEnabled)(uint32_t);
+    static void (*r_BlendFunc)(uint32_t, uint32_t);
+    static void (*r_BlendFuncSeparate)(uint32_t, uint32_t, uint32_t, uint32_t);
+    static void (*r_Viewport)(int32_t, int32_t, int32_t, int32_t);
+    static void (*r_BindFramebuffer2)(uint32_t, uint32_t);
+    static void (*r_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+    static uint32_t (*r_CheckFbStatus)(uint32_t);
+    static void (*r_GenFramebuffers)(int32_t, uint32_t *);
+    static uint32_t feather_fb;
+
+    if (!tried) {
+        tried = 1;
+        r_CreateShader = asym("glCreateShader");
+        r_ShaderSource = asym("glShaderSource");
+        r_CompileShader = asym("glCompileShader");
+        r_GetShaderiv = asym("glGetShaderiv");
+        r_CreateProgram = asym("glCreateProgram");
+        r_AttachShader = asym("glAttachShader");
+        r_LinkProgram = asym("glLinkProgram");
+        r_GetProgramiv = asym("glGetProgramiv");
+        r_UseProgram = asym("glUseProgram");
+        r_GetUniformLocation = asym("glGetUniformLocation");
+        r_GetAttribLocation = asym("glGetAttribLocation");
+        r_Uniform1i = asym("glUniform1i");
+        r_Uniform1f = asym("glUniform1f");
+        r_GenVertexArrays = asym("glGenVertexArrays");
+        r_BindVertexArray = asym("glBindVertexArray");
+        r_GenBuffers = asym("glGenBuffers");
+        r_BindBuffer = asym("glBindBuffer");
+        r_BufferData = asym("glBufferData");
+        r_VertexAttribPointer = asym("glVertexAttribPointer");
+        r_EnableVertexAttribArray = asym("glEnableVertexAttribArray");
+        r_DrawArrays = asym("glDrawArrays");
+        r_ActiveTexture = asym("glActiveTexture");
+        r_BindTexture = asym("glBindTexture");
+        r_TexParameteri = asym("glTexParameteri");
+        r_GetTexParameteriv = asym("glGetTexParameteriv");
+        r_Enable = asym("glEnable");
+        r_Disable = asym("glDisable");
+        r_IsEnabled = asym("glIsEnabled");
+        r_BlendFunc = asym("glBlendFunc");
+        r_BlendFuncSeparate = asym("glBlendFuncSeparate");
+        r_Viewport = asym("glViewport");
+        r_BindFramebuffer2 = asym("glBindFramebuffer");
+        r_FramebufferTexture2D = asym("glFramebufferTexture2D");
+        r_CheckFbStatus = asym("glCheckFramebufferStatus");
+        r_GenFramebuffers = asym("glGenFramebuffers");
+        if (r_CreateShader && r_CreateProgram && r_UseProgram && r_DrawArrays &&
+            r_GenVertexArrays && r_GenBuffers && r_VertexAttribPointer &&
+            r_BindFramebuffer2 && r_FramebufferTexture2D && r_GenFramebuffers) {
+            const char *vs =
+                "#version 300 es\n"
+                "in vec2 aPos; in vec2 aUV; out vec2 vUV;\n"
+                "void main(){ vUV = aUV; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+            const char *fs =
+                "#version 300 es\n"
+                "precision highp float;\n"
+                "in vec2 vUV; uniform sampler2D uTex; uniform float uInner;\n"
+                "out vec4 o;\n"
+                "void main(){\n"
+                "  vec3 c = texture(uTex, vUV).rgb;\n"
+                "  vec2 d = (vUV - 0.5) * 2.0;\n"
+                "  float r = length(d);\n"
+                "  float a = 1.0 - smoothstep(uInner, 1.0, r);\n"
+                "  o = vec4(c, a);\n"
+                "}\n";
+            uint32_t v = r_CreateShader(0x8B31 /* VERTEX_SHADER */);
+            uint32_t f = r_CreateShader(0x8B30 /* FRAGMENT_SHADER */);
+            int32_t okv = 0, okf = 0, okl = 0;
+            r_ShaderSource(v, 1, &vs, NULL); r_CompileShader(v);
+            r_ShaderSource(f, 1, &fs, NULL); r_CompileShader(f);
+            if (r_GetShaderiv) { r_GetShaderiv(v, 0x8B81, &okv);
+                                 r_GetShaderiv(f, 0x8B81, &okf); }
+            else okv = okf = 1;
+            prog = r_CreateProgram();
+            r_AttachShader(prog, v); r_AttachShader(prog, f);
+            r_LinkProgram(prog);
+            if (r_GetProgramiv) r_GetProgramiv(prog, 0x8B82 /* LINK_STATUS */, &okl);
+            else okl = 1;
+            if (okv && okf && okl) {
+                loc_tex   = r_GetUniformLocation(prog, "uTex");
+                loc_inner = r_GetUniformLocation(prog, "uInner");
+                loc_pos   = r_GetAttribLocation(prog, "aPos");
+                loc_uv    = r_GetAttribLocation(prog, "aUV");
+                r_GenVertexArrays(1, &vao);
+                r_GenBuffers(1, &vbo);
+                r_GenFramebuffers(1, &feather_fb);
+                if (loc_pos >= 0 && loc_uv >= 0 && vao && vbo && feather_fb)
+                    ok_program = 1;
+            }
+            if (!ok_program)
+                fprintf(stderr, "  [glfb] fovea feather: shader unavailable, "
+                                "falling back to a hard-edged inset\n");
+        }
+    }
+    if (!ok_program) return 1;
+
+    // Save every piece of state the draw disturbs.
+    int32_t s_prog = 0, s_vao = 0, s_vbo = 0, s_at = 0, s_tex2d = 0, s_vp[4];
+    int32_t s_draw_fb = 0;
+    int32_t s_bsr = 0x1, s_bdr = 0, s_bsa = 0x1, s_bda = 0;
+    a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &s_prog);
+    a_glGetIntegerv(0x85B5 /* VERTEX_ARRAY_BINDING */, &s_vao);
+    a_glGetIntegerv(0x8894 /* ARRAY_BUFFER_BINDING */, &s_vbo);
+    a_glGetIntegerv(0x84E0 /* ACTIVE_TEXTURE */, &s_at);
+    a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &s_tex2d);
+    a_glGetIntegerv(0x0BA2 /* VIEWPORT */, s_vp);
+    a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &s_draw_fb);
+    a_glGetIntegerv(0x80C9 /* BLEND_SRC_RGB */,   &s_bsr);
+    a_glGetIntegerv(0x80C8 /* BLEND_DST_RGB */,   &s_bdr);
+    a_glGetIntegerv(0x80CB /* BLEND_SRC_ALPHA */, &s_bsa);
+    a_glGetIntegerv(0x80CA /* BLEND_DST_ALPHA */, &s_bda);
+    int blend_was = r_IsEnabled ? (int)r_IsEnabled(0x0BE2 /* BLEND */) : 0;
+    int depth_was = r_IsEnabled ? (int)r_IsEnabled(0x0B71 /* DEPTH_TEST */) : 0;
+    int cull_was  = r_IsEnabled ? (int)r_IsEnabled(0x0B44 /* CULL_FACE */) : 0;
+    int sciss_was = r_IsEnabled ? (int)r_IsEnabled(0x0C11 /* SCISSOR_TEST */) : 0;
+
+    r_BindFramebuffer2(0x8CA9 /* DRAW_FRAMEBUFFER */, feather_fb);
+    r_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, dst_tex, 0);
+    if (r_CheckFbStatus && r_CheckFbStatus(0x8CA9) != 0x8CD5) {
+        r_BindFramebuffer2(0x8CA9, (uint32_t)s_draw_fb);
+        return 1;   // let the caller blit instead
+    }
+
+    if (depth_was && r_Disable) r_Disable(0x0B71);
+    if (cull_was  && r_Disable) r_Disable(0x0B44);
+    if (sciss_was && r_Disable) r_Disable(0x0C11);
+    if (r_Enable) r_Enable(0x0BE2 /* BLEND */);
+    if (r_BlendFunc) r_BlendFunc(0x0302 /* SRC_ALPHA */, 0x0303 /* ONE_MINUS_SRC_ALPHA */);
+    r_Viewport(0, 0, dstw, dsth);
+
+    float nx0 = 2.0f * dx0 / dstw - 1.0f, nx1 = 2.0f * dx1 / dstw - 1.0f;
+    float ny0 = 2.0f * dy0 / dsth - 1.0f, ny1 = 2.0f * dy1 / dsth - 1.0f;
+    float quad[16] = {
+        nx0, ny0, 0.0f, 0.0f,
+        nx1, ny0, 1.0f, 0.0f,
+        nx0, ny1, 0.0f, 1.0f,
+        nx1, ny1, 1.0f, 1.0f,
+    };
+    r_BindVertexArray(vao);
+    r_BindBuffer(0x8892 /* ARRAY_BUFFER */, vbo);
+    r_BufferData(0x8892, (long)sizeof quad, quad, 0x88E0 /* DYNAMIC_DRAW */);
+    r_EnableVertexAttribArray((uint32_t)loc_pos);
+    r_VertexAttribPointer((uint32_t)loc_pos, 2, 0x1406 /* FLOAT */, 0,
+                          4 * (int)sizeof(float), (const void *)0);
+    r_EnableVertexAttribArray((uint32_t)loc_uv);
+    r_VertexAttribPointer((uint32_t)loc_uv, 2, 0x1406, 0,
+                          4 * (int)sizeof(float),
+                          (const void *)(2 * sizeof(float)));
+    r_UseProgram(prog);
+    r_ActiveTexture(0x84C0 /* TEXTURE0 */);
+    r_BindTexture(0x0DE1, src_tex);
+    // The shader samples with texture(): the inset must have a mipmap-free filter
+    // (a swapchain texture can default to NEAREST_MIPMAP_* and sample as black)
+    // and clamp so the fade does not wrap. Saved and restored on the guest's own
+    // texture.
+    int32_t s_min = 0x2601, s_mag = 0x2601, s_ws = 0x812F, s_wt = 0x812F;
+    if (r_GetTexParameteriv) {
+        r_GetTexParameteriv(0x0DE1, 0x2801 /* MIN_FILTER */, &s_min);
+        r_GetTexParameteriv(0x0DE1, 0x2800 /* MAG_FILTER */, &s_mag);
+        r_GetTexParameteriv(0x0DE1, 0x2802 /* WRAP_S */, &s_ws);
+        r_GetTexParameteriv(0x0DE1, 0x2803 /* WRAP_T */, &s_wt);
+    }
+    if (r_TexParameteri) {
+        r_TexParameteri(0x0DE1, 0x2801, 0x2601 /* LINEAR */);
+        r_TexParameteri(0x0DE1, 0x2800, 0x2601);
+        r_TexParameteri(0x0DE1, 0x2802, 0x812F /* CLAMP_TO_EDGE */);
+        r_TexParameteri(0x0DE1, 0x2803, 0x812F);
+    }
+    if (loc_tex >= 0)   r_Uniform1i(loc_tex, 0);
+    if (loc_inner >= 0) r_Uniform1f(loc_inner, inner);
+    r_DrawArrays(0x0005 /* TRIANGLE_STRIP */, 0, 4);
+
+    // Restore the guest's texture parameters while its texture is still bound.
+    if (r_TexParameteri) {
+        r_TexParameteri(0x0DE1, 0x2801, s_min);
+        r_TexParameteri(0x0DE1, 0x2800, s_mag);
+        r_TexParameteri(0x0DE1, 0x2802, s_ws);
+        r_TexParameteri(0x0DE1, 0x2803, s_wt);
+    }
+
+    // Restore everything else, in reverse.
+    r_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, 0, 0);
+    r_BindFramebuffer2(0x8CA9, (uint32_t)s_draw_fb);
+    r_UseProgram((uint32_t)s_prog);
+    r_BindVertexArray((uint32_t)s_vao);
+    r_BindBuffer(0x8892, (uint32_t)s_vbo);
+    r_ActiveTexture(0x84C0);
+    r_BindTexture(0x0DE1, (uint32_t)s_tex2d);
+    if (s_at != 0x84C0) r_ActiveTexture((uint32_t)s_at);
+    r_Viewport(s_vp[0], s_vp[1], s_vp[2], s_vp[3]);
+    if (r_BlendFuncSeparate)
+        r_BlendFuncSeparate((uint32_t)s_bsr, (uint32_t)s_bdr,
+                            (uint32_t)s_bsa, (uint32_t)s_bda);
+    if (!blend_was && r_Disable) r_Disable(0x0BE2);
+    if (depth_was && r_Enable) r_Enable(0x0B71);
+    if (cull_was  && r_Enable) r_Enable(0x0B44);
+    if (sciss_was && r_Enable) r_Enable(0x0C11);
+    return 0;
+}
+
 // Give one GL name storage the layer provider owns. Internal: the only caller
 // is kl_glfb_mirror_layer below, and the name it passes is one of OURS — see
 // that function's header comment for why the guest's own name must not be
@@ -2974,6 +3254,94 @@ void *kl_glfb_layer_mtl_texture(int layer, int stage, int *out_w, int *out_h) {
 static struct { uint32_t tex; int w, h; uint32_t fmt; }
     g_eye_mirror[2][KL_MTL_MAX_STAGES];
 
+// Forward-declared for the KL_GLFB_PROBE_VIDEO readbacks (here and in
+// kl_glfb_image_bind); both are defined further down with the probe machinery.
+static unsigned long klfb_probe_fbo(uint32_t, float *, uint8_t *, char *, size_t,
+                                    uint8_t *, int32_t *, int32_t *, int32_t, int32_t);
+static uint32_t klfb_read_from_texture_layer(uint32_t, int);
+
+// KL_GLFB_PROBE_VIDEO shared scratch + a lit-count readback of any texture. Used
+// to answer "did the guest's draw land lit" (the eye texture, here) vs "is the
+// decoded frame in its texture" (the video texture, in kl_glfb_image_bind).
+static void klfb_probe_named_tex(const char *tag, uint32_t tex, int layer,
+                                 int hint_w, int hint_h) {
+    static int pv_on = -1;
+    if (pv_on < 0) pv_on = kl_env_on("KL_GLFB_PROBE_VIDEO", 0);
+    if (!pv_on) return;
+    // Cap the number of readbacks, not just the logging: a full-frame glReadPixels
+    // with glFinish every eye every frame would starve the stream. 48 is enough to
+    // see both textures settle over the first frames.
+    static unsigned runs;
+    if (runs++ >= 48) return;
+    static float   *pf;
+    static uint8_t *pb;
+    static long     cap;
+    long need = (long)hint_w * hint_h;
+    if (need <= 0) return;
+    if (need > cap) {
+        free(pf); free(pb);
+        pf = malloc((size_t)need * 16);
+        pb = malloc((size_t)need * 4);
+        cap = (pf && pb) ? need : 0;
+    }
+    if (cap < need) return;
+    static void (*r_bindfb)(uint32_t, uint32_t);
+    static void (*r_bindtex)(uint32_t, uint32_t);
+    if (!r_bindfb)  r_bindfb  = asym("glBindFramebuffer");
+    if (!r_bindtex) r_bindtex = asym("glBindTexture");
+    int32_t s_t = 0, s_rf = 0, s_df = 0;
+    if (a_glGetIntegerv) {
+        a_glGetIntegerv(0x8069, &s_t);    // TEXTURE_BINDING_2D
+        a_glGetIntegerv(0x8CAA, &s_rf);   // READ_FRAMEBUFFER_BINDING
+        a_glGetIntegerv(0x8CA6, &s_df);   // DRAW_FRAMEBUFFER_BINDING
+    }
+    char nt[160] = "no framebuffer";
+    unsigned long lit = 0;
+    uint32_t fb = klfb_read_from_texture_layer(tex, layer);
+    if (fb) lit = klfb_probe_fbo(fb, pf, pb, nt, sizeof nt, NULL, NULL, NULL,
+                                 hint_w, hint_h);
+    if (r_bindfb) { r_bindfb(0x8CA8, (uint32_t)s_rf); r_bindfb(0x8CA9, (uint32_t)s_df); }
+    if (r_bindtex) r_bindtex(0x0DE1, (uint32_t)s_t);
+    static unsigned said;
+    if (said++ < 24)
+        fprintf(stderr, "  [glfb] PROBE_%s tex=%u layer=%d: %lu lit of %dx%d (%s)\n",
+                tag, tex, layer, lit, hint_w, hint_h, nt);
+}
+
+void kl_glfb_probe_tex(const char *tag, uint32_t tex, int layer,
+                       int hint_w, int hint_h) {
+    klfb_probe_named_tex(tag, tex, layer, hint_w, hint_h);
+}
+
+// A foveated guest (Steam Link) hands us a low-resolution base eye and a
+// separate high-resolution centre inset. If the compositor's eye texture is the
+// base's own size, laying the inset into its centre SUB-rectangle scales the
+// inset DOWN to fit — throwing away the very detail it carries, so the centre
+// ends up no sharper than the periphery. So the eye texture is allocated LARGER
+// than the base (the base is upscaled into it, which costs the base nothing it
+// had) and the inset then lands at close to full resolution. num/den is the
+// factor; 1/1 (the default) is the old behaviour for every non-foveated guest.
+static int g_eye_scale_num = 1, g_eye_scale_den = 1, g_eye_cap = 3456;
+void kl_glfb_set_eye_mirror_scale(int num, int den) {
+    if (num > 0 && den > 0) { g_eye_scale_num = num; g_eye_scale_den = den; }
+}
+void kl_glfb_set_eye_mirror_cap(int px) { if (px > 0) g_eye_cap = px; }
+// Uniform upscale by num/den, aspect preserved, capped so the larger side never
+// exceeds g_eye_cap — a base already near the display's resolution (Steam Link's
+// 3072-wide menu layers) must not be doubled to 6144 and churn the allocator,
+// while the small streamed base (1152) still grows enough to host the inset.
+static void klfb_eye_scaled(int w, int h, int *ow, int *oh) {
+    double s = (double)g_eye_scale_num / (double)g_eye_scale_den;
+    if (s < 1.0) s = 1.0;
+    int mx = w > h ? w : h;
+    if (g_eye_cap > 0 && (double)mx * s > (double)g_eye_cap)
+        s = (double)g_eye_cap / (double)mx;
+    int mw = (int)(w * s + 0.5), mh = (int)(h * s + 0.5);
+    if (mw < w) mw = w;
+    if (mh < h) mh = h;
+    *ow = mw; *oh = mh;
+}
+
 int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer,
                              int w, int h, uint32_t internal_fmt) {
     if (!g_mtl_provider || !src_tex || w <= 0 || h <= 0) return 0;
@@ -2998,6 +3366,12 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
 
     if (!klfb_mirror_resolve(src_layer >= 0)) return 0;
 
+    // The destination is allocated at the SCALED size (see klfb_eye_scaled): for
+    // a foveated guest it is larger than the source eye so the centre inset laid
+    // over it later keeps its detail. The base is upscaled into it here.
+    int mw, mh;
+    klfb_eye_scaled(w, h, &mw, &mh);
+
     // (Re)allocate the destination. A size or format change means the guest
     // rebuilt its swapchain, and the old destination describes a picture that no
     // longer exists — release it rather than blit a mismatch, which the blit
@@ -3010,10 +3384,10 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
     // deleted name: GL_INVALID_OPERATION, once, and a black eye for the rest of
     // the run.
     if (m->tex && g_eye_mtl[eye][stage].gl_tex != m->tex) *m = (__typeof__(*m)){0};
-    if (m->tex && (m->w != w || m->h != h || m->fmt != internal_fmt)) {
+    if (m->tex && (m->w != mw || m->h != mh || m->fmt != internal_fmt)) {
         fprintf(stderr, "  [glfb] mirror eye=%d stage=%d: %dx%d fmt 0x%x -> %dx%d "
                         "fmt 0x%x, reallocating\n",
-                eye, stage, m->w, m->h, m->fmt, w, h, internal_fmt);
+                eye, stage, m->w, m->h, m->fmt, mw, mh, internal_fmt);
         kl_glfb_release_eye_texture(eye, stage);   // drops the EGLImage AND our name
         *m = (__typeof__(*m)){0};
     }
@@ -3029,7 +3403,7 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
         // the guest never asked for surviving into its next draw.
         int32_t save_tex = 0;
         a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &save_tex);
-        int ok = kl_glfb_bind_eye_mtl_texture(eye, stage, t, w, h, internal_fmt);
+        int ok = kl_glfb_bind_eye_mtl_texture(eye, stage, t, mw, mh, internal_fmt);
         if (a_glBindTexture_mtl) a_glBindTexture_mtl(0x0DE1, (uint32_t)save_tex);
         if (!ok) {
             // The provider declined, so the name is ours and nothing else took a
@@ -3037,14 +3411,25 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
             if (r_DeleteTextures) r_DeleteTextures(1, &t);
             return 0;
         }
-        m->tex = t; m->w = w; m->h = h; m->fmt = internal_fmt;
+        m->tex = t; m->w = mw; m->h = mh; m->fmt = internal_fmt;
         fprintf(stderr, "  [glfb] mirror eye=%d stage=%d: %dx%d fmt 0x%x <- guest "
-                        "tex %u layer %d (one blit a frame; the array swapchain "
+                        "tex %u layer %d %s(one blit a frame; the array swapchain "
                         "cannot be re-pointed)\n",
-                eye, stage, w, h, internal_fmt, src_tex, src_layer);
+                eye, stage, mw, mh, internal_fmt, src_tex, src_layer,
+                (mw != w || mh != h) ? "UPSCALED from source " : "");
     }
 
-    uint32_t e = klfb_mirror_blit(src_tex, src_layer, m->tex, w, h);
+    // KL_GLFB_PROBE_VIDEO: read the guest's rendered EYE texture just before we
+    // copy it to the compositor. Bright here => the guest DID render the video,
+    // and the black is between this and the display; dark here => the guest's
+    // draw itself produced black from the (proven-bright) video texture.
+    klfb_probe_named_tex("EYE", src_tex, src_layer, w, h);
+
+    // Identity copy at 1:1 (NEAREST, exact); an upscale into a larger eye
+    // texture goes through the LINEAR sub-rect blit, filling it whole.
+    uint32_t e = (mw == w && mh == h)
+        ? klfb_mirror_blit(src_tex, src_layer, m->tex, w, h)
+        : klfb_blit_subrect(src_tex, src_layer, m->tex, w, h, 0, 0, mw, mh);
     if (e) {
         static int said;
         if (!said++)
@@ -3053,6 +3438,53 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
         return 0;
     }
     return 1;
+}
+
+// Lay a foveal inset over the base eye already mirrored into (eye, stage). The
+// caller (the OpenXR layer loop) has computed, from the two layers' fields of
+// view, where the inset's frustum falls inside the base's — as fractions of the
+// eye in [0,1] — so this only turns those into pixels and blits. No-op until the
+// base is present (m->tex): the inset is meaningless on its own.
+void kl_glfb_overlay_eye_inset(int eye, int stage, uint32_t tex, int layer,
+                               int iw, int ih,
+                               float nx0, float ny0, float nx1, float ny1) {
+    if (!g_mtl_provider || !tex || iw <= 0 || ih <= 0) return;
+    if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) return;
+    __typeof__(g_eye_mirror[0][0]) *m = &g_eye_mirror[eye][stage];
+    if (!m->tex || m->w <= 0 || m->h <= 0) return;    // base not mirrored yet
+    if (nx0 < 0) nx0 = 0; if (nx0 > 1) nx0 = 1;
+    if (nx1 < 0) nx1 = 0; if (nx1 > 1) nx1 = 1;
+    if (ny0 < 0) ny0 = 0; if (ny0 > 1) ny0 = 1;
+    if (ny1 < 0) ny1 = 0; if (ny1 > 1) ny1 = 1;
+    int dx0 = (int)(nx0 * m->w + 0.5f), dx1 = (int)(nx1 * m->w + 0.5f);
+    int dy0 = (int)(ny0 * m->h + 0.5f), dy1 = (int)(ny1 * m->h + 0.5f);
+    if (dx1 <= dx0 || dy1 <= dy0) return;
+    if (!klfb_mirror_resolve(layer >= 0)) return;
+
+    // Feather the edge into a soft round centre, unless disabled or the inset is
+    // an ARRAY slice (the feather shader samples a plain sampler2D). The feather
+    // returns nonzero if its program could not be built, so a straight blit is
+    // always the fallback — the sharp centre still lands, just with a hard edge.
+    static int feather = -1, inner_x100 = -1;
+    if (feather < 0)     feather = kl_env_on("KL_XR_FOVEA_FEATHER", 1);
+    // Higher = WIDER fully-sharp core before the fade begins (0..100). 78 keeps
+    // most of the inset crisp with the fade concentrated at the very rim.
+    if (inner_x100 < 0)  inner_x100 = kl_env_int("KL_XR_FOVEA_INNER", 78);
+    const char *how = "blit";
+    uint32_t e = 0;
+    if (feather && layer < 0 &&
+        klfb_feather_blit(m->tex, m->w, m->h, tex, dx0, dy0, dx1, dy1,
+                          inner_x100 / 100.0f) == 0) {
+        how = "feather";
+    } else {
+        e = klfb_blit_subrect(tex, layer, m->tex, iw, ih, dx0, dy0, dx1, dy1);
+    }
+    static int said;
+    if (said++ < 6)
+        fprintf(stderr, "  [glfb] fovea inset eye=%d stage=%d: %dx%d -> "
+                        "eye rect [%d,%d..%d,%d] of %dx%d (%s)%s\n",
+                eye, stage, iw, ih, dx0, dy0, dx1, dy1, m->w, m->h, how,
+                e ? " GL error" : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -3296,6 +3728,11 @@ int kl_glfb_image_bind(void *image) {
     if (bound++ < 4)
         fprintf(stderr, "  [glfb] video image %p is now texture %d (%dx%d)\n",
                 image, tex, im->w, im->h);
+
+    // KL_GLFB_PROBE_VIDEO=1: is the decoded frame actually IN this texture?
+    // (proven yes — bright, changing content — which is why the eye probe in the
+    // mirror path is now the interesting one.)
+    klfb_probe_named_tex("VIDEO", (uint32_t)tex, 0, im->w, im->h);
     return 1;
 }
 
@@ -5980,28 +6417,43 @@ static uint32_t klfb_read_from_texture_layer(uint32_t tex, int layer) {
     }
     if (!tex || !r_GenFramebuffers || !r_BindFramebuffer ||
         !r_FramebufferTextureLayer || !r_CheckFramebufferStatus) return 0;
+    static void (*r_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t,
+                                          uint32_t, int32_t);
+    static void (*r_GetFbAttachmentParam)(uint32_t, uint32_t, uint32_t, int32_t *);
+    if (!r_FramebufferTexture2D) {
+        r_FramebufferTexture2D = asym("glFramebufferTexture2D");
+        r_GetFbAttachmentParam = asym("glGetFramebufferAttachmentParameteriv");
+    }
     static uint32_t layer_fb;
     if (!layer_fb) r_GenFramebuffers(1, &layer_fb);
     if (!layer_fb) return 0;
     r_BindFramebuffer(0x8CA8 /* READ_FRAMEBUFFER */, layer_fb);
-    r_FramebufferTextureLayer(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */, tex, 0, layer);
-    if (r_CheckFramebufferStatus(0x8CA8) == 0x8CD5) return layer_fb;
-    // A layered attach only works on an ARRAY or 3D texture, and this guest's
-    // eye targets stopped being arrays the moment it asked for one swapchain
-    // per eye — so the probe built for the array case answered "no framebuffer"
-    // for every plain 2D texture, which reads as "nothing to see" rather than
-    // as "wrong attach call". Layer 0 of a 2D texture is the texture.
-    if (layer == 0) {
-        static void (*r_FramebufferTexture2D)(uint32_t, uint32_t, uint32_t,
-                                              uint32_t, int32_t);
-        if (!r_FramebufferTexture2D)
-            r_FramebufferTexture2D = asym("glFramebufferTexture2D");
-        if (r_FramebufferTexture2D) {
-            r_FramebufferTexture2D(0x8CA8, 0x8CE0, 0x0DE1 /* TEXTURE_2D */, tex, 0);
-            if (r_CheckFramebufferStatus(0x8CA8) == 0x8CD5) return layer_fb;
-        }
+    // The attach that CANNOT silently succeed on the wrong texture. A layered
+    // attach only works on an ARRAY or 3D texture; on a plain 2D texture
+    // glFramebufferTextureLayer is INVALID_OPERATION and a NO-OP — it neither
+    // attaches the new texture NOR detaches whatever was on this reused FBO from
+    // the last call. The old code then saw the STALE attachment still complete
+    // and returned it, so every 2D-texture probe read the first texture ever
+    // attached (a bright eye) instead of its own. So: pick the attach that
+    // matches the layer, then VERIFY the colour attachment is actually `tex`
+    // before trusting COMPLETE — a stale-but-complete FBO must read as a miss.
+    // OpenXR states layer=-1 ("not an array") for the per-eye-swapchain case, so
+    // any non-positive layer is a whole-2D-texture attach.
+    if (layer > 0) {
+        r_FramebufferTextureLayer(0x8CA8, 0x8CE0 /* COLOR_ATTACHMENT0 */, tex, 0,
+                                  layer);
+    } else if (r_FramebufferTexture2D) {
+        r_FramebufferTexture2D(0x8CA8, 0x8CE0, 0x0DE1 /* TEXTURE_2D */, tex, 0);
+    } else {
+        return 0;
     }
-    return 0;
+    if (r_CheckFramebufferStatus(0x8CA8) != 0x8CD5) return 0;
+    if (r_GetFbAttachmentParam) {
+        int32_t oname = 0;
+        r_GetFbAttachmentParam(0x8CA8, 0x8CE0, 0x8CD1 /* OBJECT_NAME */, &oname);
+        if ((uint32_t)oname != tex) return 0;  // stale attach, not ours
+    }
+    return layer_fb;
 }
 
 static uint32_t klfb_read_from_texture(uint32_t tex) {

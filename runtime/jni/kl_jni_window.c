@@ -659,6 +659,30 @@ static klj_val klj_SL_startVRLink(void *env, void *self, const klj_val *a, int n
     kl_fatal_prepare(); abort();
 }
 
+// SteamLink.isVRLinkRunning() — "is the OTHER half up". On Android the Java
+// answers it from its own bookkeeping around the VRLink activity; here the
+// only party that knows is the DRIVER (the app runs both front doors in one
+// process, `build/m_slink` re-execs into the other one), so the driver states
+// it — kl_app.c sets it at the handoff and at the VR door's onCreate — and
+// this binding only repeats it. The default, with nothing set, is false:
+// truthful for a shell that has not handed off yet, and for the host shell,
+// whose VR half lives in a process it cannot see.
+//
+// The newer Steam Link build polls this from the shell's background threads
+// AFTER startVRLink, so an unbound name here was a run that paired, handed
+// off, brought the VR chain up — and then stopped by name in the half that
+// was supposed to be finished.
+static volatile int g_vrlink_running;
+
+void kl_jni_set_vrlink_running(int on) { g_vrlink_running = on; }
+
+static klj_val klj_SL_isVRLinkRunning(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    int on = g_vrlink_running;
+    KLJ_LOG("SteamLink.isVRLinkRunning() -> %s", on ? "true" : "false");
+    return (klj_val){.j = (uint64_t)(on != 0)};
+}
+
 // Activity.requestPermissions(String[], int) — the runtime prompt. On Android
 // this RETURNS IMMEDIATELY and the answer arrives later on the main thread, at
 // onRequestPermissionsResult; returning is therefore the whole of the
@@ -732,6 +756,10 @@ const klj_binding klj_bind_window[] = {
     // it prints the payload first, because that string IS the session.
     {"com/valvesoftware/steamlink/SteamLink", "startVRLink", "(Ljava/lang/String;)V",
      klj_SL_startVRLink},
+    // ...and the question about the other half, answered from the driver's
+    // state (see klj_SL_isVRLinkRunning above).
+    {"com/valvesoftware/steamlink/SteamLink", "isVRLinkRunning", "()Z",
+     klj_SL_isVRLinkRunning},
     {"android/view/Window", "getDecorView", "()Landroid/view/View;", klj_Window_getDecorView},
     {"android/view/Window", "setFlags", "(II)V", klj_Window_setFlags},
     {"android/os/PowerManager", "isSustainedPerformanceModeSupported", "()Z", klj_PowerManager_sustainedPerf},

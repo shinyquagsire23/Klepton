@@ -183,7 +183,10 @@ static void *klaa_feeder(void *arg) {
         }
 
         size_t bytes = (size_t)frames * (size_t)frame_out;
-        size_t played = kl_audio_write(pcm, bytes);
+        // Tagged with this stream's pointer: the VR client runs two output
+        // streams at once, and kl_audio mixes them per-source instead of letting
+        // their feeder threads corrupt one ring.
+        size_t played = kl_audio_write_src(s, pcm, bytes);
         if (played < bytes) {
             // No device, KL_AUDIO=0, or one that stopped draining: pace the
             // remainder ourselves, which is byte-for-byte what this loop would

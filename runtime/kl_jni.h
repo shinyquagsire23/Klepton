@@ -100,6 +100,16 @@ void *kl_jni_new_string_array(const char *const *items, int n);
 // instant this returns).
 void kl_jni_set_vrlink_handoff(void (*fn)(const char *sargs));
 
+// ...and the question the guest asks about the OTHER half:
+// SteamLink.isVRLinkRunning(). On Android it reports whether the VR activity
+// is up; here that is the DRIVER's knowledge, exactly like the handoff above —
+// the app runs both front doors in one process, the host driver re-execs — so
+// the driver states it and the JNI layer only repeats it. Nothing sets it by
+// default, which answers false: the truthful answer for a shell that has not
+// handed off yet, and for the host shell, whose VR half lives in a different
+// process it cannot see.
+void kl_jni_set_vrlink_running(int on);
+
 // How the JNI surface calls BACK into the guest, by exported symbol name.
 //
 // The Unity guests never need this: their Java front end hands objects to
