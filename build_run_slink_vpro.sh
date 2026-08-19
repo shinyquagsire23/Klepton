@@ -4,11 +4,12 @@
 # The hybrid of the two wrappers, because neither alone fits this target on
 # device. build_run_vpro.sh owns the device loop — build through visionos/run.sh,
 # don't re-upload the assets, pull the log back, end with an answer — but its
-# summary asks Unity's questions of a guest that is not Unity. build_run_slink.sh
+# summary asks Unity's questions of a guest that is not Unity. build_run_host.sh
 # asks the right questions — did the chain bind, did the doors open, where did it
-# stop BY NAME — but wraps `make slink`, a HOST run. This script is the device
-# loop with the Steam Link questions, and its flags are that script's flags
-# restricted to the knobs the APP actually reads (kl_app.c / kl_slink.c):
+# stop BY NAME — but drives `build/m_boot`, a HOST run. This script is the device
+# loop with the Steam Link questions, and its flags are the host wrapper's flags
+# restricted to the knobs the APP actually reads (kl_app.c / kl_driver.c /
+# kl_slink.c):
 #
 #   ./build_run_slink_vpro.sh             # what a normal launch does: the 2D
 #                                         #   shell in a window, pair, and the
@@ -28,12 +29,25 @@
 #   ./build_run_slink_vpro.sh --host <ip> # aim host discovery instead of the
 #                                         #   broadcast sweep (KL_SLINK_HOST,
 #                                         #   comma-separated for several)
-#   ./build_run_slink_vpro.sh --wait 60   # seconds of looper pump on the window
-#                                         #   path (KL_SLINK_WAIT; the app's
-#                                         #   default is 30, and the media/audio/
-#                                         #   XR/GL report is written at the END
-#                                         #   of the pump)
-#   ./build_run_slink_vpro.sh --window    # window only, no immersive space
+#   ./build_run_slink_vpro.sh --wait 60   # seconds of looper pump (KL_SLINK_WAIT,
+#                                         #   and the media/audio/XR/GL report is
+#                                         #   written at the END of the pump). The
+#                                         #   SHELL door runs unbounded without
+#                                         #   it — it is being USED, not measured
+#                                         #   — and this bounds it; the VR door
+#                                         #   takes kl_driver_pump_default(),
+#                                         #   which is 10 s, a measurement rather
+#                                         #   than a session
+#   ./build_run_slink_vpro.sh --immersive # open the ImmersiveSpace at launch.
+#                                         #   Implied by --vr and --sargs: the
+#                                         #   space is OFF by default for this
+#                                         #   target (a shell run wants the
+#                                         #   window it reports into), and the VR
+#                                         #   door without one pumps a guest whose
+#                                         #   picture has nowhere to go. The
+#                                         #   2D->VR handoff opens it on its own
+#   ./build_run_slink_vpro.sh --window    # window only: hold the space shut even
+#                                         #   on the VR door
 #   ./build_run_slink_vpro.sh --null      # the null GL driver instead of ANGLE
 #   ./build_run_slink_vpro.sh --permissive# unimplemented JNI returns 0: scouting
 #   ./build_run_slink_vpro.sh --trace-fs  # log every guest file op
@@ -41,13 +55,23 @@
 #   ./build_run_slink_vpro.sh --stage     # re-upload the assets + qt plugins
 #   ./build_run_slink_vpro.sh --log       # pull + summarise the last run only
 #
-# What is deliberately NOT here, from build_run_slink.sh's list: --gap, --main,
-# --nofork and --no-handoff are `build/m_slink` knobs — KL_SLINK_HANDOFF is read
-# only by mains/m_slink.c, whose shell RE-EXECS into the VR door. The app cannot
+# What is deliberately NOT here, from build_run_host.sh's list: --gap, --main,
+# --nofork and --no-handoff are `build/m_boot` knobs — KL_SLINK_HANDOFF is read
+# only by mains/m_boot.c, whose shell RE-EXECS into the VR door. The app cannot
 # re-exec; its two front doors share one process and the 2D->VR handoff is the
 # app's own (kl_app.c, app_vrlink_handoff), so there is no host-side phase to
-# isolate. --libdir is gone for the same reason: on device the tree is the
+# isolate. There is no target argument either: on device the tree is the
 # TARGET's (staged assets + embedded translations), not an argument.
+#
+# What the app decides for this target before its chain runs — kl_app.c,
+# steamlink_policy() — so no flag has to: the topmost projection layer is the one
+# composited, the eye texture is allocated 2x and capped at 3456, the display rate
+# is pinned to 90 Hz (this client dereferences a null frametime container on a
+# MEASURED rate) and the audio buffer is 240 ms (a network stream jitters through
+# the 80 ms local-mixer default). Each is one env var away — KL_XR_CAPTURE_LAYER,
+# KL_XR_EYE_SCALE / KL_XR_EYE_MAX, KL_DISPLAY_HZ, KL_AUDIO_LATENCY_MS — and
+# run.sh forwards every KL_* it sees. Those defaults are the APP's alone;
+# `build/m_boot` sets none of them, so a host run still passes them by hand.
 #
 # Anything already set in the environment wins, so a one-off knob the flags do
 # not cover still works:
@@ -72,6 +96,7 @@ while [ $# -gt 0 ]; do
     --sargs)      export KL_SLINK_SARGS="$2"; shift 2 ;;
     --host)       export KL_SLINK_HOST="$2"; shift 2 ;;
     --wait)       export KL_SLINK_WAIT="$2"; shift 2 ;;
+    --immersive)  export KL_IMMERSIVE=1; shift ;;
     --window)     export KL_IMMERSIVE=0; shift ;;
     --null)       export KL_GLFB=0; shift ;;
     --permissive) export KL_PERMISSIVE=1; shift ;;
@@ -79,10 +104,22 @@ while [ $# -gt 0 ]; do
     --trace-net)  export KL_TRACE_NET=1; shift ;;
     --stage)      STAGE=1; shift ;;
     --log)        LOG_ONLY=1; shift ;;
-    -h|--help)    sed -n '2,56p' "$0"; exit 0 ;;
+    -h|--help)    sed -n '2,80p' "$0"; exit 0 ;;
     *)            echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
   esac
 done
+
+# The VR door opens the ImmersiveSpace, because nothing else will. The app
+# defaults the space OFF for this target — a shell run is read, typed into and
+# waited on, and an immersive space that is black by construction hides the one
+# surface with information on it — but that is the SHELL's default taken by a
+# door that has a session and a picture. --window still wins — it sets the same
+# variable — and so does a KL_IMMERSIVE already in the environment.
+if [ -z "${KL_IMMERSIVE:-}" ] \
+   && { [ -n "${KL_SLINK_VR:-}" ] || [ -n "${KL_SLINK_SARGS:-}" ]; } \
+   && [ -z "${KL_SLINK_SHELL:-}" ]; then
+  export KL_IMMERSIVE=1
+fi
 
 # Resolved the way build_run_vpro.sh resolves it, for the same reason: the
 # bundle id is what the log is pulled out of, so it has to come from the table
@@ -189,7 +226,18 @@ summarise() {
   fi
 
   echo "  -- compositor / graphics --"
-  g -E '\[glfb\]|\[cp\]|present\]' "$LOCAL_LOG" | sed 's/^/    /' | head -40 || true
+  # [ovrp] belongs here now: the display rate is PINNED for this target rather
+  # than measured, and which of the two happened is one line.
+  g -E '\[glfb\]|\[cp\]|present\]|\[ovrp\] display frequency' "$LOCAL_LOG" \
+    | sed 's/^/    /' | head -40 || true
+
+  # The stream itself, which is what a run of this target is FOR — the decoder's
+  # own counts and the audio's underruns, both written into the end-of-pump
+  # report. A stream that arrives and does not decode looks exactly like a
+  # compositor problem from the picture alone.
+  echo "  -- the stream --"
+  g -E 'first frame published|codec "|reader:|submitted, [0-9]+ decoded|parameter sets:|CoreAudio:|\[aaudio\]|\[au\] (restart|session|no render callback)' \
+    "$LOCAL_LOG" | sed 's/^ *//; s/^/    /' | awk '!seen[$0]++' | head -12 || true
 
   echo "  -- how it ended --"
   # The heartbeat separates the three failures that otherwise look identical:
@@ -233,8 +281,10 @@ export KL_LOG_OUT="$LOCAL_LOG"
 echo "target    : $KLT_NAME ($BUNDLE_ID, $KLT_PRODUCT.app)"
 echo "device    : $DEVID"
 echo "knobs     : ${KL_SLINK_SHELL:+KL_SLINK_SHELL=1 }${KL_SLINK_VR:+KL_SLINK_VR=1 }${KL_SLINK_SARGS:+KL_SLINK_SARGS=(carried) }${KL_SLINK_HOST:+KL_SLINK_HOST=$KL_SLINK_HOST }${KL_SLINK_WAIT:+KL_SLINK_WAIT=$KL_SLINK_WAIT }${KL_IMMERSIVE:+KL_IMMERSIVE=$KL_IMMERSIVE }${KL_GLFB:+KL_GLFB=$KL_GLFB }${KL_PERMISSIVE:+KL_PERMISSIVE=1 }${KL_TRACE_FS:+KL_TRACE_FS=1 }${KL_TRACE_NET:+KL_TRACE_NET=1 }KL_ALARM=$KL_ALARM${KL_SKIP_STAGE:+ (assets not re-staged)}"
-echo "            (unset knobs take the app's defaults: the 2D shell, immersive"
-echo "             handoff, ANGLE; run.sh forwards every KL_* it sees)"
+echo "            (unset knobs take the app's defaults: the 2D shell, ANGLE, the"
+echo "             space opened by the handoff rather than at launch, and the"
+echo "             Steam Link policy kl_app.c sets — 90 Hz, 240 ms audio, topmost"
+echo "             layer, 2x eye. run.sh forwards every KL_* it sees)"
 echo
 
 # Cleared before, not after: the sentinel says how THIS run produced its log,
