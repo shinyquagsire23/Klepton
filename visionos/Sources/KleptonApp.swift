@@ -142,6 +142,10 @@ enum Lifecycle {
 @main
 struct KleptonApp: App {
     @Environment(\.scenePhase) private var scenePhase
+    /// Observed so the Matting panel's hand-matting toggle re-evaluates the
+    /// immersive scene's `.upperLimbVisibility` live. The object is the shared
+    /// singleton the panel edits, not a second copy.
+    @ObservedObject private var chroma = KleptonChroma.shared
 
     var body: some Scene {
         WindowGroup { BootView() }
@@ -173,6 +177,12 @@ struct KleptonApp: App {
         // a CompositorLayer has no view hierarchy for the View-level modifier to
         // attach to, so the Scene-level one is the only one that applies here.
         .persistentSystemOverlays(Immersive.systemOverlays)
+        // Whether the system mattes the user's own hands and arms over the
+        // guest's picture. Read from the observed settings rather than from the
+        // environment directly, so the toggle in the Matting panel takes effect
+        // without a relaunch — which is the whole reason these live in a window
+        // that stays open beside the space.
+        .upperLimbVisibility(chroma.upperLimbVisibility)
     }
 }
 
@@ -273,6 +283,12 @@ struct BootView: View {
             // while they move, which is the entire point of them. Collapsed by
             // default: it is a tuning instrument, not part of booting.
             DisclosureGroup("Controller alignment") { TuningView() }
+                .font(.callout)
+
+            // ...and the matting dials, the same way and in the same window.
+            // Collapsed by default for the same reason: a key colour is found
+            // once for a room and then left alone.
+            DisclosureGroup("Matting") { ChromaView() }
                 .font(.callout)
 
             HStack(spacing: 16) {

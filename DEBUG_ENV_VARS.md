@@ -1469,6 +1469,34 @@ The composite/timewarp pass — one file, compiled by both compositors
 - `KL_REPROJECT_TRANSLATE=0` — correct rotation only, which is what the
   composite did before the parallax above. Inert at the default depth, so this
   is only meaningful together with a finite `KL_REPROJECT_DEPTH`.
+- `KL_CHROMA=1` — chroma-key the guest's picture so the room shows through
+  wherever it drew the key colour. Ported from VisionOSALVRClient with its maths
+  and defaults intact, so a value found in that client transfers. Off by
+  default. Applies to the EYE pass only — composition-layer quads (a guest's own
+  panels) are not matted.
+- `KL_CHROMA_COLOR=<r,g,b>` — the key colour, 0..1 per channel, default
+  `0.0627,0.4863,0.0627` (16, 124, 16). Matched in HSV with hue weighted four
+  times value and twice saturation, which is what makes it a key rather than a
+  colour comparison: a green screen under uneven light varies far more in
+  brightness than in hue. A pixel with almost no saturation or value is always
+  KEPT — black and white have no meaningful hue, and measuring their distance to
+  the key would matte out every shadow.
+- `KL_CHROMA_RANGE=<min,max>` — the HSV distance fade band, default `0.35,0.7`.
+  Below `min` a pixel is fully keyed out, above `max` fully kept, between them it
+  fades; a band rather than a threshold is what stops the matte having a hard
+  jagged edge.
+- `KL_HAND_MATTING=0` — stop the system drawing the user's own hands and arms
+  over the guest's picture (`.upperLimbVisibility`). On by default, which is what
+  visionOS does in `.mixed`; off is what a guest that draws its own hands wants,
+  because two pairs of hands in one place is worse than either alone.
+
+  All four are seeded into the **Matting** panel in the boot window and are
+  PERSISTED from there (UserDefaults, JSON, key `klepton.chroma`) — unlike the
+  controller dials beside them, because a key colour is a property of the room
+  rather than of a debugging session. Precedence at launch: an explicitly set
+  environment variable wins, then the saved settings, then these defaults.
+
+
 - `KL_SENSE_PREDICT_MS=<ms>` — how far into the future a Sense-controller pose
   may be predicted. 0 is the measured pose; the default 50 is the same horizon
   `kl_openxr` clamps the HEAD to, so both poses a guest reads are bounded by one

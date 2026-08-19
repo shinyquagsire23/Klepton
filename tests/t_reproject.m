@@ -198,6 +198,34 @@ static void klr_draw(id<MTLRenderCommandEncoder> enc) {
              vertexCount:kl_reproject_grid_vertices(1, 1)];
 }
 
+// One encode of the real pass into `out`. Factored out when the chroma case
+// arrived: two copies of an encoder is how one of them comes to bind a
+// different sampler or skip the grid, and this test has already caught exactly
+// that once.
+static void klr_render(id<MTLDevice> dev, id<MTLCommandQueue> q,
+                       id<MTLRenderPipelineState> ps, MTLSamplerDescriptor *sd,
+                       id<MTLTexture> src, id<MTLTexture> dst,
+                       const kl_reproject_uniforms *u, uint8_t out[16]) {
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    id<MTLCommandBuffer> cmd = [q commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:ps];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
+    [enc setFragmentSamplerState:[dev newSamplerStateWithDescriptor:sd] atIndex:0];
+    [enc setVertexBytes:u length:sizeof *u atIndex:0];
+    [enc setFragmentBytes:u length:sizeof *u atIndex:0];
+    klr_draw(enc);
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    [dst getBytes:out bytesPerRow:8 fromRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0];
+}
+
 static void check_pixels(void) {
     printf("=== the pass, run ===\n");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -298,6 +326,47 @@ static void check_pixels(void) {
     memcpy(want + 8, s0,     8);     // source row 0 (picture bottom) -> output bottom
     ok(memcmp(out, want, 16) == 0,
        "the pass reproduces the source, right way up, from the right slice");
+
+    // ---- the chroma key, through the real pass ------------------------------
+    //
+    // Ported from VisionOSALVRClient with its maths and its defaults intact, so
+    // what is asserted is that the KEY COLOUR goes to alpha 0 while a colour
+    // that is not the key survives. Both halves matter: a matte that keys
+    // everything looks exactly like a matte that works, right up until there is
+    // something in the scene you wanted to keep.
+    {
+        const float key[3] = { 16.0f / 255.0f, 124.0f / 255.0f, 16.0f / 255.0f };
+        uint8_t ck[16] = { 16,124,16,255,   16,124,16,255,     // the key colour
+                           220,30,30,255,   16,124,16,255 };   // ...and one red
+        [src replaceRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0 slice:0
+                 withBytes:ck bytesPerRow:8 bytesPerImage:16];
+
+        kl_reproject_set_chroma(1, key, 0.35f, 0.7f);
+        kl_reproject_uniforms cu =
+            kl_reproject_build(&r, 0, matrix_identity_float4x4,
+                               matrix_identity_float4x4, P, 0, 0, 0);
+        uint8_t cout[16] = {0};
+        klr_render(dev, q, ps, sd, src, dst, &cu, cout);
+        // Output row 0 is the picture's TOP, which is SOURCE row 1 — so the red
+        // texel (memory row 1, left) lands at the output's top left.
+        int red_kept  = cout[3] == 255 && cout[0] > 180;
+        int green_out = cout[8 + 3] == 0 && cout[12 + 3] == 0;
+        ok(red_kept && green_out,
+           "the key colour mattes to alpha 0 and a non-key colour survives");
+
+        // ...and off is a true passthrough, not a mask that happens to be 1.
+        // This is the assertion that keeps every other guest unaffected.
+        kl_reproject_set_chroma(0, key, 0.35f, 0.7f);
+        kl_reproject_uniforms nu =
+            kl_reproject_build(&r, 0, matrix_identity_float4x4,
+                               matrix_identity_float4x4, P, 0, 0, 0);
+        uint8_t nout[16] = {0};
+        klr_render(dev, q, ps, sd, src, dst, &nu, nout);
+        ok(nout[3] == 255 && nout[7] == 255 && nout[11] == 255 && nout[15] == 255,
+           "with the key off every pixel comes through opaque");
+        [src replaceRegion:MTLRegionMake2D(0,0,2,2) mipmapLevel:0 slice:0
+                 withBytes:s0 bytesPerRow:8 bytesPerImage:16];
+    }
     if (memcmp(out, want, 16) != 0)
         printf("    got  %3u,%3u,%3u | %3u,%3u,%3u\n"
                "         %3u,%3u,%3u | %3u,%3u,%3u\n"

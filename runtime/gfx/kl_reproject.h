@@ -130,6 +130,28 @@ typedef struct {
     // Sampling eye 1 through eye 0's crop shifts its picture
     // by that offset, which is a warped, displaced right eye and nothing else.
     uint32_t      grid_eye;
+    // ---- chroma key ---------------------------------------------------------
+    //
+    // A green-screen matte applied to the guest's picture so the room shows
+    // through wherever the guest drew the key colour — the way a flat-screen
+    // title is put into passthrough. Ported from VisionOSALVRClient with its
+    // maths and its defaults intact, deliberately: the two dials below are
+    // numbers a person finds by looking, and keeping them identical means a
+    // value found in one client still means the same thing here.
+    //
+    // **Scalars only, and that is a layout decision.** This struct is duplicated
+    // in MSL and the two must agree byte for byte; a float3 is 16-byte aligned
+    // there and 4-byte packed here, so the obvious spelling would put the whole
+    // frustum silently at the wrong offset. Every field here is a 4-byte scalar,
+    // which both compilers lay out the same way, and the key colour is three of
+    // them read as `packed_float3` on the other side.
+    uint32_t      chroma_on;
+    // The HSV distance band, in the units colorclose_hsv measures: below `min`
+    // the pixel is fully keyed out, above `max` it is fully kept, and between
+    // them it fades. A band rather than a threshold is what stops the matte
+    // having a hard jagged edge.
+    float         chroma_min, chroma_max;
+    float         chroma_key[3];
 } kl_reproject_uniforms;
 
 // The blit's uniforms — buffer(0) of its FRAGMENT stage. It carried a bare
@@ -208,6 +230,17 @@ kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
 // answer from one place instead of each deciding.
 void kl_reproject_set_srgb_decode(int on);
 int  kl_reproject_srgb_decode(void);
+
+// The chroma key, as the panel and the environment set it — see the struct
+// field above. `rgb` is the key colour in the same space the composite samples
+// in, `dmin`/`dmax` the HSV distance band. `rgb` may be NULL to leave the
+// colour alone. Every eye pass built after this call carries the new values, so
+// a slider moves the matte while it is being dragged.
+void kl_reproject_set_chroma(int on, const float rgb[3], float dmin, float dmax);
+
+// ...and what is in force, so a panel can show the numbers the composite is
+// actually using rather than its own idea of them. Any pointer may be NULL.
+int  kl_reproject_chroma(float rgb[3], float *dmin, float *dmax);
 
 // The reprojection pass. Draw as a 4-vertex triangle strip, no vertex buffer.
 //

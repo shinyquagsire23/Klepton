@@ -41,6 +41,46 @@ static float s_depth = 0.0f;
 
 void kl_reproject_reset_depth(void) { s_depth = 0.0f; }
 
+// The chroma key in force. Plain scalars written by a UI thread and read by the
+// render thread: each is a single aligned word, a torn read is not possible on
+// this platform, and the worst a race can do is use one slider's previous value
+// for one frame while a person is dragging it — the same argument
+// kl_openxr_set_grip_tune makes for the controller dials.
+//
+// Defaults are VisionOSALVRClient's, unchanged, so a value found there
+// transfers: off, a mid green (16, 124, 16), and a fade band of 0.35 to 0.7.
+// The environment seeds them once so a run can be keyed without opening a
+// panel, and DEBUG_ENV_VARS.md carries the names.
+static int   s_chroma_on = -1;
+static float s_chroma_key[3] = { 16.0f / 255.0f, 124.0f / 255.0f, 16.0f / 255.0f };
+static float s_chroma_min = 0.35f, s_chroma_max = 0.7f;
+
+static void klr_chroma_init(void) {
+    if (s_chroma_on >= 0) return;
+    const char *c = kl_env_str("KL_CHROMA_COLOR", NULL);
+    if (c) sscanf(c, "%f,%f,%f", &s_chroma_key[0], &s_chroma_key[1], &s_chroma_key[2]);
+    const char *r = kl_env_str("KL_CHROMA_RANGE", NULL);
+    if (r) sscanf(r, "%f,%f", &s_chroma_min, &s_chroma_max);
+    s_chroma_on = kl_env_on("KL_CHROMA", 0);
+}
+
+void kl_reproject_set_chroma(int on, const float rgb[3], float dmin, float dmax) {
+    klr_chroma_init();
+    if (rgb) for (int i = 0; i < 3; i++) s_chroma_key[i] = rgb[i];
+    s_chroma_min = dmin;
+    s_chroma_max = dmax;
+    // Last, so a reader that sees it enabled sees the values with it.
+    __atomic_store_n(&s_chroma_on, on ? 1 : 0, __ATOMIC_RELEASE);
+}
+
+int kl_reproject_chroma(float rgb[3], float *dmin, float *dmax) {
+    klr_chroma_init();
+    if (rgb) for (int i = 0; i < 3; i++) rgb[i] = s_chroma_key[i];
+    if (dmin) *dmin = s_chroma_min;
+    if (dmax) *dmax = s_chroma_max;
+    return __atomic_load_n(&s_chroma_on, __ATOMIC_ACQUIRE);
+}
+
 static int klr_translate(void) {
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_REPROJECT_TRANSLATE", 1);
@@ -104,6 +144,10 @@ static const char kl_msl_reproject[] =
 "    uint     srgbDecode; // 1 = the sample is an sRGB code value, not linear\n"
 "    uint     flipY;      // 1 = the picture's origin is the TOP left (Vulkan)\n"
 "    uint     gridEye;    // which grid BLOCK this view reads — kl_reproject.h\n"
+"    uint     chromaOn;\n"
+"    float    chromaMin;\n"
+"    float    chromaMax;\n"
+"    packed_float3 chromaKey;  // packed: matches the C side's three floats\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -141,7 +185,14 @@ static const char kl_msl_reproject[] =
 // to two and each view says which is its own; when they really do share one,
 // the same texture is bound twice and this reduces to exactly what it was.
 "struct VOut { float4 pos [[position]]; float2 uv; uint slice [[flat]];\n"
-"              uint srgb [[flat]]; uint src [[flat]]; };\n"
+"              uint srgb [[flat]]; uint src [[flat]];\n"
+// The chroma parameters travel as flat varyings for the same reason `slice` and
+// `srgbDecode` do: with both eyes drawn in one amplified pass the fragment stage
+// has no amplification_id, so it cannot index the per-view uniform array it
+// would otherwise read. Unlike the struct above these are varyings, not buffer
+// members, so a float3 here costs nothing and hides nothing.
+"              uint chromaOn [[flat]]; float3 chromaKey [[flat]];\n"
+"              float2 chromaRange [[flat]]; };\n"
 "\n"
 // One place, so a rung of the probe ladder cannot disagree with the real pass
 // about which eye it is looking at — which is the failure this whole file keeps
@@ -154,6 +205,65 @@ static const char kl_msl_reproject[] =
 "{\n"
 "    return src == 0u ? kl_eye_sample(t0, samp, uv, slice, srgbDecode)\n"
 "                     : kl_eye_sample(t1, samp, uv, slice, srgbDecode);\n"
+"}\n"
+"\n"
+// ---- the chroma key -------------------------------------------------------
+//
+// Ported from VisionOSALVRClient with its maths unchanged, on purpose: the two
+// distance dials are found by a person looking at a matte, and a value found
+// there has to mean the same thing here or the numbers do not transfer.
+//
+// The test is in HSV with hue weighted four times value and twice saturation,
+// which is what makes it a KEY rather than a colour comparison — a green screen
+// under uneven light varies in brightness far more than in hue.
+//
+// **Which colour space this runs in is the sampled one**, i.e. linear when
+// `srgbDecode` is set and raw code values otherwise, and the key colour is
+// compared as authored. That is ALVR's convention rather than a defensible one
+// — it compares an sRGB-authored key against a linearised frame — and it is
+// kept because changing it would silently move every dial value. If this is
+// ever made rigorous, the key colour has to be converted alongside, and the
+// defaults restated.
+"static float3 kl_rgb2hsv(float3 rgb)\n"
+"{\n"
+"    float cmax = max(rgb.r, max(rgb.g, rgb.b));\n"
+"    float cmin = min(rgb.r, min(rgb.g, rgb.b));\n"
+"    float delta = cmax - cmin;\n"
+"    float3 hsv = float3(0.0, 0.0, cmax);\n"
+"    if (cmax > cmin) {\n"
+"        hsv.y = delta / cmax;\n"
+"        if (rgb.r == cmax)      hsv.x = (rgb.g - rgb.b) / delta;\n"
+"        else if (rgb.g == cmax) hsv.x = 2.0 + (rgb.b - rgb.r) / delta;\n"
+"        else                    hsv.x = 4.0 + (rgb.r - rgb.g) / delta;\n"
+"        hsv.x = fract(hsv.x / 6.0);\n"
+"    }\n"
+"    return hsv;\n"
+"}\n"
+"\n"
+// 0 = key it out entirely, 1 = keep it entirely, between = the fade band.
+// A pixel with almost no saturation or almost no value is KEPT whatever its
+// hue: black and white have no meaningful hue, so measuring their distance to
+// the key would matte out every shadow in the picture.
+"static float kl_colorclose_hsv(float3 hsv, float3 keyHsv, float2 tol)\n"
+"{\n"
+"    if (hsv.b < 0.001 || hsv.g < 0.001) return 1.0;\n"
+"    float d = length(float3(4.0, 1.0, 2.0) * (keyHsv - hsv));\n"
+"    if (d < tol.x) return 0.0;\n"
+"    if (d < tol.y) return (d - tol.x) / (tol.y - tol.x);\n"
+"    return 1.0;\n"
+"}\n"
+"\n"
+// The matte, as one call both the real pass and its opaque probe make.
+//
+// The colour is un-multiplied by the key as well as scaled — ALVR's
+// `(rgb * mask) - (key * (1 - mask))` — which pulls the spill of the key colour
+// out of edge pixels instead of leaving a green fringe around everything.
+// Alpha carries the matte, and the compositor blends against passthrough.
+"static float4 kl_chroma_apply(float4 c, uint on, float3 key, float2 range)\n"
+"{\n"
+"    if (on == 0u) return c;\n"
+"    float mask = kl_colorclose_hsv(kl_rgb2hsv(c.rgb), kl_rgb2hsv(key), range);\n"
+"    return float4((c.rgb * mask) - (key * (1.0 - mask)), c.a * mask);\n"
 "}\n"
 "\n"
 // Off-screen on every axis (x, y and z all exceed w), so the clipper drops the
@@ -206,6 +316,9 @@ static const char kl_msl_reproject[] =
 "    VOut o;\n"
 "    o.slice = u.slice;\n"
 "    o.srgb = u.srgbDecode;\n"
+"    o.chromaOn = u.chromaOn;\n"
+"    o.chromaKey = float3(u.chromaKey);\n"
+"    o.chromaRange = float2(u.chromaMin, u.chromaMax);\n"
 "    // The amplification index IS the texture slot: the caller binds the views'\n"
 "    // textures in the order it amplified them. A single-view pass amplifies\n"
 "    // once, lands on 0, and binds one texture.\n"
@@ -245,7 +358,12 @@ static const char kl_msl_reproject[] =
 "                               texture2d_array<float> tex1 [[texture(1)]],\n"
 "                               sampler samp [[sampler(0)]])\n"
 "{\n"
-"    return kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+// The matte is applied HERE and in no probe below. A rung of the probe ladder
+// exists to answer "is the picture arriving", and one that could also be
+// keyed out would answer that question with the matte's opinion — which is the
+// failure mode this ladder was built to end.
+"    return kl_chroma_apply(c, in.chromaOn, in.chromaKey, in.chromaRange);\n"
 "}\n"
 "\n"
 // The probe ladder (KL_CP_PROBE). Same library, same vertex function, so each
@@ -278,6 +396,9 @@ static const char kl_msl_reproject[] =
 "    VOut o;\n"
 "    o.slice = ua[amp].slice;\n"
 "    o.srgb = ua[amp].srgbDecode;\n"
+"    o.chromaOn = ua[amp].chromaOn;\n"
+"    o.chromaKey = float3(ua[amp].chromaKey);\n"
+"    o.chromaRange = float2(ua[amp].chromaMin, ua[amp].chromaMax);\n"
 "    o.src = uint(amp);\n"
 "    o.pos = ua[amp].visible == 0u ? kl_offscreen\n"
 "                                  : float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
@@ -574,6 +695,12 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
         s_depth = (v > 0.0f) ? v : KL_REPROJECT_DEPTH;
     }
     u.depth = s_depth;
+
+    // Read per build rather than latched, so a slider moves the matte while it
+    // is being dragged — the panel and the environment reach the shader through
+    // exactly this call and no other.
+    u.chroma_on = (uint32_t)kl_reproject_chroma(u.chroma_key, &u.chroma_min,
+                                                &u.chroma_max);
 
     if (rendered && rendered->serial) {
         const float *t = rendered->tangents[(unsigned)eye > 1 ? 0 : eye];
