@@ -1565,7 +1565,17 @@ static int         g_frame_latched;
 static int klovrp_latch_enabled(void) {
     static int on = -1;
     if (on < 0) {
-        on = kl_env_on("KL_OVRP_LATCH", 0);
+        // **Default ON.** It was written that way (`on = !(e && e[0] == '0')`)
+        // and became `kl_env_on(..., 0)` in a tidying pass, which inverted the
+        // knob's meaning against both its own comment above and its entry in
+        // DEBUG_ENV_VARS — each of which describes `=0` as the OVERRIDE. With
+        // the latch off the guest reads a live pose that moves DURING its own
+        // frame, so the pose recorded for timewarp is not the pose the picture
+        // was drawn from, and the composite corrects by the difference. That is
+        // the temporal doubling this was written to fix, and it scales with the
+        // frame time — invisible at 90 fps, a full second of head motion during
+        // a 1 fps shader prewarm.
+        on = kl_env_on("KL_OVRP_LATCH", 1);
     }
     return on;
 }
@@ -1868,6 +1878,8 @@ static struct {
     kl_ovrp_render_pose pending;
     int                 pending_index;   // the GUEST's frame index
     uint64_t            stage_disagree;  // index%%N vs the observed stage
+    int                 last_named;      // the stage the previous submit named, or -1
+    uint64_t            repeat_drop;     // frames dropped for naming it again
     // How the observation window closed, counted per frame. These are the
     // numbers that say whether the pose↔picture association is *known* or
     // merely available — see klovrp_EndFrame.
@@ -1890,7 +1902,8 @@ static struct {
     uint64_t            serial;         // frames begun
     int                 last_complete;  // stage of the last completed frame, -1 = none
     pthread_mutex_t     mu;
-} g_frames = { .last_complete = -1, .mu = PTHREAD_MUTEX_INITIALIZER };
+} g_frames = { .last_complete = -1, .last_named = -1,
+               .mu = PTHREAD_MUTEX_INITIALIZER };
 
 // How many swapchain stages the guest is told it has. KL_OVRP_STAGES is the
 // A/B in both directions.
@@ -2137,6 +2150,36 @@ static uint64_t klovrp_end_frame_impl(int guest_frame_index, const int *viewport
     // remain the fallback. There, nothing composites and nothing reads these
     // records, so the old behaviour is preserved rather than reasoned about.
     int drop = binds == 0 && observed >= 0;
+
+    // ...and the same rule for a guest the GL observation cannot see at all.
+    //
+    // The test above is expressed in draw BINDS, which is a GL measurement, so
+    // on a Vulkan guest it is `observed < 0` and the protection above is
+    // structurally absent: every frame files a fresh pose, including one that
+    // drew nothing, against a stage still holding an older picture. That is the
+    // mismatch the paragraph above describes, and it is exactly what a DROPPED
+    // frame looks like from here — which is when it is seen.
+    //
+    // What Vulkan does state is the stage, in the guest's own submit. A guest
+    // rotating a three-stage ring names a different one every frame (measured
+    // on BONELAB: 85/84/84 across three stages), so naming the SAME stage twice
+    // running means it did not rotate — no new picture went anywhere. Filing
+    // this frame's pose against it would pair a new pose with the previous
+    // frame's image.
+    //
+    // Deliberately narrow: it needs the observation to be blind AND the guest
+    // to have named a stage AND that stage to repeat. A guest that genuinely
+    // renders twice into one stage would keep the older pose instead, so this
+    // is counted and reported rather than silent, and KL_OVRP_DROP_REPEAT=0
+    // turns it off.
+    static int drop_repeat = -1;
+    if (drop_repeat < 0) drop_repeat = kl_env_on("KL_OVRP_DROP_REPEAT", 1);
+    if (!drop && drop_repeat && observed < 0 && named_stage >= 0 &&
+        named_stage < stages && named_stage == g_frames.last_named) {
+        drop = 1;
+        g_frames.repeat_drop++;
+    }
+    if (named_stage >= 0) g_frames.last_named = named_stage;
     pthread_mutex_lock(&g_frames.mu);
     // Before the record is filed, and into the same record: the viewport
     // describes THIS frame's picture exactly as the pose and the tangents do,
@@ -2464,6 +2507,82 @@ typedef struct {
 } klovrp_input_state;
 static klovrp_input_state g_input[2];
 
+// ---- what each path actually applies to a controller pose -----------------
+//
+// The controller correction is spread across three seams and no log joined
+// them, which is why "the alignment is wrong on some targets" could not say
+// WHERE. The frontend applies a convention offset when it publishes
+// (KleptonControllers' KLSenseTune: a hilt pitch and a position nudge, tuned by
+// playing Beat Saber); kl_ovrp passes that through to an OVRPlugin guest
+// unchanged; kl_openxr adds its own grip pitch to a LOCAL copy for an OpenXR
+// guest. So two guests can receive rotations that differ by tens of degrees
+// with every constant behaving exactly as documented.
+//
+// This prints what is PUBLISHED. kl_openxr prints what it hands its guest after
+// its own pitch, in the same shape and the same units, so one device log
+// carries both numbers and the difference between them is the answer.
+//
+// Once per hand, then only when it moves materially, and never more than once
+// every two seconds: a controller pose changes every frame and a per-frame line
+// would be the log.
+static void klovrp_pose_euler_deg(const klovrp_pose *p, float *out) {
+    float x = p->qx, y = p->qy, z = p->qz, w = p->qw;
+    const float R = 57.29577951308232f;
+    // XYZ order, matching the frontend's klEulerXYZ so the two can be compared
+    // term by term rather than only in magnitude.
+    float sx = 2.0f * (w * x + y * z), cx = 1.0f - 2.0f * (x * x + y * y);
+    float sy = 2.0f * (w * y - z * x);
+    float sz = 2.0f * (w * z + x * y), cz = 1.0f - 2.0f * (y * y + z * z);
+    if (sy > 1.0f) sy = 1.0f;
+    if (sy < -1.0f) sy = -1.0f;
+    out[0] = atan2f(sx, cx) * R;
+    out[1] = asinf(sy) * R;
+    out[2] = atan2f(sz, cz) * R;
+}
+
+void kl_ovrp_ctrl_trace(const char *where, int hand, const float *euler_deg,
+                        const float *pos) {
+    static int on = -1;
+    // Opt-in: for an OVRPlugin guest this says nothing the frontend's own
+    // `[cp] Sense grip pitch` line does not, and it prints while the user is
+    // playing. It earns its place on the OpenXR path, where the two lines
+    // together are the only statement of what that path adds.
+    if (on < 0) on = kl_env_on("KL_CTRL_TRACE", 0);
+    if (!on || (unsigned)hand > 1) return;
+    // Keyed on the SOURCE as well as the hand, so the two seams do not silence
+    // each other — they describe different numbers and both are wanted.
+    static struct { const char *w; int hand; float e[3]; uint64_t t; } said[4];
+    static int nsaid;
+    int slot = -1;
+    for (int i = 0; i < nsaid; i++)
+        if (said[i].w == where && said[i].hand == hand) { slot = i; break; }
+    if (slot < 0) {
+        if (nsaid >= (int)(sizeof said / sizeof said[0])) return;
+        slot = nsaid++;
+        said[slot].w = where; said[slot].hand = hand;
+        said[slot].t = 0;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    float moved = 0;
+    for (int i = 0; i < 3; i++) {
+        float d = euler_deg[i] - said[slot].e[i];
+        if (d < 0) d = -d;
+        if (d > moved) moved = d;
+    }
+    if (said[slot].t && (moved < 2.0f || now - said[slot].t < 2000000000ull)) return;
+    said[slot].t = now;
+    for (int i = 0; i < 3; i++) said[slot].e[i] = euler_deg[i];
+    fprintf(stderr, "  [ctrl] %s hand %d: euler XYZ %.1f %.1f %.1f deg",
+            where, hand, (double)euler_deg[0], (double)euler_deg[1],
+            (double)euler_deg[2]);
+    if (pos)
+        fprintf(stderr, ", pos %.3f %.3f %.3f m",
+                (double)pos[0], (double)pos[1], (double)pos[2]);
+    fprintf(stderr, "\n");
+}
+
 void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              float vx, float vy, float vz,
@@ -2476,6 +2595,9 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
     klovrp_hist_note(&g_hand_hist[hand], &v);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
+    float e[3]; klovrp_pose_euler_deg(&v, e);
+    float pp[3] = { px, py, pz };
+    kl_ovrp_ctrl_trace("published", hand, e, pp);
 }
 
     // ...and the pose-only form, which is what the macOS viewer publishes. It
@@ -2488,6 +2610,9 @@ void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
     klovrp_derive_motion(&v, &g_hand_hist[hand]);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
+    float e[3]; klovrp_pose_euler_deg(&v, e);
+    float pp[3] = { px, py, pz };
+    kl_ovrp_ctrl_trace("published", hand, e, pp);
 }
 
 // Is the velocity in the latched hand sample a measurement, or is it the
@@ -5695,6 +5820,7 @@ void kl_ovrp_report(FILE *f) {
     uint64_t unobserved = g_frames.unobserved, multi = g_frames.multi;
     uint64_t cross = g_frames.cross_thread, disagree = g_frames.stage_disagree;
     uint64_t named = g_frames.named, named_dis = g_frames.named_disagree;
+    uint64_t repeat_drop = g_frames.repeat_drop;
     uint64_t filed[KLOVRP_MAX_STAGES];
     memcpy(filed, g_frames.filed, sizeof filed);
     pthread_mutex_unlock(&g_frames.mu);
@@ -5717,6 +5843,15 @@ void kl_ovrp_report(FILE *f) {
                        "submit, %llu of them differing from the frame counter%s\n",
                     (unsigned long long)named, (unsigned long long)named_dis,
                     named_dis ? "  <-- the counter would have been wrong there" : "");
+        // Frames the guest submitted without rotating its stage — a dropped
+        // frame, on a guest the GL observation cannot see. Their records are
+        // NOT filed, so the compositor keeps showing the previous picture with
+        // the pose it was drawn at instead of pairing it with a newer one.
+        if (repeat_drop)
+            fprintf(f, "  ...and %llu frame(s) named the SAME stage again and were "
+                       "dropped as having drawn nothing (KL_OVRP_DROP_REPEAT=0 "
+                       "files them anyway)\n",
+                    (unsigned long long)repeat_drop);
         // What the GL side saw, independently of any of the bookkeeping above.
         // A stage whose draw count stops climbing is a frozen picture, and that
         // is a different bug from a mis-filed pose even though both look like

@@ -1808,6 +1808,21 @@ front door is a knob, not a build. `build_run_host.sh`'s flags map onto these:
   more motion in the encoded frame at a fixed bitrate. Measured, so the knob is
   known to bite: `VTE_PROPS_STATIC_{L,R} was updated` appears **4 times** with
   it on and **0** with it off, same run otherwise.
+- `KL_CTRL_TRACE=1` — the controller-alignment trace, **off by default**. One
+  line per (seam, hand): `[ctrl] published hand N: euler XYZ …`
+  from kl_ovrp when the frontend publishes a pose, and `[ctrl] openxr grip hand
+  N: …` / `openxr aim` from kl_openxr after its own pitch. Once per pair, then
+  only on a change of more than 2 degrees and at most once every two seconds.
+
+  It exists because the correction is spread across three seams and no log
+  joined them. The frontend applies a convention offset when it publishes
+  (`KLSenseTune` in `KleptonControllers.swift`: a hilt pitch and a position
+  nudge, tuned by playing Beat Saber); kl_ovrp hands that to an OVRPlugin guest
+  unchanged; kl_openxr adds `KL_XR_GRIP_PITCH` to a LOCAL copy for an OpenXR
+  guest. Two guests can therefore receive rotations tens of degrees apart with
+  every constant behaving exactly as documented, and until both lines existed
+  nothing said which seam a misalignment came from. Read the two together: the
+  difference between them IS what the OpenXR path adds.
 - `KL_XR_GRIP_PITCH=<degrees>` — rotate the CONTROLLER pose about its X axis,
   positive tilting forward up. **Default +37, confirmed by eye on a headset
   streaming from SteamVR.** This is the one that visibly rotates the controller.
@@ -1847,6 +1862,41 @@ front door is a knob, not a build. `build_run_host.sh`'s flags map onto these:
   guest expects, and the two run opposite ways. A plausible source that gives
   the wrong answer — do not re-derive from it. A controller off by twice the
   angle rather than merely still wrong is the tell for a sign error.
+- `KL_XR_GRIP_PIVOT="x,y,z"` — metres, in the grip's own frame: **the point the
+  grip pitch should turn ABOUT**, i.e. the point that must not move when the
+  correction is applied. `_L`/`_R` per hand. Default 0,0,0 (the old behaviour).
+
+  `klxr_pitch_about_x` turns the orientation and leaves the position where the
+  platform put it, so the frame pivots about the tracked origin — back at the
+  wrist — and everything the guest draws from that pose swings on an arc of the
+  pitch angle. Measured on JKXR: the hilt ends up out by the knuckles instead of
+  through the closed fist, while the pitch itself is RIGHT (at zero the same
+  guest reads as "a gun grip rather than the sword grip the game is expecting").
+
+  Prefer this over `KL_XR_GRIP_POS` below: it is a POINT you can estimate by
+  looking at your hand — "the hilt centre is about six centimetres forward and
+  two down from where the controller is tracked", so `0,-0.02,-0.06` — where the
+  equivalent translation is a blind 3-axis sweep with no physical meaning and a
+  different right answer for every pitch angle. Axes: **-Z is the pointing
+  direction, +Y up, +X right**, so a hilt centre ahead of the tracked origin has
+  a NEGATIVE z.
+- `KL_XR_GRIP_POS="x,y,z"` — metres, in the grip's own frame, added to the
+  CONTROLLER pose after `KL_XR_GRIP_PITCH`. `_L`/`_R` per hand. Default 0,0,0.
+
+  **A pitch alone rotates where the controller points and not where it PIVOTS.**
+  The frame turns about the origin the platform gave us, so the point that
+  should have stayed put — the hilt's centre, inside the closed fist — swings on
+  an arc of the pitch angle. That is a different error from a wrong angle and it
+  has its own tell: rolling the wrist sweeps a large arc and the held object
+  sits out by the knuckles rather than through the curl of the fist. Measured on
+  JKXR against Beat Saber, where the object tracks through the fist correctly.
+
+  The OVRPlugin path has carried both halves all along — `KLSenseTune`'s `pos`
+  beside its rotation — and adjusting that position is what fixed the pivot on
+  Beat Saber and BONELAB. This is the same lever for the OpenXR path, which had
+  only the rotation. Sweep it one run per value, no rebuild, the way
+  `KL_SENSE_POS` is swept on the other path; `_L`/`_R` is what a CHIRAL error
+  needs (an offset mirrored between the hands).
 - `KL_XR_AIM_PITCH=<degrees>` — the EXTRA offset between the aim ray and the
   grip, applied only to `.../input/aim/pose`. **Default 0**: the real aim-vs-grip
   angle of this input source has not been measured, and the frontend's hilt
@@ -2041,6 +2091,20 @@ except its own control vars (next section).
 - `KL_SENSE_ROT="x,y,z"` / `KL_SENSE_POS="x,y,z"` — degrees and metres, in the
   grip's frame, applied to `AccessoryAnchor`'s `.grip` pose. Replaces the
   default outright. `_L`/`_R` per hand.
+- `KL_SENSE_PIVOT="x,y,z"` — metres in the grip's frame: **the point
+  `KL_SENSE_ROT` turns ABOUT.** `_L`/`_R` per hand, default 0,0,0 (turn about
+  the reported origin, which is what this path has always done).
+
+  **A translation cannot remove an arc.** The rotation is applied about the
+  origin the platform reports — back at the wrist — so everything the guest
+  draws from the pose swings by the rotation angle about that point;
+  `KL_SENSE_POS` slides the result but cannot change what it rotated around.
+  Measured on device: with `KL_SENSE_POS="0,0,0"` BONELAB's swing is unchanged.
+
+  Same lever, same name and units, as `KL_XR_GRIP_PIVOT` on the OpenXR path, and
+  estimable the same way — it is a point you can look at your hand and guess
+  ("the hilt centre is about six centimetres forward and four down from where
+  the controller is tracked" -> `0,-0.04,-0.06`).
 - `KL_SENSE_PITCH=<deg>` — just the X term of that rotation, which is the one
   that has ever needed changing. Default **-37**: the magnitude is Beat Saber's
   own in-game controller adjustment, the sign is device-measured (the same

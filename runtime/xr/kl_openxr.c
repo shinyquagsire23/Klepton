@@ -2110,7 +2110,7 @@ static int klxr_action_space_hand(const klxr_space *sp, int *is_aim);
 // move into kl_ovrp, it needs a per-guest split at that moment — the shared
 // seam is the reason, not the knob.
 #define KLXR_GRIP_PITCH_DEFAULT (37.0f)
-#define KLXR_AIM_PITCH_DEFAULT  (0.0f)
+#define KLXR_AIM_PITCH_DEFAULT  (-37.0f)
 static void klxr_pitch_about_x(XrPosef *p, float degrees) {
     if (degrees == 0.0f) return;
     float half = degrees * 0.5f * 3.14159265358979f / 180.0f;
@@ -2164,11 +2164,142 @@ static void klxr_pitches(float *grip, float *aim) {
     if (aim)  *aim  = aim_pitch;
 }
 
-static void klxr_pose_corrections(XrPosef *p, int is_aim) {
+// ...and the POSITION half of the same correction, in the grip's own frame.
+//
+// **A pitch alone rotates where the controller points and not where it
+// PIVOTS**, and that is a different error with a different symptom. The frame
+// is rotated about the origin the platform gave us, so a point that should have
+// stayed put — the centre of the hilt, inside the closed fist — swings on an
+// arc of the pitch angle instead. Reported from a headset on JKXR: "rolling my
+// wrist has a very large arc, and the saber sits near my knuckles rather than
+// grasped correctly", against Beat Saber where "the saber travels directly
+// through the curl of my closed fist".
+//
+// Beat Saber gets both halves: the frontend's Sense correction carries a
+// rotation AND a position nudge (KLSenseTune's `pos`, applied in the grip
+// frame), and adjusting that position is what fixed the pivot there and on
+// BONELAB. This path had only the rotation, so an OpenXR guest received a frame
+// turned 37 degrees about an origin nobody moved.
+//
+// Zero by default, so nothing changes until a device run says what it should
+// be — one run per candidate, no rebuild, exactly as KL_SENSE_POS is swept on
+// the other path. `_L`/`_R` override per hand, which is what a chiral error
+// needs.
+static XrVector3f klxr_grip_vec(int hand, const char *base, const char *l,
+                                const char *r);
+
+static XrVector3f klxr_grip_pos(int hand) {
+    static int init;
+    static XrVector3f off[2];
+    if (!init) {
+        init = 1;
+        for (int h = 0; h < 2; h++)
+            off[h] = klxr_grip_vec(h, "KL_XR_GRIP_POS", "KL_XR_GRIP_POS_L",
+                                   "KL_XR_GRIP_POS_R");
+    }
+    return off[(unsigned)hand > 1 ? 0 : hand];
+}
+
+// WHERE the pitch turns, in the grip's own frame — the point that should not
+// move when the correction is applied.
+//
+// The pitch is needed: with it at zero this guest reads as "a gun grip rather
+// than the sword grip the game is expecting", so the angle is right in kind.
+// What is wrong is the CENTRE. `klxr_pitch_about_x` turns the orientation and
+// leaves the position where the platform put it, so the frame pivots about the
+// tracked origin — somewhere back at the wrist — and everything the guest draws
+// from that pose swings on an arc of the pitch angle. The hilt ends up out by
+// the knuckles instead of through the closed fist.
+//
+// So state the pivot instead of solving for a translation. This is a POINT you
+// can estimate by looking at your hand — "the hilt centre is about six
+// centimetres forward and two down from where the controller is tracked" —
+// where the equivalent translation is a 3-DOF sweep with no physical meaning
+// and a different right answer for every pitch angle. The translation that
+// holds C still falls out of it:
+//
+//     P' = P + Q·C - (Q·R)·C
+//
+// with Q the orientation before the pitch and R the pitch. Zero is exactly the
+// old behaviour, so nothing moves until this is set.
+//
+// Grip-frame axes, for reading a result: -Z is the pointing direction, +Y up,
+// +X to the right — so a hilt centre ahead of the tracked origin has NEGATIVE
+// z, and `_L`/`_R` differ only for a chiral error.
+static XrVector3f klxr_grip_vec(int hand, const char *base, const char *l,
+                                const char *r) {
+    float v[3] = { 0, 0, 0 };
+    const char *name = hand == 0 ? l : r;
+    const char *e = kl_env_str(name, NULL);
+    if (!e) { name = base; e = kl_env_str(name, NULL); }
+    if (e && sscanf(e, "%f,%f,%f", &v[0], &v[1], &v[2]) == 3) {
+        fprintf(stderr, "  [xr] %s: hand %d %.3f %.3f %.3f m in the grip's own "
+                        "frame\n", name, hand, (double)v[0], (double)v[1],
+                (double)v[2]);
+        return (XrVector3f){ v[0], v[1], v[2] };
+    }
+    return (XrVector3f){ 0, 0, 0 };
+}
+
+static XrVector3f klxr_grip_pivot(int hand) {
+    static int init;
+    static XrVector3f c[2];
+    if (!init) {
+        init = 1;
+        for (int h = 0; h < 2; h++)
+            c[h] = klxr_grip_vec(h, "KL_XR_GRIP_PIVOT", "KL_XR_GRIP_PIVOT_L",
+                                 "KL_XR_GRIP_PIVOT_R");
+    }
+    return c[(unsigned)hand > 1 ? 0 : hand];
+}
+
+static void klxr_pose_corrections(XrPosef *p, int is_aim, int hand) {
     float grip_pitch, aim_pitch;
     klxr_pitches(&grip_pitch, &aim_pitch);
+    XrQuaternionf before = p->orientation;
     klxr_pitch_about_x(p, grip_pitch);
     if (is_aim) klxr_pitch_about_x(p, aim_pitch);
+    // Hold the pivot still across whatever the two pitches just did.
+    XrVector3f c = klxr_grip_pivot(hand);
+    if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f) {
+        XrVector3f was = klxr_qrot(before, c);
+        XrVector3f now = klxr_qrot(p->orientation, c);
+        p->position.x += was.x - now.x;
+        p->position.y += was.y - now.y;
+        p->position.z += was.z - now.z;
+    }
+    // AFTER the pitch, and in the rotated frame: the offset says where the hilt
+    // centre is relative to the corrected orientation, which is the frame the
+    // guest is about to draw a controller in.
+    XrVector3f o = klxr_grip_pos(hand);
+    if (o.x != 0.0f || o.y != 0.0f || o.z != 0.0f) {
+        XrVector3f d = klxr_qrot(p->orientation, o);
+        p->position.x += d.x;
+        p->position.y += d.y;
+        p->position.z += d.z;
+    }
+}
+
+// ...and what that leaves the guest holding, in the same units and the same
+// shape kl_ovrp prints what it PUBLISHED (kl_ovrp_ctrl_trace). The two lines
+// side by side are the whole of the controller-alignment question: the
+// frontend applies a convention offset when it publishes, this path adds its
+// own to a local copy, and until both were printed nothing said what the
+// difference between an OVRPlugin guest's controller and an OpenXR guest's
+// actually was.
+static void klxr_ctrl_trace(const XrPosef *p, int hand, int is_aim) {
+    if (hand < 0 || hand > 1) return;
+    float x = p->orientation.x, y = p->orientation.y;
+    float z = p->orientation.z, w = p->orientation.w;
+    const float R = 57.29577951308232f;
+    float sx = 2.0f * (w * x + y * z), cx = 1.0f - 2.0f * (x * x + y * y);
+    float sy = 2.0f * (w * y - z * x);
+    float sz = 2.0f * (w * z + x * y), cz = 1.0f - 2.0f * (y * y + z * z);
+    if (sy > 1.0f) sy = 1.0f;
+    if (sy < -1.0f) sy = -1.0f;
+    float e[3] = { atan2f(sx, cx) * R, asinf(sy) * R, atan2f(sz, cz) * R };
+    float pos[3] = { p->position.x, p->position.y, p->position.z };
+    kl_ovrp_ctrl_trace(is_aim ? "openxr aim" : "openxr grip", hand, e, pos);
 }
 
 // `motion_known` reports whether lin/ang are a measurement — a frontend that
@@ -2201,7 +2332,8 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
         if (!present) return base;
         base.position    = (XrVector3f){ pos[0], pos[1], pos[2] };
         base.orientation = (XrQuaternionf){ quat[0], quat[1], quat[2], quat[3] };
-        klxr_pose_corrections(&base, is_aim);
+        klxr_pose_corrections(&base, is_aim, hand);
+        klxr_ctrl_trace(&base, hand, is_aim);
         if (lin) memcpy(lin, v, sizeof v);
         if (ang) memcpy(ang, a, sizeof a);
         if (motion_known) *motion_known = kl_ovrp_hand_motion_known(hand);

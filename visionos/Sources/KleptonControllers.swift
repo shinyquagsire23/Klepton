@@ -292,6 +292,23 @@ private struct KLSenseTune {
 
     var rot = klEulerXYZ(SIMD3<Float>(psvr2Tilt + hiltPitch, 0, 0))
     var pos = SIMD3<Float>(-0.004, 0.02, -0.06)
+    /// `KL_SENSE_PIVOT="x,y,z"` — the point, in the grip's own frame, that
+    /// `rot` should turn ABOUT. Zero (the default) turns about the reported
+    /// origin, which is what this path has always done.
+    ///
+    /// **A translation cannot remove an arc, and that is why `pos` is not
+    /// enough.** `rot` is applied about the origin the platform reports —
+    /// somewhere back at the wrist — so everything the guest draws from this
+    /// pose swings by the rotation angle about that point. `pos` slides the
+    /// result; it cannot change what the result rotated around. Measured on
+    /// device: with `KL_SENSE_POS="0,0,0"` the swing on BONELAB is unchanged.
+    ///
+    /// Stated as a POINT because a point is estimable by eye — "the hilt centre
+    /// is about six centimetres forward and four down from where the controller
+    /// is tracked" — where the equivalent translation has no physical meaning
+    /// and a different right answer for every rotation angle. The same lever,
+    /// with the same name and units, as `KL_XR_GRIP_PIVOT` on the OpenXR path.
+    var pivot = SIMD3<Float>(0, 0, 0)
 
     static let shared: [KLSenseTune] = [make(0), make(1)]
 
@@ -310,6 +327,10 @@ private struct KLSenseTune {
         if let (p, k) = klEnvTriple("KL_SENSE_POS", hand) {
             t.pos = p
             NSLog("[cp] \(k): hand \(hand) Sense grip offset \(p) m")
+        }
+        if let (c, k) = klEnvTriple("KL_SENSE_PIVOT", hand) {
+            t.pivot = c
+            NSLog("[cp] \(k): hand \(hand) Sense grip rotates about \(c) m")
         }
         return t
     }
@@ -541,7 +562,12 @@ final class KleptonControllers {
         let raw = simd_quatf(m)
         let t = KLSenseTune.shared[hand]
         let q = simd_normalize(raw * t.rot)
-        let p = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z) + raw.act(t.pos)
+        // `pos` slides the corrected pose; `pivot` decides what the correction
+        // turned AROUND. Holding C still across the rotation is
+        // `+ raw·C - q·C`, which is zero when C is — so the default is exactly
+        // the behaviour this path has always had. See KLSenseTune.pivot.
+        var p = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z) + raw.act(t.pos)
+        if t.pivot != SIMD3<Float>(0, 0, 0) { p += raw.act(t.pivot) - q.act(t.pivot) }
 
         // Motion, rotated out of the accessory's own frame if that is what it
         // is in — by the UNCORRECTED orientation, because the correction above

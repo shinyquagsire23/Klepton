@@ -230,8 +230,17 @@ COMMON = f"""
 				// Klepton-Bridging-Header.h, so each directory holding one has
 				// to be on the search path. Same list as the Makefile's
 				// RUNTIME_INC; a new runtime/<area>/ needs a line in both.
+				//
+				// **The source tree comes BEFORE $(inherited)**, which carries
+				// $(BUILT_PRODUCTS_DIR)/include — a directory Xcode copies
+				// headers into and never removes them from. A header that MOVED
+				// between runtime directories therefore leaves a copy at its old
+				// bare path there for the life of the derived data, and with
+				// $(inherited) first that stale copy shadows the real one: the
+				// build fails on a symbol the header plainly declares, naming a
+				// Swift line and not a header. Measured after runtime/<area>/
+				// existed, on the per-target derived data that predated it.
 				HEADER_SEARCH_PATHS = (
-					"$(inherited)",
 					"$(SRCROOT)/../runtime",
 					"$(SRCROOT)/../runtime/jni",
 					"$(SRCROOT)/../runtime/libc",
@@ -240,6 +249,7 @@ COMMON = f"""
 					"$(SRCROOT)/../runtime/media",
 					"$(SRCROOT)/../runtime/guest",
 					"$(SRCROOT)/../runtime/diag",
+					"$(inherited)",
 				);
 				// Two levels of escaping, and the first attempt had one. The
 				// pbxproj layer eats a backslash, and the build system then

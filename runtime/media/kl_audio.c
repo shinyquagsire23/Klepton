@@ -735,14 +735,29 @@ size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
     }
 
     int slot = src_slot(src);
+    // **One source takes the shared write cursor, and that is the whole of the
+    // single-producer path.** The per-source cursor and the mix exist for a
+    // guest with TWO output streams (Steam Link opens a float one and an int16
+    // one); every other guest has exactly one, and for it `g_w` IS that
+    // source's position by definition. Deriving it from a second cursor instead
+    // was measured to starve the producer outright: Beat Saber went from 13692
+    // writes with 0 underruns to 78 writes with 8599, i.e. the guest's mixer —
+    // which is paced by this call — stalled. The equivalence was argued rather
+    // than constructed; this constructs it.
+    int mixing = g_src_n > 1;
     uint64_t r0 = atomic_load_explicit(&g_r, memory_order_acquire);
-    uint64_t pos = g_src_pos[slot];
-    // (Re)sync a new or stalled source to the latency target ahead of the reader,
-    // so its samples mix with the others in step — not in the past (already
-    // played as silence) nor so far ahead the ring wraps under it.
-    if (pos < r0 || pos > r0 + g_cap) {
-        uint64_t back = g_target > frames ? g_target - frames : 0;
-        pos = r0 + back;
+    uint64_t pos;
+    if (!mixing) {
+        pos = atomic_load_explicit(&g_w, memory_order_relaxed);
+    } else {
+        pos = g_src_pos[slot];
+        // (Re)sync a new or stalled source to the latency target ahead of the
+        // reader, so its samples mix with the others in step — not in the past
+        // (already played as silence) nor so far ahead the ring wraps under it.
+        if (pos < r0 || pos > r0 + g_cap) {
+            uint64_t back = g_target > frames ? g_target - frames : 0;
+            pos = r0 + back;
+        }
     }
 
     // Block until this source is no more than the latency target ahead of the
@@ -761,11 +776,27 @@ size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
         if (take > room) take = room;
 
         if (take) {
-            for (size_t k = 0; k < take; k++) {
-                size_t off = (size_t)((here + k) % g_cap);
-                const float *sp = conv + (written + k) * g_out_ch;
-                float *dp = g_ring + off * g_out_ch;
-                for (unsigned c = 0; c < g_out_ch; c++) dp[c] += sp[c];   // MIX
+            if (!mixing) {
+                // A COPY, in runs, exactly as the single-producer path always
+                // did: with one source there is nothing to sum with, and a
+                // read-modify-write of every sample is both slower and only
+                // correct if the slot is already silent.
+                for (size_t done = 0; done < take; ) {
+                    size_t off = (size_t)((here + done) % g_cap);
+                    size_t run = g_cap - off;
+                    if (run > take - done) run = take - done;
+                    memcpy(g_ring + off * g_out_ch,
+                           conv + (written + done) * g_out_ch,
+                           run * g_out_ch * sizeof(float));
+                    done += run;
+                }
+            } else {
+                for (size_t k = 0; k < take; k++) {
+                    size_t off = (size_t)((here + k) % g_cap);
+                    const float *sp = conv + (written + k) * g_out_ch;
+                    float *dp = g_ring + off * g_out_ch;
+                    for (unsigned c = 0; c < g_out_ch; c++) dp[c] += sp[c];   // MIX
+                }
             }
             written += take;
             uint64_t nf = pos + written;
@@ -783,6 +814,10 @@ size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
         nap_ms(2);
     }
     g_src_pos[slot] = pos + written < r0 ? r0 : pos + written;
+    // A source that appears LATE must not inherit a cursor from the
+    // single-source era: the moment a second one registers, both are resynced
+    // against the reader on their next write by the ladder above.
+    if (!mixing && g_src_n > 1) g_src_pos[slot] = 0;
 
     dump_write(conv, written);
 

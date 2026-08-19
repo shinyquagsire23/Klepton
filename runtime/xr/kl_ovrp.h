@@ -112,6 +112,9 @@ void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
 // convention. `kl_ovrp_set_hand_pose` is this with zero motion, and the two
 // write through one seqlock update so a reader can never pair this frame's
 // pose with last frame's velocity.
+void kl_ovrp_ctrl_trace(const char *where, int hand, const float *euler_deg,
+                        const float *pos);
+
 void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              float vx, float vy, float vz,
