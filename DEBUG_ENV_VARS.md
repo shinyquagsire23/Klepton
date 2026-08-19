@@ -1417,6 +1417,39 @@ that reports what came due since the frontend last asked. Platform-independent
 The composite/timewarp pass — one file, compiled by both compositors
 (`KleptonCompositor.swift` on device, `kl_view_mtl.m` in the viewer).
 
+- `KL_OVRP_TOUCH_FRAME=0` — hand an OVRPlugin guest the grip pose the platform
+  publishes, rather than the pose an Oculus Touch's TRACKED origin would have
+  had. On by default: the render model is drawn around the tracked origin and
+  that is the pose OVRPlugin reports, 10.2 cm back along the handle and pitched
+  20.6 degrees off the grip (`tools/rendermodel_frames.py`). An OpenXR guest is
+  unaffected either way — it asks for the grip and gets it.
+- `KL_XR_PREDICT=0` — return the head pose as it stands now from the pose
+  entry points instead of predicting it to the `displayTime` the guest named.
+  The prediction is the frontend's (a timestamped device-anchor query, walked
+  back 5 ms at a time until the tracker answers), capped 50 ms ahead, and it is
+  computed ONCE per (frame, instant): `xrLocateSpace`, `xrLocateViews` and the
+  layer placement in `xrEndFrame` all read the same one, because a guest that
+  renders from one of them and submits from another otherwise draws from one
+  head and declares another. Off restores exactly what this did before the seam
+  existed, which makes it the A/B for any motion artefact that appeared with it.
+  No host frontend publishes a tracker at all, so on host this knob does
+  nothing and every pose is the latched head.
+- `KL_XR_POSE_TRACE=1` — once a second, the head each pose entry point answered
+  with this frame and the head the guest actually submitted, differenced
+  pairwise (worst degrees and metres over the second) with a count of the frames
+  each source was asked on. This is how "the guest draws from one head and
+  declares another" is measured rather than inferred from its source, and it is
+  the instrument for any swim or slosh on head motion. A row of zeros says the
+  runtime is consistent and the fault is elsewhere.
+- `KL_HEAD_MIDPOINT=0` — report visionOS's device anchor as the guest's head
+  pose and rotate the timewarp about it, which is what this did before the
+  midpoint was measured. OpenXR defines VIEW space as the point midway between
+  the eyes and the device anchor is not that point, so the default (on) takes
+  the midpoint from the average of the drawable's two eye transforms, publishes
+  head poses and eye offsets about it, and restates `device_from_view` to
+  match. Latched once, from the first drawable: a streaming guest sends its eye
+  transform to the host once and the host will not revise it. The measured
+  offset prints as `[cp] eye midpoint`.
 - `KL_REPROJECT_DEPTH=<m>` — how far out the reprojection quad is placed
   (default **500 m**, the same distance ALVR uses). The quad is eye-centred, so
   this changes nothing about our own picture: it is what the SYSTEM's
@@ -1425,6 +1458,28 @@ The composite/timewarp pass — one file, compiled by both compositors
   drawable reports `depthRange = (far inf, near 0.1)`, so nothing is ever
   discarded for being too far; a frame that vanishes is depth WRITES being off,
   not this number.
+  **This is the swim knob.** The composite corrects the head's TRANSLATION as
+  parallax for a plane at this distance, and at the 500 m default that
+  correction is nothing — so the world slides whenever the head translates, and
+  a head TURN translates the eyes by several centimetres about the neck. That
+  is why yaw swims and pitch (whose eye displacement is vertical and in depth)
+  does not. A few metres, near the content, is the experiment: `2`, `3`, `5`.
+  The correction is exact for content at this distance and wrong for the rest,
+  which is the best a single plane can do.
+- `KL_REPROJECT_TRANSLATE=0` — correct rotation only, which is what the
+  composite did before the parallax above. Inert at the default depth, so this
+  is only meaningful together with a finite `KL_REPROJECT_DEPTH`.
+- `KL_SENSE_PREDICT_MS=<ms>` — how far into the future a Sense-controller pose
+  may be predicted. 0 is the measured pose; the default 50 is the same horizon
+  `kl_openxr` clamps the HEAD to, so both poses a guest reads are bounded by one
+  number. **A time cap, not a fraction of the frame interval**: a tracker's
+  extrapolation error is a function of how far ahead it reaches, and a fraction
+  would mean a different horizon at 90 Hz than at 60. Both extremes were
+  measured wrong on Steam Link — full prediction overshoots (we predict AND
+  publish a velocity, and SteamVR predicts again to the PC's photon time), none
+  lags. The app logs the measured interval and whether the cap binds; if
+  presentation is nearer than the cap, the cap does nothing and wants lowering.
+
 - `KL_REPROJECT_NOCANT=1` — treat `device_from_view` as having no rotation;
   the A/B for the eye-cant handling.
 - `KL_SRGB_DECODE=0|1` — force the composite's sRGB→linear decode on or off,
@@ -1862,6 +1917,28 @@ front door is a knob, not a build. `build_run_host.sh`'s flags map onto these:
   guest expects, and the two run opposite ways. A plausible source that gives
   the wrong answer — do not re-derive from it. A controller off by twice the
   angle rather than merely still wrong is the tell for a sign error.
+- `KL_XR_SYSTEM_NAME=<string>` / `KL_XR_RUNTIME_NAME=<string>` /
+  `KL_XR_VENDOR_ID=<n>` — the device identity an OpenXR guest reads.
+  Defaults `Oculus Quest2`, `Oculus`, `0x2833` (the Oculus USB vendor id).
+
+  **These are the ONLY things an OpenXR guest can identify the device by**, and
+  they have to agree with the identity every other seam gives. We present a
+  Quest 2 in `Build.MODEL`, `Build.PRODUCT` and `ovrp_GetSystemHeadsetType` (9 =
+  Oculus_Quest_2) because reporting anything else fails every Oculus branch in a
+  guest — but an OpenXR guest sees none of those. It has the interaction profile
+  (already `oculus/touch_controller`), these three, and nothing else.
+
+  They used to answer `Klepton HMD` / `Klepton` / vendor 0, i.e. "a runtime I
+  have never heard of", and the guest then fell back to its DEFAULT controller:
+  JKXR and Open Brush both drew **Quest 1** controllers while every OVRPlugin
+  guest drew Quest 2s. That is not cosmetic — a controller model carries its own
+  grip-to-model transform, so the guest applies a pose offset in its own frame
+  that nothing here can see or cancel, which is a per-title alignment error by
+  construction.
+
+  Knobs because clients branch on these strings. Steam Link already showed
+  Quest 2 controllers (its identity comes from the Steam host, not from here),
+  so it is the target to watch for a regression.
 - `KL_XR_GRIP_PIVOT="x,y,z"` — metres, in the grip's own frame: **the point the
   grip pitch should turn ABOUT**, i.e. the point that must not move when the
   correction is applied. `_L`/`_R` per hand. Default 0,0,0 (the old behaviour).
@@ -2091,6 +2168,22 @@ except its own control vars (next section).
 - `KL_SENSE_ROT="x,y,z"` / `KL_SENSE_POS="x,y,z"` — degrees and metres, in the
   grip's frame, applied to `AccessoryAnchor`'s `.grip` pose. Replaces the
   default outright. `_L`/`_R` per hand.
+**These values can be tuned LIVE.** The boot window carries a "Controller
+alignment" panel (`visionos/Sources/KleptonTuning.swift`) with a slider per
+term, and it stays open beside the immersive space — so the guest keeps
+rendering while they move and a candidate costs a drag instead of a two-minute
+relaunch. The panel seeds itself from whatever is actually in force, so the
+variables below still set the starting point; it prints the whole set back as a
+copy-pasteable environment line, because a value found by dragging and not
+written down is a value found twice.
+
+- `KL_SENSE_MIRROR=0` — stop mirroring the shared offsets' X term for the LEFT
+  hand. A grip offset is a point on a hand and the two hands are mirror images,
+  so the same physical displacement is `+x` on one and `-x` on the other;
+  without the mirror a shared value is right on one hand and wrong by twice its
+  own size on the other, which is the chiral error reported on BONELAB. Applies
+  only to the shared `KL_SENSE_POS` / `KL_SENSE_PIVOT` — an explicit `_L`/`_R`
+  is already an answer about that hand and is taken exactly as given.
 - `KL_SENSE_PIVOT="x,y,z"` — metres in the grip's frame: **the point
   `KL_SENSE_ROT` turns ABOUT.** `_L`/`_R` per hand, default 0,0,0 (turn about
   the reported origin, which is what this path has always done).

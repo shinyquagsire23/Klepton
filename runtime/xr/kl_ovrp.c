@@ -1383,6 +1383,15 @@ static int g_head_set;              // has a frontend ever written a head pose?
 // The two hands, published by the same frontend in the same breath. Declared
 // here beside the head because the per-frame latch below promotes all three
 // together — they are one sample of one instant and must stay so.
+// CLOCK_MONOTONIC nanoseconds — the clock the frame record is stamped on, and
+// the same one the guest's own System.nanoTime answers from, so an age computed
+// against it is not the offset between two clocks.
+static uint64_t klovrp_mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 static klovrp_pose g_hand_pose[2];
 
 // --- The frontend/guest pose handoff: a seqlock ----------------------------
@@ -1636,16 +1645,43 @@ void kl_ovrp_frame_latch(void) {
     klovrp_pose l = klovrp_pose_read(&g_hand_pose[0]);
     klovrp_pose r = klovrp_pose_read(&g_hand_pose[1]);
 
-    static float worst;
+    static float worst, worst_axis[3];
     static unsigned n;
     if (__atomic_load_n(&g_frame_latched, __ATOMIC_ACQUIRE)) {
         float moved = klovrp_quat_degrees(&g_frame_head, &h);
         if (moved > worst) worst = moved;
+        // ...and the same motion split by AXIS, because "the world swims when I
+        // look side to side but not when I nod" has two candidate readings and
+        // one number cannot tell them apart. Either the pipeline is wrong about
+        // yaw specifically (a geometry fault), or it is wrong in proportion to
+        // angular RATE and people simply yaw far faster than they pitch — in
+        // which case the asymmetry is latency wearing a geometric disguise and
+        // no amount of looking at the yaw axis will find it. These three
+        // numbers decide which.
+        //
+        // The rotation vector of the relative quaternion, which for the
+        // fractions of a degree a frame carries is the axis-angle to well
+        // inside the reporting precision.
+        const klovrp_pose *a = &g_frame_head;
+        float cx = -a->qx, cy = -a->qy, cz = -a->qz, cw = a->qw;
+        float dw = h.qw*cw - h.qx*cx - h.qy*cy - h.qz*cz;
+        float dx = h.qw*cx + h.qx*cw + h.qy*cz - h.qz*cy;
+        float dy = h.qw*cy - h.qx*cz + h.qy*cw + h.qz*cx;
+        float dz = h.qw*cz + h.qx*cy - h.qy*cx + h.qz*cw;
+        if (dw < 0) { dx = -dx; dy = -dy; dz = -dz; }
+        const float R2 = 2.0f * (180.0f / 3.14159265358979f);
+        float ax[3] = { fabsf(dx) * R2, fabsf(dy) * R2, fabsf(dz) * R2 };
+        for (int i = 0; i < 3; i++)
+            if (ax[i] > worst_axis[i]) worst_axis[i] = ax[i];
     }
     if (++n % 300 == 0) {
         fprintf(stderr, "  [ovrp] pose latch: worst %.2f deg of head motion "
-                        "inside one guest frame over the last 300\n", (double)worst);
+                        "inside one guest frame over the last 300 "
+                        "(pitch %.2f, yaw %.2f, roll %.2f)\n",
+                (double)worst, (double)worst_axis[0], (double)worst_axis[1],
+                (double)worst_axis[2]);
         worst = 0;
+        worst_axis[0] = worst_axis[1] = worst_axis[2] = 0;
     }
 
     uint32_t s = __atomic_load_n(&g_frame_pose_seq, __ATOMIC_RELAXED);
@@ -1722,6 +1758,25 @@ void kl_ovrp_get_guest_head_pose(float *px, float *py, float *pz,
     if (px) *px = h.px; if (py) *py = h.py; if (pz) *pz = h.pz;
     if (qx) *qx = h.qx; if (qy) *qy = h.qy;
     if (qz) *qz = h.qz; if (qw) *qw = h.qw;
+}
+
+// The head's own motion, from the sample this frame was latched with — the
+// velocity half of "one measurement per frame". A client that wants to predict
+// an instant we were not asked about needs it, and OpenXR's XrSpaceVelocity is
+// where it asks: without it the only way to move a pose forward is to trust the
+// runtime's prediction of the one instant it was told about.
+//
+// Reads the LATCHED sample, exactly as kl_ovrp_get_guest_head_pose does, so the
+// velocity a guest is given belongs to the pose it was given. Returns whether
+// those six numbers are a measurement at all — DeviceAnchor publishes no
+// velocity, so this is derived from successive poses and the first sample after
+// a gap has no basis. Zero is the claim that a moving head is stationary, which
+// is the lie OpenXR's velocityFlags == 0 exists to avoid.
+int kl_ovrp_head_motion(float *vel, float *ang) {
+    klovrp_pose h = klovrp_head();
+    if (vel) { vel[0] = h.vx;  vel[1] = h.vy;  vel[2] = h.vz;  }
+    if (ang) { ang[0] = h.avx; ang[1] = h.avy; ang[2] = h.avz; }
+    return h.motion_valid;
 }
 
 void kl_ovrp_set_head_pose(float px, float py, float pz,
@@ -1847,11 +1902,86 @@ static klovrp_pose klovrp_step_head(int step) {
     return klovrp_head();
 }
 
+// Where an Oculus Touch's TRACKED origin sits in its own OpenXR grip frame,
+// straight out of the SteamVR render model (tools/rendermodel_frames.py prints
+// the table): 10.2 cm back along the handle and pitched 20.6 degrees off it.
+// The X term is a point on a hand, so it mirrors between them.
+//
+// It matters because the two guest-facing XR APIs want DIFFERENT poses out of
+// one controller. An OpenXR guest asks for the grip, and the platform publishes
+// a grip, so that path is the identity. An OVRPlugin guest is handed the
+// tracked pose — the render model is drawn around it — and a title then applies
+// its own offset on top, which is why Beat Saber pitches a controller by 40
+// degrees to find a saber the model puts 37.4 degrees off tracked.
+//
+// OFF by default, against that reasoning, because the measurement disagrees
+// with it: one shared position offset was found by hand that satisfies the
+// OVRPlugin guests and the OpenXR guests at once, and if these two really
+// wanted poses 10 cm apart no single value could have. Either a title's own
+// offset already assumes the grip, or the guests never use the node pose the
+// way the model implies. KL_OVRP_TOUCH_FRAME=1 composes it so one run can
+// settle what the argument cannot.
+#define KLOVRP_TOUCH_TRACKED_X  ( 0.007000f)
+#define KLOVRP_TOUCH_TRACKED_Y  (-0.034157f)
+#define KLOVRP_TOUCH_TRACKED_Z  (-0.096073f)
+#define KLOVRP_TOUCH_TRACKED_PITCH (-20.60f)
+
+// The residual, measured by playing rather than derived, kept as its own term
+// so the two never blur together: everything above is a statement about an
+// Oculus Touch that a file can be pointed at, and this is what was left over
+// once that statement was applied.
+//
+// Found on BONELAB with the sense offset at zero, and it is the whole
+// correction that target needed after grip-to-tracked landed — where before it
+// wanted a chiral 8 cm in X, which nothing in the model could explain. Not
+// mirrored, because it did not measure chiral: X came out zero on both hands.
+//
+// What it probably IS, unresolved: the platform grip and the Touch grip are
+// not the same point on a hand. A Sense's tracked origin is 2.1 cm from its
+// grip and a Touch's is 10.2 cm from its own, so the two controllers are held
+// differently and the frames they call "grip" need not coincide. That would
+// make this a per-controller constant rather than a per-guest one, which is
+// what it is being treated as.
+#define KLOVRP_TOUCH_RESIDUAL_X (0.000000f)
+#define KLOVRP_TOUCH_RESIDUAL_Y (0.075000f)
+#define KLOVRP_TOUCH_RESIDUAL_Z (0.005000f)
+
+static void klovrp_grip_to_touch(klovrp_pose *p, int hand) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_OVRP_TOUCH_FRAME", 1);
+    if (!on) return;
+    // The offset is stated in the grip's own frame, so it is carried by the
+    // grip's orientation before the pitch is applied — the pitch turns the
+    // reported frame, it does not move the point.
+    float mx = hand == 0 ? -1.0f : 1.0f;
+    float ox, oy, oz;
+    klovrp_qrot(p,
+                mx * KLOVRP_TOUCH_TRACKED_X + KLOVRP_TOUCH_RESIDUAL_X,
+                KLOVRP_TOUCH_TRACKED_Y + KLOVRP_TOUCH_RESIDUAL_Y,
+                KLOVRP_TOUCH_TRACKED_Z + KLOVRP_TOUCH_RESIDUAL_Z, &ox, &oy, &oz);
+    p->px += ox; p->py += oy; p->pz += oz;
+    float h = KLOVRP_TOUCH_TRACKED_PITCH * 0.5f * 3.14159265358979f / 180.0f;
+    float sx = sinf(h), cw = cosf(h);
+    // q = q_grip * rotX(pitch), the pitch on the RIGHT because it is expressed
+    // in the grip's frame and not in the tracking space's.
+    float qx = p->qx, qy = p->qy, qz = p->qz, qw = p->qw;
+    p->qx = qw * sx + qx * cw;
+    p->qy = qy * cw + qz * sx;
+    p->qz = qz * cw - qy * sx;
+    p->qw = qw * cw - qx * sx;
+}
+
 static klovrp_pose klovrp_step_hand(int step, int hand) {
     int ix = klovrp_step_ix(step);
+    klovrp_pose p;
     if (__atomic_load_n(&g_step_valid[ix], __ATOMIC_ACQUIRE))
-        return klovrp_seq_read(&g_step_hand[ix][hand], &g_step_seq);
-    return klovrp_hand(hand);
+        p = klovrp_seq_read(&g_step_hand[ix][hand], &g_step_seq);
+    else
+        p = klovrp_hand(hand);
+    // Here and not in klovrp_hand: this is the OVRPlugin guest's read.
+    // kl_ovrp_hand_motion is kl_openxr's and must keep the grip.
+    klovrp_grip_to_touch(&p, hand);
+    return p;
 }
 
 // --- Timewarp bookkeeping ---------------------------------------------------
@@ -1986,6 +2116,7 @@ static uint64_t klovrp_begin_frame_impl(int guest_frame_index) {
     r->serial = s;
     r->stage = -1;
     r->complete = 0;
+    r->submit_ns = klovrp_mono_ns();
     // Unity's own frame counter — the number it picks its stage from.
     g_frames.pending_index = guest_frame_index;
     pthread_mutex_unlock(&g_frames.mu);
@@ -2396,6 +2527,7 @@ void kl_ovrp_frame_begin_external(void) {
     r->serial = s;
     r->stage = -1;
     r->complete = 0;
+    r->submit_ns = klovrp_mono_ns();
     g_frames.pending_index = (int)s;
     pthread_mutex_unlock(&g_frames.mu);
 }
@@ -2581,6 +2713,37 @@ void kl_ovrp_ctrl_trace(const char *where, int hand, const float *euler_deg,
         fprintf(stderr, ", pos %.3f %.3f %.3f m",
                 (double)pos[0], (double)pos[1], (double)pos[2]);
     fprintf(stderr, "\n");
+}
+
+static kl_ovrp_head_at_fn g_head_at;
+
+void kl_ovrp_set_head_at(kl_ovrp_head_at_fn fn) {
+    __atomic_store_n(&g_head_at, fn, __ATOMIC_RELEASE);
+}
+
+int kl_ovrp_head_predict_delta(double time_s, float *quat4, float *pos3) {
+    kl_ovrp_head_at_fn fn = __atomic_load_n(&g_head_at, __ATOMIC_ACQUIRE);
+    if (!fn) return 0;
+    float w[7];
+    if (!fn(time_s, w)) return 0;
+    // delta = predicted o current^-1, so applying it on the left of anything
+    // built from the current pose moves it to where the prediction says.
+    klovrp_pose h = klovrp_head();
+    float ix = -h.qx, iy = -h.qy, iz = -h.qz, iw = h.qw;   // conjugate = inverse
+    // q_delta = q_pred * q_cur^-1
+    quat4[0] = w[3] * ix + w[0] * iw + w[1] * iz - w[2] * iy;
+    quat4[1] = w[3] * iy - w[0] * iz + w[1] * iw + w[2] * ix;
+    quat4[2] = w[3] * iz + w[0] * iy - w[1] * ix + w[2] * iw;
+    quat4[3] = w[3] * iw - w[0] * ix - w[1] * iy - w[2] * iz;
+    // p_delta = p_pred - q_delta * p_cur
+    klovrp_pose d;
+    d.qx = quat4[0]; d.qy = quat4[1]; d.qz = quat4[2]; d.qw = quat4[3];
+    float rx, ry, rz;
+    klovrp_qrot(&d, h.px, h.py, h.pz, &rx, &ry, &rz);
+    pos3[0] = w[4] - rx;
+    pos3[1] = w[5] - ry;
+    pos3[2] = w[6] - rz;
+    return 1;
 }
 
 void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,

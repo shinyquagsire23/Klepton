@@ -268,6 +268,13 @@ struct BootView: View {
             }
             .frame(maxHeight: .infinity)
 
+            // The controller-alignment sliders, in THIS window because it stays
+            // open beside the immersive space — so the guest keeps rendering
+            // while they move, which is the entire point of them. Collapsed by
+            // default: it is a tuning instrument, not part of booting.
+            DisclosureGroup("Controller alignment") { TuningView() }
+                .font(.callout)
+
             HStack(spacing: 16) {
                 Button(running ? "Running…" : "Boot") { boot() }
                     .disabled(running)

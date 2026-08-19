@@ -242,6 +242,16 @@ private func klEulerXYZ(_ degrees: SIMD3<Float>) -> simd_quatf {
          * simd_quatf(angle: r.z, axis: [0, 0, 1])
 }
 
+/// `klEulerXYZ` read back off a transform, in degrees — the same convention a
+/// SteamVR render model's `rotate_xyz` states, so a measured row and a row out
+/// of a model file can be compared term by term.
+func klEulerDegOf(_ m: simd_float4x4) -> SIMD3<Float> {
+    let r = 180 / Float.pi
+    return SIMD3<Float>(atan2(-m.columns.2.y, m.columns.2.z) * r,
+                        asin(max(-1, min(1, m.columns.2.x))) * r,
+                        atan2(-m.columns.1.x, m.columns.0.x) * r)
+}
+
 /// The Sense controllers' own correction — `KL_SENSE_ROT` / `KL_SENSE_POS`, in
 /// the grip's frame, per hand with `_L`/`_R`.
 ///
@@ -283,7 +293,7 @@ private func klEulerXYZ(_ degrees: SIMD3<Float>) -> simd_quatf {
 /// -42.04. Beat Saber's own `OculusVRHelper.AdjustControllerTransform` pitches
 /// a Touch controller by 40 degrees, and `KL_SENSE_PITCH=-45.037` puts the
 /// total there exactly (-45.037 + 5.037) in one run.
-private struct KLSenseTune {
+struct KLSenseTune {
     /// ALVR's PSVR2 comfort tilt and this guest's hilt pitch, kept apart so the
     /// log line and the source agree on where each degree came from.
     static let psvr2Tilt: Float = 5.037
@@ -291,7 +301,7 @@ private struct KLSenseTune {
         ProcessInfo.processInfo.environment["KL_SENSE_PITCH"].flatMap { Float($0) } ?? -37
 
     var rot = klEulerXYZ(SIMD3<Float>(psvr2Tilt + hiltPitch, 0, 0))
-    var pos = SIMD3<Float>(-0.004, 0.02, -0.06)
+    var pos = SIMD3<Float>(-0.005, 0.02, -0.02)
     /// `KL_SENSE_PIVOT="x,y,z"` — the point, in the grip's own frame, that
     /// `rot` should turn ABOUT. Zero (the default) turns about the reported
     /// origin, which is what this path has always done.
@@ -312,8 +322,29 @@ private struct KLSenseTune {
 
     static let shared: [KLSenseTune] = [make(0), make(1)]
 
+    /// `KL_SENSE_MIRROR=0` — stop mirroring the shared offsets' X term for the
+    /// LEFT hand.
+    ///
+    /// A grip offset is a point on a hand, and the two hands are mirror images:
+    /// the same physical displacement is `+x` on one and `-x` on the other.
+    /// Confirmed on device — "we need to flip the x offset for the left hand" —
+    /// and without it a shared value is right on one hand and wrong by twice
+    /// its own size on the other, which is the CHIRAL error reported on BONELAB.
+    ///
+    /// Applies only to the shared `KL_SENSE_POS` / `KL_SENSE_PIVOT`. An explicit
+    /// `_L` / `_R` is taken exactly as given: a per-hand value is already an
+    /// answer about that hand, and mirroring it would be second-guessing it.
+    static let mirrorX =
+        ProcessInfo.processInfo.environment["KL_SENSE_MIRROR"] != "0"
+
+    private static func mirrored(_ v: SIMD3<Float>, _ hand: Int) -> SIMD3<Float> {
+        (mirrorX && hand == 0) ? SIMD3<Float>(-v.x, v.y, v.z) : v
+    }
+
     private static func make(_ hand: Int) -> KLSenseTune {
         var t = KLSenseTune()
+        t.pos   = mirrored(t.pos, hand)
+        t.pivot = mirrored(t.pivot, hand)
         if hand == 0 {
             NSLog(String(format: "[cp] Sense grip pitch %.3f deg about X "
                          + "(%.3f PSVR2 tilt + %.3f hilt; KL_SENSE_PITCH, "
@@ -324,13 +355,16 @@ private struct KLSenseTune {
             t.rot = klEulerXYZ(d)
             NSLog("[cp] \(k): hand \(hand) Sense grip rotation \(d) degrees")
         }
+        // A shared value is mirrored for the left hand; an explicit _L/_R is
+        // not — klEnvTriple reports which it found, so the two are told apart
+        // by the NAME rather than by guessing.
         if let (p, k) = klEnvTriple("KL_SENSE_POS", hand) {
-            t.pos = p
-            NSLog("[cp] \(k): hand \(hand) Sense grip offset \(p) m")
+            t.pos = k == "KL_SENSE_POS" ? mirrored(p, hand) : p
+            NSLog("[cp] \(k): hand \(hand) Sense grip offset \(t.pos) m")
         }
         if let (c, k) = klEnvTriple("KL_SENSE_PIVOT", hand) {
-            t.pivot = c
-            NSLog("[cp] \(k): hand \(hand) Sense grip rotates about \(c) m")
+            t.pivot = k == "KL_SENSE_PIVOT" ? mirrored(c, hand) : c
+            NSLog("[cp] \(k): hand \(hand) Sense grip rotates about \(t.pivot) m")
         }
         return t
     }
@@ -344,6 +378,30 @@ private struct KLSenseTune {
     /// (the magnitude is the same either way), so this is the knob that settles
     /// it on device: shake the controller along one axis and see which reading
     /// stays pointed the way your hand went.
+    /// `KL_SENSE_PREDICT_MS=<ms>` — how far into the future a Sense controller
+    /// pose may be predicted. 0 is the measured pose; the default 50 is the
+    /// same horizon `kl_openxr` clamps the HEAD to, so both poses a guest reads
+    /// are bounded by one number.
+    ///
+    /// **A time cap, not a fraction of the interval**, and that distinction is
+    /// the whole knob: a tracker's extrapolation error is a function of how far
+    /// AHEAD it reaches, not of what proportion of some pipeline that
+    /// represents. A fraction moves with the frame rate, so the same setting
+    /// means a different horizon at 90 Hz and at 60, and tuning it once tunes
+    /// it for one frame rate.
+    ///
+    /// It exists because both extremes were measured wrong on Steam Link: at
+    /// full prediction the controllers overshoot badly (we predict to
+    /// presentation time and publish a velocity, and SteamVR predicts AGAIN to
+    /// the PC's photon time — twice applied), and with no prediction the
+    /// overshoot goes but they visibly lag, because the PC's own prediction
+    /// does not cover our pipeline.
+    static let sensePredictMaxMs: Double = {
+        guard let v = ProcessInfo.processInfo.environment["KL_SENSE_PREDICT_MS"],
+              let f = Double(v) else { return 50.0 }
+        return max(0.0, f)
+    }()
+
     static let velocityIsLocal =
         ProcessInfo.processInfo.environment["KL_SENSE_VEL_FRAME"] != "world"
 }
@@ -527,9 +585,78 @@ final class KleptonControllers {
     }
 
     private func store(hand: Int, removed: Bool, anchor: AccessoryAnchor) {
+        if !removed { probeSenseFrames(hand: hand, anchor) }
         lock.lock()
         defer { lock.unlock() }
         accessoryAnchor[hand] = removed ? nil : anchor
+    }
+
+    /// Which hands have already described themselves. Written from the anchor
+    /// stream only, which is one task, so no lock.
+    private var senseFramesProbed: [Bool] = [false, false]
+
+    /// Every frame this controller publishes, in its own `.grip` frame — once
+    /// per hand, the first time it arrives.
+    ///
+    /// The correction this file applies is a transform from what the platform
+    /// publishes to what the guest was built against, and only half of it is
+    /// knowable off-device. The half that is: a SteamVR render model states
+    /// exactly where an Oculus Touch's tracked pose, `openxr_grip` and
+    /// `openxr_aim` sit relative to one another, and those are the poses a
+    /// guest asks for — an OVRPlugin guest is handed the tracked pose, an
+    /// OpenXR guest asks for grip or aim, and on a Touch those are 10.2 cm and
+    /// 20.6 degrees apart. `tools/rendermodel_frames.py` prints that table.
+    ///
+    /// The half that is not: whether Apple's `.grip` means what OpenXR's grip
+    /// means. Nothing off-device answers it, so this measures it. The rows are
+    /// in the render model's units and euler order so the two tables can be
+    /// read side by side, and the Touch's own rows are printed underneath to
+    /// compare against. Agreement looks like an aim that lands forward of and
+    /// below the grip with something near -60 degrees of pitch; a *sign* that
+    /// disagrees is a convention gap and has to be corrected for, while a
+    /// magnitude that disagrees is only a differently shaped controller and
+    /// must not be.
+    ///
+    /// `.none` and `.rendered` are both printed because the gap between them is
+    /// Apple's own comfort correction, and the pose path takes `.rendered` —
+    /// so a constant tuned by playing may be re-deriving something the platform
+    /// already applied.
+    private func probeSenseFrames(hand: Int, _ a: AccessoryAnchor) {
+        if senseFramesProbed[hand] { return }
+        senseFramesProbed[hand] = true
+        let side = hand == 0 ? "left" : "right"
+        guard a.accessory.locations.contains(.grip) else {
+            NSLog("[cp] sense frames (\(side)): \(a.accessory.name) publishes no .grip")
+            return
+        }
+        let grip = a.coordinateSpace(for: .grip, correction: .none)
+            .ancestorFromSpaceTransformFloat().matrix
+        var rows: [(String, simd_float4x4)] = [("tracked", a.originFromAnchorTransform)]
+        if a.accessory.locations.contains(.aim) {
+            rows.append(("aim", a.coordinateSpace(for: .aim, correction: .none)
+                .ancestorFromSpaceTransformFloat().matrix))
+        }
+        if a.accessory.locations.contains(.gripSurface) {
+            rows.append(("gripSurface", a.coordinateSpace(for: .gripSurface, correction: .none)
+                .ancestorFromSpaceTransformFloat().matrix))
+        }
+        rows.append(("grip .rendered", a.coordinateSpace(for: .grip, correction: .rendered)
+            .ancestorFromSpaceTransformFloat().matrix))
+
+        NSLog("[cp] sense frames (\(side)): \(a.accessory.name), relative to .grip")
+        let gi = grip.inverse
+        for (name, m) in rows {
+            let r = gi * m
+            let o = SIMD3<Float>(r.columns.3.x, r.columns.3.y, r.columns.3.z)
+            let e = klEulerDegOf(r)
+            NSLog(String(format: "[cp]   %@ (%9.6f, %9.6f, %9.6f)  (%+7.2f, %+6.2f, %+7.2f)  %.4f",
+                         name.padding(toLength: 14, withPad: " ", startingAt: 0),
+                         o.x, o.y, o.z, e.x, e.y, e.z, simd_length(o)))
+        }
+        // The same two rows for an Oculus Touch, straight out of the render
+        // model, so the comparison is in the log rather than in a notebook.
+        NSLog("[cp]   Touch tracked  ( 0.007000, -0.034157, -0.096073)  ( -20.60,  +0.00,   -0.00)  0.1022")
+        NSLog("[cp]   Touch aim      ( 0.000000, -0.067273, -0.073480)  ( -60.00,  +0.00,   -0.00)  0.0996")
     }
 
     /// This hand's Sense controller, predicted to `time` and corrected: grip
@@ -548,7 +675,30 @@ final class KleptonControllers {
         let provider = accessoryProvider
         lock.unlock()
         guard let stored, let provider else { return nil }
-        let a = provider.predictAnchor(for: stored, at: time) ?? stored
+        // **KL_SENSE_PREDICT=0 hands over the raw anchor**, and it exists
+        // because a guest can predict a second time. We predict to the frame's
+        // presentation time and publish the velocity alongside; a guest that
+        // takes both and extrapolates again lands past the controller, and the
+        // further ahead its own pipeline reaches the further past. Steam Link
+        // is that case — the pose crosses to a PC and SteamVR predicts it to
+        // the PC's photon time — and it is the one target where the
+        // controllers were reported to overshoot badly while native guests did
+        // not. Off publishes the measured pose with its measured velocity and
+        // leaves all the predicting to whoever is going to do it anyway.
+        // Predicted no further AHEAD than the cap, so a guest that predicts
+        // again downstream is handed a pose that has not already reached into
+        // its territory. The cap is applied to the target INSTANT and the
+        // tracker is asked for that instant, rather than the pose being scaled
+        // after the fact: a pose is not linear in time and the tracker is the
+        // thing that knows how to move it.
+        let now = CACurrentMediaTime()
+        let capS = KLSenseTune.sensePredictMaxMs / 1000.0
+        let ahead = time - now
+        Self.notePredictionHorizon(ahead: ahead, cap: capS)
+        let a = capS > 0.0
+            ? (provider.predictAnchor(for: stored, at: now + min(max(ahead, 0), capS))
+               ?? stored)
+            : stored
 
         // `.grip` is the location the platform defines for "where a hand holds
         // this" — the anchor's own transform is the middle of the plastic, and
@@ -561,13 +711,22 @@ final class KleptonControllers {
             : a.originFromAnchorTransform
         let raw = simd_quatf(m)
         let t = KLSenseTune.shared[hand]
-        let q = simd_normalize(raw * t.rot)
+        // The LIVE tune, re-read every pose so a slider in the boot window moves
+        // the controller while it is being dragged (KleptonTuning). Its X term
+        // is mirrored for the left hand for the reason KL_SENSE_MIRROR gives.
+        let live = KleptonTuning.shared.snapshot()
+        let mx: Float = KLSenseTune.mirrorX && hand == 0 ? -1 : 1
+        let rot   = klEulerXYZ(SIMD3<Float>(KLSenseTune.psvr2Tilt + live.sensePitch, 0, 0))
+        let tpos   = SIMD3<Float>(mx * live.sensePos.x, live.sensePos.y, live.sensePos.z)
+        let tpivot = SIMD3<Float>(mx * live.sensePivot.x, live.sensePivot.y, live.sensePivot.z)
+        _ = t
+        let q = simd_normalize(raw * rot)
         // `pos` slides the corrected pose; `pivot` decides what the correction
         // turned AROUND. Holding C still across the rotation is
         // `+ raw·C - q·C`, which is zero when C is — so the default is exactly
         // the behaviour this path has always had. See KLSenseTune.pivot.
-        var p = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z) + raw.act(t.pos)
-        if t.pivot != SIMD3<Float>(0, 0, 0) { p += raw.act(t.pivot) - q.act(t.pivot) }
+        var p = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z) + raw.act(tpos)
+        if tpivot != SIMD3<Float>(0, 0, 0) { p += raw.act(tpivot) - q.act(tpivot) }
 
         // Motion, rotated out of the accessory's own frame if that is what it
         // is in — by the UNCORRECTED orientation, because the correction above
@@ -576,6 +735,25 @@ final class KleptonControllers {
         var v = a.velocity, w = a.angularVelocity
         if KLSenseTune.velocityIsLocal { v = raw.act(v); w = raw.act(w) }
         return (p, q, v, w)
+    }
+
+    /// Say, once, how far ahead the frame's presentation time actually is and
+    /// whether the cap reaches it.
+    ///
+    /// Without this the cap is untunable from a log: a horizon of 50 ms over a
+    /// pipeline that is 30 ms deep is not a mild setting, it is NO setting —
+    /// the cap never binds and the prediction is the full one that overshoots.
+    /// The number that decides it is measured here and nowhere else.
+    private static var loggedHorizon = false
+    private static func notePredictionHorizon(ahead: Double, cap: Double) {
+        if loggedHorizon || !ahead.isFinite { return }
+        loggedHorizon = true
+        NSLog(String(format: "[ctrl] sense prediction: presentation is %.1f ms "
+                     + "ahead, cap %.1f ms (KL_SENSE_PREDICT_MS) — the cap %@",
+                     ahead * 1000, cap * 1000,
+                     cap <= 0 ? "is off, poses are the measured ones"
+                     : (cap < ahead ? "BINDS" : "does NOT bind, this is the full "
+                        + "prediction; lower it to shorten the horizon")))
     }
 
     /// Apply the KL_HAND_ROT / KL_HAND_POS tuning, in the grip's own frame.

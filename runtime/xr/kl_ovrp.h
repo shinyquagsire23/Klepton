@@ -95,6 +95,30 @@ void kl_ovrp_set_frame_pacer(void (*wait)(void));
 // space as the head. Buttons/touches are ovrpButton/ovrpTouch bit values as
 // the guest's own OVRPlugin enum defines them (the frontend composes final
 // bits); triggers are 0..1, thumbstick -1..1 on both axes.
+// The head pose for an INSTANT, supplied by the frontend.
+//
+// kl_ovrp otherwise publishes one current pose, which is all a guest that
+// renders immediately needs. A guest that names the instant it wants views for
+// (OpenXR's xrLocateViews takes a displayTime) needs the pose predicted to
+// then, and only the frontend can predict — the platform's tracker does it,
+// and nothing here can.
+//
+// `time_s` is CLOCK_MONOTONIC seconds, which on this platform is the clock
+// CACurrentMediaTime answers from, so the frontend can pass it straight to a
+// timestamped query. `pose7` is {qx,qy,qz,qw,px,py,pz}. Return 0 for "no
+// answer" — a tracker refuses an instant too far ahead, and refusing is the
+// correct answer rather than a reason to invent one.
+typedef int (*kl_ovrp_head_at_fn)(double time_s, float *pose7);
+void kl_ovrp_set_head_at(kl_ovrp_head_at_fn fn);
+
+// The rigid delta from the CURRENT head pose to the one predicted for
+// `time_s`, as a left-multiplied correction: pose' = delta o pose. Returns 0
+// if there is no provider or it declined, and then nothing should move.
+//
+// A delta rather than the pose itself so a caller keeps whatever it had
+// composed — eye offsets, cant, a base space — instead of rebuilding it.
+int kl_ovrp_head_predict_delta(double time_s, float *quat4, float *pos3);
+
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
 
@@ -258,6 +282,11 @@ typedef struct {
     uint64_t serial;              // guest frame serial, 1-based; 0 = nothing recorded
     int      stage;               // the swapchain stage this frame drew into
     int      complete;            // has ovrp_EndFrame been seen for this serial?
+    // CLOCK_MONOTONIC when the guest opened this frame, so a compositor can
+    // say how OLD the pose it is correcting against is. The reprojection delta
+    // alone cannot: an angle is a rate times an interval, so a large delta is
+    // either a fast head or a stale pose and the two want opposite fixes.
+    uint64_t submit_ns;
 } kl_ovrp_render_pose;
 
 // What the guest rendered `stage` with. Returns 0 (and leaves *out untouched)
@@ -640,6 +669,14 @@ void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz,
 // pinned one makes reprojection a no-op — so the two must stay distinct.
 void kl_ovrp_get_guest_head_pose(float *px, float *py, float *pz,
                                  float *qx, float *qy, float *qz, float *qw);
+
+// ...and that same latched sample's velocity: linear m/s and angular rad/s, in
+// the tracking space, either pointer NULL to skip. Returns 0 when they are not
+// a measurement — the frontend publishes pose only, so these are derived from
+// successive poses and the first sample after a gap has no basis. A caller must
+// pass that on as "unknown" rather than as a velocity of zero, which asserts
+// the head is stationary.
+int kl_ovrp_head_motion(float *vel, float *ang);
 
 // Standing eye height above the floor origin (KL_OVRP_EYE_HEIGHT), or 0 when
 // the guest asked for an eye-level tracking origin. This is the offset between

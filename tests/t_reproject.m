@@ -34,7 +34,11 @@ static void ok(int cond, const char *what) {
 // is exactly why the corner assertion below is worth having: it pins the one
 // property the two have to agree on.
 static simd_float4 corner_ndc(kl_reproject_uniforms u, float cx, float cy) {
-    float d = KL_REPROJECT_DEPTH;
+    // u.depth, NOT the compile-time default: the shader reads the uniform, and
+    // a helper that hardcodes the constant silently places every quad at 500 m
+    // however the pass was configured — which made the parallax assertion below
+    // read as a correction that did not scale with depth.
+    float d = u.depth;
     float x = (-u.tangents.x + (u.tangents.y + u.tangents.x) * cx) * d;
     float y = (-u.tangents.w + (u.tangents.z + u.tangents.w) * cy) * d;
     simd_float4 p = simd_mul(simd_mul(u.projection, u.model_view),
@@ -1081,6 +1085,35 @@ static void check_proj_layers(void) {
     simd_float4 sbl = corner_ndc(us, 0, 0);
     ok(fabsf(sbl.x - bl.x) > 0.1f,
        "a 30-degree head turn since the layer was drawn moves that layer's quad");
+
+    // ---- the head TRANSLATING is parallax, and only at a finite depth -------
+    //
+    // A head turn rotates about the neck, so the eyes translate several
+    // centimetres; uncorrected, that is the lateral swim measured on device.
+    // The correction is a shift of the quad by the head's displacement, which
+    // at depth d is an angular shift of |dP| / d — so it MUST scale with the
+    // depth, and at the 500 m default it must be nothing at all. Both halves
+    // are asserted: a correction that fired at 500 m would be a correction
+    // nobody could turn off.
+    simd_float4x4 moved = head;
+    moved.columns[3] = simd_make_float4(0.10f, 0, 0, 1);   // 10 cm to the right
+    simd_float4 far_x = corner_ndc(
+        kl_proj_layer_build(&base, 0, moved, matrix_identity_float4x4, P, 0), 0, 0);
+    ok(fabsf(far_x.x - bl.x) < 1e-3f,
+       "at 500 m a 10 cm head translation moves the quad by nothing");
+
+    setenv("KL_REPROJECT_DEPTH", "2.0", 1);
+    kl_reproject_reset_depth();
+    simd_float4 near_still = corner_ndc(
+        kl_proj_layer_build(&base, 0, head, matrix_identity_float4x4, P, 0), 0, 0);
+    simd_float4 near_moved = corner_ndc(
+        kl_proj_layer_build(&base, 0, moved, matrix_identity_float4x4, P, 0), 0, 0);
+    // Right by 10 cm at 2 m is 0.05 rad of parallax; the picture must move
+    // LEFT, which is -x, and by a distance a person would see.
+    ok(near_moved.x - near_still.x < -0.01f,
+       "at 2 m the same translation moves the quad the other way, as parallax");
+    unsetenv("KL_REPROJECT_DEPTH");
+    kl_reproject_reset_depth();
 
     // The flip travels with the record, not with the caller: a layer Vulkan
     // drew has its origin at the top left and the shader is told so.

@@ -39,6 +39,7 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#include <unistd.h>
 #include "kl_openxr.h"
 #include "kl_jni.h"
 #include "kl_ovrp.h"
@@ -1210,7 +1211,12 @@ static XrResult klxr_GetInstanceProperties(void *instance, XrInstanceProperties 
     klxr_log_chain("xrGetInstanceProperties", props->next);
     props->type = XR_TYPE_INSTANCE_PROPERTIES;
     props->runtimeVersion = XR_MAKE_VERSION(1, 0, 0);
-    snprintf(props->runtimeName, sizeof props->runtimeName, "Klepton");
+    // **Oculus, not Klepton.** See klxr_system_name below: an OpenXR guest has
+    // only these strings to identify the device by, and a guest that cannot
+    // identify it falls back to a default controller — which is what JKXR and
+    // Open Brush were doing.
+    snprintf(props->runtimeName, sizeof props->runtimeName, "%s",
+             kl_env_str("KL_XR_RUNTIME_NAME", "Oculus"));
     return KLXR_SUCCESS;
 }
 
@@ -1245,8 +1251,31 @@ static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
 
     props->type = XR_TYPE_SYSTEM_PROPERTIES;
     props->systemId = system_id;
-    props->vendorId = 0;
-    snprintf(props->systemName, sizeof props->systemName, "Klepton HMD");
+    // **The device identity an OpenXR guest can actually read**, and the reason
+    // it has to agree with the one every other seam gives.
+    //
+    // We present a Quest 2 everywhere else — `Build.MODEL`, `Build.PRODUCT`,
+    // `ovrp_GetSystemHeadsetType` (9 = Oculus_Quest_2) — because reporting
+    // anything else fails every Oculus branch in a guest. An OpenXR guest never
+    // sees any of those: it has the interaction profile (already
+    // `oculus/touch_controller`), the runtime name, the system name and the
+    // vendor id, and nothing else. Answering "Klepton HMD" with vendor 0 told
+    // it "some runtime I have never heard of", so it fell back to its DEFAULT
+    // controller — and the two guests that read these strings, JKXR and Open
+    // Brush, both drew Quest 1 controllers while every OVRPlugin guest drew
+    // Quest 2s. A controller model carries its own grip-to-model transform, so
+    // that is not cosmetic: it is a systematic pose offset applied on the
+    // guest's side, in the guest's own frame, that nothing here can see.
+    //
+    // 0x2833 is the Oculus USB vendor id, which is what a Meta runtime reports.
+    // Knobs because these strings are read by clients that branch on them and
+    // this is the kind of change worth being able to undo in one run: Steam
+    // Link already showed Quest 2 controllers (its identity comes from the
+    // Steam host, not from here), so it is the target to watch for a
+    // regression.
+    props->vendorId = (uint32_t)kl_env_int("KL_XR_VENDOR_ID", 0x2833);
+    snprintf(props->systemName, sizeof props->systemName, "%s",
+             kl_env_str("KL_XR_SYSTEM_NAME", "Oculus Quest2"));
     // The maxima are a ceiling on what a swapchain may ask for, not a
     // recommendation — so they are generous, and the recommendation lives in
     // the view configuration below where the guest will actually read it.
@@ -1458,6 +1487,18 @@ typedef struct {
     int      frame_begun;         // between xrBeginFrame and xrEndFrame
     int64_t  frame_predicted_time;// what the last xrWaitFrame promised
     uint64_t frames_waited, frames_ended, layers_ignored, layers_quad;
+    // One head per frame for xrLocateViews — see the comment there.
+    uint64_t predict_frame;
+    int64_t  predict_time;
+    int      predict_valid;
+    float    predict_q[4], predict_p[3];
+    // KL_XR_POSE_TRACE: the head this frame was answered with, per entry
+    // point, so "the guest draws from one head and declares another" is a
+    // measurement rather than a reading of the guest's source. Indexed by
+    // klxr_pose_src.
+    uint64_t agree_frame;
+    int      agree_have[3];
+    XrPosef  agree_pose[3];
     // The per-layer composite's own census: how many frames carried N
     // projection layers, and per layer index how many carried it at all against
     // how many got it as far as a compositor slot. This is the one measurement
@@ -2253,14 +2294,69 @@ static XrVector3f klxr_grip_pivot(int hand) {
     return c[(unsigned)hand > 1 ? 0 : hand];
 }
 
+// The live override — see kl_openxr.h. Plain floats written by a UI thread and
+// read by the guest's: each is a single aligned word, a torn read is not
+// possible on this platform, and the worst a race can do is use one slider's
+// previous value for one frame while a person is dragging it.
+static int   g_tune_live;
+static float g_tune_grip_pitch, g_tune_aim_pitch;
+static float g_tune_pivot[3], g_tune_pos[3];
+
+void kl_openxr_set_grip_tune(float grip_pitch_deg, float aim_pitch_deg,
+                             const float pivot[3], const float pos[3]) {
+    g_tune_grip_pitch = grip_pitch_deg;
+    g_tune_aim_pitch  = aim_pitch_deg;
+    for (int i = 0; i < 3; i++) {
+        g_tune_pivot[i] = pivot ? pivot[i] : 0.0f;
+        g_tune_pos[i]   = pos   ? pos[i]   : 0.0f;
+    }
+    // Last, so a reader that sees the flag sees the values with it.
+    __atomic_store_n(&g_tune_live, 1, __ATOMIC_RELEASE);
+}
+
+void kl_openxr_grip_tune(float *grip_pitch_deg, float *aim_pitch_deg,
+                         float pivot[3], float pos[3]) {
+    // Whatever is in force: the pushed values once anything has been pushed,
+    // the environment's otherwise. A panel built on its own defaults would
+    // show numbers the runtime is not using.
+    if (__atomic_load_n(&g_tune_live, __ATOMIC_ACQUIRE)) {
+        if (grip_pitch_deg) *grip_pitch_deg = g_tune_grip_pitch;
+        if (aim_pitch_deg)  *aim_pitch_deg  = g_tune_aim_pitch;
+        for (int i = 0; i < 3; i++) {
+            if (pivot) pivot[i] = g_tune_pivot[i];
+            if (pos)   pos[i]   = g_tune_pos[i];
+        }
+        return;
+    }
+    float g, a;
+    klxr_pitches(&g, &a);
+    if (grip_pitch_deg) *grip_pitch_deg = g;
+    if (aim_pitch_deg)  *aim_pitch_deg  = a;
+    XrVector3f c = klxr_grip_pivot(1), o = klxr_grip_pos(1);
+    if (pivot) { pivot[0] = c.x; pivot[1] = c.y; pivot[2] = c.z; }
+    if (pos)   { pos[0]   = o.x; pos[1]   = o.y; pos[2]   = o.z; }
+}
+
 static void klxr_pose_corrections(XrPosef *p, int is_aim, int hand) {
     float grip_pitch, aim_pitch;
     klxr_pitches(&grip_pitch, &aim_pitch);
+    // A pushed value wins, and is re-read every pose so a slider moves the
+    // controller while it is being dragged. The X term is MIRRORED for the left
+    // hand for the reason KL_SENSE_MIRROR gives: an offset is a point on a hand
+    // and the two hands are mirror images.
+    XrVector3f pivot = klxr_grip_pivot(hand), pos = klxr_grip_pos(hand);
+    if (__atomic_load_n(&g_tune_live, __ATOMIC_ACQUIRE)) {
+        grip_pitch = g_tune_grip_pitch;
+        aim_pitch  = g_tune_aim_pitch;
+        float mx = hand == 0 ? -1.0f : 1.0f;
+        pivot = (XrVector3f){ mx * g_tune_pivot[0], g_tune_pivot[1], g_tune_pivot[2] };
+        pos   = (XrVector3f){ mx * g_tune_pos[0],   g_tune_pos[1],   g_tune_pos[2] };
+    }
     XrQuaternionf before = p->orientation;
     klxr_pitch_about_x(p, grip_pitch);
     if (is_aim) klxr_pitch_about_x(p, aim_pitch);
     // Hold the pivot still across whatever the two pitches just did.
-    XrVector3f c = klxr_grip_pivot(hand);
+    XrVector3f c = pivot;
     if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f) {
         XrVector3f was = klxr_qrot(before, c);
         XrVector3f now = klxr_qrot(p->orientation, c);
@@ -2271,7 +2367,7 @@ static void klxr_pose_corrections(XrPosef *p, int is_aim, int hand) {
     // AFTER the pitch, and in the rotated frame: the offset says where the hilt
     // centre is relative to the corrected orientation, which is the frame the
     // guest is about to draw a controller in.
-    XrVector3f o = klxr_grip_pos(hand);
+    XrVector3f o = pos;
     if (o.x != 0.0f || o.y != 0.0f || o.z != 0.0f) {
         XrVector3f d = klxr_qrot(p->orientation, o);
         p->position.x += d.x;
@@ -2302,12 +2398,98 @@ static void klxr_ctrl_trace(const XrPosef *p, int hand, int is_aim) {
     kl_ovrp_ctrl_trace(is_aim ? "openxr aim" : "openxr grip", hand, e, pos);
 }
 
+// How far ahead a pose may be asked for, in nanoseconds.
+//
+// A tracker extrapolates, and past about 50 ms the extrapolation is no longer
+// a prediction — it overshoots on any real head motion and the pose becomes
+// unstable, which is worse than a pose that is merely late. A guest asking for
+// a distant instant gets the pose at the cap instead, and one frame at any
+// sane rate is far inside it (8.3 ms at 120 Hz), so this bites only when
+// something has gone wrong with the frame clock.
+#define KLXR_PREDICT_MAX_NS (50ll * 1000ll * 1000ll)
+
+static int64_t klxr_predict_clamp(int64_t ahead_ns) {
+    if (ahead_ns < 0) return 0;
+    return ahead_ns > KLXR_PREDICT_MAX_NS ? KLXR_PREDICT_MAX_NS : ahead_ns;
+}
+
+// The instant a pose is wanted for, clamped: the guest names it and the guest
+// can name anything. Returned as an interval from now rather than as an
+// absolute time, because that is what a predicting tracker takes.
+static int64_t klxr_predict_ahead(int64_t display_time) {
+    return klxr_predict_clamp(display_time - klxr_now());
+}
+
+// ---- one head per frame, for every entry point that answers a pose ---------
+//
+// A guest may take the pose it RENDERS with from one call and the pose it
+// SUBMITS from another: JKXR draws the world from
+// `xrLocateSpace(VIEW, STAGE, predictedDisplayTime)` and declares its
+// projection layer out of `xrLocateViews` for the same instant. A runtime owes
+// those two the same head. Answering them out of separate queries — even
+// microseconds apart, and especially when only one of them carries the
+// prediction — makes the engine draw from one head and declare another, and a
+// compositor that corrects against the declared one is then correcting a
+// difference the guest never made. That is a rotational swim on head motion,
+// and it is the runtime's bug rather than the guest's.
+//
+// So the prediction is computed ONCE per (frame, instant) and every pose entry
+// point reads it through here. Keyed on the instant as well as the frame
+// because a guest asking for a genuinely different displayTime is entitled to a
+// genuinely different answer — the stability owed is per (frame, instant),
+// which makes this a cache and not a freeze.
+//
+// The frontend does the predicting: only the platform's tracker can, and it
+// answers with a delta against the pose kl_ovrp latched for this frame, so the
+// eye offsets and cant already composed into a view survive it. A tracker that
+// declines (every host run — `kl_ovrp_set_head_at` is the visionOS
+// compositor's) leaves the delta invalid and every pose is the latched head,
+// which is what this produced before the seam existed and keeps the two entry
+// points agreeing for free. KL_XR_PREDICT=0 is the A/B.
+typedef struct { int valid; float q[4], p[3]; } klxr_head_delta;
+
+static klxr_head_delta klxr_frame_head_delta(klxr_session *s, int64_t display_time) {
+    klxr_head_delta d = { 0, {0, 0, 0, 1}, {0, 0, 0} };
+    static int predict_on = -1;
+    if (predict_on < 0) predict_on = kl_env_on("KL_XR_PREDICT", 1);
+    // A displayTime of 0 is the guest saying it has no frame in flight (JKXR's
+    // recentre path locates spaces before its first xrWaitFrame). There is no
+    // instant to predict to, so the latched head is the whole answer.
+    if (!predict_on || !s || display_time <= 0) return d;
+    if (s->predict_frame == s->frames_waited && s->predict_time == display_time) {
+        d.valid = s->predict_valid;
+        memcpy(d.q, s->predict_q, sizeof d.q);
+        memcpy(d.p, s->predict_p, sizeof d.p);
+        return d;
+    }
+    d.valid = kl_ovrp_head_predict_delta(
+        (double)(klxr_now() + klxr_predict_ahead(display_time)) / 1e9, d.q, d.p);
+    s->predict_frame = s->frames_waited;
+    s->predict_time  = display_time;
+    s->predict_valid = d.valid;
+    memcpy(s->predict_q, d.q, sizeof d.q);
+    memcpy(s->predict_p, d.p, sizeof d.p);
+    return d;
+}
+
+// pose' = delta o pose, the delta on the LEFT because it moves the head the
+// thing hangs off and not the thing within the head.
+static XrPosef klxr_head_predicted(XrPosef p, const klxr_head_delta *d) {
+    if (!d || !d->valid) return p;
+    XrQuaternionf q = { d->q[0], d->q[1], d->q[2], d->q[3] };
+    XrVector3f rp = klxr_qrot(q, p.position);
+    p.position = (XrVector3f){ rp.x + d->p[0], rp.y + d->p[1], rp.z + d->p[2] };
+    p.orientation = klxr_qmul(q, p.orientation);
+    return p;
+}
+
 // `motion_known` reports whether lin/ang are a measurement — a frontend that
 // publishes pose only has them derived (kl_ovrp), and the first sample after a
 // gap has no basis at all. That case must reach the guest as velocityFlags == 0
 // and not as a velocity of zero, which asserts the controller is stationary.
 static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
-                                  float *lin, float *ang, int *motion_known) {
+                                  float *lin, float *ang, int *motion_known,
+                                  const klxr_head_delta *pred) {
     XrPosef base = { {0, 0, 0, 1}, {0, 0, 0} };   // STAGE, and the tracking space
     if (tracked) *tracked = 1;
     if (motion_known) *motion_known = 0;
@@ -2317,6 +2499,24 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
                                     &base.position.z, &base.orientation.x,
                                     &base.orientation.y, &base.orientation.z,
                                     &base.orientation.w);
+        // ...moved to the instant the caller named, out of the frame's single
+        // prediction — so VIEW located here and the eyes located by
+        // xrLocateViews are the same head. Before the offset below, which is
+        // stated in the head's own frame.
+        //
+        // The HANDS are not predicted with it, and that is a gap rather than a
+        // decision: locating a hand against VIEW now pairs a predicted head
+        // with a latched hand, so during head motion the hand would appear to
+        // counter-rotate by the prediction interval. Nothing in the corpus asks
+        // — every guest here locates its hands in STAGE or LOCAL — and the
+        // honest fix is to carry each hand forward on its OWN measured velocity
+        // (kl_ovrp_hand_motion already returns one), not to apply the head's
+        // delta to something that moves independently of the head.
+        base = klxr_head_predicted(base, pred);
+        // The head's motion, which is what lets a client predict instants of
+        // its own rather than trusting ours. Derived in kl_ovrp from successive
+        // published poses, and reported as a measurement only when it is one.
+        if (motion_known) *motion_known = kl_ovrp_head_motion(lin, ang);
     } else if (sp->reference_type == KLXR_REF_SPACE_LOCAL) {
         base.position.y = kl_ovrp_eye_height();
     } else if (sp->reference_type == 0) {
@@ -2354,9 +2554,12 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
 }
 
 // The pose alone, for every caller that only ever asks about a reference space
-// — xrLocateViews and the self-test — where "tracked" is not a question.
-static XrPosef klxr_space_pose(const klxr_space *sp) {
-    return klxr_space_pose_ex(sp, NULL, NULL, NULL, NULL);
+// — xrLocateViews, xrEndFrame's layer placement and the self-test — where
+// "tracked" is not a question. The prediction still travels, because a
+// head-locked layer placed against an unpredicted head would sit where the
+// picture around it is not.
+static XrPosef klxr_space_pose(const klxr_space *sp, const klxr_head_delta *pred) {
+    return klxr_space_pose_ex(sp, NULL, NULL, NULL, NULL, pred);
 }
 
 // The three reference spaces klxr_space_pose can place, and no others —
@@ -4064,7 +4267,7 @@ static void klxr_back_layer_images(klxr_swapchain *sc, int slice) {
 // that cannot be placed, which is then counted as ignored rather than drawn
 // somewhere invented.
 static int klxr_quad_record(const XrCompositionLayerQuad *q, klxr_swapchain *sc,
-                            kl_ovrp_overlay *o) {
+                            kl_ovrp_overlay *o, const klxr_head_delta *pred) {
     if (!(q->size.width > 0.0f) || !(q->size.height > 0.0f)) return 0;
     memset(o, 0, sizeof *o);
     o->layer_id = klxr_layer_id(sc);
@@ -4091,7 +4294,7 @@ static int klxr_quad_record(const XrCompositionLayerQuad *q, klxr_swapchain *sc,
     // frame was latched with, which is what that space MEANS.
     klxr_space *lsp = klxr_space_of(((const XrCompositionLayerBaseHeader *)q)->space);
     XrPosef in_tracking = klxr_pose_apply(
-        lsp ? klxr_space_pose(lsp) : (XrPosef){{0,0,0,1},{0,0,0}}, q->pose);
+        lsp ? klxr_space_pose(lsp, pred) : (XrPosef){{0,0,0,1},{0,0,0}}, q->pose);
     o->pose[0] = in_tracking.orientation.x;
     o->pose[1] = in_tracking.orientation.y;
     o->pose[2] = in_tracking.orientation.z;
@@ -4425,7 +4628,7 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
 
     state->type = XR_TYPE_FRAME_STATE;
     state->predictedDisplayPeriod = period;
-    state->predictedDisplayTime = klxr_now() + period;
+    state->predictedDisplayTime = klxr_now() + klxr_predict_clamp(period);
     // shouldRender is the runtime telling the app whether its pictures will be
     // seen. False during SYNCHRONIZED (the app is ticking but not visible) is
     // the specified answer and lets an app skip the work; anything from VISIBLE
@@ -4457,6 +4660,114 @@ static XrResult klxr_BeginFrame(void *session, const XrFrameBeginInfo *info) {
 // it is here that an image becomes an eye texture as far as kl_glfb and the
 // compositor are concerned. Registration is idempotent and only re-done when
 // the mapping changes, because the app rebuilds its swapchains across scenes.
+// ---- KL_XR_POSE_TRACE: do this guest's pose entry points agree? -----------
+//
+// A guest may take the pose it RENDERS with from one call and the pose it
+// SUBMITS from another — JKXR draws the world from xrLocateSpace(VIEW, STAGE)
+// and declares its projection layer out of xrLocateViews. A runtime owes both
+// the same head for one instant; if it does not, the engine draws from one head
+// and declares another, and a composite that corrects against the declared one
+// is correcting a difference the guest never made. That is what this measures,
+// and it measures it rather than reading the guest's source: the head each
+// entry point answered with this frame and the head the guest finally
+// submitted, all three in the tracking space, differenced per frame and
+// reported once a second.
+enum { KLXR_POSE_SRC_SPACE, KLXR_POSE_SRC_VIEWS, KLXR_POSE_SRC_SUBMIT,
+       KLXR_POSE_SRC_N };
+static const char *const klxr_pose_src_name[KLXR_POSE_SRC_N] = {
+    "xrLocateSpace(VIEW)", "xrLocateViews", "submitted"
+};
+
+static int klxr_pose_trace_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_XR_POSE_TRACE", 0);
+    return on;
+}
+
+// The FIRST answer of each frame from each source, which is the one the guest
+// built that frame on. A later call in the same frame is the guest asking
+// again, and a runtime that answered it differently would be the bug this is
+// looking for — so it is recorded separately rather than overwriting.
+static void klxr_pose_note(klxr_session *s, int src, XrPosef head) {
+    if (!s || !klxr_pose_trace_on()) return;
+    if (s->agree_frame != s->frames_waited) {
+        s->agree_frame = s->frames_waited;
+        for (int i = 0; i < KLXR_POSE_SRC_N; i++) s->agree_have[i] = 0;
+    }
+    if (s->agree_have[src]) return;
+    s->agree_have[src] = 1;
+    s->agree_pose[src] = head;
+}
+
+// The angle between two orientations, from the relative quaternion
+// a o conj(b) via atan2 of its vector part against its scalar.
+//
+// NOT `2 * acosf(dot)`, which is the obvious form and is unusable here: acos
+// loses almost all its precision exactly where this instrument spends its life,
+// at angles near zero. In float32 the first representable dot below 1.0 comes
+// out as 0.056 deg, so two orientations that were bit-identical to within a few
+// ULPs reported a floor of 0.056 deg — and on a device run it did, landing on
+// 0.040 / 0.056 / 0.069 / 0.079, which is that floor times 1, sqrt2, sqrt3, 2.
+// atan2 is well conditioned there and reads 0.000. Same reason
+// klovrp_derive_motion uses it.
+static float klxr_quat_deg(XrQuaternionf a, XrQuaternionf b) {
+    float dw =  a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+    float dx = -a.w * b.x + a.x * b.w - a.y * b.z + a.z * b.y;
+    float dy = -a.w * b.y + a.x * b.z + a.y * b.w - a.z * b.x;
+    float dz = -a.w * b.z - a.x * b.y + a.y * b.x + a.z * b.w;
+    if (dw < 0) { dw = -dw; dx = -dx; dy = -dy; dz = -dz; }
+    return 2.0f * atan2f(sqrtf(dx * dx + dy * dy + dz * dz), dw) *
+           57.29577951308232f;
+}
+
+// Called once per frame, after the submitted head has been noted.
+static void klxr_pose_trace_report(klxr_session *s) {
+    if (!s || !klxr_pose_trace_on()) return;
+    // Three pairs, in the order they matter: what the guest rendered with
+    // against what it submitted, and each of those against the other entry
+    // point. The pairs are (a, b) indices into agree_pose.
+    static const int pair[3][2] = {
+        { KLXR_POSE_SRC_SPACE,  KLXR_POSE_SRC_VIEWS  },
+        { KLXR_POSE_SRC_SPACE,  KLXR_POSE_SRC_SUBMIT },
+        { KLXR_POSE_SRC_VIEWS,  KLXR_POSE_SRC_SUBMIT },
+    };
+    static int64_t  t0;
+    static unsigned frames, seen[KLXR_POSE_SRC_N], both[3];
+    static float    worst_deg[3], worst_m[3];
+    int64_t now = klxr_now();
+    if (!t0) t0 = now;
+    frames++;
+    for (int i = 0; i < KLXR_POSE_SRC_N; i++) if (s->agree_have[i]) seen[i]++;
+    for (int k = 0; k < 3; k++) {
+        int a = pair[k][0], b = pair[k][1];
+        if (!s->agree_have[a] || !s->agree_have[b]) continue;
+        both[k]++;
+        float deg = klxr_quat_deg(s->agree_pose[a].orientation,
+                                  s->agree_pose[b].orientation);
+        float dx = s->agree_pose[a].position.x - s->agree_pose[b].position.x;
+        float dy = s->agree_pose[a].position.y - s->agree_pose[b].position.y;
+        float dz = s->agree_pose[a].position.z - s->agree_pose[b].position.z;
+        float m = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (deg > worst_deg[k]) worst_deg[k] = deg;
+        if (m > worst_m[k]) worst_m[k] = m;
+    }
+    if (now - t0 < 1000000000LL) return;
+    fprintf(stderr, "  [xr] pose agreement over %u frame(s):", frames);
+    for (int i = 0; i < KLXR_POSE_SRC_N; i++)
+        fprintf(stderr, " %s %u,", klxr_pose_src_name[i], seen[i]);
+    fprintf(stderr, "\n");
+    for (int k = 0; k < 3; k++)
+        fprintf(stderr, "  [xr]   %s vs %s: %u frame(s) with both, worst "
+                        "%.3f deg / %.4f m\n",
+                klxr_pose_src_name[pair[k][0]], klxr_pose_src_name[pair[k][1]],
+                both[k], (double)worst_deg[k], (double)worst_m[k]);
+    t0 = now; frames = 0;
+    memset(seen, 0, sizeof seen);
+    memset(both, 0, sizeof both);
+    memset(worst_deg, 0, sizeof worst_deg);
+    memset(worst_m, 0, sizeof worst_m);
+}
+
 static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     klxr_session *s = klxr_sess(session);
     if (!s) return KLXR_ERROR_HANDLE_INVALID;
@@ -4650,6 +4961,12 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // reading it half-written would draw one frame's panel with another's.
     kl_ovrp_overlay quads[4];
     int nquads = 0;
+    // A layer states its pose in a space the guest names, and that space can be
+    // VIEW — so placing one needs the same head the guest drew with. The
+    // instant is the one xrWaitFrame promised, which is the one every guest in
+    // the corpus passes to its locate calls, so this hits the frame's cache
+    // rather than asking the tracker a third time.
+    klxr_head_delta fpred = klxr_frame_head_delta(s, s->frame_predicted_time);
     klxr_frame_shape(info);
 
     for (uint32_t i = 0; i < info->layerCount; i++) {
@@ -4699,7 +5016,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                                                  : -1);
                     if (drawn_stage < 0) drawn_stage = sc->last_released;
                     if (nquads < (int)(sizeof quads / sizeof *quads) &&
-                        klxr_quad_record(q, sc, &quads[nquads])) {
+                        klxr_quad_record(q, sc, &quads[nquads], &fpred)) {
                         klxr_back_layer_images(sc, sc->array_size > 1
                             ? (int)q->subImage.imageArrayIndex : -1);
                         int placed = kl_glfb_layer_mtl_texture(
@@ -4941,7 +5258,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 // with one field of view must keep being placed with that one.
                 klxr_space *lsp = klxr_space_of(layer->space);
                 XrPosef in_tracking = klxr_pose_apply(
-                    lsp ? klxr_space_pose(lsp) : (XrPosef){{0,0,0,1},{0,0,0}},
+                    lsp ? klxr_space_pose(lsp, &fpred) : (XrPosef){{0,0,0,1},{0,0,0}},
                     proj->views[v].pose);
                 const XrFovf *f = &proj->views[v].fov;
 
@@ -5260,6 +5577,12 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // no new picture, so nothing is filed and the compositor shows the previous
     // one again — the same rule, and for the same reason, as klovrp_EndFrame's
     // "a frame that drew into no eye stage must not file anything".
+    if (have_layer_pose) {
+        XrPosef sub = { { layer_pose[3], layer_pose[4], layer_pose[5], layer_pose[6] },
+                        { layer_pose[0], layer_pose[1], layer_pose[2] } };
+        klxr_pose_note(s, KLXR_POSE_SRC_SUBMIT, sub);
+    }
+    klxr_pose_trace_report(s);
     if (drawn_stage >= 0)
         kl_ovrp_frame_end_external(drawn_stage,
                                    have_layer_pose ? layer_pose : NULL,
@@ -5339,6 +5662,12 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
     if (info->type != XR_TYPE_VIEW_LOCATE_INFO) return KLXR_ERROR_VALIDATION_FAILURE;
     if (info->viewConfigurationType != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
         return KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    // The guest names the instant it wants these views for, so the views below
+    // are predicted to it rather than being the head as it stands now — out of
+    // the frame's ONE prediction, which xrLocateSpace reads too. See
+    // klxr_frame_head_delta: two entry points answering one instant out of two
+    // queries is what made this guest draw from one head and declare another.
+    klxr_head_delta pred = klxr_frame_head_delta(s, info->displayTime);
     klxr_space *base = klxr_space_of(info->space);
     if (!base) return KLXR_ERROR_HANDLE_INVALID;
 
@@ -5355,13 +5684,29 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
     // VIEW this is the eye-to-head, and it must come back with no standing
     // height in it, which is what the census below prints.
     int say = klxr_locate_seen("xrLocateViews", -1, base->reference_type);
-    XrPosef base_pose = klxr_space_pose(base);
+    XrPosef base_pose = klxr_space_pose(base, &pred);
+
+    // The head these eyes hang off, in the tracking space, by the same
+    // convention klxr_EndFrame's record uses: the midpoint of the two eye
+    // positions, orientation from eye 0. Recorded so the answer this call gave
+    // can be differenced against the one xrLocateSpace gave (KL_XR_POSE_TRACE).
+    XrPosef head_seen = { {0, 0, 0, 1}, {0, 0, 0} };
 
     for (uint32_t e = 0; e < 2; e++) {
         float px, py, pz, qx, qy, qz, qw, tan[4];
         kl_ovrp_eye_view((int)e, &px, &py, &pz, &qx, &qy, &qz, &qw, tan);
         klxr_log_chain("xrLocateViews", views[e].next);
-        XrPosef eye = { {qx, qy, qz, qw}, {px, py, pz} };
+        // The delta moves the head the eye hangs off, so the eye offset and
+        // cant composed into it above survive.
+        XrPosef eye = klxr_head_predicted(
+            (XrPosef){ {qx, qy, qz, qw}, {px, py, pz} }, &pred);
+        if (e == 0) {
+            head_seen = eye;
+        } else {
+            head_seen.position.x = 0.5f * (head_seen.position.x + eye.position.x);
+            head_seen.position.y = 0.5f * (head_seen.position.y + eye.position.y);
+            head_seen.position.z = 0.5f * (head_seen.position.z + eye.position.z);
+        }
         views[e].type = XR_TYPE_VIEW;
         views[e].pose = klxr_pose_rel(base_pose, eye);
         views[e].fov.angleLeft  = -atanf(tan[0]);
@@ -5369,6 +5714,7 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
         views[e].fov.angleUp    =  atanf(tan[2]);
         views[e].fov.angleDown  = -atanf(tan[3]);
     }
+    klxr_pose_note(s, KLXR_POSE_SRC_VIEWS, head_seen);
     if (say)
         fprintf(stderr, "  [xr] xrLocateViews in %s: eye 0 at (%.3f %.3f %.3f), "
                         "eye 1 at (%.3f %.3f %.3f)\n",
@@ -5405,8 +5751,10 @@ static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
     int sp_tracked = 1, bs_tracked = 1;
     float lin[3], ang[3];
     int sp_motion_known = 0;
-    XrPosef sp_pose = klxr_space_pose_ex(sp, &sp_tracked, lin, ang, &sp_motion_known);
-    XrPosef bs_pose = klxr_space_pose_ex(bs, &bs_tracked, NULL, NULL, NULL);
+    klxr_head_delta pred = klxr_frame_head_delta(sp->session, time);
+    XrPosef sp_pose = klxr_space_pose_ex(sp, &sp_tracked, lin, ang, &sp_motion_known,
+                                         &pred);
+    XrPosef bs_pose = klxr_space_pose_ex(bs, &bs_tracked, NULL, NULL, NULL, &pred);
 
     // The census key distinguishes the two hands, because a left action space
     // and a right one are different questions with different answers and
@@ -5439,6 +5787,8 @@ static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
         return KLXR_SUCCESS;
     }
 
+    if (sp->reference_type == KLXR_REF_SPACE_VIEW)
+        klxr_pose_note(sp->session, KLXR_POSE_SRC_SPACE, sp_pose);
     location->pose = klxr_pose_rel(bs_pose, sp_pose);
     location->locationFlags = KLXR_SPACE_ORIENTATION_VALID | KLXR_SPACE_POSITION_VALID |
                               KLXR_SPACE_ORIENTATION_TRACKED | KLXR_SPACE_POSITION_TRACKED;
@@ -5455,7 +5805,15 @@ static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
     // ...and only if it is a measurement. Without this the derived-velocity
     // seam would report zeros as valid for exactly the samples that have no
     // basis, which is the lie this whole path exists to avoid.
-    int have_motion = sp->reference_type == 0 && base_static && sp_motion_known;
+    //
+    // VIEW as well as an action space: the head has a motion of its own, and a
+    // client given a pose and a velocity can predict instants this runtime was
+    // never asked about. Withholding it leaves a guest that wants to look ahead
+    // no basis but our single answer for our single instant. LOCAL and STAGE
+    // are the two spaces that do not move, so they have nothing to report.
+    int locatable_motion = sp->reference_type == 0 ||
+                           sp->reference_type == KLXR_REF_SPACE_VIEW;
+    int have_motion = locatable_motion && base_static && sp_motion_known;
     klxr_fill_space_velocity(location->next, have_motion ? lin : NULL,
                                              have_motion ? ang : NULL);
     if (say)
@@ -6038,10 +6396,20 @@ int kl_openxr_input_selftest(FILE *f) {
         ok &= pitched;
     }
 
-    // The aim delta is SEPARATE from the grip correction and defaults to 0, so
-    // an aim space must land exactly where the grip one does. If these ever
-    // differ with KL_XR_AIM_PITCH unset, the two knobs have been conflated
-    // again — which is the same bug in the other direction.
+    // The aim delta is SEPARATE from the grip correction and applies ON TOP of
+    // it, so an aim space lands at the sum of the two pitches while a grip
+    // space lands at the grip pitch alone. Checking the sum rather than
+    // checking that the two agree is what keeps this a test of separateness at
+    // any default: if the aim delta were ever folded into the grip correction,
+    // an aim space would land at the grip pitch (or at twice the sum) and this
+    // fails either way.
+    //
+    // The default is not zero. An accessory publishes its own grip-to-aim
+    // angle and on a PSVR2 Sense that is -34.81 degrees, measured on device
+    // (`[cp] sense frames`); the default is within a couple of degrees of it,
+    // having been found by aiming in a guest's menu before the measurement
+    // existed. A Touch's own grip-to-aim is -60, so this is a real per-device
+    // quantity and not a comfort constant.
     {
         XrActionSpaceCreateInfo ai;
         memset(&ai, 0, sizeof ai);
@@ -6055,8 +6423,14 @@ int kl_openxr_input_selftest(FILE *f) {
         memset(&a, 0, sizeof a); memset(&g, 0, sizeof g);
         klxr_LocateSpace(aim_space, stage_sp, 0, &a);
         klxr_LocateSpace(sp[0], stage_sp, 0, &g);
-        ok &= klxr_st_ok(f, "the aim delta is separate and defaults to none",
-                         fabsf(a.pose.orientation.x - g.pose.orientation.x) < 1e-4f);
+        // Both spaces carry only the correction, so each orientation is
+        // q.x = sin(pitch/2) for its own total.
+        const float rad = 0.5f * 3.14159265358979f / 180.0f;
+        float want_aim  = sinf((KLXR_GRIP_PITCH_DEFAULT + KLXR_AIM_PITCH_DEFAULT) * rad);
+        float want_grip = sinf(KLXR_GRIP_PITCH_DEFAULT * rad);
+        ok &= klxr_st_ok(f, "the aim delta applies on top of the grip pitch",
+                         fabsf(a.pose.orientation.x - want_aim)  < 1e-3f &&
+                         fabsf(g.pose.orientation.x - want_grip) < 1e-3f);
     }
 
     // Haptics: what is checked is that the order REACHES kl_ovrp's queue — the
@@ -6252,6 +6626,17 @@ int kl_openxr_input_selftest(FILE *f) {
     return ok;
 }
 
+// A tracker for the selftest: the head, yawed 10 degrees further, for any
+// instant. Standing in for the visionOS compositor's timestamped DeviceAnchor
+// query, which is the only thing that can really predict — see
+// kl_ovrp_set_head_at.
+static int klxr_st_head_at(double time_s, float *pose7) {
+    (void)time_s;
+    pose7[0] = 0.0f; pose7[1] = 0.08715574f; pose7[2] = 0.0f; pose7[3] = 0.9961947f;
+    pose7[4] = 0.0f; pose7[5] = 1.6f;        pose7[6] = 0.0f;
+    return 1;
+}
+
 int kl_openxr_space_selftest(FILE *f) {
     klxr_space view  = klxr_st_space(KLXR_REF_SPACE_VIEW, 0, 0, 0);
     klxr_space stage = klxr_st_space(KLXR_REF_SPACE_STAGE, 0, 0, 0);
@@ -6287,8 +6672,8 @@ int kl_openxr_space_selftest(FILE *f) {
         // VIEW located in STAGE *is* the head: this is the answer that is
         // supposed to carry the head's position, and it is the control for the
         // ones below that are not.
-        XrPosef head_in_stage = klxr_pose_rel(klxr_space_pose(&stage),
-                                              klxr_space_pose(&view));
+        XrPosef head_in_stage = klxr_pose_rel(klxr_space_pose(&stage, NULL),
+                                              klxr_space_pose(&view, NULL));
         ok &= klxr_st_pos(f, "VIEW in STAGE is the head", head_in_stage.position,
                           heads[h].p[0], heads[h].p[1], heads[h].p[2]);
 
@@ -6298,7 +6683,7 @@ int kl_openxr_space_selftest(FILE *f) {
             float px, py, pz, qx, qy, qz, qw, tan[4];
             kl_ovrp_eye_view(e, &px, &py, &pz, &qx, &qy, &qz, &qw, tan);
             XrPosef eye = { {qx, qy, qz, qw}, {px, py, pz} };
-            e2h[h][e] = klxr_pose_rel(klxr_space_pose(&view), eye).position;
+            e2h[h][e] = klxr_pose_rel(klxr_space_pose(&view, NULL), eye).position;
             float d = sqrtf(e2h[h][e].x * e2h[h][e].x + e2h[h][e].y * e2h[h][e].y +
                             e2h[h][e].z * e2h[h][e].z);
             int near = d < 0.2f;
@@ -6310,8 +6695,8 @@ int kl_openxr_space_selftest(FILE *f) {
 
         // LOCAL and STAGE are both fixed frames, so they differ by the standing
         // height and by nothing the head does.
-        XrPosef local_in_stage = klxr_pose_rel(klxr_space_pose(&stage),
-                                               klxr_space_pose(&local));
+        XrPosef local_in_stage = klxr_pose_rel(klxr_space_pose(&stage, NULL),
+                                               klxr_space_pose(&local, NULL));
         ok &= klxr_st_pos(f, "LOCAL in STAGE is the standing height",
                           local_in_stage.position, 0, eh, 0);
 
@@ -6319,11 +6704,95 @@ int kl_openxr_space_selftest(FILE *f) {
         // merely added to it: a metre in
         // front of a head yawed 90 degrees is a metre along -x, not along -z.
         klxr_space ahead = klxr_st_space(KLXR_REF_SPACE_VIEW, 0, 0, -1.0f);
-        XrPosef a = klxr_pose_rel(klxr_space_pose(&stage), klxr_space_pose(&ahead));
+        XrPosef a = klxr_pose_rel(klxr_space_pose(&stage, NULL), klxr_space_pose(&ahead, NULL));
         float fx = heads[h].p[0] - (h ? 1.0f : 0.0f);
         float fz = heads[h].p[2] - (h ? 0.0f : 1.0f);
         ok &= klxr_st_pos(f, "a space 1 m in front of the head", a.position,
                           fx, heads[h].p[1], fz);
+    }
+
+    // ---- one head per instant, across BOTH pose entry points ----------------
+    //
+    // The other regression this file exists for, and it is the one that cannot
+    // be seen in either entry point alone. A guest may render from
+    // xrLocateSpace(VIEW) and submit from xrLocateViews for the same instant —
+    // JKXR does — so answering the two out of separate queries makes the engine
+    // draw from one head and declare another, and the composite then corrects a
+    // difference the guest never made. It reads as a rotational swim.
+    //
+    // Asserted with a tracker that genuinely predicts, because without one both
+    // answers are the latched head and agreement is free: this one yaws the
+    // head 10 degrees further, so a runtime that predicts only one of the two
+    // fails by that whole angle rather than by a rounding error.
+    {
+        kl_ovrp_set_head_pose(0, 1.6f, 0, 0, 0, 0, 1);
+        kl_ovrp_frame_latch();
+        kl_ovrp_set_head_at(klxr_st_head_at);
+        klxr_session ss;
+        memset(&ss, 0, sizeof ss);
+        ss.frames_waited = 1;
+        // Far enough ahead to be a real prediction, well inside the clamp.
+        klxr_head_delta pred = klxr_frame_head_delta(&ss, klxr_now() + 8000000LL);
+        fprintf(f, "  --- one head per instant ---\n");
+        fprintf(f, "  %s the tracker's prediction was taken\n",
+                pred.valid ? "ok  " : "FAIL");
+        ok &= pred.valid;
+
+        // What each entry point answers, reduced to the same thing: a head in
+        // the tracking space. xrLocateViews states EYES, so its head is the
+        // midpoint of the two — the same reconstruction klxr_EndFrame makes of
+        // a submitted projection layer.
+        XrPosef from_space = klxr_space_pose(&view, &pred);
+        XrPosef from_views = { {0, 0, 0, 1}, {0, 0, 0} };
+        for (int e = 0; e < 2; e++) {
+            float px, py, pz, qx, qy, qz, qw, tan[4];
+            kl_ovrp_eye_view(e, &px, &py, &pz, &qx, &qy, &qz, &qw, tan);
+            XrPosef eye = klxr_head_predicted(
+                (XrPosef){ {qx, qy, qz, qw}, {px, py, pz} }, &pred);
+            if (e == 0) from_views = eye;
+            else {
+                from_views.position.x = 0.5f * (from_views.position.x + eye.position.x);
+                from_views.position.y = 0.5f * (from_views.position.y + eye.position.y);
+                from_views.position.z = 0.5f * (from_views.position.z + eye.position.z);
+            }
+        }
+        float deg = klxr_quat_deg(from_space.orientation, from_views.orientation);
+        float dx = from_space.position.x - from_views.position.x;
+        float dy = from_space.position.y - from_views.position.y;
+        float dz = from_space.position.z - from_views.position.z;
+        float m = sqrtf(dx * dx + dy * dy + dz * dz);
+        int agree = deg <= 1e-3f && m <= 1e-4f;
+        fprintf(f, "  %s xrLocateSpace(VIEW) and xrLocateViews are the same head "
+                   "(%.4f deg, %.5f m apart)\n", agree ? "ok  " : "FAIL",
+                (double)deg, (double)m);
+        ok &= agree;
+
+        // ...and not vacuously: both must have MOVED off the latched pose, or a
+        // runtime that ignores the prediction entirely would pass the line
+        // above by answering the same wrong thing twice.
+        XrPosef latched = klxr_space_pose(&view, NULL);
+        float moved = klxr_quat_deg(latched.orientation, from_space.orientation);
+        int predicted = moved > 1.0f;
+        fprintf(f, "  %s ...and it is the PREDICTED head, %.2f deg off the "
+                   "latched one\n", predicted ? "ok  " : "FAIL", (double)moved);
+        ok &= predicted;
+
+        // The velocity that lets a client predict instants of its own. It is
+        // derived from successive published poses over the WALL CLOCK, so what
+        // gives it a basis is a second pose a plausible frame later — two
+        // publishes in the same microsecond are float noise over nearly zero
+        // and are correctly reported as unknown.
+        usleep(10000);
+        kl_ovrp_set_head_pose(0, 1.6f, 0, 0, 0.0872f, 0, 0.9962f);
+        kl_ovrp_frame_latch();
+        float lin[3], ang[3];
+        int known = kl_ovrp_head_motion(lin, ang);
+        int spinning = known && fabsf(ang[1]) > 1e-3f;
+        fprintf(f, "  %s the head reports its own angular velocity "
+                   "(%.3f rad/s about y%s)\n", spinning ? "ok  " : "FAIL",
+                (double)ang[1], known ? "" : ", NOT a measurement");
+        ok &= spinning;
+        kl_ovrp_set_head_at(NULL);
     }
 
     // The regression itself, stated as one comparison: moving and turning the

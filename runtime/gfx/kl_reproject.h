@@ -51,6 +51,11 @@
 // vanishes. ALVR uses the same 500 m. KL_REPROJECT_DEPTH overrides at runtime.
 #define KL_REPROJECT_DEPTH 500.0f
 
+// Forget the latched KL_REPROJECT_DEPTH so the next build re-reads it. For the
+// gate, which places one quad at two distances in one process; nothing in a
+// real run changes the depth after it has been chosen.
+void kl_reproject_reset_depth(void);
+
 // Matches the MSL struct in kl_reproject_msl(). Bound at buffer(0) for both
 // stages: the vertex shader needs the geometry, the fragment shader the slice.
 typedef struct {

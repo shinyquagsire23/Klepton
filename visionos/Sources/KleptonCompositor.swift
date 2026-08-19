@@ -419,6 +419,11 @@ final class KleptonCompositor {
             // immersive space, hand tracking needs the user's consent. A
             // refusal must leave the head working rather than take the
             // whole seam down with it.
+            // The guest asks for views at an instant; only the tracker can
+            // answer that, so it is handed to kl_ovrp here rather than having
+            // kl_openxr guess from the pose we last published.
+            Self.headAtTracker = worldTracking
+            kl_ovrp_set_head_at(Self.headAt)
             var providers: [any DataProvider] = [worldTracking]
             if HandTrackingProvider.isSupported { providers.append(handTracking) }
             let accessories = await controllers.makeAccessoryProvider()
@@ -463,7 +468,12 @@ final class KleptonCompositor {
             // it into the stage record when the guest reaches ovrp_BeginFrame —
             // which is what the composite pass reads back to know where the
             // picture it is about to show was drawn from.
-            let (p, q) = Self.decompose(anchor.originFromAnchorTransform)
+            // In head space, not device space — see the midpoint argument at
+            // originFromHead. The guest derives its eye positions from this
+            // pose and the offsets pushEyeOffsets sent, and those two have to
+            // be stated about one origin or every near object sits wrong.
+            let (p, q) = Self.decompose(
+                Self.headFrom(anchor.originFromAnchorTransform, midpoint: eyeMidpointInDevice))
             kl_ovrp_set_head_pose(p.x, p.y, p.z, q.imag.x, q.imag.y, q.imag.z, q.real)
         }
 
@@ -1553,9 +1563,40 @@ final class KleptonCompositor {
             .duration(to: main.frameTiming.presentationTime).timeInterval
         let displayAnchor = worldTracking.queryDeviceAnchor(atTimestamp: presentation)
         let originFromDevice = displayAnchor?.originFromAnchorTransform ?? matrix_identity_float4x4
+        // OpenXR's VIEW space is DEFINED as the midpoint between the eyes.
+        // visionOS's device anchor is a point on the hardware and is not that
+        // midpoint, so treating the two as equal declares an equality that is
+        // false at both seams at once: the guest is told its head is somewhere
+        // it is not, and the timewarp rotates about a centre the picture was
+        // not drawn about. The second one is the expensive half — a rotation
+        // applied about the wrong centre moves the eyes along a lever arm
+        // nothing models, so a pure head turn smears near content while the
+        // measured delta stays small and healthy-looking.
+        //
+        // The drawable states the midpoint every frame and it needs no tuning:
+        // it is the average of the two eyes' own transforms. `deviceAnchor`
+        // below still gets the raw anchor, which is what that API means.
+        let originFromHead = Self.headFrom(originFromDevice, midpoint: eyeMidpointInDevice)
 
-        noteReprojection(rendered: haveRendered ? rendered : nil,
-                         originFromDevice: originFromDevice, stage: stage)
+        // Measure the pose the composite is about to DRAW with, which is not
+        // always the frame record. With the layer path live the eye picture is
+        // placed by the guest's own submitted layer pose; the frame record is
+        // the head pose we latched when the guest opened the frame. Those are
+        // different poses, and reporting the second while drawing the first
+        // describes a correction nobody is applying — the delta reads healthy
+        // while the picture swims.
+        var measured = haveRendered ? rendered : nil
+        if projLayerCount > 0 {
+            var r = kl_ovrp_render_pose()
+            r.serial = rendered.serial
+            r.submit_ns = rendered.submit_ns
+            let pl = projLayers[0]
+            r.px = pl.pose.0; r.py = pl.pose.1; r.pz = pl.pose.2
+            r.qx = pl.pose.3; r.qy = pl.pose.4; r.qz = pl.pose.5; r.qw = pl.pose.6
+            measured = r
+        }
+        noteReprojection(rendered: measured,
+                         originFromHead: originFromHead, stage: stage)
 
         // The drawable's depth range, once, with the depth our quad actually
         // reaches. This is not curiosity. The quad's distance is what the
@@ -1656,7 +1697,7 @@ final class KleptonCompositor {
             encoded += encodeComposite(drawable, cmd: cmd, stage: stage,
                                        completeStage: completeStage,
                                        rendered: rendered, haveRendered: haveRendered,
-                                       originFromDevice: originFromDevice)
+                                       originFromHead: originFromHead)
             drawable.encodePresent(commandBuffer: cmd)
         }
 
@@ -1712,7 +1753,7 @@ final class KleptonCompositor {
     private func encodeComposite(_ drawable: LayerRenderer.Drawable,
                                  cmd: MTLCommandBuffer, stage: Int, completeStage: Int,
                                  rendered: kl_ovrp_render_pose, haveRendered: Bool,
-                                 originFromDevice: simd_float4x4) -> Int {
+                                 originFromHead: simd_float4x4) -> Int {
         // KL_CP_AMPLIFY=0 — back to ONE RENDER PASS PER EYE, selecting the
         // slice on the attachment, with no rate map and no amplification.
         //
@@ -1736,7 +1777,7 @@ final class KleptonCompositor {
                                rateMap: drawable.rasterizationRateMaps.first,
                                cmd: cmd, stage: stage, completeStage: completeStage,
                                rendered: rendered, haveRendered: haveRendered,
-                               originFromDevice: originFromDevice)
+                               originFromHead: originFromHead)
         }
         var n = 0
         let maps = drawable.rasterizationRateMaps
@@ -1750,7 +1791,7 @@ final class KleptonCompositor {
                              rateMap: perView ? maps[i] : nil,
                              cmd: cmd, stage: stage, completeStage: completeStage,
                              rendered: rendered, haveRendered: haveRendered,
-                             originFromDevice: originFromDevice)
+                             originFromHead: originFromHead)
         }
         return n
     }
@@ -1762,7 +1803,7 @@ final class KleptonCompositor {
                              rateMap: MTLRasterizationRateMap?,
                              cmd: MTLCommandBuffer, stage: Int, completeStage: Int,
                              rendered: kl_ovrp_render_pose, haveRendered: Bool,
-                             originFromDevice: simd_float4x4) -> Int {
+                             originFromHead: simd_float4x4) -> Int {
         guard let first = viewIndices.first else { return 0 }
         let firstMap = drawable.views[first].textureMap
 
@@ -1845,7 +1886,9 @@ final class KleptonCompositor {
             let alloc = (completeStage < 0 || kl_ovrp_eye_layer_live() == 0) ? nil : a
             var u = withUnsafePointer(to: rendered) { r in
                 kl_reproject_build(haveRendered ? r : nil, Int32(vi),
-                                   originFromDevice, view.transform,
+                                   originFromHead,
+                                   Self.headFromView(view.transform,
+                                                     midpoint: eyeMidpointInDevice),
                                    drawable.computeProjection(viewIndex: vi),
                                    UInt32(alloc?.slice ?? 0),
                                    (alloc?.flipY ?? false) ? 1 : 0,
@@ -1942,7 +1985,7 @@ final class KleptonCompositor {
         if nproj > 0 {
             visible = encodeProjLayers(enc, viewIndices: viewIndices,
                                        drawable: drawable,
-                                       originFromDevice: originFromDevice,
+                                       originFromHead: originFromHead,
                                        count: nproj) > 0 ? viewIndices.count : 0
         }
         // The EYE pass, and only when there is an eye. `haveEyes` is false for
@@ -2074,7 +2117,7 @@ final class KleptonCompositor {
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
         }
         let panels = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
-                                    originFromDevice: originFromDevice,
+                                    originFromHead: originFromHead,
                                     writeDepth: visible == 0)
         enc.endEncoding()
         // "How many eyes got a picture", which is what the caller counts black
@@ -2108,7 +2151,7 @@ final class KleptonCompositor {
     private func encodeProjLayers(_ enc: MTLRenderCommandEncoder,
                                   viewIndices: [Int],
                                   drawable: LayerRenderer.Drawable,
-                                  originFromDevice: simd_float4x4,
+                                  originFromHead: simd_float4x4,
                                   count: Int) -> Int {
         guard let pipeline, let sampler else { return 0 }
         let grid = identityGrid()
@@ -2135,8 +2178,9 @@ final class KleptonCompositor {
                                         .takeUnretainedValue() as MTLTexture)
                 }
                 var u = withUnsafePointer(to: pl) {
-                    kl_proj_layer_build($0, Int32(vi), originFromDevice,
-                                        drawable.views[vi].transform,
+                    kl_proj_layer_build($0, Int32(vi), originFromHead,
+                                        Self.headFromView(drawable.views[vi].transform,
+                                                          midpoint: eyeMidpointInDevice),
                                         drawable.computeProjection(viewIndex: vi),
                                         UInt32(slice))
                 }
@@ -2270,7 +2314,7 @@ final class KleptonCompositor {
     private func encodeOverlays(_ enc: MTLRenderCommandEncoder,
                                 viewIndices: [Int],
                                 drawable: LayerRenderer.Drawable,
-                                originFromDevice: simd_float4x4,
+                                originFromHead: simd_float4x4,
                                 writeDepth: Bool) -> Int {
         guard overlaysEnabled, let pipe = overlayPipeline else { return 0 }
         // .greater against that same clear, and the shader's own projected
@@ -2301,8 +2345,9 @@ final class KleptonCompositor {
                     ?? kl_glfb_layer_mtl_texture(ov.layer_id, ov.stage, &w, &h)
                 if texture == nil, let t { texture = Unmanaged<MTLTexture>
                     .fromOpaque(t).takeUnretainedValue() }
-                var u = kl_overlay_build(&ov, Int32(vi), originFromDevice,
-                                         drawable.views[vi].transform,
+                var u = kl_overlay_build(&ov, Int32(vi), originFromHead,
+                                         Self.headFromView(drawable.views[vi].transform,
+                                                           midpoint: eyeMidpointInDevice),
                                          drawable.computeProjection(viewIndex: vi))
                 if t == nil { u.visible = 0 }
                 uniforms.append(u)
@@ -2695,9 +2740,110 @@ final class KleptonCompositor {
         kl_ovrp_set_eye_texture_size(Int32(w), Int32(h))
     }
 
+    /// The tracker the pose-at-time callback queries.
+    ///
+    /// Static because kl_ovrp takes a plain C function pointer, which cannot
+    /// capture. Written once during setup and only read afterwards.
+    nonisolated(unsafe) static var headAtTracker: WorldTrackingProvider?
+
+    /// A head pose for an instant, for `kl_ovrp_set_head_at`.
+    ///
+    /// Two things here are defensive rather than obvious, and both come from
+    /// this API's history:
+    ///
+    ///   * **The anchor is re-queried, never cached.** Device anchors have
+    ///     carried hidden state, so an anchor object held across a frame is
+    ///     not reliably the pose it was fetched for. Every call fetches.
+    ///   * **The timestamp is walked back.** The tracker returns nil for an
+    ///     instant it will not predict to, and how far ahead that is is not
+    ///     documented and not fixed. Stepping back 5 ms at a time finds the
+    ///     edge instead of guessing where it is; the interval is already
+    ///     capped at 50 ms by the caller, so this walks at most that far.
+    ///
+    /// Returning 0 leaves the guest with the current pose, which is what it
+    /// had before this existed — strictly better than inventing one.
+    nonisolated(unsafe) static let headAt: @convention(c)
+        (Double, UnsafeMutablePointer<Float>?) -> Int32 = { time, out in
+        guard let out, let tracker = KleptonCompositor.headAtTracker else { return 0 }
+        var t = time
+        var anchor = tracker.queryDeviceAnchor(atTimestamp: t)
+        var steps = 0
+        while anchor == nil && steps < 10 {
+            t -= 0.005
+            anchor = tracker.queryDeviceAnchor(atTimestamp: t)
+            steps += 1
+        }
+        guard let a = anchor else { return 0 }
+        let (p, q) = KleptonCompositor.decompose(a.originFromAnchorTransform)
+        // Head space, matching every other pose this file publishes.
+        let m = KleptonCompositor.headFrom(a.originFromAnchorTransform,
+                                           midpoint: KleptonCompositor.headAtMidpoint)
+        let (hp, hq) = KleptonCompositor.decompose(m)
+        _ = p; _ = q
+        out[0] = hq.imag.x; out[1] = hq.imag.y; out[2] = hq.imag.z; out[3] = hq.real
+        out[4] = hp.x;      out[5] = hp.y;      out[6] = hp.z
+        return 1
+    }
+
+    /// The midpoint the callback uses — the instance's, copied out so a C
+    /// function pointer can reach it.
+    nonisolated(unsafe) static var headAtMidpoint = SIMD3<Float>(0, 0, 0)
+
+    /// The eye midpoint in the device anchor's frame — the offset between what
+    /// visionOS calls the device and what OpenXR calls VIEW.
+    ///
+    /// Zero until `pushEyeOffsets` has seen a drawable, and zero forever if
+    /// `KL_HEAD_MIDPOINT=0`; both helpers below are the identity at zero, so
+    /// the knob and the not-yet-measured case are one code path.
+    private var eyeMidpointInDevice = SIMD3<Float>(0, 0, 0)
+
+    /// `origin_from_head` from `origin_from_device`.
+    private static func headFrom(_ originFromDevice: simd_float4x4,
+                                 midpoint m: SIMD3<Float>) -> simd_float4x4 {
+        if m == SIMD3<Float>(0, 0, 0) { return originFromDevice }
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4<Float>(m.x, m.y, m.z, 1)
+        return originFromDevice * t
+    }
+
+    /// `head_from_view` from `device_from_view` — the drawable's own per-eye
+    /// transform, restated about the midpoint so the whole composite chain is
+    /// in one space.
+    private static func headFromView(_ deviceFromView: simd_float4x4,
+                                     midpoint m: SIMD3<Float>) -> simd_float4x4 {
+        if m == SIMD3<Float>(0, 0, 0) { return deviceFromView }
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4<Float>(-m.x, -m.y, -m.z, 1)
+        return t * deviceFromView
+    }
+
     private func pushEyeOffsets(_ drawable: LayerRenderer.Drawable) {
+        // Latched, not re-read per frame. A streaming guest sends its eye
+        // transform to the host ONCE and the host will not revise it, so the
+        // number the guest was given has to stay the number it was given; the
+        // display side is free to move underneath it, and bridging the two is
+        // the composite's job rather than something to hide by re-pushing.
+        if ProcessInfo.processInfo.environment["KL_HEAD_MIDPOINT"] != "0",
+           drawable.views.count >= 2 {
+            let a = drawable.views[0].transform.columns.3
+            let b = drawable.views[1].transform.columns.3
+            eyeMidpointInDevice = SIMD3<Float>((a.x + b.x) * 0.5,
+                                               (a.y + b.y) * 0.5,
+                                               (a.z + b.z) * 0.5)
+            Self.headAtMidpoint = eyeMidpointInDevice
+            NSLog(String(format: "[cp] eye midpoint (%.4f, %.4f, %.4f) m from the "
+                                 + "device anchor — head space is this, not the anchor "
+                                 + "(KL_HEAD_MIDPOINT=0 restores the anchor)",
+                         eyeMidpointInDevice.x, eyeMidpointInDevice.y,
+                         eyeMidpointInDevice.z))
+        }
         for (i, view) in drawable.views.enumerated() where i < 2 {
-            let t = view.transform.columns.3
+            // Relative to the eye MIDPOINT, because that is what the guest
+            // calls its head. The drawable states these about the device
+            // anchor.
+            let t = view.transform.columns.3 - SIMD4<Float>(eyeMidpointInDevice.x,
+                                                            eyeMidpointInDevice.y,
+                                                            eyeMidpointInDevice.z, 0)
             kl_ovrp_set_eye_offset(Int32(i), t.x, t.y, t.z)
             // ...and the eye's ROTATION, which this loop used to discard.
             //
@@ -2713,9 +2859,19 @@ final class KleptonCompositor {
             kl_ovrp_set_eye_rotation(Int32(i), q.imag.x, q.imag.y, q.imag.z, q.real)
             if !loggedEyeOffsets && i == drawable.views.count - 1 {
                 loggedEyeOffsets = true
+                // Both eyes in the SAME space — the midpoint-relative one that
+                // is actually pushed. Printing view[0]'s raw column beside
+                // view[1]'s corrected one made the two eyes look wildly
+                // asymmetric (2.6 cm apart vertically, 3.4 cm in depth) when
+                // the pushed values are symmetric to a tenth of a millimetre,
+                // and that read as a geometry fault for as long as it took to
+                // subtract the midpoint by hand.
                 let l = drawable.views[0].transform.columns.3
-                NSLog(String(format: "[cp] eye offsets: L (%.4f, %.4f, %.4f) "
-                             + "R (%.4f, %.4f, %.4f) — IPD %.1f mm",
+                    - SIMD4<Float>(eyeMidpointInDevice.x, eyeMidpointInDevice.y,
+                                   eyeMidpointInDevice.z, 0)
+                NSLog(String(format: "[cp] eye offsets from the midpoint: "
+                             + "L (%.4f, %.4f, %.4f) R (%.4f, %.4f, %.4f) "
+                             + "— IPD %.1f mm",
                              l.x, l.y, l.z, t.x, t.y, t.z,
                              abs(t.x - l.x) * 1000))
                 // The half of view.transform the guest is NOT told about.
@@ -2876,20 +3032,39 @@ final class KleptonCompositor {
     /// guest is keeping up and the pass is a blit, and a growing value with
     /// `stale` frames behind it means pictures are being reused, which is
     /// reprojection earning its place rather than a fault.
+    /// Worst pose age seen since the last line, in milliseconds.
+    private var worstAgeMs: Double = 0
+
     private func noteReprojection(rendered: kl_ovrp_render_pose?,
-                                  originFromDevice: simd_float4x4, stage: Int) {
+                                  originFromHead: simd_float4x4, stage: Int) {
         reprojectFrames += 1
         var delta: Float = 0
         if var r = rendered {
             delta = withUnsafePointer(to: &r) {
-                kl_reproject_delta_degrees($0, originFromDevice)
+                kl_reproject_delta_degrees($0, originFromHead)
             }
         }
         worstDelta = max(worstDelta, delta)
+        // How OLD the pose being corrected against is. An angle on its own
+        // cannot separate a fast head from a stale pose — it is the product of
+        // the two — and those want opposite fixes. One displayed frame at
+        // 120 Hz is 8.3 ms; tens of milliseconds means the record is not this
+        // frame's and the correction is aimed at the wrong instant.
+        var ageMs: Double = 0
+        if let sub = rendered?.submit_ns, sub != 0 {
+            var ts = timespec()
+            clock_gettime(CLOCK_MONOTONIC, &ts)
+            let now = UInt64(ts.tv_sec) * 1_000_000_000 + UInt64(ts.tv_nsec)
+            if now > sub { ageMs = Double(now - sub) / 1_000_000 }
+        }
+        worstAgeMs = max(worstAgeMs, ageMs)
         guard reprojectFrames % 90 == 0 else { return }
         NSLog(String(format: "[cp] timewarp: stage %d serial %llu, delta %.2f deg "
-                             + "(worst %.2f), %d stale in a row",
-                     stage, rendered?.serial ?? 0, delta, worstDelta, staleInARow))
+                             + "(worst %.2f), pose age %.1f ms (worst %.1f), "
+                             + "%d stale in a row",
+                     stage, rendered?.serial ?? 0, delta, worstDelta,
+                     ageMs, worstAgeMs, staleInARow))
         worstDelta = 0
+        worstAgeMs = 0
     }
 }

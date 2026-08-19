@@ -15,6 +15,7 @@
 // still stays on the C side.
 #import "kl_glfb.h"
 #import "kl_ovrp.h"
+#import "kl_openxr.h"
 #import "kl_reproject.h"
 // ...and by one more for audio: kl_audio owns the CoreAudio output unit, but
 // the AVAudioSession it needs on this platform can only be configured from

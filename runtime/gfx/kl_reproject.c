@@ -29,6 +29,24 @@ static int klr_nocant(void) {
     return on;
 }
 
+// Whether the head's TRANSLATION between the render pose and the display pose
+// is corrected as parallax for a plane at KL_REPROJECT_DEPTH. On by default and
+// inert at the default depth — see the argument at the chain below.
+// KL_REPROJECT_TRANSLATE=0 restores the rotation-only correction.
+// Latched on first use like every other knob here. File scope rather than
+// function scope only so kl_reproject_reset_depth can clear it: the gate has to
+// place the same quad at two distances in one process, and a depth that could
+// only be chosen once would make the parallax assertion untestable.
+static float s_depth = 0.0f;
+
+void kl_reproject_reset_depth(void) { s_depth = 0.0f; }
+
+static int klr_translate(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_REPROJECT_TRANSLATE", 1);
+    return on;
+}
+
 // Whether the composite decodes its sample from sRGB. See kl_reproject.h for
 // the full argument; the short version is that ANGLE forces an sRGB encode the
 // guest explicitly asked to be without, and the extra decode undoes it.
@@ -551,7 +569,6 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     // drawable reports `depthRange = (far inf, near 0.1)`, an INFINITE far
     // plane. The compositor logs the quad's actual NDC depth beside that range,
     // so this is a number in the log rather than an argument.
-    static float s_depth = 0.0f;
     if (s_depth == 0.0f) {
         float v = kl_env_float("KL_REPROJECT_DEPTH", 0.0);
         s_depth = (v > 0.0f) ? v : KL_REPROJECT_DEPTH;
@@ -575,9 +592,15 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     //     view <- device <- world <- render
     //
     // and the model-view is that whole chain, which is the inverse of the
-    // chain written the other way round. Only the two head poses have their
-    // translation dropped; device_from_view keeps its eye offset, because that
-    // is a property of the display and not part of the delta being corrected.
+    // chain written the other way round. All three have their translation
+    // dropped — see each of the two arguments below for why, which are
+    // different reasons and not one.
+    //
+    // `origin_from_device` is expected to be OpenXR's VIEW space, i.e. the
+    // point midway between the eyes, because that is the space the guest
+    // rendered about. Rotating about any other point moves the eyes along a
+    // lever arm this correction does not model, and the error is largest on
+    // near content while the measured delta stays small.
     //
     // With no record, the render rotation is defined to be the *display's* and
     // not identity. That is not a detail: a missing record means "we do not
@@ -603,7 +626,39 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     // drawn with, oppositely in the two eyes.
     simd_float4x4 view_rot = klr_nocant() ? matrix_identity_float4x4
                                           : klr_rotation_of(device_from_view);
-    simd_float4x4 chain = simd_mul(simd_mul(simd_inverse(render_rot), device_rot),
+    // ---- and the TRANSLATION, which is the parallax ------------------------
+    //
+    // Everything above corrects rotation only, and that leaves a real error
+    // that reads as swim: a head TURN is a rotation about the neck, so the eyes
+    // translate several centimetres, and none of that was corrected here. It
+    // was left to the system's own reprojection, which is why the quad sits at
+    // 500 m — at that distance the system's correction is rotational and the
+    // translation is simply not applied by anyone.
+    //
+    // The asymmetry that identified it: the eye displacement from a YAW is
+    // lateral, and lateral motion of the whole picture is glaring; the
+    // displacement from a PITCH is vertical and in depth, which is far less
+    // visible. So the world swims when you look side to side and does not when
+    // you nod — measured on device, JKXR, and it is one cause with the plain
+    // translational swim rather than two.
+    //
+    // The correction is exact for content at `u.depth` and wrong for the rest,
+    // which is the best a single plane can do: shifting a quad at depth d by
+    // the head's displacement is an angular shift of |dP| / d, i.e. the parallax
+    // of a plane at d. **At 500 m it is nothing**, so this is inert until
+    // KL_REPROJECT_DEPTH names a distance near the content — which makes that
+    // knob the whole experiment and this change safe by construction.
+    //
+    // Only the DIFFERENCE of the two positions is used, so a constant offset
+    // between the guest's tracking space and the display's world origin (a
+    // floor height, a recentre) cancels and neither space has to be the other.
+    simd_float4x4 render_m = render_rot, device_m = device_rot;
+    if (klr_translate() && rendered && rendered->serial) {
+        render_m.columns[3] = simd_make_float4(rendered->px, rendered->py,
+                                               rendered->pz, 1.0f);
+        device_m.columns[3] = origin_from_device.columns[3];
+    }
+    simd_float4x4 chain = simd_mul(simd_mul(simd_inverse(render_m), device_m),
                                    view_rot);
     u.model_view = simd_inverse(chain);
     return u;

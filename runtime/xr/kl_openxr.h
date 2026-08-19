@@ -120,4 +120,24 @@ void kl_openxr_set_frame_pacer(void (*wait)(void));
 // when set, still pins one index and overrides this.
 void kl_openxr_set_capture_topmost_layer(int on);
 
+// The controller correction, pushed LIVE instead of read once from the
+// environment — see the KL_XR_GRIP_* knobs in DEBUG_ENV_VARS.md for what each
+// term means.
+//
+// It exists because these values cannot be derived, only judged by wearing the
+// headset, and a relaunch per candidate is two minutes an iteration. A frontend
+// that can show sliders pushes them here and the next pose located uses them;
+// nothing is cached across the call.
+//
+// The environment still sets the STARTING values, so a run with no frontend UI
+// behaves exactly as before, and `kl_openxr_grip_tune` reads back whatever is
+// in force so a panel can be built showing the real current numbers rather than
+// its own idea of them.
+//
+// `pivot` and `pos` are three floats each, in the grip's own frame, metres.
+void kl_openxr_set_grip_tune(float grip_pitch_deg, float aim_pitch_deg,
+                             const float pivot[3], const float pos[3]);
+void kl_openxr_grip_tune(float *grip_pitch_deg, float *aim_pitch_deg,
+                         float pivot[3], float pos[3]);
+
 #endif
