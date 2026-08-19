@@ -62,10 +62,11 @@ Currently working well on both macOS and visionOS with minor-to-no graphical iss
 - SUPERHOT VR
 - Resident Evil 4 VR
 - OpenBrush (OpenXR)
+- OpenJK XR (Team Beef)
 
 WIP or not in a great state:
 
-- Steam VR Link (low bitrate, networking issues)
+- Steam VR Link (no AWDL mitigations due to entitlement restrictions, XR_EXT_hand_tracking not implemented yet)
 
 Abandoned due to anticheat, JIT mmaping, or other problems:
 
