@@ -19,7 +19,7 @@ import simd
 /// old one.
 struct KLTune: Equatable {
     var sensePitch: Float = -37
-    var sensePos   = SIMD3<Float>(-0.004, 0.02, -0.06)
+    var sensePos   = SIMD3<Float>(-0.004, 0.02, -0.02)
     var sensePivot = SIMD3<Float>(0, 0, 0)
     var gripPitch: Float = 37
     var aimPitch:  Float = 0
