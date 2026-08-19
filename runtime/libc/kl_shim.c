@@ -500,6 +500,17 @@ static int kl_getaddrinfo(const char *node, const char *serv,
 // every forwarded connect/sendto failed EINVAL (the "Ping" storm is one).
 // Convert through a local: bionic family (u16 at 0) -> Darwin sa_len+sa_family,
 // and AF_INET6 10 -> 30 on top of that. Port/addr offsets are identical.
+// The address length Darwin's socket calls want: the family's own size, not
+// whatever the guest passed (it hands sizeof(sockaddr_storage)=128 and Linux
+// tolerates it; Darwin rejects the oversize with EINVAL). `fallback` covers an
+// unknown family — AF_UNIX and friends carry a meaningful caller length.
+static socklen_t kl_sa_hostlen(const struct sockaddr_storage *ss, socklen_t fallback) {
+    switch (ss->ss_family) {
+        case AF_INET:  return sizeof(struct sockaddr_in);
+        case AF_INET6: return sizeof(struct sockaddr_in6);
+        default:       return fallback;
+    }
+}
 static int kl_sa_to_host(struct sockaddr_storage *dst, const struct sockaddr *sa,
                          socklen_t len) {
     if (!sa || len > sizeof *dst) return -1;
@@ -508,7 +519,16 @@ static int kl_sa_to_host(struct sockaddr_storage *dst, const struct sockaddr *sa
     if (fam == 10) fam = AF_INET6;
     memmove((uint8_t *)dst + 2, (const uint8_t *)sa + 2, (size_t)len - 2);
     dst->ss_family = (uint8_t)fam;
-    dst->ss_len = (uint8_t)len;
+    // ss_len is the FAMILY's size, never the guest's `len`. The guest hands its
+    // whole sockaddr_storage across (len = 128) — legal on Linux, which reads
+    // only the family's worth and ignores the rest. Darwin VALIDATES the length
+    // against the family and rejects an oversized one with EINVAL, so a stored
+    // 128 (or a bind/connect passed 128) is a bind that fails "Invalid argument".
+    // Steam Link's SVLDataLinkTransferUDP does exactly this — binds/connects its
+    // UDP transport with sizeof(sockaddr_storage) — so every transport socket
+    // failed to bind and the stream never opened. kl_bind/kl_connect/kl_sendto
+    // pass kl_sa_hostlen() rather than the guest len for the same reason.
+    dst->ss_len = (uint8_t)kl_sa_hostlen(dst, len);
     // The other half of the interface-0 divergence: a link-local IPv6
     // destination (ff02::/16 multicast, fe80::/10 unicast) carries its link in
     // sin6_scope_id, and Linux fills a zero in from the routing table where
@@ -615,15 +635,134 @@ static void kl_no_sigpipe(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
 }
 
+// Steam Link streams HEVC in bursts over UDP, and Darwin's default socket
+// buffers are small (the receive side especially) — a burst that arrives faster
+// than the guest drains overflows the buffer and the datagrams are dropped
+// before any FEC can help. The client reads that loss as a bad link and its
+// adaptive encoder ratchets the resolution DOWN to stop it, which on a healthy
+// LAN shows up as a soft, low-resolution image for no visible reason. So every
+// socket the guest opens is given a large receive AND send buffer up front,
+// best-effort: Darwin silently clamps to kern.ipc.maxsockbuf, and even the
+// clamp is far above the default. Harmless on the small discovery/sideband
+// sockets, decisive on the video one. The guest may still raise these itself
+// (kl_setsockopt lets it); this only sets the FLOOR, so a guest that asks for
+// more keeps more.
+static void kl_grow_sock_buffers(int fd) {
+    // 8 MiB target. macOS/visionOS cap this well below the ask, but the clamped
+    // result is still MBs, not the tens of KB a UDP socket starts with.
+    int want = 8 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &want, sizeof want);
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &want, sizeof want);
+    if (kl_net_trace()) {
+        int got_r = 0, got_s = 0;
+        socklen_t rl = sizeof got_r, sl = sizeof got_s;
+        getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got_r, &rl);
+        getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &got_s, &sl);
+        static int said;
+        if (said++ < 4)
+            fprintf(stderr, "  [net] fd %d socket buffers grown: rcvbuf=%d "
+                            "sndbuf=%d (asked %d)\n", fd, got_r, got_s, want);
+    }
+}
+
 static int kl_socket(int domain, int type, int protocol) {
     // bionic AF_INET6=10 -> Darwin 30; SOCK_* types agree.
     if (domain == 10) domain = AF_INET6;
+    // AF_NETLINK (16) has no Darwin equivalent, and socket() refusing it is NOT
+    // the harmless gap it reads as. Steam Link's SVLDataLinkUber opens a
+    // NETLINK_ROUTE socket only to WATCH for interface changes — but the routine
+    // that opens it (SetupScanningForLinkChanges) bails on the FIRST failure and
+    // so never reaches ScanForLinkChanges, which is the one place the client
+    // enumerates its own interfaces (through getifaddrs) into the list
+    // GuessBestCorrespondenceAddress needs to choose a route to the host. No
+    // netlink socket -> no interface list -> no correspondence address -> the UDP
+    // video transport is never created (SVLDataLinkUDP::Reconnect never runs, no
+    // socket to <host>:10400), the stream times out and the headset shows a blue
+    // void. The guest reads the interfaces from getifaddrs, NOT from this socket,
+    // so it only needs the socket to OPEN and its bind() to SUCCEED: a plain
+    // AF_UNIX datagram socket it can hold and select() on serves — nothing ever
+    // makes it readable, which is the honest answer, since the interface set does
+    // not change under us. kl_bind no-ops the sockaddr_nl bind that Darwin would
+    // otherwise reject.
+    if (domain == 16) {
+        int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (kl_net_trace())
+            fprintf(stderr, "  [net] socket(AF_NETLINK) -> synthetic fd %d "
+                            "(interface scan uses getifaddrs, not this socket)\n", fd);
+        return fd;
+    }
     int fd = socket(domain, type, protocol);
+    if (fd >= 0) kl_grow_sock_buffers(fd);
     if (kl_net_trace())
         fprintf(stderr, "  [net] socket(dom=%d type=%d proto=%d) -> fd %d%s\n",
                 domain, type, protocol, fd, fd < 0 ? strerror(errno) : "");
     return fd;
 }
+
+// getifaddrs / freeifaddrs — the interface census, translated.
+//
+// libvrlink_scene's WebRTC stack (libsteamwebrtc) gathers ICE candidates by
+// enumerating the local interfaces, and that is the ONLY way it learns an
+// address to stream video from. It reaches for two things: the getifaddrs
+// symbol (imported, and UNRESOLVED until this — it sat in the shim-gap work
+// list) and, inside bionic's own getifaddrs, an AF_NETLINK route socket, which
+// Darwin refuses outright (`socket(dom=16 …) -> Operation not permitted`). With
+// neither working the candidate set is empty: the video connection to
+// <host>:10400 is never opened, and the client sits on "Host not responding"
+// (error 450) in a blue void while the sideband on 27036 keeps working. That is
+// exactly the run this closes — every port-10400 socket was absent from the
+// trace and the only failure in it was that netlink refusal.
+//
+// Darwin HAS getifaddrs (BSD's own), and its `struct ifaddrs` is byte-identical
+// to bionic's on LP64, so the list itself is handed straight back. What differs
+// is INSIDE the sockaddrs and the flags, both read by the guest with LINUX
+// numbers:
+//   - sockaddr: Darwin leads with {sa_len, sa_family(1 byte)}; bionic has a
+//     2-byte sa_family and no length. For AF_INET / AF_INET6 the body past the
+//     first two bytes is byte-identical (port, address, scope all at the same
+//     offsets), so the fix is to overwrite those two bytes with the bionic
+//     family as a little-endian u16. AF_INET is 2 on both; AF_INET6 is 30 on
+//     Darwin and 10 on bionic. Anything else (AF_LINK, the MAC rows) becomes
+//     AF_UNSPEC so the guest skips it rather than reading a sockaddr_dl as a
+//     sockaddr_in.
+//   - ifa_flags: UP..ALLMULTI share bit values, but IFF_MULTICAST is 0x8000 on
+//     Darwin and 0x1000 on Linux — a consumer that filters on it would drop
+//     every interface. Remapped by name.
+//
+// The list stays Darwin's allocation, so klb_freeifaddrs is Darwin's free.
+static unsigned klb_ifflags_d2l(unsigned d) {
+    unsigned l = d & 0x03ffu;            // UP..ALLMULTI: identical bit values
+    if (d & 0x8000u) l |= 0x1000u;       // IFF_MULTICAST: Darwin 0x8000 -> Linux 0x1000
+    return l;
+}
+static void klb_ifa_fix_sa(struct sockaddr *sa) {
+    if (!sa) return;
+    unsigned char *b = (unsigned char *)sa;
+    switch (sa->sa_family) {              // Darwin family, at byte offset 1
+        case AF_INET:  b[0] = 2;  b[1] = 0; break;   // bionic AF_INET  = 2
+        case AF_INET6: b[0] = 10; b[1] = 0; break;   // bionic AF_INET6 = 10
+        default:       b[0] = 0;  b[1] = 0; break;   // AF_UNSPEC: guest ignores it
+    }
+}
+static int klb_getifaddrs(struct ifaddrs **out) {
+    struct ifaddrs *ifa = NULL;
+    int r = getifaddrs(&ifa);
+    if (r != 0) { if (out) *out = NULL; return r; }
+    int n = 0;
+    for (struct ifaddrs *p = ifa; p; p = p->ifa_next, n++) {
+        klb_ifa_fix_sa(p->ifa_addr);
+        klb_ifa_fix_sa(p->ifa_netmask);
+        klb_ifa_fix_sa(p->ifa_broadaddr);   // == ifa_dstaddr (the union)
+        p->ifa_flags = klb_ifflags_d2l(p->ifa_flags);
+    }
+    if (kl_net_trace())
+        fprintf(stderr, "  [net] getifaddrs -> %d entr%s (bionic-translated)\n",
+                n, n == 1 ? "y" : "ies");
+    if (out) *out = ifa;
+    return 0;
+}
+static void klb_freeifaddrs(struct ifaddrs *ifa) { freeifaddrs(ifa); }
+
 static int kl_connect(int fd, const struct sockaddr *sa, socklen_t len) {
     if (kl_net_offline()) {
         if (kl_net_trace()) fprintf(stderr, "  [net] connect() -> ENETUNREACH (offline)\n");
@@ -639,6 +778,7 @@ static int kl_connect(int fd, const struct sockaddr *sa, socklen_t len) {
     struct sockaddr_storage hs;
     if (kl_sa_to_host(&hs, sa, len) == 0) {
         sa = (struct sockaddr *)&hs;
+        len = kl_sa_hostlen(&hs, len);   // Darwin rejects the guest's oversize
         kl_sa_fmt(host, sizeof host, (const struct sockaddr *)&hs);
     }
     struct timespec t0, t1;
@@ -749,6 +889,19 @@ static int kl_bind_remap(int port) {
 
 // The other sockaddr carriers, same conversion.
 static int kl_bind(int fd, const struct sockaddr *sa, socklen_t len) {
+    // A sockaddr_nl bind (guest AF_NETLINK == 16, a 2-byte little-endian family)
+    // is for the synthetic netlink socket kl_socket handed back — there is
+    // nothing to bind on Darwin, and the guest only needs the call to SUCCEED so
+    // its link-change setup proceeds to the getifaddrs enumeration that actually
+    // finds the interfaces. Answer 0 without touching the AF_UNIX fd underneath;
+    // a real bind() with a sockaddr_nl would fail EAFNOSUPPORT and re-open the
+    // gap this closes.
+    if (sa && len >= 2 && ((const unsigned char *)sa)[0] == 16
+                       && ((const unsigned char *)sa)[1] == 0) {
+        if (kl_net_trace())
+            fprintf(stderr, "  [net] bind(fd=%d, AF_NETLINK groups) -> 0 (synthetic)\n", fd);
+        return 0;
+    }
     struct sockaddr_storage hs;
     char host[80] = "?";
     if (kl_sa_to_host(&hs, sa, len) == 0) {
@@ -760,6 +913,7 @@ static int kl_bind(int fd, const struct sockaddr *sa, socklen_t len) {
             struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&hs;
             v6->sin6_port = htons((uint16_t)kl_bind_remap(ntohs(v6->sin6_port)));
         }
+        len = kl_sa_hostlen(&hs, len);   // Darwin rejects the guest's oversize
         kl_sa_fmt(host, sizeof host, (const struct sockaddr *)&hs);
         kl_bind_conflict_check(fd, sa, len);
     }
@@ -1081,6 +1235,7 @@ static ssize_t kl_sendto(int fd, const void *buf, size_t n, int flags,
     char host[80] = "-";
     if (sa && kl_sa_to_host(&hs, sa, len) == 0) {
         sa = (struct sockaddr *)&hs;
+        len = kl_sa_hostlen(&hs, len);   // Darwin rejects the guest's oversize
         kl_sa_fmt(host, sizeof host, (const struct sockaddr *)&hs);
     }
     int nosig = 0, dflags = kl_msg_flags(flags, &nosig);
@@ -1285,7 +1440,7 @@ static ssize_t kl_sendmsg(int fd, const void *gmsg, int flags) {
     if (g->msg_name && g->msg_namelen &&
         kl_sa_to_host(&hs, g->msg_name, g->msg_namelen) == 0) {
         h.msg_name = &hs;
-        h.msg_namelen = g->msg_namelen;
+        h.msg_namelen = kl_sa_hostlen(&hs, g->msg_namelen);   // Darwin rejects oversize
         kl_sa_fmt(host, sizeof host, (const struct sockaddr *)&hs);
     }
     h.msg_iov = g->msg_iov;                     // struct iovec agrees
@@ -1665,6 +1820,7 @@ static const kl_entry g_shim[] = {
     E("getaddrinfo", kl_getaddrinfo), E("connect", kl_connect),
     E("socket", kl_socket),
     E("bind", kl_bind), E("sendto", kl_sendto), E("accept", kl_accept),
+    E("getifaddrs", klb_getifaddrs), E("freeifaddrs", klb_freeifaddrs),
     E("recvfrom", kl_recvfrom), E("getpeername", kl_getpeername),
     E("sendmsg", kl_sendmsg), E("recvmsg", kl_recvmsg),
     E("send", kl_send), E("recv", kl_recv),

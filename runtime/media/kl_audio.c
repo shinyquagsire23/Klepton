@@ -36,7 +36,7 @@ static int          g_running;        // ...and AudioOutputUnitStart succeeded
 static int          g_playing;        // the guest wants sound
 static int          g_interrupted;    // the OS took the stream
 static uint64_t     g_interrupt_ns;   // ...when, so a lost `.ended` is escapable
-static unsigned     g_interrupt_max_ms = 3000;
+static unsigned     g_interrupt_max_ms = 1500;
 // The recovery machinery lives at the bottom of the file, beside the producer
 // it used to be part of; kl_audio_open and kl_audio_interrupted are above it.
 static unsigned     g_wd_streak;      // consecutive restarts, for the backoff
@@ -54,6 +54,36 @@ static float           *g_ring;
 static size_t           g_cap;          // frames
 static size_t           g_target;       // frames of fill the producer aims for
 static _Atomic size_t   g_w, g_r;
+
+// Multiple producers, MIXED. Steam Link's VR client opens TWO output streams at
+// once (a float one and an int16 one, both AAudio, both 48 kHz stereo after the
+// feeder's conversion) and each has its own feeder thread calling in here. The
+// ring is single-producer by construction, so two of them appending raced the
+// write cursor and interleaved their audio — heard as the wild, unfixable
+// stutter that no buffer touched. So writes now MIX (add) into the ring at a
+// per-source position kept in step with the reader, and the render callback
+// ZEROES each slot as it consumes it so the next pass sums from silence. One
+// source is the old behaviour exactly (add into a zeroed slot == a copy). A
+// small lock serialises the producers (never the reader): they run on feeder
+// threads that can afford to block, the reader cannot.
+#define KL_AU_MAX_SRC 4
+static const void      *g_src_key[KL_AU_MAX_SRC];
+static uint64_t         g_src_pos[KL_AU_MAX_SRC];   // next write frame, per source
+static int              g_src_n;
+static pthread_mutex_t  g_wlock = PTHREAD_MUTEX_INITIALIZER;
+
+// Slot for a producer key (NULL = the single-source/OpenSL path -> slot 0).
+// Caller holds g_wlock. Overflow folds into slot 0 rather than dropping audio.
+static int src_slot(const void *key) {
+    if (!key) return 0;
+    for (int i = 0; i < g_src_n; i++) if (g_src_key[i] == key) return i;
+    if (g_src_n < KL_AU_MAX_SRC) { g_src_key[g_src_n] = key; g_src_pos[g_src_n] = 0; return g_src_n++; }
+    return 0;
+}
+
+// A driver-set floor for the fill target, in ms (0 = none). See kl_audio_open.
+static unsigned         g_latency_override_ms;
+void kl_audio_set_latency_ms(unsigned ms) { g_latency_override_ms = ms; }
 
 // Resampler state, producer-side only.
 static double g_pos;                     // position in the input stream
@@ -171,6 +201,11 @@ static OSStatus render_cb(void *ref, AudioUnitRenderActionFlags *flags,
         if (run > take - done) run = take - done;
         memcpy(dst + done * g_out_ch, g_ring + off * g_out_ch,
                run * g_out_ch * sizeof(float));
+        // Zero what we just took: the ring is a mix accumulator now, and a slot
+        // reused on the next wrap must start from silence so producers can add
+        // into it. Harmless for the single-source case (it re-zeros a slot the
+        // one producer will fully overwrite anyway).
+        memset(g_ring + off * g_out_ch, 0, run * g_out_ch * sizeof(float));
         done += run;
     }
     if (take < want) {
@@ -319,7 +354,14 @@ int kl_audio_open(unsigned rate, unsigned channels, unsigned bits) {
     // wrap it; the *fill target* is what sets latency, and it is much smaller.
     // Keeping those two separate is what lets the target grow to fit an
     // unexpectedly large guest buffer without reallocating anything.
-    unsigned lat_ms = kl_env_int("KL_AUDIO_LATENCY_MS", 80);
+    // 80 ms is fine for a LOCAL mixer (FMOD), which never starves its own feed.
+    // A streamed guest (Steam Link) delivers audio over the network in bursts,
+    // and a stall shorter than the fill target is silently absorbed while a
+    // longer one is a dropout — so a driver that knows its audio arrives over a
+    // jittery link raises this floor (kl_audio_set_latency_ms). KL_AUDIO_LATENCY_MS
+    // still overrides both.
+    unsigned lat_ms = kl_env_int("KL_AUDIO_LATENCY_MS",
+                                 g_latency_override_ms ? g_latency_override_ms : 80);
     if (lat_ms < 10) lat_ms = 10;
     if (lat_ms > 500) lat_ms = 500;
 
@@ -344,7 +386,16 @@ int kl_audio_open(unsigned rate, unsigned channels, unsigned bits) {
     if (!dump_tried++) dump_open();
 
     g_interrupt_ns = now_ns();
-    g_interrupt_max_ms = kl_env_int("KL_AUDIO_INTERRUPT_MAX_MS", 3000);
+    // Shorter than the original 3 s, but NOT so short it fires before the audio
+    // session has finished reactivating. The common interruption here is the
+    // shell window closing as the immersive space takes over, whose ".ended" this
+    // OS routinely drops; the session comes back on its own ~1–1.5 s later. Fire
+    // BEFORE that and the restart lands on a still-dead session, plays silence,
+    // and the heartbeat restarts again — several short jumps instead of one gap
+    // (600 ms did exactly that). 1.5 s lands just past the reactivation, so the
+    // single escape restart takes and the handoff recovers in one step.
+    // KL_AUDIO_INTERRUPT_MAX_MS overrides — lower it if your recovery is faster.
+    g_interrupt_max_ms = kl_env_int("KL_AUDIO_INTERRUPT_MAX_MS", 1500);
     // Start the unit immediately, even with nothing queued. A stopped unit is
     // one the OS is free to tear down harder than a running silent one, and the
     // render callback's timestamp is the watchdog's only heartbeat.
@@ -540,7 +591,18 @@ static void watchdog(void) {
     uint64_t idle = now_ns() - last;
     uint64_t limit = 500ull * 1000000ull;
     if (g_wd_streak > 3) limit = 3000ull * 1000000ull;    // backed off
-    if (g_running && idle <= limit) { g_wd_streak = 0; return; }
+    // The render callback's heartbeat is the ONLY honest signal that the device
+    // is alive. g_running is our own bookkeeping, and on this OS AudioOutputUnitStop
+    // does not reliably stop the callback firing — so a stale g_running=0 while the
+    // callback keeps arriving must NOT tear the unit down. It did: with the callback
+    // healthy (idle ~0.01 s) but g_running read as 0, this rebuilt the unit on every
+    // pass — hundreds a run, ~2 ms apart from the producer's full-ring spin — and
+    // each rebuild is a real gap. THAT was the "stutter", and no buffer could hide
+    // it. So the decision is the heartbeat alone: the callback is alive, leave it be.
+    if (idle <= limit) { g_wd_streak = 0; return; }
+    // The callback has genuinely stopped. Only worth rebuilding if the guest still
+    // wants sound; a stopped guest is just an idle device, not a fault to fight.
+    if (!g_playing)    { g_wd_streak = 0; return; }
     if (g_wd_streak < 4 || (g_wd_streak % 20) == 0)
         fprintf(stderr, "  [au] no render callback for %.2f s — restarting%s\n",
                 (double)idle / 1e9,
@@ -587,6 +649,12 @@ static void *watchdog_thread(void *unused) {
                 g_interrupted = 0;
                 g_interrupt_ns = now_ns();
                 kl_audio_restart();
+                // If this restart lands on a session that is STILL reactivating
+                // it plays silence and the normal watchdog below would rebuild it
+                // again every 500 ms — the jump storm. Pre-load the backoff so the
+                // next attempt is seconds away, not milliseconds: one more try,
+                // spaced, by which point the session is certainly back.
+                g_wd_streak = 4;
             }
             continue;
         }
@@ -631,6 +699,10 @@ void kl_audio_resume(void) {
 }
 
 size_t kl_audio_write(const void *pcm, size_t bytes) {
+    return kl_audio_write_src(NULL, pcm, bytes);
+}
+
+size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes) {
     if (!g_open || !pcm || !bytes) return 0;
     unsigned in_frame = g_in_ch * 2;              // 16-bit, checked at open
     size_t n = bytes / in_frame;
@@ -645,69 +717,84 @@ size_t kl_audio_write(const void *pcm, size_t bytes) {
     if (peak > g_peak) g_peak = peak;
     if (!peak) g_silent_buffers++;
 
+    // The convert()/scratch state and the mix cursors are shared, so the whole
+    // body is serialised: two feeder threads (Steam Link's two output streams)
+    // reach here at once. The reader never takes this lock.
+    pthread_mutex_lock(&g_wlock);
+
     float *conv = NULL;
     size_t frames = convert((const int16_t *)pcm, n, &conv);
-    if (!frames) return 0;
+    if (!frames) { pthread_mutex_unlock(&g_wlock); return 0; }
     g_writes++;
 
     // The target has to be able to hold at least two of these, or the wait
-    // below can never be satisfied and every write times out. FMOD's buffer
-    // size is not knowable until the first one arrives, which is why this is
-    // here and not in kl_audio_open.
+    // below can never be satisfied and every write times out.
     if (g_target < frames * 2) {
         g_target = frames * 2;
         if (g_target > g_cap - 1) g_target = g_cap - 1;
     }
 
-    // Block until the ring has drained enough to keep us at the latency target.
-    // THIS is the clock: the wait lasts about as long as the audio already
-    // queued takes to play, so the guest's buffer-queue callback comes back at
-    // the device's rate rather than at a sleep's.
+    int slot = src_slot(src);
+    uint64_t r0 = atomic_load_explicit(&g_r, memory_order_acquire);
+    uint64_t pos = g_src_pos[slot];
+    // (Re)sync a new or stalled source to the latency target ahead of the reader,
+    // so its samples mix with the others in step — not in the past (already
+    // played as silence) nor so far ahead the ring wraps under it.
+    if (pos < r0 || pos > r0 + g_cap) {
+        uint64_t back = g_target > frames ? g_target - frames : 0;
+        pos = r0 + back;
+    }
+
+    // Block until this source is no more than the latency target ahead of the
+    // reader — THIS is the clock, exactly as the single-source path was, and it
+    // paces both streams to the device rate.
     uint64_t deadline = now_ns() + 2000ull * 1000000ull;
     size_t written = 0;
     while (written < frames) {
-        size_t w = atomic_load_explicit(&g_w, memory_order_relaxed);
-        size_t r = atomic_load_explicit(&g_r, memory_order_acquire);
-        size_t fill = w - r;
-        size_t room = g_target > fill ? g_target - fill : 0;
-        if (room > g_cap - fill) room = g_cap - fill;
+        uint64_t r = atomic_load_explicit(&g_r, memory_order_acquire);
+        uint64_t here = pos + written;
+        if (here < r) here = r;                       // never write in the past
+        uint64_t ahead = here - r;
+        size_t room = ahead < g_target ? (size_t)(g_target - ahead) : 0;
+        if (ahead < g_cap && g_cap - (size_t)ahead < room) room = g_cap - (size_t)ahead;
         size_t take = frames - written;
         if (take > room) take = room;
 
         if (take) {
-            for (size_t done = 0; done < take; ) {
-                size_t off = (w + done) % g_cap;
-                size_t run = g_cap - off;
-                if (run > take - done) run = take - done;
-                memcpy(g_ring + off * g_out_ch,
-                       conv + (written + done) * g_out_ch,
-                       run * g_out_ch * sizeof(float));
-                done += run;
+            for (size_t k = 0; k < take; k++) {
+                size_t off = (size_t)((here + k) % g_cap);
+                const float *sp = conv + (written + k) * g_out_ch;
+                float *dp = g_ring + off * g_out_ch;
+                for (unsigned c = 0; c < g_out_ch; c++) dp[c] += sp[c];   // MIX
             }
-            atomic_store_explicit(&g_w, w + take, memory_order_release);
             written += take;
+            uint64_t nf = pos + written;
+            if (nf < r) nf = r;
+            uint64_t curw = atomic_load_explicit(&g_w, memory_order_relaxed);
+            if (nf > curw) atomic_store_explicit(&g_w, nf, memory_order_release);
             continue;
         }
 
-        // Full. Anything that stops the drain — a stop, an interruption, a
-        // device the OS took away — has to break this loop, or the feeder wedges
-        // holding nothing and the guest's mixer stalls behind it.
+        // Full. A stop / interruption / lost device must break the loop, or the
+        // feeder wedges holding nothing and the guest's mixer stalls behind it.
         if (!g_playing || g_interrupted) break;
         watchdog();
         if (now_ns() > deadline) { g_short_writes++; break; }
         nap_ms(2);
     }
+    g_src_pos[slot] = pos + written < r0 ? r0 : pos + written;
 
     dump_write(conv, written);
 
     if (g_trace && (g_writes % 200) == 1) {
         size_t fill = atomic_load(&g_w) - atomic_load(&g_r);
-        fprintf(stderr, "  [au] write #%lu: %zu in -> %zu out frames, fill %zu/%zu "
-                        "(%.1f ms), underruns %u\n",
-                g_writes, n, frames, fill, g_target,
-                1000.0 * (double)fill / g_out_rate,
+        fprintf(stderr, "  [au] write #%lu src%d: %zu in -> %zu out, fill %zu/%zu "
+                        "(%.1f ms), %d src(s), underruns %u\n",
+                g_writes, slot, n, frames, fill, g_target,
+                1000.0 * (double)fill / g_out_rate, g_src_n,
                 atomic_load(&g_underruns));
     }
+    pthread_mutex_unlock(&g_wlock);
     return written == frames ? bytes : written * in_frame;
 }
 

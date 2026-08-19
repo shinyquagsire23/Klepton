@@ -102,4 +102,22 @@ int kl_openxr_input_selftest(FILE *f);
 // should make the guest render against the last pose, not wedge it.
 void kl_openxr_set_frame_pacer(void (*wait)(void));
 
+// Capture the TOPMOST projection layer instead of the base one (layer 0).
+//
+// The compositor shows exactly one projection layer (kl_glfb draws one quad per
+// eye out of one array texture — see xrEndFrame). For a guest that submits a
+// single projection layer that is layer 0 and there is nothing to choose. Steam
+// Link submits several: layer 0 is the environment/room (measured black in an
+// empty space), and the streamed screen is composited ABOVE it. OpenXR draws
+// projection layers back-to-front in submission order, so the last one is the
+// one on top — the picture — and the base one is the backdrop behind it. This
+// makes the capture follow that rule for a guest that stacks layers, without
+// the runtime having to read every layer back to find the lit one.
+//
+// It is a driver's fact ("this guest stacks projection layers"), not the
+// runtime's, so the driver states it — exactly as the front-door handoff and
+// the frame pacer are installed rather than compiled in. KL_XR_CAPTURE_LAYER,
+// when set, still pins one index and overrides this.
+void kl_openxr_set_capture_topmost_layer(int on);
+
 #endif

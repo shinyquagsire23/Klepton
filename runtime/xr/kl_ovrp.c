@@ -762,7 +762,51 @@ static uint64_t klovrp_GetSystemProductName2(const char **out) {
 // pass is for.
 static float g_display_hz = KL_OVRP_REFRESH;
 
+// KL_DISPLAY_HZ, resolved once: >0 means the rate was FORCED and must outrank
+// the compositor's live measurement. It used not to: the getter set g_display_hz
+// from the env, and then the compositor's priming pass called the setter with
+// the number it measured over its first frames, silently overwriting it. That
+// is fine for a rate the guest tolerates, and it is a crash for Steam Link's VR
+// client — libvrlink_scene's QSVLClient::UpdateFrameVariables (+0xf14e0) takes
+// an empty-container branch for the display-rate/frametime submission and then
+// dereferences its null data pointer regardless (VTE_AVAILABLE_FRAMETIMES_US).
+// So a run has to be able to PIN the rate the guest is told, which is what the
+// forced flag protects — the measurement can no longer clobber the override.
+// A driver may PIN the rate for a guest that is known to mishandle a measured
+// one — Steam Link's VR client crashes on anything but a value it was told up
+// front — without the run having to pass KL_DISPLAY_HZ. The env still wins.
+static float g_forced_hz_hint;
+void kl_ovrp_set_forced_hz_hint(float hz) { g_forced_hz_hint = hz; }
+
+static float klovrp_forced_hz(void) {
+    static int   checked;
+    static float forced;   // 0 = not forced
+    if (!checked) {
+        checked = 1;
+        const char *e = getenv("KL_DISPLAY_HZ");
+        if (e && *e) {
+            float hz = strtof(e, NULL);
+            if (hz >= 30.0f && hz <= 240.0f) {
+                fprintf(stderr, "  [ovrp] display frequency forced to %.1f Hz "
+                                "by KL_DISPLAY_HZ (measurement will not override)\n",
+                        (double)hz);
+                forced = hz;
+            }
+        } else if (g_forced_hz_hint >= 30.0f && g_forced_hz_hint <= 240.0f) {
+            fprintf(stderr, "  [ovrp] display frequency pinned to %.1f Hz for this "
+                            "target (measurement will not override; KL_DISPLAY_HZ "
+                            "overrides)\n", (double)g_forced_hz_hint);
+            forced = g_forced_hz_hint;
+        }
+    }
+    return forced;
+}
+
 void kl_ovrp_set_display_frequency(float hz) {
+    // An explicit override wins over a measurement — the whole point of forcing
+    // a rate is a guest that mishandles the real one, so letting the compositor's
+    // measured value overwrite it here would undo exactly the fix it is for.
+    if (klovrp_forced_hz() > 0.0f) return;
     // A display frequency is a divisor in Unity's pacing math and a period
     // everywhere else. Anything outside the range a headset can actually run at
     // is a measurement that went wrong, and passing it on turns one bad number
@@ -774,22 +818,11 @@ void kl_ovrp_set_display_frequency(float hz) {
 // KL_DISPLAY_HZ=<hz> forces it. On the host there is no headset to measure, so
 // the 72 above is the Quest-2 fiction the rest of the device description keeps
 // up; this is how a host run says "pretend the panel runs at what the thing on
-// the other end of the wire is asking for". Read once, and through the same
-// 30..240 sanity check as the setter, so a typo cannot poison pacing math.
+// the other end of the wire is asking for". On device it is the override that
+// outranks the compositor's live measurement — see klovrp_forced_hz.
 float kl_ovrp_display_frequency(void) {
-    static int checked;
-    if (!checked) {
-        checked = 1;
-        const char *e = getenv("KL_DISPLAY_HZ");
-        if (e && *e) {
-            float hz = strtof(e, NULL);
-            if (hz >= 30.0f && hz <= 240.0f) {
-                fprintf(stderr, "  [ovrp] display frequency forced to %.1f Hz "
-                                "by KL_DISPLAY_HZ\n", (double)hz);
-                g_display_hz = hz;
-            }
-        }
-    }
+    float forced = klovrp_forced_hz();
+    if (forced > 0.0f) g_display_hz = forced;
     return g_display_hz;
 }
 

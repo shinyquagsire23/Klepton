@@ -15,6 +15,7 @@
 #include "kl_fault.h"
 #include "kl_egl.h"
 #include "kl_driver.h"    // the guest's own sequences, shared with build/m_boot
+#include "kl_audio.h"     // kl_audio_set_latency_ms — streamed audio needs a deeper buffer
 #include "kl_ovrp.h"      // kl_ovrp_set_frame_pacer — the OVRPlugin frame clock
 #include "kl_openxr.h"    // kl_openxr_set_frame_pacer — the OpenXR one
 #include "kl_slink.h"
@@ -482,6 +483,45 @@ static int steamlink_load_vr(void) {
     return 0;
 }
 
+// What this target needs decided before its chain runs, in one place because
+// both front doors reach it and neither can be told apart afterwards. Policy
+// lives here rather than in kl_driver: the driver describes the guest, the
+// frontend chooses how this platform runs it.
+static void steamlink_policy(void) {
+    // Steam Link's VR door composites several OpenXR projection layers: layer 0
+    // is the environment/room (black in an empty space) and the streamed screen
+    // is stacked ON TOP. The compositor shows one projection layer, so tell it
+    // to take the topmost — the picture — rather than the base layer, which is
+    // why the stream came up as a black void before. Harmless for the 2D shell
+    // (it submits no projection layers); KL_XR_CAPTURE_LAYER still overrides.
+    kl_openxr_set_capture_topmost_layer(1);
+    // Steam Link streams FOVEATED: the wide base eye is low resolution and a
+    // separate narrow inset carries the sharp centre (kl_openxr lays it over the
+    // base). For that inset to keep its detail the compositor's eye texture must
+    // be bigger than the base, so the inset is not scaled down to fit — allocate
+    // it larger, but cap the larger side near the display's own per-eye
+    // resolution so an already-large menu layer is not doubled and the allocator
+    // does not churn. KL_XR_EYE_SCALE / KL_XR_EYE_MAX tune it.
+    {
+        int es = kl_env_int("KL_XR_EYE_SCALE", 2);
+        if (es < 1) es = 1;
+        if (es > 4) es = 4;
+        kl_glfb_set_eye_mirror_scale(es, 1);
+        kl_glfb_set_eye_mirror_cap(kl_env_int("KL_XR_EYE_MAX", 3456));
+    }
+    // Two things this target has always needed passed on the command line, made
+    // defaults so a bare launch just works — the env still overrides either:
+    //   - the 90 Hz pin (KL_DISPLAY_HZ): Steam Link's VR client dereferences a
+    //     null frametime container on any rate the compositor MEASURES, so the
+    //     rate it is told has to be fixed up front.
+    //   - a deeper audio buffer (KL_AUDIO_LATENCY_MS): the audio is a network
+    //     stream, and the 80 ms local-mixer default underruns on jitter — heard
+    //     as the micro-stutters. 180 ms buffers the jitter at a latency a
+    //     streamed title tolerates.
+    kl_ovrp_set_forced_hz_hint((float)kl_env_int("KL_DISPLAY_HZ_DEFAULT", 90));
+    kl_audio_set_latency_ms((unsigned)kl_env_int("KL_AUDIO_LATENCY_DEFAULT_MS", 240));
+}
+
 // The 2D -> VR handoff — and the one thing about it that is
 // this driver's rather than the host driver's is that **there is no re-exec**.
 //
@@ -527,6 +567,11 @@ static void app_vrlink_handoff(const char *sargs) {
     fflush(NULL);
 
     kl_glfb_release_current();
+    // From here on the answer to SteamLink.isVRLinkRunning() is yes — the
+    // session is recorded and the ImmersiveSpace is about to open the VR door.
+    // Set before the park, because the asker is the SHELL's own background
+    // threads, which outlive this thread and poll exactly that question.
+    kl_jni_set_vrlink_running(1);
     // The shell's pump has nothing left to drain — its main thread is about to
     // stop existing for all practical purposes — so let whoever is pumping it
     // finish and write its report.
@@ -556,6 +601,10 @@ static int steamlink_vr_begin(void) {
     // handoff because the handoff's own meaning is "stop pumping the shell" and
     // clearing it there would be a race with the loop it is trying to stop.
     g_guest_quit = 0;
+    // Here as well as at the handoff, because this door is also reached
+    // DIRECTLY — a launch handed KL_SLINK_SARGS never runs the shell, and
+    // isVRLinkRunning() must still answer for the door that is opening.
+    kl_jni_set_vrlink_running(1);
     if (steamlink_load_vr()) return 1;
     if (kl_driver_lifecycle_begin(stdout) != 0) return fail(kl_driver_error());
     return 0;
@@ -623,6 +672,10 @@ int kl_app_boot(void) {
     printf("  apk       : %s\n", g_apk);
     printf("  files     : %s\n\n", g_files);
     fflush(NULL);
+
+    // Before the chain runs, so nothing it starts reads a default we meant to
+    // replace.
+    if (kl_app_target_is_steamlink()) steamlink_policy();
 
     // The door's own sequence, in kl_driver: the chain and its entry point for
     // Steam Link, Unreal and OpenJK; libmain -> NativeLoader.load -> initJni for

@@ -282,6 +282,34 @@ void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
 int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer,
                              int w, int h, uint32_t internal_fmt);
 
+// Diagnostic-only: read `tex` back and log its lit-pixel count under `tag`,
+// gated on KL_GLFB_PROBE_VIDEO. Lets a caller outside kl_glfb (the OpenXR
+// layer loop) ask "is THIS projection layer's image lit?" for every layer,
+// not just the one the compositor happens to mirror.
+void kl_glfb_probe_tex(const char *tag, uint32_t tex, int layer,
+                       int hint_w, int hint_h);
+
+// Allocate the compositor's eye-mirror textures LARGER than the guest's eye by
+// num/den, upscaling the base into them. For a foveated guest this is what gives
+// the high-resolution centre inset (kl_glfb_overlay_eye_inset) room to land at
+// full detail instead of being shrunk into the base's own resolution. 1/1 (the
+// default) is unchanged behaviour. Set once, before the eyes are first mirrored.
+void kl_glfb_set_eye_mirror_scale(int num, int den);
+
+// Cap the eye-mirror texture's larger side (pixels). Keeps the scale above from
+// ballooning a base that is already near the display resolution. Default 3456.
+void kl_glfb_set_eye_mirror_cap(int px);
+
+// Composite a foveal inset over the base eye already mirrored into (eye, stage).
+// `tex`/`layer` are the inset swapchain image (iw×ih); nx0..ny1 are where the
+// inset's frustum falls inside the base eye, as fractions in [0,1]. For a guest
+// that streams foveated (a wide low-detail base plus a narrow high-detail
+// centre — Steam Link), this is what puts the sharp centre back on screen. Must
+// be called AFTER kl_glfb_mirror_eye_layer for the same (eye, stage).
+void kl_glfb_overlay_eye_inset(int eye, int stage, uint32_t tex, int layer,
+                               int iw, int ih,
+                               float nx0, float ny0, float nx1, float ny1);
+
 // Which way up is the picture in (eye, stage)? 1 = row 0 is the TOP of the
 // image, 0 = row 0 is the bottom.
 //
