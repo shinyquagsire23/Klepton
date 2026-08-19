@@ -64,6 +64,15 @@ int getentropy(void *buffer, size_t size);
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <ifaddrs.h>
+#include <sys/sysctl.h>
+// The kernel's UDP counters are the only place a datagram the kernel threw away
+// is written down; nothing at the socket API says a receive buffer overflowed.
+// <netinet/udp_var.h> is a macOS-only SDK header, so the counter is a host-side
+// answer and the meter says so rather than printing a zero on the headset.
+#if __has_include(<netinet/udp_var.h>)
+#include <netinet/udp_var.h>
+#define KL_HAVE_UDPSTAT 1
+#endif
 #include "klepton.h"
 #include "kl_env.h"
 #include "kl_va.h"
@@ -342,6 +351,43 @@ static int kl_sock_level_opt(int *level, int opt) {
     if (*level == IPPROTO_IPV6) return kl_ipv6_optname(opt);
     return opt;                             // IPPROTO_TCP: NODELAY agrees at 1
 }
+// ---------- a socket buffer request is a ceiling on both kernels, and the two
+// ---------- disagree about what happens when you exceed it ----------
+// Linux clamps SO_RCVBUF/SO_SNDBUF to net.core.{r,w}mem_max and returns
+// success; Darwin refuses outright once the request passes kern.ipc.maxsockbuf
+// (8 MiB by default on macOS), leaving the socket on the default receive space.
+// A guest sizing a buffer for a video stream asks for far more than that and
+// takes success for granted: Steam Link's UDP data link asks for 24 MiB on both
+// its send and receive sides and only logs "warning: could not set socket
+// buffer size". So the halving retry makes the clamp happen, which is the
+// answer Linux would have given, and the effective size is printed whenever it
+// differs from the request — a receive buffer smaller than a frame is packet
+// loss the guest reports to its host, and it appears nowhere else.
+static void kl_sock_buf_clamp(int fd, int ropt, int asked, int failed) {
+    if (failed) {
+        for (int sz = asked / 2; sz >= 64 * 1024; sz /= 2)
+            if (setsockopt(fd, SOL_SOCKET, ropt, &sz, sizeof sz) == 0) break;
+    }
+    int got = 0; socklen_t gl = sizeof got;
+    if (getsockopt(fd, SOL_SOCKET, ropt, &got, &gl) != 0 || got == asked) return;
+    // One line per (fd, option): the guest re-asks on every reconnect.
+    static struct { int fd, opt; } said[16];
+    static unsigned n;
+    for (unsigned i = 0; i < n && i < 16; i++)
+        if (said[i].fd == fd && said[i].opt == ropt) return;
+    if (n < 16) { said[n].fd = fd; said[n].opt = ropt; n++; }
+    // kern.ipc.maxsockbuf is the ceiling doing the clamping, and it is the one
+    // number that says whether the gap is fixable on this machine.
+    uint64_t sbmax = 0; size_t sl = sizeof sbmax;
+    char lim[64] = "";
+    if (sysctlbyname("kern.ipc.maxsockbuf", &sbmax, &sl, NULL, 0) == 0)
+        snprintf(lim, sizeof lim, ", kern.ipc.maxsockbuf %llu",
+                 (unsigned long long)sbmax);
+    fprintf(stderr, "  [sock] fd %d %s: guest asked %d B, kernel gave %d B%s%s\n",
+            fd, ropt == SO_RCVBUF ? "SO_RCVBUF" : "SO_SNDBUF", asked, got,
+            got < asked ? " (clamped)" : "", lim);
+}
+
 static int kl_setsockopt(int fd, int level, int opt, const void *val, socklen_t len) {
     int glevel = level;
     int ropt = kl_sock_level_opt(&level, opt);
@@ -360,6 +406,12 @@ static int kl_setsockopt(int fd, int level, int opt, const void *val, socklen_t 
     int r = setsockopt(fd, level, ropt, val, len);
     if (r) fprintf(stderr, "  [sock] setsockopt(fd=%d level=%d opt=%d->%d) FAILED: %s\n",
                    fd, level, opt, ropt, strerror(errno));
+    if (level == SOL_SOCKET && (ropt == SO_RCVBUF || ropt == SO_SNDBUF) &&
+        val && len == sizeof(int)) {
+        int asked; memcpy(&asked, val, sizeof asked);
+        kl_sock_buf_clamp(fd, ropt, asked, r != 0);
+        r = 0;                          // Linux would have clamped and succeeded
+    }
     // SO_BROADCAST is the guest DECLARING that it is about to broadcast, and it
     // is the only signal that survives whichever send call it then uses. Said
     // out loud because "no fan-out line in the log" has two completely
@@ -1063,9 +1115,72 @@ static ssize_t kl_send(int fd, const void *buf, size_t n, int flags) {
     kl_hexdump("->", buf, r);
     return r;
 }
+// ---------- KL_NET_RATE=<seconds>: what is actually arriving ----------
+// A streaming client cannot tell you from inside itself whether the picture is
+// thin because the host is sending little or because the link is losing what it
+// sends, and the two want opposite work. This meter separates them: per
+// receiving socket, per interval, the datagram count, the byte count, the rate
+// those imply, the datagram size range, and the socket's effective receive
+// buffer. A rate that starts high and collapses is a host rate-controller
+// reacting to loss the client reported; a rate flat from the first interval was
+// decided before any packet moved. The kernel's own overflow counter is
+// system-wide and host-only, and is printed as a delta so a buffer too small to
+// hold a burst is visible as the thing it is rather than as missing frames.
+//
+// One writer per fd — a datagram socket is drained by the thread that owns it —
+// so the counters need no atomics; a second reader would only smear one line.
+static int kl_net_rate_secs(void) {
+    static int s = -1;
+    if (s < 0) s = kl_env_int("KL_NET_RATE", 0);
+    return s;
+}
+static uint64_t kl_udp_overflows(void) {
+#ifdef KL_HAVE_UDPSTAT
+    struct udpstat u; size_t sz = sizeof u;
+    if (sysctlbyname("net.inet.udp.stats", &u, &sz, NULL, 0) == 0)
+        return (uint64_t)u.udps_fullsock;
+#endif
+    return UINT64_MAX;                  // not askable here; the line says so
+}
+static void kl_net_rate_note(int fd, ssize_t r) {
+    int secs = kl_net_rate_secs();
+    if (secs <= 0 || r <= 0) return;
+    static struct { int fd; unsigned pkts; uint64_t bytes; size_t lo, hi;
+                    double t0; uint64_t drops0; } s[16];
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+    unsigned i = 0;
+    while (i < 16 && s[i].fd && s[i].fd != fd) i++;
+    if (i == 16) return;                // more sockets than slots: name nothing
+    if (!s[i].fd) { s[i].fd = fd; s[i].t0 = now; s[i].lo = (size_t)-1;
+                    s[i].drops0 = kl_udp_overflows(); }
+    s[i].pkts++;
+    s[i].bytes += (uint64_t)r;
+    if ((size_t)r < s[i].lo) s[i].lo = (size_t)r;
+    if ((size_t)r > s[i].hi) s[i].hi = (size_t)r;
+    double dt = now - s[i].t0;
+    if (dt < secs) return;
+    int rcvbuf = 0; socklen_t bl = sizeof rcvbuf;
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &bl) != 0) rcvbuf = -1;
+    uint64_t drops = kl_udp_overflows();
+    char dropped[80] = ", kernel overflow count not askable here";
+    if (drops != UINT64_MAX && s[i].drops0 != UINT64_MAX) {
+        // System-wide, not per-socket: the kernel keeps no per-socket total.
+        snprintf(dropped, sizeof dropped, ", %llu UDP buffer overflow(s) system-wide",
+                 (unsigned long long)(drops - s[i].drops0));
+        s[i].drops0 = drops;
+    }
+    fprintf(stderr, "  [net] fd %d rx %.1f Mbit/s (%u datagrams, %llu B in %.2f s, "
+                    "%zu..%zu B, SO_RCVBUF %d)%s\n",
+            fd, s[i].bytes * 8.0 / dt / 1e6, s[i].pkts,
+            (unsigned long long)s[i].bytes, dt, s[i].lo, s[i].hi, rcvbuf, dropped);
+    s[i].pkts = 0; s[i].bytes = 0; s[i].lo = (size_t)-1; s[i].hi = 0; s[i].t0 = now;
+}
+
 static ssize_t kl_recv(int fd, void *buf, size_t n, int flags) {
     int dflags = kl_msg_flags(flags, NULL);
     ssize_t r = recv(fd, buf, n, dflags);
+    kl_net_rate_note(fd, r);
     if (kl_net_trace())
         fprintf(stderr, "  [net] recv(fd=%d, %zu B, flags=0x%x->0x%x) -> %zd%s\n",
                 fd, n, flags, dflags, r, r < 0 ? strerror(errno) : "");
@@ -1081,6 +1196,7 @@ static ssize_t kl_recvfrom(int fd, void *buf, size_t n, int flags,
                            struct sockaddr *sa, socklen_t *len) {
     int dflags = kl_msg_flags(flags, NULL);
     ssize_t r = recvfrom(fd, buf, n, dflags, sa, len);
+    kl_net_rate_note(fd, r);
     char host[80] = "-";
     if (r >= 0 && sa && len) {
         kl_sa_fmt(host, sizeof host, sa);
@@ -1246,6 +1362,7 @@ static ssize_t kl_recvmsg(int fd, void *gmsg, int flags) {
                                        ? g->msg_controllen : sizeof cbuf);
     }
     ssize_t r = recvmsg(fd, &h, kl_msg_flags(flags, NULL));
+    kl_net_rate_note(fd, r);
     char host[80] = "-";
     if (r >= 0) {
         if (h.msg_name && h.msg_namelen) {

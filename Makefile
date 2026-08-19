@@ -17,7 +17,7 @@ CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(R
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
 # RUNTIME_SHIP — everything that links the runtime needs them.
 LDLIBS  := -lz -framework AudioToolbox \
-           -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+           -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
            -framework CoreFoundation -framework AVFoundation -framework Foundation
 # The host/ship split is a source-list boundary, not a runtime getenv.
 #
@@ -54,9 +54,9 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/xr/kl_ovrplat.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
            runtime/gfx/kl_vulkan.c \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c \
-           runtime/guest/kl_jkxr.c \
+           runtime/guest/kl_jkxr.c runtime/guest/kl_driver.c \
            runtime/media/kl_aaudio.c \
-           runtime/gfx/kl_glfb.c runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
+           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
            runtime/guest/kl_mono.c \
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S
@@ -197,34 +197,22 @@ guestlibs:
 guestlibs-list:
 	@echo $(GUEST_LIBS)
 
-# The second target's boot harness. Links the same
-# runtime as m_boot, minus the host-only diagnostics: this target has no
-# managed side to probe and no viewer yet.
+# ---- Steam Link ----
 #
-# It links the SDL viewer for the same reason m_boot does: Steam Link is a FLAT
-# app, so the viewer is not a debugging aid here — it is the app's actual
-# output device. kl_view_mtl.m and tests/t_mtl_provider.m come with it because
-# kl_view.c references both; the mono path uses neither (no eye textures to
-# provide, and the readback sink needs no Metal interop), but the symbols must
-# resolve.
-build/m_slink: mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
-               runtime/gfx/kl_view_mtl.m $(RUNTIME_HDRS)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
-	  mains/m_slink.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
-	  runtime/gfx/kl_view_mtl.m \
-	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation \
-	  $(shell pkg-config --libs sdl3)
-
-slink: build/m_slink
-	./build/m_slink
-
-# The VR build of the same app (steamlink-vr.apk). Same seven
-# libraries for the 2D half, so `slink` is the same gate; libvrlink_scene is the
-# OpenXR NativeActivity and is NOT loaded by this target yet.
+# One target row like any other (`./build/m_boot steamlink-vr`), and one binary:
+# the front door is a KNOB, not a build. All three doors are the same guest, the
+# same profile and the same APK — steamlink-vr.apk, which carries libmain and the
+# SDL3 chain as well as libvrlink_scene, so the streaming client is reachable on
+# it too. steamlink-android/ is the older Qt5 build and is kept only for the ELF
+# scans below.
 SLVRLIBS := steamlink-vr/lib/arm64-v8a
-slink-vr: build/m_slink
-	./build/m_slink $(SLVRLIBS)
+SLINK := steamlink-vr
+
+# SL-1: the CLIENT chain binds and libSDL3's JNI_OnLoad runs. The VR door's
+# equivalent is `slink-vr-scene` — with no KL_SLINK_MAIN it stops at onCreate,
+# which is that door's chain gate.
+slink: build/m_boot
+	./build/m_boot $(SLINK)
 
 # onCreate's whole sequence, through nativeRunMain into SDL_main, with the
 # app reaching its own renderer. Needs ANGLE (KL_GLFB=1) — the null GL driver
@@ -235,8 +223,8 @@ slink-vr: build/m_slink
 # last line is SUCCESS, not failure: it is the app having got all the way to
 # looking for a Steam machine to stream from. A picture needs a host (and then
 # AMediaCodec); everything before that point is what this gate covers.
-slink-main: build/m_slink
-	KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
+slink-main: build/m_boot
+	KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 ./build/m_boot $(SLINK)
 
 # The OTHER front door: the 2D configuration frontend — libshell + Qt6,
 # which is what SteamLink.getMainSharedObject() actually names — instead of the
@@ -251,15 +239,16 @@ slink-main: build/m_slink
 # across runs, so a machine that has paired once can reach startVRLink without
 # anyone clicking anything, and the default handoff would re-exec this recipe
 # into the VR front door — which is a different measurement wearing this one's
-# name. `./build_run_slink.sh --shell --view` is where the handoff belongs.
-slink-shell: build/m_slink
+# name. `./build_run_host.sh steamlink-vr --shell --view` is where the handoff
+# belongs.
+slink-shell: build/m_boot
 	KL_SLINK_SHELL=1 KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 KL_SLINK_HANDOFF=0 \
-	  ./build/m_slink $(SLVRLIBS)
+	  ./build/m_boot $(SLINK)
 
 # ...and the work list for it, which is the number that matters first: map and
 # relocate all fourteen, print what is still unresolved, stop before init.
-slink-shell-gap: build/m_slink
-	KL_SLINK_SHELL=1 KL_GAP_ONLY=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
+slink-shell-gap: build/m_boot
+	KL_SLINK_SHELL=1 KL_GAP_ONLY=1 KL_NOFORK=1 ./build/m_boot $(SLINK)
 
 # The THIRD front door: libvrlink_scene.so, the OpenXR NativeActivity.
 # Not SDL3 at all, and the chain is ONE guest library: its DT_NEEDED is entirely
@@ -268,13 +257,13 @@ slink-shell-gap: build/m_slink
 #
 # The gap first, because that is the number that matters: 127 unresolved names,
 # and they are the work list for the whole VR arc.
-slink-vr-gap: build/m_slink
-	KL_SLINK_VR=1 KL_GAP_ONLY=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
+slink-vr-gap: build/m_boot
+	KL_SLINK_VR=1 KL_GAP_ONLY=1 KL_NOFORK=1 ./build/m_boot $(SLINK)
 
 # ...and the run: init arrays, then ANativeActivity_onCreate. Stops by name
 # wherever the shim ends, which is the whole point.
-slink-vr-scene: build/m_slink
-	KL_SLINK_VR=1 KL_NOFORK=1 ./build/m_slink $(SLVRLIBS)
+slink-vr-scene: build/m_boot
+	KL_SLINK_VR=1 KL_NOFORK=1 ./build/m_boot $(SLINK)
 
 # ...and the whole thing running: the OpenXR boot sequence, the session
 # state machine, and the frame loop, on ANGLE.
@@ -311,9 +300,9 @@ slink-vr-scene: build/m_slink
 #
 # Read the last "fault:"/"fatal:" line, not make's exit code.
 KL_SLINK_SARGS ?= 192.168.1.50~10400~10400~0,0,1~~~~dGVzdA==
-slink-vr-run: build/m_slink
+slink-vr-run: build/m_boot
 	KL_SLINK_VR=1 KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1 KL_SLINK_WAIT=25 \
-	  KL_SLINK_SARGS='$(KL_SLINK_SARGS)' ./build/m_slink $(SLVRLIBS)
+	  KL_SLINK_SARGS='$(KL_SLINK_SARGS)' ./build/m_boot $(SLINK)
 
 # The video decode gate. kl_vtdec is the only piece of the video path
 # that can be checked with no guest and no Steam host — an elementary stream in,
@@ -325,6 +314,21 @@ build/t_hevc: tests/t_hevc.c $(RUNTIME) $(RUNTIME_HDRS)
 
 hevc: build/t_hevc
 	./build/t_hevc
+
+# The video TEXTURE gate: a natively-decoded biplanar frame through
+# CVMetalTextureCache + EGL_METAL_TEXTURE_ANGLE to sampled pixels, compared
+# against the same picture through the BGRA path. This is what proves the
+# vendored ANGLE still knows the private YCbCr formats — run it after any
+# ANGLE re-pull or format-table change. Needs the PATCHED ANGLE
+# (`make angle-debug`); NOT in `make check`, which must pass on a bare
+# checkout with no vendor/.
+build/t_vidtex: tests/t_vidtex.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_vidtex.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: vidtex
+vidtex: build/t_vidtex
+	./build/t_vidtex
 
 # The OpenXR reference-space gate. The pose a runtime answers with is not
 # visible from anywhere else — every call succeeds and the picture is correct
@@ -794,14 +798,14 @@ build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
 build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
 	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
-	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
 	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
 	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
 	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
-	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
 	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
 	   -install_name @rpath/libklepton.dylib
 

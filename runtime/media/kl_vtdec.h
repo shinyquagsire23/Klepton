@@ -15,28 +15,22 @@
 //     — measured). VideoToolbox takes neither: it wants a
 //     CMVideoFormatDescription built from the parameter sets up front and
 //     length-prefixed NALs after. Both conversions live in here.
-//   - Output is BGRA, not NV12, and that is a decision rather than a default.
-//     The guest samples the frame through a `samplerExternalOES`, whose whole
-//     promise on Android is that the YUV->RGB conversion has already happened
-//     by the time the shader sees it. Asking VideoToolbox for BGRA keeps that
-//     promise on the host side, where a hardware converter does it for free,
-//     and leaves us with a single-plane texture that the MTLTexture->EGLImage
-//     path in kl_glfb.c already knows how to hand to ANGLE. The alternative —
-//     two planes and a conversion in the shader — would mean rewriting the
-//     guest's shader rather than merely retargeting its sampler. See kl_egl.c.
-//
-//     ...and there is a third option that is better than both, to take on
-//     device. Apple has private MTLPixelFormats that sample as RGB — the
-//     conversion happens in the sampler hardware — which keeps the
-//     samplerExternalOES promise EXACTLY, with no shader rewrite and no
-//     conversion pass. WebKit uses them for this. Two costs are avoided at
-//     once, because asking for a pixel format AT ALL is itself what makes
-//     VideoToolbox copy on visionOS 2 (measured by the VisionOSALVRClient
-//     author, ~2 ms a frame at high resolution; ours is 1536x6144). What
-//     stands in the way is ANGLE, whose IOSurface path knows only nine public
-//     formats. The format table and the route through
-//     EGL_METAL_TEXTURE_ANGLE is a device-time optimisation, not a
-//     correction.
+//   - Output is the decoder's NATIVE biplanar 4:2:0, and no pixel format is
+//     requested at session creation — deliberately, twice over. Requesting one
+//     costs the conversion (BGRA is 2.67x the bytes of NV12 at Steam Link's
+//     1536x6144: 2.72 GB/s against 1.02 at 72 fps) and, on visionOS 2, a copy
+//     VideoToolbox performs merely because a format was named (~2 ms/frame at
+//     high resolution, measured by the VisionOSALVRClient author). The guest
+//     samples the frame through a `samplerExternalOES`, whose whole promise on
+//     Android is that the YUV->RGB conversion has already happened by the time
+//     the shader sees it; the native frame keeps that promise in the SAMPLER —
+//     kl_glfb.c wraps it in one of Apple's private single-plane YCbCr
+//     MTLPixelFormats (WebKit's numbers; the patched ANGLE knows them) and
+//     hands it to ANGLE via EGL_METAL_TEXTURE_ANGLE, one texture, no shader
+//     rewrite, no conversion pass anywhere. KL_VTDEC_BGRA=1 restores the BGRA
+//     request and the IOSurface-pbuffer path behind it (the A/B, and the
+//     escape hatch for a native format kl_glfb cannot wrap); the Simulator
+//     always takes it, because the private formats do not exist there.
 #ifndef KL_VTDEC_H
 #define KL_VTDEC_H
 

@@ -6,7 +6,7 @@ the guest images are mmap'd by us and dyld has never heard of them. That turns
 the one diagnostic that keeps paying off into a
 wall of hex the moment the target has fourteen libraries.
 
-The load addresses are already printed by m_slink/t_boot's phase 1 as
+The load addresses are already printed as each door maps its chain,
 `  <soname>  @0x...`, so this joins the two: read the bases out of the run's
 log, look each unknown address up in the owning library's .dynsym, and print
 `<lib>`<nearest symbol>+0xoff`.

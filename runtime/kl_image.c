@@ -341,10 +341,26 @@ static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,
 }
 
 // ---------- symbol lookup ----------
+// Registered interposers, consulted for defined and undefined symbols alike.
+// Small and fixed: this is an instrument, and a table that has to grow is a sign
+// the question being asked wants a different tool.
+static struct { const char *name; void *fn; } g_interpose[8];
+static unsigned g_interpose_n;
+
+void kl_interpose(const char *name, void *fn) {
+    if (!name || !fn || g_interpose_n >= 8) return;
+    g_interpose[g_interpose_n].name = name;
+    g_interpose[g_interpose_n].fn = fn;
+    g_interpose_n++;
+}
+
 static uint64_t sym_value(kl_image *img, uint32_t idx, const char **name_out) {
     const Elf64_Sym *s = &img->symtab[idx];
     const char *nm = img->strtab + s->st_name;
     if (name_out) *name_out = nm;
+    for (unsigned i = 0; i < g_interpose_n; i++)
+        if (!strcmp(nm, g_interpose[i].name))
+            return (uint64_t)(uintptr_t)g_interpose[i].fn;
     if (s->st_shndx != 0) return (uint64_t)(uintptr_t)(img->base + s->st_value);
     void *ext = kl_shim_lookup(nm);
     // Not a shim: try other already-loaded guest images. Android's linker binds

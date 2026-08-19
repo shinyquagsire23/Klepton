@@ -47,6 +47,13 @@ static int                        g_started;
 static unsigned                   g_frames;
 static uint64_t                   g_last_value;      // fence value last composited
 static unsigned long             g_lit;   // atomics below: written on a Metal completion queue
+// The FLAT guest's picture: kl_glfb's IOSurface-backed root surface, wrapped
+// once. When set, the composite is klvm_present_flat — one blit, no pose, no
+// overlays — and nothing anywhere reads pixels back. sRGB view over the BGRA
+// bytes so sampling decodes and the sRGB drawable re-encodes: net identity,
+// the same bytes the readback path showed.
+static id<MTLTexture>             g_flat_tex;
+static int                        g_flat_w, g_flat_h;
 
 // Build one pipeline from one of kl_reproject.c's two shaders. Both are shared
 // with the visionOS compositor; the only thing this file decides is which one
@@ -470,7 +477,12 @@ int kl_viewmtl_start(void *metal_layer) {
     // a picture arriving intact the whole time.
     void *eyep = kl_glfb_eye_mtl_texture(0, 0, NULL);
     if (!eyep) eyep = klvm_first_layer_texture();
-    if (!eyep) return 0;
+    // ...or a FLAT guest, whose whole picture is kl_glfb's IOSurface-backed
+    // root surface — no eye, no layers, ever. Available from init, so this
+    // starter succeeds on the first retry rather than seconds in.
+    int flat_w = 0, flat_h = 0;
+    void *flatp = eyep ? NULL : kl_glfb_flat_surface(&flat_w, &flat_h);
+    if (!eyep && !flatp) return 0;
 
     // **The device is the EYE TEXTURE's, not MTLCreateSystemDefaultDevice() and
     // no longer ANGLE's either.** A drawable from a different device cannot be
@@ -480,9 +492,33 @@ int kl_viewmtl_start(void *metal_layer) {
     // On GL that is ANGLE's device by construction (the extension requires the
     // eye texture to belong to the display's device); on the
     // Vulkan path it is MoltenVK's, and `kl_glfb_mtl_device()` answers NULL
-    // there because ANGLE was never brought up at all.
-    g_dev = ((__bridge id<MTLTexture>)eyep).device;
+    // there because ANGLE was never brought up at all. The flat surface is an
+    // IOSurface, which belongs to no device until wrapped — ANGLE's is the one
+    // rendering into it, so ANGLE's is the one that can sample it coherently.
+    g_dev = eyep ? ((__bridge id<MTLTexture>)eyep).device
+                 : (__bridge id<MTLDevice>)kl_glfb_mtl_device();
     if (!g_dev) return 0;
+    if (flatp) {
+        MTLTextureDescriptor *fd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
+                                         width:(NSUInteger)flat_w
+                                        height:(NSUInteger)flat_h
+                                     mipmapped:NO];
+        fd.usage = MTLTextureUsageShaderRead;
+        g_flat_tex = [g_dev newTextureWithDescriptor:fd
+                                           iosurface:(IOSurfaceRef)flatp
+                                               plane:0];
+        if (!g_flat_tex) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [vmtl] could not wrap the flat IOSurface in an "
+                                "MTLTexture — the window stays black\n");
+            g_dev = nil;
+            return 0;
+        }
+        g_flat_w = flat_w;
+        g_flat_h = flat_h;
+    }
     g_queue = [g_dev newCommandQueue];
     g_event = [g_dev newSharedEvent];
     if (!g_queue || !g_event) {
@@ -607,8 +643,83 @@ static void klvm_note_delta(int stage) {
     }
 }
 
+// The flat guest's composite: the IOSurface the guest renders into, blitted to
+// the drawable, letterboxed to the panel's aspect. Single-buffered storage, so
+// the shared-event wait orders this pass after the last COMPLETED guest frame
+// but cannot fence the next one out — for the 2D pairing shell that can show a
+// partial repaint, which is the trade against the full-frame readback and
+// pipeline stall every swap that this pass replaces.
+static int klvm_present_flat(int win_w, int win_h) {
+    int fenced = 0;
+    uint64_t v = klvm_frame_value(&fenced);
+    if (!v || v == g_last_value) return 0;   // no new guest frame
+    if (win_w <= 0 || win_h <= 0) return 0;
+    CGSize want = CGSizeMake(win_w, win_h);
+    if (!CGSizeEqualToSize(g_layer.drawableSize, want)) g_layer.drawableSize = want;
+    id<CAMetalDrawable> drawable = [g_layer nextDrawable];
+    if (!drawable) return 0;
+    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    if (!cmd) return 0;
+    if (fenced) [cmd encodeWaitForEvent:g_event value:v];
+
+    // The blit samples through the array view like every kl_reproject shader
+    // (a plain 2D bound to a texture2d_array returns nothing, silently), and
+    // flip 0 is the GL orientation — the same value every GL eye carries.
+    id<MTLTexture> src = klvm_array_view(g_flat_tex);
+    kl_blit_uniforms bu = { 0u, 0u };
+
+    double scale = fmin((double)win_w / g_flat_w, (double)win_h / g_flat_h);
+    double dw = g_flat_w * scale, dh = g_flat_h * scale;
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = drawable.texture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+    enc.label = @"klepton viewer flat";
+    [enc setViewport:(MTLViewport){ (win_w - dw) * 0.5, (win_h - dh) * 0.5,
+                                    dw, dh, 0.0, 1.0 }];
+    [enc setRenderPipelineState:g_pipe];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
+    [enc setFragmentSamplerState:g_samp atIndex:0];
+    [enc setFragmentBytes:&bu length:sizeof bu atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+
+    // The liveness downsample, same as the eye path's: the HUD's `lit` is the
+    // only number separating a blank window from a dead pipeline.
+    if (g_stat && src) {
+        MTLRenderPassDescriptor *sp = [MTLRenderPassDescriptor renderPassDescriptor];
+        sp.colorAttachments[0].texture = g_stat;
+        sp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        sp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> se = [cmd renderCommandEncoderWithDescriptor:sp];
+        se.label = @"klepton viewer liveness";
+        [se setRenderPipelineState:g_pipe];
+        [se setFragmentTexture:src atIndex:0];
+        [se setFragmentTexture:src atIndex:1];
+        [se setFragmentSamplerState:g_samp atIndex:0];
+        [se setFragmentBytes:&bu length:sizeof bu atIndex:0];
+        [se drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [se endEncoding];
+        int cw = g_flat_w, ch = g_flat_h;
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+            (void)b;
+            klvm_read_stats(cw, ch);
+        }];
+    }
+
+    [cmd presentDrawable:drawable];
+    [cmd commit];
+    g_last_value = v;
+    g_frames++;
+    return 1;
+}
+
 int kl_viewmtl_present(int win_w, int win_h) {
     if (!g_started) return 0;
+    if (g_flat_tex) return klvm_present_flat(win_w, win_h);
 
     // Re-read every frame rather than caching: Unity really does re-create its
     // eye textures at a different size partway through startup (1832x1920 ->
@@ -872,7 +983,7 @@ void kl_viewmtl_stop(void) {
     kl_glfb_set_gpu_fence(NULL);
     g_started = 0;
     g_pipe = nil; g_samp = nil; g_stat = nil; g_queue = nil;
-    g_event = nil; g_layer = nil; g_dev = nil;
+    g_event = nil; g_layer = nil; g_dev = nil; g_flat_tex = nil;
     // The array views hold their source textures alive, and a restart would
     // otherwise match a stale key against a texture from the previous device.
     for (int i = 0; i < KLVM_VIEWS; i++) { g_views[i].src = NULL; g_views[i].view = nil; }

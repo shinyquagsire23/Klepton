@@ -10,6 +10,17 @@
 
 int kl_view_available(void);
 
+// The refresh rate of the display the viewer's window will open on, in Hz, or
+// 0 when SDL cannot say (and in a build without SDL3). Ask this BEFORE the
+// guest thread exists: a guest reads the display rate once, early, and paces
+// itself and anything on the other end of a wire against it, so a number
+// arriving after boot is a number nobody reads.
+//
+// This is the panel's rate, which is a ceiling and not a promise — nothing on
+// the host paces the guest's frame loop, so what it actually achieves is its
+// own throughput and can be far below this. The viewer's HUD prints both.
+float kl_view_display_hz(void);
+
 // The kl_glfb_frame_sink implementation, used by the readback path only
 // (KL_VIEW_CPU=1). Runs on the GL thread inside the guest's frame — memcpy and
 // go, no SDL calls.

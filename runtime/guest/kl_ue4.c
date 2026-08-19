@@ -186,8 +186,8 @@ int kl_ue4_load(FILE *out) {
         // that keeps paying off here — a UE4 guest owns its own frame loop, so
         // "what is the game thread doing" is a question no return value answers
         // — and it reports every guest frame as `??? (in <unknown binary>)`
-        // until something joins the two. m_slink prints it; without it here the
-        // sampler is useless on the one target that needs it most.
+        // until something joins the two. Without this line the sampler is
+        // useless on the one target that needs it most.
         if (out) {
             fprintf(out, "  mapped %-22s @%p %7.2f MB\n", UE4_CHAIN[i],
                     kl_base(img), kl_span(img) / 1048576.0);

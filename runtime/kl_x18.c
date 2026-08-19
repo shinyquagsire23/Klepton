@@ -386,9 +386,9 @@ static unsigned g_nrefused_kinds, g_refused_total;
 // A constructor is early enough because dyld runs image initializers before
 // main(), and the frameworks' key consumption happens during app launch rather
 // than at load. It costs one pthread key in every process that links the
-// runtime, which is what the key was going to cost anyway — `build/m_boot` and
-// `build/m_slink` already claim it in their first statement, and this simply
-// makes them not have to.
+// runtime, which is what the key was going to cost anyway — `build/m_boot`
+// already claims it in its first statement, and this simply makes it not have
+// to.
 __attribute__((constructor))
 static void klx_claim_slot_early(void) {
     // Quietly: a process that links the runtime and never loads a guest (a unit

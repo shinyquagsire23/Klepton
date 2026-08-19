@@ -18,7 +18,7 @@
 //         kl_glfb's capture already produces. A flat guest's picture is the
 //         default framebuffer of an EGL window surface — there are no eye
 //         textures and no stages, so the zero-copy MTLTexture route the stereo
-//         path uses does not apply to it (see m_slink's KL_VIEW note).
+//         path uses does not apply to it.
 //
 // Costs nothing for a guest that is not SDL: the native lookups return NULL for
 // Unity, which registers no such natives, and every call becomes a no-op.

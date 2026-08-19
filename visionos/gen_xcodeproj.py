@@ -274,7 +274,7 @@ COMMON = f"""
 				// second target needed one. The failure is a link error naming
 				// VTDecompressionSession*, which reads as a missing SDK rather
 				// than as a build setting that was never updated.
-				OTHER_LDFLAGS = "-lz -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo";
+				OTHER_LDFLAGS = "-lz -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface";
 				PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID};
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;

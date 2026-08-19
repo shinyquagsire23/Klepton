@@ -1,17 +1,16 @@
-// Enter the guest through its real entry point.
+// The host driver: enter the guest through its real entry point, on macOS.
 //
-// There is no NativeActivity in the Unity APK. AndroidManifest.xml declares
-// com.unity3d.player.UnityPlayerActivity, and libmain.so exports exactly one
-// thing: JNI_OnLoad. So the true entry is a JNI call, and the gate is that
-// libmain's JNI_OnLoad runs against our synthetic JavaVM and registers the two
-// natives the Java side expects.
-//
-// Phase 1 is the assertion. Phase 2 is reconnaissance: it drives the registered
-// NativeLoader.load() to find out what the JNI surface has still to answer for,
-// and runs in a forked child because an unimplemented JNI slot aborts by
-// design.
+// The guest's own sequences are runtime/guest/kl_driver.c, shared verbatim with
+// the visionOS app so that one guest cannot be described two ways. What is here
+// is everything a COMMAND LINE adds and an app bundle has no use for: the DRM
+// policy self-test, the re-exec'd recon child (an unimplemented JNI slot aborts
+// by design, so the run that measures the surface must be disposable), the SDL
+// viewer, the host-only instruments (sampler, managed probe, metadata dump), the
+// Metal stand-in for Compositor Services, and how far to go — KL_LIFECYCLE,
+// KL_FRAMES, KL_SLINK_MAIN, KL_GAP_ONLY.
 #include <ctype.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -25,21 +24,16 @@
 #include "../runtime/gfx/kl_glfb.h"
 #include "../runtime/kl_jni.h"
 #include "../runtime/gfx/kl_egl.h"
-#include "../runtime/media/kl_opensl.h"
-#include "../runtime/media/kl_mediandk.h"
 #include "../runtime/xr/kl_ovrp.h"
 #include "../runtime/xr/kl_ovrplat.h"
-#include "../runtime/xr/kl_openxr.h"
 #include "../runtime/gfx/kl_view.h"
 #include "../runtime/diag/kl_sample.h"
 #include "../runtime/diag/kl_mprobe.h"
 #include "../runtime/diag/kl_metadump.h"
-#include "../runtime/guest/kl_il2cpp.h"
-#include "../runtime/guest/kl_guestpoke.h"
 #include "../runtime/kl_fault.h"
 #include "../runtime/kl_target.h"
-#include "../runtime/guest/kl_ue4.h"
-#include "../runtime/guest/kl_jkxr.h"
+#include "../runtime/guest/kl_driver.h"
+#include "../runtime/guest/kl_slink.h"
 #include "../tests/t_mtl_provider.h"
 
 // Which guest, and where its libraries are. Both come from the target table
@@ -51,14 +45,15 @@
 //   ./build/m_boot                      the default target (beatsaber)
 //   ./build/m_boot superhot             ...by name
 //   ./build/m_boot superhot/lib/arm64-v8a   ...the same, by path
+//   ./build/m_boot steamlink-vr         ...including Steam Link, whose front
+//                                       door is KL_SLINK_VR / KL_SLINK_SHELL
 //
 // The path form is what every documented run command and every Makefile gate
 // passes, and it resolves to the same target as the name.
 static const kl_target *TARGET;
 static const char *LIBDIR;
-
-typedef int  (*jni_onload_fn)(void *vm, void *reserved);
-typedef int8_t (*nativeloader_load_fn)(void *env, void *clazz, void *path);
+static kl_slink_door DOOR;          // read only by a Steam Link target
+#define DOOR_IS_VR (TARGET->kind == KL_GUEST_STEAMLINK && DOOR == KL_SLINK_VR)
 
 static int fail(const char *msg) { fprintf(stderr, "FAIL: %s\n", msg); return 1; }
 
@@ -353,116 +348,157 @@ static void report_eye_interop(void) {
     }
 }
 
-// The Unreal Engine 4 door. A different ENTRY, not a different lifecycle: the
-// guest is started through ANativeActivity_onCreate and then runs its own game
-// thread, so this drives it by delivering lifecycle and pumping the looper
-// rather than by calling a render native the way the Unity path below does.
+// ---- the 2D -> VR handoff ----
 //
-// Everything before the door is shared — the fault reporter, the permissive
-// flag, the texture dump — and everything under it is shared too, which is the
-// point of adding a non-Unity engine at all.
-static int ue4_run(void) {
-    // The guest's threads need x18 and the TLS veneer's slot before any guest
-    // code runs. The Unity path gets this from kl_app_boot; nothing
-    // was calling it here, and libUE4 has stack protectors.
-    kl_thread_init();
+// SteamLink.startVRLink(String) is the end of the shell's job: it has paired, the
+// host has authorized, and it now starts the VR activity with the session as
+// `sArgs` and calls finishAndRemoveTask() on itself. Both halves exist in this
+// binary, but they are two front doors with different chains, different libraries
+// and different lifecycles, and the shell's `main` is on the stack of the thread
+// making this call.
+//
+// So: re-EXEC, which is what Android's own model already is — a new activity in a
+// fresh task, the old one finishing. It replaces the process image, so every
+// question about tearing the shell down (Qt, SDL, ANGLE's contexts, the audio
+// unit, the shell's threads) does not arise. The exec'd process reads the session
+// out of the environment through the same KL_SLINK_SARGS path a pasted one uses,
+// so nothing downstream can tell the difference.
+//
+// KL_SLINK_HANDOFF=0 leaves the session printed and the run stopped by name,
+// which is what a gate measuring the SHELL wants: a run that re-execs into a
+// different front door measures something else.
+static const char *g_argv0 = "./build/m_boot";
 
-    if (kl_ue4_configure(LIBDIR, stdout) != 0) return fail(kl_ue4_error());
-    if (kl_ue4_load(stdout) != 0) return fail(kl_ue4_error());
+static void slink_setenv_default(const char *k, const char *v, const char *why) {
+    if (getenv(k)) return;
+    setenv(k, v, 1);
+    printf("    %s=%s   (%s)\n", k, v, why);
+}
 
-    // The work list, before anything is driven. For a brand-new target this is
-    // the most valuable thing a run produces, and it is worth having even when
-    // the boot below dies immediately: KL_GAP_ONLY stops here.
-    printf("\n=== the shim gap ===\n");
-    kl_ue4_gap(stdout);
-    if (getenv("KL_GAP_ONLY")) { fflush(NULL); return 0; }
+static void slink_vrlink_handoff(const char *sargs) {
+    if (!kl_env_on("KL_SLINK_HANDOFF", 1)) {
+        printf("  (KL_SLINK_HANDOFF=0 — not entering the VR front door)\n");
+        return;                      // the caller aborts by name, as before
+    }
 
-    printf("\n=== ANativeActivity_onCreate ===\n");
+    printf("\n=== 2D -> VR handoff: re-exec into the OpenXR front door ===\n");
+    printf("    %s %s\n", g_argv0, TARGET->name);
+    setenv("KL_SLINK_SARGS", sargs, 1);
+    setenv("KL_SLINK_VR", "1", 1);
+    unsetenv("KL_SLINK_SHELL");      // the door resolver would otherwise tie
+    unsetenv("KL_VIEW_POKE");        // a click script for the SHELL's UI, and
+                                     // replaying it into the VR view would be
+                                     // synthetic input nobody asked for
+    slink_setenv_default("KL_SLINK_MAIN", "1",
+                         "drive the lifecycle on into the OpenXR frame loop");
+    slink_setenv_default("KL_GLFB", "1",
+                         "the null GL driver cannot present a stream");
+    slink_setenv_default("KL_OVRP_IPD", "0.063",
+                         "HOST STOPGAP: an IPD of 0 stops the host sending video");
+    if (!getenv("KL_VIEW"))
+        slink_setenv_default("KL_SLINK_WAIT", "45",
+                             "the VR deadline; 10 s would waste the pairing");
     fflush(NULL);
+
+    execl(g_argv0, g_argv0, TARGET->name, (char *)NULL);
+
+    // Only reachable if exec failed. Returning is the contract for "could not do
+    // the handoff": the caller then aborts by name with the session printed
+    // above, so the run is no worse off than before.
+    printf("  !! exec(\"%s\") failed: %s\n", g_argv0, strerror(errno));
+    fflush(NULL);
+}
+
+// The doors whose guest owns its own frame loop and takes a looper rather than a
+// render call: Unreal's NativeActivity, OpenJK's static exports, and Steam Link's
+// three. What differs between them is entirely inside kl_driver; what this adds
+// is the command line's part — the budget in SECONDS (there is no render call
+// here to count), the watchdog around it, and the interop readback, which is the
+// only thing that says whether the guest's rendering ARRIVED.
+//
+// Under the viewer the deadline is the window: the pump runs until it closes,
+// and the reports belong to the main thread after the join.
+static int pump_and_report(double want, int view_pump) {
     const char *aenv = getenv("KL_ALARM");
-    alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : 20);
-    if (kl_ue4_create(stdout) != 0) { alarm(0); return fail(kl_ue4_error()); }
-    kl_ue4_start(stdout);
-    alarm(0);
-
-    // Seconds, not frames: a NativeActivity guest owns its own frame loop, so
-    // there is no render call here to count. KL_UE4_WAIT is the budget.
-    const char *wenv = getenv("KL_UE4_WAIT");
-    double want = wenv ? strtod(wenv, NULL) : 5.0;
-    printf("\n=== pumping the looper for %.1f s ===\n", want);
+    if (view_pump) printf("\n=== pumping the looper until the viewer closes ===\n");
+    else           printf("\n=== pumping the looper for %.1f s ===\n", want);
     fflush(NULL);
-    alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : (unsigned)(want + 30));
-    double spent = kl_ue4_pump(want, NULL);
+    // The driver's per-call watchdog off, one alarm around the whole pump: this
+    // is a single call that runs for the budget.
+    kl_driver_set_alarm(0);
+    if (!view_pump) alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : (unsigned)(want + 30));
+    double spent = kl_driver_pump(view_pump ? -1.0 : want,
+                                  view_pump ? &g_view_quit : NULL);
     alarm(0);
     printf("  pumped %.2f s\n", spent);
+    if (view_pump) return 0;
 
     printf("\n=== reports ===\n");
-    kl_ue4_report(stdout);
-    // ...and the interop readback, the only thing here that says whether the
-    // guest's rendering ARRIVED. This door reaches the eye textures exactly the
-    // way BONELAB's does — kl_vulkan publishes the MTLTexture behind each eye
-    // VkImage into kl_glfb's eye table — so leaving it to the Unity tail meant
-    // a UE4 run producing a picture and a report that never mentioned one.
+    kl_driver_report(stdout);
     report_eye_interop();
     fflush(NULL);
     return 0;
 }
 
-// The JKXR door. Neither of the two above: the guest's natives are static
-// exports on a plain Activity, so this drives them in the Activity's own order
-// — onCreate builds the engine and hands back the handle every later call is
-// keyed on — and then pumps the Android side while the engine's own render
-// thread runs.
-//
-// Shaped like ue4_run deliberately, down to KL_GAP_ONLY and the seconds-rather-
-// than-frames budget: both doors hand the guest its own frame loop, so neither
-// has a render call to count, and the two runs should be readable side by side.
-static int jkxr_run(void) {
-    // Before any guest code: x18 and the TLS veneer's slot. The Unity path gets
-    // this from kl_app_boot.
-    kl_thread_init();
-
-    if (kl_jkxr_configure(LIBDIR, TARGET->entry_lib, stdout) != 0)
-        return fail(kl_jkxr_error());
-    if (kl_jkxr_load(stdout) != 0) return fail(kl_jkxr_error());
-
-    printf("\n=== the shim gap ===\n");
-    kl_jkxr_gap(stdout);
-    if (getenv("KL_GAP_ONLY")) { fflush(NULL); return 0; }
-
+static int begin_and_pump(int view_pump) {
     // Before the engine builds its OpenXR swapchains, which is where the images
     // that need MTLTexture storage are created. The Unity path registers this
-    // inside its lifecycle (ovrp_SetupEyeTexture2 arrives there) and the UE4
-    // door needs no provider at all — its eye images come from MoltenVK — so
-    // this door is the first that has to ask for itself. Self-guarding on
-    // KL_GLFB_MTL / KL_VIEW, so a plain run is unchanged.
-    kl_mtl_provider_install();
+    // inside its lifecycle (ovrp_SetupEyeTexture2 arrives there); an Unreal
+    // guest needs no provider at all, its eye images come from MoltenVK. Self-
+    // guarding on KL_GLFB_MTL / KL_VIEW, so a plain run is unchanged.
+    if (TARGET->kind == KL_GUEST_JKXR || DOOR_IS_VR) kl_mtl_provider_install();
 
-    printf("\n=== GLES3JNILib.onCreate ===\n");
-    fflush(NULL);
-    const char *aenv = getenv("KL_ALARM");
-    alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : 20);
-    if (kl_jkxr_create(stdout) != 0) { alarm(0); return fail(kl_jkxr_error()); }
-    kl_jkxr_start(stdout);
-    alarm(0);
+    if (kl_driver_lifecycle_begin(stdout) != 0) return fail(kl_driver_error());
+    return pump_and_report(kl_driver_pump_default(), view_pump);
+}
 
-    const char *wenv = getenv("KL_JKXR_WAIT");
-    double want = wenv ? strtod(wenv, NULL) : 5.0;
-    printf("\n=== pumping the looper for %.1f s ===\n", want);
-    fflush(NULL);
-    alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : (unsigned)(want + 30));
-    double spent = kl_jkxr_pump(want, NULL);
-    alarm(0);
-    printf("  pumped %.2f s\n", spent);
+static int native_door_run(int view_pump) {
+    if (kl_driver_boot(stdout) != 0) return fail(kl_driver_error());
+    if (kl_driver_gap_only()) return 0;
+    return begin_and_pump(view_pump);
+}
 
-    printf("\n=== reports ===\n");
-    kl_jkxr_report(stdout);
-    report_eye_interop();
-    fflush(NULL);
-    return 0;
+// Steam Link, which is the one target whose front door is a choice rather than a
+// property of the tree. All three are the same guest and the same profile — the
+// pairing credential the shell stores is exactly what the VR door is handed at
+// the handoff — so what a run selects is only which chain it maps and which
+// entry it calls.
+static int steamlink_run(int view_pump) {
+    if (kl_driver_boot(stdout) != 0) return fail(kl_driver_error());
+    if (kl_driver_gap_only()) return 0;
+
+    // The VR door without KL_SLINK_MAIN is a measurement of its own: the chain,
+    // the init arrays and ANativeActivity_onCreate, which is where a glue that
+    // returned early shows up as an empty callback table. Nothing after it runs,
+    // so the guest never reaches OpenXR.
+    if (DOOR_IS_VR && !getenv("KL_SLINK_MAIN")) {
+        printf("\n=== ANativeActivity_onCreate (the VR front door) ===\n");
+        fflush(NULL);
+        if (kl_slink_vr_create(stdout) != 0) return fail(kl_slink_error());
+        printf("  (KL_SLINK_MAIN unset: stopping after onCreate)\n");
+        kl_driver_report(stdout);
+        return 0;
+    }
+    // ...and the SDL doors without it stop one step earlier still, at the bound
+    // chain: `main` is where everything unimplemented starts failing by name, and
+    // the chain gate has to stay green independently of that.
+    if (!DOOR_IS_VR && !getenv("KL_SLINK_MAIN") && !view_pump) {
+        kl_driver_report(stdout);
+        return 0;
+    }
+    return begin_and_pump(view_pump);
 }
 
 static int recon_run(int view_pump) {
+    // Every thread that runs guest code seeds bionic's stack-guard canary into
+    // TSD slot 5 first, and this is the thread the whole run is on. Without it
+    // the slot holds whatever Darwin last left there, libSDL3's JNI_OnLoad copies
+    // that at entry, something writes the slot during its 66 RegisterNatives
+    // calls, and the epilogue reports "stack smashing detected" — a real canary
+    // mismatch with no buffer overflow anywhere near it. libUE4 and the OpenJK
+    // engine have stack protectors too; Beat Saber's path to initJni has none,
+    // which is the only reason it never needed this.
+    kl_thread_init();
     install_fault_reporter();
     kl_mem_pressure_init();
     // Strict: an unimplemented *call* is fatal. Lookups are not, so this
@@ -482,117 +518,27 @@ static int recon_run(int view_pump) {
     // lifecycle, not just inside the frame pump.
     kl_egl_dump_textures(getenv("KL_DUMP_TEXTURES"));
 
-    // Which door this target takes. The Unity sequence below is not a default
-    // that happens to fit every guest — it names libmain, NativeLoader and
-    // UnityPlayer.initJni — so a UE4 target has to branch before any of it.
-    if (TARGET && TARGET->kind == KL_GUEST_UE4) return ue4_run();
-    if (TARGET && TARGET->kind == KL_GUEST_JKXR) return jkxr_run();
+    // Which door this target takes. The Unity sequence is not a default that
+    // happens to fit every guest — it names libmain, NativeLoader and
+    // UnityPlayer.initJni — so the others branch before any of it. All four live
+    // in kl_driver, shared with the visionOS app.
+    kl_driver_set_alarm(getenv("KL_ALARM")
+                        ? (unsigned)strtoul(getenv("KL_ALARM"), NULL, 10) : 20);
+    if (TARGET->kind == KL_GUEST_STEAMLINK) return steamlink_run(view_pump);
+    if (TARGET->kind == KL_GUEST_UE4 || TARGET->kind == KL_GUEST_JKXR)
+        return native_door_run(view_pump);
 
-    char path[1024];
-    snprintf(path, sizeof path, "%s/libmain.so", LIBDIR);
+    if (kl_driver_boot(stdout) != 0) return fail(kl_driver_error());
 
-    printf("=== libmain.so entry ===\n");
-    kl_image *main_img = kl_load_auto(path);
-    if (!main_img) return fail(kl_error());
-    kl_register_image("libmain.so", main_img);
-    kl_run_init(main_img);
-
-    jni_onload_fn onload = (jni_onload_fn)kl_sym(main_img, "JNI_OnLoad");
-    if (!onload) return fail("libmain.so exports no JNI_OnLoad");
-
-    int version;
-    kl_jni_local_frame_push();      // the JVM would pop each native's local
-    version = onload(kl_jni_vm(), NULL);   // frame on return; the host plays
-    kl_jni_local_frame_pop();       // that half (see kl_jni.h)
-    printf("  JNI_OnLoad returned 0x%08x\n", version);
-    if (version != KL_JNI_VERSION_1_6)
-        return fail("JNI_OnLoad did not return JNI_VERSION_1_6");
-
-    // libmain registers com.unity3d.player.NativeLoader.{load,unload} — the
-    // shim Unity's Java side calls to dlopen libunity.so.
-    const char *CLS = "com/unity3d/player/NativeLoader";
-    void *load   = kl_jni_native(CLS, "load", NULL);
-    void *unload = kl_jni_native(CLS, "unload", NULL);
-    if (!load || !unload) return fail("NativeLoader natives were not registered");
-    printf("  registered %s.load=%p unload=%p\n", CLS, load, unload);
-
-    printf("\n=== EXIT CRITERION MET: guest JNI_OnLoad ran, natives registered ===\n");
-
-    // ---- phase 2: reconnaissance, non-fatal ----
-    printf("\n=== recon: driving NativeLoader.load(\"libunity.so\") ===\n");
-    fflush(NULL);
-    // load() takes the *directory* — it appends "/libunity.so" itself.
-    kl_jni_local_frame_push();
-    int8_t ok = ((nativeloader_load_fn)load)(kl_jni_env(), NULL,
-                                             kl_jni_new_string(LIBDIR));
-    kl_jni_local_frame_pop();
-    printf("  NativeLoader.load returned %d\n", ok);
-
-    // UnityPlayer's constructor calls initJni(Context) first (UnityPlayer.smali
-    // line 372). It is `private final native`, so an instance method: the guest
-    // sees (JNIEnv*, jobject thiz, jobject context). Both objects are opaque to
-    // us — what matters is what libunity asks them for.
-    void *initJni = kl_jni_native("com/unity3d/player/UnityPlayer", "initJni", NULL);
-    if (initJni) {
-        printf("\n=== recon: UnityPlayer.initJni(Context) ===\n");
-        fflush(NULL);
-        void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
-        // On device the Context is the Activity — AndroidManifest.xml declares
-        // UnityPlayerActivity — and Unity checks that with IsInstanceOf. Handing
-        // it a bare Context would send it down the no-Activity path.
-        // The shared singleton, not a fresh instance: Unity also reads this
-        // back through the static UnityPlayer.currentActivity and compares.
-        void *context = kl_jni_activity();
-        kl_jni_local_frame_push();
-        ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, context);
-        kl_jni_local_frame_pop();
-        printf("  initJni returned\n");
-        // ...and the rest of that same constructor. See kl_jni.h: the helper
-        // objects hand THEMSELVES to libunity, so a driver that stops at
-        // initJni leaves handles libunity does not null-check.
-        kl_jni_unity_construct_helpers();
-    }
-
-    // Lifecycle, in the order UnityPlayerActivity drives it: attach a
-    // surface, resume, then pump one frame. nativeRecreateGfxState is what
-    // reaches for EGL.
+    // The lifecycle, behind a knob: everything above is a gate that must stay
+    // green, and everything below stops by name until the shim catches up.
     if (getenv("KL_LIFECYCLE")) {
         // With KL_GLFB_MTL=1, the eye textures Unity is about to ask for
         // become MTLTextures we allocated — the host stand-in for what
         // Compositor Services will hand over. Registered here because
-        // ovrp_SetupEyeTexture2 arrives inside nativeRecreateGfxState, below.
+        // ovrp_SetupEyeTexture2 arrives inside nativeRecreateGfxState.
         kl_mtl_provider_install();
-        void *surface = kl_jni_new_object("android/view/Surface");
-        void *thiz2   = kl_jni_new_object("com/unity3d/player/UnityPlayer");
-        struct { const char *name; int kind; } seq[] = {
-            {"nativeRecreateGfxState", 2}, {"nativeResume", 0}, {"nativeRender", 1},
-        };
-        for (unsigned i = 0; i < sizeof seq / sizeof seq[0]; i++) {
-            void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", seq[i].name, NULL);
-            if (!fn) { printf("  %s: not registered\n", seq[i].name); continue; }
-            printf("\n=== recon: UnityPlayer.%s ===\n", seq[i].name);
-            fflush(NULL);
-            // The render loop may block; do not hang the sweep. KL_ALARM
-            // widens the window when the question is what it is waiting on.
-            const char *aenv = getenv("KL_ALARM");
-            alarm(aenv ? (unsigned)strtoul(aenv, NULL, 10) : 20);
-            kl_jni_local_frame_push();
-            if (seq[i].kind == 2)
-                ((void (*)(void *, void *, int, void *))fn)(kl_jni_env(), thiz2, 0, surface);
-            else if (seq[i].kind == 1)
-                printf("  -> %d\n", ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2));
-            else
-                ((void (*)(void *, void *))fn)(kl_jni_env(), thiz2);
-            kl_jni_local_frame_pop();
-            alarm(0);
-            printf("  %s returned\n", seq[i].name);
-            // Android's UI thread runs its looper between callbacks; here
-            // the host has to pump it, or the queue only ever grows.
-            alarm(10);
-            unsigned ran = kl_jni_drain_ui_tasks();
-            alarm(0);
-            if (ran) printf("  drained %u posted task%s\n", ran, ran == 1 ? "" : "s");
-        }
+        if (kl_driver_lifecycle_begin(stdout) != 0) return fail(kl_driver_error());
 
         // One nativeRender is the engine's first frame and it is almost all
         // setup — no scene is loaded and nothing is drawn yet, which is why
@@ -608,8 +554,6 @@ static int recon_run(int view_pump) {
         const char *fenv = getenv("KL_FRAMES");
         unsigned frames = fenv ? (unsigned)strtoul(fenv, NULL, 10) : 0;
         if (frames || view_pump) {
-            void *fn = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
-            kl_guest_poke_texture_unit_cap();
             // Here rather than earlier because it wants il2cpp_init to have
             // decrypted the tables, and it is a scan of live memory — the guest
             // is between frames at this point, which is the quietest the heap
@@ -633,6 +577,10 @@ static int recon_run(int view_pump) {
             fflush(NULL);
             const char *aenv2 = getenv("KL_ALARM");
             unsigned budget = aenv2 ? (unsigned)strtoul(aenv2, NULL, 10) : 60;
+            // One watchdog around the whole pump rather than the driver's
+            // per-frame one, and none at all under the viewer: the window may
+            // stay open for minutes, and a human at the keyboard IS the watchdog.
+            kl_driver_set_alarm(0);
             if (!view_pump) alarm(budget);
             // KL_SAMPLE_MS: while the pump runs, sample every guest thread's
             // pc/backtrace and resolve it (kl_sample.c) — built to name the
@@ -648,37 +596,14 @@ static int recon_run(int view_pump) {
             const long frame_ns = 1000000000L / 72;
             unsigned haptic_pulses = 0;
             unsigned i;
-            for (i = 0; fn && (view_pump ? !g_view_quit : i < frames); i++) {
+            for (i = 0; view_pump ? !g_view_quit : i < frames; i++) {
                 struct timespec t0;
                 clock_gettime(CLOCK_MONOTONIC, &t0);
-                // Pin this frame's poses first, so every ovrp_GetNodePoseState
-                // inside the frame answers the same thing and the pose recorded
-                // for timewarp is the one the picture was drawn from. On the
-                // host the frontend and the guest are usually the same thread,
-                // so this changes nothing — but the viewer is what proves the
-                // reprojection math before a device is available, and it can
-                // only prove it if it runs the same shape.
-                kl_ovrp_frame_latch();
-                // The frame clock next: on Android the Choreographer's
-                // doFrame is what wakes the engine for a frame, and
-                // nativeRender then draws what it decided. Ticking after
-                // rendering would hand every frame the previous one's time.
-                // The frame clock is now a free-running host thread started at
-                // the first Choreographer postFrameCallback — it is NOT driven
-                // from here. Doing it inline is how the pump blocked forever: a
-                // doFrame could only be delivered before nativeRender, and
-                // nativeRender waits on the refresh counter a doFrame advances.
-                // One local frame per pumped frame, as the JVM gives each
-                // nativeRender on Android — the guest's per-frame locals are
-                // meant to die here (see kl_jni.h).
-                kl_jni_local_frame_push();
-                ((int8_t (*)(void *, void *))fn)(kl_jni_env(), thiz2);
-                kl_jni_local_frame_pop();
-                kl_jni_drain_ui_tasks();
-                // Android's low-memory notification, which nothing delivered
-                // before this: one task_info call, and the guest drops its
-                // caches when the footprint crosses the reported budget.
-                kl_mem_pressure_poll();
+                // The guest's frame: pose latch, nativeRender, the posted-task
+                // drain and the memory-pressure poll (kl_driver_frame). It
+                // returns -1 when nativeRender was never registered, which is
+                // the only way this loop ends early.
+                if (kl_driver_frame() < 0) break;
                 // The haptics seam's host end. Nothing on macOS can vibrate, so
                 // this only drains and counts — but draining is the point: it
                 // is what makes the host a working A/B for the whole path down
@@ -708,7 +633,6 @@ static int recon_run(int view_pump) {
             }
             alarm(0);
             if (sampling) kl_sample_stop_report(stdout);
-            printf("  pumped %u frames\n", i);
             if (md_late) {
                 char meta[1024];
                 kl_metadump_run(metadata_path(meta, sizeof meta));
@@ -728,20 +652,8 @@ static int recon_run(int view_pump) {
 
     if (view_pump)
         return 0;   // the main thread prints the reports after the join
-    kl_jni_report(stdout);
-    kl_egl_report(stdout);
-    kl_opensl_report(stdout);
-    // A Unity guest can reach the video path too — Open Brush seeds a video
-    // into its own media library at startup — and this driver had never asked
-    // it anything. The report was wired into the Steam Link driver and the
-    // fault path only, so on a CLEAN Unity run a refused demux said nothing.
-    kl_mediandk_report(stdout);
-    kl_ovrp_report(stdout);
-    kl_ovrplat_report(stdout);
-    kl_openxr_report(stdout);
-    kl_metadump_watch_report(stdout);
-    kl_madv_report();
-    kl_mem_report();
+    kl_driver_report(stdout);
+    kl_metadump_watch_report(stdout);   // host-only, so not the driver's
     fflush(NULL);   // _exit does not flush stdio, and the report is the point
     _exit(0);
 }
@@ -798,7 +710,31 @@ static int view_run(void) {
     // keeps the old glReadPixels path, which is the A/B when the compositor
     // shows the wrong picture.
     int hw = 0;
-    if (getenv("KL_VIEW_CPU")) {
+    if (TARGET->kind == KL_GUEST_STEAMLINK && DOOR != KL_SLINK_VR) {
+        // A FLAT guest (the shell and client doors): its picture is the default
+        // framebuffer of an EGL window surface, not an eye texture keyed by
+        // (eye, stage). Requested HERE, before ANGLE is up, that framebuffer's
+        // storage is an IOSurface kl_glfb allocates — the compositor samples
+        // the guest's own pixels and nothing reads back. The panel size is
+        // already published (kl_slink_configure ran in main), so bringing
+        // ANGLE up now creates the surface at the size the guest will draw.
+        // KL_VIEW_CPU=1 keeps the glReadPixels path as the A/B.
+        //
+        // The VR door is NOT flat: its eyes are mirror-blitted into provider
+        // textures keyed (eye, stage) — the same seam the device compositor
+        // samples — so it takes the hardware chain below like every XR door.
+        // Keying this on the TARGET rather than the DOOR once made a VR viewer
+        // run pay the mirror blits AND a full-frame glReadPixels per frame.
+        if (!getenv("KL_VIEW_CPU") && kl_env_on("KL_GLFB", 0)) {
+            kl_glfb_request_flat_surface();
+            if (kl_glfb_mtl_device() && kl_glfb_flat_surface(NULL, NULL)) {
+                hw = 1;
+                fprintf(stderr, "view: flat guest — IOSurface composite, "
+                                "no readback\n");
+            }
+        }
+        if (!hw) fprintf(stderr, "view: flat guest — readback path\n");
+    } else if (getenv("KL_VIEW_CPU")) {
         fprintf(stderr, "view: KL_VIEW_CPU=1 — readback path\n");
     } else if (!kl_env_on("KL_GLFB", 0)) {
         // No GL renderer was asked for, so there is no readback to fall back
@@ -816,6 +752,23 @@ static int view_run(void) {
         hw = kl_glfb_has_mtl_provider();
     }
     if (!hw) kl_glfb_set_frame_sink(kl_view_frame_sink, NULL);
+
+    // What the display actually runs at, before the guest can ask. Without this
+    // every host run describes the Quest 2's 72 Hz panel no matter what is on
+    // the desk, and a guest that paces a video stream against the number is
+    // asking its far end for frames at a rate nothing here chose.
+    //
+    // It is a ceiling, not a promise: on the host nothing paces the guest's
+    // frame loop, so a heavy target can deliver a third of this. The viewer's
+    // HUD prints achieved against advertised every second, and KL_DISPLAY_HZ
+    // (read inside kl_ovrp_display_frequency, hence after this push) is how a
+    // run pins the number to what it can really sustain.
+    float panel_hz = kl_view_display_hz();
+    if (panel_hz > 0.0f) kl_ovrp_set_display_frequency(panel_hz);
+    fprintf(stderr, "view: display %.1f Hz%s; guest will be told %.1f Hz\n",
+            (double)panel_hz, panel_hz > 0.0f ? "" : " (SDL could not say)",
+            (double)kl_ovrp_display_frequency());
+
     pthread_t guest;
     if (pthread_create(&guest, NULL, view_guest_thread, NULL)) {
         fprintf(stderr, "view: pthread_create failed\n");
@@ -823,21 +776,13 @@ static int view_run(void) {
     }
     int rc = kl_view_main(LIBDIR, hw);   // returns when the window closes
     g_view_quit = 1;
-    pthread_join(guest, NULL);
-    kl_jni_report(stdout);
-    kl_egl_report(stdout);
-    kl_opensl_report(stdout);
-    // A Unity guest can reach the video path too — Open Brush seeds a video
-    // into its own media library at startup — and this driver had never asked
-    // it anything. The report was wired into the Steam Link driver and the
-    // fault path only, so on a CLEAN Unity run a refused demux said nothing.
-    kl_mediandk_report(stdout);
-    kl_ovrp_report(stdout);
-    kl_ovrplat_report(stdout);
-    kl_openxr_report(stdout);
-    kl_metadump_watch_report(stdout);
-    kl_madv_report();
-    kl_mem_report();
+    // The flat guest is inside its own main() and does not return on its own;
+    // the process exiting is what ends it. Detaching rather than joining makes
+    // closing the window close the app, which is what a window close means.
+    if (TARGET->kind == KL_GUEST_STEAMLINK) pthread_detach(guest);
+    else                                    pthread_join(guest, NULL);
+    kl_driver_report(stdout);
+    kl_metadump_watch_report(stdout);   // host-only, so not the driver's
     return rc;
 }
 
@@ -850,11 +795,33 @@ int main(int argc, char **argv) {
         return 1;
     }
     LIBDIR = TARGET->libdir;
-    // Everything the guest is told about itself, from one row: the library
-    // path, the assets, the APK it opens as a zip, and the userdata directory
-    // its saves land in.
-    kl_target_apply_host(TARGET, NULL);
+    if (argc > 0 && argv[0] && *argv[0]) g_argv0 = argv[0];
     printf("=== target: %s (%s, %s) ===\n", TARGET->name, LIBDIR, TARGET->apk);
+
+    // Everything the guest is told about itself, from one row: the library path,
+    // the assets, the APK it opens as a zip, and the userdata directory its saves
+    // land in. Steam Link is told the same four things plus what only it has —
+    // which front door, the activity class that goes with it, Qt's plugin path
+    // and the panel size — so its description comes from kl_slink instead.
+    if (TARGET->kind == KL_GUEST_STEAMLINK) {
+        DOOR = kl_slink_door_from_env();
+        if (kl_env_on("KL_SLINK_VR", 0) && kl_env_on("KL_SLINK_SHELL", 0))
+            printf("(KL_SLINK_VR and KL_SLINK_SHELL are different front doors; "
+                   "taking VR)\n");
+        // One profile for all three doors: the pairing credential the shell
+        // stores is exactly what the VR door is handed at the handoff, so
+        // splitting them would make the app re-pair against itself.
+        if (kl_slink_configure(DOOR, LIBDIR, TARGET->assets, TARGET->apk,
+                               kl_userdata_dir(TARGET->userdata), stdout) != 0)
+            return fail(kl_slink_error());
+        // Only the shell can reach startVRLink, and only it should be able to
+        // hand off — installing this unconditionally would let a client or VR
+        // run take a path neither of them has any business on.
+        if (DOOR == KL_SLINK_SHELL) kl_jni_set_vrlink_handoff(slink_vrlink_handoff);
+    } else {
+        kl_target_apply_host(TARGET, NULL);
+    }
+    kl_driver_init(TARGET, LIBDIR, DOOR);
 
     // Re-entry of the re-exec'd recon child (see below).
     if (getenv("KL_RECON_CHILD"))
@@ -928,14 +895,12 @@ int main(int argc, char **argv) {
                     "in the log above, not in the JNI report");
     }
     // Named for the door this run actually took. `initJni` is UnityPlayer's and
-    // means nothing on a NativeActivity guest — printing it after a UE4 run is
-    // a diagnostic asserting something it never established, which is the habit
-    // this tree keeps having to unlearn (the getrandom stop that reported
-    // itself as "an unimplemented JNI call" is the same shape).
+    // means nothing on a NativeActivity guest — a diagnostic asserting something
+    // it never established sends the next reader to the wrong report.
     printf("\n=== EXIT CRITERION MET: %s ===\n",
-           !TARGET                             ? "initJni completed with no unimplemented JNI calls"
-           : TARGET->kind == KL_GUEST_UE4      ? "the NativeActivity lifecycle ran with no unimplemented JNI calls"
-           : TARGET->kind == KL_GUEST_JKXR     ? "the GLES3JNILib lifecycle ran with no unimplemented JNI calls"
+           TARGET->kind == KL_GUEST_UE4       ? "the NativeActivity lifecycle ran with no unimplemented JNI calls"
+           : TARGET->kind == KL_GUEST_JKXR    ? "the GLES3JNILib lifecycle ran with no unimplemented JNI calls"
+           : TARGET->kind == KL_GUEST_STEAMLINK ? "the Steam Link chain ran with no unimplemented JNI calls"
                                                : "initJni completed with no unimplemented JNI calls");
     return 0;
 }

@@ -135,7 +135,7 @@ static AVAssetTrack *first_video_track(AVAsset *asset) {
         (void)err;
         // Retained across the semaphore: the array the completion handler is
         // given is released when it returns. This file is compiled WITH ARC
-        // (m_boot and m_slink pass -fobjc-arc over the whole set), so the
+        // (every driver passes -fobjc-arc over the whole set), so the
         // __block strong reference is what does the retaining — writing it by
         // hand does not compile at all.
         track = tracks.firstObject;

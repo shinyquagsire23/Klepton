@@ -238,7 +238,7 @@ answers GL and kl_glfb never initializes.
   Compositor Services (`tests/t_mtl_provider.m`). With `KL_GLFB_OUT` set it
   also writes `mtl_eye0.png`/`mtl_eye1.png` from the textures, tone-mapped like
   the reference frames so the two are directly comparable.
-  On `build/m_slink`'s **VR** front door it does the same for the OpenXR
+  On the Steam Link target's **VR** front door it does the same for the OpenXR
   swapchains (SL-19) and prints, at the end of the run, the last complete frame
   record's stage and how many texels of each eye are lit. That is the host arm
   of "the immersive space is black": a stage of -1 means no frame record, `0
@@ -318,6 +318,25 @@ gamelift region probes failed EINVAL in a retry storm.
   payload in hex and ASCII. Counts alone cannot tell a discovery probe from its
   own broadcast echo (identical lengths), nor say which TLS record a handshake
   died on; both questions came up in one session and both needed the bytes.
+- `KL_NET_RATE=<seconds>` — every `<seconds>`, one line per receiving socket:
+  datagrams, bytes, the rate those imply, the datagram size range, the socket's
+  effective `SO_RCVBUF`, and the change in the kernel's system-wide count of
+  datagrams thrown away for a full socket buffer (macOS only — the header that
+  names that counter is not in the xrOS SDK, and the line says so instead of
+  printing a zero). Written for the streaming question a client cannot answer
+  about itself: a received rate that starts high and collapses is a host rate
+  controller reacting to loss, while a rate flat from the first interval was
+  decided before any packet moved. Cheap enough to leave on for a whole
+  session; `1` is the useful value.
+- `KL_SVL_TRACE=1` — Steam Link only: print every value the streaming client
+  publishes into the key/value tree it shares with the Steam host
+  (`cRXpps`, `cRXerr`, `cRXpass`, `cStandoff`, `cFramePhase`, the `cAud*`
+  family). The client does not choose its own video bitrate — the host does,
+  from these numbers — so this is the whole channel by which a stall on this
+  side becomes a lower bitrate from the other. The first write of a key always
+  prints; after that only a changed value, at most once a second, which leaves
+  each key as a readable per-second series. Answers the guest's own function at
+  relocation time, so it costs nothing when unset.
 - `KL_NET_BIND_REMAP=<from>:<to>[,...]` — bind a guest listening port
   somewhere else. A **host-development** knob, off by default: on the headset
   the guest is alone, but on a Mac that is *also* a Steam host, Steam owns UDP
@@ -554,10 +573,21 @@ The guest's own memory management, and the three seams that used to disable it.
 
 The decoder is VideoToolbox and it is either there or it is not; what would
 otherwise be a knob is a gate instead (`make hevc`, in `make check`). Worth
-knowing rather than setting: output is **BGRA**, not the decoder's native NV12,
-because the guest samples the frame through a `samplerExternalOES` whose whole
-promise is that the YUV→RGB conversion has already happened. See
-`runtime/media/kl_vtdec.h`.
+knowing rather than setting: output is the decoder's **native biplanar YCbCr**
+— no pixel format is requested at all, because requesting one costs both the
+conversion (BGRA is 2.67× the bytes of NV12) and a copy VideoToolbox performs
+on visionOS 2 merely because a format was named. The guest still samples RGB:
+`kl_glfb.c` wraps the frame in one of Apple's private single-plane YCbCr
+`MTLPixelFormat`s and the SAMPLER converts, which is `samplerExternalOES`'s
+whole promise kept in hardware. See `runtime/media/kl_vtdec.h`; the sampled
+result is gated against the BGRA path by `make vidtex`.
+
+- `KL_VTDEC_BGRA=1` — request `kCVPixelFormatType_32BGRA` from VideoToolbox
+  and take the IOSurface-pbuffer route into ANGLE instead. The A/B for the
+  native path, and the escape hatch should VideoToolbox ever hand back a
+  format `kl_glfb.c` cannot wrap (it names the fourcc when it refuses). The
+  Simulator forces this mode — the private pixel formats do not exist there.
+  Host and device. Default 0.
 
 - `KL_VTDEC_DUMP=<path>` — write the elementary stream exactly as the guest
   queued it, as plain Annex-B that `ffprobe` reads directly, plus a sidecar
@@ -1037,8 +1067,8 @@ puts the camera on the ground with its hands underneath it.
     not, so those show the squeeze directly. That is the cheapest confirmation
     it engaged.
   - **Foveation needs eye textures we own, so it follows the Metal PROVIDER, not
-    the viewer.** `tests/t_mtl_provider.m` is compiled into `m_boot` and
-    `m_slink` (it is a host stand-in for Compositor Services, not a test-only
+    the viewer.** `tests/t_mtl_provider.m` is compiled into `m_boot`
+    (it is a host stand-in for Compositor Services, not a test-only
     file), and `kl_mtl_provider_install()` registers it **unconditionally under
     `KL_VIEW`** — so the macOS viewer does foveate, and `KL_VRR` is live there.
     `KL_VIEW_CPU=1` opts out and takes the readback path instead.
@@ -1182,12 +1212,19 @@ that reports what came due since the frontend last asked. Platform-independent
   other silently; `kl_ovrp_haptics_pull` merges all three by maximum.
 
 - `KL_DISPLAY_HZ=<hz>` — force the display frequency the guest is told the
-  headset runs at, 30..240. It defaults to the Quest 2's 72, which is the
-  device we describe everywhere else, and on the host there is no panel to
-  measure; on visionOS the compositor's priming pass pushes the real number.
+  headset runs at, 30..240. It overrides both measurements: on visionOS the
+  compositor's priming pass pushes the rate it actually presented at, and under
+  `KL_VIEW` the viewer pushes the rate of the display its window opens on.
+  Without either it is the Quest 2's 72, the device we describe everywhere else.
   It matters beyond pacing for Steam Link: the VR client publishes this list to
   the Steam host as `VTE_AVAILABLE_FRAMETIMES_US`, the host asks for a rate,
-  and the negotiation is visible in the guest's own log
+  and the negotiation is visible in the guest's own log.
+
+  The viewer's number is the PANEL's rate, which is a ceiling and not a
+  promise — nothing on the host paces the guest's frame loop, so a heavy target
+  can deliver a fraction of it while the far end of a video stream is asked for
+  the full rate. The viewer's HUD prints achieved against advertised every
+  second; this knob is how a run pins the advertised number to what it measured
   (`Server requested refresh rate 90.0 was not available. Using 72.0`).
 - `KL_XR_CAPTURE_LAYER=N` — which projection layer `KL_GLFB_OUT` reads (default
   0, `runtime/xr/kl_openxr.c`). Steam Link's VR client submits **four** projection
@@ -1374,6 +1411,14 @@ The composite/timewarp pass — one file, compiled by both compositors
   `klxr_back_eye_images` refuses the swapchain by name and there is nothing to
   composite. The readback path states the layer instead
   (`kl_glfb_set_live_eye_image`) and works.
+
+  Which door takes which path is otherwise automatic and readback is nowhere
+  on it: Steam Link's VR door composites through the eye/overlay provider
+  textures like every XR door, and a FLAT guest (the Qt shell / client doors)
+  renders into an IOSurface-backed pbuffer the compositor samples directly
+  (`kl_glfb_request_flat_surface`; the run says `flat guest — IOSurface
+  composite, no readback`). `KL_VIEW_CPU=1` is the one switch that brings
+  `glReadPixels` back for either shape.
 - `KL_VIEW_EYE=1` — composite the **right** eye instead of the left. The window
   shows one eye, and which one is not a detail: a guest under Oculus symmetric
   projection renders the two eyes into different sub-rects of one texture, so
@@ -1498,21 +1543,26 @@ reads no knobs).
 - `KL_TRACE_IMAGES=1` — log each loaded image's base and span, the stub pool
   mapping, and each emitted stub. Read by `kl_image.c`.
 
-## Steam Link (`mains/m_slink.c`, `build_run_slink.sh`)
+## Steam Link (`runtime/guest/kl_slink.c`, `build_run_host.sh`)
 
-The wrapper's flags map onto these: `--gap` → `KL_GAP_ONLY=1 KL_NOFORK=1`,
-`--main` → `KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1`, `--view` adds `KL_VIEW=1`.
+Steam Link is a target row like any other (`./build/m_boot steamlink-vr`); the
+front door is a knob, not a build. `build_run_host.sh`'s flags map onto these:
+`--gap` → `KL_GAP_ONLY=1 KL_NOFORK=1`, `--main` →
+`KL_SLINK_MAIN=1 KL_GLFB=1 KL_NOFORK=1`, `--shell`/`--vr` → `KL_SLINK_SHELL=1`/
+`KL_SLINK_VR=1`, `--view` adds `KL_VIEW=1`.
 
 
-- `KL_SLINK_MAIN=1` — run phase 4 at all (onCreate → `nativeRunMain` →
-  `SDL_main` on its own thread). SL-1 (chain binds, `JNI_OnLoad`) stays the
-  unconditional gate; `KL_VIEW=1` implies this.
+- `KL_SLINK_MAIN=1` — start the guest at all. On the SDL doors that is
+  onCreate → `nativeRunMain` → the guest's `main` on its own thread; on the VR
+  door it is the activity lifecycle after `ANativeActivity_onCreate`, which is
+  where the guest reaches OpenXR. Without it the run stops at the bound chain
+  (SDL) or at onCreate (VR), which are the gates that must stay green
+  independently. `KL_VIEW=1` implies it.
 - `KL_SLINK_SHELL=1` — open the OTHER front door: the 2D **configuration
   frontend** (`libshell_arm64-v8a.so` -> `main`, Qt6) instead of the streaming
   client (`libmain.so` -> `SDL_main`). VR APK only — the old one ships Qt5 with
   the stock `qtforandroid` QPA, the VR one ships Qt6 with Valve's own `qvirtual`,
-  which imports no JNI at all. `./build_run_slink.sh --shell` sets it and picks
-  the tree. The shell draws its own UI with no Steam host on the network; the
+  which imports no JNI at all. `./build_run_host.sh steamlink-vr --shell` sets it. The shell draws its own UI with no Steam host on the network; the
   client draws nothing at all without one.
 - `KL_SLINK_VR=1` — open the THIRD front door: `libvrlink_scene.so`, the
   **OpenXR NativeActivity** (`ANativeActivity_onCreate`), instead of either SDL3
@@ -2026,8 +2076,8 @@ Read by the scripts themselves, never forwarded to the app.
 - `KL_SKIP_RETAIL=1` — stage everything except that retail data. Same reasoning
   as `KL_SKIP_OBB`: 1.2 GB that changes only when the user's install does.
 - `KL_LOG_OUT=<file>` — where the pulled log lands (device runs default
-  `/tmp/klepton-device.log`; `build_run_slink.sh` uses it too, default
-  `/tmp/slink.log`).
+  `/tmp/klepton-device.log`; `build_run_host.sh` uses it too, default
+  `/tmp/klepton-host-<target>.log`).
 - `KL_WATCH=<n>` — how many 5 s polls to watch the device log for
   (default 120).
 - `KL_QUIET=<n>` — how many no-growth polls before declaring the run over

@@ -33,7 +33,11 @@
 // The decoded-video image path — an AHardwareBuffer here is a
 // CVPixelBuffer, and what ANGLE can take is the IOSurface behind it.
 #include <CoreVideo/CoreVideo.h>
+// The flat door's zero-readback storage. IOSurfaceRef.h by name: the umbrella
+// IOSurface.h is macOS-only, and visionOS ships only the Ref/Types split.
+#include <IOSurface/IOSurfaceRef.h>
 #include "kl_glfb.h"
+#include "kl_cvmtl.h"      // native-format video frames as MTLTextures
 #include "kl_present.h"
 #include "kl_egl.h"        // kl_gl_cap_* — the capability tables
 #include "kl_reproject.h"  // kl_reproject_set_srgb_decode — see klfb_srgb_settle
@@ -116,6 +120,17 @@ static void *(*a_eglCreateContext)(void *, void *, void *, const int32_t *);
 static void *(*a_eglCreatePbufferSurface)(void *, void *, const int32_t *);
 static int   g_on = -1, g_ready;
 static int   g_w = 4000, g_h = 3200;      // one eye, Quest 2 per-eye default
+
+// The flat door's zero-readback storage: when requested (before init), the
+// root surface is a pbuffer over an IOSurface WE allocate, so the guest's
+// default framebuffer IS shareable storage — the viewer (and one day the app)
+// wraps the same IOSurface in an MTLTexture and samples it, and the display
+// path stops calling glReadPixels entirely. Single-buffered by construction
+// (an EGL surface has one storage), so a compositor sampling mid-frame can see
+// a partial 2D UI — accepted for the pairing shell, where the alternative was
+// a full-frame readback and a pipeline stall every swap.
+static int          g_flat_request;
+static IOSurfaceRef g_flat_ios;
 static unsigned g_presented;
 
 int kl_glfb_enabled(void) {
@@ -125,6 +140,22 @@ int kl_glfb_enabled(void) {
     // back to the null driver rather than a second way to say "on".
     if (g_on < 0) g_on = kl_env_on("KL_GLFB", 0);
     return g_on;
+}
+
+void kl_glfb_request_flat_surface(void) {
+    if (g_ready) {
+        fprintf(stderr, "  [glfb] flat-surface request arrived after ANGLE was "
+                        "up — too late, the root surface exists\n");
+        return;
+    }
+    g_flat_request = 1;
+}
+
+void *kl_glfb_flat_surface(int *w, int *h) {
+    if (!g_flat_ios) return NULL;
+    if (w) *w = g_w;
+    if (h) *h = g_h;
+    return (void *)g_flat_ios;
 }
 
 void kl_glfb_set_size(int w, int h) {
@@ -245,9 +276,79 @@ int kl_glfb_init(void) {
     }
     g_cfg = cfg;
     const int32_t surf_attrs[] = { EGL_WIDTH, g_w, EGL_HEIGHT, g_h, EGL_NONE };
-    g_surf = a_eglCreatePbufferSurface(g_dpy, cfg, surf_attrs);
+    // The flat door's surface first, when asked for: a pbuffer over an
+    // IOSurface we allocate. Every failure falls through to the plain pbuffer
+    // — the accessor answering NULL is how the caller knows to keep the
+    // readback path — and MakeCurrent gets its own retry below because a
+    // surface that CREATES but cannot go current would otherwise take the
+    // whole renderer down for what is only a display optimisation.
+    if (g_flat_request) {
+        void *(*mkclient)(void *, uint32_t, void *, void *, const int32_t *) =
+            asym("eglCreatePbufferFromClientBuffer");
+        if (mkclient) {
+            // Zeroed at birth (lock + memset) so the first composited frame is
+            // black rather than whatever the allocator held.
+            CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+                kCFAllocatorDefault, 4, &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks);
+            int32_t iw = g_w, ih = g_h, bpe = 4, pfmt = 'BGRA';
+            CFNumberRef n;
+            n = CFNumberCreate(NULL, kCFNumberSInt32Type, &iw);
+            CFDictionarySetValue(props, kIOSurfaceWidth, n); CFRelease(n);
+            n = CFNumberCreate(NULL, kCFNumberSInt32Type, &ih);
+            CFDictionarySetValue(props, kIOSurfaceHeight, n); CFRelease(n);
+            n = CFNumberCreate(NULL, kCFNumberSInt32Type, &bpe);
+            CFDictionarySetValue(props, kIOSurfaceBytesPerElement, n); CFRelease(n);
+            n = CFNumberCreate(NULL, kCFNumberSInt32Type, &pfmt);
+            CFDictionarySetValue(props, kIOSurfacePixelFormat, n); CFRelease(n);
+            g_flat_ios = IOSurfaceCreate(props);
+            CFRelease(props);
+            if (g_flat_ios) {
+                IOSurfaceLock(g_flat_ios, 0, NULL);
+                memset(IOSurfaceGetBaseAddress(g_flat_ios), 0,
+                       IOSurfaceGetAllocSize(g_flat_ios));
+                IOSurfaceUnlock(g_flat_ios, 0, NULL);
+                // The same six-attribute contract the video image states, with
+                // the width and height this surface will be rendered at.
+                const int32_t io_attrs[] = {
+                    EGL_WIDTH,  g_w,
+                    EGL_HEIGHT, g_h,
+                    0x345A /* EGL_IOSURFACE_PLANE_ANGLE */,           0,
+                    0x3081 /* EGL_TEXTURE_TARGET */,                  0x305F /* EGL_TEXTURE_2D */,
+                    0x3080 /* EGL_TEXTURE_FORMAT */,                  0x305E /* EGL_TEXTURE_RGBA */,
+                    0x345C /* EGL_TEXTURE_TYPE_ANGLE */,              0x1401 /* GL_UNSIGNED_BYTE */,
+                    0x345D /* EGL_TEXTURE_INTERNAL_FORMAT_ANGLE */,   0x80E1 /* GL_BGRA_EXT */,
+                    EGL_NONE,
+                };
+                g_surf = mkclient(g_dpy, 0x3454 /* EGL_IOSURFACE_ANGLE */,
+                                  (void *)g_flat_ios, cfg, io_attrs);
+                if (!g_surf) {
+                    fprintf(stderr, "  [glfb] IOSurface pbuffer refused — the flat "
+                                    "door keeps the readback path\n");
+                    CFRelease(g_flat_ios);
+                    g_flat_ios = NULL;
+                }
+            }
+        }
+        if (g_surf)
+            fprintf(stderr, "  [glfb] flat surface is a %dx%d IOSurface pbuffer — "
+                            "the picture is shareable storage, nothing reads back\n",
+                    g_w, g_h);
+    }
+    if (!g_surf) g_surf = a_eglCreatePbufferSurface(g_dpy, cfg, surf_attrs);
     const int32_t ctx_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
     g_ctx  = a_eglCreateContext(g_dpy, cfg, EGL_NO_CONTEXT, ctx_attrs);
+    if (g_surf && g_ctx && g_flat_ios && !a_eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx)) {
+        // The IOSurface surface created but cannot go current: retire it and
+        // retry on an ordinary pbuffer before declaring the renderer down.
+        fprintf(stderr, "  [glfb] the IOSurface pbuffer cannot go current — "
+                        "falling back to a plain pbuffer (readback path)\n");
+        unsigned (*dsurf)(void *, void *) = asym("eglDestroySurface");
+        if (dsurf) dsurf(g_dpy, g_surf);
+        CFRelease(g_flat_ios);
+        g_flat_ios = NULL;
+        g_surf = a_eglCreatePbufferSurface(g_dpy, cfg, surf_attrs);
+    }
     if (!g_surf || !g_ctx || !a_eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx)) {
         fprintf(stderr, "  [glfb] could not make an ES3 context current\n");
         return 0;
@@ -3103,7 +3204,15 @@ static void     (*a_glGetTexParameteriv_img)(uint32_t, uint32_t, int32_t *);
 
 typedef struct klfb_image {
     uint32_t magic;
+    // Exactly one of the two storages is set, and it is the frame's pixel
+    // format that chose: BGRA (KL_VTDEC_BGRA=1, or the Simulator) rides an
+    // IOSurface pbuffer bound with eglBindTexImage; the decoder's native
+    // biplanar YCbCr rides an EGLImage over a private-format MTLTexture,
+    // targeted with glEGLImageTargetTexture2DOES.
     void    *pbuf;              // the EGLSurface over the IOSurface
+    void    *img;               // the EGLImage over the MTLTexture
+    void    *cvtex;             // ...whose storage the CVMetalTexture keeps alive
+    void    *pixels;            // ...over this retained CVPixelBuffer
     int      w, h;
     uint32_t bound_tex;         // the GL name it is bound to, 0 if none
     struct klfb_image *next;
@@ -3141,6 +3250,100 @@ int kl_glfb_is_image(const void *h) {
     return found;
 }
 
+// The decoder's native biplanar YCbCr, as ONE texture whose SAMPLER performs
+// the YUV->RGB conversion — which is the promise samplerExternalOES makes on
+// Android, kept in hardware. The pixel-format numbers are Apple's private
+// single-plane YCbCr MTLPixelFormats (WebKit's MetalSPI.h; the patched ANGLE's
+// format table knows them). The NON-sRGB variants, deliberately: sampling
+// returns the transfer-encoded code values, exactly what the BGRA path
+// returned, so the meaning of what the guest writes into its eye texture does
+// not move (the sRGB variants would hand the shader linear instead).
+//
+// The 10-bit row is the PACKED family, not P010: packed (as its
+// lossless/lossy compressed forms) is what VideoToolbox actually hands back
+// for a 10-bit stream when no format is requested — a Steam Link HEVC Main10
+// session decodes to '&xf0'. The unpacked biplanar 10-bit forms are never
+// produced unconstrained, so they are deliberately unmapped: anything outside
+// these families hits the refusal below, which names the fourcc, and
+// KL_VTDEC_BGRA=1 is the escape hatch.
+static unsigned long klfb_video_mtl_format(uint32_t pf) {
+    switch (pf) {
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_Lossy_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_Lossy_420YpCbCr8BiPlanarFullRange:
+        return 500;             // MTLPixelFormatYCBCR8_420_2P
+    case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange:
+    case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarFullRange:
+    case kCVPixelFormatType_Lossy_420YpCbCr10PackedBiPlanarVideoRange:
+        return 508;             // MTLPixelFormatYCBCR10_420_2P_PACKED
+    default:
+        return 0;
+    }
+}
+
+static void *klfb_image_from_native(void *pixels, uint32_t pf,
+                                    int *out_w, int *out_h) {
+    unsigned long fmt = klfb_video_mtl_format(pf);
+    if (!fmt) {
+        static unsigned said;
+        if (said++ < 4)
+            fprintf(stderr, "  [glfb] decoded frame is pixel format '%c%c%c%c', which "
+                            "has no single-plane YCbCr MTLPixelFormat here — "
+                            "KL_VTDEC_BGRA=1 restores the BGRA path\n",
+                    (char)(pf >> 24), (char)(pf >> 16), (char)(pf >> 8), (char)pf);
+        return NULL;
+    }
+    if (!mtl_resolve()) {
+        fprintf(stderr, "  [glfb] no ANGLE Metal interop entry points — a native-"
+                        "format frame cannot be turned into a texture\n");
+        return NULL;
+    }
+    void *cvtex = NULL;
+    void *tex = kl_cvmtl_texture(pixels, fmt, &cvtex);
+    if (!tex) return NULL;
+    const int32_t attrs[] = { EGL_NONE_ };
+    void *img = a_eglCreateImageKHR(g_dpy, EGL_NO_CONTEXT_, EGL_METAL_TEXTURE_ANGLE_,
+                                    tex, attrs);
+    if (img == EGL_NO_IMAGE_) {
+        fprintf(stderr, "  [glfb] eglCreateImageKHR(EGL_METAL_TEXTURE_ANGLE) failed "
+                        "for a '%c%c%c%c' video frame — is the vendored ANGLE the "
+                        "patched one (it knows the private YCbCr formats by "
+                        "number)?\n",
+                (char)(pf >> 24), (char)(pf >> 16), (char)(pf >> 8), (char)pf);
+        kl_cvmtl_release(cvtex);
+        return NULL;
+    }
+    klfb_image *im = calloc(1, sizeof *im);
+    if (!im) {
+        if (a_eglDestroyImageKHR) a_eglDestroyImageKHR(g_dpy, img);
+        kl_cvmtl_release(cvtex);
+        return NULL;
+    }
+    im->magic  = KLFB_IMAGE_MAGIC;
+    im->img    = img;
+    im->cvtex  = cvtex;
+    im->pixels = pixels;
+    CVPixelBufferRetain((CVPixelBufferRef)pixels);
+    im->w = (int)CVPixelBufferGetWidth((CVPixelBufferRef)pixels);
+    im->h = (int)CVPixelBufferGetHeight((CVPixelBufferRef)pixels);
+    pthread_mutex_lock(&g_images_lk);
+    im->next = g_images;
+    g_images = im;
+    pthread_mutex_unlock(&g_images_lk);
+    if (out_w) *out_w = im->w;
+    if (out_h) *out_h = im->h;
+    static unsigned made;
+    if (made++ < 4)
+        fprintf(stderr, "  [glfb] video image %p: '%c%c%c%c' frame as a %dx%d "
+                        "YCbCr MTLTexture (format %lu, sampler converts)\n",
+                (void *)im, (char)(pf >> 24), (char)(pf >> 16), (char)(pf >> 8),
+                (char)pf, im->w, im->h, fmt);
+    return im;
+}
+
 void *kl_glfb_image_from_pixels(void *pixels, int *out_w, int *out_h) {
     if (!pixels) return NULL;
     if (!kl_glfb_init() || !img_resolve()) {
@@ -3148,6 +3351,12 @@ void *kl_glfb_image_from_pixels(void *pixels, int *out_w, int *out_h) {
                         "cannot be turned into a texture (is KL_GLFB=1?)\n");
         return NULL;
     }
+    // The frame's own pixel format picks the storage: anything that is not BGRA
+    // goes to the Metal-texture route, whose format switch is the authority on
+    // what is servable. BGRA continues below on the IOSurface pbuffer.
+    OSType pf = CVPixelBufferGetPixelFormatType((CVPixelBufferRef)pixels);
+    if (pf != kCVPixelFormatType_32BGRA)
+        return klfb_image_from_native(pixels, (uint32_t)pf, out_w, out_h);
     IOSurfaceRef surf = CVPixelBufferGetIOSurface((CVPixelBufferRef)pixels);
     if (!surf) {
         fprintf(stderr, "  [glfb] the decoded frame is not IOSurface-backed — "
@@ -3156,16 +3365,9 @@ void *kl_glfb_image_from_pixels(void *pixels, int *out_w, int *out_h) {
     }
     // The attribute list below states BGRA/UNSIGNED_BYTE to ANGLE, and ANGLE only
     // WARNs when the IOSurface disagrees (IOSurfaceSurfaceMtl::ValidateAttributes
-    // compares bytes-per-element, which every 4-byte format passes). So check the
-    // pixel format here instead: a decoder that started handing back NV12 would
-    // otherwise sample as garbage rather than fail.
-    OSType pf = CVPixelBufferGetPixelFormatType((CVPixelBufferRef)pixels);
-    if (pf != kCVPixelFormatType_32BGRA) {
-        fprintf(stderr, "  [glfb] decoded frame is pixel format '%c%c%c%c', not BGRA — "
-                        "refusing to describe it to ANGLE as something it is not\n",
-                (char)(pf >> 24), (char)(pf >> 16), (char)(pf >> 8), (char)pf);
-        return NULL;
-    }
+    // compares bytes-per-element, which every 4-byte format passes). The pixel
+    // format was checked above, so a decoder handing back something else routes
+    // to the Metal path rather than being described here as what it is not.
     int w = (int)CVPixelBufferGetWidth((CVPixelBufferRef)pixels);
     int h = (int)CVPixelBufferGetHeight((CVPixelBufferRef)pixels);
     const int32_t attrs[] = {
@@ -3271,17 +3473,42 @@ int kl_glfb_image_bind(void *image) {
     }
     if (im->bound_tex == (uint32_t)tex) return 1;      // already there
     pthread_mutex_lock(&g_images_lk);
-    if (im->bound_tex) {
+    if (im->bound_tex && im->pbuf) {
         a_eglReleaseTexImage(g_dpy, im->pbuf, EGL_BACK_BUFFER_);
         im->bound_tex = 0;
     }
+    // Whatever else believed it was this texture's storage is not any more: a
+    // pbuffer is released, an EGLImage merely forgets (retargeting replaces the
+    // storage wholesale, but a stale bound_tex would satisfy the "already
+    // there" shortcut above and skip a real rebind).
     for (klfb_image *o = g_images; o; o = o->next)
         if (o != im && o->bound_tex == (uint32_t)tex) {
-            a_eglReleaseTexImage(g_dpy, o->pbuf, EGL_BACK_BUFFER_);
+            if (o->pbuf) a_eglReleaseTexImage(g_dpy, o->pbuf, EGL_BACK_BUFFER_);
             o->bound_tex = 0;
         }
     pthread_mutex_unlock(&g_images_lk);
     while (a_glGetError && a_glGetError()) {}
+    if (im->img) {
+        // The Metal route: the frame is an EGLImage, and the guest's texture
+        // takes it as its storage. Same call the eye path makes.
+        a_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D_IMG_, im->img);
+        uint32_t e = a_glGetError ? a_glGetError() : 0;
+        if (e) {
+            static int esaid;
+            if (esaid++ < 8)
+                fprintf(stderr, "  [glfb] glEGLImageTargetTexture2DOES(video image "
+                                "%p -> texture %d) -> GL error 0x%x\n",
+                        image, tex, e);
+            return 0;
+        }
+        im->bound_tex = (uint32_t)tex;
+        klfb_external_defaults(tex);
+        static unsigned mbound;
+        if (mbound++ < 4)
+            fprintf(stderr, "  [glfb] video image %p is now texture %d (%dx%d, "
+                            "YCbCr sampled in hardware)\n", image, tex, im->w, im->h);
+        return 1;
+    }
     if (!a_eglBindTexImage(g_dpy, im->pbuf, EGL_BACK_BUFFER_)) {
         static int said;
         if (said++ < 8)
@@ -3309,9 +3536,19 @@ void kl_glfb_image_destroy(void *image) {
     // Release before destroy: a surface still bound to a texture keeps ANGLE's
     // reference on the IOSurface, and the texture would go on sampling storage
     // the decoder has recycled.
-    if (im->bound_tex && a_eglReleaseTexImage)
-        a_eglReleaseTexImage(g_dpy, im->pbuf, EGL_BACK_BUFFER_);
-    if (a_eglDestroySurface_img) a_eglDestroySurface_img(g_dpy, im->pbuf);
+    if (im->pbuf) {
+        if (im->bound_tex && a_eglReleaseTexImage)
+            a_eglReleaseTexImage(g_dpy, im->pbuf, EGL_BACK_BUFFER_);
+        if (a_eglDestroySurface_img) a_eglDestroySurface_img(g_dpy, im->pbuf);
+    }
+    if (im->img) {
+        // A texture still holding this image as storage keeps it (EGL images
+        // are refcounted under their siblings), so destruction order is free
+        // here; the CVMetalTexture and the pixel buffer go with the image.
+        if (a_eglDestroyImageKHR) a_eglDestroyImageKHR(g_dpy, im->img);
+        kl_cvmtl_release(im->cvtex);
+        CVPixelBufferRelease((CVPixelBufferRef)im->pixels);
+    }
     im->magic = 0;
     free(im);
 }

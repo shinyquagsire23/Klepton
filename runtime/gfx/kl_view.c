@@ -64,8 +64,8 @@
 
 // The double-buffered frame store, collapsed to the latest frame: the sink
 // overwrites it under the mutex and sets the flag, the SDL loop consumes and
-// clears it. Dropping intermediate frames is deliberate — the display is
-// 60 Hz, the guest is 72, and a queue would only add latency. The buffer is
+// clears it. Dropping intermediate frames is deliberate — the guest's rate and
+// the display's are independent here, and a queue would only add latency. The buffer is
 // bottom-up RGBA exactly as glReadPixels produced it; the row flip happens on
 // the consuming side so the sink stays a pure memcpy.
 static pthread_mutex_t g_frame_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -100,6 +100,26 @@ int kl_view_available(void) {
     return 1;
 #else
     return 0;
+#endif
+}
+
+// The display rate, measured rather than assumed. SDL's video subsystem is
+// reference counted, so bringing it up here and leaving it up costs the SDL
+// loop nothing later; this runs on the main thread before the guest thread
+// exists, which is the only time the answer is still useful.
+//
+// The CURRENT mode rather than the desktop mode: they differ when something
+// has switched the display, and what the window will actually be shown at is
+// the current one.
+float kl_view_display_hz(void) {
+#ifdef KL_VIEW_HAVE_SDL
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) return 0.0f;
+    SDL_DisplayID id = SDL_GetPrimaryDisplay();
+    if (!id) return 0.0f;
+    const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(id);
+    return (m && m->refresh_rate > 0.0f) ? m->refresh_rate : 0.0f;
+#else
+    return 0.0f;
 #endif
 }
 
@@ -388,6 +408,19 @@ int kl_view_main(const char *libdir, int hw) {
     int done = 0;
     uint64_t t_prev = SDL_GetTicks();
     uint64_t t_start = t_prev, hud_last = t_prev;
+    // Guest frames at the last HUD line, so the HUD can state the rate the
+    // guest ACHIEVED beside the one it was told the display runs at. Nothing on
+    // the host paces the guest's frame loop, so the two are independent numbers
+    // and their difference is the interesting one: a guest told 120 Hz and
+    // delivering 42 is asking whatever feeds it to produce three times the
+    // frames it can consume.
+    unsigned long long hud_frames = 0;
+    // The display period this loop presents against. Falls back to 60 Hz when
+    // SDL cannot name a rate, which is the only case the old fixed 16 ms was
+    // ever right for.
+    float win_hz = kl_view_display_hz();
+    uint64_t period_ms = (win_hz > 0.0f) ? (uint64_t)(1000.0f / win_hz) : 16;
+    if (period_ms < 1) period_ms = 1;
     while (!done) {
         uint64_t t_now = SDL_GetTicks();
         float dt = (float)(t_now - t_prev) / 1000.0f;
@@ -701,18 +734,30 @@ int kl_view_main(const char *libdir, int hw) {
         // the compositor renders alongside the drawable — nothing is read back
         // for kl_glfb to count exactly.
         if (t_now - hud_last >= 1000) {
+            unsigned long long now_frames =
+                hw ? kl_viewmtl_guest_frame() : (unsigned long long)g_frame_seq;
+            float achieved = (float)(now_frames - hud_frames) * 1000.0f /
+                             (float)(t_now - hud_last);
+            hud_frames = now_frames;
             hud_last = t_now;
-            char frames[64];
-            if (hw) snprintf(frames, sizeof frames, "frame %llu, shown %u",
-                             kl_viewmtl_guest_frame(), kl_viewmtl_frames());
-            else    snprintf(frames, sizeof frames, "frame %u", g_frame_seq);
+            char frames[128];
+            if (hw) snprintf(frames, sizeof frames,
+                             "frame %llu, shown %u, %.1f fps vs %.1f advertised",
+                             now_frames, kl_viewmtl_frames(),
+                             (double)achieved, (double)kl_ovrp_display_frequency());
+            else    snprintf(frames, sizeof frames,
+                             "frame %u, %.1f fps vs %.1f advertised", g_frame_seq,
+                             (double)achieved, (double)kl_ovrp_display_frequency());
             // A flat guest has no pose, and printing one would invite the
             // reader to debug a number that means nothing here. `lit` still
             // matters in both modes — it is what separates a blank frame from
             // a dead pipeline.
             if (mono)
+                // The readback path counted lit exactly; the hardware path
+                // estimates it from the compositor's 64x64 downsample — same
+                // split the stereo line below carries.
                 fprintf(stderr, "view: [mono] %s, lit=%lu\n",
-                        frames, kl_glfb_last_frame_lit());
+                        frames, hw ? kl_viewmtl_lit() : kl_glfb_last_frame_lit());
             else
                 fprintf(stderr,
                     "view: %s, pose (%.2f, %.2f, %.2f) yaw=%.1f pitch=%.1f, lit=%lu\n",
@@ -722,10 +767,13 @@ int kl_view_main(const char *libdir, int hw) {
                     hw ? kl_viewmtl_lit() : kl_glfb_last_frame_lit());
         }
 
-        // ~60 Hz: pace on the remainder rather than a blind SDL_Delay(16),
-        // so a slow upload does not compound into slower frames.
+        // Pace on the remainder rather than a blind delay, so a slow upload
+        // does not compound into slower frames. The period is the display's,
+        // because this loop presenting at half the panel's rate while the guest
+        // is told the panel's full rate would make the advertised number a
+        // ceiling the viewer itself enforces below.
         uint64_t elapsed = SDL_GetTicks() - t_now;
-        if (elapsed < 16) SDL_Delay((uint32_t)(16 - elapsed));
+        if (elapsed < period_ms) SDL_Delay((uint32_t)(period_ms - elapsed));
     }
 
     unsigned shown = hw ? kl_viewmtl_frames() : g_frame_seq;

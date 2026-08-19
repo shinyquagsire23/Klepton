@@ -392,7 +392,7 @@ TARGETS = {
     "steamlink-vr": {
         # BOTH front doors, because the app runs both: the 2D shell pairs in a
         # WindowGroup and hands off to the OpenXR half in an ImmersiveSpace, in
-        # one process (an app bundle cannot re-exec the way `build/m_slink` does).
+        # one process (an app bundle cannot re-exec the way `build/m_boot` does).
         # 
         # Three groups, and the third is the one that is easy to leave out:
         #  libvrlink_scene   the VR door. ONE library — its DT_NEEDED is
@@ -446,6 +446,12 @@ TARGETS = {
         "obb":     "obb",
         "entry":   "libvrlink_scene",
         "kind":    "steamlink",
+        # The userdata KEY, which is the row name everywhere else. It is spelled
+        # out here because this directory holds the PAIRING CREDENTIAL: it is
+        # named "steamlink" on disk, and keying it on the row instead would point
+        # a working install at an empty directory — which presents as the Steam
+        # host having deauthorized us and costs a re-pair to disbelieve.
+        "userdata": "steamlink",
         "product": "KleptonSteamLink",
         "display": "Klepton Steam Link",
     },
@@ -556,7 +562,7 @@ def c_table():
         "// cannot disagree about which tree, which APK or which boot sequence a",
         "// target means. See runtime/kl_target.h for the struct these expand into.",
         "",
-        "// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, obb, kind)",
+        "// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, userdata, obb, kind)",
         "#ifndef KL_TARGET_ROW",
         "#error \"include this through runtime/kl_target.c\"",
         "#endif",
@@ -565,9 +571,12 @@ def c_table():
     for name in sorted(TARGETS):
         t = TARGETS[name]
         kind = "KL_GUEST_" + t["kind"].upper()
-        out.append('KL_TARGET_ROW("%s", "%s", "%s", "%s", "%s", "%s", "%s", %s)'
+        # `userdata` defaults to the row name — one profile per target is the
+        # rule, and a row only states it to KEEP a directory a previous naming
+        # created (steamlink-vr).
+        out.append('KL_TARGET_ROW("%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", %s)'
                    % (name, t["tree"], t["apk"], t["assets"], t["srcdir"],
-                      t["entry"], t["obb"], kind))
+                      t["entry"], t.get("userdata", name), t["obb"], kind))
     out += ["", '#define KL_TARGET_DEFAULT_NAME "%s"' % DEFAULT, ""]
     return "\n".join(out)
 

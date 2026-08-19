@@ -51,7 +51,14 @@ typedef struct {
     const char *assets;     // <tree>/assets, the AssetManager root
     const char *libdir;     // <tree>/lib/arm64-v8a, relative to the repo root
     const char *entry_lib;  // the library the chain starts at ("libmain")
-    const char *userdata;   // the userdata KEY — see kl_target_resolve()
+    // The userdata KEY — the name of the profile directory saves, PlayerPrefs
+    // and pairing credentials live in. It is the target's own name unless the
+    // table says otherwise, which one row does: Steam Link's credential was
+    // written under "steamlink" before the target row existed, and a key that
+    // disagrees with an installed profile reads as a deauthorized host rather
+    // than as a moved directory. See kl_target_resolve() for the synthesized
+    // trees, which drop a trailing "-<digits>" so version swaps share a profile.
+    const char *userdata;
     // Where this guest looks for its OBB, RELATIVE to the external-storage
     // root — <userdata>/<obb> on the host, <container>/android-files/<obb> in
     // the app. It is in the table because it is not one layout: a Unity guest

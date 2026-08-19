@@ -9,6 +9,9 @@
 // Nothing here knows what AMediaCodec is.
 #include "kl_vtdec.h"
 
+#include "kl_env.h"
+
+#include <TargetConditionals.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +63,8 @@ typedef struct { CVPixelBufferRef pb; int64_t pts_us; } klvt_frame;
 
 struct kl_vtdec {
     int codec;
+    int bgra;                   // sessions request 32BGRA (KL_VTDEC_BGRA=1, or
+                                // the Simulator); 0 = decoder's native format
 
     // The most recent copy of each parameter set. Kept rather than pointed at:
     // they arrive inside a guest buffer that is reused the moment we return,
@@ -255,23 +260,48 @@ static int klvt_rebuild(kl_vtdec *d) {
 
     CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(d->fmt);
 
-    // What we want back. BGRA rather than the decoder's native NV12 — see the
-    // header; the IOSurface and Metal keys are what make the result usable as
-    // an MTLTexture without a copy, which is the entire point of the path this
-    // feeds.
+    // What we want back. By default: no pixel format at all. Requesting one is
+    // itself a cost twice over — the conversion out of the decoder's native
+    // biplanar 4:2:0 (BGRA is 2.67x the bytes at Steam Link's 1536x6144), and
+    // the copy VideoToolbox performs on visionOS 2 merely because a format was
+    // named (~2 ms/frame at high resolution, measured by the VisionOSALVRClient
+    // author). The native frame is served to the guest by kl_glfb.c through
+    // Apple's private single-plane YCbCr MTLPixelFormats, where the SAMPLER
+    // does the YUV->RGB — the samplerExternalOES promise kept in hardware.
+    //
+    // KL_VTDEC_BGRA=1 restores the BGRA request (the A/B, and the escape hatch
+    // for a native format kl_glfb cannot wrap). The Simulator always takes it:
+    // the private formats do not exist there. The Metal key is what makes the
+    // result usable as an MTLTexture without a copy either way; the IOSurface
+    // key rides with BGRA because the pbuffer path needs IOSurface backing
+    // explicitly.
+#if TARGET_OS_SIMULATOR
+    d->bgra = 1;
+#else
+    d->bgra = kl_env_on("KL_VTDEC_BGRA", 0);
+#endif
     CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 4, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
-    int32_t pf = kCVPixelFormatType_32BGRA;
-    CFNumberRef pfn = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pf);
-    CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, pfn);
-    CFRelease(pfn);
     CFDictionarySetValue(attrs, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
-    CFDictionaryRef empty = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0,
-                                               &kCFTypeDictionaryKeyCallBacks,
-                                               &kCFTypeDictionaryValueCallBacks);
-    CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, empty);
-    CFRelease(empty);
+    if (d->bgra) {
+        int32_t pf = kCVPixelFormatType_32BGRA;
+        CFNumberRef pfn = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pf);
+        CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, pfn);
+        CFRelease(pfn);
+        CFDictionaryRef empty = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0,
+                                                   &kCFTypeDictionaryKeyCallBacks,
+                                                   &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, empty);
+        CFRelease(empty);
+    } else {
+        // Keeps the decoder from stalling on buffer churn while frames sit in
+        // our ring; the count is the reference client's.
+        int32_t mincount = 3;
+        CFNumberRef mcn = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &mincount);
+        CFDictionarySetValue(attrs, kCVPixelBufferPoolMinimumBufferCountKey, mcn);
+        CFRelease(mcn);
+    }
 
     VTDecompressionOutputCallbackRecord cb = { klvt_output, d };
     st = VTDecompressionSessionCreate(kCFAllocatorDefault, d->fmt, NULL, attrs,
@@ -284,8 +314,9 @@ static int klvt_rebuild(kl_vtdec *d) {
     }
 
     d->n_sess_created++;
-    fprintf(stderr, "  [vtdec] %s decoder ready: %dx%d -> BGRA%s\n",
+    fprintf(stderr, "  [vtdec] %s decoder ready: %dx%d -> %s%s\n",
             d->codec == KLVT_HEVC ? "HEVC" : "H.264", dim.width, dim.height,
+            d->bgra ? "BGRA" : "native format (none requested)",
             d->n_sess_created > 1 ? " (session rebuilt — reference frames lost)" : "");
     d->width = dim.width; d->height = dim.height;
     return 0;

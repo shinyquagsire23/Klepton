@@ -1,5 +1,4 @@
-// See kl_slink.h. Moved out of mains/m_slink.c, which had been the only driver
-// until the visionOS app became the second one.
+// See kl_slink.h.
 #include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -304,9 +303,132 @@ static void report_image(FILE *out, const char *soname, kl_image *img) {
             st->imports_bound, st->imports_missing);
 }
 
+// ------------------------------------------------- what the client reports --
+//
+// The streaming client does not choose its own video bitrate; the Steam host
+// does, from what the client tells it. That whole channel is one function —
+// every quality, loss and pacing number the client publishes is a
+// SVLRoot::SetValue(key, double) into a map the two ends sync, keyed by a short
+// string ("cRXpps", "cRXerr", "cRXpass", "cAudBufMin", "cFramePhase"). The
+// client imports nothing to do it, so the only way to watch it is to answer the
+// symbol itself, which kl_interpose does through the PLT.
+//
+// Reading the key means reading a libc++ std::string by hand: the low bit of
+// the first byte distinguishes the two representations, and short strings —
+// which every key is — store their bytes immediately after that byte.
+static const char SVL_SETVALUE[] =
+    "_ZN7SVLRoot8SetValueERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEE"
+    "NS0_9allocatorIcEEEEd";
+
+static uint64_t (*g_svl_setvalue_real)(void *, const void *, double);
+
+static const char *cxx_string(const void *s) {
+    const unsigned char *p = s;
+    if (p[0] & 1) {                              // long: cap, size, data
+        const char *const *data = (const char *const *)((const char *)s + 16);
+        return *data ? *data : "";
+    }
+    return (const char *)s + 1;                  // short: bytes follow the size
+}
+
+static uint64_t svl_setvalue_trace(void *self, const void *key, double v) {
+    const char *k = cxx_string(key);
+    // A key whose number has not moved says nothing, and one that moves every
+    // frame says it 5000 times: cStandoff is written per frame and buried the
+    // once-a-second loss counters that are the reason to be looking. So: the
+    // first write of a key always prints, and after that only a CHANGED value,
+    // at most once a second. That leaves each key as a readable per-second
+    // series, which is the shape a trend has to be read from.
+    static struct { char k[24]; double v; double t; } seen[64];
+    static unsigned n;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = ts.tv_sec + ts.tv_nsec * 1e-9;
+    unsigned i = 0;
+    for (; i < n; i++) if (!strcmp(seen[i].k, k)) break;
+    if (i < n) {
+        if (seen[i].v == v || now - seen[i].t < 1.0) goto through;
+    } else if (n < 64) {
+        snprintf(seen[n].k, sizeof seen[n].k, "%s", k);
+        n++;
+    } else {
+        goto through;                 // more keys than slots: name nothing new
+    }
+    seen[i].v = v;
+    seen[i].t = now;
+    fprintf(stderr, "  [svl] %s = %g\n", k, v);
+through:
+    return g_svl_setvalue_real ? g_svl_setvalue_real(self, key, v) : 0;
+}
+
+// The other half of the same question, and it is in the OTHER protocol. The VR
+// client streams over Valve's SVL link above; the SHELL does the 2D Remote Play
+// handshake that authorizes the session, and there it sends a
+// CStreamingClientCaps stating what its decoder can take. Nothing in the shell
+// measures that number — it makes no MediaCodec capability call at all — so it
+// is a constant or a setting, and if the host honours it for the VR stream too
+// it is a ceiling no amount of clean loss reporting will lift.
+//
+// Field offsets are not guessed: CStreamingClientCaps::_InternalParse dispatches
+// on the wire tag, and stores tag 0x18 (field 3, maximum_decode_bitrate_kbps) at
+// +0x50 and tag 0x20 (field 4, maximum_burst_bitrate_kbps) at +0x54, with
+// has-bits 1 and 2 in the word at +0x10. ByteSizeLong is the read point because
+// serialisation calls it with the message fully populated.
+static const char SHELL_CAPS_BYTESIZE[] =
+    "_ZNK20CStreamingClientCaps12ByteSizeLongEv";
+
+static size_t (*g_caps_bytesize_real)(const void *);
+
+// EStreamVideoCodec, in declaration order from libshell's descriptor.
+static const char *caps_codec_name(int32_t c) {
+    static const char *const n[] = { "None", "Raw", "VP8", "VP9", "H264",
+                                     "HEVC", "ORBX1", "ORBX2", "AV1" };
+    return (c >= 0 && c < (int32_t)(sizeof n / sizeof *n)) ? n[c] : "?";
+}
+
+static size_t caps_bytesize_trace(const void *self) {
+    const unsigned char *p = self;
+    uint32_t has;
+    int32_t dec, burst, ncodec;
+    memcpy(&has,    p + 0x10, sizeof has);
+    memcpy(&dec,    p + 0x50, sizeof dec);
+    memcpy(&burst,  p + 0x54, sizeof burst);
+    // supported_video_codecs is the third RepeatedField in the message, at
+    // +0x38: {current_size_, total_size_, Rep *}, elements at Rep + 8.
+    memcpy(&ncodec, p + 0x38, sizeof ncodec);
+    const void *rep = NULL;
+    memcpy(&rep, p + 0x40, sizeof rep);
+    static int32_t last_dec, last_burst, last_ncodec = -1;
+    static int said;
+    if (said && dec == last_dec && burst == last_burst && ncodec == last_ncodec)
+        goto through;
+    said = 1;
+    last_dec = dec; last_burst = burst; last_ncodec = ncodec;
+    // An unset field is not a zero: the host reads absence as "no opinion" and a
+    // stated 0 as a stated 0, so the line has to tell them apart.
+    fprintf(stderr, "  [svl] client caps: maximum_decode_bitrate_kbps %s%d, "
+                    "maximum_burst_bitrate_kbps %s%d\n",
+            (has & 0x2) ? "= " : "UNSET, would read ", dec,
+            (has & 0x4) ? "= " : "UNSET, would read ", burst);
+    if (rep && ncodec > 0 && ncodec <= 64) {
+        const int32_t *el = (const int32_t *)((const char *)rep + 8);
+        fprintf(stderr, "  [svl] client caps: supported_video_codecs =");
+        for (int32_t i = 0; i < ncodec; i++)
+            fprintf(stderr, " %s(%d)", caps_codec_name(el[i]), el[i]);
+        fputc('\n', stderr);
+    }
+through:
+    return g_caps_bytesize_real ? g_caps_bytesize_real(self) : 0;
+}
+
 int kl_slink_load_chain(FILE *out) {
     size_t nchain;
     const char *const *chain = kl_slink_chain(&nchain);
+    int trace_svl = kl_env_int("KL_SVL_TRACE", 0);
+    if (trace_svl) {
+        kl_interpose(SVL_SETVALUE, (void *)svl_setvalue_trace);
+        kl_interpose(SHELL_CAPS_BYTESIZE, (void *)caps_bytesize_trace);
+    }
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (size_t i = 0; i < nchain; i++) {
@@ -320,6 +442,23 @@ int kl_slink_load_chain(FILE *out) {
         }
         kl_register_image(path, img);      // dependencies first, so the next
         report_image(out, chain[i], img);  // library's imports bind against it
+        if (trace_svl) {
+            // kl_sym answers the guest's own definition, not the interposed
+            // slot, so these are the call-through addresses.
+            if (!g_svl_setvalue_real) {
+                g_svl_setvalue_real = (uint64_t (*)(void *, const void *, double))
+                                      kl_sym(img, SVL_SETVALUE);
+                if (g_svl_setvalue_real && out)
+                    fprintf(out, "  [svl] tracing SVLRoot::SetValue in %s\n", chain[i]);
+            }
+            if (!g_caps_bytesize_real) {
+                g_caps_bytesize_real = (size_t (*)(const void *))
+                                       kl_sym(img, SHELL_CAPS_BYTESIZE);
+                if (g_caps_bytesize_real && out)
+                    fprintf(out, "  [svl] tracing CStreamingClientCaps in %s\n",
+                            chain[i]);
+            }
+        }
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (out) fprintf(out, "  chain mapped and relocated in %.1f ms\n",
@@ -380,10 +519,9 @@ void kl_slink_run_inits(FILE *out) {
 //                               -> SDLActivity.main() -> nativeRunMain(lib, fn, args)
 //                               -> nativeCleanupMainThread()
 //
-// This moved out of mains/m_slink.c when the visionOS app became the second
-// driver: it is SDL3's contract with Android and a property of this guest, so
-// two drivers must not be able to describe it differently. What stayed with the
-// driver is when to run it and how long to wait afterwards.
+// It is SDL3's contract with Android and a property of this guest, so no driver
+// gets to describe it differently. What stays with the driver is when to run it
+// and how long to wait afterwards.
 #define SL_SDLA "org/libsdl/app/SDLActivity"
 
 typedef void (*v_env_cls)(void *, void *);

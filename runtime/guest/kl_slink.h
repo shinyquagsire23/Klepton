@@ -1,13 +1,11 @@
 // The Steam Link target, as a thing two drivers can both open.
 //
-// Everything here used to live in mains/m_slink.c, which was fine while there
-// was exactly one way to run this guest: a command line on macOS. There are two
-// now — `build/m_slink` and the visionOS app bundle — and they agree about
-// nothing except the guest, so the guest's own description is what has to be
-// shared. Which libraries are in the chain, which front door a run opens, what
-// the JNI surface says the app is, and what Android's NativeActivity does to
-// start it: all of that is a property of *Steam Link*, not of whoever is
-// driving it.
+// There are two ways to run this guest — `build/m_boot` on macOS and the
+// visionOS app bundle — and they agree about nothing except the guest, so the
+// guest's own description is what is shared. Which libraries are in the chain,
+// which front door a run opens, what the JNI surface says the app is, and what
+// Android's NativeActivity does to start it: all of that is a property of
+// *Steam Link*, not of whoever is driving it.
 //
 // What deliberately does NOT live here is anything that decides *policy*: the
 // recon phases, KL_GAP_ONLY, the fork/re-exec, the viewer, the 2D->VR handoff
@@ -110,7 +108,7 @@ void kl_slink_run_inits(FILE *out);
 // natives, and then the surface/resolution calls SDLSurface would have made
 // before SDLMain.run spawns mSDLThread. It lives here for the same reason the
 // VR door's onCreate does — it is a property of *this guest*, and the visionOS
-// app must not describe it differently from `build/m_slink`.
+// app must not describe it differently from `build/m_boot`.
 //
 // _onload runs libSDL3's JNI_OnLoad and checks the two natives SDLActivity's
 // own onCreate calls first, so a chain that bound but registered nothing fails

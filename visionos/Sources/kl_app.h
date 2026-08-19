@@ -1,12 +1,13 @@
 // The bundle-shaped entry into the Klepton runtime.
 //
-// This is t_boot's sequence with the harness removed. What goes away is
-// everything that assumed a command line and a Unix process tree: the forked
-// DRM-guard self-test, the re-exec'd recon child (an app bundle never forks, and the Metal-refuses-forked-children reason for it is moot once it does not), argv path handling, and the SDL viewer.
-//
-// What stays is the part that is actually under test: load libmain, run its
-// JNI_OnLoad against the synthetic JavaVM, drive NativeLoader.load to pull in
-// libunity, and call UnityPlayer.initJni. That is the boot gate.
+// The guest's own sequences — the four doors, the lifecycle, one frame, the
+// reports — are runtime/guest/kl_driver.c, shared verbatim with `build/m_boot`,
+// because a guest described two ways is a bug with no error surface. What is
+// here is the bundle: where the files are, the log file, the heartbeat, the
+// guest thread the compositor paces, and the 2D->VR handoff. What is
+// deliberately absent is everything that assumes a command line and a Unix
+// process tree — the forked DRM-guard self-test, the re-exec'd recon child, argv
+// path handling and the SDL viewer.
 //
 // Deliberately C, not Swift. Everything here is guest-facing — opaque jobjects,
 // function pointers cast to JNI signatures, a JNIEnv we synthesise — and none
@@ -38,8 +39,9 @@ int kl_app_configure(const char *resources, const char *container);
 int kl_app_boot(void);
 
 // The Android lifecycle, after kl_app_boot: nativeRecreateGfxState, nativeResume,
-// nativeRender, then `frames` more pumped frames with the Choreographer ticked
-// and the posted-task queue drained between them.
+// nativeRender, then `frames` more pumped frames with the posted-task queue
+// drained between them. A guest that owns its own frame loop takes a pump in
+// SECONDS instead — a frame count means nothing to it.
 //
 // Separate from kl_app_boot on purpose. Boot is the gate and refuses a second
 // entry, so keeping them apart lets a run take the gate's numbers first and only

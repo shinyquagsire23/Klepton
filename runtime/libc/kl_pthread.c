@@ -794,8 +794,8 @@ int klb_pthread_create(pthread_t *out, const bionic_attr *ga,
     // asks first, and `sample` only answers it for threads that were actually
     // created — a thread the guest never started leaves no trace at all, which
     // reads identically to a thread that exited. The entry pointer is printed
-    // because it symbolises against the chain's load addresses (see
-    // report_image in m_slink.c) and so names WHICH pool or subsystem it was.
+    // because it symbolises against the chain's load addresses each door
+    // prints at load, and so names WHICH pool or subsystem it was.
     static int trace = -1;
     if (trace < 0) trace = kl_env_on("KL_TRACE_THREADS", 0);
     if (trace)

@@ -12,6 +12,16 @@ int  kl_glfb_enabled(void);
 int  kl_glfb_init(void);
 void kl_glfb_set_size(int w, int h);
 
+// The flat door's zero-readback storage. Requested BEFORE ANGLE comes up
+// (view_run does, for a flat Steam Link door), the root surface becomes a
+// pbuffer over an IOSurface kl_glfb allocates: the guest's default framebuffer
+// IS shareable storage, and the compositor samples it instead of anything
+// calling glReadPixels. The accessor answers NULL until init — and forever, if
+// the request was never made or the IOSurface route was refused (the caller
+// keeps the readback sink in that case). Returns the IOSurfaceRef.
+void  kl_glfb_request_flat_surface(void);
+void *kl_glfb_flat_surface(int *w, int *h);
+
 // The host's GL entry point for `name`, or NULL to mean "keep your own answer" —
 // which is what the capability queries get, since the guest must go on believing
 // it is driving GLES 3.2.

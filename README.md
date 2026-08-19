@@ -47,7 +47,8 @@ Quick run scripts:
 ```bash
 ./build_run_viewer.sh [target] # build and run macOS frontend
 ./build_run_vpro.sh [target]  # build and run Vision Pro frontend
-./build_run_slink.sh --shell --view  # macOS Steam VR Link frontend (WIP)
+./build_run_host.sh [target]  # build and run a guest headless, with a summary
+./build_run_host.sh steamlink-vr --shell --view  # Steam VR Link frontend (WIP)
 ```
 
 Where `[target]` is the name of the target, defaulting to `beatsaber`.

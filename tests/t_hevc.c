@@ -68,6 +68,27 @@ static void check(int ok, const char *what) {
 // frame count would be wrong.
 static int is_vcl(const unsigned char *nal) { return ((nal[0] >> 1) & 0x3f) <= 31; }
 
+// The formats kl_glfb.c can wrap in a single-plane YCbCr MTLTexture — the same
+// family its klfb_video_mtl_format() maps. With no format requested (the
+// default), VideoToolbox must land in this set or the video path downstream
+// refuses the frame by fourcc.
+static int is_wrappable_biplanar(uint32_t pf) {
+    switch (pf) {
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_Lossy_420YpCbCr8BiPlanarVideoRange:
+    case kCVPixelFormatType_Lossy_420YpCbCr8BiPlanarFullRange:
+    case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange:
+    case kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarFullRange:
+    case kCVPixelFormatType_Lossy_420YpCbCr10PackedBiPlanarVideoRange:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 int main(void) {
     printf("=== HEVC decode (kl_vtdec, VideoToolbox) ===\n");
 
@@ -121,24 +142,28 @@ int main(void) {
             decoded++;
             if ((int)CVPixelBufferGetWidth(pb) != EXPECT_W ||
                 (int)CVPixelBufferGetHeight(pb) != EXPECT_H) bad_size++;
-            if (CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_32BGRA)
+            if (!is_wrappable_biplanar(CVPixelBufferGetPixelFormatType(pb)))
                 bad_fmt++;
             // Every frame carries the pts of SOME submitted access unit; which
             // one depends on how far the decoder is behind, so the assertion is
             // that it is one of ours rather than that it is this one.
             if (got < 0 || got % 33333 != 0) bad_pts++;
 
+            // The luma plane is the picture for this purpose; a biplanar frame
+            // has no base address of its own to walk.
             CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-            const unsigned char *px = CVPixelBufferGetBaseAddress(pb);
-            size_t stride = CVPixelBufferGetBytesPerRow(pb);
+            const unsigned char *px = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+            size_t stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
             int varied = 0;
             if (px) {
                 unsigned char first = px[0];
                 for (int y = 0; y < EXPECT_H && !varied; y += 8)
-                    for (int x = 0; x < EXPECT_W * 4 && !varied; x += 16)
+                    for (int x = 0; x < EXPECT_W && !varied; x += 4)
                         if (px[(size_t)y * stride + x] != first) varied = 1;
             }
-            if (!varied) uniform++;
+            // A frame the CPU cannot map (a compressed-storage format) is not
+            // evidence of a blank; only a readable uniform plane is.
+            if (px && !varied) uniform++;
             CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
             CVPixelBufferRelease(pb);
             break;
@@ -194,7 +219,7 @@ int main(void) {
     check(submit_errors == 0, "every access unit submitted without error");
     check(decoded == EXPECT_FRAMES, "30 frames decoded");
     check(bad_size == 0, "every frame is 320x240");
-    check(bad_fmt == 0, "every frame is BGRA (what the EGLImage path wants)");
+    check(bad_fmt == 0, "every frame is a wrappable biplanar YCbCr format");
     check(bad_pts == 0, "the guest's pts survives the round trip");
     check(uniform == 0, "the frames carry a picture, not a uniform blank");
     check(drop == 0, "nothing was dropped for want of ring space");
@@ -205,6 +230,47 @@ int main(void) {
 
     kl_vtdec_report(stdout);
     kl_vtdec_destroy(d);
+
+    // The A/B stays honest only while both arms work: KL_VTDEC_BGRA=1 is the
+    // escape hatch for a native format kl_glfb cannot wrap, and an escape
+    // hatch nothing exercises is one that has quietly rotted. One decode pass,
+    // asserting the request took.
+    setenv("KL_VTDEC_BGRA", "1", 1);
+    kl_vtdec *db = kl_vtdec_create("video/hevc");
+    check(db != NULL, "KL_VTDEC_BGRA=1: decoder created");
+    int bgra_frames = 0, bgra_bad_fmt = 0;
+    if (db) {
+        // Pull while submitting — the ring is shallower than the stream, and a
+        // frame dropped for want of a reader would fail the count for the
+        // wrong reason.
+        long p = 0;
+        for (int c = 0; c < n_cuts; c++) {
+            kl_vtdec_submit(db, buf + p, (size_t)(cuts[c] - p), (int64_t)c * 33333);
+            p = cuts[c];
+            for (int spin = 0; spin < 200; spin++) {
+                CVPixelBufferRef pb = kl_vtdec_pull(db, NULL);
+                if (!pb) { usleep(500); continue; }
+                bgra_frames++;
+                if (CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_32BGRA)
+                    bgra_bad_fmt++;
+                CVPixelBufferRelease(pb);
+                break;
+            }
+        }
+        for (int spin = 0; spin < 600 && bgra_frames < EXPECT_FRAMES; spin++) {
+            CVPixelBufferRef pb = kl_vtdec_pull(db, NULL);
+            if (!pb) { usleep(1000); continue; }
+            bgra_frames++;
+            if (CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_32BGRA)
+                bgra_bad_fmt++;
+            CVPixelBufferRelease(pb);
+        }
+        kl_vtdec_destroy(db);
+    }
+    unsetenv("KL_VTDEC_BGRA");
+    check(bgra_frames == EXPECT_FRAMES, "KL_VTDEC_BGRA=1: 30 frames decoded");
+    check(bgra_bad_fmt == 0, "KL_VTDEC_BGRA=1: every frame is BGRA");
+
     free(pfx);
     free(cuts);
     free(buf);

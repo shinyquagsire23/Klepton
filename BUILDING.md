@@ -158,8 +158,9 @@ Everything below builds what it needs first. `<target>` is any name from
 | a guest on macOS, headless | `./build/m_boot <target>` |
 | a guest on the visionOS Simulator | `KLEPTON_TARGET=<target> visionos/run.sh` |
 | a guest on Vision Pro | `./build_run_vpro.sh <target>` |
-| Steam Link config UI, macOS | `./build_run_slink.sh --shell --view` |
-| Steam Link shim work list, in seconds | `./build_run_slink.sh --gap` |
+| a guest on macOS, with a summary | `./build_run_host.sh <target>` |
+| Steam Link config UI, macOS | `./build_run_host.sh steamlink-vr --shell --view` |
+| any target's shim work list, in seconds | `./build_run_host.sh <target> --gap` |
 | visionOS build gate, no device needed | `make xros` |
 
 ---

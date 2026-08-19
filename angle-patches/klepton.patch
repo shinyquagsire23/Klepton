@@ -1,3 +1,37 @@
+diff --git a/src/libANGLE/formatutils.cpp b/src/libANGLE/formatutils.cpp
+index 0e6d9b3..19b15a1 100644
+--- a/src/libANGLE/formatutils.cpp
++++ b/src/libANGLE/formatutils.cpp
+@@ -1415,6 +1415,11 @@ static InternalFormatInfoMap BuildInternalFormatInfoMap()
+     //                | Internal format                   | Cr | Y | Cb | Format                            | Type            | Texture supported
+     AddYUVFormat(&map, GL_G8_B8R8_2PLANE_420_UNORM_ANGLE,   8,   8,  8,  GL_G8_B8R8_2PLANE_420_UNORM_ANGLE,  GL_UNSIGNED_BYTE, RequireExt<&Extensions::yuvInternalFormatANGLE>);
+     AddYUVFormat(&map, GL_G8_B8_R8_3PLANE_420_UNORM_ANGLE,  8,   8,  8,  GL_G8_B8_R8_3PLANE_420_UNORM_ANGLE, GL_UNSIGNED_BYTE, RequireExt<&Extensions::yuvInternalFormatANGLE>);
++    // Klepton: the 10-bit two-plane form, which upstream leaves without an
++    // InternalFormatInfo entry (its FormatID and GLenum exist for Vulkan's
++    // sake). Without this, gl::Format() on the enum answers invalid and a
++    // 10-bit video EGLImage sibling is refused before Metal is even asked.
++    AddYUVFormat(&map, GL_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16_ANGLE, 10, 10, 10, GL_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16_ANGLE, GL_UNSIGNED_SHORT, RequireExt<&Extensions::yuvInternalFormatANGLE>);
+ 
+     // clang-format on
+ 
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index 71f0c61..dbc9481 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -959,6 +959,13 @@ void DisplayMtl::initializeExtensions() const
+     mNativeExtensions.textureMirrorClampToEdgeEXT   = true;
+     mNativeExtensions.depthClampEXT                 = true;
+     mNativeExtensions.rgbxInternalFormatANGLE       = mFeatures.hasTextureSwizzle.enabled;
++    // Klepton: the YUV internal formats' filterSupport requires this extension
++    // (formatutils.cpp AddYUVFormat), and without it a video EGLImage sibling
++    // in one of the private YCbCr formats (mtl_common.h) fails sampler
++    // completeness under LINEAR — sampling black with no error anywhere. The
++    // glTexStorage path the extension also advertises is unexercised here: the
++    // only source of YUV textures is the EGLImage sibling over a decoder frame.
++    mNativeExtensions.yuvInternalFormatANGLE        = true;
+ 
+     // EXT_debug_marker is not implemented yet, but the entry points must be exposed for the
+     // Metal backend to be used in Chrome (http://anglebug.com/42263519)
 diff --git a/src/libANGLE/renderer/metal/FrameBufferMtl.mm b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
 index 2825a7c..49f308d 100644
 --- a/src/libANGLE/renderer/metal/FrameBufferMtl.mm
@@ -141,10 +175,10 @@ index 2825a7c..49f308d 100644
          mStencilRenderTarget == nullptr)
      {
 diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
-index 85cc743..a1d7f17 100644
+index 85cc743..9443488 100644
 --- a/src/libANGLE/renderer/metal/mtl_common.h
 +++ b/src/libANGLE/renderer/metal/mtl_common.h
-@@ -113,7 +113,12 @@ constexpr size_t kDefaultAttributeSize = 4 * sizeof(float);
+@@ -113,7 +113,29 @@ constexpr size_t kDefaultAttributeSize = 4 * sizeof(float);
  
  // Metal limits
  constexpr uint32_t kMaxShaderBuffers     = 31;
@@ -155,10 +189,27 @@ index 85cc743..a1d7f17 100644
 +// sequentially (see ProgramExecutableMtl::updateTextures), so the raise only
 +// widens GL-side validation; M1 allows 128 textures/stage underneath.
 +constexpr uint32_t kMaxShaderSamplers    = 32;
++// Klepton: Apple's private single-plane YCbCr pixel formats. The sampler
++// hardware performs the YCbCr->RGB conversion, so a biplanar 4:2:0 video frame
++// binds as ONE texture that samples as RGB — which is the promise
++// samplerExternalOES makes on Android. The numbers are WebKit's
++// (Source/WebGPU/WebGPU/MetalSPI.h): 500 is the 8-bit biplanar form (NV12),
++// 508 the 10-bit PACKED form — packed, not P010 (505), because packed is what
++// VideoToolbox actually hands back for a 10-bit stream when no format is
++// requested (kCVPixelFormatType_Loss{y,less}_420YpCbCr10PackedBiPlanar*; a
++// Steam Link HEVC Main10 session decodes to '&xf0'). The unpacked form is
++// never produced unconstrained, so it is deliberately not mapped. Non-sRGB
++// variants deliberately — sampling returns the transfer-encoded code values,
++// exactly what decoding to BGRA returned, so nothing downstream changes
++// meaning. These exist only as EGLImage siblings of externally-created
++// textures (CVMetalTextureCache); no MTLTextureDescriptor allocation path
++// uses them.
++constexpr MTLPixelFormat kKleptonPixelFormatYCbCr8_420_2P         = static_cast<MTLPixelFormat>(500);
++constexpr MTLPixelFormat kKleptonPixelFormatYCbCr10_420_2P_PACKED = static_cast<MTLPixelFormat>(508);
  constexpr size_t kInlineConstDataMaxSize = 4 * 1024;
  constexpr size_t kDefaultUniformsMaxSize = 16 * 1024;
  constexpr uint32_t kMaxViewports         = 1;
-@@ -423,6 +428,70 @@ class Context : public ErrorHandler
+@@ -423,6 +445,70 @@ class Context : public ErrorHandler
      DisplayMtl *mDisplay;
  };
  
@@ -458,6 +509,68 @@ index d5f657b..c1658d0 100644
 +    rx::mtl::SetRasterizationRateMapForSize(width, height, minSamples,
 +                                            (id<MTLRasterizationRateMap>)mtlRateMap);
 +}
+diff --git a/src/libANGLE/renderer/metal/mtl_format_table_autogen.mm b/src/libANGLE/renderer/metal/mtl_format_table_autogen.mm
+index 7ec88c5..d49c3e1 100644
+--- a/src/libANGLE/renderer/metal/mtl_format_table_autogen.mm
++++ b/src/libANGLE/renderer/metal/mtl_format_table_autogen.mm
+@@ -304,6 +304,12 @@ angle::FormatID Format::MetalToAngleFormatID(MTLPixelFormat formatMtl)
+             return angle::FormatID::ASTC_8x8_UNORM_BLOCK;
+ #    endif  // TARGET_OS_IOS || TARGET_OS_OSX || TARGET_OS_VISION
+ #endif      // TARGET_OS_IPHONE || mac 11.0+
++        // Klepton: private YCbCr formats (see mtl_common.h). Hand-added — the
++        // generator's JSON map cannot spell a casted enum value.
++        case kKleptonPixelFormatYCbCr8_420_2P:
++            return angle::FormatID::G8_B8R8_2PLANE_420_UNORM;
++        case kKleptonPixelFormatYCbCr10_420_2P_PACKED:
++            return angle::FormatID::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
+         default:
+             return angle::FormatID::NONE;
+     }
+@@ -2848,6 +2854,21 @@ void Format::init(const DisplayMtl *display, angle::FormatID intendedFormatId_)
+             break;
+ 
+ #endif  // TARGET_OS_OSX && (__MAC_OS_X_VERSION_MAX_ALLOWED >= 110000))
++        // Klepton: private YCbCr formats (see mtl_common.h). Sample-only — the
++        // caps entries added in FormatTable::initNativeFormatCaps say
++        // filterable and nothing else.
++        case angle::FormatID::G8_B8R8_2PLANE_420_UNORM:
++
++            this->metalFormat    = kKleptonPixelFormatYCbCr8_420_2P;
++            this->actualFormatId = angle::FormatID::G8_B8R8_2PLANE_420_UNORM;
++            break;
++
++        case angle::FormatID::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
++
++            this->metalFormat    = kKleptonPixelFormatYCbCr10_420_2P_PACKED;
++            this->actualFormatId = angle::FormatID::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
++            break;
++
+         default:
+             this->metalFormat    = MTLPixelFormatInvalid;
+             this->actualFormatId = angle::FormatID::NONE;
+diff --git a/src/libANGLE/renderer/metal/mtl_format_utils.mm b/src/libANGLE/renderer/metal/mtl_format_utils.mm
+index 180cc18..014dd64 100644
+--- a/src/libANGLE/renderer/metal/mtl_format_utils.mm
++++ b/src/libANGLE/renderer/metal/mtl_format_utils.mm
+@@ -436,6 +436,18 @@ void FormatTable::adjustFormatCapsForDevice(const mtl::ContextDevice &device,
+ void FormatTable::initNativeFormatCaps(const DisplayMtl *display)
+ {
+     initNativeFormatCapsAutogen(display);
++
++    // Klepton: private YCbCr formats (see mtl_common.h). Filterable and nothing
++    // else — the sampler converts, and neither writing, blending, multisampling
++    // nor rendering is a thing these formats do. Without an entry the table
++    // lookup in FormatTable::initialize default-constructs all-false caps and
++    // the sibling reports itself untexturable.
++    setFormatCaps(kKleptonPixelFormatYCbCr8_420_2P, /** filterable */ true,
++                  /** writable */ false, /** blendable */ false, /** multisample */ false,
++                  /** resolve */ false, /** colorRenderable */ false);
++    setFormatCaps(kKleptonPixelFormatYCbCr10_420_2P_PACKED, /** filterable */ true,
++                  /** writable */ false, /** blendable */ false, /** multisample */ false,
++                  /** resolve */ false, /** colorRenderable */ false);
+ }
+ 
+ }  // namespace mtl
 diff --git a/src/libANGLE/renderer/metal/mtl_render_utils.h b/src/libANGLE/renderer/metal/mtl_render_utils.h
 index 1ae4533..eaccdb0 100644
 --- a/src/libANGLE/renderer/metal/mtl_render_utils.h

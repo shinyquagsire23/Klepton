@@ -37,6 +37,14 @@ int kl_can_load(const char *path);
 int kl_can_dlopen(const char *path);
 // Look up an exported symbol. NULL if absent.
 void      *kl_sym(kl_image *img, const char *name);
+// Answer a guest symbol with a function of ours, at relocation time. This
+// reaches every call the compiler routed through the PLT — which for a guest
+// built with default visibility is every cross-translation-unit call — so it is
+// the one way to watch a guest-internal function that imports nothing. Register
+// before the image loads; kl_sym still answers the guest's real address, which
+// is how an interposer calls through. Diagnostic: nothing in a shipping path
+// registers one.
+void       kl_interpose(const char *name, void *fn);
 // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.
 void       kl_run_init(kl_image *img);
 void       kl_unload(kl_image *img);
