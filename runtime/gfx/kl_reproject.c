@@ -609,6 +609,39 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     return u;
 }
 
+kl_reproject_uniforms kl_proj_layer_build(const kl_ovrp_proj_layer *pl, int eye,
+                                          simd_float4x4 origin_from_device,
+                                          simd_float4x4 device_from_view,
+                                          simd_float4x4 projection,
+                                          uint32_t slice) {
+    if ((unsigned)eye > 1) eye = 0;
+    // Built through the eye pass rather than beside it: a projection layer IS
+    // an eye picture, and two implementations of one placement is how the two
+    // come to disagree. The record is synthesized because that call speaks the
+    // frame record's vocabulary; `serial` is what marks it as real, and a layer
+    // with no picture for this eye is refused below rather than described.
+    kl_ovrp_render_pose r;
+    memset(&r, 0, sizeof r);
+    r.serial = 1;
+    r.px = pl ? pl->pose[0] : 0.0f;
+    r.py = pl ? pl->pose[1] : 0.0f;
+    r.pz = pl ? pl->pose[2] : 0.0f;
+    r.qx = pl ? pl->pose[3] : 0.0f;
+    r.qy = pl ? pl->pose[4] : 0.0f;
+    r.qz = pl ? pl->pose[5] : 0.0f;
+    r.qw = pl ? pl->pose[6] : 1.0f;
+    if (pl) memcpy(r.tangents, pl->tangents, sizeof r.tangents);
+    // grid_per_eye = 0: this path binds the identity grid. A layer's picture is
+    // the guest's own swapchain image copied whole, so there is no rate map to
+    // undo and no render viewport smaller than the texture.
+    kl_reproject_uniforms u =
+        kl_reproject_build(pl ? &r : NULL, eye, origin_from_device,
+                           device_from_view, projection, slice,
+                           pl ? pl->origin_top_left : 0, 0);
+    if (!pl || pl->slot[eye] < 0) u.visible = 0;
+    return u;
+}
+
 kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
                                      simd_float4x4 origin_from_device,
                                      simd_float4x4 device_from_view,

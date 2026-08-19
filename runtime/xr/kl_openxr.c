@@ -32,12 +32,15 @@
 //     transcribed from the specification, and anything we have not transcribed
 //     is a refusal rather than a partly-populated struct.
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
 #include "kl_openxr.h"
+#include "kl_jni.h"
 #include "kl_ovrp.h"
 #include "kl_egl.h"
 #include "kl_glfb.h"
@@ -1455,6 +1458,14 @@ typedef struct {
     int      frame_begun;         // between xrBeginFrame and xrEndFrame
     int64_t  frame_predicted_time;// what the last xrWaitFrame promised
     uint64_t frames_waited, frames_ended, layers_ignored, layers_quad;
+    // The per-layer composite's own census: how many frames carried N
+    // projection layers, and per layer index how many carried it at all against
+    // how many got it as far as a compositor slot. This is the one measurement
+    // that separates "the guest changes its layer set while it runs" from "we
+    // are dropping layers" — two causes of one symptom (a picture alternating
+    // between two states) that no other line here tells apart.
+    uint64_t proj_hist[9];
+    uint64_t proj_present[8], proj_placed[8];
     // Pending events, in order. Each carries a KIND as well as a payload (a
     // state, for a session-state change; unused otherwise): a queue of bare
     // states cannot deliver the second event type — the interaction profile
@@ -1481,6 +1492,28 @@ static void klxr_report_frames(FILE *f) {
             (unsigned long long)g_session.frames_ended,
             (unsigned long long)g_session.layers_quad,
             (unsigned long long)g_session.layers_ignored);
+    uint64_t any = 0;
+    for (int i = 0; i < 9; i++) any += g_session.proj_hist[i];
+    if (!any) return;
+    // Frames by layer count. More than one non-zero bucket IS the guest
+    // changing its layer set from frame to frame, and every layer it stops
+    // submitting is a region of the picture that stops being drawn — which is
+    // seen as flicker and is a faithful composite of what arrived.
+    fprintf(f, "  projection layers per frame:");
+    for (int i = 0; i < 9; i++)
+        if (g_session.proj_hist[i])
+            fprintf(f, " %d->%llu", i, (unsigned long long)g_session.proj_hist[i]);
+    fprintf(f, "\n");
+    // ...and per layer, submitted against reached-a-slot. A gap between the two
+    // is ours; equality with a moving count is the guest's.
+    for (int i = 0; i < 8; i++) {
+        if (!g_session.proj_present[i]) continue;
+        fprintf(f, "    layer %d: %llu frame(s) submitted, %llu placed%s\n", i,
+                (unsigned long long)g_session.proj_present[i],
+                (unsigned long long)g_session.proj_placed[i],
+                g_session.proj_placed[i] < g_session.proj_present[i]
+                    ? "  <- some frames had no compositor slot for this layer" : "");
+    }
 }
 
 static klxr_session *klxr_sess(void *h) {
@@ -3786,6 +3819,10 @@ static void klxr_back_eye_images(klxr_swapchain *sc, int eye) {
 // device). An ARRAY swapchain cannot be re-pointed at all, so there 0 means no
 // eye texture and a black display, which is the state this knob's old name
 // described.
+// Defined below, beside the quad path that also uses it: a swapchain's index in
+// the table, which is the stable per-swapchain identity the eye mirror keys on.
+static int klxr_layer_id(const klxr_swapchain *sc);
+
 static int klxr_eye_mirror_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -3798,10 +3835,14 @@ static int klxr_eye_mirror_on(void) {
     return on;
 }
 
-static void klxr_mirror_eye_image(klxr_swapchain *sc, int eye, int layer) {
-    if (!kl_glfb_has_mtl_provider()) return;
-    if (klxr_format_is_depth(sc->session, sc->format)) return;
-    if (sc->last_released < 0 || sc->last_released >= sc->count) return;
+// Returns the compositor SLOT the picture landed in, or -1. That number, not
+// the swapchain's own image index, is what a compositor reads the eye back with
+// — see kl_glfb_mirror_eye_layer, and note that the frame record's `stage` is
+// therefore this and not `sc->last_released`.
+static int klxr_mirror_eye_image(klxr_swapchain *sc, int eye, int layer) {
+    if (!kl_glfb_has_mtl_provider()) return -1;
+    if (klxr_format_is_depth(sc->session, sc->format)) return -1;
+    if (sc->last_released < 0 || sc->last_released >= sc->count) return -1;
     if (sc->mip_count != 1) {
         static int said;
         if (!said++)
@@ -3809,11 +3850,13 @@ static void klxr_mirror_eye_image(klxr_swapchain *sc, int eye, int layer) {
                             "copied to the compositor\n", eye, sc->mip_count);
     }
     if (layer < 0 || (uint32_t)layer >= sc->array_size) layer = 0;
-    kl_glfb_mirror_eye_layer(eye, sc->last_released,
-                             sc->tex[sc->last_released],
-                             sc->array_size > 1 ? layer : -1,
-                             (int)sc->width, (int)sc->height,
-                             (uint32_t)sc->format);
+    // +1 so swapchain 0 is not the "unknown source" sentinel.
+    return kl_glfb_mirror_eye_layer(eye, sc->last_released,
+                                    (uint32_t)(klxr_layer_id(sc) + 1),
+                                    sc->tex[sc->last_released],
+                                    sc->array_size > 1 ? layer : -1,
+                                    (int)sc->width, (int)sc->height,
+                                    (uint32_t)sc->format);
 }
 
 // ---------------------------------------------------------------------------
@@ -3946,6 +3989,14 @@ static int klxr_quad_record(const XrCompositionLayerQuad *q, klxr_swapchain *sc,
 // side that is indistinguishable from a bug in the panel. A frame shape that
 // changes at a scene transition says which of the two is happening, in one line,
 // on the run where it happens.
+// Which (layer, eye) slots the geometry census has already described. Re-armed
+// by klxr_frame_shape on every shape change — see there.
+static uint16_t g_geo_said;
+// The same re-arm covers the foveal placement line below, which is a per-shape
+// fact for the same reason.
+static uint8_t g_fovea_said;
+static void klxr_geo_census_rearm(void) { g_geo_said = 0; g_fovea_said = 0; }
+
 static void klxr_frame_shape(const XrFrameEndInfo *info) {
     char shape[256];
     int n = 0;
@@ -3976,6 +4027,12 @@ static void klxr_frame_shape(const XrFrameEndInfo *info) {
     static uint64_t since;
     since++;
     if (strcmp(shape, last) == 0) return;
+    // A new shape is a new set of swapchains, so every per-layer fact measured
+    // against the old one describes layers that are gone. Re-arm the geometry
+    // census: without this it fires once, on whatever the guest submitted
+    // FIRST, which for a streaming client is its loading scene — three
+    // identical full-FOV layers, measured, and nothing like the stream.
+    klxr_geo_census_rearm();
     if (last[0])
         fprintf(stderr, "  [xr] frame shape changed after %llu frames:%s ->%s\n",
                 (unsigned long long)since, last, shape);
@@ -4016,6 +4073,11 @@ static void klxr_quad_census(const kl_ovrp_overlay *o, int placed) {
 static XrResult klxr_DestroySwapchain(void *swapchain) {
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
     if (!sc) return KLXR_ERROR_HANDLE_INVALID;
+    // The compositor slots this swapchain's images were copied into, which are
+    // ours and are keyed on the swapchain rather than on its image index — so
+    // they cannot be found from `count` the way the eye textures below are.
+    // Same +1 as the mirror uses, so swapchain 0 is not the unknown sentinel.
+    kl_glfb_forget_eye_source((uint32_t)(klxr_layer_id(sc) + 1));
     // `mtl_eye`, not `eye`: every projection layer's views claim an eye, so
     // releasing on `eye` would have one layer's swapchain tear down the storage
     // another layer's is still rendering into — and mtl_eye is cleared when a
@@ -4144,6 +4206,59 @@ void kl_openxr_set_frame_pacer(void (*wait)(void)) { g_frame_pacer = wait; }
 static int g_capture_topmost_layer;
 void kl_openxr_set_capture_topmost_layer(int on) { g_capture_topmost_layer = on ? 1 : 0; }
 
+// ---- the foveal inset's stability, once a second (KL_XR_FOVEA_TRACE)
+//
+// Two different defects present as the same thing to the eye — the inset
+// dropping out on some frames, and its placement wandering while it stays — and
+// both read as the picture stepping about a frame at a time. Neither is visible
+// in any per-frame number, so this accumulates over a second and prints what
+// separates them: how many submissions laid the inset down, how many did not
+// and for what reason, and how far the computed rect travelled while they did.
+//
+// Placement is reported in THOUSANDTHS of the eye, which is KL_XR_FOVEA_SHIFT_Y's
+// unit on purpose: a y span of 4 here is a defect a shift of 4 would move.
+static void klxr_fovea_trace(int eye, float x0, float y0, float x1, float y1,
+                             const char *skip) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_XR_FOVEA_TRACE", 0);
+    if (!on || eye < 0 || eye > 1) return;
+    static struct {
+        int64_t     t0;
+        unsigned    cands, drawn;
+        unsigned    skipped;
+        const char *why;              // the last skip reason seen this second
+        float       xlo, xhi, ylo, yhi;
+    } fv[2];
+    int64_t now = klxr_now();
+    if (!fv[eye].t0) fv[eye].t0 = now;
+    fv[eye].cands++;
+    if (skip) {
+        fv[eye].skipped++;
+        fv[eye].why = skip;
+    } else {
+        if (!fv[eye].drawn++) {
+            fv[eye].xlo = fv[eye].xhi = x0;
+            fv[eye].ylo = fv[eye].yhi = y0;
+        }
+        if (x0 < fv[eye].xlo) fv[eye].xlo = x0;
+        if (x0 > fv[eye].xhi) fv[eye].xhi = x0;
+        if (y0 < fv[eye].ylo) fv[eye].ylo = y0;
+        if (y0 > fv[eye].yhi) fv[eye].yhi = y0;
+    }
+    if (now - fv[eye].t0 < 1000000000LL) return;
+    fprintf(stderr,
+        // "candidates", not "frames": a guest stacking three projection layers
+        // offers two of them per frame as inset candidates, so this counts
+        // opportunities rather than frames and the ratio is what matters.
+        "  [xr] fovea eye %d: %u candidate(s), %u laid down, %u skipped%s%s; "
+        "placement travel x %.1f y %.1f (thousandths of the eye)\n",
+        eye, fv[eye].cands, fv[eye].drawn, fv[eye].skipped,
+        fv[eye].skipped ? " — " : "", fv[eye].skipped ? fv[eye].why : "",
+        (double)((fv[eye].xhi - fv[eye].xlo) * 1000.0f),
+        (double)((fv[eye].yhi - fv[eye].ylo) * 1000.0f));
+    memset(&fv[eye], 0, sizeof fv[eye]);
+}
+
 static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
                                XrFrameState *state) {
     klxr_session *s = klxr_sess(session);
@@ -4269,10 +4384,27 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     if (env_cap >= 0) {
         cap_layer = env_cap;                       // pinned override
     } else if (g_capture_topmost_layer && proj_layer_count > 0) {
-        // Topmost layer whose FOV is within 80% of the widest — i.e. the
-        // topmost that actually fills the eye, not a narrow panel on top of it.
+        // The WIDEST layer, not the topmost wide-ish one, and the reason is
+        // measured. "Topmost within 80% of the widest" admits a foveal inset:
+        // Steam Link's is 88% of the base's span, and on the frames where it
+        // submits the base and the inset WITHOUT its high-resolution third
+        // layer, the inset is both within the threshold and topmost — so the
+        // narrow centre became the eye. The compositor then placed a full eye
+        // with the inset's frustum (`tan t0.795 b0.994` against the base's
+        // `t1.001 b1.193`), which is a vertical shift of the whole picture,
+        // appearing and disappearing as the guest's layer count changes ~once a
+        // second. It never reproduced on the host, whose layer shape is stable.
+        //
+        // Widest is the definition of "fills the eye" and needs no threshold.
+        // Ties are exact here — Steam Link's low- and high-resolution base
+        // layers state the same frustum — so they break on the larger image
+        // (more detail for the same field of view) and then on the topmost, in
+        // that order. Keeping the eye on one layer across a layer-count change
+        // is what stops the source flipping under the mirror at all.
         cap_layer = 0;
-        int j = 0;
+        int   j = 0;
+        float best_span = -1.0f;
+        long  best_area = -1;
         for (uint32_t i = 0; i < info->layerCount; i++) {
             const XrCompositionLayerBaseHeader *l = info->layers[i];
             if (!l || l->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
@@ -4282,7 +4414,21 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 ? fabsf(p->views[0].fov.angleLeft) +
                   fabsf(p->views[0].fov.angleRight)
                 : 0.0f;
-            if (max_span <= 0.0f || span >= 0.80f * max_span) cap_layer = j;
+            long area = 0;
+            if (p->viewCount >= 1) {
+                klxr_swapchain *csc =
+                    klxr_swapchain_of(p->views[0].subImage.swapchain);
+                if (csc) area = (long)csc->width * (long)csc->height;
+            }
+            // A hair of tolerance, because these are tangents of angles the
+            // guest recomputes per frame: two layers meaning the same frustum
+            // must not alternate on the last bit of a float.
+            if (span > best_span * 1.001f ||
+                (span >= best_span * 0.999f && area >= best_area)) {
+                if (span > best_span) best_span = span;
+                best_area = area;
+                cap_layer = j;
+            }
             j++;
         }
     } else {
@@ -4301,15 +4447,71 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     if (fovea_on < 0)   fovea_on   = g_capture_topmost_layer &&
                                      kl_env_on("KL_XR_FOVEA", 1);
     if (fovea_flip < 0) fovea_flip = kl_env_on("KL_XR_FOVEA_FLIP", 0);
+
+    // KL_XR_LAYERS: composite each projection layer as its own quad with its
+    // own frustum, in submission order (1, the default), or flatten them into
+    // one eye picture the way this file did until 2026-08-19 (0).
+    //
+    // The flattening is what everything above this line is for — picking which
+    // layer is the eye, deciding which of the others is a foveal inset, mapping
+    // that one's frustum into the eye's and blitting it there. Every one of
+    // those is a decision it can get wrong, and the seam it produced survived
+    // four separate fixes to them. A per-layer composite makes none of them:
+    // no layer is ever placed against another layer, only against the display.
+    // 0 is kept because this is the whole picture on a target that streams, and
+    // an A/B against a known state is worth more than the code it costs.
+    static int layers_on = -1;
+    if (layers_on < 0) {
+        layers_on = kl_env_on("KL_XR_LAYERS", 1);
+        if (!layers_on)
+            fprintf(stderr, "  [xr] KL_XR_LAYERS=0 — projection layers are "
+                            "flattened into one eye picture instead of "
+                            "composited one by one\n");
+    }
+
+    // The frame's projection layers, in submission order, filed whole at the
+    // end — see kl_ovrp_proj_layers_external. Built here rather than published
+    // as they are found, for the reason the quad list below is: a compositor
+    // reading it half-written would draw one frame's layer with another's
+    // geometry.
+    kl_ovrp_proj_layer pl[8];
+    int npl = 0;
+    // Eye 0's source size per layer, for the census only. Two layers stating
+    // the SAME frustum at DIFFERENT resolutions is a shape this guest submits,
+    // and the composite draws the later one — so which of them arrives last is
+    // the picture's detail, and nothing else in the log carries the number.
+    int plw[8] = {0}, plh[8] = {0};
+
+    // Inset candidates are RECORDED here and applied after the layer loop, not
+    // laid down as they are met. The placement needs the base's frustum and the
+    // stage it was mirrored into, and a projection layer can be submitted before
+    // the one we capture as the base — measured on device, where the guest
+    // alternates between two and three layers and the base is the topmost, so
+    // every earlier candidate was dropped with "the base layer was not captured
+    // before it this frame" for whole seconds at a time. Deferring removes the
+    // ordering dependency entirely rather than making it more likely to hold.
+    struct { int eye, layer, w, h; uint32_t tex; XrFovf fov; float px, py; }
+          insets[8];
+    int   ninset = 0;
     int   base_stage_eye[2] = { -1, -1 };
     float base_tan[2][4];   // signed tan(L,R,U,D) per eye — the base frustum
-    float base_eye_x[2] = { 0, 0 };   // the base VIEW's x position, for parallax
+    uint32_t base_tex[2] = { 0, 0 };  // the base IMAGE, for the alignment dump
+    int   base_w[2] = { 0, 0 }, base_h[2] = { 0, 0 };
+    float base_eye_x[2] = { 0, 0 };   // the base VIEW's position, for parallax
+    float base_eye_y[2] = { 0, 0 };   // — both axes: this display's eye offset
+                                      // has a real vertical component
     // What the composited layer SAYS it was drawn with. See kl_ovrp.h's
     // kl_ovrp_frame_end_external: taking these from the submission rather than
     // from our latch is what stops the compositor correcting a delta the guest
     // has already corrected.
     int   have_layer_pose = 0;
-    float layer_pose[7], layer_tan[8];
+    // Zeroed, not merely assigned below: eye 1's four tangents are written only
+    // when the captured layer's SECOND view is walked, and the record is
+    // published on the strength of the first. A guest that submits a one-view
+    // projection layer would hand the compositor a frustum of stack garbage for
+    // the other eye — which presents as one eye jumping, with every counter
+    // healthy. Zero is refused downstream; garbage is not.
+    float layer_pose[7] = { 0 }, layer_tan[8] = { 0 };
     // The frame's non-projection layers, filed whole at the end — see
     // kl_ovrp_overlays_external. Built here rather than published as they are
     // found, because the list REPLACES the previous frame's: a compositor
@@ -4388,6 +4590,25 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         const XrCompositionLayerProjection *proj =
             (const XrCompositionLayerProjection *)layer;
         uint32_t li = proj_layers++;
+        // This layer's entry in the frame's list, opened before its views are
+        // walked so a one-view layer still gets one (with the other eye left at
+        // -1, which is how "this layer does not name that eye" is said).
+        kl_ovrp_proj_layer *pl_cur = NULL;
+        if (layers_on) {
+            if (npl < (int)(sizeof pl / sizeof pl[0])) {
+                pl_cur = &pl[npl++];
+                memset(pl_cur, 0, sizeof *pl_cur);
+                pl_cur->slot[0] = pl_cur->slot[1] = -1;
+                pl_cur->pose[6] = 1.0f;          // identity orientation
+            } else {
+                static int said;
+                if (!said++)
+                    fprintf(stderr, "  [xr] more than %d projection layers in one "
+                                    "frame — layer %u and any after it are NOT "
+                                    "composited\n",
+                            (int)(sizeof pl / sizeof pl[0]), li);
+            }
+        }
         for (uint32_t v = 0; v < proj->viewCount && v < 2; v++) {
             klxr_swapchain *sc = klxr_swapchain_of(proj->views[v].subImage.swapchain);
             if (!sc) continue;
@@ -4415,10 +4636,9 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             // screens" from "the top layer IS the eye" — without capturing each
             // in turn. Printed for the first few (layer,eye) pairs seen.
             {
-                static uint16_t said_geo;
                 int slot = (int)(li * 2 + v);
-                if (slot < 16 && !(said_geo & (1u << slot))) {
-                    said_geo |= (uint16_t)(1u << slot);
+                if (slot < 16 && !(g_geo_said & (1u << slot))) {
+                    g_geo_said |= (uint16_t)(1u << slot);
                     klxr_space *lsp0 = klxr_space_of(layer->space);
                     const XrFovf *fv = &proj->views[v].fov;
                     const XrVector3f *lp = &proj->views[v].pose.position;
@@ -4434,11 +4654,143 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                         (int)li == cap_layer ? " [captured]" : "");
                 }
             }
+            // KL_XR_FOVEA_DUMP=<dir>: EVERY projection layer's image, with the
+            // frustum it states, every KL_XR_FOVEA_DUMP_EVERY seconds
+            // (default 5, 0 = once).
+            //
+            // Layer-wide rather than the base/inset pair it started as, because
+            // the pair assumed which layer was which. The first capture that
+            // worked disproved the assumption outright: the WIDEST layer — the
+            // one we take as the eye — was an empty blue gradient, and the
+            // streamed picture was in the narrower layer we were treating as a
+            // foveal inset. An instrument that only photographs the two things
+            // you already believe in cannot tell you that you named them wrong.
+            if (sc->last_released >= 0 && sc->last_released < sc->count &&
+                (!sc->session || sc->session->gfx != KLXR_GFX_VULKAN)) {
+                static const char *ddir = (const char *)-1;
+                static int      every_s = -1;
+                static int64_t  next_at;
+                static unsigned seq;
+                if (ddir == (const char *)-1) {
+                    ddir = getenv("KL_XR_FOVEA_DUMP");
+                    // "1" (or a relative path) means "somewhere I can actually
+                    // write": on a device an absolute /tmp is outside the
+                    // sandbox and every write fails with ENOENT, which is a
+                    // whole run spent to learn a path. The guest's own files
+                    // directory is writable by construction on both platforms.
+                    if (ddir && (!*ddir || !strcmp(ddir, "1") || *ddir != '/')) {
+                        static char under[640];
+                        const char *base = kl_jni_files_dir();
+                        snprintf(under, sizeof under, "%s/%s", base ? base : ".",
+                                 (ddir && *ddir && strcmp(ddir, "1")) ? ddir : "fovea");
+                        ddir = under;
+                        fprintf(stderr, "  [xr] fovea dump -> %s\n", ddir);
+                    }
+                }
+                if (every_s < 0) every_s = kl_env_int("KL_XR_FOVEA_DUMP_EVERY", 5);
+                if (ddir && *ddir) {
+                    int64_t now = klxr_now();
+                    // One clock for the whole frame's layers, advanced by the
+                    // first of them: a per-layer deadline would photograph
+                    // different layers from different frames, which is exactly
+                    // the comparison this exists to make impossible.
+                    static int64_t frame_mark;
+                    static unsigned frame_seq;
+                    if (li == 0 && v == 0 && (!next_at || (every_s > 0 && now >= next_at))) {
+                        next_at = every_s > 0 ? now + (int64_t)every_s * 1000000000LL
+                                              : INT64_MAX;
+                        frame_mark = now;
+                        frame_seq = seq++;
+                        if (mkdir(ddir, 0755) != 0 && errno != EEXIST) {
+                            static int said;
+                            if (!said++)
+                                fprintf(stderr, "  [xr] fovea dump: cannot create "
+                                                "%s (%s) — every write will fail\n",
+                                        ddir, strerror(errno));
+                        }
+                    }
+                    if (frame_mark) {
+                        const XrFovf *df = &proj->views[v].fov;
+                        char dp[512];
+                        snprintf(dp, sizeof dp, "%s/eye%u_%03u_layer%u.png",
+                                 ddir, v, frame_seq, li);
+                        kl_glfb_dump_tex(dp, sc->tex[sc->last_released],
+                                         sc->array_size > 1
+                                           ? (int)proj->views[v].subImage.imageArrayIndex
+                                           : -1,
+                                         (int)sc->width, (int)sc->height);
+                        fprintf(stderr,
+                            "  [xr] dump eye %u layer %u #%03u: %ux%u tan "
+                            "L%.4f R%.4f U%.4f D%.4f%s\n",
+                            v, li, frame_seq, sc->width, sc->height,
+                            (double)tanf(df->angleLeft), (double)tanf(df->angleRight),
+                            (double)tanf(df->angleUp), (double)tanf(df->angleDown),
+                            (int)li == cap_layer ? "  [captured as the eye]" : "");
+                        if (li + 1 >= info->layerCount && v == 1) frame_mark = 0;
+                    }
+                }
+            }
+            // Whether this layer's picture reaches the composite. Under the
+            // per-layer composite EVERY projection layer does — that is the
+            // whole change — and under KL_XR_LAYERS=0 exactly one does, with
+            // the rest flattened into it or dropped.
+            int captured = layers_on || (int)li == cap_layer;
+
+            // The eye textures the compositor samples, provided retroactively:
+            // this call is the first moment anything knows which swapchain is
+            // an eye.
+            //
+            // Three routes, and which one is taken is measurement rather than
+            // preference. Vulkan exports the guest's own image and copies
+            // nothing. GL copies the presented image (every frame), because
+            // re-pointing the guest's own texture breaks some guests' rendering
+            // outright — klxr_eye_mirror_on has the numbers — and because an
+            // ARRAY swapchain (every Unity OpenXR guest, one texture for both
+            // eyes) cannot be re-pointed at all. KL_XR_EYE_MIRROR=0 is the
+            // re-point, kept as the A/B.
+            //
+            // `slot` is where the picture LANDED, and it is the key everything
+            // downstream reads it back with — the frame record's stage and the
+            // per-layer record both. Only the copy allocates one per
+            // (swapchain, image); the other two routes back the guest's own
+            // images in place, so their key is the image index and two
+            // projection layers out of two swapchains would collide in it. No
+            // guest in the corpus submits more than one projection layer on
+            // those routes, and the one that tried is named rather than drawn
+            // wrong.
+            int slot = -1;
+            if (captured) {
+                if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN) {
+                    // One route for both shapes here: an array swapchain is a
+                    // SLICE of an already-exported texture, not a copy, so the
+                    // GL path's array-vs-2D split has no counterpart.
+                    klxr_publish_eye_vulkan(sc, (int)v,
+                                            (int)proj->views[v].subImage.imageArrayIndex);
+                    slot = sc->last_released;
+                } else if (klxr_eye_mirror_on() || sc->array_size > 1) {
+                    slot = klxr_mirror_eye_image(sc, (int)v,
+                                          (int)proj->views[v].subImage.imageArrayIndex);
+                } else {
+                    klxr_back_eye_images(sc, (int)v);
+                    slot = sc->last_released;
+                }
+                if (layers_on && pl_cur && li > 0 && slot == sc->last_released) {
+                    static int said;
+                    if (!said++)
+                        fprintf(stderr, "  [xr] projection layer %u reaches the "
+                                        "compositor through its own storage, whose "
+                                        "key is the image index — a second layer "
+                                        "sharing an index overwrites it. Set "
+                                        "KL_XR_EYE_MIRROR=1 for a slot per "
+                                        "swapchain\n", li);
+                }
+            }
+
             // The image the guest DREW is the one it released, not the one its
             // framebuffer still points at — the swapchain has three and the
             // next acquire has not happened yet. Named every frame, because the
             // rotation moves every frame; the registration below is once.
-            if ((int)li == cap_layer && sc->last_released >= 0 &&
+            if (captured && sc->last_released >= 0 &&
                 sc->last_released < sc->count) {
                 // The whole description, not just the name: the swapchain's
                 // size is not in kl_glfb's allocation table (it is created
@@ -4451,12 +4803,6 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                                            sc->array_size > 1
                                                ? (int)proj->views[v].subImage.imageArrayIndex
                                                : -1);
-                // The stage the frame record is filed under. Taken from eye 0,
-                // because both eyes' swapchains are acquired and released once
-                // per frame and therefore rotate together — and taken from the
-                // guest's own release rather than observed, which is the whole
-                // reason this path has none of the OVRPlugin path's ambiguity.
-                if (v == 0) drawn_stage = sc->last_released;
                 // The layer states its pose in ITS space, which need not be the
                 // tracking space — so it is composed out of that space rather
                 // than used raw. The frustum comes with it: a picture rendered
@@ -4465,14 +4811,62 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 XrPosef in_tracking = klxr_pose_apply(
                     lsp ? klxr_space_pose(lsp) : (XrPosef){{0,0,0,1},{0,0,0}},
                     proj->views[v].pose);
+                const XrFovf *f = &proj->views[v].fov;
+
+                // This layer's own record, which is the per-layer composite:
+                // its picture, its frustum, its pose, placed against the
+                // display and never against another layer.
+                if (pl_cur) {
+                    if (v == 0 && npl >= 1 && npl <= 8) {
+                        plw[npl - 1] = (int)sc->width;
+                        plh[npl - 1] = (int)sc->height;
+                    }
+                    pl_cur->slot[v] = slot;
+                    float *pt = pl_cur->tangents[v];
+                    pt[0] = fabsf(tanf(f->angleLeft));
+                    pt[1] = fabsf(tanf(f->angleRight));
+                    pt[2] = fabsf(tanf(f->angleUp));
+                    pt[3] = fabsf(tanf(f->angleDown));
+                    // Vulkan and Metal put row 0 at the top; GL puts it at the
+                    // bottom. A property of the API that drew the picture, and
+                    // the same question kl_glfb_eye_mtl_origin_top_left answers
+                    // for a texture it allocated.
+                    pl_cur->origin_top_left =
+                        sc->session && sc->session->gfx == KLXR_GFX_VULKAN;
+                    // The head, as the eye pass wants it: the first view seeds
+                    // the pose and the second averages its position in. The
+                    // orientation is view 0's — the two are measured 0.000 deg
+                    // apart, and the composite is rotation-only anyway.
+                    if (v == 0) {
+                        pl_cur->pose[0] = in_tracking.position.x;
+                        pl_cur->pose[1] = in_tracking.position.y;
+                        pl_cur->pose[2] = in_tracking.position.z;
+                        pl_cur->pose[3] = in_tracking.orientation.x;
+                        pl_cur->pose[4] = in_tracking.orientation.y;
+                        pl_cur->pose[5] = in_tracking.orientation.z;
+                        pl_cur->pose[6] = in_tracking.orientation.w;
+                    } else {
+                        pl_cur->pose[0] = 0.5f * (pl_cur->pose[0] + in_tracking.position.x);
+                        pl_cur->pose[1] = 0.5f * (pl_cur->pose[1] + in_tracking.position.y);
+                        pl_cur->pose[2] = 0.5f * (pl_cur->pose[2] + in_tracking.position.z);
+                    }
+                }
+
+                // The FRAME record, which every consumer that is not the
+                // per-layer pass still reads: the letterbox aspect, the
+                // overlay pass's projection, the reprojection delta. With the
+                // per-layer composite on, which layer fills it stops being a
+                // decision about the picture — the topmost simply wins, and it
+                // wins by being written last.
+                //
                 // The record wants the HEAD, and a projection layer states the
                 // EYES — measured: eye 0's position differs from the latched
                 // head by 0.0315 m, which is exactly half the IPD and not a
                 // reprojection. The head is the midpoint, so the first view
                 // seeds it and the second averages it in; the orientation is
-                // the same for both (measured at 0.000 deg apart) and is taken
-                // from view 0.
+                // the same for both and is taken from view 0.
                 if (v == 0) {
+                    if (slot >= 0) drawn_stage = slot;
                     layer_pose[0] = in_tracking.position.x;
                     layer_pose[1] = in_tracking.position.y;
                     layer_pose[2] = in_tracking.position.z;
@@ -4489,116 +4883,56 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 // OpenXR states the field of view as four signed ANGLES from
                 // the view axis; the record speaks tangents, all positive, in
                 // cp_view_get_tangents order.
-                const XrFovf *f = &proj->views[v].fov;
                 float *t = layer_tan + v * 4;
                 t[0] = fabsf(tanf(f->angleLeft));
                 t[1] = fabsf(tanf(f->angleRight));
                 t[2] = fabsf(tanf(f->angleUp));
                 t[3] = fabsf(tanf(f->angleDown));
-                // Signed tangents + the stage the base landed in, for the foveal
+                // Signed tangents + the slot the base landed in, for the foveal
                 // inset below: it needs the base's real (asymmetric) frustum and
-                // the eye texture the base was mirrored into.
-                base_tan[v][0] = tanf(f->angleLeft);
-                base_tan[v][1] = tanf(f->angleRight);
-                base_tan[v][2] = tanf(f->angleUp);
-                base_tan[v][3] = tanf(f->angleDown);
-                base_eye_x[v] = proj->views[v].pose.position.x;
-                base_stage_eye[v] = sc->last_released;
-            }
-            // The eye textures the compositor samples, provided retroactively:
-            // this call is the first moment anything knows which swapchain is
-            // an eye.
-            //
-            // Three routes, and which one is taken is measurement rather than
-            // preference. Vulkan exports the guest's own image and copies
-            // nothing. GL copies the presented image (every frame), because
-            // re-pointing the guest's own texture breaks some guests' rendering
-            // outright — klxr_eye_mirror_on has the numbers — and because an
-            // ARRAY swapchain (every Unity OpenXR guest, one texture for both
-            // eyes) cannot be re-pointed at all. KL_XR_EYE_MIRROR=0 is the
-            // re-point, kept as the A/B.
-            if ((int)li == cap_layer) {
-                if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN)
-                    // One route for both shapes here: an array swapchain is a
-                    // SLICE of an already-exported texture, not a copy, so the
-                    // GL path's array-vs-2D split has no counterpart.
-                    klxr_publish_eye_vulkan(sc, (int)v,
-                                            (int)proj->views[v].subImage.imageArrayIndex);
-                else if (klxr_eye_mirror_on() || sc->array_size > 1)
-                    klxr_mirror_eye_image(sc, (int)v,
-                                          (int)proj->views[v].subImage.imageArrayIndex);
-                else
-                    klxr_back_eye_images(sc, (int)v);
+                // the eye texture the base was mirrored into. Flattening only —
+                // the per-layer composite maps no layer into another's space,
+                // which is the whole point of it.
+                if (!layers_on) {
+                    base_tan[v][0] = tanf(f->angleLeft);
+                    base_tan[v][1] = tanf(f->angleRight);
+                    base_tan[v][2] = tanf(f->angleUp);
+                    base_tan[v][3] = tanf(f->angleDown);
+                    base_eye_x[v] = proj->views[v].pose.position.x;
+                    base_eye_y[v] = proj->views[v].pose.position.y;
+                    base_tex[v] = sc->tex[sc->last_released];
+                    base_w[v] = (int)sc->width; base_h[v] = (int)sc->height;
+                    base_stage_eye[v] = slot;
+                }
             }
             // Foveal inset: a NON-captured projection layer that is strictly
             // narrower than the base and centred inside it is the high-detail
-            // centre of a foveated stream. Lay it over the base eye where its
-            // frustum falls. GL path only (the composite is kl_glfb's blit); the
-            // base for this eye must already be captured this frame.
-            if (fovea_on && (int)li != cap_layer && base_stage_eye[v] >= 0 &&
-                sc->last_released >= 0 && sc->last_released < sc->count &&
-                (!sc->session || sc->session->gfx != KLXR_GFX_VULKAN)) {
-                const XrFovf *f = &proj->views[v].fov;
-                float il = tanf(f->angleLeft),  ir = tanf(f->angleRight);
-                float iu = tanf(f->angleUp),    id = tanf(f->angleDown);
-                float bl = base_tan[v][0], br = base_tan[v][1];
-                float bu = base_tan[v][2], bd = base_tan[v][3];
-                float bw = br - bl, bh = bu - bd, ispan = ir - il;
-                if (bw > 0 && bh > 0 && ispan > 0 && ispan < 0.80f * bw) {
-                    float nx0 = (il - bl) / bw, nx1 = (ir - bl) / bw;
-                    float ny0, ny1;
-                    if (!fovea_flip) { ny0 = (bu - iu) / bh; ny1 = (bu - id) / bh; }
-                    else             { ny0 = (id - bd) / bh; ny1 = (iu - bd) / bh; }
-                    // Parallax alignment. The inset is rendered from the HEAD
-                    // CENTRE (pose x≈0) and the base from this EYE (pose x≈±IPD/2),
-                    // so the same angular direction points at different content
-                    // for anything not at infinity — seen as a doubled edge where
-                    // the sharp inset and the parallax-offset base overlap. A point
-                    // at depth D shifts by (inset_x - base_x)/D in tangent between
-                    // the two viewpoints; shifting the inset placement by that lands
-                    // the sharp centre on the base for content around D metres.
-                    // KL_XR_FOVEA_DEPTH sets D (a large value ≈ off).
-                    static int depth_cm = -1;
-                    if (depth_cm < 0) depth_cm = kl_env_int("KL_XR_FOVEA_DEPTH_CM", 200);
-                    float D = depth_cm / 100.0f;
-                    if (D >= 0.2f) {
-                        float dtan = (proj->views[v].pose.position.x - base_eye_x[v]) / D;
-                        nx0 += dtan / bw;
-                        nx1 += dtan / bw;
-                    }
-                    // Manual fine-alignment, for the residual the depth model does
-                    // not reach (in the streamed state both layers are centred, so
-                    // the parallax term above is zero). A direct nudge of the inset
-                    // placement, in THOUSANDTHS of the eye, tuned by eye until the
-                    // sharp centre sits exactly on the blurry base. Same shift both
-                    // eyes; KL_XR_FOVEA_SHIFT_Y for vertical.
-                    static int shx = -32768, shy = -32768;
-                    if (shx == -32768) shx = kl_env_int("KL_XR_FOVEA_SHIFT_X", 0);
-                    if (shy == -32768) shy = kl_env_int("KL_XR_FOVEA_SHIFT_Y", 0);
-                    nx0 += shx / 1000.0f; nx1 += shx / 1000.0f;
-                    ny0 += shy / 1000.0f; ny1 += shy / 1000.0f;
-                    // Scale trim about the inset's own centre. The doubling grows
-                    // from nothing at the centre to worst at the edge, which is a
-                    // SCALE mismatch — the inset image does not fill exactly the
-                    // field of view it states, so its content drifts off the base
-                    // the further out you look. This shrinks/grows the placement to
-                    // make the edges land on the base too. 1000 = no change; try a
-                    // little either side (e.g. 970 or 1030) until an edge feature
-                    // stops doubling as it crosses into the fovea.
-                    static int fsc = -1;
-                    if (fsc < 0) fsc = kl_env_int("KL_XR_FOVEA_SCALE", 1000);
-                    if (fsc > 0 && fsc != 1000) {
-                        float s = fsc / 1000.0f;
-                        float cx = (nx0 + nx1) * 0.5f, cy = (ny0 + ny1) * 0.5f;
-                        nx0 = cx + (nx0 - cx) * s; nx1 = cx + (nx1 - cx) * s;
-                        ny0 = cy + (ny0 - cy) * s; ny1 = cy + (ny1 - cy) * s;
-                    }
-                    int ilayer = sc->array_size > 1
+            // centre of a foveated stream. Recorded here, placed after the loop
+            // (see `insets`) — its placement needs the base, which may not have
+            // been walked yet. GL path only; the composite is kl_glfb's blit.
+            // Flattening only: with the per-layer composite on there is no base
+            // to lay it over, because it is a layer like any other.
+            if (fovea_on && !layers_on && (int)li != cap_layer) {
+                const char *skip = NULL;
+                if (!(sc->last_released >= 0 && sc->last_released < sc->count))
+                    skip = "the inset swapchain has released no image";
+                else if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN)
+                    skip = "Vulkan (this composite is kl_glfb's blit)";
+                else if (ninset >= (int)(sizeof insets / sizeof insets[0]))
+                    skip = "more inset candidates in one frame than can be held";
+                if (skip) {
+                    klxr_fovea_trace((int)v, 0, 0, 0, 0, skip);
+                } else {
+                    insets[ninset].eye   = (int)v;
+                    insets[ninset].tex   = sc->tex[sc->last_released];
+                    insets[ninset].layer = sc->array_size > 1
                         ? (int)proj->views[v].subImage.imageArrayIndex : -1;
-                    kl_glfb_overlay_eye_inset((int)v, base_stage_eye[v],
-                                              sc->tex[sc->last_released], ilayer,
-                                              (int)sc->width, (int)sc->height,
-                                              nx0, ny0, nx1, ny1);
+                    insets[ninset].w     = (int)sc->width;
+                    insets[ninset].h     = (int)sc->height;
+                    insets[ninset].fov   = proj->views[v].fov;
+                    insets[ninset].px    = proj->views[v].pose.position.x;
+                    insets[ninset].py    = proj->views[v].pose.position.y;
+                    ninset++;
                 }
             }
             if (sc->eye == (int)v) continue;            // already this eye
@@ -4624,29 +4958,121 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     li, v, sc->width, sc->height, imgs,
                     r->extent.width, r->extent.height, r->offset.x, r->offset.y,
                     proj->views[v].subImage.imageArrayIndex,
-                    (int)li == cap_layer ? " [captured]" : "");
+                    captured ? " [captured]" : "");
         }
     }
 
-    // Close this frame's record, under the image the guest actually presented.
-    // A frame that submitted no projection layer for the composited layer drew
-    // no new picture, so nothing is filed and the compositor shows the previous
-    // one again — the same rule, and for the same reason, as klovrp_EndFrame's
-    // "a frame that drew into no eye stage must not file anything".
-    if (drawn_stage >= 0)
-        kl_ovrp_frame_end_external(drawn_stage,
-                                   have_layer_pose ? layer_pose : NULL,
-                                   have_layer_pose ? layer_tan : NULL);
-
-    // ...and this frame's panels, replaced whole — including with none, which is
-    // how a guest taking a menu down is expressed. Unconditional rather than
-    // guarded on nquads: leaving the previous frame's list standing would keep
-    // drawing a layer the guest has stopped submitting.
-    kl_ovrp_overlays_external(quads, nquads);
-    // The same statement for the eye, which had no way to be told "not this
-    // frame" — see kl_ovrp.h. A guest that alternates between a projection pair
-    // and a quad shows one or the other, not both at once.
-    kl_ovrp_eye_layer_external(proj_layers > 0);
+    // The foveal insets, now that the base is known however the guest ordered
+    // its layers. Everything here is the placement math that used to run inline;
+    // the only change is WHEN.
+    for (int k = 0; k < ninset; k++) {
+        int v = insets[k].eye;
+        if (base_stage_eye[v] < 0) {
+            klxr_fovea_trace(v, 0, 0, 0, 0,
+                             "no base layer was captured for this eye at all");
+            continue;
+        }
+        const XrFovf *f = &insets[k].fov;
+        float il = tanf(f->angleLeft),  ir = tanf(f->angleRight);
+        float iu = tanf(f->angleUp),    id = tanf(f->angleDown);
+        float bl = base_tan[v][0], br = base_tan[v][1];
+        float bu = base_tan[v][2], bd = base_tan[v][3];
+        float bw = br - bl, bh = bu - bd, ispan = ir - il;
+        // CONTAINMENT, not a ratio. "Narrower than 80% of the base" was a
+        // threshold with nothing behind it, and this guest's inset frustum
+        // crosses it while adapting: measured on device at tan L-1.3381
+        // R0.9985 (span 2.337 against the base's 2.732 — 86%, REFUSED) and,
+        // two captures later, L-0.6627 R0.6737 (span 1.336 — accepted). So the
+        // inset was composited on some frames and not others as the guest
+        // foveated, which is the centre of the picture gaining and losing its
+        // detail: the jitter, from a constant nobody measured.
+        //
+        // The real question is whether this layer's frustum lies INSIDE the
+        // base's, which is what "an inset" means and needs no magic number. The
+        // epsilon keeps a layer that merely equals the base — the same view
+        // submitted twice — from being laid over itself.
+        const float in_eps = 0.01f;
+        int inside = il > bl + in_eps && ir < br - in_eps &&
+                     iu < bu - in_eps && id > bd + in_eps;
+        if (!(bw > 0 && bh > 0 && ispan > 0) || !inside) {
+            klxr_fovea_trace(v, 0, 0, 0, 0,
+                             "this layer's frustum is not inside the base's");
+            continue;
+        }
+        float nx0 = (il - bl) / bw, nx1 = (ir - bl) / bw;
+        float ny0, ny1;
+        if (!fovea_flip) { ny0 = (bu - iu) / bh; ny1 = (bu - id) / bh; }
+        else             { ny0 = (id - bd) / bh; ny1 = (iu - bd) / bh; }
+        // Parallax alignment. The inset is rendered from one viewpoint and the
+        // base from another, so the same angular direction points at different
+        // content for anything not at infinity — seen as a doubled edge where
+        // the sharp inset and the offset base overlap. A point at depth D shifts
+        // by (inset - base) / D in tangent between the two viewpoints.
+        // KL_XR_FOVEA_DEPTH_CM sets D; BOTH axes, because this display's
+        // head->eye offset has a real vertical component where a Quest's is
+        // essentially horizontal. Measured zero on Steam Link, whose two layers
+        // share a pose — it costs nothing there and is not what that guest's
+        // vertical seam was.
+        static int depth_cm = -1, par = -1;
+        if (depth_cm < 0) depth_cm = kl_env_int("KL_XR_FOVEA_DEPTH_CM", 200);
+        if (par < 0)      par      = kl_env_on("KL_XR_FOVEA_PARALLAX", 1);
+        float D = depth_cm / 100.0f;
+        if (par && D >= 0.2f) {
+            float dx = (insets[k].px - base_eye_x[v]) / D;
+            float dy = (insets[k].py - base_eye_y[v]) / D;
+            nx0 += dx / bw; nx1 += dx / bw;
+            // Screen y runs DOWN where the tangent runs up, so the vertical
+            // term enters negated — the same sign relation ny0/ny1 carries.
+            ny0 -= dy / bh; ny1 -= dy / bh;
+        }
+        // Manual fine-alignment for the residual the depth model does not
+        // reach, in THOUSANDTHS of the eye, and a scale trim about the inset's
+        // own centre for doubling that grows from nothing at the centre to
+        // worst at the rim (1000 = no change).
+        static int shx = -32768, shy = -32768, fsc = -1;
+        if (shx == -32768) shx = kl_env_int("KL_XR_FOVEA_SHIFT_X", 0);
+        if (shy == -32768) shy = kl_env_int("KL_XR_FOVEA_SHIFT_Y", 0);
+        if (fsc < 0)       fsc = kl_env_int("KL_XR_FOVEA_SCALE", 1000);
+        nx0 += shx / 1000.0f; nx1 += shx / 1000.0f;
+        ny0 += shy / 1000.0f; ny1 += shy / 1000.0f;
+        if (fsc > 0 && fsc != 1000) {
+            float sc_ = fsc / 1000.0f;
+            float cx = (nx0 + nx1) * 0.5f, cy = (ny0 + ny1) * 0.5f;
+            nx0 = cx + (nx0 - cx) * sc_; nx1 = cx + (nx1 - cx) * sc_;
+            ny0 = cy + (ny0 - cy) * sc_; ny1 = cy + (ny1 - cy) * sc_;
+        }
+        // Once per frame shape: the numbers behind a vertical seam. `as placed`
+        // is after every correction above, so it is what the blit did; the flip
+        // figure is the delta a flip would add to it, and it is a pure shift
+        // whose size is ((iu+id) - (bu+bd)) / bh — zero only for a frustum
+        // symmetric about the view axis, which this one is not.
+        // Printed on a frame-shape change AND whenever the inset's own frustum
+        // moves materially, because this guest's foveation is DYNAMIC — the
+        // inset narrows and widens while the shape stays the same, and those are
+        // exactly the seconds klxr_fovea_trace reports placement travel in. A
+        // shape-keyed line cannot describe an event it never fires on.
+        static float said_iu[2], said_id[2];
+        int moved = fabsf(iu - said_iu[v]) > 0.002f ||
+                    fabsf(id - said_id[v]) > 0.002f;
+        if (!(g_fovea_said & (1u << v)) || moved) {
+            g_fovea_said |= (uint8_t)(1u << v);
+            said_iu[v] = iu; said_id[v] = id;
+            fprintf(stderr,
+                "  [xr] fovea eye %d placement: base tan U%.3f D%.3f at "
+                "(%.4f %.4f), inset tan U%.3f D%.3f at (%.4f %.4f); y "
+                "[%.4f..%.4f] as placed; KL_XR_FOVEA_FLIP would move it %.1f "
+                "thousandths of the eye\n",
+                v, (double)bu, (double)bd,
+                (double)base_eye_x[v], (double)base_eye_y[v],
+                (double)iu, (double)id, (double)insets[k].px,
+                (double)insets[k].py, (double)ny0, (double)ny1,
+                (double)((((iu + id) - (bu + bd)) / bh) * 1000.0f));
+        }
+        klxr_fovea_trace(v, nx0, ny0, nx1, ny1, NULL);
+        kl_glfb_overlay_eye_inset(v, base_stage_eye[v], insets[k].tex,
+                                  insets[k].layer, insets[k].w, insets[k].h,
+                                  nx0, ny0, nx1, ny1);
+    }
 
     // The Vulkan frame seam, and BONELAB's trap (c) reached through the other
     // API: a compositor's "is there a new frame?" test is a SERIAL, and on the
@@ -4677,6 +5103,90 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             (out || kl_glfb_has_frame_sink() || kl_glfb_has_gpu_fence()))
             kl_glfb_present(out);
     }
+    // ---------------------------------------------------------------------
+    // Publishing this frame, and the ORDER of it is load-bearing.
+    //
+    // A compositor waits on the guest's frame fence and then draws whatever
+    // records it finds. If a record is published BEFORE the fence value that
+    // covers it, the compositor can read the fence for frame N, read the record
+    // for frame N+1, and draw N+1's layers having waited only for N's blits —
+    // so a destination still holds its previous contents and one frame of the
+    // display is a picture from several frames ago. That is the "stale frame"
+    // flash, and it is a pure ordering bug: every call succeeds and the picture
+    // is correct again on the next frame.
+    //
+    // So the frame's completion is published FIRST (the Vulkan serial, or the
+    // GL fence signal inside kl_glfb_present) and the records that describe it
+    // SECOND. A compositor that reads the records before the fence then cannot
+    // hold a record newer than the fence it is about to wait on — it can only
+    // hold an older one, which costs a frame of latency and is always safe.
+    // See KleptonCompositor.encodeFrame and klvm_draw_proj_layers, which read
+    // in that order for this reason.
+
+    // Close this frame's record, under the image the guest actually presented.
+    // A frame that submitted no projection layer for the composited layer drew
+    // no new picture, so nothing is filed and the compositor shows the previous
+    // one again — the same rule, and for the same reason, as klovrp_EndFrame's
+    // "a frame that drew into no eye stage must not file anything".
+    if (drawn_stage >= 0)
+        kl_ovrp_frame_end_external(drawn_stage,
+                                   have_layer_pose ? layer_pose : NULL,
+                                   have_layer_pose ? layer_tan : NULL);
+
+    // ...and this frame's PROJECTION layers, in the order the guest submitted
+    // them, replaced whole for the same reason the panels below are. Filed only
+    // when the per-layer composite is on: a count of zero is what tells every
+    // compositor to fall back to the single eye picture, which is what every
+    // other guest and KL_XR_LAYERS=0 must keep getting.
+    if (layers_on) {
+        kl_ovrp_proj_layers_external(pl, npl);
+        s->proj_hist[npl < 9 ? npl : 8]++;
+        for (int k = 0; k < npl && k < 8; k++) {
+            s->proj_present[k]++;
+            if (pl[k].slot[0] >= 0 || pl[k].slot[1] >= 0) s->proj_placed[k]++;
+        }
+        // The frame's layer ARRANGEMENT, printed whenever it changes — which is
+        // often, and is the point. This guest alternates between two and three
+        // layers about once a second AND narrows one layer's frustum while it
+        // runs, so a count-keyed line describes a shape the run spends most of
+        // its time not being in. Keyed on the fields of view rather than on the
+        // slots, which rotate every frame by design.
+        char shape[192];
+        int  sn = snprintf(shape, sizeof shape, "%d:", npl);
+        for (int k = 0; k < npl && sn > 0 && sn < (int)sizeof shape; k++)
+            sn += snprintf(shape + sn, sizeof shape - (size_t)sn, " %.0fx%.0f@%dx%d",
+                           (double)((atanf(pl[k].tangents[0][0]) +
+                                     atanf(pl[k].tangents[0][1])) * 57.2958f),
+                           (double)((atanf(pl[k].tangents[0][2]) +
+                                     atanf(pl[k].tangents[0][3])) * 57.2958f),
+                           plw[k], plh[k]);
+        static char said_shape[192];
+        if (strcmp(shape, said_shape) != 0) {
+            snprintf(said_shape, sizeof said_shape, "%s", shape);
+            fprintf(stderr, "  [xr] compositing %d projection layer(s) back to "
+                            "front:", npl);
+            for (int k = 0; k < npl; k++)
+                fprintf(stderr, " [%d] slots %d/%d fov %.0fx%.0f deg, %dx%d px",
+                        k, pl[k].slot[0], pl[k].slot[1],
+                        (double)((atanf(pl[k].tangents[0][0]) +
+                                  atanf(pl[k].tangents[0][1])) * 57.2958f),
+                        (double)((atanf(pl[k].tangents[0][2]) +
+                                  atanf(pl[k].tangents[0][3])) * 57.2958f),
+                        plw[k], plh[k]);
+            fprintf(stderr, "\n");
+        }
+    }
+
+    // ...and this frame's panels, replaced whole — including with none, which is
+    // how a guest taking a menu down is expressed. Unconditional rather than
+    // guarded on nquads: leaving the previous frame's list standing would keep
+    // drawing a layer the guest has stopped submitting.
+    kl_ovrp_overlays_external(quads, nquads);
+    // The same statement for the eye, which had no way to be told "not this
+    // frame" — see kl_ovrp.h. A guest that alternates between a projection pair
+    // and a quad shows one or the other, not both at once.
+    kl_ovrp_eye_layer_external(proj_layers > 0);
+
     return KLXR_SUCCESS;
 }
 

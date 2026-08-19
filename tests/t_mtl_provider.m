@@ -29,10 +29,15 @@
 // so a texture released after SetupEyeTexture2 returns would leave the GL
 // texture pointing at freed storage — and the failure would appear frames later
 // in the compositor rather than here.
-static id<MTLTexture> g_held[2][4];
-static int g_slice[2][4];
-static int g_dim[4][2];          // the size each stage's texture actually is
-static uint32_t g_fmt[4];        // ...and the GL internalformat it was made for
+// Sized by kl_glfb's slot count and not by the guest's stage count, and that is
+// the whole of it: a provider holding fewer DECLINES every slot past its own
+// end, and a declined slot is a layer with no storage — the mirror fails, the
+// frame composes nothing, and the viewer holds. Held four while kl_glfb keyed
+// sixteen, and most frames of a two-swapchain guest failed to compose.
+static id<MTLTexture> g_held[2][KL_MTL_MAX_STAGES];
+static int g_slice[2][KL_MTL_MAX_STAGES];
+static int g_dim[KL_MTL_MAX_STAGES][2];   // the size each slot's texture actually is
+static uint32_t g_fmt[KL_MTL_MAX_STAGES]; // ...and the GL internalformat it was made for
 
 // ---------------------------------------------------------------------------
 // Foveation on the host (KL_VRR, on by default; KL_VRR=0 is the A/B).
@@ -117,7 +122,18 @@ static MTLPixelFormat klmtl_pixel_format(uint32_t gl_internal) {
 static int provide(int eye, int stage, int w, int h, uint32_t internal_fmt,
                    kl_mtl_eye_texture *out, void *ctx) {
     (void)ctx;
-    if (eye < 0 || eye > 1 || stage < 0 || stage > 3) return 0;
+    if (eye < 0 || eye > 1 || stage < 0) return 0;
+    if (stage >= KL_MTL_MAX_STAGES) {
+        // Named, not silent: a declined slot has no error surface downstream —
+        // the guest renders correctly into its own storage and the composite
+        // simply has nothing to sample for that layer.
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [mtl] eye %d slot %d is beyond the %d this provider "
+                            "holds — declining, so that layer is not composited\n",
+                    eye, stage, KL_MTL_MAX_STAGES);
+        return 0;
+    }
     MTLPixelFormat pf = klmtl_pixel_format(internal_fmt);
     if (pf == MTLPixelFormatInvalid) {
         // Declining is the right answer, not a substitute format: the guest

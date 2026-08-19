@@ -16,10 +16,29 @@ int kl_view_available(void);
 // itself and anything on the other end of a wire against it, so a number
 // arriving after boot is a number nobody reads.
 //
-// This is the panel's rate, which is a ceiling and not a promise — nothing on
-// the host paces the guest's frame loop, so what it actually achieves is its
-// own throughput and can be far below this. The viewer's HUD prints both.
+// This is the panel's rate, which is a ceiling and not a promise: what a guest
+// actually achieves is its own throughput and can be far below this. The
+// viewer's HUD prints both. A guest paced by kl_view_pace_wait below is held to
+// the composite and so cannot exceed it either.
 float kl_view_display_hz(void);
+
+// ---- the guest's frame clock ------------------------------------------------
+//
+// For a guest that owns its own frame loop — an OpenXR one, where xrWaitFrame
+// is the call that means "my next frame starts here". Install kl_view_pace_wait
+// as that runtime's frame pacer and the viewer's composite becomes the guest's
+// clock: one tick published per displayed frame, consumed by the guest's wait.
+//
+// Without it nothing on the host paces such a guest at all. Steam Link's VR
+// client then ran its render loop at ~1000 Hz against a 120 Hz window — eight
+// submitted frames for every one displayed, every mirror blit paid for each of
+// them, and the frame-pacing telemetry it reports to the streaming host
+// measured against a clock nobody drives.
+//
+// The publish/stop halves are the viewer's own; a caller only installs the wait.
+void kl_view_pace_wait(void);
+void kl_view_pace_publish(void);
+void kl_view_pace_stop(void);
 
 // The kl_glfb_frame_sink implementation, used by the readback path only
 // (KL_VIEW_CPU=1). Runs on the GL thread inside the guest's frame — memcpy and

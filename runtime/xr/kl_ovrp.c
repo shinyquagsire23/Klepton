@@ -1854,7 +1854,14 @@ static klovrp_pose klovrp_step_hand(int step, int hand) {
 // that never existed, and reprojecting against it would produce a visible jump
 // rather than a shrug. The lock is taken twice per frame per side and is
 // uncontended in practice.
-#define KLOVRP_MAX_STAGES 4
+// **Sized to kl_glfb's slot count, not to the guest's stage count**, and the
+// two are the same key: a frame is filed under the SLOT its picture landed in,
+// which on the OpenXR path is allocated per (swapchain, image) and runs well
+// past a swapchain's own 0..2 (see kl_glfb.h, kl_glfb_mirror_eye_layer). A ring
+// shorter than the slot space silently files nothing for the frames whose slot
+// is past its end, which is a compositor with no pose for the picture it is
+// holding.
+#define KLOVRP_MAX_STAGES 16
 static struct {
     kl_ovrp_render_pose r[KLOVRP_MAX_STAGES];
     // The frame between BeginFrame and EndFrame, whose stage is not known yet.
@@ -4198,6 +4205,53 @@ void kl_ovrp_overlays_external(const kl_ovrp_overlay *v, int n) {
     if (n && v) memcpy(g_overlays.v, v, (size_t)n * sizeof *v);
     g_overlays.n = n;
     pthread_mutex_unlock(&g_frames.mu);
+}
+
+// The projection layers of the current frame — see kl_ovrp.h. One storage, one
+// lock, one reader, exactly as the overlay list beside it; nothing but an
+// OpenXR guest ever files it, and a count of zero means "composite the eye the
+// way you always did".
+static struct {
+    kl_ovrp_proj_layer v[KLOVRP_MAX_LAYERS];
+    int                n;
+} g_proj_layers;
+
+void kl_ovrp_proj_layers_external(const kl_ovrp_proj_layer *v, int n) {
+    if (n < 0) n = 0;
+    if (n > KLOVRP_MAX_LAYERS) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [ovrp] %d projection layers submitted and only %d "
+                            "fit the record — the rest are NOT composited\n",
+                    n, KLOVRP_MAX_LAYERS);
+        }
+        n = KLOVRP_MAX_LAYERS;
+    }
+    pthread_mutex_lock(&g_frames.mu);
+    if (n && v) memcpy(g_proj_layers.v, v, (size_t)n * sizeof *v);
+    g_proj_layers.n = n;
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
+int kl_ovrp_proj_layer_count(void) {
+    pthread_mutex_lock(&g_frames.mu);
+    int n = g_proj_layers.n;
+    pthread_mutex_unlock(&g_frames.mu);
+    return n;
+}
+
+// The whole list under ONE lock — see kl_ovrp.h. Reading it an entry at a time
+// lets the guest replace it in between, which draws half of one frame's layers
+// with half of the next's.
+int kl_ovrp_proj_layers_snapshot(kl_ovrp_proj_layer *out, int max) {
+    if (!out || max <= 0) return 0;
+    pthread_mutex_lock(&g_frames.mu);
+    int n = g_proj_layers.n;
+    if (n > max) n = max;
+    if (n > 0) memcpy(out, g_proj_layers.v, (size_t)n * sizeof *out);
+    pthread_mutex_unlock(&g_frames.mu);
+    return n;
 }
 
 // See kl_ovrp.h. One int, no lock: it is written by the guest's frame thread and

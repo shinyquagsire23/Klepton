@@ -375,6 +375,68 @@ void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8
 // which eyes were named, and nothing downstream can recover either.
 void kl_ovrp_overlays_external(const kl_ovrp_overlay *v, int n);
 
+// ---------------------------------------------------------------------------
+// The PROJECTION layers — the eye picture, once per layer instead of flattened
+//
+// A guest may submit more than one projection layer, and OpenXR says what they
+// mean: draw them back to front, each with its own field of view, each in its
+// own space. Steam Link submits two or three (a wide picture plus an adaptive
+// high-detail centre, and on host an environment backdrop under both).
+//
+// The composite used to pick ONE of them and flatten the others into it — the
+// widest became "the eye", a narrower one contained inside it was blitted over
+// the centre, and everything else was dropped. That model requires a rect
+// computation, a mapping from one layer's frustum into another's, a rule for
+// which layer is the eye, a threshold for what counts as an inset, and a
+// destination shared between sources; four real defects were fixed inside it
+// and the seam it produced survived all four. Drawing each layer as its own
+// quad with its own frustum has none of those decisions, because each layer is
+// placed only against the display — never against another layer.
+//
+// One entry per submitted projection layer, in SUBMISSION ORDER: entry 0 is the
+// backdrop and the last entry is on top, which is the order a compositor draws
+// them in.
+typedef struct {
+    // The compositor slot holding this layer's picture, per eye — the key for
+    // kl_glfb_eye_mtl_texture — or -1 for an eye this layer does not name. It
+    // is NOT the guest's swapchain image index: several layers name image 0 in
+    // one frame, which is exactly why they used to collide (kl_glfb.h).
+    int   slot[2];
+    // What this layer was RENDERED with, per eye: left, right, top, bottom
+    // tangents, all positive, in cp_view_get_tangents order. The whole point of
+    // the per-layer composite — a picture drawn with one field of view is
+    // placed with that one and no other.
+    float tangents[2][4];
+    // Where the layer's views are, in the tracking space: {px,py,pz} then
+    // {qx,qy,qz,qw}. One pose for the layer rather than one per eye, because
+    // the composite is rotation-only (kl_reproject.h) and the two views'
+    // orientations are the same — measured at 0.000 deg apart. The position is
+    // the midpoint of the two views, i.e. the head.
+    float pose[7];
+    // 1 when row 0 of the picture is its TOP — Vulkan and Metal — and 0 for one
+    // GL drew. Same meaning and polarity as kl_ovrp_overlay.origin_top_left.
+    int   origin_top_left;
+} kl_ovrp_proj_layer;
+
+// How many projection layers the guest's most recent frame submitted, and what
+// they were. Replaced whole under the frame lock, exactly as the overlay list
+// is and for the same reason: a compositor reading a half-written list would
+// draw one frame's layer with another frame's geometry.
+//
+// **Zero is the ordinary answer for every other guest**, and means "composite
+// the eye the way you always did" rather than "draw nothing". Only a guest that
+// files this list is drawn per layer; an OVRPlugin guest never does, and
+// neither does an OpenXR guest under KL_XR_LAYERS=0.
+// **Read the list with the snapshot, not entry by entry.** The guest files a
+// new list whole, between any two calls a compositor makes, so fetching entry 0
+// and then entry 1 can pair one frame's backdrop with the next frame's picture
+// — half of each, drawn together, seen as a region of the display briefly
+// showing an older frame. One lock, one list, no pairing to get wrong. Returns
+// how many entries were written, never more than `max`.
+int  kl_ovrp_proj_layers_snapshot(kl_ovrp_proj_layer *out, int max);
+int  kl_ovrp_proj_layer_count(void);
+void kl_ovrp_proj_layers_external(const kl_ovrp_proj_layer *v, int n);
+
 // ...and whether the guest's most recent frame carried an EYE PICTURE at all.
 //
 // A compositor draws the layers the guest submitted THIS frame, and the eye

@@ -214,6 +214,9 @@ final class KleptonCompositor {
     private var queue: MTLCommandQueue?
     private var pipeline: MTLRenderPipelineState!
     private var depthState: MTLDepthStencilState?
+    /// Always-pass, no write — for coplanar draws after the first. See where
+    /// `depthState` is built for why the two cannot be one.
+    private var depthPassState: MTLDepthStencilState?
     private var sampler: MTLSamplerState!
     /// Views this GPU can draw in one amplified pass. 2 everywhere real; 1
     /// forces the old per-view passes, and forces foveation off with them
@@ -626,6 +629,21 @@ final class KleptonCompositor {
             dsd.depthCompareFunction = .greater
             dsd.isDepthWriteEnabled = true
             depthState = device.makeDepthStencilState(descriptor: dsd)
+
+            // ...and the state for everything drawn AFTER the first thing at a
+            // given distance. `.greater` against a depth already written is
+            // false for an EQUAL depth, and every projection layer is a quad at
+            // KL_REPROJECT_DEPTH — so with the state above left in force, layer
+            // 0 writes its depth and every layer after it is discarded by the
+            // depth test. That is the picture losing everything the guest
+            // stacked on it, with no error surface: each draw is issued, each
+            // returns, and the display shows the backdrop. Measured on device
+            // as a lower-detail, shimmering picture, shimmering because WHICH
+            // layer is first changes while the guest runs.
+            let dsdAlways = MTLDepthStencilDescriptor()
+            dsdAlways.depthCompareFunction = .always
+            dsdAlways.isDepthWriteEnabled = false
+            depthPassState = device.makeDepthStencilState(descriptor: dsdAlways)
 
             // The overlay pass — the guest's non-eye layers, which are the whole
             // of an Unreal title's UI. See encodeOverlays.
@@ -1496,6 +1514,18 @@ final class KleptonCompositor {
         // instead. `guestFrameEvent` being nil on that path is what keeps the
         // wait below from being encoded against a value nothing ever signals,
         // which would be a command buffer that is committed and never executes.
+        // The guest's projection layers, snapshotted BEFORE the fence below is
+        // read, and that order is the whole of it: the guest publishes its
+        // frame's completion before the records that describe it
+        // (klxr_EndFrame), so a list read first can only be OLDER than the
+        // fence read second — never newer, which would be drawing layers whose
+        // blits this pass never waited for. Seen as one frame of the display
+        // showing a picture from several frames ago, a few seconds apart.
+        projLayerCount = projLayers.withUnsafeMutableBufferPointer {
+            kl_ovrp_eye_layer_live() != 0
+                ? Int(kl_ovrp_proj_layers_snapshot($0.baseAddress, Int32($0.count)))
+                : 0
+        }
         let glFence = kl_glfb_gpu_fence_value()
         let frameValue = glFence != 0 ? glFence : kl_vulkan_frame_serial()
         // KL_CP_NOFENCE=1 skips the wait. A composite command buffer that waits
@@ -1902,11 +1932,24 @@ final class KleptonCompositor {
             enc.setVertexAmplificationCount(viewIndices.count, viewMappings: &mappings)
         }
 
+        // The PER-LAYER composite, when the guest's last frame described its
+        // projection layers one by one. It replaces everything the eye pass
+        // does below — the layers ARE the eye picture — so `visible` comes from
+        // it and the eye branch is skipped entirely. Zero is every guest that
+        // files no list, which is every guest but Steam Link and every run
+        // under KL_XR_LAYERS=0, and those take the eye pass unchanged.
+        let nproj = projLayerCount
+        if nproj > 0 {
+            visible = encodeProjLayers(enc, viewIndices: viewIndices,
+                                       drawable: drawable,
+                                       originFromDevice: originFromDevice,
+                                       count: nproj) > 0 ? viewIndices.count : 0
+        }
         // The EYE pass, and only when there is an eye. `haveEyes` is false for
         // a guest whose whole picture is a composition layer (see above), and
         // the overlay pass below is then the entire composite rather than a
         // decoration on top of one.
-        if visible > 0, let bind0, let bind1 {
+        if nproj == 0, visible > 0, let bind0, let bind1 {
             if !loggedEyeTextures {
                 loggedEyeTextures = true
                 NSLog("[cp] eye textures: slot0 \(bind0.width)x\(bind0.height) "
@@ -2041,6 +2084,149 @@ final class KleptonCompositor {
         if visible > 0 { return visible }
         return panels > 0 ? viewIndices.count : 0
     }
+
+    /// The guest's PROJECTION layers, each as its own quad with its own frustum,
+    /// in submission order — the macOS viewer's klvm_draw_proj_layers, on the
+    /// device. Returns how many were drawn, which is what the caller's
+    /// black-frame count needs.
+    ///
+    /// This REPLACES the eye pass rather than adding to it: the layers are the
+    /// eye picture, stated whole instead of flattened into one texture. A guest
+    /// that files no list — every guest but Steam Link, and every run under
+    /// `KL_XR_LAYERS=0` — takes the eye pass unchanged, so nothing here is on
+    /// any other target's path.
+    ///
+    /// Ordering is the draw order and nothing else. Each layer is a quad at
+    /// `KL_REPROJECT_DEPTH`, so they are coplanar and the depth test cannot
+    /// separate them; back to front is what OpenXR specifies and what
+    /// submission order means. Depth is written by the FIRST layer drawn — the
+    /// backdrop — because visionOS reprojects using the depth buffer and a
+    /// frame that writes none is treated as empty (see encodeOverlays), while
+    /// letting every layer write would stamp a nearer quad's depth over the
+    /// same plane for no gain.
+    @discardableResult
+    private func encodeProjLayers(_ enc: MTLRenderCommandEncoder,
+                                  viewIndices: [Int],
+                                  drawable: LayerRenderer.Drawable,
+                                  originFromDevice: simd_float4x4,
+                                  count: Int) -> Int {
+        guard let pipeline, let sampler else { return 0 }
+        let grid = identityGrid()
+        var drawn = 0
+        for i in 0..<min(count, projLayers.count) {
+            let pl = projLayers[i]
+            // One uniform per amplified view, in the pass's own order — the
+            // vertex shader indexes this by [[amplification_id]], so a view this
+            // layer does not cover says so with visible = 0 rather than by not
+            // being drawn.
+            var uniforms: [kl_reproject_uniforms] = []
+            var sources: [MTLTexture?] = []
+            for vi in viewIndices {
+                let slot = vi == 1 ? pl.slot.1 : pl.slot.0
+                var tex: MTLTexture? = nil
+                var slice: Int32 = 0
+                if slot >= 0,
+                   let t = kl_glfb_eye_mtl_texture(Int32(vi), slot, &slice) {
+                    // Through the array view for the reason the eye pass is:
+                    // every shader in kl_reproject.c samples a
+                    // texture2d_array, and a plain 2D bound to one samples
+                    // nothing with no error at all.
+                    tex = arrayView(Unmanaged<MTLTexture>.fromOpaque(t)
+                                        .takeUnretainedValue() as MTLTexture)
+                }
+                var u = withUnsafePointer(to: pl) {
+                    kl_proj_layer_build($0, Int32(vi), originFromDevice,
+                                        drawable.views[vi].transform,
+                                        drawable.computeProjection(viewIndex: vi),
+                                        UInt32(slice))
+                }
+                if tex == nil { u.visible = 0 }
+                if let only = Self.onlyEye, only != vi { u.visible = 0 }
+                uniforms.append(u)
+                sources.append(tex)
+            }
+            // Two texture slots, view 0 in the first and every other view in the
+            // second — the eye pass's rule, and for the same reason: a layer's
+            // two eyes are either two slices of one texture or two textures.
+            let bind0 = sources.first.flatMap { $0 } ?? sources.compactMap { $0 }.first
+            let bind1 = (sources.count > 1 ? sources[1] : nil) ?? bind0
+            guard let bind0, let bind1,
+                  uniforms.contains(where: { $0.visible != 0 }) else {
+                // Named once per layer index: "the guest submitted a layer we
+                // cannot reach" and "the guest submitted fewer layers" are the
+                // same picture, which is the failure this pass exists to end.
+                if !loggedProjMiss.contains(i) {
+                    loggedProjMiss.insert(i)
+                    NSLog("[cp] projection layer \(i) (slots \(pl.slot.0)/\(pl.slot.1)) "
+                          + "has no MTLTexture — not composited")
+                }
+                continue
+            }
+            // A view whose texture is neither bound slot is dropped rather than
+            // shown another eye's picture — the eye pass's rule again.
+            for n in uniforms.indices where uniforms[n].visible != 0 {
+                if sources[n] !== (n == 0 ? bind0 : bind1) { uniforms[n].visible = 0 }
+            }
+            // The FIRST layer drawn writes depth and every one after it only
+            // passes. visionOS reprojects from the depth buffer, so the frame
+            // must carry some — but the layers are coplanar at
+            // KL_REPROJECT_DEPTH, and a `.greater` test against a depth already
+            // written discards every one of them.
+            if let d = drawn == 0 ? depthState : depthPassState {
+                enc.setDepthStencilState(d)
+            }
+            enc.setRenderPipelineState(pipeline)
+            enc.setFragmentTexture(bind0, index: 0)
+            enc.setFragmentTexture(bind1, index: 1)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            uniforms.withUnsafeBytes { buf in
+                enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            }
+            enc.setVertexBuffer(grid, offset: 0, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                               vertexCount: Int(kl_reproject_grid_vertices(1, 1)))
+            drawn += 1
+        }
+        // What each layer is ACTUALLY being placed with, said when it CHANGES —
+        // this guest's layer arrangement moves while it runs (a layer appears
+        // and disappears about once a second, and one layer's frustum halves
+        // and doubles), so a first-frame-only line describes a shape the run
+        // spends most of its time not being in.
+        if drawn > 0 {
+            let shape = "\(count) layer(s), \(drawn) composited"
+            if shape != lastProjShape {
+                lastProjShape = shape
+                NSLog("[cp] per-layer composite: \(shape)")
+            }
+        }
+        return drawn
+    }
+
+    /// The identity unwarp grid, built once. The per-layer pass binds this
+    /// rather than `unwarpGrid`'s: a layer's picture is a whole guest swapchain
+    /// image copied as it is, so there is no rate map to undo and no render
+    /// viewport smaller than the texture.
+    private func identityGrid() -> MTLBuffer? {
+        if identityGridBuffer == nil {
+            var tmp = [SIMD2<Float>](repeating: .zero,
+                                     count: Int(kl_reproject_grid_entries(1, 1)))
+            tmp.withUnsafeMutableBufferPointer { kl_reproject_grid_identity($0.baseAddress) }
+            identityGridBuffer = tmp.withUnsafeBytes {
+                device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: [])
+            }
+        }
+        return identityGridBuffer
+    }
+    /// This frame's projection layers, taken whole and taken EARLY — see where
+    /// it is filled for why the read order against the frame fence matters.
+    /// Read only on the render loop, which is also the only thread that writes
+    /// it, so it needs no lock of its own.
+    private var projLayers = [kl_ovrp_proj_layer](repeating: kl_ovrp_proj_layer(),
+                                                  count: 8)
+    private var projLayerCount = 0
+    private var identityGridBuffer: MTLBuffer?
+    private var loggedProjMiss = Set<Int>()
+    private var lastProjShape = ""
 
     /// The layers that are NOT the eye, drawn on top of it in the same encoder.
     ///

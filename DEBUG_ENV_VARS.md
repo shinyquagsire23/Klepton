@@ -1221,11 +1221,122 @@ that reports what came due since the frontend last asked. Platform-independent
   and the negotiation is visible in the guest's own log.
 
   The viewer's number is the PANEL's rate, which is a ceiling and not a
-  promise — nothing on the host paces the guest's frame loop, so a heavy target
-  can deliver a fraction of it while the far end of a video stream is asked for
-  the full rate. The viewer's HUD prints achieved against advertised every
-  second; this knob is how a run pins the advertised number to what it measured
-  (`Server requested refresh rate 90.0 was not available. Using 72.0`).
+  promise: a heavy target can deliver a fraction of it while the far end of a
+  video stream is asked for the full rate. The viewer's HUD prints achieved
+  against advertised every second; this knob is how a run pins the advertised
+  number to what it measured (`Server requested refresh rate 90.0 was not
+  available. Using 72.0`). Under `KL_XR_PACE` a guest that owns its frame loop
+  is held to the composite, so the two numbers agree unless the guest cannot
+  keep up; nothing paces the other host guests.
+
+  For Steam Link this knob decides the far end's ENCODE rate, and the pixel
+  count is not ours to set: the host packs four 1536x1536 tiles into one
+  1536x6144 frame, so 120 Hz asks SteamVR for 1.13 Gpixel/s and every advertised
+  hertz divides a bitrate the host chose into thinner frames. A live run at 120
+  measured 773 decoded frames in ~6.5 s — the rate was honoured — so the picture
+  quality question at a fixed link rate is bits per pixel, and this knob is the
+  only lever on the denominator.
+- `KL_XR_LAYERS=0` — flatten the guest's projection layers into one eye picture
+  instead of compositing each as its own quad (default 1, the per-layer
+  composite).
+
+  A guest may submit more than one projection layer, and OpenXR says what they
+  mean: draw them back to front, each with its own field of view, each in its
+  own space. Steam Link submits two or three. The per-layer composite does
+  exactly that — every layer is placed against the DISPLAY by its own tangents
+  and never against another layer, so there is no rect to compute, no mapping
+  from one frustum into another, no rule for which layer is "the eye" and no
+  threshold for what counts as an inset.
+
+  `0` restores the flattening those five decisions belong to: the widest layer
+  becomes the eye, a narrower one contained inside it is blitted over the
+  centre, and everything else is dropped. It is the A/B against a known state
+  and the only setting under which the `KL_XR_FOVEA*` knobs below do anything —
+  they place the inset the flattening lays down, and the per-layer composite
+  lays none.
+- `KL_XR_FOVEA=0` — stop compositing the foveal inset (default on, and only for
+  a guest whose driver said it stacks layers, `runtime/xr/kl_openxr.c`). Steam
+  Link streams a wide low-detail base projection layer plus a NARROW high-detail
+  centre one; the base is captured as the eye and the narrow layer is laid over
+  it where its own frustum falls, per eye, every frame it is submitted with a
+  released image and a span under 80% of the base's.
+
+  This is the A/B for two symptoms that look unrelated and are not: a visible
+  fovea BOUNDARY, and the view stepping up and down a frame at a time. The inset
+  is only laid down on frames where all of its preconditions hold, so if it is
+  misaligned against the base, the centre of the picture snaps between two
+  positions as it drops in and out. Off, the whole eye is uniformly the base's
+  detail and neither can happen — which is what makes it the separator.
+
+  Alignment, all read once: `KL_XR_FOVEA_SHIFT_X` / `_Y` nudge the placement in
+  THOUSANDTHS of the eye (default 0); `KL_XR_FOVEA_SCALE` (1000 = none) trims the
+  placement about the inset's own centre, for doubling that grows from nothing at
+  the centre to worst at the rim; `KL_XR_FOVEA_DEPTH_CM` (200) is the depth the
+  parallax correction aligns for, because the inset is rendered from the head
+  centre and the base from the eye; `KL_XR_FOVEA_FLIP=1` inverts the vertical
+  mapping for a guest whose rows run bottom-up. **The defaults were tuned by eye
+  on the HOST**, where the IPD is the 63 mm stopgap rather than a measured one,
+  so a device run is expected to want its own numbers — `_Y` first for a vertical
+  seam.
+
+  `KL_XR_FOVEA_FEATHER=0` makes the inset a hard rectangle instead of fading its
+  rim into the base; `KL_XR_FOVEA_INNER` (78, 0..100) is how much of the inset
+  stays fully sharp before that fade begins. The feather needs a plain
+  `sampler2D`, so an inset that is an ARRAY slice gets the hard edge regardless.
+
+- `KL_XR_FOVEA_DUMP=<dir>` — write EVERY projection layer's image as
+  `eye<N>_<seq>_layer<L>.png`, with the frustum each states, repeating every
+  `KL_XR_FOVEA_DUMP_EVERY` seconds (default 5; 0 captures once). All layers of
+  one frame share a capture, so they are comparable to each other.
+
+  It began as a base/inset pair and that was a mistake worth recording: a pair
+  assumes which layer is which, and the first capture that worked disproved the
+  assumption — the WIDEST layer, the one taken as the eye, was an empty blue
+  gradient, and the streamed picture was in the narrower layer being treated as
+  a foveal inset. An instrument that only photographs what you already believe
+  in cannot tell you that you named it wrong.
+
+  Prefer a HOST run: the files land where you can read them and no device pull is
+  needed — but set `KL_OVRP_EYE_TAN=vision` with it, because the host's default
+  base frustum is a symmetric 90 degrees and the device's is not, so an unset run
+  measures a different frustum pair than the one being complained about.
+
+  The dump REFUSES rather than guesses: if the texture's recorded size disagrees
+  with the size the caller asked for, if the texture cannot be attached for
+  reading, or if the read errors, it says which and writes nothing. It also
+  prints the image's mean, so a read that succeeded and saw nothing is
+  distinguishable from a picture.
+
+- `KL_XR_FOVEA_TRACE=1` — one line a second, per eye, on the foveal inset's
+  stability. The inset dropping out on some frames and the inset staying put in
+  a MOVING place look identical to the eye — both step the picture about — and
+  no per-frame number distinguishes them, so this accumulates over a second:
+
+  ```
+  [xr] fovea eye 0: 118 candidate(s), 112 laid down, 6 skipped — the base layer
+       was not captured before it this frame; placement travel x 0.4 y 3.9
+       (thousandths of the eye)
+  ```
+
+  Skips dominate → it is dropping out, and the named reason says why. Travel
+  dominates → the placement is moving, and the number is in
+  `KL_XR_FOVEA_SHIFT_Y`'s unit, so a y travel of 4 is a defect a shift of 4 would
+  cover. "Candidates", not frames: a guest stacking three projection layers
+  offers two of them per frame, so the count is opportunities.
+
+- `KL_XR_PACE=0` — stop pacing a host guest that owns its own frame loop, i.e.
+  let `xrWaitFrame` return immediately (default on, `mains/m_boot.c` under
+  `KL_VIEW`; the device app always paces, from its compositor). Applies to the
+  OpenXR guests that drive their own loop — Steam Link's VR door and JKXR — and
+  never to a Unity one, whose frame this side already calls.
+
+  It is an A/B for a real cost. Unpaced, the guest renders as fast as it can and
+  the compositor shows what it can: Steam Link's VR client ran ~1000 frames a
+  second against a 120 Hz window, paying its three per-frame mirror blits eight
+  times over for each displayed frame, and measuring the frame pacing it reports
+  to the streaming host against a clock nothing drove. Paced, the guest's frame
+  count tracks the composite (JKXR: 105 fps paced against 100 shown, 125 fps
+  unpaced against the same 100).
 - `KL_XR_CAPTURE_LAYER=N` — which projection layer `KL_GLFB_OUT` reads (default
   0, `runtime/xr/kl_openxr.c`). Steam Link's VR client submits **four** projection
   layers a frame — two 1536x1536 pairs for its panels and two 2290x2400 pairs

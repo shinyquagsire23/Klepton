@@ -266,7 +266,12 @@ static id<MTLBuffer> klvm_grid_buffer(id<MTLTexture> src, const float *vp,
 // then it says so and returns the original, which composites exactly as badly
 // as before but names the reason instead of leaving a flat colour to be read as
 // a dead guest.
-#define KLVM_VIEWS 8
+// Two eyes' worth of every compositor slot: the per-layer composite samples one
+// texture per layer per eye, so a guest with three layers of three images in
+// flight has eighteen distinct sources rather than the two the eye pass had. A
+// cache that fills builds a fresh texture view on every frame for everything
+// past it — correct, and an allocation per layer per frame.
+#define KLVM_VIEWS 32
 static struct { void *src; id<MTLTexture> view; } g_views[KLVM_VIEWS];
 
 static id<MTLTexture> klvm_array_view(id<MTLTexture> src) {
@@ -289,6 +294,102 @@ static id<MTLTexture> klvm_array_view(id<MTLTexture> src) {
     for (int i = 0; i < KLVM_VIEWS; i++)
         if (!g_views[i].src) { g_views[i].src = key; g_views[i].view = v; break; }
     return v ?: src;
+}
+
+// The identity unwarp grid, built once. The projection-layer pass below binds
+// this rather than klvm_grid_buffer's: a layer's picture is a whole guest
+// swapchain image copied as it is, so there is no rate map to undo and no
+// render viewport smaller than the texture — and the cached grid belongs to the
+// single-eye path, which would thrash between the two shapes.
+static id<MTLBuffer> g_grid_id;
+static id<MTLBuffer> klvm_identity_grid(void) {
+    if (!g_grid_id) {
+        simd_float2 tmp[8];
+        kl_reproject_grid_identity(tmp);
+        g_grid_id = [g_dev newBufferWithBytes:tmp
+                                       length:kl_reproject_grid_entries(1, 1) * sizeof *tmp
+                                      options:MTLResourceStorageModeShared];
+    }
+    return g_grid_id;
+}
+
+// The guest's PROJECTION layers, each drawn as its own quad with its own
+// frustum, in submission order — see kl_ovrp.h. Returns how many were drawn.
+//
+// This replaces the eye pass rather than adding to it: the layers ARE the eye
+// picture, and the single-eye path is what a guest that submits one projection
+// layer (which is every guest but Steam Link) still takes, unchanged, because
+// it files no list at all.
+//
+// No depth attachment and no blending here, so submission order is the whole
+// of the ordering: layer 0 is the backdrop and each one after it draws over
+// what is under it, which is what OpenXR's back-to-front means.
+static int klvm_draw_proj_layers(id<MTLRenderCommandEncoder> enc, int eye,
+                                 const kl_ovrp_proj_layer *list, int n,
+                                 simd_float4x4 proj) {
+    if (!g_pipe_rp) return 0;
+    // Where the head is NOW. Each layer's quad corrects the delta against its
+    // OWN render pose, which is why the pose travels in the record per layer.
+    float px, py, pz, qx, qy, qz, qw;
+    kl_ovrp_get_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
+    simd_float4x4 device = simd_matrix4x4(simd_quaternion(qx, qy, qz, qw));
+    id<MTLBuffer> gbuf = klvm_identity_grid();
+    uint32_t gverts = kl_reproject_grid_vertices(1, 1);
+    int drawn = 0;
+    for (int i = 0; i < n; i++) {
+        kl_ovrp_proj_layer pl = list[i];
+        if (pl.slot[eye] < 0) continue;      // this layer does not name this eye
+        int slice = 0;
+        void *tp = kl_glfb_eye_mtl_texture(eye, pl.slot[eye], &slice);
+        if (!tp) {
+            // Named once per layer index: "the guest submitted a layer we
+            // cannot reach" and "the guest submitted fewer layers" are the same
+            // picture, which is the failure this whole pass exists to end.
+            static int said[8];
+            if (i < 8 && !said[i]) {
+                said[i] = 1;
+                fprintf(stderr, "  [vmtl] projection layer %d has no MTLTexture in "
+                                "slot %d for eye %d — not composited\n",
+                        i, pl.slot[eye], eye);
+            }
+            continue;
+        }
+        // Through the array view for the reason the eye is: every shader in
+        // kl_reproject.c samples a texture2d_array, and a plain 2D bound to one
+        // returns nothing with no error at all.
+        id<MTLTexture> t = klvm_array_view((__bridge id<MTLTexture>)tp);
+        kl_reproject_uniforms u = kl_proj_layer_build(&pl, eye, device,
+                                                      matrix_identity_float4x4,
+                                                      proj, (uint32_t)slice);
+        if (!u.visible) continue;
+        [enc setRenderPipelineState:g_pipe_rp];
+        [enc setVertexBytes:&u length:sizeof u atIndex:0];
+        [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+        [enc setVertexBuffer:gbuf offset:0 atIndex:1];
+        [enc setFragmentTexture:t atIndex:0];
+        [enc setFragmentTexture:t atIndex:1];
+        [enc setFragmentSamplerState:g_samp atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
+        drawn++;
+    }
+    return drawn;
+}
+
+// A frame the per-layer pass could not compose, held rather than presented
+// black. Counted and named on the first, then once a second, because "the
+// composite is holding" and "the guest has stopped" are the same still picture
+// and a silent hold would hide either.
+static unsigned long g_holds;
+static void klvm_hold_frame(int nproj, int eye) {
+    g_holds++;
+    static double last;
+    double now = (double)clock() / CLOCKS_PER_SEC;
+    if (g_holds == 1 || now - last > 1.0) {
+        last = now;
+        fprintf(stderr, "  [vmtl] %d projection layer(s) submitted and none could be "
+                        "composited for eye %d — holding the previous frame "
+                        "(%lu so far)\n", nproj, eye, g_holds);
+    }
 }
 
 // One overlay's uniforms, for the eye this window is showing.
@@ -746,12 +847,27 @@ int kl_viewmtl_present(int win_w, int win_h) {
     // once full-field underneath and once on its panel.
     void *texp = kl_ovrp_eye_layer_live()
                      ? kl_glfb_eye_mtl_texture(eye, stage, &slice) : NULL;
+    // ...and how many projection layers the guest's last frame submitted. Any
+    // at all and the eye pass below becomes the per-layer pass: they are the
+    // same picture, described whole instead of flattened into one texture. Zero
+    // is every guest that does not file the list, which is every guest but
+    // Steam Link and every run under KL_XR_LAYERS=0.
+    // Snapshotted HERE, before the frame fence is read below, and that order is
+    // the whole of it: the guest publishes its frame's completion before the
+    // records that describe it (klxr_EndFrame), so a list read first can only
+    // be older than the fence read second — never newer, which would be drawing
+    // layers whose blits this pass never waited for. Seen as one frame of a
+    // picture from several frames ago.
+    kl_ovrp_proj_layer g_list[8];
+    int nproj = kl_ovrp_eye_layer_live()
+        ? kl_ovrp_proj_layers_snapshot(g_list, (int)(sizeof g_list / sizeof g_list[0]))
+        : 0;
     // No eye picture is not the same as no picture. A guest can present its
     // whole frame as an OpenXR quad layer and submit no projection layer at all
     // — JKXR does for its entire menu — and returning here showed a black window
     // for a run whose panel was arriving intact. The eye pass is skipped in that
     // case and the overlay pass below is the composite.
-    if (!texp && kl_ovrp_overlay_count() == 0) return 0;
+    if (!texp && nproj == 0 && kl_ovrp_overlay_count() == 0) return 0;
     id<MTLTexture> src = texp ? (__bridge id<MTLTexture>)texp : nil;
     // Every shader in kl_reproject.c samples a `texture2d_array<float>`, so a
     // source that is NOT an array is a bound type the shader cannot read — and
@@ -817,7 +933,20 @@ int kl_viewmtl_present(int win_w, int win_h) {
     // keep THAT aspect or a panel comes out stretched by the window's shape.
     // The tangents are the frustum, so their ratio is the aspect.
     double sw = 1832, sh = 1920;
-    if (src) { sw = (double)src.width; sh = (double)src.height; }
+    if (nproj > 0) {
+        // The per-layer composite has no single source texture to fit: the
+        // picture is several layers of DIFFERENT sizes and the guest changes
+        // which of them it submits while it runs, so a window shaped by "the
+        // texture in hand" changes shape frame to frame — which is the whole
+        // picture jumping, not a letterbox detail. The display's own frustum is
+        // what every layer is placed against, so its aspect is the window's.
+        float et[4] = { 1, 1, 1, 1 };
+        kl_ovrp_eye_view(eye, NULL, NULL, NULL, NULL, NULL, NULL, NULL, et);
+        if (et[0] + et[1] > 0 && et[2] + et[3] > 0) {
+            sw = et[0] + et[1];
+            sh = et[2] + et[3];
+        }
+    } else if (src) { sw = (double)src.width; sh = (double)src.height; }
     else {
         kl_ovrp_render_pose r;
         const float *t = kl_ovrp_stage_render_pose(stage, &r) ? r.tangents[eye] : NULL;
@@ -851,7 +980,31 @@ int kl_viewmtl_present(int win_w, int win_h) {
     }
     [enc setFragmentSamplerState:g_samp atIndex:0];
     kl_blit_uniforms bu = { (uint32_t)slice, (uint32_t)(flip ? 1 : 0) };
-    if (!src) {
+    if (nproj > 0) {
+        // The per-layer composite. The frustum is the DISPLAY's — what this
+        // window is looking through — and every layer is then placed inside it
+        // by its own tangents, never against another layer's. Taking it from
+        // the frame record instead would take it from whichever layer happened
+        // to be submitted last, which is a field of view that changes while the
+        // guest runs and would move the whole picture with it.
+        float et[4] = { 1, 1, 1, 1 };
+        kl_ovrp_eye_view(eye, NULL, NULL, NULL, NULL, NULL, NULL, NULL, et);
+        simd_float4x4 pproj = kl_reproject_projection(et[0], et[1], et[2], et[3], 0.03f);
+        int drew = klvm_draw_proj_layers(enc, eye, g_list, nproj, pproj);
+        if (!drew && kl_ovrp_overlay_count() == 0) {
+            // Nothing composed, and no panel to compose either. The drawable is
+            // CLEARED, so presenting it is a black frame between two good ones —
+            // flicker this compositor invents rather than flicker the guest
+            // sent. The eye pass could not produce it: its texture outlives the
+            // frame that filled it, so there was always something to draw. Hold
+            // the previous frame instead, and count the hold.
+            klvm_hold_frame(nproj, eye);
+            [enc endEncoding];
+            [cmd commit];
+            return 0;
+        }
+        klvm_note_delta(stage);
+    } else if (!src) {
         // Nothing to draw here; the cleared drawable is the background the
         // overlay pass draws its panel onto.
     } else if (g_pipe_rp) {

@@ -185,6 +185,25 @@ uint64_t kl_glfb_stage_draw_count(int stage);
 // With no provider registered nothing below changes behaviour, which is why the
 // macOS path and `make check` are unaffected.
 
+// How many (eye, slot) pairs the system carries, and therefore how many a
+// PROVIDER must be able to hold.
+//
+// A slot is the guest's own swapchain stage on the OVRPlugin path
+// (ovrp_GetEyeTextureStageCount's answer, indexed directly) and a compositor
+// SLOT on the OpenXR one, where several projection layers' images are live at
+// once and a swapchain's image index is not unique across them — see
+// kl_glfb_mirror_eye_layer. The two never share a process, so one table serves
+// both, and what the count has to cover is the OpenXR case: every (swapchain,
+// image) pair the guest keeps in flight, which for a three-layer guest is nine.
+//
+// **A provider sized smaller than this declines the slots past its own end**,
+// and a declined slot is a layer with no storage: the mirror fails, the frame
+// composes nothing, and a compositor either presents black or holds. Measured
+// on the host provider, which held four — most frames of a two-swapchain guest
+// failed to compose, seen first as flicker and then, once the compositor held
+// instead, as two seconds a frame.
+#define KL_MTL_MAX_STAGES 16
+
 // What the host supplies for one (eye, stage). `texture` is an id<MTLTexture>
 // which the host must keep alive for as long as the guest holds the eye texture.
 // `slice` addresses an array slice, which is how the two eyes arrive in a
@@ -257,7 +276,7 @@ void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
                                   int w, int h);
 
 // Copy one array LAYER of a guest-owned texture into a provider-backed 2D eye
-// texture, and return 1 if (eye, stage) now holds that picture.
+// texture, and return the SLOT that now holds that picture (-1 on failure).
 //
 // This is the ARRAY swapchain's way onto the compositor, and it exists because
 // the zero-copy route cannot serve one. `kl_glfb_bind_eye_mtl_texture` re-points
@@ -271,21 +290,46 @@ void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
 // The copy is one blit per eye per frame into storage the compositor already
 // owns, so nothing about the compositor, the reprojection pass or the frame
 // record changes: the destination is the same provider slice `SetupEyeTexture2`
-// would have handed a Unity/OVRPlugin guest. `stage` should be the swapchain
-// image the guest just presented, so that the destinations rotate exactly as the
-// guest's own images do — a single destination would be blitted into while the
+// would have handed a Unity/OVRPlugin guest. `image` is the swapchain image the
+// guest just presented, so that the destinations rotate exactly as the guest's
+// own images do — a single destination would be blitted into while the
 // compositor is sampling it.
 //
-// `src_layer` is -1 for a plain 2D source. Returns 0 with a named reason if
+// `src_layer` is -1 for a plain 2D source. Returns -1 with a named reason if
 // there is no provider, no interop, or the blit failed; the caller then has an
 // eye the compositor cannot sample, which is the state this replaces.
-int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer,
+//
+// **The return value is the key the picture is read back with** —
+// `kl_glfb_eye_mtl_texture(eye, slot, ...)` — and it is NOT `image`. A
+// swapchain's image index runs 0..2 whatever swapchain it belongs to, so two of
+// a guest's projection layers name the same index in the same frame; keying the
+// destinations on it is why only one projection layer could ever be composited.
+// The slot is allocated per (`source`, `image`) instead, so every image a guest
+// keeps in flight has a destination of its own and any number of layers coexist.
+//
+// `source` identifies WHICH swapchain these images come from. Any stable
+// per-swapchain value will do; 0 means "unknown" and then `image` IS the slot,
+// which is the OVRPlugin path's direct keying and what a caller with nothing to
+// give still gets.
+int kl_glfb_mirror_eye_layer(int eye, int image, uint32_t source,
+                             uint32_t src_tex, int src_layer,
                              int w, int h, uint32_t internal_fmt);
+
+// ...and the teardown half: release every slot allocated to `source`. Call it
+// when the swapchain goes, or its slots stay claimed by something that no
+// longer exists and the pool fills with the dead.
+void kl_glfb_forget_eye_source(uint32_t source);
 
 // Diagnostic-only: read `tex` back and log its lit-pixel count under `tag`,
 // gated on KL_GLFB_PROBE_VIDEO. Lets a caller outside kl_glfb (the OpenXR
 // layer loop) ask "is THIS projection layer's image lit?" for every layer,
 // not just the one the compositor happens to mirror.
+// Read `tex` back and write it as a PNG. Diagnostic; returns non-zero on
+// success. Exists so two layers that overlap in the picture can be compared
+// AGAINST EACH OTHER rather than against the field of view each claims — the
+// only way to measure a seam whose sides are doubled rather than just softer.
+int kl_glfb_dump_tex(const char *path, uint32_t tex, int layer, int w, int h);
+
 void kl_glfb_probe_tex(const char *tag, uint32_t tex, int layer,
                        int hint_w, int hint_h);
 

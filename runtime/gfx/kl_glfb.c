@@ -23,6 +23,7 @@
 // argument after it.
 #include <dlfcn.h>
 #include <pthread.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2233,11 +2234,10 @@ static int   g_eye_rate_zx, g_eye_rate_zy;
 
 static kl_glfb_mtl_provider g_mtl_provider;
 static void *g_mtl_provider_ctx;
-// One record per (eye, stage). Stage count is ovrp_GetEyeTextureStageCount's
-// answer, which is 1 today — raising it for GPU pipelining is what makes
-// the pose-keyed-to-stage requirement bite, so the array is indexed by stage
-// from the start rather than retrofitted later.
-#define KL_MTL_MAX_STAGES 4
+// One record per (eye, slot). KL_MTL_MAX_STAGES is in the header, because a
+// PROVIDER has to be sized by the same number and providers live outside this
+// file — a provider that holds fewer declines every slot past its own end, and
+// kl_glfb then has no storage for those layers at all.
 // w/h are carried so a rate map can be matched against the texture it would be
 // attached to. A map is built for one screen size; attaching it to a texture of
 // another is a warp against coordinates that do not exist, and nothing in Metal
@@ -3352,8 +3352,77 @@ void *kl_glfb_layer_mtl_texture(int layer, int stage, int *out_w, int *out_h) {
 // the eye table, the rate map, the sRGB settle, the census, the release path —
 // sees exactly what it sees for a Unity/OVRPlugin guest, and this function owns
 // nothing but the blit and the name it created.
-static struct { uint32_t tex; int w, h; uint32_t fmt; }
+//
+// `src` is the guest texture whose image this slot currently holds, and it is a
+// DIAGNOSTIC of a keying problem rather than something the blit needs: `stage`
+// is a swapchain's own image index, so two different swapchains both have
+// images 0..2 and land in the same slot. A guest submitting more than one
+// projection layer therefore has two sources competing for one destination —
+// visible as this record reallocating back and forth between their sizes.
+static struct { uint32_t tex; int w, h; uint32_t fmt; uint32_t src; }
     g_eye_mirror[2][KL_MTL_MAX_STAGES];
+
+// Which (swapchain, image) each slot currently holds, and the reason a slot is
+// allocated rather than being the guest's own image index.
+//
+// A swapchain's image index runs 0..2 whatever swapchain it belongs to, so two
+// of a guest's projection layers name the same index in the same frame and land
+// in the same destination. That is why only one layer could ever be composited:
+// a second one overwrote the first, and the record reallocated back and forth
+// between their sizes. Keyed by (source, image) instead, every image a guest
+// keeps in flight has a destination of its own and any number of layers coexist.
+//
+// The key does NOT include the eye: the destinations are already per-eye
+// (g_eye_mirror[2][...]), so one slot number addresses both eyes' copies of the
+// same guest image and a layer that names only one eye simply leaves the other
+// half unused. That is what makes 16 slots cover Steam Link's three layers of
+// three images with room over, instead of half that.
+//
+// `used` is the allocation clock, for the least-recently-used eviction: a guest
+// with more live images than slots has to degrade somehow, and reusing the
+// oldest — loudly — is the one that keeps the images it is actually cycling
+// through. Evicting silently would present as a layer flickering.
+static struct { uint32_t source; int image; uint64_t used; }
+    g_eye_slot[KL_MTL_MAX_STAGES];
+static uint64_t g_eye_slot_clock;
+
+// The slot holding (source, image), allocating or evicting one if it is new.
+// `source` 0 means the caller has no swapchain identity to give, and then the
+// image index IS the slot — the OVRPlugin path's direct keying, unchanged.
+static int klfb_eye_slot(uint32_t source, int image) {
+    if (!source)
+        return (image >= 0 && image < KL_MTL_MAX_STAGES) ? image : -1;
+    int free_slot = -1, lru = 0;
+    for (int i = 0; i < KL_MTL_MAX_STAGES; i++) {
+        if (g_eye_slot[i].source == source && g_eye_slot[i].image == image) {
+            g_eye_slot[i].used = ++g_eye_slot_clock;
+            return i;
+        }
+        if (!g_eye_slot[i].source && free_slot < 0) free_slot = i;
+        if (g_eye_slot[i].used < g_eye_slot[lru].used) lru = i;
+    }
+    int slot = free_slot >= 0 ? free_slot : lru;
+    if (free_slot < 0) {
+        // Named, and named every time: an eviction is a destination being
+        // reused for a different picture, so a guest cycling through more
+        // images than there are slots would otherwise show layers alternating
+        // with each other and nothing would say why.
+        fprintf(stderr, "  [glfb] eye slot pool full (%d): evicting swapchain %u "
+                        "image %d for swapchain %u image %d — this guest keeps "
+                        "more images live than there are slots\n",
+                KL_MTL_MAX_STAGES, g_eye_slot[slot].source, g_eye_slot[slot].image,
+                source, image);
+        for (int e = 0; e < 2; e++) {
+            if (!g_eye_mirror[e][slot].tex) continue;
+            kl_glfb_release_eye_texture(e, slot);
+            g_eye_mirror[e][slot] = (__typeof__(g_eye_mirror[0][0])){0};
+        }
+    }
+    g_eye_slot[slot].source = source;
+    g_eye_slot[slot].image  = image;
+    g_eye_slot[slot].used   = ++g_eye_slot_clock;
+    return slot;
+}
 
 // Forward-declared for the KL_GLFB_PROBE_VIDEO readbacks (here and in
 // kl_glfb_image_bind); both are defined further down with the probe machinery.
@@ -3409,6 +3478,114 @@ static void klfb_probe_named_tex(const char *tag, uint32_t tex, int layer,
                 tag, tex, layer, lit, hint_w, hint_h, nt);
 }
 
+// Both defined further down with the PNG/probe machinery.
+static int klfb_write_png(const char *path, const uint8_t *px,
+                          int32_t w, int32_t h);
+
+// Read a texture back and write it as a PNG. The alignment instrument: a seam
+// whose two sides are DOUBLED rather than merely differently sharp is a
+// disagreement between the field of view a layer states and the image behind
+// it, and no amount of reasoning about stated frustums can measure that — the
+// two images have to be compared to each other. Diagnostic-only and unthrottled,
+// because the caller dumps once.
+int kl_glfb_dump_tex(const char *path, uint32_t tex, int layer, int w, int h) {
+    if (!path || !tex || w <= 0 || h <= 0) return 0;
+    static void (*r_bindfb)(uint32_t, uint32_t);
+    static void (*r_bindtex)(uint32_t, uint32_t);
+    static void (*r_bindbuf)(uint32_t, uint32_t);
+    static void (*r_pixelstorei)(uint32_t, int32_t);
+    if (!r_bindfb)      r_bindfb      = asym("glBindFramebuffer");
+    if (!r_bindtex)     r_bindtex     = asym("glBindTexture");
+    if (!r_bindbuf)     r_bindbuf     = asym("glBindBuffer");
+    if (!r_pixelstorei) r_pixelstorei = asym("glPixelStorei");
+    if (!a_glReadPixels || !r_bindfb) return 0;
+
+    // The size is the CALLER's, taken from the swapchain that owns the image,
+    // and it is checked against the allocation table rather than discovered
+    // from the framebuffer. The first cut of this read a size back out of the
+    // attachment and got the WINDOW (1280x800) for a 1536x1536 layer, then
+    // wrote a perfectly plausible PNG of the wrong surface — which is worse
+    // than writing nothing, because the picture invites you to measure it.
+    uint32_t tfmt = 0; int32_t tw = 0, th = 0;
+    klfb_tex_info(tex, &tfmt, &tw, &th);
+    if (tw > 0 && th > 0 && (tw != w || th != h)) {
+        fprintf(stderr, "  [glfb] dump %s: asked for %dx%d but texture %u is "
+                        "%dx%d — refusing rather than writing the wrong "
+                        "picture\n", path, w, h, tex, tw, th);
+        return 0;
+    }
+
+    uint32_t fb = klfb_read_from_texture_layer(tex, layer);
+    if (!fb) {
+        fprintf(stderr, "  [glfb] dump %s: texture %u layer %d could not be "
+                        "attached for reading — nothing written\n",
+                path, tex, layer);
+        return 0;
+    }
+    uint8_t *px = malloc((size_t)w * (size_t)h * 4);
+    if (!px) return 0;
+
+    int32_t s_rf = 0, s_df = 0, s_t = 0, pack_buf = 0, pack_align = 4,
+            pack_rowlen = 0;
+    if (a_glGetIntegerv) {
+        a_glGetIntegerv(0x8CAA, &s_rf);
+        a_glGetIntegerv(0x8CA6, &s_df);
+        a_glGetIntegerv(0x8069, &s_t);
+        a_glGetIntegerv(0x88ED, &pack_buf);      // PIXEL_PACK_BUFFER_BINDING
+        a_glGetIntegerv(0x0D05, &pack_align);
+        a_glGetIntegerv(0x0D02, &pack_rowlen);
+    }
+    // A bound PIXEL_PACK_BUFFER turns the pointer below into an OFFSET: zeroes,
+    // no error. Neutralised and restored, like every other read here.
+    if (pack_buf && r_bindbuf) r_bindbuf(0x88EB, 0);
+    if (r_pixelstorei) {
+        if (pack_align != 4) r_pixelstorei(0x0D05, 4);
+        if (pack_rowlen)     r_pixelstorei(0x0D02, 0);
+    }
+    r_bindfb(0x8CA8 /* READ_FRAMEBUFFER */, fb);
+    // The read buffer is part of the framebuffer's state and a stale one is a
+    // GL_INVALID_ENUM on the read, not a wrong picture — set it explicitly.
+    static void (*r_readbuffer)(uint32_t);
+    if (!r_readbuffer) r_readbuffer = asym("glReadBuffer");
+    if (r_readbuffer) r_readbuffer(0x8CE0 /* COLOR_ATTACHMENT0 */);
+    if (a_glFinish) a_glFinish();
+    a_glReadPixels(0, 0, w, h, 0x1908 /* RGBA */, 0x1401 /* UNSIGNED_BYTE */, px);
+    uint32_t err = a_glGetError ? a_glGetError() : 0;
+
+    if (pack_buf && r_bindbuf) r_bindbuf(0x88EB, (uint32_t)pack_buf);
+    if (r_pixelstorei) {
+        if (pack_align != 4) r_pixelstorei(0x0D05, pack_align);
+        if (pack_rowlen)     r_pixelstorei(0x0D02, pack_rowlen);
+    }
+    if (r_bindfb) { r_bindfb(0x8CA8, (uint32_t)s_rf); r_bindfb(0x8CA9, (uint32_t)s_df); }
+    if (r_bindtex) r_bindtex(0x0DE1, (uint32_t)s_t);
+
+    int ok = 0;
+    if (err) {
+        fprintf(stderr, "  [glfb] dump %s: glReadPixels error 0x%x — nothing "
+                        "written\n", path, err);
+    } else {
+        errno = 0;
+        ok = klfb_write_png(path, px, (int32_t)w, (int32_t)h) != 0;
+        int werr = errno;
+        // The mean is the instrument checking itself: a uniform 0 here is a
+        // read that succeeded and saw nothing, which is a different fault from
+        // the two refusals above and must not look like a picture.
+        double sum = 0;
+        for (long i = 0; i < (long)w * h; i++)
+            sum += (px[i*4] + px[i*4+1] + px[i*4+2]) / 3.0;
+        // Name the errno: on a device the usual answer is that the directory
+        // is outside the sandbox, and "write FAILED" alone sends you looking at
+        // the GL instead of at the path.
+        fprintf(stderr, "  [glfb] dump %s: tex=%u layer=%d %dx%d mean %.2f -> %s%s%s\n",
+                path, tex, layer, w, h, sum / ((double)w * h),
+                ok ? "written" : "write FAILED",
+                ok || !werr ? "" : " — ", ok || !werr ? "" : strerror(werr));
+    }
+    free(px);
+    return ok;
+}
+
 void kl_glfb_probe_tex(const char *tag, uint32_t tex, int layer,
                        int hint_w, int hint_h) {
     klfb_probe_named_tex(tag, tex, layer, hint_w, hint_h);
@@ -3443,18 +3620,55 @@ static void klfb_eye_scaled(int w, int h, int *ow, int *oh) {
     *ow = mw; *oh = mh;
 }
 
-int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer,
+// Every slot this swapchain owns, released together — the teardown half of the
+// allocator above. Without it a destroyed swapchain's slots stay claimed by a
+// source that no longer exists, and a guest that rebuilds its swapchains fills
+// the pool and starts evicting the ones it is using: layers alternating with
+// each other, every counter healthy.
+void kl_glfb_forget_eye_source(uint32_t source) {
+    if (!source) return;
+    int freed = 0;
+    for (int i = 0; i < KL_MTL_MAX_STAGES; i++) {
+        if (g_eye_slot[i].source != source) continue;
+        for (int e = 0; e < 2; e++) {
+            if (!g_eye_mirror[e][i].tex) continue;
+            kl_glfb_release_eye_texture(e, i);
+            g_eye_mirror[e][i] = (__typeof__(g_eye_mirror[0][0])){0};
+        }
+        g_eye_slot[i] = (__typeof__(g_eye_slot[0])){0};
+        freed++;
+    }
+    if (freed)
+        fprintf(stderr, "  [glfb] swapchain %u destroyed: %d eye slot(s) freed\n",
+                source, freed);
+}
+
+int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t source,
+                             uint32_t src_tex, int src_layer,
                              int w, int h, uint32_t internal_fmt) {
-    if (!g_mtl_provider || !src_tex || w <= 0 || h <= 0) return 0;
-    if (eye < 0 || eye > 1 || stage < 0 || stage >= KL_MTL_MAX_STAGES) {
+    if (!g_mtl_provider || !src_tex || w <= 0 || h <= 0) return -1;
+    if (eye < 0 || eye > 1 || stage < 0) {
         static int said;
         if (!said++)
-            fprintf(stderr, "  [glfb] mirror eye=%d stage=%d is out of range "
-                            "(%d stages) — this eye is not composited\n",
-                    eye, stage, KL_MTL_MAX_STAGES);
-        return 0;
+            fprintf(stderr, "  [glfb] mirror eye=%d image=%d is out of range — "
+                            "this eye is not composited\n", eye, stage);
+        return -1;
     }
-    if (!kl_glfb_init() || !mtl_resolve()) return 0;
+    if (!kl_glfb_init() || !mtl_resolve()) return -1;
+
+    // The guest's (swapchain, image) pair, mapped to a destination of its own.
+    // See klfb_eye_slot: the image index alone is not unique across a guest's
+    // swapchains, which is why several projection layers used to collide in one
+    // destination and only one of them could be composited.
+    int slot = klfb_eye_slot(source, stage);
+    if (slot < 0) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] mirror image %d has no slot (%d slots, no "
+                            "swapchain identity given) — not composited\n",
+                    stage, KL_MTL_MAX_STAGES);
+        return -1;
+    }
 
     // Before the first bind below, because that is what asks the provider for
     // storage and both providers build a rate map from the size they are asked
@@ -3465,7 +3679,7 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
         if (g_eye_rate_map) kl_glfb_set_eye_rate_map(0, 0, 0, 0, NULL);
     }
 
-    if (!klfb_mirror_resolve(src_layer >= 0)) return 0;
+    if (!klfb_mirror_resolve(src_layer >= 0)) return -1;
 
     // The destination is allocated at the SCALED size (see klfb_eye_scaled): for
     // a foveated guest it is larger than the source eye so the centre inset laid
@@ -3477,25 +3691,26 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
     // rebuilt its swapchain, and the old destination describes a picture that no
     // longer exists — release it rather than blit a mismatch, which the blit
     // would happily scale.
-    __typeof__(g_eye_mirror[0][0]) *m = &g_eye_mirror[eye][stage];
+    __typeof__(g_eye_mirror[0][0]) *m = &g_eye_mirror[eye][slot];
     // ...and the eye table is the authority on whether our name still exists.
     // kl_glfb_release_eye_texture deletes it, and it has callers that know
     // nothing about this record — a swapchain teardown, a re-bind backstop — so
     // a destination remembered here and gone there would be a blit into a
     // deleted name: GL_INVALID_OPERATION, once, and a black eye for the rest of
     // the run.
-    if (m->tex && g_eye_mtl[eye][stage].gl_tex != m->tex) *m = (__typeof__(*m)){0};
+    if (m->tex && g_eye_mtl[eye][slot].gl_tex != m->tex) *m = (__typeof__(*m)){0};
     if (m->tex && (m->w != mw || m->h != mh || m->fmt != internal_fmt)) {
-        fprintf(stderr, "  [glfb] mirror eye=%d stage=%d: %dx%d fmt 0x%x -> %dx%d "
-                        "fmt 0x%x, reallocating\n",
-                eye, stage, m->w, m->h, m->fmt, mw, mh, internal_fmt);
-        kl_glfb_release_eye_texture(eye, stage);   // drops the EGLImage AND our name
+        fprintf(stderr, "  [glfb] mirror eye=%d slot=%d: %dx%d fmt 0x%x (guest tex "
+                        "%u) -> %dx%d fmt 0x%x (guest tex %u), reallocating — the "
+                        "guest rebuilt this swapchain\n",
+                eye, slot, m->w, m->h, m->fmt, m->src, mw, mh, internal_fmt, src_tex);
+        kl_glfb_release_eye_texture(eye, slot);   // drops the EGLImage AND our name
         *m = (__typeof__(*m)){0};
     }
     if (!m->tex) {
         uint32_t t = 0;
         r_GenTextures(1, &t);
-        if (!t) return 0;
+        if (!t) return -1;
         // kl_glfb_bind_eye_mtl_texture leaves GL_TEXTURE_2D bound to whatever it
         // was given, which is fine where it is normally called from (the guest's
         // own graphics setup, in ovrp_SetupEyeTexture2) and is not fine here:
@@ -3504,19 +3719,19 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
         // the guest never asked for surviving into its next draw.
         int32_t save_tex = 0;
         a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &save_tex);
-        int ok = kl_glfb_bind_eye_mtl_texture(eye, stage, t, mw, mh, internal_fmt);
+        int ok = kl_glfb_bind_eye_mtl_texture(eye, slot, t, mw, mh, internal_fmt);
         if (a_glBindTexture_mtl) a_glBindTexture_mtl(0x0DE1, (uint32_t)save_tex);
         if (!ok) {
             // The provider declined, so the name is ours and nothing else took a
             // reference to it. kl_glfb_bind_eye_mtl_texture has already said why.
             if (r_DeleteTextures) r_DeleteTextures(1, &t);
-            return 0;
+            return -1;
         }
-        m->tex = t; m->w = mw; m->h = mh; m->fmt = internal_fmt;
-        fprintf(stderr, "  [glfb] mirror eye=%d stage=%d: %dx%d fmt 0x%x <- guest "
-                        "tex %u layer %d %s(one blit a frame; the array swapchain "
-                        "cannot be re-pointed)\n",
-                eye, stage, mw, mh, internal_fmt, src_tex, src_layer,
+        m->tex = t; m->w = mw; m->h = mh; m->fmt = internal_fmt; m->src = src_tex;
+        fprintf(stderr, "  [glfb] mirror eye=%d slot=%d: %dx%d fmt 0x%x <- swapchain "
+                        "%u image %d (guest tex %u layer %d) %s(one blit a frame; "
+                        "the array swapchain cannot be re-pointed)\n",
+                eye, slot, mw, mh, internal_fmt, source, stage, src_tex, src_layer,
                 (mw != w || mh != h) ? "UPSCALED from source " : "");
     }
 
@@ -3534,11 +3749,11 @@ int kl_glfb_mirror_eye_layer(int eye, int stage, uint32_t src_tex, int src_layer
     if (e) {
         static int said;
         if (!said++)
-            fprintf(stderr, "  [glfb] mirror eye=%d stage=%d: glBlitFramebuffer -> "
-                            "GL error 0x%x\n", eye, stage, e);
-        return 0;
+            fprintf(stderr, "  [glfb] mirror eye=%d slot=%d: glBlitFramebuffer -> "
+                            "GL error 0x%x\n", eye, slot, e);
+        return -1;
     }
-    return 1;
+    return slot;
 }
 
 // Lay a foveal inset over the base eye already mirrored into (eye, stage). The

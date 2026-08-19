@@ -24,6 +24,7 @@
 #include "../runtime/gfx/kl_glfb.h"
 #include "../runtime/kl_jni.h"
 #include "../runtime/gfx/kl_egl.h"
+#include "../runtime/xr/kl_openxr.h"
 #include "../runtime/xr/kl_ovrp.h"
 #include "../runtime/xr/kl_ovrplat.h"
 #include "../runtime/gfx/kl_view.h"
@@ -448,6 +449,26 @@ static int begin_and_pump(int view_pump) {
     // guarding on KL_GLFB_MTL / KL_VIEW, so a plain run is unchanged.
     if (TARGET->kind == KL_GUEST_JKXR || DOOR_IS_VR) kl_mtl_provider_install();
 
+    // The same layer policy the device app applies, and for the same reasons —
+    // Steam Link's VR door stacks projection layers and streams FOVEATED, so the
+    // eye is the widest layer and the narrow one is laid over its centre, into
+    // an eye texture allocated larger so the inset keeps its detail.
+    //
+    // It lived only in the visionOS frontend, which made the host silently a
+    // DIFFERENT pipeline: no inset composite at all. That is why this arc's
+    // foveal defects "did not reproduce in the macOS viewer" — not a stable
+    // layer shape, as was first written down, but a path that was never on.
+    // A host run is the cheap half of every A/B here, and it can only be that
+    // if it runs what the device runs.
+    if (DOOR_IS_VR) {
+        kl_openxr_set_capture_topmost_layer(1);
+        int es = kl_env_int("KL_XR_EYE_SCALE", 2);
+        if (es < 1) es = 1;
+        if (es > 4) es = 4;
+        kl_glfb_set_eye_mirror_scale(es, 1);
+        kl_glfb_set_eye_mirror_cap(kl_env_int("KL_XR_EYE_MAX", 3456));
+    }
+
     if (kl_driver_lifecycle_begin(stdout) != 0) return fail(kl_driver_error());
     return pump_and_report(kl_driver_pump_default(), view_pump);
 }
@@ -758,16 +779,39 @@ static int view_run(void) {
     // the desk, and a guest that paces a video stream against the number is
     // asking its far end for frames at a rate nothing here chose.
     //
-    // It is a ceiling, not a promise: on the host nothing paces the guest's
-    // frame loop, so a heavy target can deliver a third of this. The viewer's
-    // HUD prints achieved against advertised every second, and KL_DISPLAY_HZ
-    // (read inside kl_ovrp_display_frequency, hence after this push) is how a
-    // run pins the number to what it can really sustain.
+    // It is a ceiling, not a promise: a heavy target can deliver a third of
+    // this. The viewer's HUD prints achieved against advertised every second,
+    // and KL_DISPLAY_HZ (read inside kl_ovrp_display_frequency, hence after
+    // this push) is how a run pins the number to what it can really sustain.
+    // For Steam Link the number is also the far end's encode rate, and the
+    // pixel count is the host's choice, so every hertz here divides a bitrate
+    // it chose into thinner frames.
     float panel_hz = kl_view_display_hz();
     if (panel_hz > 0.0f) kl_ovrp_set_display_frequency(panel_hz);
     fprintf(stderr, "view: display %.1f Hz%s; guest will be told %.1f Hz\n",
             (double)panel_hz, panel_hz > 0.0f ? "" : " (SDL could not say)",
             (double)kl_ovrp_display_frequency());
+
+    // The guest's frame clock, for the guests that own their own frame loop.
+    // Nothing else on the host paces one: the compositor takes the newest frame
+    // and never blocks its producer, so an OpenXR guest spins as fast as it can
+    // render — Steam Link's VR client ran at ~1000 Hz against a 120 Hz window,
+    // paying every mirror blit eight times over and reporting frame pacing to
+    // its streaming host against a clock nobody drove.
+    //
+    // Which pacer a guest wants is a property of the XR RUNTIME it drives, not
+    // of the door it came through, and this is the same pairing the device app
+    // makes. A Unity guest is NOT in this set: kl_driver_frame already calls its
+    // frame from this side, so a pacer there would be the compositor waiting on
+    // itself. KL_XR_PACE=0 restores the free-running loop as the A/B.
+    int owns_loop = (TARGET->kind == KL_GUEST_STEAMLINK && DOOR == KL_SLINK_VR) ||
+                    TARGET->kind == KL_GUEST_JKXR;
+    if (owns_loop && kl_env_on("KL_XR_PACE", 1)) {
+        kl_openxr_set_frame_pacer(kl_view_pace_wait);
+        fprintf(stderr, "view: the guest owns its frame loop — paced by the "
+                        "composite at %.1f Hz\n",
+                (double)kl_ovrp_display_frequency());
+    }
 
     pthread_t guest;
     if (pthread_create(&guest, NULL, view_guest_thread, NULL)) {

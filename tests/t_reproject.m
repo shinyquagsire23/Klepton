@@ -994,6 +994,103 @@ static simd_float4x4 head_at(float x, float y, float z) {
     return m;
 }
 
+// The per-layer projection composite: several projection layers, each placed by
+// its OWN frustum against the display and never against another layer.
+//
+// This is the case the flattening it replaced could not state. To lay a narrow
+// layer over a wide one, that model had to compute where the narrow frustum
+// falls inside the wide one as a fraction, decide which layer was "the eye",
+// and decide by threshold which of the others counted as an inset. Here the
+// placement is the same arithmetic the eye quad has always used, so the
+// assertion is that a layer's picture lands at exactly the angular size it was
+// drawn with — which is what makes the seam a geometric identity rather than a
+// number to tune.
+static void check_proj_layers(void) {
+    printf("=== per-layer projection composite ===\n");
+    // The display's frustum, i.e. the topmost layer's: symmetric 45 degrees.
+    simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
+    simd_float4x4 head = matrix_identity_float4x4;
+
+    kl_ovrp_proj_layer base = {0};
+    base.slot[0] = 3; base.slot[1] = 4;
+    base.pose[6] = 1.0f;                       // identity orientation
+    for (int e = 0; e < 2; e++) {
+        base.tangents[e][0] = base.tangents[e][1] = 1.0f;
+        base.tangents[e][2] = base.tangents[e][3] = 1.0f;
+    }
+    kl_reproject_uniforms u =
+        kl_proj_layer_build(&base, 0, head, matrix_identity_float4x4, P, 0);
+    simd_float4 bl = corner_ndc(u, 0, 0), tr = corner_ndc(u, 1, 1);
+    ok(u.visible &&
+       fabsf(bl.x + 1) < 1e-4f && fabsf(bl.y + 1) < 1e-4f &&
+       fabsf(tr.x - 1) < 1e-4f && fabsf(tr.y - 1) < 1e-4f,
+       "a layer drawn with the display's frustum fills the viewport exactly");
+
+    // The inset: HALF the tangents, so half the angular size. Its corners land
+    // at +-0.5 in NDC — a quarter of the area, dead centre — with no rect, no
+    // containment test and no threshold anywhere in the arithmetic.
+    kl_ovrp_proj_layer inset = base;
+    inset.slot[0] = 5; inset.slot[1] = 6;
+    for (int e = 0; e < 2; e++)
+        for (int k = 0; k < 4; k++) inset.tangents[e][k] = 0.5f;
+    kl_reproject_uniforms ui =
+        kl_proj_layer_build(&inset, 0, head, matrix_identity_float4x4, P, 0);
+    simd_float4 ibl = corner_ndc(ui, 0, 0), itr = corner_ndc(ui, 1, 1);
+    ok(fabsf(ibl.x + 0.5f) < 1e-4f && fabsf(ibl.y + 0.5f) < 1e-4f &&
+       fabsf(itr.x - 0.5f) < 1e-4f && fabsf(itr.y - 0.5f) < 1e-4f,
+       "a half-tangent layer lands on exactly the middle half of the viewport");
+
+    // ...and an ASYMMETRIC inset, because a symmetric one cannot tell a
+    // correct placement from one that centres everything it is given. This is
+    // the shape the guest actually submits: the streamed inset's frustum is
+    // asymmetric and it MOVES while running.
+    kl_ovrp_proj_layer off = base;
+    for (int e = 0; e < 2; e++) {
+        off.tangents[e][0] = 0.2f; off.tangents[e][1] = 0.6f;   // left, right
+        off.tangents[e][2] = 0.5f; off.tangents[e][3] = 0.1f;   // top, bottom
+    }
+    kl_reproject_uniforms uo =
+        kl_proj_layer_build(&off, 0, head, matrix_identity_float4x4, P, 0);
+    simd_float4 obl = corner_ndc(uo, 0, 0), otr = corner_ndc(uo, 1, 1);
+    ok(fabsf(obl.x + 0.2f) < 1e-4f && fabsf(otr.x - 0.6f) < 1e-4f &&
+       fabsf(obl.y + 0.1f) < 1e-4f && fabsf(otr.y - 0.5f) < 1e-4f,
+       "an asymmetric layer lands off-centre, exactly where its tangents say");
+
+    // Each layer keeps its own placement: building one does not disturb the
+    // other, which is the property a shared destination slot destroyed.
+    kl_reproject_uniforms u2 =
+        kl_proj_layer_build(&base, 0, head, matrix_identity_float4x4, P, 0);
+    simd_float4 b2 = corner_ndc(u2, 1, 1);
+    ok(fabsf(b2.x - tr.x) < 1e-6f && fabsf(b2.y - tr.y) < 1e-6f,
+       "compositing the inset leaves the base's placement untouched");
+
+    // An eye the layer does not name is REFUSED, not drawn with the other
+    // eye's picture: a one-view layer says so with slot -1.
+    kl_ovrp_proj_layer mono = base;
+    mono.slot[1] = -1;
+    ok(kl_proj_layer_build(&mono, 1, head, matrix_identity_float4x4, P, 0).visible == 0 &&
+       kl_proj_layer_build(&mono, 0, head, matrix_identity_float4x4, P, 0).visible == 1,
+       "a layer that names one eye is drawn in that eye only");
+
+    // The pose is per LAYER, so the reprojection delta is too: a layer rendered
+    // against a head that has since turned comes back rotated, and one rendered
+    // against the current head does not move at all.
+    simd_float4x4 turned = simd_matrix4x4(simd_quaternion(0.0f, 0.2588f, 0.0f, 0.9659f));
+    kl_reproject_uniforms us =
+        kl_proj_layer_build(&base, 0, turned, matrix_identity_float4x4, P, 0);
+    simd_float4 sbl = corner_ndc(us, 0, 0);
+    ok(fabsf(sbl.x - bl.x) > 0.1f,
+       "a 30-degree head turn since the layer was drawn moves that layer's quad");
+
+    // The flip travels with the record, not with the caller: a layer Vulkan
+    // drew has its origin at the top left and the shader is told so.
+    kl_ovrp_proj_layer vk = base;
+    vk.origin_top_left = 1;
+    ok(kl_proj_layer_build(&vk, 0, head, matrix_identity_float4x4, P, 0).flip_y == 1 &&
+       u.flip_y == 0,
+       "origin_top_left reaches the shader from the layer's own record");
+}
+
 static void check_overlay_math(void) {
     printf("=== overlay (quad layer) placement ===\n");
     simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
@@ -1176,6 +1273,7 @@ int main(void) {
         check_crop_pixels();
         check_split_crop_pixels();
         check_two_textures();
+        check_proj_layers();
         check_overlay_math();
         check_overlay_pixels();
     }

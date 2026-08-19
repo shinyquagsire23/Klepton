@@ -382,6 +382,31 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
                                          uint32_t slice, int flip_y,
                                          int grid_per_eye);
 
+// One projection LAYER's uniforms — the same pass as kl_reproject_build, given
+// one layer's own picture, frustum and pose instead of the frame record's.
+//
+// A guest that submits several projection layers is asking for each to be drawn
+// with its own field of view, back to front, and that is all this is: the eye
+// quad, once per layer. Nothing about it is new geometry — the rotation
+// correction, the eye-centring, the 500 m placement and the sRGB decode are the
+// eye pass's, unchanged — which is the argument for doing it this way. A
+// flattening has to map one layer's frustum into another's; this maps each
+// against the display and never against another layer.
+//
+// `slice` is the array slice of the layer's texture, as
+// kl_glfb_eye_mtl_texture reports it for `pl->slot[eye]`. The flip comes from
+// the record rather than from the caller: which way up a layer's picture is
+// follows from the API that drew it, and the filer knows which that was.
+//
+// `visible` is 0 for an eye this layer does not name (slot < 0), which is how a
+// one-view layer is expressed — the quad collapses instead of the caller having
+// to skip a draw.
+kl_reproject_uniforms kl_proj_layer_build(const kl_ovrp_proj_layer *pl, int eye,
+                                          simd_float4x4 origin_from_device,
+                                          simd_float4x4 device_from_view,
+                                          simd_float4x4 projection,
+                                          uint32_t slice);
+
 // A perspective projection from tangents, all positive, right-handed looking
 // down -Z, reverse-Z (near maps to 1). For the viewer, which has no Compositor
 // Services to ask, and as the fallback when cp_drawable_compute_projection is

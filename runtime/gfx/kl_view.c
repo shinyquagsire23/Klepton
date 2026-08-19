@@ -24,12 +24,14 @@
 // Everything in this file is host-only scaffolding, like kl_glfb itself: it
 // exists so a human can look at the frame and walk the pose around while the
 // XR problems (no scene draws, the Bloom abort) are worked.
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "kl_view.h"
 #include "kl_glfb.h"     // kl_glfb_last_frame_lit — the HUD's liveness signal
@@ -39,6 +41,53 @@
 #include "kl_present.h"  // mono vs stereo — which shape of picture the guest makes
 #include "kl_jni.h"      // the mono input path: SDLActivity's registered natives
 #include "kl_env.h"
+
+// ---- the guest's frame clock -------------------------------------------------
+//
+// See kl_view.h for what installs this and why. The publisher is the composite
+// below, one tick a displayed frame; the consumer is the guest's xrWaitFrame.
+// Same shape as the device path, where the compositor's own frame loop is the
+// publisher — deliberately, so the guest's clock has one description on both.
+//
+// Outside the SDL guard: a build without SDL3 still links a caller that
+// installed the wait, and gets the deadline below rather than a link error.
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    unsigned long long published, consumed;
+    int stop;
+} g_pace = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0 };
+
+void kl_view_pace_publish(void) {
+    pthread_mutex_lock(&g_pace.mu);
+    g_pace.published++;
+    pthread_cond_signal(&g_pace.cv);
+    pthread_mutex_unlock(&g_pace.mu);
+}
+
+void kl_view_pace_stop(void) {
+    pthread_mutex_lock(&g_pace.mu);
+    g_pace.stop = 1;
+    pthread_cond_broadcast(&g_pace.cv);
+    pthread_mutex_unlock(&g_pace.mu);
+}
+
+void kl_view_pace_wait(void) {
+    // A deadline, not a plain wait: the window is not open for the guest's
+    // first frames, and a viewer loop that dies must not be able to stop the
+    // guest's for good. A frame that times out simply runs unpaced.
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 1;
+    pthread_mutex_lock(&g_pace.mu);
+    while (!g_pace.stop && g_pace.published == g_pace.consumed)
+        if (pthread_cond_timedwait(&g_pace.cv, &g_pace.mu, &ts) == ETIMEDOUT) break;
+    // Coalesce rather than queue: everything published since the guest's last
+    // frame is one turn, so a guest that falls behind skips frames instead of
+    // being owed a backlog it can never work off.
+    g_pace.consumed = g_pace.published;
+    pthread_mutex_unlock(&g_pace.mu);
+}
 
 #if __has_include(<SDL3/SDL.h>)
 #define KL_VIEW_HAVE_SDL 1
@@ -718,6 +767,11 @@ int kl_view_main(const char *libdir, int hw) {
             view_show_cpu_frame(&disp, ren, win);
         }
 
+        // ...and that composite is the guest's clock, if it asked for one. A
+        // tick a displayed frame, published whether or not the guest was ready
+        // for it: the wait coalesces, so a slow guest skips rather than queues.
+        kl_view_pace_publish();
+
         // The HUD is one stderr line a second, not text rendering: a blank
         // frame with a moving pose and a nonzero lit count is still a live
         // pipeline, and that distinction is the whole point of the line.
@@ -777,6 +831,9 @@ int kl_view_main(const char *libdir, int hw) {
     }
 
     unsigned shown = hw ? kl_viewmtl_frames() : g_frame_seq;
+    // Before anything else is torn down: a guest paced by this loop is inside
+    // its wait right now, and nothing else will ever publish to it again.
+    kl_view_pace_stop();
     kl_viewmtl_stop();          // unregisters the fence before the event goes
     view_cpu_disp_free(&disp);
     if (mview) SDL_Metal_DestroyView(mview);
