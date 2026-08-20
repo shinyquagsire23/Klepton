@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <sys/ucontext.h>
 #include <mach/mach.h>
 #include "klepton.h"
@@ -22,6 +24,35 @@
 #include "kl_aaudio.h"
 #include "kl_il2cpp.h"
 #include "kl_x18.h"
+
+// ---- where a crash report goes so that it SURVIVES ------------------------
+//
+// The report used to go to fd 2 alone, and on device it was not there to read:
+// the app points stdout at the container's log and dups it onto stderr, but a
+// guest is free to `dup2` its own pipe over both (one shipped library does
+// exactly that), and anything the process wrote through stdio is buffered
+// behind whatever the dying thread was holding. The result is the one output
+// that only exists when something has gone wrong being the one output that goes
+// missing — and every diagnosis after that is guesswork about a crash nobody
+// can see.
+//
+// So the report is ALSO written to a file of its own, opened by path at fault
+// time and fsync'd before the process is allowed to die. Opening by path is the
+// point: it cannot be inherited, redirected, or buffered by anyone else.
+static char g_crash_path[1024];
+static int  g_crash_fd = -1;
+
+void kl_fault_set_crash_path(const char *path) {
+    if (!path) { g_crash_path[0] = 0; return; }
+    snprintf(g_crash_path, sizeof g_crash_path, "%s", path);
+}
+
+// Every line of the report goes through here: fd 2 as before, plus the crash
+// file once it is open. Never allocates and never uses stdio.
+static void klf_emit(const char *b, size_t n) {
+    ssize_t w = write(2, b, n); (void)w;
+    if (g_crash_fd >= 0) { w = write(g_crash_fd, b, n); (void)w; }
+}
 
 static void (*g_extra[KL_FAULT_MAX_REPORTERS])(FILE *);
 static unsigned g_extra_n;
@@ -66,12 +97,37 @@ void kl_fault_print_frames(FILE *f, void *fp_) {
     fflush(f);
 }
 
+// Is `n` bytes at `p` actually mapped and readable?
+//
+// Every dereference the reporter makes goes through here first. It is reading
+// memory in a process that has already proved it cannot be trusted, and a
+// second fault inside a signal handler does not produce a second report — it
+// produces no report at all, from the run that most needed one.
+static int klf_readable(const void *p, size_t n) {
+    if (!p) return 0;
+    vm_address_t start = (vm_address_t)(uintptr_t)p;
+    vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    if (vm_region_64(mach_task_self(), &start, &sz, VM_REGION_BASIC_INFO_64,
+                     (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS)
+        return 0;
+    if (start > (vm_address_t)(uintptr_t)p) return 0;          // landed in a hole
+    if (!(info.protection & VM_PROT_READ)) return 0;
+    return (vm_address_t)(uintptr_t)p + n <= start + sz;
+}
+
 // This has to survive being called in a broken process, so it uses write(2)
 // rather than stdio and does not attempt a symbolised backtrace.
 static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // Our own handler, so this is a Darwin ucontext_t and reading it is safe.
     // The layout mismatch only bites the GUEST's handlers.
     ucontext_t *uc = uctx;
+    // Before anything else can fail: a report that is written only after the
+    // interesting work has succeeded is missing exactly when it is needed.
+    if (g_crash_path[0] && g_crash_fd < 0)
+        g_crash_fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     void *pc = uc ? (void *)uc->uc_mcontext->__ss.__pc : NULL;
     uint64_t tid = 0;
     pthread_threadid_np(NULL, &tid);
@@ -93,7 +149,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                       sig, si ? si->si_addr : NULL, img ? img : "<host>", off, pc,
                       (unsigned long long)tid,
                       pthread_main_np() ? " (main)" : " (a guest worker thread)");
-    if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+    if (n > 0) { klf_emit(buf, (size_t)n); }
 
     // WHAT KIND OF PAGE the address is, for a memory fault.
     //
@@ -145,7 +201,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                              ? " — a GUARD page: something walked off the end of "
                                "the mapping before it" : "",
                          info.reserved ? " (reserved)" : "");
-        if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+        if (n > 0) { klf_emit(buf, (size_t)n); }
     }
 
     // THE REGISTER FILE, and the guest's logical x18 beside it.
@@ -172,7 +228,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                              i + 1, (unsigned long long)x[i + 1],
                              i + 2, (unsigned long long)x[i + 2],
                              i + 3, (unsigned long long)x[i + 3]);
-            if (m > 0) { ssize_t w = write(2, buf, (size_t)m); (void)w; }
+            if (m > 0) { klf_emit(buf, (size_t)m); }
         }
         int m = snprintf(buf, sizeof buf,
                          "    fp  %016llx  lr  %016llx  sp  %016llx  "
@@ -183,7 +239,87 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                          (unsigned long long)(uintptr_t)
                              pthread_getspecific(KLX_TSD_SLOT),
                          KLX_TSD_SLOT);
-        if (m > 0) { ssize_t w = write(2, buf, (size_t)m); (void)w; }
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+    }
+
+    // WHO DISPATCHED IT — lr, named the way pc is named.
+    //
+    // **For a fault whose pc is not mapped, this is the whole answer and the
+    // frame chain is not.** A branch through a bad function pointer (`br x3`)
+    // is a TAIL call: it leaves x30 pointing into the caller and never builds a
+    // frame, so the fp chain below either describes some older frame or, if x29
+    // was reused, is garbage — one such crash symbolised as a host variable
+    // plus a 16-digit offset, which is a wrong answer wearing the shape of a
+    // right one. x30 is the caller, directly, with no walk to be wrong about.
+    if (uc) {
+        void *lr = (void *)uc->uc_mcontext->__ss.__lr;
+        size_t loff = 0;
+        const char *limg = kl_addr_image(lr, &loff);
+        const char *lmm = kl_il2cpp_method_at(lr);
+        Dl_info ldi;
+        int m;
+        if (lmm)
+            m = snprintf(buf, sizeof buf, "    lr (who called it): %s  [%s+0x%zx]\n",
+                         lmm, limg ? limg : "?", loff);
+        else if (limg)
+            m = snprintf(buf, sizeof buf, "    lr (who called it): %s+0x%zx\n",
+                         limg, loff);
+        else if (dladdr(lr, &ldi) && ldi.dli_sname && ldi.dli_fname)
+            m = snprintf(buf, sizeof buf, "    lr (who called it): %s`%s+0x%tx\n",
+                         ldi.dli_fname, ldi.dli_sname,
+                         (const char *)lr - (const char *)ldi.dli_saddr);
+        else
+            m = snprintf(buf, sizeof buf, "    lr (who called it): %p — in no known image\n", lr);
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+    }
+
+    // WHAT EACH REGISTER POINTS AT, for the registers that point at anything.
+    //
+    // The register file says which operand was wrong; this says what was in it.
+    // The case it exists for is a value that is not a pointer at all and is not
+    // obviously wrong either — a corrupted dispatch slot reads as a plausible
+    // address until you notice its bytes spell text, and then the ASCII column
+    // names the data that overwrote it. Sixteen bytes is enough for that and
+    // short enough that thirty-one of them stay readable.
+    //
+    // vm_region first, every time: the whole point is to survive a process that
+    // is already broken, so a pointer is only followed once the kernel has said
+    // the page is there and readable. An unreadable one prints nothing rather
+    // than taking the reporter down with it.
+    // KL_FAULT_PEEK is how many bytes per register, rounded down to a row of 16.
+    // The default is one row, which is enough to see that a value is text; a
+    // bigger one is for the question "is this object live or is it freed memory
+    // somebody else has since written" — that needs the shape of the whole
+    // object, not its first word.
+    int want = kl_env_int("KL_FAULT_PEEK", 16);
+    if (want < 16) want = 16;
+    if (want > 512) want = 512;
+    if (uc) {
+        const uint64_t *x = (const uint64_t *)uc->uc_mcontext->__ss.__x;
+        for (int i = 0; i < 29; i++) {
+            uint64_t v = x[i];
+            if (v < 0x1000 || (v & 3)) continue;      // not a plausible pointer
+            if (!klf_readable((const void *)(uintptr_t)v, 16)) continue;
+            const unsigned char *b = (const unsigned char *)(uintptr_t)v;
+            for (int row = 0; row < want / 16; row++) {
+                if (!klf_readable(b + row * 16, 16)) break;
+                char hex[64], asc[24];
+                for (int k = 0; k < 16; k++) {
+                    static const char d[] = "0123456789abcdef";
+                    unsigned char c = b[row * 16 + k];
+                    hex[k * 3 + 0] = d[c >> 4];
+                    hex[k * 3 + 1] = d[c & 15];
+                    hex[k * 3 + 2] = ' ';
+                    asc[k] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+                }
+                hex[48] = 0; asc[16] = 0;
+                int m = row == 0
+                    ? snprintf(buf, sizeof buf, "    [x%-2d]        %s |%s|\n", i, hex, asc)
+                    : snprintf(buf, sizeof buf, "          +0x%-3x %s |%s|\n",
+                               row * 16, hex, asc);
+                if (m > 0) { klf_emit(buf, (size_t)m); }
+            }
+        }
     }
 
     // THE INSTRUCTION WORD AT THE PC, and its two neighbours.
@@ -198,20 +334,45 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // Four words, because the interesting question is usually whether the pc is
     // inside a veneer body (a `stp`/`mrs`/`ldr` prologue is unmistakable) or in
     // the guest's own code.
-    if (pc) {
+    //
+    // **The pc is only read once the kernel says it is there.** When the fault
+    // is a BRANCH to a bad address the pc IS that address, so reading it faults
+    // a second time — inside the handler, which then dies without printing the
+    // frame chain. That is the worst possible moment to lose: a jump through a
+    // corrupted function pointer says nothing about who dispatched it, and the
+    // frame chain immediately below is the only thing that does.
+    if (pc && klf_readable(pc, 16)) {
         const uint32_t *w = (const uint32_t *)((uintptr_t)pc & ~(uintptr_t)3);
+        // [-1] is behind `pc`, so it needs its own check.
+        uint32_t prev = klf_readable((const char *)w - 4, 4) ? w[-1] : 0;
         int m = snprintf(buf, sizeof buf,
                          "    insn at pc: %08x  [-1] %08x  [+1] %08x  [+2] %08x\n",
-                         w[0], w[-1], w[1], w[2]);
-        if (m > 0) { ssize_t x = write(2, buf, (size_t)m); (void)x; }
+                         w[0], prev, w[1], w[2]);
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+    } else if (pc) {
+        int m = snprintf(buf, sizeof buf,
+                         "    insn at pc: UNREADABLE — the pc itself is not mapped, "
+                         "so this fault is a BRANCH to a bad address, not a bad "
+                         "access by a good instruction. The frames below are who "
+                         "dispatched it.\n");
+        if (m > 0) { klf_emit(buf, (size_t)m); }
     }
 
     // Walk the frame chain. The faulting pc is usually in libsystem — memmove
     // with a null pointer says nothing about who passed it — so what matters is
     // the first guest frame above it. AAPCS64 keeps x29 as the frame pointer and
     // stores {fp, lr} at [fp], which both the guest and our own code honour.
+    // AArch64 keeps the frame pointer 16-byte aligned; anything else is not a
+    // frame and walking it manufactures callers that were never there.
     void **fp = uc ? (void **)uc->uc_mcontext->__ss.__fp : NULL;
-    for (int depth = 0; fp && depth < 12; depth++) {
+    if ((uintptr_t)fp & 15) {
+        int m = snprintf(buf, sizeof buf,
+                         "    fp %p is not 16-byte aligned — not a frame chain, "
+                         "not walked. Use lr above.\n", (void *)fp);
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+        fp = NULL;
+    }
+    for (int depth = 0; fp && klf_readable(fp, 16) && depth < 12; depth++) {
         void *ret = fp[1];
         if (!ret) break;
         size_t roff = 0;
@@ -228,7 +389,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                          (const char *)ret - (const char *)rdi.dli_saddr);
         else
             n = snprintf(buf, sizeof buf, "    #%-2d %p\n", depth, ret);
-        if (n > 0) { ssize_t w2 = write(2, buf, (size_t)n); (void)w2; }
+        if (n > 0) { klf_emit(buf, (size_t)n); }
         void **next = (void **)fp[0];
         if (next <= fp) break;                  // stacks grow down; anything else is junk
         fp = next;
@@ -269,8 +430,22 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                      "[klepton] KL_FAULT_WAIT: pid %d parked on signal %d — "
                      "attach with `lldb -p %d`, then `bt all`\n", getpid(), sig,
                      getpid());
-        if (n > 0) { ssize_t w3 = write(2, buf, (size_t)n); (void)w3; }
+        if (n > 0) { klf_emit(buf, (size_t)n); }
         for (;;) pause();
+    }
+
+    // The subsystem reports above go through stdio to stderr, so push them into
+    // the same file before it closes — otherwise the crash copy has the
+    // registers and not the surface state, which is half an answer.
+    fflush(stderr);
+    fflush(stdout);
+
+    // fsync before dying, not just close: the report is worth nothing if it is
+    // still in the page cache when the process goes away.
+    if (g_crash_fd >= 0) {
+        fsync(g_crash_fd);
+        close(g_crash_fd);
+        g_crash_fd = -1;
     }
 
     // Die of the original signal, so whoever is watching still reports it as one.

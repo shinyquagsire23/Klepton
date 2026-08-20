@@ -536,8 +536,10 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
 	@echo "=== variadic ABI ===" && ./build/t_variadic
+	@echo "=== crash reporter ===" && ./build/t_fault
+	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
 	@grep -E '=== HEVC|30 access units' build/hevc.log && tail -1 build/hevc.log
 	@./build/t_xrspace > build/xrspace.log 2>&1 || { cat build/xrspace.log; exit 1; }
@@ -927,6 +929,25 @@ build/t_reproject: tests/t_reproject.m runtime/gfx/kl_reproject.c runtime/gfx/kl
 	  runtime/kl_env.c -framework Metal -framework Foundation
 
 .PHONY: reproject
+build/t_glcaps: tests/t_glcaps.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $< $(RUNTIME) \
+	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation
+
+# Our advertised GL limits vs what the vendored ANGLE will honour. Needs
+# `make angle-debug`; passes (as a skip) without it, so a bare checkout is clean.
+build/t_fault: tests/t_fault.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $< $(RUNTIME) \
+	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation
+
+# The crash reporter, on a process that really faults. Needs no guest.
+fault: build/t_fault
+	@./build/t_fault
+
+glcaps: build/t_glcaps
+	@./build/t_glcaps vendor/out/Debug
+
 reproject: build/t_reproject
 	@./build/t_reproject
 

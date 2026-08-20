@@ -161,6 +161,26 @@ const char *kl_addr_image(const void *addr, size_t *offset) {
     return NULL;
 }
 
+// Every guest image and where it landed, one line each.
+//
+// **A guest pc is meaningless without this.** The libraries are mapped wherever
+// the kernel put them, so a crash address, an `lldb` breakpoint on a guest
+// function, and a `sample` profile all need the base to be subtracted before
+// any of them can be matched against a disassembly of the .so — and re-deriving
+// it from a fault report only works if there was a fault. Printed once at boot
+// so the number is in the log before it is needed rather than after.
+void kl_dl_report_images(FILE *f) {
+    if (!f) return;
+    fprintf(f, "=== guest image map (subtract the base to disassemble) ===\n");
+    for (int i = 0; i < g_nimgs; i++) {
+        const void *base = kl_base(g_imgs[i].img);
+        if (!base) continue;
+        fprintf(f, "  %-24s %p .. %p  (%zu KiB)\n", g_imgs[i].soname, base,
+                (const char *)base + kl_span(g_imgs[i].img),
+                kl_span(g_imgs[i].img) / 1024);
+    }
+}
+
 // Would klb_dlopen() succeed for `path`? This is the question anything answering
 // an existence check on the guest's behalf has to ask, and it is strictly wider
 // than kl_can_load(): a library can be loadable two ways, and only one of them

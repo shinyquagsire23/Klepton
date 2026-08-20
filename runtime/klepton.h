@@ -141,6 +141,11 @@ const void *kl_phdrs(kl_image *img, unsigned *count);
 // raw pc from a fault mean anything.
 const char *kl_addr_image(const void *addr, size_t *offset);
 
+// Every guest image and its load address, one line each. A guest pc means
+// nothing without the base: subtract it to match a disassembly of the .so, to
+// set a breakpoint on a guest function, or to read a sampling profile.
+void kl_dl_report_images(FILE *f);
+
 
 // Rewrite a guest file path into the synthetic /proc and /sys tree when we serve
 // it; returns `path` unchanged otherwise. Every guest file entry point goes

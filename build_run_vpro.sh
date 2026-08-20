@@ -129,6 +129,24 @@ export KLEPTON_DEVICE="$DEVID"
 # poller happily replaces a 701-line crash with a 200-line clean boot. That is
 # not a stale-log problem (the file really is current), it is the opposite: the
 # evidence is overwritten by something newer and less interesting.
+# The crash report, which is a SEPARATE file on purpose: the boot log is stdout
+# with stderr duped onto it, and a fault can lose both (a guest may take the
+# fds; stdio can hold the last writes behind a lock the dying thread never
+# releases). kl_fault writes this one by path and fsyncs it, so when a run ends
+# in a signal this is the file that actually has the registers, what each one
+# pointed at, and the frame chain. Pulled after the log and printed, because a
+# crash report nobody reads is the same as no crash report.
+pull_crash() {
+  local out="${LOCAL_LOG%.log}-crash.log"
+  xcrun devicectl device copy from --device "$DEVID" \
+    --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+    --source Documents/klepton-crash.log --destination "$out" >/dev/null 2>&1 || return 1
+  [ -s "$out" ] || { rm -f "$out"; return 1; }
+  echo
+  echo "!! a crash report was left on device — $out"
+  LC_ALL=C sed -n '1,40p' "$out"
+}
+
 pull_log() {
   local tmp; tmp="$(mktemp)"
   xcrun devicectl device copy from --device "$DEVID" \
@@ -186,6 +204,7 @@ summarise() {
 
 if [ -n "$LOG_ONLY" ]; then
   pull_log || { echo "!! could not copy the log off $DEVID"; exit 1; }
+  pull_crash || true
   summarise
   exit 0
 fi
@@ -224,5 +243,6 @@ if [ -f "$LOCAL_LOG.streamed" ]; then
   echo "    (streamed live over --console; the container's log is not this run's)"
 else
   pull_log || true
+  pull_crash || true
 fi
 summarise

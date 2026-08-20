@@ -367,6 +367,14 @@ final class KleptonCompositor {
     private var cadenceRepeats = 0      // gaps of 1.5 periods or more
     private var missedDeadline = 0
     private let noFence = klEnvOn("KL_CP_NOFENCE", default: false)
+    // The last device anchor the tracker actually answered with, and how often
+    // it has had to stand in. See displayOriginFromDevice for why holding it is
+    // not the same kind of guess as the identity it replaced.
+    private var lastGoodOriginFromDevice: simd_float4x4?
+    private var anchorWalkedBack = 0
+    private var anchorHeld = 0
+    private var anchorUnknown = 0
+    private let holdAnchor = klEnvOn("KL_CP_ANCHOR_HOLD", default: true)
     private var cmdCommitted = 0
     private let cmdLock = NSLock()
     private var cmdCompleted = 0
@@ -450,6 +458,69 @@ final class KleptonCompositor {
     /// flip here would be inventing a bug rather than fixing one.
     private static func decompose(_ m: simd_float4x4) -> (SIMD3<Float>, simd_quatf) {
         (SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z), simd_quatf(m))
+    }
+
+    /// The device anchor for the instant the composite is about to draw at.
+    ///
+    /// This and `originFromDevice` below are one answer in two halves, and what
+    /// they exist for is that **`origin_from_device` is never the identity while
+    /// the session has ever tracked.** `queryDeviceAnchor` answers nil for an instant it will not
+    /// predict to, and how far ahead that is is neither documented nor fixed —
+    /// a guest hitch that pushes the presentation time out, or a tracking
+    /// interruption, is enough to reach it.
+    ///
+    /// Substituting the identity there does not weaken the correction, it
+    /// asserts something false: that the head is at the world origin, unrotated.
+    /// The composite places the guest's picture in the space its render pose
+    /// defines and looks at it from this one, so the quad stops counteracting
+    /// head motion and sits fixed in front of the face — and stays there for as
+    /// long as the tracker keeps refusing, which is what makes it read as stuck
+    /// rather than as a glitch.
+    ///
+    /// Holding the last pose actually measured is wrong by however far the head
+    /// has moved since, which is bounded by the length of the outage. It is also
+    /// the answer `updatePoses` already gives the guest, by skipping the push
+    /// and leaving the previous pose in place: the two seams now fail the same
+    /// way instead of opposite ways, which is what made the disagreement
+    /// invisible.
+    ///
+    /// The walk-back is `headAt`'s, for `headAt`'s reason — stepping back finds
+    /// the edge of what the tracker will predict to instead of guessing where it
+    /// is. `KL_CP_ANCHOR_HOLD=0` restores the identity fallback as the A/B.
+    private func displayAnchor(at presentation: TimeInterval) -> DeviceAnchor? {
+        var t = presentation
+        var steps = 0
+        while steps < 10 {
+            if let a = worldTracking.queryDeviceAnchor(atTimestamp: t) {
+                if steps > 0 { anchorWalkedBack += 1 }
+                return a
+            }
+            t -= 0.005
+            steps += 1
+        }
+        return nil
+    }
+
+    /// ...and the transform the composite's own math uses, which is where the
+    /// holding happens. Kept separate from the anchor above because the anchor
+    /// OBJECT goes to `cp_drawable.deviceAnchor`, and that is the system's
+    /// input to its own reprojection: handing it one we invented would put our
+    /// correction and the system's on different heads. Nil there is a refusal
+    /// the system understands; the identity here is a lie it cannot see.
+    private func originFromDevice(_ anchor: DeviceAnchor?) -> simd_float4x4 {
+        if let anchor {
+            lastGoodOriginFromDevice = anchor.originFromAnchorTransform
+            return anchor.originFromAnchorTransform
+        }
+        guard holdAnchor, let held = lastGoodOriginFromDevice else {
+            // Nothing has ever tracked — the frames before ARKit starts — or the
+            // knob is off. The identity is the only answer left, and it is
+            // counted so that it can never again be taken silently.
+            anchorUnknown += 1
+            return matrix_identity_float4x4
+        }
+        anchorHeld += 1
+        return held
     }
 
     /// Sample every pose for this frame and push it across the seam.
@@ -1561,8 +1632,8 @@ final class KleptonCompositor {
         // therefore also what the drawable is told it was rendered with.
         let presentation = LayerRenderer.Clock.Instant.epoch
             .duration(to: main.frameTiming.presentationTime).timeInterval
-        let displayAnchor = worldTracking.queryDeviceAnchor(atTimestamp: presentation)
-        let originFromDevice = displayAnchor?.originFromAnchorTransform ?? matrix_identity_float4x4
+        let displayAnchor = displayAnchor(at: presentation)
+        let originFromDevice = originFromDevice(displayAnchor)
         // OpenXR's VIEW space is DEFINED as the midpoint between the eyes.
         // visionOS's device anchor is a point on the hardware and is not that
         // midpoint, so treating the two as equal declares an equality that is
@@ -2461,8 +2532,17 @@ final class KleptonCompositor {
             + (displayPeriod > 0 ? String(format: " = %.2f periods", periods) : "")
             + ", \(cadenceRepeats)/\(cadenceN) held >=1.5, "
             + "\(missedDeadline) past deadline"
+            // Only when it has happened: a permanently-zero clause on the one
+            // line known to print is noise, and a NON-zero one here is the
+            // tracker refusing the instant the composite asked about — which is
+            // the quad going head-locked, named. See displayOriginFromDevice.
+            + (anchorWalkedBack + anchorHeld + anchorUnknown > 0
+               ? ", anchor \(anchorWalkedBack) walked back"
+                 + " / \(anchorHeld) held / \(anchorUnknown) unknown"
+               : "")
         cadenceN = 0; cadenceSum = 0; cadenceMax = 0
         cadenceRepeats = 0; missedDeadline = 0
+        anchorWalkedBack = 0; anchorHeld = 0; anchorUnknown = 0
         return out
     }
 

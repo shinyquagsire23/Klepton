@@ -148,6 +148,15 @@ int kl_app_configure(const char *resources, const char *container) {
     snprintf(g_files,  sizeof g_files,  "%s/android-files", container);
     snprintf(g_log,    sizeof g_log,    "%s/klepton-boot.log", container);
 
+    // A crash report of its own, beside the log. The boot log is stdout with
+    // stderr duped onto it, and neither survives a fault reliably — a guest may
+    // take both fds, and stdio can hold the last writes behind a lock the dying
+    // thread never releases. This path is opened at fault time and fsync'd, so
+    // "it crashed and the log stops just before" stops being the whole story.
+    static char crash[1024];
+    snprintf(crash, sizeof crash, "%s/klepton-crash.log", container);
+    kl_fault_set_crash_path(crash);
+
     // Check before running, not after failing. A missing asset tree otherwise
     // surfaces three layers up inside Unity as something that reads like a shim
     // bug.

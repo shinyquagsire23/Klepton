@@ -2284,6 +2284,17 @@ written down is a value found twice.
   full-viewport blit. `KL_CP_NOFENCE=1` skips the guest fence wait; the
   `alive:` line reports `cmdbuf done/committed` so "committed but never
   executed" is visible.
+- `KL_CP_ANCHOR_HOLD=0` — when the tracker will not answer for the instant the
+  composite is drawing at, fall back to the IDENTITY device pose instead of the
+  last one it did answer with. The default (hold) exists because the identity is
+  not a weaker correction but a false assertion — that the head is at the world
+  origin, unrotated — and its symptom is the guest's picture unsticking from the
+  world and sitting fixed in front of the face for as long as the refusal lasts.
+  `queryDeviceAnchor` refuses instants it will not predict to, so a guest hitch
+  that pushes the presentation time out is enough to reach it. The `cadence`
+  line counts it whenever it happens: `anchor N walked back / N held / N
+  unknown` — walked back is the timestamp being stepped into range, held is the
+  last measured pose standing in, unknown is having never tracked at all.
 - `KL_CP_EYE=<0|1>` — composite ONLY that eye, leaving the other black. The
   binocular-vs-temporal split for a doubled image: one second, halves the
   search space.

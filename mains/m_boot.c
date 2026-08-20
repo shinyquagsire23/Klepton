@@ -64,6 +64,12 @@ static int fail(const char *msg) { fprintf(stderr, "FAIL: %s\n", msg); return 1;
 // t_boot registers it rather than kl_fault.c referencing RUNTIME_DIAG.
 static void install_fault_reporter(void) {
     kl_fault_add_reporter(kl_sample_stop_report);
+    // A crash report that does not depend on stderr surviving. On the host that
+    // is usually the terminal and fine, but a viewer run redirects, a guest can
+    // take the fd, and stdio can hold the last writes behind a lock the dying
+    // thread never releases — and a signal death is exactly when the output
+    // matters most. KL_CRASH_LOG moves it; the default sits beside the run.
+    kl_fault_set_crash_path(kl_env_str("KL_CRASH_LOG", "/tmp/klepton-crash.log"));
     kl_fault_install();
     // After kl_fault_install, deliberately: the watch chains to whatever it
     // finds on SIGSEGV/SIGBUS, so a real crash still reaches the reporter.

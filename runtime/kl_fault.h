@@ -31,4 +31,16 @@ void kl_fault_add_reporter(void (*fn)(FILE *));
 // name of the call is already known and the caller is the open question.
 void kl_fault_print_frames(FILE *f, void *fp);
 
+// Where to write a copy of the fault report, opened by path at fault time and
+// fsync'd before the process dies.
+//
+// **This exists because fd 2 is not reliable at the moment it matters.** The
+// device app points stdout at the container's log and dups it onto stderr, but
+// a guest may `dup2` its own pipe over both, and stdio buffering can hold the
+// last writes behind a lock the dying thread never releases — so the one report
+// that only exists when something has gone wrong is the one that goes missing.
+// A path opened here is immune to all three. NULL disables the copy; the report
+// still goes to fd 2 either way.
+void kl_fault_set_crash_path(const char *path);
+
 #endif

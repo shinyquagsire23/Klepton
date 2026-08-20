@@ -140,6 +140,9 @@ static int boot_unity(FILE *out) {
     ((void (*)(void *, void *, void *))initJni)(kl_jni_env(), thiz, kl_jni_activity());
     kl_jni_local_frame_pop();
     P(out, "  initJni returned\n");
+    // Here rather than at libmain: the chain dlopens libunity.so and libil2cpp.so
+    // on its way through initJni, so this is the first moment the map is complete.
+    kl_dl_report_images(out);
     // ...and the rest of that same constructor: the helper objects hand
     // THEMSELVES to libunity, and it does not null-check the handles.
     kl_jni_unity_construct_helpers();

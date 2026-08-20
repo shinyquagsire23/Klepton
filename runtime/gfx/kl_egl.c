@@ -313,10 +313,28 @@ static const char *klgl_GetStringi(uint32_t name, uint32_t index) {
 
 static uint32_t klgl_GetError(void) { return GL_NO_ERROR; }
 
-// The limits Unity sizes its renderer from. Values are a conformant GLES 3.2
-// implementation on tile-based mobile hardware, which is what the guest thinks
-// it is talking to; nothing here is measured from a real driver yet because
-// there is no real driver yet.
+// The limits Unity sizes its renderer from.
+//
+// **Every number here must be one ANGLE will actually honour.** These began as
+// a plausible GLES 3.2 tile-based mobile driver, written when nothing real was
+// underneath; ANGLE-on-Metal is underneath now, and a limit we state above what
+// it enforces is not optimism, it is a lie with no error surface. The guest
+// validates against THESE, passes, calls GL, and GL refuses — and an engine
+// that keeps a shadow of the state it just set writes that shadow anyway,
+// indexed by the number it believed was legal. Measured overclaims and what
+// each one did:
+//
+//   MAX_VERTEX_ATTRIBS       32 vs 16     attribute slots the driver refuses
+//   MAX_UNIFORM_BLOCK_SIZE   65536 vs 16384
+//                                         Unity sizes UnityInstancing_PerDraw0
+//                                         for 64 KiB; the shader then fails to
+//                                         LINK ("exceeds GL_MAX_UNIFORM_BLOCK_
+//                                         SIZE (16384)"), which is a whole
+//                                         effect missing rather than a slow one
+//
+// Stating a LARGER value is only safe where the number is a requirement the
+// guest must meet rather than a budget it may spend — UNIFORM_BUFFER_OFFSET_
+// ALIGNMENT is the one of those here, and 256 over ANGLE's 16 is deliberate.
 static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
     // GL_NUM_EXTENSIONS is NOT here — it is answered from g_gl_extensions in
     // kl_gl_cap_integerv so the count and the strings cannot disagree.
@@ -327,15 +345,29 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
     {0x8073 /* MAX_3D_TEXTURE_SIZE         */, 2048},
     {0x88FF /* MAX_ARRAY_TEXTURE_LAYERS    */, 2048},
     {0x84E8 /* MAX_RENDERBUFFER_SIZE       */, 16384},
-    {0x8869 /* MAX_VERTEX_ATTRIBS          */, 32},
-    {0x8872 /* MAX_TEXTURE_IMAGE_UNITS     */, 32},   // matches the vendored
-    {0x8B4D /* MAX_COMBINED_TEXTURE_IMAGE_UNITS */, 64},   // ANGLE rebuild with
-    {0x8B4C /* MAX_VERTEX_TEXTURE_IMAGE_UNITS   */, 32},   // kMaxShaderSamplers=32:
-                                                           // Unity binds samplers up
-                                                           // to unit 35 on its post
-                                                           // passes and its own cap
-                                                           // check comes from these
-                                                           // answers, not ANGLE's
+    {0x8869 /* MAX_VERTEX_ATTRIBS          */, 16},
+    // ---- texture units: three numbers that must agree ----------------------
+    //
+    // Unity's own "Invalid texture unit!" check reads the cap it was told HERE,
+    // not ANGLE's, and then binds anyway — so these answers, the vendored
+    // ANGLE's `kMaxGLSamplerBindings`, and its front-end
+    // `IMPLEMENTATION_MAX_ES31_ACTIVE_TEXTURES` clamp have to state one number.
+    // Per-stage stays 32 because ANGLE's front end clamps
+    // `maxShaderTextureImageUnits` to 32 regardless, and promising more than
+    // the driver will accept is a bind that silently does nothing.
+    //
+    // **Combined is 96 because 64 was measured to be too few.** A Unity 2019.4
+    // title assigns sampler units up to 67 on one post-processing program
+    // (`glUniform1i(loc, 64..67)`, GL_INVALID_VALUE against a limit of 64) from
+    // unit numbers its Android build baked in, where the driver's limit is
+    // higher — it never queries and cannot be made to adapt. The refusal is not
+    // where it hurts: the engine believes the unit was set, indexes its own
+    // unbounded GL state cache with it, and writes through the function-pointer
+    // table it dispatches every GL call through, so the process dies in an
+    // unrelated subsystem thousands of frames later.
+    {0x8872 /* MAX_TEXTURE_IMAGE_UNITS          */, 32},
+    {0x8B4D /* MAX_COMBINED_TEXTURE_IMAGE_UNITS */, 96},
+    {0x8B4C /* MAX_VERTEX_TEXTURE_IMAGE_UNITS   */, 32},
     {0x8DFB /* MAX_VERTEX_UNIFORM_VECTORS  */, 256},
     {0x8DFD /* MAX_FRAGMENT_UNIFORM_VECTORS*/, 224},
     {0x8DFC /* MAX_VARYING_VECTORS         */, 15},
@@ -344,7 +376,7 @@ static const struct { uint32_t pname; int32_t value; } g_gl_int[] = {
     {0x8D57 /* MAX_SAMPLES                 */, 4},
     {0x80E8 /* MAX_ELEMENTS_VERTICES       */, 65536},
     {0x80E9 /* MAX_ELEMENTS_INDICES        */, 65536},
-    {0x8A30 /* MAX_UNIFORM_BLOCK_SIZE      */, 65536},
+    {0x8A30 /* MAX_UNIFORM_BLOCK_SIZE      */, 16384},
     {0x8A2D /* MAX_FRAGMENT_UNIFORM_BLOCKS */, 12},
     {0x8A2B /* MAX_VERTEX_UNIFORM_BLOCKS   */, 12},
     {0x8A2F /* MAX_COMBINED_UNIFORM_BLOCKS */, 24},

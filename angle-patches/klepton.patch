@@ -1,3 +1,26 @@
+diff --git a/src/libANGLE/Constants.h b/src/libANGLE/Constants.h
+index 62d983b..3aa3a4a 100644
+--- a/src/libANGLE/Constants.h
++++ b/src/libANGLE/Constants.h
+@@ -73,8 +73,16 @@ enum
+ 
+     IMPLEMENTATION_MAX_SHADER_TEXTURES = 32,
+ 
+-    // In ES 3.1 and below, the limit for active textures is 64.
+-    IMPLEMENTATION_MAX_ES31_ACTIVE_TEXTURES = 64,
++    // In ES 3.1 and below, the limit for active textures is 64 upstream; 96 for
++    // Klepton. A guest gets an ES 3.0 context, so this clamp — not the backend's
++    // own cap — is what decides its combined texture-unit count, and a Unity
++    // 2019.4 title binds units up to 67 from numbers baked in by its Android
++    // build. The arrays this bounds are already sized by
++    // IMPLEMENTATION_MAX_ACTIVE_TEXTURES below, so raising it allocates nothing
++    // new; it is the same reasoning that comment gives for the ES 3.2 value.
++    // Both this and the Metal backend's kMaxGLSamplerBindings sat on exactly 64
++    // and ANGLE_LIMIT_CAP takes the smaller, so both have to move together.
++    IMPLEMENTATION_MAX_ES31_ACTIVE_TEXTURES = 96,
+ 
+     // In ES 3.2 we need to support a minimum of 96 maximum textures, but some Android
+     // apps assume more are available without querying limits first.
 diff --git a/src/libANGLE/formatutils.cpp b/src/libANGLE/formatutils.cpp
 index 0e6d9b3..19b15a1 100644
 --- a/src/libANGLE/formatutils.cpp
@@ -175,7 +198,7 @@ index 2825a7c..49f308d 100644
          mStencilRenderTarget == nullptr)
      {
 diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
-index 85cc743..9443488 100644
+index 85cc743..1b76b7e 100644
 --- a/src/libANGLE/renderer/metal/mtl_common.h
 +++ b/src/libANGLE/renderer/metal/mtl_common.h
 @@ -113,7 +113,29 @@ constexpr size_t kDefaultAttributeSize = 4 * sizeof(float);
@@ -209,7 +232,34 @@ index 85cc743..9443488 100644
  constexpr size_t kInlineConstDataMaxSize = 4 * 1024;
  constexpr size_t kDefaultUniformsMaxSize = 16 * 1024;
  constexpr uint32_t kMaxViewports         = 1;
-@@ -423,6 +445,70 @@ class Context : public ErrorHandler
+@@ -142,7 +164,25 @@ constexpr uint32_t kTextureToBufferBlittingAlignment = 256;
+ constexpr size_t kConstantBufferOffsetAlignment = 32;  // Metal3 minimum constant buffer alignment.
+ 
+ // Front end binding limits
+-constexpr uint32_t kMaxGLSamplerBindings = 2 * kMaxShaderSamplers;
++// 2 * kMaxShaderSamplers upstream, which lands on exactly 64; raised to 96 for
++// Klepton because a Unity 2019.4 title assigns sampler texture units up to 67
++// (measured: glUniform1i(loc, 64..67) on one post-processing program), and 64
++// units means 0..63. The unit numbers are baked into the shader by the Android
++// build, where the driver's combined limit is higher, so the app never queries
++// and never adapts — it just calls with a unit the driver rejects.
++//
++// **The failure is not the rejected call.** GL answers GL_INVALID_VALUE and the
++// engine carries on with a texture-unit table it believes it set, then indexes
++// its own GL state cache with the unit it wanted; that write is unbounded, and
++// what it lands on is the function-pointer table the engine dispatches every GL
++// call through. The crash is a jump through a corrupted slot, thousands of
++// frames later and nowhere near here.
++//
++// This is a FRONT-END limit, deliberately decoupled from kMaxShaderSamplers:
++// per-stage Metal slots are assigned sequentially per shader, so the combined
++// GL unit count does not have to be twice the per-stage one. 96 is the number
++// ANGLE's own front end already calls the modern minimum (Constants.h).
++constexpr uint32_t kMaxGLSamplerBindings = 96;
+ constexpr uint32_t kMaxGLUBOBindings     = 2 * kMaxShaderUBOs;
+ 
+ // Binding index start for vertex data buffers:
+@@ -423,6 +463,70 @@ class Context : public ErrorHandler
      DisplayMtl *mDisplay;
  };
  
