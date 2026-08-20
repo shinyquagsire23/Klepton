@@ -29,8 +29,8 @@ echo "[viewer] $TARGET, logging to $LOG"
 # it turned that deliberate override into a blind default: on VRChat (Unity
 # 2022, unlisted) the viewer died in a wild dereference before its first frame,
 # with the fault inside recon_run — i.e. reading as a bug in the pump. Left
-# unset, the version table does its own job: Beat Saber still gets its measured
-# row and the same poke of 64, and an unlisted version SKIPS and says so.
+# unset, the version table does its own job: each build gets the answer measured
+# for it, and an unlisted version SKIPS and says so.
 # Pass KL_POKE_CAP=<n> in the environment to force it, which is what it is for.
 KL_GLFB_ERRSCAN=1 KL_OVRP_HANDS_IN_VIEW=1 KL_NET_OFFLINE=0 KL_TRACE_FS=1 KL_GLFB_EXPOSURE=1.0 KL_GLFB_GAMMA=0.45 KL_VIEW=1 KL_GLFB=1 KL_LIFECYCLE=1 \
   script -q /dev/null ./build/m_boot "$TARGET" 2>&1 | tee "$LOG"

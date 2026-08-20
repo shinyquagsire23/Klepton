@@ -10,12 +10,13 @@
 #ifndef KL_GUESTPOKE_H
 #define KL_GUESTPOKE_H
 
-// libunity's texture-unit cap, raised from Unity's un-queried 32 to what our
-// GL actually offers. Call it once the graphics device is up and before the
-// frame pump; it does nothing unless this guest's Unity version is one the
-// offsets were measured against, and says so by name when it declines.
-// KL_POKE_CAP=<n> sets the value (and forces an unlisted version to use the
-// first row's offsets); KL_POKE_CAP_OFF=1 leaves the guest alone.
+// libunity's texture-unit cap, raised from Unity's un-queried 32. Call it once
+// the graphics device is up and before the frame pump. It stores only when this
+// guest's Unity version is one the offsets were measured against AND the raise
+// is used on that build, and names the reason when it declines. It is not used
+// on Beat Saber, where the engine's own 32-unit check is what keeps an
+// out-of-range unit out of its GL state cache. KL_POKE_CAP=<n> sets the value
+// and forces it; KL_POKE_CAP_OFF=1 leaves the guest alone.
 void kl_guest_poke_texture_unit_cap(void);
 
 #endif

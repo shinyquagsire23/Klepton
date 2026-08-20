@@ -1528,23 +1528,38 @@ The composite/timewarp pass — one file, compiled by both compositors
 
 - `KL_POKE_CAP=<n>` — at frame-pump start, overwrite libunity's texture-unit
   cap (the value its `SetTexture` path checks before logging "Invalid texture
-  unit!"; read via the singleton at libunity+0x122e340, field +0xe8) with n.
-  **Default is 64**, matching the 32-sampler ANGLE rebuild: Unity defaults
-  the cap to 32 without ever querying GL for it, while its HLSLCC-baked
-  sampler bindings reach unit 35 on the post passes. `KL_POKE_CAP_OFF=1`
-  leaves the field alone.
+  unit!") with n. The raise is 64, matching the 32-sampler ANGLE rebuild:
+  Unity defaults the cap to 32 without ever querying GL for it, while its
+  HLSLCC-baked sampler bindings reach unit 35 on the post passes, so binds past
+  32 are refused and those samplers read stale unit-0 textures.
+  `KL_POKE_CAP_OFF=1` leaves the field alone.
 
-  **Both offsets were measured against Unity 2019.4 and apply to no other
-  build**, so the poke is now GATED on the version stamp `m_boot` reads out of
-  the mapped libunity (`unity_version()`). On anything else it skips and says
-  so by name. Setting `KL_POKE_CAP=<n>` explicitly ALSO forces it past that
-  gate — do that only with re-measured offsets, since the write is a 4-byte
-  store through whatever the stale offset happens to point at. Beat Saber
-  1.6.0 (Unity 2018.4.4f1) found this the expensive way: the unguarded read
-  took the lifecycle down with a SIGSEGV inside `recon_run`, which reads like a
-  shim bug rather than an expired constant. **Marked for deletion** — see the
-  TODO on `poke_texture_unit_cap()` in `mains/m_boot.c` for the two fixes that
-  would retire it, neither of which needs an offset into anything.
+  **The singleton address and field offset are per-Unity-build and apply to no
+  other**, so the store is GATED on the version stamp read out of the mapped
+  libunity (`unity_version()` in `runtime/guest/kl_guestpoke.c`), and each
+  measured row carries whether the raise is USED on that build. On an unlisted
+  version, or on a measured row that is not used, it skips and names which.
+  Setting `KL_POKE_CAP=<n>` explicitly forces it past both gates — do that only
+  with re-measured offsets, since the write is a 4-byte store through whatever
+  the offset happens to point at. Beat Saber 1.6.0 (Unity 2018.4.4f1) found
+  this the expensive way: the unguarded read took the lifecycle down with a
+  SIGSEGV inside `recon_run`, which reads like a shim bug rather than an
+  expired constant.
+
+  **Not used on Beat Saber** — the Unity 2019.4 and 2022.3.33f1 rows are
+  measured and declined. The engine's own cap check is load-bearing as a guard:
+  at 32 it refuses the out-of-range bind itself and the frame is only wrong.
+  Raised, the bind instead reaches a GL that clamps per-stage texture image
+  units to 32 regardless and refuses it there, and the engine believes the unit
+  was set, indexes its own unbounded GL state cache with it and writes through
+  the function-pointer table every GL call dispatches through — the process
+  dies thousands of frames later in an unrelated subsystem, branching through a
+  slot holding whatever the page held, on device and in the viewer alike.
+  Bisected to the commit that first ran the raise on the headset, and confirmed
+  by an A/B on device, 2026-08-19. **Marked for deletion** — see the TODO on
+  `kl_guest_poke_texture_unit_cap()` in `runtime/guest/kl_guestpoke.c` for the
+  two fixes that would retire it, neither of which needs an offset into
+  anything.
 
 - `KL_LOG=<file>` — where `build_run_viewer.sh` keeps the run's output, default
   `/tmp/viewer.log`. Not a runtime knob: the script `tee`s through `script`, so

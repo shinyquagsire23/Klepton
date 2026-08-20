@@ -1,0 +1,55 @@
+# Debugging GUEST code under lldb.
+#
+#   lldb -s tools/kl_guest.lldb -- ./build/m_boot <target>
+#
+# The guest is not a dyld image: its libraries are mapped by the runtime's own
+# loader, so lldb has no symbols, no image list entry and no way to name a guest
+# address. Three things follow, and this file is the first two.
+#
+# 1. SIGNALS. A guest built for Android ships a Boehm GC that suspends threads
+#    for a collection by SIGNAL rather than by mach port. Those arrive
+#    constantly. lldb stops on them by default, which makes the session unusable
+#    and — because they arrive in bursts — looks convincingly like a breakpoint
+#    firing over and over. Pass them through: -n false (do not stop), -p true
+#    (deliver, because the guest is waiting for exactly this).
+#
+# 2. WHERE THE GUEST IS. Every boot prints
+#
+#        === guest image map (subtract the base to disassemble) ===
+#          libunity.so   0x107cd4000 .. 0x109139bc0
+#
+#    That base is what turns a crash pc, a breakpoint address and a sampling
+#    profile into an offset that matches `objdump -d` of the .so. Nothing else
+#    in the process knows it, and it changes every run.
+#
+# 3. WHAT THE FRAMES MEAN. A tail call through a bad function pointer (`br xN`)
+#    builds no frame, so `bt` describes an older frame or garbage — and lldb
+#    will symbolise a guest address as whatever host symbol is nearest below it,
+#    which is a wrong answer that looks like a right one. Trust `$lr` and the
+#    runtime's own fault report over `bt` for that class of fault.
+#
+# The breakpoint below is a TEMPLATE, commented out. Fill in an address computed
+# as (base from the image map) + (offset from your disassembly). A condition
+# matters more than it looks: a per-frame guest function is hit thousands of
+# times a second, so an unconditional breakpoint on one is not a session.
+#
+#   br set -a 0x107cd4000+0xbf6028 -c '$x0 == 0x300000000'
+#
+# For a value that is written rather than called, watch it instead — but arm the
+# watchpoint from a breakpoint that only fires once the guest is up, because the
+# address does not exist before then and a watchpoint on unmapped memory never
+# fires and never says so:
+#
+#   watchpoint set expression -w write -s 8 -- <address>
+
+breakpoint set --name kl_glfb_begin_render_window
+run
+
+process handle SIGXCPU -n false -p true -s false
+process handle SIGUSR1 -n false -p true -s false
+process handle SIGUSR2 -n false -p true -s false
+
+# --- put a `br set` / `watchpoint set` here; the guest is alive and mapped ---
+
+breakpoint delete 1
+continue

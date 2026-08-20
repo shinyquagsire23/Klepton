@@ -304,9 +304,10 @@ static int begin_unity(FILE *out) {
     }
 
     g_render = kl_jni_native("com/unity3d/player/UnityPlayer", "nativeRender", NULL);
-    // The graphics device exists by now and no frame has been drawn yet. Without
-    // it libunity keeps its own un-queried cap of 32 texture units, refuses
-    // every bind past it, and the samplers read stale unit-0 textures.
+    // The graphics device exists by now and no frame has been drawn yet. The
+    // raise lets libunity bind past its un-queried cap of 32 texture units
+    // instead of refusing every bind and reading stale unit-0 textures; it is
+    // declined per Unity build, and names the build when it declines.
     kl_guest_poke_texture_unit_cap();
     phase("frame pump");
     return 0;

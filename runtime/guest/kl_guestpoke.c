@@ -173,12 +173,25 @@ static int addr_mapped(const void *p, size_t len) {
 // Until then it is OFF for every guest but the ones it was measured on, which is
 // the only honest state for a constant nobody can verify.
 //
-// One row per measured (Unity version prefix, singleton vaddr, cap field offset).
-struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; };
+// One row per measured (Unity version prefix, singleton vaddr, cap field
+// offset) and whether the raise is USED on that build. A row with `use` 0 keeps
+// the measurement while declining to store through it.
+//
+// Beat Saber's two rows are measured and NOT used. Unity's own cap check is
+// load-bearing as a guard: at 32 the engine refuses the out-of-range bind
+// itself and the frame is merely wrong — "Invalid texture unit!", samplers
+// reading stale unit-0 textures. Raised, the bind instead reaches a GL that
+// clamps per-stage texture image units to 32 regardless and refuses it there,
+// and the engine believes the unit was set, indexes its own unbounded GL state
+// cache with it and writes through the function-pointer table every GL call
+// dispatches through. The process then dies in an unrelated subsystem thousands
+// of frames later, on device and in the viewer alike, branching through a slot
+// holding whatever the page held. Stale unit-0 textures are the lesser fault.
+struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; int use; };
 static const struct poke_cap_row k_poke_caps[] = {
     // Unity 2019.4 — Beat Saber 1.28/1.6.0, the long-standing reference build.
     // Getter 0x313710 serves *(base + 0x122e340); cap at +0xe8.
-    { "2019.4", 0x122e340, 0xe8 },
+    { "2019.4", 0x122e340, 0xe8, 0 },
     // Unity 2022.3 — Beat Saber 1.40 (2026-08-12). Measured by the recipe above:
     //   0x14b20b  "OpenGL Error: Invalid texture unit!"
     //   0xbd29b8  bl 0x6420f0            ; the singleton getter
@@ -192,7 +205,7 @@ static const struct poke_cap_row k_poke_caps[] = {
     // test, and VRChat is a different 2022.3 build with a different singleton,
     // so a "2022.3" key would aim this store at Beat Saber's address inside
     // VRChat's libunity. A minor version is not a build.
-    { "2022.3.33f1", 0x13d7cc0, 0xec },
+    { "2022.3.33f1", 0x13d7cc0, 0xec, 0 },
     // Unity 2022.3.22f2-DWR — VRChat (2026-08-13). Same recipe, and the guard
     // is INLINE in this build rather than behind a getter, so steps 3 and 4
     // collapse into one read:
@@ -205,7 +218,7 @@ static const struct poke_cap_row k_poke_caps[] = {
     // 0x19943c0 lands in the RW LOAD's BSS (va 0x18c7970, filesz 0x1ca90 <
     // memsz 0x111676), which is what a singleton pointer filled at runtime
     // looks like.
-    { "2022.3.22f2-DWR", 0x19943c0, 0xec },
+    { "2022.3.22f2-DWR", 0x19943c0, 0xec, 1 },
 };
 #define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])
 
@@ -225,12 +238,12 @@ void kl_guest_poke_texture_unit_cap(void) {
     static int calls;
     const int first = (++calls == 1);
     const char *pv = getenv("KL_POKE_CAP");
-    // The knobs are read HERE rather than at the call sites, because there are
-    // two of them now and a gate that lives in one driver is a difference
-    // between the host and the headset with nothing to report it. Default is
-    // poke 64, matching the vendored ANGLE rebuild (kMaxShaderSamplers=32,
-    // combined 64); KL_POKE_CAP=<n> overrides and forces it on an unlisted
-    // Unity version; KL_POKE_CAP_OFF=1 leaves the guest alone entirely.
+    // The knobs are read HERE rather than at the call sites: a gate living in
+    // one driver is a difference between the host and the headset with nothing
+    // to report it. The raise is 64, matching the vendored ANGLE build
+    // (kMaxShaderSamplers=32, combined 64), and is applied only to rows marked
+    // `use`; KL_POKE_CAP=<n> sets the value and forces it on an unlisted or
+    // unused row; KL_POKE_CAP_OFF=1 leaves the guest alone entirely.
     if (!pv && getenv("KL_POKE_CAP_OFF")) return;
     int poke_n = pv ? atoi(pv) : 64;
     if (poke_n <= 1) return;
@@ -242,6 +255,16 @@ void kl_guest_poke_texture_unit_cap(void) {
             row = &k_poke_caps[i];
             break;
         }
+    // A row that exists and is not used declines by name, so the absence of a
+    // raise on a build the offsets ARE known for never reads as an unlisted one.
+    if (row && !row->use && !pv) {
+        if (first) fprintf(stderr, "  [poke] texture-unit cap: not raised on Unity %s — the "
+                        "engine's own 32-unit check is what keeps an out-of-range unit out "
+                        "of its GL state cache, and raising it trades stale unit-0 textures "
+                        "for a later branch through a poisoned dispatch slot. "
+                        "KL_POKE_CAP=<n> forces it.\n", row->ver);
+        return;
+    }
     // KL_POKE_CAP is also the override for an unlisted version: asking for it
     // explicitly is a statement that the offsets have been re-measured. It then
     // runs against the FIRST row's offsets, and the shape checks below are what
