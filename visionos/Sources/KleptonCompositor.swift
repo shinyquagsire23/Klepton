@@ -545,6 +545,14 @@ final class KleptonCompositor {
             // be stated about one origin or every near object sits wrong.
             let (p, q) = Self.decompose(
                 Self.headFrom(anchor.originFromAnchorTransform, midpoint: eyeMidpointInDevice))
+            // Date the pose with the instant it is about. It was predicted to
+            // `presentationTime`, so that — not "now" — is the clock the head
+            // velocity has to be differenced on. The two differ by this
+            // thread's scheduling jitter, and dividing a uniform
+            // presentation-time step by a jittery call-time one multiplies the
+            // derived velocity by a per-frame noise factor. See
+            // klovrp_derive_motion in runtime/xr/kl_ovrp.c.
+            kl_ovrp_set_head_pose_time(presentationTime)
             kl_ovrp_set_head_pose(p.x, p.y, p.z, q.imag.x, q.imag.y, q.imag.z, q.real)
         }
 
