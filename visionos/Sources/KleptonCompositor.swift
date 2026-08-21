@@ -361,11 +361,91 @@ final class KleptonCompositor {
     // (primeDisplay), not against an assumed 90 or 120 Hz.
     private var displayPeriod: TimeInterval = 0
     private var lastPresentation: TimeInterval = 0
+
+    // --- The boot rate SETTLE gate -------------------------------------------
+    //
+    // The panel does not start at the rate it runs at. A Vision Pro brings the
+    // layer up at 120 Hz and drops to 90 once the immersive session is properly
+    // engaged, some hundreds of milliseconds later — and priming takes a fixed
+    // eight frames, i.e. ~66 ms, which lands squarely inside that window. So
+    // the rate the guest is told is decided by a race.
+    //
+    // That race matters more than the two numbers suggest, because the guest
+    // reads its refresh rate exactly ONCE, early, and paces everything off it
+    // for the rest of the session. Measured on device: a boot that lost the
+    // race told the guest 120 while the panel delivered 90 slots a second all
+    // session. 120:90 is 4:3, so every fourth guest frame shares a panel slot
+    // with its neighbour and displayed motion steps alternate one slot / two
+    // slots — a whole-image zigzag proportional to head speed, identical in
+    // feel to a pose bug and not one. Five consecutive sessions won the race
+    // and validated the design on luck; the sixth lost it.
+    //
+    // So: measure until the cadence has been the SAME cadence for a while, and
+    // only then latch. This holds every downstream consumer with no extra
+    // plumbing, because primeDisplay runs before kl_app_guest_start — the guest
+    // thread does not exist yet, so its one early Hz read cannot precede the
+    // latch.
+    //
+    // The numbers, and why:
+    //   KL_HZ_SETTLE_MS (500) — the run of agreeing intervals must span half a
+    //     second. That is ~45 slots at 90 Hz and ~60 at 120, far longer than
+    //     the 120->90 transition itself (under a second, end to end, in the
+    //     device log), and long enough that a rate still in motion cannot fake
+    //     it. Half a second of black at boot is free: the guest takes tens of
+    //     seconds to come up behind it.
+    //   KL_HZ_SETTLE_MIN_GAPS (120) — DURATION IS NOT RESOLUTION. Sixty
+    //     intervals cannot resolve a tenth of a percent, and a tenth of a
+    //     percent is 8 microseconds a frame. 120 intervals is ~1.0 s at 120 Hz
+    //     and ~1.3 s at 90.
+    //   KL_HZ_SETTLE_TIMEOUT_MS (3000) — a panel that never gives a steady half
+    //     second is real (thermal ramping, a loaded device), and blocking the
+    //     boot on it forever is worse than guessing. At three seconds we latch
+    //     the median of everything seen and SAY SO, so a confounded session is
+    //     identifiable from its own log.
+    //   tolerance 6% — 120 and 90 are 33% apart, so this discriminates them
+    //     with an order of magnitude to spare while absorbing sub-millisecond
+    //     scheduling noise.
+    // A gap that is a near-exact 2x or 3x of the run's period is a HELD frame,
+    // not a rate change; it extends the run rather than breaking it.
+    private let hzSettle          = klEnvOn("KL_HZ_SETTLE", default: true)
+    private let hzSettleMs        = Double(klEnvFloat("KL_HZ_SETTLE_MS", 500))
+    private let hzSettleTimeoutMs = Double(klEnvFloat("KL_HZ_SETTLE_TIMEOUT_MS", 3000))
+    private let hzSettleTol       = Double(klEnvFloat("KL_HZ_SETTLE_TOL", 0.06))
+    private let hzSettleMinGaps   = Int(klEnvFloat("KL_HZ_SETTLE_MIN_GAPS", 120))
+    private let hzSnapTol         = Double(klEnvFloat("KL_HZ_SNAP_TOL", 0.005))
+
+    // THE ESTIMATOR IS A MEDIAN, and that is the load-bearing choice rather
+    // than a detail. The obvious way to turn a settled run into a period is the
+    // mean — total span over total slots — and it is measurably wrong here: the
+    // run necessarily begins at the layer's very first frames, which is where
+    // primeDisplay is also computing the foveation curve and pushing the eye
+    // textures, so the slowest frames of the whole session are inside the
+    // measured window. Worse, if the running mean is also the tolerance
+    // reference, those outliers drag the reference far enough to keep accepting
+    // themselves. Measured on device, that mean came out 0.16% low against a
+    // dead-steady panel — 13.9 microseconds a frame, which is enough to walk
+    // the guest a whole panel slot every five seconds. A median of the same
+    // samples is immune to it, and averaging for longer is not: the error was
+    // bias, not noise. (The eight-frame code this replaced took a median for
+    // precisely this reason, and said so.)
+    //
+    // ...and the last step, snapping: a measurement within half a percent of a
+    // rate the panel actually runs IS that rate. The guest is told this number
+    // once and paces against it forever, so our estimate's last two digits
+    // would otherwise become a permanent frequency offset against the panel.
+    // The candidates are what visionOS documents for this panel plus the 60 a
+    // thermal demotion produces; the closest pair is 96 and 100, 4.2% apart, so
+    // half a percent has eight times the margin it needs.
+    private static let canonicalHz: [Double] = [120, 100, 96, 90, 60]
+
     private var cadenceN = 0
     private var cadenceSum = 0.0
     private var cadenceMax = 0.0
     private var cadenceRepeats = 0      // gaps of 1.5 periods or more
     private var missedDeadline = 0
+    // Consecutive liveness reports whose mean gap disagrees with the latched
+    // display period by more than 10%. See cadenceSummary().
+    private var cadenceDisagreed = 0
     private let noFence = klEnvOn("KL_CP_NOFENCE", default: false)
     // The last device anchor the tracker actually answered with, and how often
     // it has had to stand in. See displayOriginFromDevice for why holding it is
@@ -2548,6 +2628,31 @@ final class KleptonCompositor {
                ? ", anchor \(anchorWalkedBack) walked back"
                  + " / \(anchorHeld) held / \(anchorUnknown) unknown"
                : "")
+        // The latch is a BOOT measurement, and visionOS reserves the right to
+        // change the panel rate mid-session — a demotion to 59.98 Hz has been
+        // seen on this hardware. That recreates the mismatch at a point where
+        // nothing can be re-told: the guest read its rate once, early, and
+        // stored it. Detection is therefore the whole of what is available, and
+        // it is still worth having, because the alternative is diagnosing the
+        // same thing from scratch off a log that never remarked on it. Three
+        // consecutive reports — six seconds — of the cadence disagreeing with
+        // the latched period by more than 10% is not a hitch.
+        if displayPeriod > 0 && cadenceN >= 30 && abs(periods - 1.0) > 0.10 {
+            cadenceDisagreed += 1
+            if cadenceDisagreed == 3 {
+                NSLog(String(format: "[cp] THE PANEL IS NO LONGER RUNNING AT THE RATE WE "
+                             + "LATCHED. We latched %.2f Hz at boot and told the guest "
+                             + "%.2f Hz; the last six seconds present every %.2f ms, "
+                             + "i.e. %.2f Hz. The guest cannot be re-told — it read its "
+                             + "rate once, at boot — so its pacing is now incoherent with "
+                             + "the panel and motion will judder. Treat any smoothness "
+                             + "verdict from here on as confounded.",
+                             1.0 / displayPeriod, kl_ovrp_display_frequency(),
+                             meanS * 1000, meanS > 0 ? 1.0 / meanS : 0))
+            }
+        } else {
+            cadenceDisagreed = 0
+        }
         cadenceN = 0; cadenceSum = 0; cadenceMax = 0
         cadenceRepeats = 0; missedDeadline = 0
         anchorWalkedBack = 0; anchorHeld = 0; anchorUnknown = 0
@@ -3025,9 +3130,44 @@ final class KleptonCompositor {
     private func primeDisplay() {
         var stamps: [TimeInterval] = []
         var tangents: [SIMD4<Float>] = []
-        // Eight frames: enough for a median frame interval that a slow first
-        // frame cannot drag, and under 100 ms of startup.
-        for _ in 0..<8 {
+
+        // The settle run: a stretch of presentations that all agree on one
+        // period. `runUnits` is how many PANEL SLOTS the run spans (a held
+        // frame contributes 2). The span/slots mean is the run's own coarse
+        // reference for deciding membership; the LATCHED value is the median of
+        // the per-slot gaps, for the reason set out beside the knobs above.
+        var runStart:  TimeInterval = 0
+        var runEnd:    TimeInterval = 0
+        var runUnits   = 0.0
+        var runGaps    = 0
+        var runUnitGaps: [TimeInterval] = []
+        // ...and what was thrown away getting there, which is the interesting
+        // half of the report: it is the rate a fixed-length measurement would
+        // have latched instead.
+        var deadSpan:  TimeInterval = 0
+        var deadUnits  = 0.0
+        var deadGaps   = 0
+        var latched:   TimeInterval = 0
+        var latchedMean: TimeInterval = 0
+        var latchedGaps = 0
+        var latchedMs  = 0.0
+        let clockNow: () -> TimeInterval = {
+            LayerRenderer.Clock.Instant.epoch
+                .duration(to: LayerRenderer.Clock().now).timeInterval
+        }
+        let t0 = clockNow()
+
+        while true {
+            if hzSettle {
+                if latched > 0 { break }
+                if (clockNow() - t0) * 1000 >= hzSettleTimeoutMs { break }
+            } else if stamps.count >= 8 {
+                // Eight frames: enough for a median frame interval that a slow
+                // first frame cannot drag, and under 100 ms of startup. This is
+                // the pre-settle behaviour, kept byte-for-byte behind
+                // KL_HZ_SETTLE=0 so the gate has a one-launch A/B.
+                break
+            }
             guard layerRenderer.state == .running,
                   let frame = layerRenderer.queryNextFrame() else { break }
             frame.startUpdate()
@@ -3036,13 +3176,50 @@ final class KleptonCompositor {
             if let timing { LayerRenderer.Clock().wait(until: timing.optimalInputTime) }
             // Drawable first, THEN startSubmission — the documented order, and
             // the same correction as renderFrame(). These are the layer's first
-            // eight frames, so getting the sequence wrong here is not a local
+            // frames, so getting the sequence wrong here is not a local
             // matter: it is the state the whole session starts from.
             let all = frame.queryDrawables()
             guard let drawable = all.first else { continue }
             frame.startSubmission()
-            stamps.append(LayerRenderer.Clock.Instant.epoch
-                .duration(to: drawable.frameTiming.presentationTime).timeInterval)
+            let stamp = LayerRenderer.Clock.Instant.epoch
+                .duration(to: drawable.frameTiming.presentationTime).timeInterval
+            let prev = stamps.last ?? 0
+            stamps.append(stamp)
+            if hzSettle, prev > 0, stamp - prev > 0 {
+                let gap = stamp - prev
+                let ref = runUnits > 0 ? (runEnd - runStart) / runUnits : 0
+                // How many slots this gap spans, if it belongs to the run at
+                // all. Held frames (2x, 3x) are the same rate; anything else
+                // is a different cadence and starts the run over.
+                let mult = ref > 0 ? (gap / ref).rounded() : 0
+                let belongs = ref > 0 && mult >= 1 && mult <= 3
+                    && abs(gap / mult - ref) <= hzSettleTol * ref
+                if belongs {
+                    runEnd = stamp
+                    runUnits += mult
+                    runGaps += 1
+                    runUnitGaps.append(gap / mult)
+                } else {
+                    if runGaps > 0 {
+                        deadSpan  += runEnd - runStart
+                        deadUnits += runUnits
+                        deadGaps  += runGaps
+                    }
+                    runStart = prev
+                    runEnd   = stamp
+                    runUnits = 1
+                    runGaps  = 1
+                    runUnitGaps = [gap]
+                }
+                if (runEnd - runStart) * 1000 >= hzSettleMs
+                    && runGaps >= hzSettleMinGaps && !runUnitGaps.isEmpty {
+                    let sorted = runUnitGaps.sorted()
+                    latched     = sorted[sorted.count / 2]
+                    latchedMean = (runEnd - runStart) / runUnits
+                    latchedGaps = runGaps
+                    latchedMs   = (runEnd - runStart) * 1000
+                }
+            }
             if tangents.isEmpty {
                 tangents = (0..<drawable.views.count).map {
                     kl_reproject_tangents(drawable.computeProjection(viewIndex: $0))
@@ -3080,11 +3257,53 @@ final class KleptonCompositor {
         // of a freshly-started layer are not representative and one of them is
         // enough to move an average by several Hz.
         let gaps = zip(stamps.dropFirst(), stamps).map(-).filter { $0 > 0 }.sorted()
-        if let mid = gaps.isEmpty ? nil : gaps[gaps.count / 2], mid > 0 {
+        let median: TimeInterval? = gaps.isEmpty ? nil : gaps[gaps.count / 2]
+
+        // What the settle gate decided, and — the part that matters when a
+        // session goes wrong — what it REFUSED. Discarded frames suggesting
+        // 120 Hz in front of a latch at 90 is the whole race, printed.
+        var chosen = median
+        var chosenGaps = gaps.count
+        if hzSettle {
+            let deadHz = deadUnits > 0 ? 1.0 / (deadSpan / deadUnits) : 0
+            if latched > 0 {
+                chosen = latched
+                chosenGaps = latchedGaps
+                let rawHz = 1.0 / latched
+                var snapHz = rawHz
+                for c in Self.canonicalHz where abs(rawHz - c) <= hzSnapTol * c {
+                    snapHz = c
+                    break
+                }
+                if snapHz != rawHz { chosen = 1.0 / snapHz }
+                NSLog(String(format: "[cp] display rate SETTLED at %.3f Hz after %.0f ms "
+                             + "of steady cadence (%d intervals in the settled run, "
+                             + "median of one-slot gaps; their mean says %.3f Hz); "
+                             + "%d pre-settle interval(s) discarded%@%@",
+                             rawHz, latchedMs, latchedGaps,
+                             latchedMean > 0 ? 1.0 / latchedMean : 0, deadGaps,
+                             deadHz > 0 ? String(format: ", and they suggested %.2f Hz",
+                                                 deadHz) : "",
+                             snapHz != rawHz
+                                ? String(format: " — SNAPPED to the panel's %.2f Hz "
+                                         + "(within %.1f%%)", snapHz, hzSnapTol * 100)
+                                : " — no canonical rate within "
+                                  + String(format: "%.1f%%, keeping the measurement",
+                                           hzSnapTol * 100)))
+            } else {
+                NSLog(String(format: "[cp] THE DISPLAY RATE NEVER SETTLED — %.0f ms went by "
+                             + "without %.0f ms of cadence agreeing with itself to within "
+                             + "%.0f%%, so the guest is being paced off the median of all "
+                             + "%d interval(s) instead. Treat any smoothness verdict from "
+                             + "this session as confounded.",
+                             hzSettleTimeoutMs, hzSettleMs, hzSettleTol * 100, gaps.count))
+            }
+        }
+        if let mid = chosen, mid > 0 {
             displayPeriod = mid          // what the cadence check measures against
             let hz = Float(1.0 / mid)
             NSLog(String(format: "[cp] display %.2f Hz measured over %d frames",
-                         hz, gaps.count))
+                         hz, chosenGaps))
             kl_ovrp_set_display_frequency(hz)
         } else {
             NSLog("[cp] could not measure the display rate — the guest keeps "

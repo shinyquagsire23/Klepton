@@ -1236,6 +1236,46 @@ that reports what came due since the frontend last asked. Platform-independent
   measured 773 decoded frames in ~6.5 s — the rate was honoured — so the picture
   quality question at a fixed link rate is bits per pixel, and this knob is the
   only lever on the denominator.
+- `KL_HZ_SETTLE=0|1` — the **boot rate settle gate**, default **on**
+  (`visionos/Sources/KleptonCompositor.swift`, `primeDisplay`). The Vision Pro
+  brings the layer up at 120 Hz and drops to 90 once the immersive session
+  engages; the fixed eight-frame priming measurement (~66 ms) lands inside that
+  window, so the rate the guest is told is decided by a race — and the guest
+  reads that rate exactly once, early, then paces everything off it for the
+  session. A boot that lost the race told the guest 120 against a panel
+  delivering 90: 4:3, every fourth guest frame sharing a slot, a whole-image
+  zigzag proportional to head speed.
+  With the gate on, priming keeps presenting black until the presentation
+  intervals have agreed on one period to within 6% (`KL_HZ_SETTLE_TOL`) for
+  **500 ms** (`KL_HZ_SETTLE_MS`) *and* over at least **120 intervals**
+  (`KL_HZ_SETTLE_MIN_GAPS` — duration is not resolution), then latches; if that
+  never happens within **3000 ms** (`KL_HZ_SETTLE_TIMEOUT_MS`) it latches the
+  median of everything seen and says so loudly. A gap that is a near-exact
+  2x/3x of the run's period is a held frame, not a rate change, and extends the
+  run rather than breaking it. `KL_HZ_SETTLE=0` restores the eight-frame
+  behaviour exactly, so the A/B costs one launch and no rebuild.
+  Holding here holds every consumer with no extra plumbing: `primeDisplay` runs
+  before `kl_app_guest_start`, so the guest thread does not exist yet and its
+  one early Hz read cannot precede the latch.
+  **The latched value is a MEDIAN of the run's one-slot gaps, not the mean.**
+  The run necessarily begins at the layer's first frames, which is where
+  `primeDisplay` also computes the foveation curve and pushes the eye textures,
+  so the slowest frames of the session are inside the window; measured on
+  device, the mean came out 0.16% low against a dead-steady panel, which is
+  13.9 us a frame. That is bias, not noise, and averaging longer does not touch
+  it. `KL_HZ_SNAP_TOL` (default **0.005**) then snaps a measurement within half
+  a percent of a rate the panel actually runs — 120/100/96/90, plus the 60 a
+  thermal demotion produces — to that rate exactly, because the guest is told
+  the number once and our estimate's last two digits would otherwise become a
+  permanent frequency offset.
+  *Read it with:*
+  `  [cp] display rate SETTLED at 119.995 Hz after 1001 ms of steady cadence (120 intervals in the settled run, median of one-slot gaps; their mean says 119.812 Hz); 7 pre-settle interval(s) discarded, and they suggested 120.00 Hz — SNAPPED to the panel's 120.00 Hz (within 0.5%)`
+  followed by the unchanged `[cp] display .. Hz measured over N frames` and
+  `[cp] guest will be told .. Hz`, which remains the truth of what the guest
+  got. A panel rate that moves *after* the latch is caught separately by
+  `[cp] THE PANEL IS NO LONGER RUNNING AT THE RATE WE LATCHED` — six seconds of
+  cadence more than 10% off the latched period. Detection only: the guest read
+  its rate once and cannot be re-told.
 - `KL_XR_LAYERS=0` — flatten the guest's projection layers into one eye picture
   instead of compositing each as its own quad (default 1, the per-layer
   composite).
