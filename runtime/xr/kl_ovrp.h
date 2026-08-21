@@ -45,6 +45,17 @@ int kl_ovrp_tracking_origin(void);
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
 
+// Date the NEXT head pose: the instant that pose IS ABOUT, on any monotonic
+// clock the frontend likes, as long as it is the same clock every time. On
+// visionOS that is the PRESENTATION TIME the device anchor was predicted to,
+// not the moment the call is made — those differ by the render thread's
+// scheduling jitter, and the head velocity we derive is the pose difference
+// divided by exactly this interval. Taking it from the call clock instead
+// multiplies the velocity by a per-frame noise factor; see klovrp_derive_motion
+// for the full account. Call immediately before kl_ovrp_set_head_pose, from the
+// same thread. A frontend that never calls this keeps the call-time behaviour.
+void kl_ovrp_set_head_pose_time(double t);
+
 // The pose the FRONTEND last published — where the head is now, including the
 // standing-eye-height default a headless run gets. This is the display side's
 // number: the viewer's composite reprojects towards it. It is deliberately not

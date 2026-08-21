@@ -1456,18 +1456,39 @@ static double klovrp_mono_now(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-static void klovrp_hist_note(klovrp_motion_hist *h, const klovrp_pose *v) {
-    h->have = 1;   h->t  = klovrp_mono_now();
+// `when` is the instant the sample IS ABOUT, not the instant this call happens
+// to be made at. 0 means the publisher has no such clock, and then the call
+// time is the only answer available.
+static void klovrp_hist_note(klovrp_motion_hist *h, const klovrp_pose *v,
+                             double when) {
+    h->have = 1;   h->t  = when > 0 ? when : klovrp_mono_now();
     h->px = v->px; h->py = v->py; h->pz = v->pz;
     h->qx = v->qx; h->qy = v->qy; h->qz = v->qz; h->qw = v->qw;
 }
 
 // Fill v's velocity from the difference against `h`, then advance `h`.
-static void klovrp_derive_motion(klovrp_pose *v, klovrp_motion_hist *h) {
+//
+// The dt has to be the SAMPLES' OWN dt. The numerator is the difference between
+// two poses the frontend obtained by asking for the device anchor at two
+// PRESENTATION TIMES (KleptonCompositor.updatePoses(at:)) — a uniform grid, one
+// panel slot apart. Differencing CLOCK_MONOTONIC across the two *calls* instead
+// measures the wall-clock spacing of the frame loop's publish step, which
+// carries every bit of scheduling jitter the render thread suffers. Dividing a
+// uniform numerator by a jittery denominator multiplies the velocity by
+// (dt_presentation / dt_call): not a constant-dt scale error but a per-frame
+// noise term, and a guest that integrates the velocity to predict its render
+// pose then gets a different answer every frame for the same real motion.
+//
+// So a publisher that KNOWS what instant its sample is about says so, and the
+// difference is taken on that clock. Publishers with no such clock — the SDL
+// viewer, the parked default poses — pass 0 and keep the call-time behaviour,
+// which for them is the only clock there is.
+static void klovrp_derive_motion(klovrp_pose *v, klovrp_motion_hist *h,
+                                 double when) {
     static int derive = -1;
     if (derive < 0) derive = kl_env_on("KL_OVRP_DERIVE_VELOCITY", 1);
 
-    double now = klovrp_mono_now();
+    double now = when > 0 ? when : klovrp_mono_now();
     double dt  = h->have ? now - h->t : 0.0;
 
     v->vx = v->vy = v->vz = v->avx = v->avy = v->avz = 0;
@@ -1503,7 +1524,7 @@ static void klovrp_derive_motion(klovrp_pose *v, klovrp_motion_hist *h) {
         }
         v->motion_valid = 1;
     }
-    klovrp_hist_note(h, v);
+    klovrp_hist_note(h, v, now);
 }
 
 static void klovrp_pose_write(klovrp_pose *dst, const klovrp_pose *v) {
@@ -1779,6 +1800,14 @@ int kl_ovrp_head_motion(float *vel, float *ang) {
     return h.motion_valid;
 }
 
+// The instant the NEXT published head pose is about, or 0 for a frontend that
+// has no such clock. Written and read from the one thread that publishes.
+static double g_head_pose_time;
+
+void kl_ovrp_set_head_pose_time(double t) {
+    g_head_pose_time = t;
+}
+
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     // DeviceAnchor does not report a velocity, so this derives one. The old
@@ -1788,7 +1817,7 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     // guest arrived: velocity there is a chained output struct on any space,
     // and zeros in it are an assertion rather than a silence.
     klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
-    klovrp_derive_motion(&v, &g_head_hist);
+    klovrp_derive_motion(&v, &g_head_hist, g_head_pose_time);
     klovrp_pose_write(&g_head_pose, &v);
     __atomic_store_n(&g_head_set, 1, __ATOMIC_RELEASE);
 }
@@ -2755,7 +2784,7 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
 // A measured velocity is authoritative — nothing is derived here. The
     // history still advances, so a publisher that later drops to the pose-only
     // call differentiates against the right previous sample instead of a gap.
-    klovrp_hist_note(&g_hand_hist[hand], &v);
+    klovrp_hist_note(&g_hand_hist[hand], &v, 0);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
     float e[3]; klovrp_pose_euler_deg(&v, e);
@@ -2770,7 +2799,7 @@ void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw) {
     if ((unsigned)hand > 1) return;
     klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0 };
-    klovrp_derive_motion(&v, &g_hand_hist[hand]);
+    klovrp_derive_motion(&v, &g_hand_hist[hand], 0);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
     float e[3]; klovrp_pose_euler_deg(&v, e);
