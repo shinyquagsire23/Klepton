@@ -111,6 +111,7 @@ enum {
     XR_TYPE_ACTION_SPACE_CREATE_INFO    = 38,
     XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING = 51,
     XR_TYPE_INTERACTION_PROFILE_STATE   = 53,
+    XR_TYPE_BATTERY_STATE_DISPLAY_EXT   = 1000836000,
     XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO = 54,
     XR_TYPE_ACTION_STATE_GET_INFO       = 58,
     XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO = 60,
@@ -273,6 +274,19 @@ typedef struct { int32_t type; const void *next;
 
 typedef struct { int32_t type; void *next;
                  XrPath interactionProfile; } XrInteractionProfileState;
+
+// XR_EXT_interaction_profile_battery_state_display. This output structure is
+// chained to XrInteractionProfileState and queried for one top-level user path,
+// which maps naturally to Klepton's per-hand controller battery seam.
+typedef struct { int32_t type; void *next;
+                 uint64_t stateFlags;
+                 float batteryLevel; } XrBatteryStateDisplayEXT;
+enum {
+    XR_BATTERY_STATE_DISPLAY_STATE_VALID_BIT_EXT     = 0x00000001,
+    XR_BATTERY_STATE_DISPLAY_STATE_CHARGING_BIT_EXT  = 0x00000002,
+    XR_BATTERY_STATE_DISPLAY_STATE_PLUGGED_IN_BIT_EXT = 0x00000004,
+    XR_BATTERY_STATE_DISPLAY_STATE_NO_BATTERY_BIT_EXT = 0x00000008,
+};
 
 typedef struct { void *actionSet; XrPath subactionPath; } XrActiveActionSet;
 typedef struct { int32_t type; const void *next;
@@ -769,6 +783,7 @@ typedef struct {
     int       ext_opengl_es;      // did it enable XR_KHR_opengl_es_enable?
     int       gl_requirements_queried;   // ...and did it then ask for the range?
     int       ext_vulkan;         // ...or XR_KHR_vulkan_enable? (Open Brush)
+    int       ext_controller_battery; // ...controller battery output chain?
     int       vk_requirements_queried;   // its own gate, separate from GLES's:
                                          // the spec's requirements-call check is
                                          // per graphics API, and one flag for
@@ -906,6 +921,10 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     { "XR_FB_passthrough",                    1, KLXR_GATE_ALWAYS },
     { "XR_META_performance_metrics",          2, KLXR_GATE_ALWAYS },
     { "XR_EXT_user_presence",                 1, KLXR_GATE_USER_PRESENCE },
+    // Standard per-device battery query. A client opts in by enabling this and
+    // chaining XrBatteryStateDisplayEXT to xrGetCurrentInteractionProfile.
+    // The visionOS frontend supplies real per-hand GCController readings.
+    { "XR_EXT_interaction_profile_battery_state_display", 1, KLXR_GATE_ALWAYS },
 };
 #define KLXR_EXT_ALL ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
 
@@ -1271,6 +1290,8 @@ static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **ins
         if (!known) { g_instance.magic = 0; KLXR_RET(KLXR_ERROR_EXTENSION_NOT_PRESENT); }
         if (strcmp(name, "XR_KHR_opengl_es_enable") == 0) g_instance.ext_opengl_es = 1;
         if (strcmp(name, "XR_KHR_vulkan_enable") == 0)    g_instance.ext_vulkan = 1;
+        if (strcmp(name, "XR_EXT_interaction_profile_battery_state_display") == 0)
+            g_instance.ext_controller_battery = 1;
     }
 
     *instance = &g_instance;
@@ -3542,6 +3563,33 @@ static XrResult klxr_GetCurrentInteractionProfile(void *session, XrPath top_leve
         const char *profile = g_active_profile[0] ? g_active_profile
                                                   : KLXR_ACTIVE_PROFILE;
         klxr_StringToPath(s->instance, profile, &state->interactionProfile);
+    }
+    // Only an app that enabled the extension is allowed to supply this chain.
+    // Walk the normal OpenXR output chain (bounded like the velocity helper),
+    // leaving unrelated structures untouched. A missing platform reading is
+    // represented by VALID clear, never by a fabricated percentage.
+    if (s->instance->ext_controller_battery) {
+        int hand = klxr_path_hand(klxr_path_str(top_level_path), NULL);
+        void *next = state->next;
+        for (int depth = 0; next && depth < 16;
+             depth++, next = *(void **)((char *)next + 8)) {
+            XrBatteryStateDisplayEXT *battery = next;
+            if (battery->type != XR_TYPE_BATTERY_STATE_DISPLAY_EXT) continue;
+            battery->stateFlags = XR_BATTERY_STATE_DISPLAY_STATE_NO_BATTERY_BIT_EXT;
+            battery->batteryLevel = 0.0f;
+            int level = hand >= 0 ? kl_ovrp_controller_battery_level(hand) : -1;
+            if (state->interactionProfile && level >= 0) {
+                battery->stateFlags = XR_BATTERY_STATE_DISPLAY_STATE_VALID_BIT_EXT;
+                battery->batteryLevel = (float)level / 100.0f;
+                int power = kl_ovrp_controller_battery_state(hand);
+                if (power == KL_CONTROLLER_BATTERY_CHARGING)
+                    battery->stateFlags |= XR_BATTERY_STATE_DISPLAY_STATE_CHARGING_BIT_EXT |
+                                           XR_BATTERY_STATE_DISPLAY_STATE_PLUGGED_IN_BIT_EXT;
+                else if (power == KL_CONTROLLER_BATTERY_FULL)
+                    battery->stateFlags |= XR_BATTERY_STATE_DISPLAY_STATE_PLUGGED_IN_BIT_EXT;
+            }
+            break;
+        }
     }
     static int said;
     if (!said++)
@@ -6974,6 +7022,35 @@ int kl_openxr_input_selftest(FILE *f) {
     ok &= klxr_st_ok(f, "releasing it does",
                      klxr_st_bool(press0, "/user/hand/left", &b) &&
                      b.changedSinceLastSync && !b.currentState);
+
+    // Controller batteries share the same frontend seam for OVRPlugin and
+    // OpenXR. Exercise the independent values and OpenXR's standard output
+    // chain here; OVRPlugin's ControllerState4 layout is compiled separately.
+    fprintf(f, "  --- controller batteries ---\n");
+    kl_ovrp_set_controller_battery(0, 37, KL_CONTROLLER_BATTERY_CHARGING);
+    kl_ovrp_set_controller_battery(1, 82, KL_CONTROLLER_BATTERY_DISCHARGING);
+    ok &= klxr_st_ok(f, "the seam retains independent left/right percentages",
+                     kl_ovrp_controller_battery_level(0) == 37 &&
+                     kl_ovrp_controller_battery_level(1) == 82);
+
+    XrPath battery_left = 0;
+    klxr_StringToPath(&g_instance, "/user/hand/left", &battery_left);
+    XrBatteryStateDisplayEXT battery = {
+        XR_TYPE_BATTERY_STATE_DISPLAY_EXT, NULL, 0, 0.0f
+    };
+    XrInteractionProfileState battery_profile = {
+        XR_TYPE_INTERACTION_PROFILE_STATE, &battery, 0
+    };
+    g_instance.ext_controller_battery = 1;
+    XrResult battery_result = klxr_GetCurrentInteractionProfile(
+        &g_session, battery_left, &battery_profile);
+    ok &= klxr_st_ok(f, "OpenXR reports level, valid, charging and plugged-in",
+                     battery_result == KLXR_SUCCESS &&
+                     fabsf(battery.batteryLevel - 0.37f) < 1e-4f &&
+                     battery.stateFlags ==
+                         (XR_BATTERY_STATE_DISPLAY_STATE_VALID_BIT_EXT |
+                          XR_BATTERY_STATE_DISPLAY_STATE_CHARGING_BIT_EXT |
+                          XR_BATTERY_STATE_DISPLAY_STATE_PLUGGED_IN_BIT_EXT));
 
     // The action space, and the invariant that matters: it must follow the hand
     // named by its subaction path and no other.

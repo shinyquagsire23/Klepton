@@ -443,6 +443,11 @@ final class KleptonControllers {
 
     private(set) var senseConnected = false
     private var tracked: [GCController] = []
+    // Last values sent across the C seam, to avoid rewriting/logging an
+    // unchanged battery every display frame. -2 is the never-published marker;
+    // -1 is a real "controller/API supplied no battery" state.
+    private var reportedBatteryLevel = [-2, -2]
+    private var reportedBatteryState = [-2, -2]
 
     // MARK: - Discovery
 
@@ -977,6 +982,12 @@ final class KleptonControllers {
             // a hand that falls back must report no motion rather than the
             // motion its controller had before it was put down.
             state[i].linearVelocity = .zero; state[i].angularVelocity = .zero
+            if reportedBatteryLevel[i] != -1 {
+                kl_ovrp_set_controller_battery(Int32(i), -1,
+                                                Int32(KL_CONTROLLER_BATTERY_UNKNOWN))
+                reportedBatteryLevel[i] = -1
+                reportedBatteryState[i] = Int(KL_CONTROLLER_BATTERY_UNKNOWN)
+            }
         }
         lock.unlock()
 
@@ -987,6 +998,11 @@ final class KleptonControllers {
             // not joined here. The suffix is what the vendor string actually
             // contains: "PlayStation VR2 Sense Controller (L)".
             let hand = Self.hand(of: c)
+
+            // Battery is device state, not input state. Publish it before
+            // nextInputState(): nil there means no button/axis changed, and
+            // must not suppress a battery update.
+            publishBattery(of: c, hand: hand)
 
             c.input.inputStateQueueDepth = 1
             // nil is "nothing new since you last asked", NOT "everything is
@@ -1281,6 +1297,43 @@ final class KleptonControllers {
     /// not joined here.
     static func hand(of c: GCController) -> Int {
         (c.vendorName ?? "").hasSuffix("(L)") ? 0 : 1
+    }
+
+    /// Publish one Sense controller's battery through the runtime seam. Apple
+    /// exposes each PSVR2 Sense half as its own GCController, so the existing
+    /// vendor-name chirality rule gives us genuinely independent L/R values.
+    private func publishBattery(of controller: GCController, hand: Int) {
+        guard let battery = controller.battery else {
+            if reportedBatteryLevel[hand] != -1 {
+                kl_ovrp_set_controller_battery(Int32(hand), -1,
+                                                Int32(KL_CONTROLLER_BATTERY_UNKNOWN))
+                reportedBatteryLevel[hand] = -1
+                reportedBatteryState[hand] = Int(KL_CONTROLLER_BATTERY_UNKNOWN)
+                NSLog("[cp] \(hand == 0 ? "left" : "right") controller battery unavailable")
+            }
+            return
+        }
+
+        let level = Int((min(max(battery.batteryLevel, 0), 1) * 100).rounded())
+        let state: Int32
+        let stateName: String
+        switch battery.batteryState {
+        case .discharging:
+            state = Int32(KL_CONTROLLER_BATTERY_DISCHARGING); stateName = "discharging"
+        case .charging:
+            state = Int32(KL_CONTROLLER_BATTERY_CHARGING); stateName = "charging"
+        case .full:
+            state = Int32(KL_CONTROLLER_BATTERY_FULL); stateName = "full"
+        default:
+            state = Int32(KL_CONTROLLER_BATTERY_UNKNOWN); stateName = "unknown"
+        }
+        guard reportedBatteryLevel[hand] != level || reportedBatteryState[hand] != Int(state) else {
+            return
+        }
+        kl_ovrp_set_controller_battery(Int32(hand), Int32(level), state)
+        reportedBatteryLevel[hand] = level
+        reportedBatteryState[hand] = Int(state)
+        NSLog("[cp] \(hand == 0 ? "left" : "right") controller battery \(level)% (\(stateName))")
     }
 
     /// Follow both hands' envelopes. Called once a frame from the compositor,
