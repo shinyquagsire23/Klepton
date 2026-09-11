@@ -994,7 +994,7 @@ float kl_ovrp_display_frequency(void) {
 // on device — a frontend pushing UIDevice's real reading. Sanity checks mirror
 // the display-frequency setter: a level outside 0..100 is a bad measurement,
 // and passing it on would make every consumer answer nonsense.
-static int g_battery_level = 95;       // Quest-2 fiction, like the display: 72 Hz
+static int g_battery_level = 95;       // host/unknown fallback; visionOS publishes UIDevice
 static int g_battery_charging;
 
 void kl_ovrp_set_battery_level(int level) {
@@ -1018,6 +1018,38 @@ int kl_ovrp_battery_charging(void) {
         if (e && *e) g_battery_charging = atoi(e) != 0;
     }
     return g_battery_charging;
+}
+
+// PSVR2 Sense controllers are two independent GCController devices, so retain
+// two independent readings. The render thread reads these while GameController
+// is polled by the frontend; atomics keep that seam valid if either callback is
+// ever moved off the render thread. Unknown is distinct from 0%: OpenXR has a
+// validity bit, while OVRPlugin's byte has no unknown representation and keeps
+// its historical 100% fallback in fill_controller_state below.
+static int g_controller_battery_level[2] = { -1, -1 };
+static int g_controller_battery_state[2] = {
+    KL_CONTROLLER_BATTERY_UNKNOWN, KL_CONTROLLER_BATTERY_UNKNOWN
+};
+
+void kl_ovrp_set_controller_battery(int hand, int level, int state) {
+    if (hand < 0 || hand > 1) return;
+    if (level < 0) level = -1;
+    else if (level > 100) level = 100;
+    if (state < KL_CONTROLLER_BATTERY_UNKNOWN ||
+        state > KL_CONTROLLER_BATTERY_FULL)
+        state = KL_CONTROLLER_BATTERY_UNKNOWN;
+    __atomic_store_n(&g_controller_battery_level[hand], level, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_controller_battery_state[hand], state, __ATOMIC_RELEASE);
+}
+
+int kl_ovrp_controller_battery_level(int hand) {
+    if (hand < 0 || hand > 1) return -1;
+    return __atomic_load_n(&g_controller_battery_level[hand], __ATOMIC_ACQUIRE);
+}
+
+int kl_ovrp_controller_battery_state(int hand) {
+    if (hand < 0 || hand > 1) return KL_CONTROLLER_BATTERY_UNKNOWN;
+    return __atomic_load_n(&g_controller_battery_state[hand], __ATOMIC_ACQUIRE);
 }
 
 // ---- predicted display time seam ----
@@ -3675,7 +3707,10 @@ static void fill_controller_state(int mask, void *out, int version) {
         f[6] = in[0].hand_trigger;                      // LHandTrigger
         f[8] = in[0].stick_x; f[9] = in[0].stick_y;
         if (version >= 2) { f[12] = in[0].stick_x; f[13] = in[0].stick_y; }
-        if (version >= 4) b[0x40] = 100;                // LBatteryPercentRemaining
+        if (version >= 4) {
+            int level = kl_ovrp_controller_battery_level(0);
+            b[0x40] = (uint8_t)(level >= 0 ? level : 100); // LBatteryPercentRemaining
+        }
     }
     if (conn & OVRP_CTRL_RTOUCH) {
         w[1] |= in[1].buttons;
@@ -3685,7 +3720,10 @@ static void fill_controller_state(int mask, void *out, int version) {
         f[7] = in[1].hand_trigger;                      // RHandTrigger
         f[10] = in[1].stick_x; f[11] = in[1].stick_y;
         if (version >= 2) { f[14] = in[1].stick_x; f[15] = in[1].stick_y; }
-        if (version >= 4) b[0x41] = 100;                // RBatteryPercentRemaining
+        if (version >= 4) {
+            int level = kl_ovrp_controller_battery_level(1);
+            b[0x41] = (uint8_t)(level >= 0 ? level : 100); // RBatteryPercentRemaining
+        }
     }
     // Thumbstick values, logged when non-zero (no flag) so a turning problem is
     // visible: the guest reads the RIGHT stick (f[10]=x, f[11]=y) for turning.

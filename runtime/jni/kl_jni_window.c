@@ -62,12 +62,10 @@ static klj_val klj_PowerManager_sustainedPerf(void *env, void *self, const klj_v
 // telemetry, not a control input: nothing here changes streaming behaviour, and
 // the cost of a wrong answer is a wrong number on someone's desktop.
 //
-// Answered as a headset on its battery and nearly full, which is what a Vision
-// Pro on its pack is for most of a session. Both are knobs because neither is
-// measured yet: on device the real values are available (UIDevice's battery
-// monitoring), and wiring them is the honest fix — until then a fixed answer at
-// least does not fluctuate, and a fluctuating invented number would be worse
-// than a static one.
+// The visionOS frontend publishes UIDevice's real level and charging state into
+// the seam below before the guest boots. A host run has no battery and therefore
+// keeps the stable 95% / unplugged fallback; KL_BATTERY_* can override either
+// field for a diagnostic run.
 static klj_val klj_BatteryManager_isCharging(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     // The charging flag lives in the kl_ovrp battery seam — the single source

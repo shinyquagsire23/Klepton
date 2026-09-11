@@ -572,9 +572,9 @@ The guest's own memory management, and the three seams that used to disable it.
   `IsHmdBatteryCharging()`/`GetHmdBatteryLevel()` and publishes them to the host
   as device properties, which the Steam client shows beside the headset. Nothing
   in the streaming path branches on them, so a wrong answer costs a wrong number
-  on someone's desktop. They are knobs because neither is measured yet — on
-  device the real values are available and wiring them is the honest fix; a
-  fixed answer at least does not fluctuate in the meantime.
+  on someone's desktop. The visionOS frontend normally publishes UIDevice's real
+  level and charging state; these knobs override those readings for diagnostics.
+  A host run, which has no device battery, keeps the 95% / not-charging fallback.
 
 ## Video decode (`runtime/media/kl_vtdec.c`, `runtime/media/kl_mediandk.c`)
 
