@@ -42,7 +42,8 @@ RUNTIME_JNI := runtime/kl_jni.c \
            runtime/jni/kl_jni_net.c runtime/jni/kl_jni_softinput.c \
            runtime/jni/kl_jni_services.c runtime/jni/kl_jni_io.c \
            runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
-           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c
+           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c \
+           runtime/jni/kl_jni_bhaptics.c
 
 RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
            runtime/libc/kl_va_handlers.c runtime/libc/kl_va_thunks.S \

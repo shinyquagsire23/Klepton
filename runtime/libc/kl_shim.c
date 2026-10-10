@@ -820,12 +820,31 @@ static int kl_connect(int fd, const struct sockaddr *sa, socklen_t len) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     int r = connect(fd, sa, len);
+    int saved_errno = errno;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (kl_net_trace())
         fprintf(stderr, "  [net] connect(%s) -> %d (%s) in %.2fs [fam=%d len=%d]\n", host, r,
-                r ? strerror(errno) : "ok",
+                r ? strerror(saved_errno) : "ok",
                 (double)(t1.tv_sec - t0.tv_sec) + 1e-9 * (double)(t1.tv_nsec - t0.tv_nsec),
                 sa ? ((const struct sockaddr_storage *)sa)->ss_family : -1, (int)len);
+    // A refused connect earns a line even without KL_TRACE_NET. The guest's own
+    // log says "Cannot connect to destination host" and names neither the peer
+    // nor the errno — and EPERM, ENETUNREACH and ECONNREFUSED are three
+    // different diagnoses (a policy denial, no network, nobody listening).
+    // Ancient Dungeon's Unity Authentication sign-in failed that way with only
+    // the Rust side's "Operation not permitted" to go on. The first few only; a
+    // retry storm would otherwise flood the log. EINPROGRESS is a non-blocking
+    // connect proceeding normally, not a failure.
+    else if (r != 0 && saved_errno != EINPROGRESS) {
+        static int said;
+        if (said < 8) {
+            said++;
+            fprintf(stderr, "  [net] connect(%s) -> %s [fam=%d]%s\n", host, strerror(saved_errno),
+                    sa ? ((const struct sockaddr_storage *)sa)->ss_family : -1,
+                    said == 8 ? " (further failures only with KL_TRACE_NET=1)" : "");
+        }
+    }
+    errno = saved_errno;
     return r;
 }
 // A guest binding a fixed port is normally alone on the device. Here it is not:

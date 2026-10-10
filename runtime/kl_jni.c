@@ -621,15 +621,13 @@ static const struct { const char *cls, *super; } g_supers[] = {
     {NULL, NULL},
 };
 
-static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
-    (void)env;
-    if (!obj) return 1;                       // null is an instance of everything
-    klj_object *o = klj_as_object(obj);
-    if (!o) return 0;
-    const char *want = klj_class_name(clazz);
+// Is class `sub` the class `want`, or does it reach `want` by walking g_supers?
+// Every class is an Object. Shared by IsInstanceOf and IsAssignableFrom: both
+// ask the same question of the same hierarchy, one about an object's class and
+// one about two classes, so the walk lives in one place.
+static int klj_class_extends(const char *sub, const char *want) {
     if (strcmp(want, "java/lang/Object") == 0) return 1;
-
-    for (const char *cur = o->cls; cur; ) {
+    for (const char *cur = sub; cur; ) {
         if (strcmp(cur, want) == 0) return 1;
         const char *next = NULL;
         for (int i = 0; g_supers[i].cls; i++)
@@ -637,6 +635,28 @@ static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
         cur = next;
     }
     return 0;
+}
+
+static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
+    (void)env;
+    if (!obj) return 1;                       // null is an instance of everything
+    klj_object *o = klj_as_object(obj);
+    if (!o) return 0;
+    return klj_class_extends(o->cls, klj_class_name(clazz));
+}
+
+// IsAssignableFrom(clazz1, clazz2): can a clazz1 be stored where a clazz2 is
+// expected — i.e. is clazz1 the same class as, or a subclass of, clazz2. Ancient
+// Dungeon's LIV Creator Kit (liblck_core, Rust `jni` crate) asks this right
+// after resolving Settings$Secure.getString, as part of its device-ID lookup.
+// Interfaces are not modelled here, so a class is never assignable to one; the
+// callers seen so far only ask about concrete classes.
+static kl_jint klj_IsAssignableFrom(void *env, void *clazz1, void *clazz2) {
+    (void)env;
+    const char *sub = klj_class_name(clazz1), *want = klj_class_name(clazz2);
+    kl_jint r = klj_class_extends(sub, want);
+    KLJ_LOG("IsAssignableFrom  %s -> %s = %d", sub, want, r);
+    return r;
 }
 
 // Strings. A jstring never crosses into real Java, so we are free to define the
@@ -990,6 +1010,22 @@ static int klj_same_args(const char *a, const char *b) {
 
 static const klj_binding *klj_find_binding(const char *cls, const char *name,
                                            const char *sig) {
+    // No signature at all: Unity's AndroidJNIHelper.GetMethodID(class, name)
+    // defaults the signature to "" and ReflectionHelper then answers by NAME
+    // alone — Java reflection's first method of that name. bHaptics' SDK2
+    // caches its ids that way (refreshPairing, stopAll, isBhapticsUser …), so
+    // the jmethodID carries no signature and the match is by name here too;
+    // klj_call_common types the arguments from the binding's signature instead.
+    if (!sig || !*sig) {
+        for (const klj_binding *const *t = klj_binding_tables; *t; t++)
+            for (const klj_binding *b = *t; b->cls; b++)
+                if (strcmp(b->cls, cls) == 0 && strcmp(b->name, name) == 0) {
+                    KLJ_LOG("binding %s.%s matched by NAME (guest gave no signature): table has %s",
+                            cls, name, b->sig);
+                    return b;
+                }
+        return NULL;
+    }
     // Exact wins outright across EVERY family table, so the answer does not
     // depend on which file a class landed in; a loose match is only ever the
     // fallback.
@@ -1073,18 +1109,22 @@ static klj_val klj_call_common(void *env, void *self, void *mid, char want,
         kl_fatal_prepare(); abort();
     }
 
-    char have = klj_return_kind(w->sig);
+    const klj_binding *b = klj_resolve_binding(w->cls, w->name, w->sig);
+    // An id looked up by name alone has no signature of its own (see
+    // klj_find_binding); the binding's is the only description of the arguments.
+    const char *sig = (w->sig[0] || !b) ? w->sig : b->sig;
+
+    char have = klj_return_kind(sig);
     if (want != '?' && have != want)
         KLJ_LOG("WARNING %s.%s%s called through a '%c' slot but returns '%c'",
-                w->cls, w->name, w->sig, want, have);
+                w->cls, w->name, sig, want, have);
 
-    const klj_binding *b = klj_resolve_binding(w->cls, w->name, w->sig);
     if (b) {
         klj_val argv[KLJ_MAX_ARGS];
-        int argc = va ? klj_decode_args(w->sig, va, argv)
-                      : klj_decode_args_a(w->sig, args, argv);
+        int argc = va ? klj_decode_args(sig, va, argv)
+                      : klj_decode_args_a(sig, args, argv);
         if (argc < 0) {
-            KLJ_LOG("cannot decode signature %s for %s.%s", w->sig, w->cls, w->name);
+            KLJ_LOG("cannot decode signature %s for %s.%s", sig, w->cls, w->name);
             kl_fatal_prepare(); abort();
         }
         return b->fn(env, self, argv, argc);
@@ -2008,6 +2048,7 @@ const klj_binding *const klj_binding_tables[] = {
     klj_bind_electra,
     klj_bind_fmod,
     klj_bind_jkxr,
+    klj_bind_bhaptics,
     NULL,
 };
 
@@ -2121,6 +2162,7 @@ static void klj_build_tables(void) {
     ENV(DeleteWeakGlobalRef,  klj_ref_release);
     ENV(IsSameObject,         klj_IsSameObject);
     ENV(IsInstanceOf,         klj_IsInstanceOf);
+    ENV(IsAssignableFrom,     klj_IsAssignableFrom);
     ENV(NewString,            klj_NewString);
     ENV(GetStringChars,       klj_GetStringChars);
     ENV(ReleaseStringChars,   klj_ReleaseStringChars);
