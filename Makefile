@@ -18,7 +18,7 @@ CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(R
 # RUNTIME_SHIP — everything that links the runtime needs them.
 LDLIBS  := -lz -framework AudioToolbox \
            -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-           -framework CoreFoundation -framework AVFoundation -framework Foundation
+           -framework CoreFoundation -framework AVFoundation -framework Foundation -framework CoreAudio
 # The host/ship split is a source-list boundary, not a runtime getenv.
 #
 # RUNTIME_SHIP is everything that goes into the visionOS app bundle. It is the
@@ -864,7 +864,7 @@ angle-ios: angle-fetch
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
 	  gn gen out/ios --args='is_debug=false target_os="ios" target_cpu="arm64" \
 	    target_environment="device" ios_enable_code_signing=false \
-	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
+	    angle_enable_vulkan=false angle_enable_swiftshader=false use_lld=false use_custom_libcxx=false use_custom_libcxx_for_host=false treat_warnings_as_errors=false' && \
 	  autoninja -C out/ios libEGL libGLESv2
 
 # The simulator slice. Same trick one platform over: an iOS *simulator* build
@@ -876,7 +876,7 @@ angle-ios-sim: angle-fetch
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
 	  gn gen out/ios-sim --args='is_debug=false target_os="ios" target_cpu="arm64" \
 	    target_environment="simulator" ios_enable_code_signing=false \
-	    angle_enable_vulkan=false angle_enable_swiftshader=false' && \
+	    angle_enable_vulkan=false angle_enable_swiftshader=false use_thin_archive=false' && \
 	  autoninja -C out/ios-sim libEGL libGLESv2
 
 # The retarget itself is a script (tools/angle_retarget.sh) — it rewrites the
@@ -992,9 +992,10 @@ ovrpabi:
 # checkout ~12 GB, build ~30-60 min.
 .PHONY: angle-debug
 angle-debug: angle-fetch
+	cd vendor && if [ ! -f depot_tools/python3_bin_reldir.txt ]; then cd depot_tools && ./update_depot_tools && cd ..; fi
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
-	  gn gen out/Debug --args='is_debug=true target_cpu="arm64"' && \
-	  autoninja -C out/Debug libEGL libGLESv2
+		gn gen out/Debug --args='is_debug=true target_cpu="arm64" use_lld=false' && \
+		autoninja -C out/Debug libEGL libGLESv2
 
 # ---- vendor/ — the ANGLE checkout, which we MODIFY ----
 #

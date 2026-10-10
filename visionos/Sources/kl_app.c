@@ -200,7 +200,7 @@ int kl_app_configure(const char *resources, const char *container) {
         return missing("staged assets (run stage_assets.sh)", g_assets);
     if (!folder_fed && !have(g_apk))
         return missing("staged APK (run stage_assets.sh)", g_apk);
-    mkdir(g_files, 0755);
+    mkdir(g_files, 0777);
 
     if (kl_app_target_is_steamlink()) {
         // Which front door this launch opens. The SHELL is the default because
