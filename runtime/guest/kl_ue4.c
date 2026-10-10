@@ -730,8 +730,25 @@ static void kl_ue4_java_create(FILE *out) {
     // The engine version is not cheaply readable from the stripped binary, so
     // this is a name list rather than a probe — a wrong guess does not corrupt,
     // it faults loudly in klj_str exactly as TWD2 did, which names the fix.
+    //
+    // ...plus one probe, for a 4.25 guest under a name that is not in the list:
+    // Resident Evil 4 adopted from the user's own APK runs as a generic target
+    // (AVP Play names it x<store id>), took the 4.26+ shape, and died in klj_str
+    // exactly as described. The exported GameActivity natives tell the two
+    // apart: 4.26 added nativeOnTrimMemory, nativeOnThermalStatusChangedListener
+    // and nativeSetMemoryAdvisorState (measured: Wrath 2's 4.27 libUE4 exports
+    // all three, RE4's 4.25 none), so a guest exporting NONE of them is 4.25.
+    // Any one present keeps the 4.26+ default, so a 4.26+ build that dropped
+    // one of the three is still read correctly.
     const char *ue4_tgt = kl_driver_target_name();
     int is_425 = ue4_tgt && strcmp(ue4_tgt, "re4") == 0;
+    if (!is_425 && !ue4_native("nativeOnTrimMemory") &&
+        !ue4_native("nativeOnThermalStatusChangedListener") &&
+        !ue4_native("nativeSetMemoryAdvisorState")) {
+        is_425 = 1;
+        if (out) fprintf(out, "  [ue4] no 4.26+ natives exported — taking UE 4.25's "
+                              "five-string nativeSetAndroidVersionInformation\n");
+    }
     if (is_425) {
         UE4_CALL(out, "nativeSetAndroidVersionInformation", ue4_fn_sssss,
                  jrel, jmake, jmodel, jbuild, jloc);
