@@ -239,6 +239,9 @@ static uint64_t klplat_called(const char *name) {
 #define KLPLAT_MSG_ACCESS_TOKEN     0x06A85ABEu  // .User_GetAccessToken (Message<string>)
 #define KLPLAT_MSG_ACHIEVEMENT_DEFS 0x03D3458Du  // .Achievements_GetAllDefinitions (empty array)
 #define KLPLAT_MSG_LOGGED_IN_USER  0x436F345Du  // .User_GetLoggedInUser (Message<User>)
+#define KLPLAT_MSG_USER_PROOF      0x22810483u  // .User_GetUserProof (Message<UserProof>);
+                                                //   confirmed as a movz/movk pair in
+                                                //   Ancient Dungeon's libil2cpp
 #define KLPLAT_INIT_SUCCESS        0            // PlatformInitializeResult.Success
 #define KLPLAT_AGE_ADULT           3            // AccountAgeCategory.Ad
 
@@ -495,6 +498,16 @@ static int klplat_user_default(void) {
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
+    // Ancient Dungeon is a Unity title of Walkabout's kind: it does not quit, it
+    // WAITS. Its GenerateOculusNoncesForPhoton coroutine asks for the logged-in
+    // user and then for a user proof, and the loading screen spins on "Waiting
+    // for Oculus Nonce generation..." until both complete; with the 0 answer its
+    // callback logs "Request failed" and the flag is never set. Keyed on the
+    // guest's package rather than a target name, so it holds under whatever
+    // name a packaging tool gives the target.
+    extern const char *klj_guest_package(void);   // runtime/jni, the manifest's package
+    const char *pkg = klj_guest_package();
+    if (pkg && strcmp(pkg, "de.erthu.ancientdungeonfull") == 0) return 1;
     return 0;
 }
 static uint64_t klplat_User_GetLoggedInUser(void) {
@@ -527,6 +540,36 @@ static const char *klplat_User_GetOculusID(const void *h) {
 static const char *klplat_User_GetDisplayName(const void *h) {
     plat_hit("ovr_User_GetDisplayName"); (void)h;
     return "Klepton Player";
+}
+
+// The user PROOF — a nonce the game forwards to its own online services (Unity
+// Authentication's SignInWithOculus, Photon Fusion's custom auth) so THEY can
+// ask Meta who this is. It is not an ownership answer: entitlement is the
+// separate request above, and a nonce grants nothing by itself — whoever
+// receives it verifies it against Meta, which will not know this one, so the
+// online sign-in fails exactly as it would with no network. Gated like the
+// user it proves: without KL_PLAT_USER there is no user to prove, and the
+// answer is 0, "the request could not be made". With it the request completes
+// (Message<UserProof>, read through ovr_Message_GetUserProof ->
+// ovr_UserProof_GetNonce) so that a title which WAITS on the completion —
+// Ancient Dungeon's "Waiting for Oculus Nonce generation..." — moves on.
+static uint64_t klplat_User_GetUserProof(void) {
+    plat_hit("ovr_User_GetUserProof");
+    if (!kl_env_on("KL_PLAT_USER", klplat_user_default())) {
+        static int said;
+        if (!said) { said = 1;
+            fprintf(stderr, "  [plat] ovr_User_GetUserProof -> 0 (no platform user "
+                    "to prove; set KL_PLAT_USER=1 for a synthetic offline user)\n"); }
+        return 0;
+    }
+    static const char nonce[] = "kleptonOfflineNonce00000000000000000000000000000";
+    return klplat_request_str("ovr_User_GetUserProof", KLPLAT_MSG_USER_PROOF, 0, nonce);
+}
+// The UserProof handle IS the message (one payload per message, as with User);
+// its single field is the nonce string the request above carried.
+static const char *klplat_UserProof_GetNonce(const klplat_msg *m) {
+    plat_hit("ovr_UserProof_GetNonce");
+    return m ? m->str : NULL;
 }
 // The list payload's one accessor pair: the handle is the message (the same
 // convention as every other payload here), and its size is zero.
@@ -1043,6 +1086,11 @@ static const struct { const char *name; void *fn; } g_plat_impl[] = {
     {"ovr_User_GetID",                         (void *)klplat_User_GetID},
     {"ovr_User_GetOculusID",                   (void *)klplat_User_GetOculusID},
     {"ovr_User_GetDisplayName",                (void *)klplat_User_GetDisplayName},
+    // The user proof (nonce) and its accessor; gated by KL_PLAT_USER in the
+    // handler, same as the user it proves.
+    {"ovr_User_GetUserProof",                  (void *)klplat_User_GetUserProof},
+    {"ovr_Message_GetUserProof",               (void *)klplat_Message_GetPayload},
+    {"ovr_UserProof_GetNonce",                 (void *)klplat_UserProof_GetNonce},
     {"ovr_ApplicationVersion_GetCurrentCode",  (void *)klplat_AppVersion_code},
     {"ovr_ApplicationVersion_GetLatestCode",   (void *)klplat_AppVersion_code},
     {"ovr_ApplicationVersion_GetCurrentName",  (void *)klplat_AppVersion_name},

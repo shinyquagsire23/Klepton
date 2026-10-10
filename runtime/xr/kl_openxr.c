@@ -573,6 +573,9 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     X(xrRequestDisplayRefreshRateFB)                                           \
     X(xrConvertTimespecTimeToTimeKHR) X(xrConvertTimeToTimespecTimeKHR)         \
     X(xrPerfSettingsSetPerformanceLevelEXT)                                    \
+    X(xrEnumeratePerformanceMetricsCounterPathsMETA)                           \
+    X(xrSetPerformanceMetricsStateMETA) X(xrGetPerformanceMetricsStateMETA)    \
+    X(xrQueryPerformanceMetricsCounterMETA)                                    \
     X(xrSetAndroidApplicationThreadKHR)                                        \
     X(xrEnumerateColorSpacesFB) X(xrSetColorSpaceFB)                          \
     X(xrCreatePassthroughFB) X(xrDestroyPassthroughFB)                         \
@@ -1915,6 +1918,65 @@ static XrResult klxr_PerfSettingsSetPerformanceLevelEXT(void *session,
             domain == KLXR_PERF_DOMAIN_CPU ? "CPU" : "GPU",
             (level >= 1 && level <= 4) ? LEVELS[level] : "?");
     return KLXR_SUCCESS;
+}
+
+// ---------------------------------------------------------- XR_META_performance_metrics
+//
+// Added because it turned up in the "not served" line (see the comment on
+// xrGetInstanceProcAddr above): Ancient Dungeon's Meta XR SDK asks for this at
+// instance setup purely to read perf counters, checks the XR_ERROR_FUNCTION_
+// UNSUPPORTED result, logs it — and then calls the null pointer anyway, which
+// is a SIGSEGV before the first frame. We have no counters to expose, and "zero
+// counters" is the true, spec-legal answer this entry point can give without
+// the rest of the extension ever being implemented. The other three entry
+// points of this same four-function extension are implemented alongside it
+// rather than waiting for each to turn up in its own "not served" line in a
+// separate round: the shape of an honest zero-counters answer is identical
+// for all four, and splitting them across rebuilds (minutes each) would not
+// have taught us anything the spec does not already say.
+static XrResult klxr_EnumeratePerformanceMetricsCounterPathsMETA(
+        void *instance, uint32_t capacity, uint32_t *count_out, XrPath *paths) {
+    (void)paths;
+    if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    return klxr_two_call(capacity, count_out, 0);
+}
+
+typedef struct { int32_t type; void *next;
+                 XrBool32 enabled; } XrPerformanceMetricsStateMETA;
+
+// Accepted either way: there is nothing to turn on, since we offer zero
+// counters, but refusing an app that has not yet learned that (it may enable
+// this before ever enumerating) would end the run over a no-op.
+static XrBool32 g_xr_perf_metrics_enabled;
+
+static XrResult klxr_SetPerformanceMetricsStateMETA(void *session,
+                                                    const XrPerformanceMetricsStateMETA *state) {
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    g_xr_perf_metrics_enabled = state->enabled;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetPerformanceMetricsStateMETA(void *session,
+                                                    XrPerformanceMetricsStateMETA *state) {
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    state->enabled = g_xr_perf_metrics_enabled;
+    return KLXR_SUCCESS;
+}
+
+// A counter path only exists if it came out of the enumerate call above, and
+// that call always hands back zero of them — so any path reaching here is one
+// the guest fabricated or cached from elsewhere, and XR_ERROR_PATH_INVALID is
+// the spec's own name for that. The output struct is never touched, which is
+// why it is taken as `void *` rather than given a typed definition here: a
+// struct this runtime never writes is not one it needs to lay out.
+static XrResult klxr_QueryPerformanceMetricsCounterMETA(void *session, XrPath counter_path,
+                                                        void *counter) {
+    (void)counter;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    (void)counter_path;
+    KLXR_RET(KLXR_ERROR_PATH_INVALID);
 }
 
 
@@ -6547,6 +6609,14 @@ static void klxr_install(void) {
                                    (void *)klxr_ConvertTimeToTimespecTimeKHR},
         {"xrPerfSettingsSetPerformanceLevelEXT",
                                    (void *)klxr_PerfSettingsSetPerformanceLevelEXT},
+        {"xrEnumeratePerformanceMetricsCounterPathsMETA",
+                                   (void *)klxr_EnumeratePerformanceMetricsCounterPathsMETA},
+        {"xrSetPerformanceMetricsStateMETA",
+                                   (void *)klxr_SetPerformanceMetricsStateMETA},
+        {"xrGetPerformanceMetricsStateMETA",
+                                   (void *)klxr_GetPerformanceMetricsStateMETA},
+        {"xrQueryPerformanceMetricsCounterMETA",
+                                   (void *)klxr_QueryPerformanceMetricsCounterMETA},
         {"xrSetAndroidApplicationThreadKHR",
                                    (void *)klxr_SetAndroidApplicationThreadKHR},
         {"xrEnumerateColorSpacesFB", (void *)klxr_EnumerateColorSpacesFB},
