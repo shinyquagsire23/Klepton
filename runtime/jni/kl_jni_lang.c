@@ -37,7 +37,7 @@
 static klj_val klj_Class_getClassLoader(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *loader;
-    if (!loader) loader = kl_jni_new_object("java/lang/ClassLoader");
+    if (!loader) loader = klj_host_cache(kl_jni_new_object("java/lang/ClassLoader"));
     return (klj_val){.l = loader};
 }
 
@@ -148,6 +148,20 @@ const klj_binding klj_bind_lang[] = {
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},
     {"java/lang/ClassLoader", "findClass", "(Ljava/lang/String;)Ljava/lang/Class;", klj_ClassLoader_findClass},
+    // loadClass is findClass's public face; the delegation between them is the
+    // only difference on Android and there is nothing here to delegate to.
+    {"java/lang/ClassLoader", "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", klj_ClassLoader_findClass},
+    {"java/lang/ClassLoader", "loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;", klj_ClassLoader_findClass},
+    // Context.getClassLoader() — the same loader, reached the other way round.
+    // A native library that was handed no Class of its own gets there through
+    // the Context: `ActivityThread.currentActivityThread().getApplication()`,
+    // then `.getClassLoader()`, then `loadClass`. libEOSSDK.so takes exactly
+    // that route out of its JNI_OnLoad-cached VM. Every Context is the same
+    // Context here, and our class registry has a single namespace, so all
+    // three spellings answer with the one loader.
+    {"android/content/Context", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
+    {"android/app/Application", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
+    {"android/app/Activity",    "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
 
     {"java/lang/StringBuilder", "<init>",   "()V",                  klj_SB_init},
     {"java/lang/StringBuilder", "toString", "()Ljava/lang/String;", klj_SB_toString},

@@ -44,6 +44,37 @@ static klj_val klj_DisplayManager_getDisplay(void *env, void *self, const klj_va
     return klj_singleton("android/view/Display", &display);
 }
 
+// The OTHER route to the same Display, and Unreal 5.3 (Pinball FX VR) is the
+// first guest here to take it: `getWindowManager().getDefaultDisplay()` off the
+// Activity, where Unity goes through Context.getSystemService("window") and the
+// DisplayManager. What matters is that it lands on the SAME Display object — a
+// guest that caches one and compares identity (UE's FAndroidWindow does) must
+// not be handed a second screen — so this delegates to getDisplay(0) rather
+// than making one of its own.
+//
+// The WindowManager it goes through is a singleton of this file's, which is one
+// object short of Android's truth: Context.getSystemService("window") keeps its
+// own cache in kl_jni_android.c, so a guest that got a WindowManager BOTH ways
+// would see two. Nothing does — Unreal takes this route and Unity takes that
+// one — and the object is a pure handle either way, with getDefaultDisplay its
+// only bound method. Written down because it is the kind of thing that is only
+// wrong on the day a guest does both.
+//
+// `android/app/NativeActivity` rather than `android/app/Activity`: that is the
+// class the guest holds, since the activity it was handed at
+// ANativeActivity_onCreate is a NativeActivity.
+static klj_val klj_Activity_getWindowManager(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *wm;
+    return klj_singleton("android/view/WindowManager", &wm);
+}
+static klj_val klj_WindowManager_getDefaultDisplay(void *env, void *self,
+                                                   const klj_val *a, int n) {
+    (void)a; (void)n;
+    klj_val zero = {.j = 0};
+    return klj_DisplayManager_getDisplay(env, self, &zero, 1);
+}
+
 // registerDisplayListener is a host->guest callback, and it lands in the same
 // gap runOnUiThread does: we can record the listener but nothing will ever fire
 // it, because calling into the proxy needs JNIBridge.invoke. Our display never
@@ -142,9 +173,10 @@ static klj_val klj_Display_getSupportedModes(void *env, void *self, const klj_va
     (void)env; (void)self; (void)a; (void)n;
     static void *modes;
     if (!modes) {
-        modes = klj_new_array('L', "android/view/Display$Mode", 1);
+        modes = klj_host_cache(klj_new_array('L', "android/view/Display$Mode", 1));
         void **slot = klj_arr(modes)->data;
-        slot[0] = klj_new_object_data("android/view/Display$Mode", NULL);
+        // The Mode is pinned too — the array holds the pointer, not the object.
+        slot[0] = klj_host_cache(klj_new_object_data("android/view/Display$Mode", NULL));
     }
     return (klj_val){.l = modes};
 }
@@ -319,6 +351,10 @@ const klj_binding klj_bind_display[] = {
     {"android/hardware/display/DisplayManager", "unregisterDisplayListener",
      "(Landroid/hardware/display/DisplayManager$DisplayListener;)V",
      klj_DisplayManager_unregisterDisplayListener},
+    {"android/app/NativeActivity", "getWindowManager",
+     "()Landroid/view/WindowManager;", klj_Activity_getWindowManager},
+    {"android/view/WindowManager", "getDefaultDisplay",
+     "()Landroid/view/Display;", klj_WindowManager_getDefaultDisplay},
     {"android/view/Display", "getDisplayId",   "()I", klj_Display_getDisplayId},
     {"android/view/Display", "getWidth",       "()I", klj_Display_getWidth},
     {"android/view/Display", "getHeight",      "()I", klj_Display_getHeight},

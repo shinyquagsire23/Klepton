@@ -547,6 +547,32 @@ The guest's own memory management, and the three seams that used to disable it.
   refusal leaves the SDK waiting on a completion that never comes, behind the
   launch precache's own black clear.
 
+- `KL_APK=<path>` — the APK behind `getPackageCodePath()` and
+  `ApplicationInfo.sourceDir`, which Unity opens as a zip for its streaming
+  assets. Host default is `beatsaber.apk`; set it (with `KL_FILES_DIR`) when
+  host-booting another title. visionOS ignores it — `kl_app.c` passes the
+  staged APK explicitly.
+
+## JNI surface (`runtime/jni/`)
+
+- `KL_UE_KEYBOARD=1` — hold UE's GameActivity virtual keyboard open
+  (`runtime/jni/kl_jni_ue4.c`) so a frontend can type into it through
+  `kl_jni_soft_input_*` (`runtime/kl_jni.h`), the same four calls Unity's soft
+  input answers. The default, with no keyboard on the host, ends every entry
+  immediately by committing the text the guest opened it with — the engine's
+  only end-of-entry native is an accept, and an entry nobody closes leaves the
+  widget holding input for the rest of the session.
+- `KL_UE_KEYBOARD_TEXT=<s>` — the default auto-close commits `<s>` instead of
+  the seed (initials on a score screen). Never applied to a password field.
+- `KL_FMOD_AAUDIO=1` — answer `org.fmod.FMOD.supportsAAudio()` true
+  (`runtime/jni/kl_jni_fmod.c`), as fmod.jar's own constant does on a Quest, so
+  FMOD opens its output through `kl_aaudio.c`. Default false: FMOD stays on
+  OpenSL ES.
+- `KL_TRACE_DLSYM=1` — also covers the synthetic `libandroid.so` handle
+  (`runtime/guest/kl_ndk.c`): every `dlsym` a guest makes on it prints
+  `[ndk] dlsym("…") -> served|NULL`. That handle answers before kl_dl's own
+  tracer runs, so FMOD's asset-layer probes would otherwise be invisible.
+
 ## Device identity (`runtime/kl_jni.c`)
 
 - `KL_BUILD_<FIELD>=<value>` — override one `android/os/Build` (or
@@ -1116,7 +1142,38 @@ puts the camera on the ground with its hands underneath it.
   packaged Vulkan-only and says so itself when refused ("This device does not
   support Vulkan but the app was not packaged with ES 3.1 support", out of its
   own message box), so this restores that refusal exactly and is the A/B for
-  anything that suspects the API choice.
+  anything that suspects the API choice. Unset or `1` presents
+  `VK_MAKE_VERSION(1,1,0)`; any value **> 1 is used as the version word**
+  itself, because Unreal decides from the number — UE5.3 (Pinball FX VR)
+  refuses Vulkan at 1.0.3 without calling a single vk* function and accepts it
+  at 1.1.
+- `KL_UE4_MULTIVIEW` — tri-state override of the mobile-multiview clear
+  (`runtime/guest/kl_ue4.c`). UE4 prepends `layout(num_views = 2) in;` to every
+  cooked shader when `GSupportsMobileMultiView` is true, ANGLE's Metal backend
+  has no multiview, and the compile failure becomes a ForceQuit — so on a **GL**
+  guest the runtime clears that flag (log: *"mobile multiview was ON —
+  cleared"*). On a **Vulkan** guest none of that applies, and clearing it
+  forces UE4's DoubleWide stereo path (static meshes that vanish as the head
+  moves on Into the Radius), so it is left alone (log: *"mobile multiview left
+  alone — this guest brought up a VULKAN device"*), and a value cleared before
+  the device existed is put back.
+  - **unset (default)** — decide from `kl_vulkan_guest_active()`.
+  - **`=1`** — never clear, whatever the RHI.
+  - **`=0`** — always clear, Vulkan included.
+- `KL_UE4_FORCE_QUIT=1` — obey `AndroidThunkJava_ForceQuit()`
+  (`runtime/jni/kl_jni_ue4.c`), whose whole body in a UE4 GameActivity is
+  `System.exit(0)`. The default logs and counts every request and keeps
+  running, so the end-of-run reports — the evidence for why the guest wanted
+  out — still print.
+- `KL_UE4_QUIT_LIMIT=<n>` — how many ignored ForceQuit requests before the run
+  prints its reports and exits cleanly, default 16; `0` never exits. A guest
+  that has decided to quit asks again and again, and its torn-down game thread
+  segfaults if the process is kept alive forever.
+- `KL_UE4_QUIT_TRACE=1` — print a frame-pointer backtrace (`<image>+<off>`) for
+  the first few ForceQuit calls. UE4's arm64 build keeps frame pointers; in
+  libUE4 the thunk is reached from `FAndroidMisc::RequestExit(true)` and from
+  `FAndroidErrorOutputDevice::Serialize` (a Fatal UE_LOG), and which one it is
+  decides everything.
 - `KL_UE4_WAIT=<seconds>` — the pump budget for a NativeActivity guest, default
   5. There is no frame count on this door: the guest owns its own game thread
   and its own frame loop, so seconds are the only unit. **RE4 needs 300** — its

@@ -40,6 +40,19 @@ static klj_val klj_Window_getDecorView(void *env, void *self, const klj_val *a, 
     return klj_singleton("android/view/View", &view);
 }
 
+// UnityPlayer.getView() — the SurfaceView the player owns. The C# reach for it
+// is the line after the mUnityPlayer read that brought that field into the
+// table above:
+//   currentActivity.Get<AndroidJavaObject>("mUnityPlayer").Call(..., "getView")
+// and it is what a plugin passes to a window/insets/touch API. A distinct View
+// from the window's decor view, because on Android they are distinct; both are
+// the same class here, so every android/view/View binding answers for either.
+static klj_val klj_UnityPlayer_getView(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *view;
+    return klj_singleton("android/view/View", &view);
+}
+
 static klj_val klj_Window_setFlags(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     KLJ_LOG("Window.setFlags(0x%llx, mask 0x%llx) — recorded, not applied",
@@ -112,6 +125,14 @@ static klj_val klj_InputDevice_getDeviceIds(void *env, void *self, const klj_val
         int32_t *v = klj_arr(ids)->data;
         v[0] = KLJ_INPUT_DEV_LTOUCH;
         v[1] = KLJ_INPUT_DEV_RTOUCH;
+        // Pinned for the same reason getDevice()'s InputDevice objects are.
+        // Unpinned, Paint the Town Red VR's boot aborts: libunity asks for the
+        // ids inside a local frame, the pop retires the array, and the next caller
+        // — Rewired, from C#, through the erased `()Ljava/lang/Object;`
+        // spelling — is handed a pointer we no longer recognise and aborts in
+        // GetObjectClass. A cached answer must outlive the frame it was built
+        // in; that is what klj_host_cache says.
+        klj_host_cache(ids);
     }
     KLJ_LOG("InputDevice.getDeviceIds() -> [%d, %d] (the two Touch controllers)",
             KLJ_INPUT_DEV_LTOUCH, KLJ_INPUT_DEV_RTOUCH);
@@ -225,11 +246,96 @@ static klj_val klj_InputDevice_getMotionRange(void *env, void *self, const klj_v
     return (klj_val){.l = NULL};   // no InputDevice-backed axis exists
 }
 
+// InputDevice.hasKeys(int... keyCodes) -> boolean[], one flag per key asked.
+//
+// Rewired asks this one, and only this one, to decide whether a device is a
+// DualShock 4 wearing a generic gamepad keymap (`IsDeviceKeyMapped`,
+// `DS4_GAMEPAD_KEYMAP_DISALLOWED_KEYS`): a real DS4 reports the disallowed
+// keys, a controller that merely looks like one does not. Our devices are the
+// two synthetic Touch controllers, which are NOT DualShocks and carry no
+// Android keymap at all — every button reaches the guest through OVRPlugin's
+// GetControllerState4, never as a key code. So the honest answer is all-false,
+// which is also the answer that keeps Rewired from mis-identifying a Touch
+// controller as a DS4 and remapping its buttons to a PlayStation layout.
+//
+// The array must be the same LENGTH as the one asked with — Rewired indexes it
+// positionally — so it is sized from the argument rather than from a constant.
+static klj_val klj_InputDevice_hasKeys(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int len = 0;
+    if (n > 0 && a[0].l) {
+        klj_array *keys = klj_arr(a[0].l);
+        if (keys) len = keys->len;
+    }
+    void *out = klj_new_array('Z', NULL, len);
+    KLJ_LOG("InputDevice.hasKeys(%d keys) -> all false (Touch carries no Android keymap)", len);
+    return (klj_val){.l = out};
+}
+
+// `com.zenstudios.PinballFX_VR.BluetoothHelper.getConnectedInputDevices()` —
+// a game class rather than a platform one, and it lives HERE because the
+// surface it stands in for is the InputDevice family directly above: its whole
+// body is `for (id : InputDevice.getDeviceIds())` building one string per
+// device as `"ID: <id> | Type: <t> | Name: <name>"`, where the type is
+// "Gamepad" when `(sources & 0x401) == 0x401`, "Keyboard" when
+// `(sources & 0x101) == 0x101`, and "Unknown" otherwise.
+//
+// So this is not a stub — it is that loop, run over the same two controllers
+// klj_InputDevice_getDeviceIds already reports, with the same sources
+// klj_InputDevice_getSources already answers (GAMEPAD|JOYSTICK, so every one
+// of them types as "Gamepad"). Deriving it rather than hard-coding two strings
+// is what keeps it from disagreeing with the device list if that list ever
+// changes.
+//
+// The class's OTHER method, GetConnectedBluetoothDevices(Context), is a
+// genuine BluetoothManager walk and is deliberately NOT answered until a boot
+// asks for it: its no-adapter arm returns the single string "Bluetooth not
+// supported or disabled", which is a UI string, and inventing it before
+// something reads it would be guessing at a screen nobody has seen.
+static klj_val klj_ZenBT_getConnectedInputDevices(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)a; (void)n;
+    void *ids = klj_InputDevice_getDeviceIds(env, self, NULL, 0).l;
+    int count = ids ? klj_arr(ids)->len : 0;
+    void *arr = klj_new_array('L', "java/lang/String", count);
+    void **out = klj_arr(arr)->data;
+    const int32_t *v = ids ? klj_arr(ids)->data : NULL;
+    for (int i = 0; i < count; i++) {
+        klj_val idv = {.j = (uint64_t)(uint32_t)v[i]};
+        void *dev = klj_InputDevice_getDevice(env, self, &idv, 1).l;
+        klj_inputdev *d = dev ? klj_inputdev_of(dev) : NULL;
+        int sources = (int)klj_InputDevice_getSources(env, dev, NULL, 0).j;
+        const char *type = (sources & KLJ_SOURCE_GAMEPAD) == KLJ_SOURCE_GAMEPAD
+                             ? "Gamepad"
+                         : (sources & 0x101) == 0x101 ? "Keyboard"
+                                                      : "Unknown";
+        char line[192];
+        snprintf(line, sizeof line, "ID: %d | Type: %s | Name: %s",
+                 (int)v[i], type, d && d->name ? d->name : "");
+        out[i] = kl_jni_new_string(line);
+    }
+    KLJ_LOG("BluetoothHelper.getConnectedInputDevices() -> %d device(s), from "
+            "the same list InputDevice.getDeviceIds() reports", count);
+    return (klj_val){.l = arr};
+}
+
 static klj_val klj_InputManager_registerListener(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     // Same shape as registerDisplayListener: recorded, and nothing is owed a
     // callback because our device set never changes.
     KLJ_LOG("InputManager.registerInputDeviceListener — recorded; the device set never changes");
+    return (klj_val){.l = NULL};
+}
+
+// ...and its pair. Rewired's Android input source (Paint the Town Red ships
+// Rewired_Android.dll; `unregisterInputDeviceListener` is in its il2cpp string
+// heap next to the register call) tears the listener down on shutdown and on
+// every platform-helper reinitialise. Nothing was recorded, so nothing is
+// undone — but the call has to EXIST, or the teardown path aborts a boot that
+// otherwise worked.
+static klj_val klj_InputManager_unregisterListener(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("InputManager.unregisterInputDeviceListener — nothing was owed a callback");
     return (klj_val){.l = NULL};
 }
 
@@ -251,7 +357,6 @@ static klj_val klj_InputManager_getInputDevice(void *env, void *self, const klj_
 
 static klj_val klj_InputManager_getInputDeviceIds(void *env, void *self, const klj_val *a, int n) {
     return klj_InputDevice_getDeviceIds(env, self, a, n);
-    return (klj_val){.j = 0};
 }
 
  klj_val klj_AudioManager_getStreamVolume(void *env, void *self, const klj_val *a, int n) {
@@ -303,13 +408,20 @@ static klj_val klj_AudioManager_getProperty(void *env, void *self, const klj_val
     const char *k = n > 0 ? klj_str(a[0].l) : "";
     // The keys are the values of AudioManager.PROPERTY_* below; match on the
     // documented strings so the two cannot drift apart.
+    // The strings are FORMATTED from the macros rather than spelled again beside
+    // them: this door hands back text where AudioSystem below hands back an int,
+    // and a literal here is a copy that can drift from the number every other
+    // door reports. Same fact, one source.
+    char buf[24];
     if (strstr(k, "OUTPUT_SAMPLE_RATE")) {
         KLJ_LOG("AudioManager.getProperty(OUTPUT_SAMPLE_RATE) -> %d", KLJ_AUDIO_RATE);
-        return (klj_val){.l = kl_jni_new_string("48000")};
+        snprintf(buf, sizeof buf, "%d", KLJ_AUDIO_RATE);
+        return (klj_val){.l = kl_jni_new_string(buf)};
     }
     if (strstr(k, "OUTPUT_FRAMES_PER_BUFFER")) {
         KLJ_LOG("AudioManager.getProperty(OUTPUT_FRAMES_PER_BUFFER) -> %d", KLJ_AUDIO_FRAMES);
-        return (klj_val){.l = kl_jni_new_string("256")};
+        snprintf(buf, sizeof buf, "%d", KLJ_AUDIO_FRAMES);
+        return (klj_val){.l = kl_jni_new_string(buf)};
     }
     // Android returns null for an unknown property, and FMOD handles that.
     KLJ_LOG("AudioManager.getProperty(\"%s\") -> null (unknown property)", k);
@@ -348,20 +460,7 @@ static klj_val klj_AudioManager_isBluetoothA2dpOn(void *env, void *self,
     return (klj_val){.j = 0};
 }
 
-// The other two of the game's once-a-second audio-route poll. Both answered
-// the way a headset with no Bluetooth route answers: no SCO link, and
-// isMusicActive false - the poll is asking about OTHER apps' playback, which
-// does not exist here.
-static klj_val klj_AudioManager_isBluetoothScoOn(void *env, void *self,
-                                                 const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.j = 0};
-}
-static klj_val klj_AudioManager_isMusicActive(void *env, void *self,
-                                              const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.j = 0};
-}
+// (isBluetoothScoOn / isMusicActive: answered false in kl_jni_android.c.)
 
 // ---------------------------------------------------------- window insets
 //
@@ -466,23 +565,6 @@ static klj_val klj_Context_unbindService(void *env, void *self, const klj_val *a
     return (klj_val){.l = NULL};
 }
 
-// Google VR sample PermissionHelper (Into the Radius): checkPermission(name)Z
-// and acquirePermissions([name])V. Answered from the same manifest permission
-// model as Context.checkPermission — a boolean here, granted only for what the
-// manifest declares — and acquiring is a no-op (there is no user to prompt).
-static klj_val klj_PermissionHelper_check(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
-    const char *p = n > 0 ? klj_str(a[0].l) : "", *why = "";
-    int granted = klj_permission_state(p, &why);
-    KLJ_LOG("PermissionHelper.checkPermission(\"%s\") -> %s%s", p,
-            granted ? "true" : "false", why);
-    return (klj_val){.j = (uint64_t)(granted != 0)};
-}
-static klj_val klj_PermissionHelper_acquire(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    KLJ_LOG("PermissionHelper.acquirePermissions(...) — no user to prompt; no-op");
-    return (klj_val){.l = NULL};
-}
 static klj_val klj_Context_checkPermission(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     // Answered from the SAME manifest model as checkSelfPermission below. It
@@ -764,7 +846,76 @@ static klj_val klj_Activity_requestPermissions(void *env, void *self, const klj_
     return (klj_val){.j = 0};
 }
 
+// com.google.vr.sdk.samples.permission.PermissionHelper — Google's VR sample
+// permission helper, which UE4's Android VR builds embed wholesale (Into the
+// Radius resolves both of its statics during startup, right after the engine
+// has worked out where its files are). Two methods, and they are the same
+// question and the same command Activity.checkSelfPermission /
+// requestPermissions already answer above — so they read the SAME
+// klj_permission_state rather than deciding again. A permission granted through
+// one door and denied through another is precisely the split this file's
+// permission model exists to prevent.
+//
+// checkPermission returns a `boolean` here rather than the PackageManager int
+// the Context spelling uses: true is granted. The helper's own Java is
+// `ContextCompat.checkSelfPermission(...) == PERMISSION_GRANTED`, so this is
+// that comparison, done here.
+static klj_val klj_GvrPermission_check(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *p = n > 0 ? klj_str(a[0].l) : "", *why = "";
+    int granted = klj_permission_state(p ? p : "", &why);
+    KLJ_LOG("PermissionHelper.checkPermission(\"%s\") -> %s%s", p ? p : "",
+            granted ? "true" : "false", why);
+    return (klj_val){.j = granted ? 1u : 0u};
+}
+
+// ...and the ACQUIRE half, which on Android puts up the system dialog. There is
+// nobody here to be asked and no dialog to put up; what the state actually IS
+// was already settled by the manifest model, and checkPermission is where the
+// guest reads it.
+//
+// The answer is still DELIVERED. On Android the real class hands off to a
+// PermissionFragment and the result arrives later at the guest's STATIC NATIVE
+// `onAcquirePermissions(String[] permissions, int[] grantResults)`, which UE4's
+// AndroidPermission plugin registers and which fires
+// UAndroidPermissionCallbackProxy's delegate. A Blueprint that asked and is
+// never answered waits forever — a hang, harder to diagnose than an abort. So
+// the guest's own native is called with the same values checkPermission gives
+// (PackageManager constants: GRANTED 0, DENIED -1). Looked up, never cached
+// (kl_jni_ue4.c's reason: a lookup that beat RegisterNatives would pin NULL);
+// a guest that registered no such native gets the log line and nothing else.
+// Five Nights at Freddy's: Help Wanted 2 asks from Blueprint on its loading
+// path and waits on the delegate.
+#define KLJ_PERMISSION_HELPER "com/google/vr/sdk/samples/permission/PermissionHelper"
+static klj_val klj_GvrPermission_acquire(void *env, void *self, const klj_val *a, int n) {
+    (void)self;
+    klj_array *arr = n > 0 ? klj_arr(a[0].l) : NULL;
+    int len = arr && arr->kind == 'L' ? arr->len : 0;
+    void      *results = klj_new_array('I', NULL, len);
+    klj_array *ra      = klj_arr(results);
+    for (int i = 0; i < len; i++) {
+        const char *p = klj_str(((void **)arr->data)[i]), *why = "";
+        int granted = klj_permission_state(p ? p : "", &why);
+        if (ra && ra->data) ((kl_jint *)ra->data)[i] = granted ? 0 : -1;
+        KLJ_LOG("PermissionHelper.acquirePermissions[%d] \"%s\" -> already %s%s "
+                "(no dialog: there is no user session here to ask, and the state "
+                "is the manifest's)", i, p ? p : "",
+                granted ? "GRANTED" : "DENIED", why);
+    }
+    void (*cb)(void *, void *, void *, void *) = (void (*)(void *, void *, void *, void *))
+        kl_jni_native(KLJ_PERMISSION_HELPER, "onAcquirePermissions", NULL);
+    KLJ_LOG("PermissionHelper.acquirePermissions(%d) -> onAcquirePermissions%s",
+            len, cb ? "" : " — SKIPPED, the guest registered no such native");
+    if (cb) cb(env ? env : kl_jni_env(), kl_jni_class(KLJ_PERMISSION_HELPER),
+               n > 0 ? a[0].l : NULL, results);
+    return (klj_val){.j = 0};
+}
+
 const klj_binding klj_bind_window[] = {
+    {"com/google/vr/sdk/samples/permission/PermissionHelper", "checkPermission",
+     "(Ljava/lang/String;)Z", klj_GvrPermission_check},
+    {"com/google/vr/sdk/samples/permission/PermissionHelper", "acquirePermissions",
+     "([Ljava/lang/String;)V", klj_GvrPermission_acquire},
     // Reached by pressing *Start Pairing*: the shell checks a permission before
     // it opens the socket. Bound on SteamLink rather than on Context because a
     // binding is matched on the full (class, name, signature) triple and this is
@@ -798,6 +949,9 @@ const klj_binding klj_bind_window[] = {
     {"android/os/BatteryManager", "isCharging", "()Z", klj_BatteryManager_isCharging},
     {"android/os/BatteryManager", "getIntProperty", "(I)I", klj_BatteryManager_getIntProperty},
     {"android/view/InputDevice", "getDeviceIds", "()[I", klj_InputDevice_getDeviceIds},
+    // Pinball FX's own helper over that same enumeration — see the note above it.
+    {"com/zenstudios/PinballFX_VR/BluetoothHelper", "getConnectedInputDevices",
+     "()[Ljava/lang/String;", klj_ZenBT_getConnectedInputDevices},
     {"android/view/InputDevice", "getDevice", "(I)Landroid/view/InputDevice;", klj_InputDevice_getDevice},
     {"android/view/InputDevice", "getName", "()Ljava/lang/String;", klj_InputDevice_getName},
     {"android/view/InputDevice", "getId", "()I", klj_InputDevice_getId},
@@ -815,15 +969,18 @@ const klj_binding klj_bind_window[] = {
      klj_InputManager_getInputDeviceIds},
     {"android/hardware/input/InputManager", "getInputDevice",
      "(I)Landroid/view/InputDevice;", klj_InputManager_getInputDevice},
+    {"android/hardware/input/InputManager", "unregisterInputDeviceListener",
+     "(Landroid/hardware/input/InputManager$InputDeviceListener;)V",
+     klj_InputManager_unregisterListener},
+    {"android/view/InputDevice", "hasKeys", "([I)[Z", klj_InputDevice_hasKeys},
     {"android/media/AudioManager", "getStreamVolume", "(I)I", klj_AudioManager_getStreamVolume},
     {"android/media/AudioManager", "getStreamMinVolume", "(I)I", klj_AudioManager_getStreamMinVolume},
     {"android/media/AudioManager", "getStreamMaxVolume", "(I)I", klj_AudioManager_getStreamMaxVolume},
     {"android/media/AudioManager", "setStreamVolume", "(III)V", klj_AudioManager_setStreamVolume},
     {"com/unity3d/player/UnityPlayer", "getLaunchURL", "()Ljava/lang/String;", klj_UnityPlayer_getLaunchURL},
+    {"com/unity3d/player/UnityPlayer", "getView", "()Landroid/view/View;", klj_UnityPlayer_getView},
     {"android/media/AudioManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", klj_AudioManager_getProperty},
     {"android/media/AudioManager", "isBluetoothA2dpOn", "()Z", klj_AudioManager_isBluetoothA2dpOn},
-    {"android/media/AudioManager", "isBluetoothScoOn", "()Z", klj_AudioManager_isBluetoothScoOn},
-    {"android/media/AudioManager", "isMusicActive", "()Z", klj_AudioManager_isMusicActive},
     // Unity 2018.4 reads the device's audio configuration off the hidden
     // AudioSystem class instead of AudioManager.getProperty(). Same numbers.
     {"android/media/AudioSystem", "getPrimaryOutputSamplingRate", "()I", klj_AudioSystem_getPrimaryOutputSamplingRate},
@@ -835,10 +992,6 @@ const klj_binding klj_bind_window[] = {
     {"android/view/WindowInsets", "getDisplayCutout", "()Landroid/view/DisplayCutout;", klj_WindowInsets_getDisplayCutout},
     {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
     {"android/content/Context", "checkCallingOrSelfPermission", "(Ljava/lang/String;)I", klj_Context_checkPermission},
-    {"com/google/vr/sdk/samples/permission/PermissionHelper", "checkPermission",
-     "(Ljava/lang/String;)Z", klj_PermissionHelper_check},
-    {"com/google/vr/sdk/samples/permission/PermissionHelper", "acquirePermissions",
-     "([Ljava/lang/String;)V", klj_PermissionHelper_acquire},
     {"android/content/Context", "bindService", "(Landroid/content/Intent;Landroid/content/ServiceConnection;I)Z", klj_Context_bindService},
     {"android/content/Context", "unbindService", "(Landroid/content/ServiceConnection;)V", klj_Context_unbindService},
     {0}

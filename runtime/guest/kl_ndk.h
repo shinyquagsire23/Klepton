@@ -12,6 +12,15 @@
 // Resolve an NDK import by name. NULL if we do not provide it.
 void *kl_ndk_lookup(const char *name);
 
+// ...and the dlopen door onto the same table, for a guest that resolves
+// libandroid.so at RUNTIME instead of importing it — FMOD's asset layer does,
+// and there is no libandroid.so on disk to fall through to. See the note beside
+// kl_ndk_dlopen in kl_ndk.c.
+int   kl_ndk_claims(const char *soname);
+void *kl_ndk_dlopen(const char *soname);
+int   kl_ndk_is_handle(const void *h);
+void *kl_ndk_sym(const char *name);
+
 // The surface Unity renders into. Placeholder until EGL binds a real drawable;
 // the host sets the true geometry once it has one.
 void kl_ndk_set_window(int32_t width, int32_t height, int32_t format);
@@ -63,5 +72,9 @@ int kl_ndk_thread_has_looper(void);
 // between callbacks. Returns what ALooper_pollOnce returns. A prepared looper
 // nobody polls is a queue with no drain — see the note at the definition.
 int kl_ndk_pump_looper(int timeout_ms);
+
+// The host-owned AInputQueue — see the AInput note in kl_ndk.c. No guest holds
+// a queue until a caller passes this out (there is no input source yet).
+void *kl_ndk_input_queue(void);
 
 #endif

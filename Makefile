@@ -42,7 +42,8 @@ RUNTIME_JNI := runtime/kl_jni.c \
            runtime/jni/kl_jni_net.c runtime/jni/kl_jni_softinput.c \
            runtime/jni/kl_jni_services.c runtime/jni/kl_jni_io.c \
            runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
-           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c
+           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c \
+           runtime/jni/kl_jni_haptics.c
 
 RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
            runtime/libc/kl_va_handlers.c runtime/libc/kl_va_thunks.S \
@@ -85,7 +86,7 @@ RUNTIME_HDRS := $(RUNTIME_ALL_HDRS) $(wildcard tests/*.h) \
                 runtime/data/phonon_hrtf_cipic_124.sofa \
                 runtime/data/kl_menu_font.ttf
 
-.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
+.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest jniobj uevk
 all: build/t_opus
 
 build/t_opus: tests/t_opus.c $(RUNTIME) $(RUNTIME_HDRS)
@@ -375,12 +376,37 @@ build/t_softinput: tests/t_softinput.c $(RUNTIME) $(RUNTIME_HDRS)
 softinput: build/t_softinput
 	./build/t_softinput
 
+# UE's GameActivity virtual keyboard — the same gate for the other engine's
+# keyboard. A missing AndroidThunkJava_ShowVirtualKeyboardInput aborts, and the
+# obvious fix (a no-op) trades the abort for an editor the engine holds open
+# forever, which produces no crash and no log line. No guest, no window, no
+# headset; milliseconds, in `make check`.
+build/t_uevk: tests/t_uevk.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_uevk.c $(RUNTIME) $(LDLIBS)
+
+uevk: build/t_uevk
+	./build/t_uevk
+
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(LDLIBS)
 
 vatest: build/t_variadic
 	./build/t_variadic
+
+# The JNI object model: a jobject a host-side static caches must outlive the
+# local frame it was built in, and every erased spelling Unity's C# produces for
+# a call must resolve to the same binding and the same object. Both failures
+# abort a boot hundreds of lines from the binding at fault (see kl_jni.c's
+# kl_jni_object_lifetime_selftest). No guest, no window, no headset;
+# milliseconds, in `make check`.
+build/t_jniobj: tests/t_jniobj.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jniobj.c $(RUNTIME) $(LDLIBS)
+
+jniobj: build/t_jniobj
+	./build/t_jniobj
 
 # kl_view.c is the KL_VIEW=1 interactive viewer (SDL3); only m_boot links it,
 # so only this rule carries the pkg-config flags. kl_view.c compiles to a stub
@@ -540,7 +566,7 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_jniobj build/t_uevk build/t_ctr build/t_bcast build/t_fault build/t_glcaps
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
@@ -552,6 +578,10 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@grep -E '=== OpenXR actions' build/xrinput.log && tail -1 build/xrinput.log
 	@./build/t_softinput > build/softinput.log 2>&1 || { cat build/softinput.log; exit 1; }
 	@head -1 build/softinput.log && tail -1 build/softinput.log
+	@./build/t_jniobj > build/jniobj.log 2>&1 || { cat build/jniobj.log; exit 1; }
+	@head -1 build/jniobj.log && tail -1 build/jniobj.log
+	@./build/t_uevk > build/uevk.log 2>&1 || { cat build/uevk.log; exit 1; }
+	@head -1 build/uevk.log && tail -1 build/uevk.log
 	@./build/t_ctr > build/ctr.log 2>&1 || { cat build/ctr.log; exit 1; }
 	@head -2 build/ctr.log && tail -1 build/ctr.log
 	@./build/t_bcast > build/bcast.log 2>&1 || { cat build/bcast.log; exit 1; }

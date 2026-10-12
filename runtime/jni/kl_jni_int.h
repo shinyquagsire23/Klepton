@@ -140,6 +140,7 @@ const char *klj_class_name(void *clazz);
 void       *klj_class_object(const char *class_name);
 void       *klj_new_object_data(const char *class_name, void *data);
 void       *klj_own(void *obj, void (*destroy)(void *));
+void       *klj_host_cache(void *obj);   // a jobject the host keeps in a static
 const char *klj_str(void *s);
 klj_array  *klj_arr(void *a);
 void       *klj_new_array(char kind, const char *elem_cls, int len);
@@ -171,6 +172,7 @@ klj_val     klj_appinfo_splitSourceDirs(void);
 klj_val     klj_Uri_EMPTY(void);
 klj_val     klj_metaData_field(void);
 klj_val     klj_currentActivity_field(void);
+klj_val     klj_mUnityPlayer_field(void);
 klj_val     klj_porterduff_clear(void);
 
 // ---------------------------------------------------------------- the tables
@@ -191,6 +193,7 @@ extern const klj_binding klj_bind_electra[];
 extern const klj_binding klj_bind_fmod[];
 extern const klj_binding klj_bind_jkxr[];
 extern const klj_binding klj_bind_services[];
+extern const klj_binding klj_bind_haptics[];
 extern const klj_binding *const klj_binding_tables[];
 
 
@@ -224,6 +227,24 @@ extern const klj_binding *const klj_binding_tables[];
 #define KLJ_DISPLAY_YDPI     320.0
 #define KLJ_DISPLAY_REFRESH  72.0f
 #define KLJ_DISPLAY_ROTATION 0       /* Surface.ROTATION_0 */
+
+// The device's `android_id`, and there is exactly ONE of it.
+//
+// Android's own is a per-device, per-app-signing-key random 64-bit value, so
+// any 16-hex-digit string is a well-formed one. It has to be a real string: a
+// null is not a harmless blank, it is the guest aborting inside its own string
+// handling — which is how it first presented, as a SIGABRT with no JNI call
+// named. Stable across runs because callers cache it and compare.
+//
+// It lives here rather than beside one handler because two unrelated surfaces
+// ask for it and must not answer differently: `Settings.Secure.getString(
+// resolver, "android_id")`, which is what Unity turns into
+// SystemInfo.deviceUniqueIdentifier (kl_jni_net.c), and UE's
+// `GameActivity.AndroidThunkJava_GetAndroidId()`, which is that same
+// Settings.Secure read wrapped in an activity method (kl_jni_ue4.c). A guest
+// that reached both — Pinball FX VR reaches the UE one — would otherwise see
+// one device claim to be two.
+#define KLJ_ANDROID_ID "4b6c6570746f6e01"      /* "Klepton\1" as hex */
 
 // NetworkCapabilities.TRANSPORT_* / NET_CAPABILITY_*, from android-34's
 // android.jar. Defined here rather than beside their handlers because both
@@ -308,6 +329,8 @@ int          klj_permission_state(const char *p, const char **why);
 klj_val klj_List_size(void *env, void *self, const klj_val *a, int n);
 klj_val klj_PM_queryIntentActivities(void *env, void *self, const klj_val *a, int n);
 klj_val klj_HandlerThread_start(void *env, void *self, const klj_val *a, int n);
+// The one AssetManager, which org.fmod.FMOD.getAssetManager must hand back.
+klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n);
 klj_val klj_AudioManager_getStreamVolume(void *env, void *self, const klj_val *a, int n);
 klj_val klj_Display_getAppVsyncOffsetNanos(void *env, void *self, const klj_val *a, int n);
 
@@ -319,6 +342,18 @@ klj_val klj_Display_getPresentationDeadlineNanos(void *env, void *self, const kl
 klj_val klj_Display_getRefreshRate(void *env, void *self, const klj_val *a, int n);
 klj_val klj_UnityPlayer_loadLibrary(void *env, void *self, const klj_val *a, int n);
 unsigned klj_drain_soft_input(void);
+
+// UE's GameActivity virtual keyboard (kl_jni_ue4.c). It answers the same
+// frontend contract Unity's soft input does — kl_jni.h's four
+// kl_jni_soft_input_* calls — so kl_jni_softinput.c asks these first and speaks
+// for Unity only when no UE field is open. A guest has one engine, so the two
+// can never both be open.
+int      klj_ue_vk_active(void);
+int      klj_ue_vk_get(char *buf, size_t cap, int *secure);
+void     klj_ue_vk_set(const char *utf8);
+void     klj_ue_vk_close(int canceled);
+unsigned klj_ue_vk_drain(void);
+
 void *klj_box_int(int32_t v);
 void klj_deliver_message(void *message);
 void klj_guest_version(long *code, const char **name);

@@ -189,6 +189,12 @@ static klj_val klj_SL_canDisplay4K(void *env, void *self, const klj_val *a, int 
     return (klj_val){.j = 0};
 }
 
+// hidapi's write/read failure return. See the HIDDeviceManager block below.
+static klj_val klj_HID_ioerror(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)(int64_t)(int32_t)-1};
+}
+
 // "This facility is not available." Distinct from klj_SDLA_false only in that
 // the caller wants an object back, not a boolean.
 static klj_val klj_SDLA_null(void *env, void *self, const klj_val *a, int n) {
@@ -322,7 +328,41 @@ static klj_val klj_SL_getWifiInfo(void *env, void *self, const klj_val *a, int n
     return (klj_val){.l = obj};
 }
 
+// ------------------------------------------------- HIDDeviceManager -------
+//
+// SDL2's Android HID backend, and the whole family answers "there are no HID
+// devices here", which is TRUE rather than convenient: this runtime presents no
+// USB host and no Bluetooth HID, and the VR controllers a guest on this
+// platform sees arrive through OpenXR, not through hidapi.
+//
+// The family is here because it is not optional. SDLActivity.onCreate
+// constructs the manager, and its constructor's native half is what hands
+// libSDL2's hidapi backend the JavaVM — without it SDL_hid_init dereferences a
+// NULL g_JVM inside SDL_Init(SDL_INIT_JOYSTICK), which is where Simpsons Hit &
+// Run's first host run died with the engine nowhere on the stack. Once the
+// object exists, SDL calls back into it, and these six are what it calls:
+//
+//   initialize(usb, bluetooth) -> Z  "did either transport start". FALSE, and
+//       SDL's own code path for it is the ordinary "no HID devices" one — it
+//       logs and carries on, exactly as on a phone with USB host disabled.
+//   openDevice(id) -> Z              cannot happen: nothing was enumerated, so
+//   sendOutputReport / sendFeatureReport / getFeatureReport / closeDevice
+//       are unreachable in a run where initialize answered false. They are
+//       bound anyway because an UNBOUND method is a fatal abort at the moment
+//       the guest asks for its id — which SDL does up front, in
+//       HIDDeviceRegisterCallback, for all six at once, long before it would
+//       call any of them.
+#define KLJ_HIDMGR "org/libsdl/app/HIDDeviceManager"
+
 const klj_binding klj_bind_sdl[] = {
+    {KLJ_HIDMGR, "initialize", "(ZZ)Z", klj_SDLA_false},
+    {KLJ_HIDMGR, "openDevice", "(I)Z", klj_SDLA_false},
+    // -1 is hidapi's "write failed", not 0 ("wrote nothing"): a caller that
+    // reaches here has a device id we never handed out.
+    {KLJ_HIDMGR, "sendOutputReport", "(I[B)I", klj_HID_ioerror},
+    {KLJ_HIDMGR, "sendFeatureReport", "(I[B)I", klj_HID_ioerror},
+    {KLJ_HIDMGR, "getFeatureReport", "(I[B)Z", klj_SDLA_false},
+    {KLJ_HIDMGR, "closeDevice", "(I)V", klj_SDLCM_pollInputDevices},
     {KLJ_SDLA, "getContext", "()Landroid/app/Activity;", klj_SDLA_getContext},
     {KLJ_SDLA, "getManifestEnvironmentVariables", "()Z", klj_SDLA_getManifestEnv},
     {KLJ_SDLA, "getPreferredLocales", "()Ljava/lang/String;", klj_SDLA_getPreferredLocales},

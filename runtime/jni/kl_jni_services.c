@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include "klepton.h"
 #include "kl_mediaplayer.h"
 #include "kl_jni.h"
@@ -383,6 +384,13 @@ void kl_jni_unity_construct_helpers(void) {
     return (klj_val){.l = kl_jni_activity()};
 }
 
+// UnityPlayerActivity.mUnityPlayer — the activity's handle on the player it
+// constructed in onCreate. Same object as the `thiz` every UnityPlayer native
+// is called with, because on Android it IS that object.
+ klj_val klj_mUnityPlayer_field(void) {
+    return (klj_val){.l = kl_jni_unity_player()};
+}
+
 // Oculus's device-config client. The native half of this
 // (libdeviceconfigclient-full-aar.so) is not in the APK — the dlopen for it fails
 // early in every run — so there is no configuration service behind this on a real
@@ -561,13 +569,57 @@ void kl_jni_locale_parts(char *lang, size_t lang_sz, char *country, size_t count
     klj_locale_parts(lang, lang_sz, country, country_sz);
 }
 
+// A Locale object carries its own two parts rather than deferring to the host
+// every time. The guest can build one (`new Locale("en","US")`,
+// `Locale.forLanguageTag`) and it must then describe THAT locale, not the
+// machine's — while `getDefault()` keeps describing the machine. One payload,
+// tagged by its destructor so a jclass or any other object is never mistaken
+// for a Locale, is what lets both be true through the same accessors.
+typedef struct { char lang[16], country[16]; } klj_locale;
+
+static void klj_locale_free(void *p) { free(p); }
+
+static klj_locale *klj_locale_payload(void *self) {
+    klj_object *o = self ? klj_as_object(self) : NULL;
+    // The destructor is the tag. klj_object.data means something different for
+    // every class (a klj_class* for java/lang/Class, a char* for a String), so
+    // reading it on identity alone is how a static call through the jclass turns
+    // into a wild pointer.
+    return (o && o->destroy == klj_locale_free) ? (klj_locale *)o->data : NULL;
+}
+
+static void *klj_locale_new(const char *lang, const char *country) {
+    void *obj = kl_jni_new_object("java/util/Locale");
+    if (!obj) return NULL;
+    klj_locale *l = calloc(1, sizeof *l);
+    if (!l) return obj;
+    snprintf(l->lang,    sizeof l->lang,    "%s", lang    ? lang    : "");
+    snprintf(l->country, sizeof l->country, "%s", country ? country : "");
+    klj_as_object(obj)->data    = l;
+    klj_as_object(obj)->destroy = klj_locale_free;
+    return obj;
+}
+
+// The two parts of whichever Locale is being asked about: the receiver's own if
+// it has them, the host's otherwise. The fallback is what makes a static call
+// and a call on the default Locale agree.
+static void klj_locale_read(void *self, char *lang, size_t ls, char *country, size_t cs) {
+    const klj_locale *l = klj_locale_payload(self);
+    if (l) {
+        snprintf(lang, ls, "%s", l->lang);
+        snprintf(country, cs, "%s", l->country);
+        return;
+    }
+    klj_locale_parts(lang, ls, country, cs);
+}
+
 static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *locale;
     if (!locale) {
         char lang[16], country[16];
         klj_locale_parts(lang, sizeof lang, country, sizeof country);
-        locale = kl_jni_new_object("java/util/Locale");
+        locale = klj_locale_new(lang, country);
         // PINNED, because the cache outlives the read. The object is handed
         // out again on every later
         // call, but the guest is entitled to retire the reference it was given:
@@ -628,17 +680,38 @@ static klj_val klj_LocaleList_get(void *env, void *self, const klj_val *a, int n
 }
 
 static klj_val klj_Locale_getLanguage(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
+    (void)env; (void)a; (void)n;
     char lang[16], country[16];
-    klj_locale_parts(lang, sizeof lang, country, sizeof country);
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
     return (klj_val){.l = kl_jni_new_string(lang)};
 }
 
 static klj_val klj_Locale_getCountry(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
+    (void)env; (void)a; (void)n;
     char lang[16], country[16];
-    klj_locale_parts(lang, sizeof lang, country, sizeof country);
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
     return (klj_val){.l = kl_jni_new_string(country)};
+}
+
+// Locale.toString() — the UNDERSCORE form, "en_US". This is not a cosmetic
+// difference from toLanguageTag() below and the two must not be swapped: it is
+// the string Unity's mscorlib parses to build CultureInfo.CurrentCulture. The
+// IL2CPP metadata's slash-spelled `java/util/Locale` sits beside
+// `java/lang/System` and `java/lang/reflect/Field`, i.e. in the BCL's own Android
+// interop block rather than in the game's — the culture bootstrap is
+// `Locale.getDefault().toString()`, and without it the boot aborts at the first
+// thing that touches a culture-sensitive format.
+//
+// Java omits the separator entirely when there is no region, rather than leaving
+// a trailing underscore, and mscorlib's parse depends on that.
+static klj_val klj_Locale_toString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char lang[16], country[16], out[40];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    if (*country) snprintf(out, sizeof out, "%s_%s", lang, country);
+    else          snprintf(out, sizeof out, "%s", lang);
+    KLJ_LOG("Locale.toString() -> %s", out);
+    return (klj_val){.l = kl_jni_new_string(out)};
 }
 
 // BCP 47, which is what Beat Saber 1.40 asks for where 1.28 read getLanguage()
@@ -647,13 +720,157 @@ static klj_val klj_Locale_getCountry(void *env, void *self, const klj_val *a, in
 // opinion about it. Java omits the region subtag entirely when there is none,
 // rather than leaving a trailing hyphen.
 static klj_val klj_Locale_toLanguageTag(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
+    (void)env; (void)a; (void)n;
     char lang[16], country[16], tag[40];
-    klj_locale_parts(lang, sizeof lang, country, sizeof country);
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
     if (*country) snprintf(tag, sizeof tag, "%s-%s", lang, country);
     else          snprintf(tag, sizeof tag, "%s", lang);
     KLJ_LOG("Locale.toLanguageTag() -> %s", tag);
     return (klj_val){.l = kl_jni_new_string(tag)};
+}
+
+// new Locale(lang), new Locale(lang, country), new Locale(lang, country, variant).
+// The variant is accepted and dropped, because getVariant() below reports "" for
+// every Locale we hand out and the two have to agree.
+static klj_val klj_Locale_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *lang    = n > 0 ? klj_str(a[0].l) : "";
+    const char *country = n > 1 ? klj_str(a[1].l) : "";
+    return (klj_val){.l = klj_locale_new(lang, country)};
+}
+
+// Locale.forLanguageTag("en-US"). The inverse of toLanguageTag: everything after
+// the first subtag separator that looks like a region is the region, and script
+// and extension subtags are dropped for the same reason getScript() answers "".
+static klj_val klj_Locale_forLanguageTag(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *tag = n > 0 ? klj_str(a[0].l) : "";
+    char lang[16] = "", country[16] = "", buf[64];
+    snprintf(buf, sizeof buf, "%s", tag ? tag : "");
+    char *dash = strchr(buf, '-');
+    if (!dash) dash = strchr(buf, '_');
+    if (dash) { *dash = 0; snprintf(country, sizeof country, "%s", dash + 1); }
+    snprintf(lang, sizeof lang, "%s", buf);
+    // A region subtag is two letters or three digits; anything else after the
+    // language is a script or a variant, which this Locale does not carry.
+    size_t cl = strlen(country);
+    if (cl != 2 && cl != 3) country[0] = 0;
+    KLJ_LOG("Locale.forLanguageTag(\"%s\") -> %s%s%s", tag ? tag : "", lang,
+            *country ? "_" : "", country);
+    return (klj_val){.l = klj_locale_new(lang, country)};
+}
+
+// The ISO 639-2 / ISO 3166-1 alpha-3 renderings. A table rather than a
+// computation because there is no rule connecting the two-letter and
+// three-letter forms — and a SHORT table, covering the languages a store build
+// of this shape ships, with the two-letter code and a log line for anything
+// else. That is the honest failure: the caller gets a code of the wrong width
+// and the log says which one was missing, instead of a plausible invention.
+static const char *klj_iso3(const char *code, const char *const *map, const char *kind) {
+    if (!code || !*code) return "";
+    for (const char *const *m = map; m[0]; m += 2)
+        if (strcmp(code, m[0]) == 0) return m[1];
+    KLJ_LOG("Locale: no ISO3 %s for \"%s\" — answering with the 2-letter code",
+            kind, code);
+    return code;
+}
+static klj_val klj_Locale_getISO3Language(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    static const char *const map[] = {
+        "en","eng", "de","deu", "fr","fra", "es","spa", "it","ita", "pt","por",
+        "ru","rus", "pl","pol", "nl","nld", "sv","swe", "da","dan", "fi","fin",
+        "no","nor", "cs","ces", "hu","hun", "tr","tur", "el","ell", "uk","ukr",
+        "ja","jpn", "ko","kor", "zh","zho", "th","tha", "vi","vie", "id","ind",
+        "ar","ara", NULL, NULL,
+    };
+    char lang[16], country[16];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    return (klj_val){.l = kl_jni_new_string(klj_iso3(lang, map, "language"))};
+}
+static klj_val klj_Locale_getISO3Country(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    static const char *const map[] = {
+        "US","USA", "GB","GBR", "DE","DEU", "FR","FRA", "ES","ESP", "IT","ITA",
+        "PT","PRT", "BR","BRA", "NL","NLD", "SE","SWE", "DK","DNK", "FI","FIN",
+        "NO","NOR", "PL","POL", "CZ","CZE", "HU","HUN", "TR","TUR", "GR","GRC",
+        "RU","RUS", "UA","UKR", "JP","JPN", "KR","KOR", "CN","CHN", "TW","TWN",
+        "TH","THA", "VN","VNM", "ID","IDN", "CA","CAN", "AU","AUS", "MX","MEX",
+        NULL, NULL,
+    };
+    char lang[16], country[16];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    return (klj_val){.l = kl_jni_new_string(klj_iso3(country, map, "country"))};
+}
+
+// getDisplayName / getDisplayLanguage / getDisplayCountry are the LOCALIZED,
+// human-readable names — "English (United States)" where getLanguage() answers
+// "en". Serving those properly means shipping CLDR, which is a whole ICU we do
+// not have; so these answer with the code, and say so once per call in the log.
+//
+// The code is a defensible answer rather than a stub: it is what Java itself
+// falls back to when it has no display name for a locale, so callers already
+// handle seeing a bare code, and any string that reaches a menu is at least
+// correct about WHICH locale it names. A launch that shows "en" in a language
+// picker is then a known, named cost rather than a mystery.
+static klj_val klj_Locale_getDisplayLanguage(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char lang[16], country[16];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    KLJ_LOG("Locale.getDisplayLanguage() -> \"%s\" (the code; no CLDR name table here)", lang);
+    return (klj_val){.l = kl_jni_new_string(lang)};
+}
+static klj_val klj_Locale_getDisplayCountry(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char lang[16], country[16];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    KLJ_LOG("Locale.getDisplayCountry() -> \"%s\" (the code; no CLDR name table here)", country);
+    return (klj_val){.l = kl_jni_new_string(country)};
+}
+static klj_val klj_Locale_getDisplayName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char lang[16], country[16], out[48];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    if (*country) snprintf(out, sizeof out, "%s (%s)", lang, country);
+    else          snprintf(out, sizeof out, "%s", lang);
+    KLJ_LOG("Locale.getDisplayName() -> \"%s\" (codes; no CLDR name table here)", out);
+    return (klj_val){.l = kl_jni_new_string(out)};
+}
+
+// A Locale here has a language and a region and nothing else — no variant, no
+// script — so these are "" by construction rather than by omission, and
+// forLanguageTag above drops exactly the subtags that would make them non-empty.
+static klj_val klj_Locale_empty_string(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("")};
+}
+
+// equals() compares the two parts rather than the handles: getDefault() hands
+// back one pinned singleton, but a guest that built its own `new Locale("en","US")`
+// is asking whether they describe the same locale, and they do.
+static klj_val klj_Locale_equals(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    char al[16], ac[16], bl[16], bc[16];
+    klj_locale_read(self, al, sizeof al, ac, sizeof ac);
+    void *other = n > 0 ? a[0].l : NULL;
+    // A payload is required on the OTHER side, not merely tolerated: without it
+    // klj_locale_read would fall back to the host default and have this Locale
+    // report equal to any object at all that happens to be handed in.
+    const klj_locale *ol = klj_locale_payload(other);
+    if (!ol) return (klj_val){.j = 0};
+    klj_locale_read(other, bl, sizeof bl, bc, sizeof bc);
+    return (klj_val){.j = (strcmp(al, bl) == 0 && strcmp(ac, bc) == 0) ? 1u : 0u};
+}
+
+// hashCode() over the same two parts, so equal Locales hash equal — the one
+// invariant a caller putting Locales in a HashMap depends on.
+static klj_val klj_Locale_hashCode(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char lang[16], country[16], buf[40];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    snprintf(buf, sizeof buf, "%s_%s", lang, country);
+    uint32_t h = 2166136261u;
+    for (const char *p = buf; *p; p++) { h ^= (unsigned char)*p; h *= 16777619u; }
+    return (klj_val){.j = (uint64_t)(int64_t)(int32_t)h};
 }
 
 // null means "this route is not presenting to a secondary display", which is the
@@ -965,7 +1182,7 @@ static const klj_kv *klj_manifest_metadata(void) {
                     "transcribed <meta-data>, which may not be this guest's",
                     g_assets_dir);
         }
-        bundle = klj_new_object_data("android/os/Bundle", (void *)kv);
+        bundle = klj_host_cache(klj_new_object_data("android/os/Bundle", (void *)kv));
     }
     return (klj_val){.l = bundle};
 }
@@ -1319,6 +1536,187 @@ static klj_val klj_Environment_getExternalStorageDirectory(void *env, void *self
     return (klj_val){.l = klj_new_file("/sdcard")};   // short form; see getExternalFilesDir
 }
 
+// ---- android.os.StatFs ----
+//
+// "How much room is left?", asked the way every Android app asks it. Guests
+// reach this immediately after `getObbDir()` + `File.getAbsolutePath()` — the
+// classic before-first-run-unpack free space check — and a missing constructor
+// aborts the boot there.
+//
+// It is an OBJECT with per-instance state, like ZipFile and HandlerThread: the
+// path is fixed at construction and every getter reads the snapshot taken then
+// (Android's StatFs caches a `statfs()` too, which is exactly why it has a
+// `restat()`).
+//
+// The numbers are the HOST filesystem's, read through statvfs(). Nothing here
+// is a constant: the Vision Pro genuinely has the space, the guest is entitled
+// to a true answer, and a fabricated one is wrong in both directions — too
+// small aborts the unpack, too large lets it write until the real volume fills.
+//
+// Two details that are not obvious:
+//
+//   - The path is MAPPED. The guest may hand back a container path it got from
+//     getObbDir() (already ours, so kl_guest_path passes it through) or an
+//     Android-flavoured one like /sdcard/... — the same redirect every file
+//     call in this runtime goes through, so there is one mapper and not two.
+//   - statvfs() needs the path to EXIST. Android's StatFs throws
+//     IllegalArgumentException otherwise, and we have no exception state, so
+//     instead of failing we walk up to the nearest existing ancestor — which is
+//     on the same volume and therefore gives the same answer — and say so.
+//     The alternative is a zeroed StatFs, which reads as "disk full".
+typedef struct {
+    char           path[1024];   // the mapped path, as statted
+    struct statvfs st;
+    int            ok;
+} klj_statfs;
+
+static void klj_statfs_read(klj_statfs *s) {
+    // Nearest existing ancestor: same volume, same numbers, and never zero.
+    char probe[1024];
+    snprintf(probe, sizeof probe, "%s", s->path);
+    for (;;) {
+        if (statvfs(probe, &s->st) == 0) {
+            s->ok = 1;
+            if (strcmp(probe, s->path) != 0)
+                KLJ_LOG("StatFs(\"%s\") does not exist yet — measured its nearest "
+                        "existing ancestor %s, which is the same volume", s->path, probe);
+            return;
+        }
+        char *cut = strrchr(probe, '/');
+        if (!cut || cut == probe) break;
+        *cut = '\0';
+    }
+    s->ok = 0;
+    KLJ_LOG("StatFs(\"%s\"): statvfs failed all the way up (%s) — answering zeroes, "
+            "which the guest will read as a full disk", s->path, strerror(errno));
+    memset(&s->st, 0, sizeof s->st);
+}
+
+static klj_statfs *klj_statfs_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o ? o->data : NULL;
+}
+
+// f_frsize is the FRAGMENT size, which is what f_blocks/f_bfree/f_bavail are
+// counted in; f_bsize is the preferred I/O size and is NOT the multiplier.
+// Getting these two backwards is the classic statvfs bug, and on APFS they do
+// differ, so it would be off by a large factor rather than harmlessly.
+static uint64_t klj_statfs_unit(const klj_statfs *s) {
+    uint64_t u = s->st.f_frsize ? (uint64_t)s->st.f_frsize : (uint64_t)s->st.f_bsize;
+    return u ? u : 4096;
+}
+
+static klj_val klj_StatFs_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env;
+    const char *given = n > 0 ? klj_str(a[0].l) : NULL;
+    klj_statfs *s = calloc(1, sizeof *s);
+    if (!s) return (klj_val){.l = NULL};
+    char mapped[1024];
+    const char *p = given ? kl_guest_path(given, mapped, sizeof mapped) : kl_jni_files_dir();
+    snprintf(s->path, sizeof s->path, "%s", p ? p : "/");
+    klj_statfs_read(s);
+    if (s->ok)
+        KLJ_LOG("StatFs(\"%s\") -> %s: %llu bytes available of %llu (%llu-byte blocks)",
+                given ? given : "(null)", s->path,
+                (unsigned long long)((uint64_t)s->st.f_bavail * klj_statfs_unit(s)),
+                (unsigned long long)((uint64_t)s->st.f_blocks * klj_statfs_unit(s)),
+                (unsigned long long)klj_statfs_unit(s));
+    void *obj = kl_jni_new_object(klj_class_name(clazz));
+    klj_object *o = klj_as_object(obj);
+    if (!o) { free(s); return (klj_val){.l = NULL}; }
+    o->data = s;
+    o->destroy = free;
+    return (klj_val){.l = obj};
+}
+
+// API 17's restat(String) — re-reads, and may be handed a different path.
+static klj_val klj_StatFs_restat(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_statfs *s = klj_statfs_of(self);
+    if (!s) return (klj_val){.j = 0};
+    const char *given = n > 0 ? klj_str(a[0].l) : NULL;
+    if (given) {
+        char mapped[1024];
+        const char *p = kl_guest_path(given, mapped, sizeof mapped);
+        snprintf(s->path, sizeof s->path, "%s", p ? p : s->path);
+    }
+    klj_statfs_read(s);
+    return (klj_val){.j = 0};
+}
+
+static uint64_t klj_statfs_blocks(void *self, int which) {
+    klj_statfs *s = klj_statfs_of(self);
+    if (!s) return 0;
+    switch (which) {
+        case 0:  return (uint64_t)s->st.f_blocks;   // total
+        case 1:  return (uint64_t)s->st.f_bavail;   // available to an unprivileged app
+        default: return (uint64_t)s->st.f_bfree;    // free, including the root reserve
+    }
+}
+
+static klj_val klj_StatFs_getBlockSizeLong(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_statfs *s = klj_statfs_of(self);
+    return (klj_val){.j = s ? klj_statfs_unit(s) : 0};
+}
+static klj_val klj_StatFs_getBlockCountLong(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = klj_statfs_blocks(self, 0)};
+}
+static klj_val klj_StatFs_getAvailableBlocksLong(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = klj_statfs_blocks(self, 1)};
+}
+static klj_val klj_StatFs_getFreeBlocksLong(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = klj_statfs_blocks(self, 2)};
+}
+static klj_val klj_StatFs_getTotalBytes(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_statfs *s = klj_statfs_of(self);
+    return (klj_val){.j = s ? (uint64_t)s->st.f_blocks * klj_statfs_unit(s) : 0};
+}
+static klj_val klj_StatFs_getAvailableBytes(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_statfs *s = klj_statfs_of(self);
+    return (klj_val){.j = s ? (uint64_t)s->st.f_bavail * klj_statfs_unit(s) : 0};
+}
+static klj_val klj_StatFs_getFreeBytes(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_statfs *s = klj_statfs_of(self);
+    return (klj_val){.j = s ? (uint64_t)s->st.f_bfree * klj_statfs_unit(s) : 0};
+}
+
+// The DEPRECATED int forms, which are still what a lot of shipped code calls:
+// the Long variants only arrived in API 18, and Unity-era Java keeps reaching
+// for the int ones because they work everywhere. They are carried for the same
+// reason getObbDir and getObbDirs both are — one answer asked two ways, and the
+// guest picks which. Adding them costs four lines and saves a failed run.
+//
+// Android CLAMPS rather than wrapping (`(int) Math.min(x, Integer.MAX_VALUE)`),
+// and that matters: a large volume counted in small blocks overflows an int,
+// and a wrapped NEGATIVE block count reads as "disk full" to every caller.
+static kl_jint klj_statfs_clamp(uint64_t v) {
+    return (kl_jint)(v > 0x7fffffffull ? 0x7fffffffull : v);
+}
+static klj_val klj_StatFs_getBlockSize(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_statfs *s = klj_statfs_of(self);
+    return (klj_val){.j = (uint64_t)(int64_t)klj_statfs_clamp(s ? klj_statfs_unit(s) : 0)};
+}
+static klj_val klj_StatFs_getBlockCount(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)(int64_t)klj_statfs_clamp(klj_statfs_blocks(self, 0))};
+}
+static klj_val klj_StatFs_getAvailableBlocks(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)(int64_t)klj_statfs_clamp(klj_statfs_blocks(self, 1))};
+}
+static klj_val klj_StatFs_getFreeBlocks(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)(int64_t)klj_statfs_clamp(klj_statfs_blocks(self, 2))};
+}
+
 // MANAGE_EXTERNAL_STORAGE — "does this app hold unrestricted access to shared
 // storage?" — and the answer here is yes, because there is nothing to restrict.
 // The permission exists on Android to separate one app's files in shared
@@ -1542,7 +1940,7 @@ static klj_val klj_PlayAssetDelivery_missing(void *env, void *self, const klj_va
     return (klj_val){.j = 1};        // Play Core is absent — see above
 }
 
-static klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {
+klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *am;
     return klj_singleton("android/content/res/AssetManager", &am);
@@ -1741,7 +2139,72 @@ static klj_val klj_Scanner_next(void *env, void *self, const klj_val *a, int n) 
     return (klj_val){.l = s};
 }
 
+// System.identityHashCode(Object) — the identity hash, i.e. "which object is
+// this". Unity caches this method id at UnityPlayer init and uses it to key its
+// own side table of proxies, so it must be stable for the lifetime of an object
+// and distinct between live objects; the handle we issued is exactly that, since
+// every jobject the guest holds is a klj_object we allocated.
+//
+// Java's is an int, so the pointer is folded rather than truncated: the low bits
+// of consecutive allocations are the ones that repeat, and a truncation would
+// collide two neighbours that a fold separates.
+static klj_val klj_System_identityHashCode(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    uintptr_t p = n > 0 ? (uintptr_t)a[0].l : 0;
+    uint32_t h = (uint32_t)(p ^ (p >> 32));
+    // Java never returns 0 for a live object; 0 is what a caller reads as "null".
+    if (!h && p) h = 1;
+    return (klj_val){.j = (uint64_t)(int64_t)(int32_t)h};
+}
+
+// com.oculus.metrics.MetricsService — OVRPlugin's door onto OVR Monitor, the
+// Quest-side performance capture service. It binds to a service exported by
+// com.oculus.ovrmonitormetricsservice, which is a Horizon OS component and is
+// not on this host; isServiceAvailable() answering false is the transcription of
+// that, not a refusal, and it is the branch the plugin's own code takes on a
+// device without the service installed.
+//
+// The rest are bound to match: bind/unbind/shutdown record and return (there is
+// nothing to bind to), the two debug-string setters report failure the same way
+// the real ones do when the service is absent, and getLatestEventJson answers
+// with the empty JSON object rather than null so a caller that parses it gets an
+// empty document instead of an exception.
+static klj_val klj_MetricsService_unavailable(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MetricsService_void(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("MetricsService: no OVR Monitor service on this host — recorded");
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MetricsService_json(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("{}")};
+}
+
 const klj_binding klj_bind_services[] = {
+    {"java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I",
+                                                    klj_System_identityHashCode},
+
+    // com.oculus.metrics.MetricsService — OVR Monitor, absent on this host.
+    {"com/oculus/metrics/MetricsService", "isServiceAvailable",
+     "(Landroid/content/Context;)Z", klj_MetricsService_unavailable},
+    {"com/oculus/metrics/MetricsService", "isServiceAvailable",
+     "(Landroid/content/Context;I)Z", klj_MetricsService_unavailable},
+    {"com/oculus/metrics/MetricsService", "bind",
+     "(Landroid/content/Context;)V", klj_MetricsService_void},
+    {"com/oculus/metrics/MetricsService", "unbind",
+     "(Landroid/content/Context;)V", klj_MetricsService_void},
+    {"com/oculus/metrics/MetricsService", "shutdown",
+     "(Landroid/content/Context;)V", klj_MetricsService_void},
+    {"com/oculus/metrics/MetricsService", "setOverlayDebugString",
+     "(Landroid/content/Context;Ljava/lang/String;)Z", klj_MetricsService_unavailable},
+    {"com/oculus/metrics/MetricsService", "appendCsvDebugString",
+     "(Landroid/content/Context;Ljava/lang/String;)Z", klj_MetricsService_unavailable},
+    {"com/oculus/metrics/MetricsService", "getLatestEventJson",
+     "(Landroid/content/Context;)Ljava/lang/String;", klj_MetricsService_json},
+
     {"org/fmod/FmodAndroidAudioManager", "getInstance",
      "()Lorg/fmod/FmodAndroidAudioManager;",        klj_fmod_audio_manager},
     {"org/fmod/FmodAndroidAudioManager", "getBluetoothInputDeviceId", "()I",
@@ -1810,10 +2273,39 @@ const klj_binding klj_bind_services[] = {
     {"android/content/res/Configuration", "getLocales", "()Landroid/os/LocaleList;", klj_Configuration_getLocales},
     {"android/os/LocaleList", "get", "(I)Ljava/util/Locale;", klj_LocaleList_get},
     {"android/os/LocaleList", "size", "()I", klj_LocaleList_size},
+    // java.util.Locale, read WHOLE rather than one method per launch. The class
+    // has no state a host can get wrong — a language and a region — so the
+    // whole public surface that reduces to those two is bound at once, and the
+    // three that do not (getDisplay*) are bound to the code with a log line
+    // saying so. A guest that dies on toString() with getDefault() already
+    // bound beside it is the shape this table exists to stop.
     {"java/util/Locale", "getDefault",  "()Ljava/util/Locale;",   klj_Locale_getDefault},
+    // Locale.getDefault(Locale.Category) — Java 7's per-category default. There
+    // is one default here, so both categories are it.
+    {"java/util/Locale", "getDefault",  "(Ljava/util/Locale$Category;)Ljava/util/Locale;",
+                                                                  klj_Locale_getDefault},
     {"java/util/Locale", "getLanguage", "()Ljava/lang/String;",   klj_Locale_getLanguage},
     {"java/util/Locale", "getCountry",  "()Ljava/lang/String;",   klj_Locale_getCountry},
+    {"java/util/Locale", "toString",    "()Ljava/lang/String;",   klj_Locale_toString},
     {"java/util/Locale", "toLanguageTag", "()Ljava/lang/String;", klj_Locale_toLanguageTag},
+    {"java/util/Locale", "forLanguageTag", "(Ljava/lang/String;)Ljava/util/Locale;",
+                                                                  klj_Locale_forLanguageTag},
+    {"java/util/Locale", "<init>", "(Ljava/lang/String;)V", klj_Locale_init},
+    {"java/util/Locale", "<init>", "(Ljava/lang/String;Ljava/lang/String;)V", klj_Locale_init},
+    {"java/util/Locale", "<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                                                                  klj_Locale_init},
+    {"java/util/Locale", "getISO3Language", "()Ljava/lang/String;", klj_Locale_getISO3Language},
+    {"java/util/Locale", "getISO3Country",  "()Ljava/lang/String;", klj_Locale_getISO3Country},
+    {"java/util/Locale", "getDisplayName",     "()Ljava/lang/String;", klj_Locale_getDisplayName},
+    {"java/util/Locale", "getDisplayName",     "(Ljava/util/Locale;)Ljava/lang/String;", klj_Locale_getDisplayName},
+    {"java/util/Locale", "getDisplayLanguage", "()Ljava/lang/String;", klj_Locale_getDisplayLanguage},
+    {"java/util/Locale", "getDisplayLanguage", "(Ljava/util/Locale;)Ljava/lang/String;", klj_Locale_getDisplayLanguage},
+    {"java/util/Locale", "getDisplayCountry",  "()Ljava/lang/String;", klj_Locale_getDisplayCountry},
+    {"java/util/Locale", "getDisplayCountry",  "(Ljava/util/Locale;)Ljava/lang/String;", klj_Locale_getDisplayCountry},
+    {"java/util/Locale", "getVariant", "()Ljava/lang/String;", klj_Locale_empty_string},
+    {"java/util/Locale", "getScript",  "()Ljava/lang/String;", klj_Locale_empty_string},
+    {"java/util/Locale", "equals",   "(Ljava/lang/Object;)Z", klj_Locale_equals},
+    {"java/util/Locale", "hashCode", "()I",                   klj_Locale_hashCode},
     {"android/media/MediaRouter$RouteInfo", "getPresentationDisplay", "()Landroid/view/Display;", klj_RouteInfo_getPresentationDisplay},
 
     {"android/app/AlertDialog$Builder", "<init>", "(Landroid/content/Context;)V", klj_AlertBuilder_init},
@@ -1892,6 +2384,22 @@ const klj_binding klj_bind_services[] = {
     {"android/os/Environment", "getExternalStorageState", "()Ljava/lang/String;", klj_Environment_getExternalStorageState},
     {"android/os/Environment", "getExternalStorageDirectory", "()Ljava/io/File;", klj_Environment_getExternalStorageDirectory},
     {"android/os/Environment", "isExternalStorageManager", "()Z", klj_Environment_isExternalStorageManager},
+    // android.os.StatFs — free space, measured rather than invented. See the
+    // implementation for why f_frsize is the multiplier and why the int forms
+    // are here alongside the Long ones.
+    {"android/os/StatFs", "<init>", "(Ljava/lang/String;)V", klj_StatFs_init},
+    {"android/os/StatFs", "restat", "(Ljava/lang/String;)V", klj_StatFs_restat},
+    {"android/os/StatFs", "getAvailableBytes", "()J", klj_StatFs_getAvailableBytes},
+    {"android/os/StatFs", "getFreeBytes",      "()J", klj_StatFs_getFreeBytes},
+    {"android/os/StatFs", "getTotalBytes",     "()J", klj_StatFs_getTotalBytes},
+    {"android/os/StatFs", "getBlockSizeLong",       "()J", klj_StatFs_getBlockSizeLong},
+    {"android/os/StatFs", "getBlockCountLong",      "()J", klj_StatFs_getBlockCountLong},
+    {"android/os/StatFs", "getAvailableBlocksLong", "()J", klj_StatFs_getAvailableBlocksLong},
+    {"android/os/StatFs", "getFreeBlocksLong",      "()J", klj_StatFs_getFreeBlocksLong},
+    {"android/os/StatFs", "getBlockSize",       "()I", klj_StatFs_getBlockSize},
+    {"android/os/StatFs", "getBlockCount",      "()I", klj_StatFs_getBlockCount},
+    {"android/os/StatFs", "getAvailableBlocks", "()I", klj_StatFs_getAvailableBlocks},
+    {"android/os/StatFs", "getFreeBlocks",      "()I", klj_StatFs_getFreeBlocks},
     {"java/io/File", "getAbsolutePath", "()Ljava/lang/String;", klj_File_getPath},
     {"java/io/File", "getPath",         "()Ljava/lang/String;", klj_File_getPath},
     {"java/io/File", "getCanonicalPath","()Ljava/lang/String;", klj_File_getPath},
