@@ -28,6 +28,32 @@ import Foundation
 enum KleptonAudio {
     nonisolated(unsafe) private static var started = false
     nonisolated(unsafe) private static var observers: [NSObjectProtocol] = []
+    // Set by setSilenced: while true, the route-change / interruption recoveries
+    // must not restart the unit — exiting immersion fires exactly those
+    // notifications, and without the gate they would "recover" the silence away
+    // a moment after the crown press asked for it.
+    nonisolated(unsafe) private static var silenced = false
+
+    /// Silence or restore the output unit from the scene phase, without
+    /// tearing anything down. The Digital Crown dismisses the immersive space
+    /// to the Home View and the app goes .inactive — but the system takes
+    /// ~30 s to actually *background* it (which is when Lifecycle exits), and
+    /// all that while the music kept playing. Other apps go quiet on the crown
+    /// press; this is that.
+    static func setSilenced(_ next: Bool) {
+        guard started, next != silenced else { return }
+        silenced = next
+        let session = AVAudioSession.sharedInstance()
+        if next {
+            try? session.setActive(false)
+            kl_audio_set_silenced(1)
+        } else {
+            // Same order as the interruption-ended path below: the unit only
+            // produces sound against an ACTIVE session, so reactivate first.
+            try? session.setActive(true)
+            kl_audio_set_silenced(0)
+        }
+    }
 
     /// Configure and activate the session, then tell the C side what the
     /// hardware rate turned out to be. Safe to call more than once.
@@ -79,6 +105,8 @@ enum KleptonAudio {
                 // reactivated on the way out — an interruption that ends leaves
                 // an inactive session, and a unit started against one produces
                 // silence with no error. Reactivate before telling C to rebuild.
+                // Unless the silence is deliberate (crown press) — then stay.
+                guard !silenced else { return }
                 try? session.setActive(true)
             }
             kl_audio_interrupted(began ? 1 : 0)
@@ -93,6 +121,9 @@ enum KleptonAudio {
             let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
             let reason = AVAudioSession.RouteChangeReason(rawValue: raw)
             NSLog("[au] route change (reason \(raw)), now \(session.sampleRate) Hz")
+            // Exiting immersion fires a route change; a crown press silenced us
+            // on purpose, and "recovering" here would undo it a moment later.
+            guard !silenced else { return }
             switch reason {
             case .oldDeviceUnavailable, .newDeviceAvailable, .override,
                  .routeConfigurationChange, .categoryChange:
@@ -114,6 +145,7 @@ enum KleptonAudio {
             // spatial experience is one of them — without this the sound comes
             // back correct in every respect except where it is.
             try? Self.directStereo(session)
+            guard !silenced else { return }   // keep the crown-press silence
             kl_audio_session_ready(session.sampleRate)
             _ = kl_audio_restart()
         }

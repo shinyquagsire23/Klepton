@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include "kl_jni.h"
 #include "kl_va.h"
+#include "kl_audio.h"   // KL_AUDIO_NATIVE_RATE / _FRAMES — see the audio block below
 
 #define KLJ_LOG(...) do { fprintf(stderr, "[jni] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 // Hot-path variant: logs only the first time a given call site is reached.
@@ -253,8 +254,16 @@ extern const klj_binding *const klj_binding_tables[];
 // answers that disagree are worse than either alone. 48 kHz / 256 frames is the
 // low-latency configuration a Quest 2 reports, and it is what the engine had
 // already inferred from the driver before it got this far.
-#define KLJ_AUDIO_RATE   48000
-#define KLJ_AUDIO_FRAMES 256
+//
+// The two numbers are not spelled here. A guest asks the same device these
+// questions TWICE — once through Java and once through whatever native sink it
+// opens — and a disagreement between the answers is audible: Java said 256
+// frames while kl_aaudio.c handed the same guest bursts of 240, 240 does not
+// divide Wwise's 1024-frame mixer block, and every fifth callback came back
+// with 64 lit frames and 176 zeros spliced into the music. One definition, in
+// kl_audio.h, is the only way they cannot drift.
+#define KLJ_AUDIO_RATE   KL_AUDIO_NATIVE_RATE
+#define KLJ_AUDIO_FRAMES KL_AUDIO_NATIVE_FRAMES
 
 // ------------------------------------------------- cross-family seams
 // Types and definitions one family file owns and another reaches for. The

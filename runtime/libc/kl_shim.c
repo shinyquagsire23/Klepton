@@ -192,9 +192,15 @@ static size_t kl_fwrite(const void *p, size_t a, size_t b, void *f) { return fwr
 // async loader's throughput is the loading-screen pacing question. Bytes are
 // attributed per open file (kl_file_path) so a slow trickle names its file.
 extern const char *kl_file_path(void *f);
+extern void kl_bank_note_io(const char *op, void *f, long long a, long long b, long long res);
+extern int  kl_bank_is_open(void *f);              // kl_libc.c — gate, false for every other file
 static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
     FILE *hf = kl_host_file(f);
+    // The archive trace: WHERE libzip is reading (the offset it starts from) and
+    // whether it got what it asked for. Silent unless this is an open archive.
+    long long at = kl_bank_is_open(hf) ? (long long)ftello(hf) : -1;
     size_t r = fread(p, a, b, hf);
+    if (at >= 0) kl_bank_note_io("fread", hf, at, (long long)(a * b), (long long)(r * a));
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_TRACE_IO", 0);
     if (on) {
@@ -226,17 +232,33 @@ static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
     }
     return r;
 }
-static int kl_fclose(void *f)                      { return fclose(kl_host_file(f)); }
+extern void kl_bank_note_close(void *f);           // kl_libc.c — the bank probe
+static int kl_fclose(void *f)                      { kl_bank_note_close(f);
+                                                     return fclose(kl_host_file(f)); }
 static int kl_fflush(void *f)                      { return fflush(f ? kl_host_file(f) : NULL); }
 static char *kl_fgets(char *s, int n, void *f)     { return fgets(s, n, kl_host_file(f)); }
 static int kl_getc_(void *f)                       { return getc(kl_host_file(f)); }
 static int kl_feof(void *f)                        { return feof(kl_host_file(f)); }
 static int kl_ferror(void *f)                      { return ferror(kl_host_file(f)); }
 static void kl_clearerr(void *f)                   { clearerr(kl_host_file(f)); }
-static int kl_fseek(void *f, long o, int w)        { return fseek(kl_host_file(f), o, w); }
-static int kl_fseeko(void *f, off_t o, int w)      { return fseeko(kl_host_file(f), o, w); }
+// The offsets ARE the evidence for the bank probe (a 3.4 GB archive whose
+// central directory and Init.bnk both sit above 2^31), so each of these reports
+// the offset it was handed and the offset the host ended up at.
+static int kl_fseek(void *f, long o, int w)        { FILE *hf = kl_host_file(f); int r = fseek(hf, o, w);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("fseek", hf, (long long)o, w,
+                                                                         r ? -1 : (long long)ftello(hf));
+                                                     return r; }
+static int kl_fseeko(void *f, off_t o, int w)      { FILE *hf = kl_host_file(f); int r = fseeko(hf, o, w);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("fseeko", hf, (long long)o, w,
+                                                                         r ? -1 : (long long)ftello(hf));
+                                                     return r; }
 static long kl_ftell(void *f)                      { return ftell(kl_host_file(f)); }
-static off_t kl_ftello(void *f)                    { return ftello(kl_host_file(f)); }
+static off_t kl_ftello(void *f)                    { FILE *hf = kl_host_file(f); off_t r = ftello(hf);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("ftello", hf, 0, 0, (long long)r);
+                                                     return r; }
 static int kl_setvbuf(void *f, char *b, int m, size_t n) { return setvbuf(kl_host_file(f), b, m, n); }
 
 // ---------- sockets: bionic -> Darwin option constants ----------

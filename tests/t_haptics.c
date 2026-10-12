@@ -277,9 +277,19 @@ int main(void) {
         CHECK(s.queued >= 30 && s.queued <= 32, "%d queued after a 32-sample PCM push",
               s.queued);
         CHECK(get_state(LTOUCH).queued == 0, "the PCM push reached the OTHER hand");
-        nap(0.09);
+        // A THIRD of the way in, not ninety percent of the way in. 32 samples
+        // at 320 Hz is a 100 ms clip, so the old `nap(0.09)` read the ramp 90 ms
+        // into its own 100 ms and then asserted the level was still under 0.99 —
+        // a margin of ten milliseconds of scheduling jitter, on a check that is
+        // about neither scheduling nor jitter. It failed about one run in twelve,
+        // which in the DEFAULT gate is worse than no check at all: it teaches
+        // the reader to re-run instead of to look. 30 ms is what the assertion's
+        // own wording already claimed, and it lands near 0.3 with room on both
+        // sides. (A change in static data layout that shifted first-touch page
+        // faults was enough to make it fail visibly.)
+        nap(0.03);
         CHECK(kl_ovrp_haptics_pull(1, &amp, &secs), "no level out of a PCM clip");
-        printf("  pcm: level %.2f from the ramp's first 90 ms\n", (double)amp);
+        printf("  pcm: level %.2f from the ramp's first 30 ms\n", (double)amp);
         CHECK(amp > 0.0f && amp < 0.99f, "a ramp's first third came out at %.2f",
               (double)amp);
 

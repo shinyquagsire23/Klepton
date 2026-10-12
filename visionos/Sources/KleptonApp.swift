@@ -113,6 +113,16 @@ enum Immersive {
 enum Lifecycle {
     static func scenePhaseChanged(to phase: ScenePhase) {
         NSLog("[app] scene phase -> \(phase)")
+        // The crown press delivers .inactive at once but .background only when
+        // the system gets round to it (measured ~30 s). The music belongs to
+        // the immersive moment: go silent on the first, and still exit on the
+        // second. .active restores — the boot transition passes through a
+        // 2 s .inactive on the way in, which this round-trips harmlessly.
+        switch phase {
+        case .inactive: KleptonAudio.setSilenced(true)
+        case .active:   KleptonAudio.setSilenced(false)
+        default: break
+        }
         // Coming back is the audio's cue, and it needs one: this OS silently
         // stops calling CoreAudio's render callback across a scene transition —
         // the boot window being closed while the immersive space runs is one,

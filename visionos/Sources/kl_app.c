@@ -16,6 +16,7 @@
 #include "kl_egl.h"
 #include "kl_driver.h"    // the guest's own sequences, shared with build/m_boot
 #include "kl_audio.h"     // kl_audio_set_latency_ms — streamed audio needs a deeper buffer
+#include "kl_opensl.h"    // kl_opensl_heartbeat — the live audio census in the [hb] loop
 #include "kl_ovrp.h"      // kl_ovrp_set_frame_pacer — the OVRPlugin frame clock
 #include "kl_openxr.h"    // kl_openxr_set_frame_pacer — the OpenXR one
 #include "kl_slink.h"
@@ -359,6 +360,26 @@ int kl_app_configure(const char *resources, const char *container) {
     // stopped — and a device is slower to reach its first frame than the host.
     kl_driver_set_alarm(kl_env_int("KL_ALARM", 120));
 
+    // The two PCM captures (kl_audio.h, KL_AUDIO_DUMP / KL_AAUDIO_DUMP) are off
+    // unless set. A bare filename resolves against the data container, which is
+    // the one directory `devicectl device copy from` can read back — see
+    // visionos/pull_audio.sh:
+    //
+    //   KL_AUDIO_DUMP=klepton-audio-out.wav KL_AAUDIO_DUMP=klepton-audio-guest.wav
+    //
+    // These two name a FILE, not a directory, so they get the container prefix
+    // without the mkdir the loop above does — an mkdir here would create a
+    // directory exactly where the file needs to be written.
+    static const char *const cap_files[] = { "KL_AUDIO_DUMP", "KL_AAUDIO_DUMP" };
+    for (size_t i = 0; i < sizeof cap_files / sizeof *cap_files; i++) {
+        const char *v = getenv(cap_files[i]);
+        if (!v || !*v || *v == '/') continue;
+        char abs[1200];
+        snprintf(abs, sizeof abs, "%s/%s", container, v);
+        setenv(cap_files[i], abs, 1);
+        printf("[app] %s is relative — resolved to %s\n", cap_files[i], abs);
+    }
+
     // ...and the app uses it by default. KL_GLFB stays opt-IN for the host,
     // where the null driver is a legitimate answer — `make check` and every
     // lifecycle loop run on it, and the reference renderer is a deliberate
@@ -483,6 +504,11 @@ static void *heartbeat(void *arg) {
             fflush(stderr);
             last_phase = phase;
         }
+        // Every 10 s, a quarter as often as the memory line: whether the guest
+        // is feeding the audio stream and whether what it feeds is silence. The
+        // end-of-run report never prints on a headset (the app is killed, not
+        // exited), so this is the only audio census a device log carries.
+        if (ticks % 40 == 0) { kl_opensl_heartbeat(stderr); fflush(stderr); }
         ticks++;
         struct timespec iv = { 0, 250000000 };  // nanosleep: usleep is EINVAL at >= 1e6
         nanosleep(&iv, NULL);

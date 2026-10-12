@@ -1242,6 +1242,38 @@ final class KleptonControllers {
     /// queue.
     private var hapticEngine: [Int: CHHapticEngine] = [:]
     private var hapticPlayer: [Int: CHHapticAdvancedPatternPlayer] = [:]
+    /// **Every CoreHaptics call runs here and only here — never on the
+    /// compositor thread.** `CHHapticEngine` creation, `start`, `stop` and the
+    /// players are all synchronous XPC round-trips into gamecontrollerd, and
+    /// gamecontrollerd dies: a physical knock on a Sense controller took it
+    /// down mid-session, and the lazy engine rebuild then parked the
+    /// compositor thread inside `xpc_connection_send_message_with_reply_sync`
+    /// waiting on the dead daemon. No frames were submitted, and ~2 s later
+    /// the system killed the frozen immersive app (SIGKILL, namespace 0x28 =
+    /// WAKEBOARD). Haptics are a luxury; frames are life. The compositor hands
+    /// levels over `hapticsQueue` and never waits for it.
+    private let hapticsQueue = DispatchQueue(label: "klepton.haptics", qos: .userInitiated)
+    /// Per hand: is a work item still in flight on `hapticsQueue`? Guarded by
+    /// `lock`. While the queue is wedged in XPC the compositor skips the hand's
+    /// haptics for the frame instead of queueing a backlog behind the hang.
+    private var hapticsBusy = [false, false]
+    /// How many frames of envelope were dropped because the queue was still in
+    /// flight, and the worst single CoreHaptics call this run took. Guarded by
+    /// `lock` (the worst is written from the haptics queue, read from the
+    /// compositor). These are the only running measure of how close the frame
+    /// loop came to the 2-second compositor watchdog before this queue existed
+    /// — a run with a 900 ms worst call is a run that would have died.
+    private var hapticDropped: UInt64 = 0
+    private var hapticWorstMs: Double = 0
+    /// Below this a slow call is not worth a line; the report is for stalls.
+    private static let hapticSlowMs: Double = 50
+    /// Engine-rebuild backoff, per hand, guarded by `lock`. gamecontrollerd
+    /// coming apart looks like up → stopped → up → stopped once a second; each
+    /// failed life doubles the wait before the next rebuild is even attempted,
+    /// and an engine that survived a while earns a clean slate.
+    private var hapticRetryAt: [TimeInterval] = [0, 0]
+    private var hapticBackoff: [TimeInterval] = [0, 0]
+    private var hapticEngineUpAt: [TimeInterval] = [0, 0]
     /// Per hand: is the player started, is it paused, when did it last go
     /// silent, and the burst being logged.
     private var hapticRunning = [false, false]
@@ -1297,12 +1329,47 @@ final class KleptonControllers {
             guard Self.hapticsEnabled else { continue }
             let level = live ? min(max(amplitude * Self.gain, 0), 1) : 0
             traceBurst(hand: hand, level: level, at: now)
-            if Self.pulseMode || hapticPulseMode[hand] {
-                if level > 0 { playPulse(hand: hand, level: level, seconds: seconds) }
-            } else {
-                drive(hand: hand, level: level, at: now)
+            // Hand the level to the haptics queue without ever waiting on it.
+            // If the previous item is still in flight (the queue is inside an
+            // XPC call — possibly a hung one), this frame's level is dropped
+            // for that hand: a stale envelope sample costs nothing, a queued
+            // backlog behind a hang costs the actuator playing history, and
+            // waiting costs the process (see `hapticsQueue`).
+            lock.lock()
+            let busy = hapticsBusy[hand]
+            if !busy { hapticsBusy[hand] = true }
+            lock.unlock()
+            guard !busy else { lock.lock(); hapticDropped &+= 1; lock.unlock(); continue }
+            hapticsQueue.async { [self] in
+                let t0 = CACurrentMediaTime()
+                if Self.pulseMode || hapticPulseMode[hand] {
+                    if level > 0 { playPulse(hand: hand, level: level, seconds: seconds) }
+                } else {
+                    drive(hand: hand, level: level, at: now)
+                }
+                let ms = (CACurrentMediaTime() - t0) * 1000
+                lock.lock()
+                hapticsBusy[hand] = false
+                if ms > hapticWorstMs { hapticWorstMs = ms }
+                lock.unlock()
             }
         }
+    }
+
+    /// What the haptics path cost this window, for the present-order census.
+    /// nil when there is nothing to say, so a run whose haptics never stalled
+    /// costs no line. The point of the line is the counterfactual: every
+    /// millisecond here would have been a millisecond of frozen frame loop
+    /// before the calls moved off it.
+    func hapticsSummary() -> String? {
+        lock.lock()
+        let dropped = hapticDropped
+        let worst = hapticWorstMs
+        lock.unlock()
+        guard dropped != 0 || worst >= Self.hapticSlowMs else { return nil }
+        return String(format: "haptics: worst CoreHaptics call %.0f ms, "
+                      + "%llu frame(s) of envelope dropped while it was busy "
+                      + "(the frame loop was never blocked)", worst, dropped)
     }
 
     /// The continuous path: hold one looping player per hand and move its
@@ -1419,8 +1486,16 @@ final class KleptonControllers {
     }
 
     private func hapticsEngine(for hand: Int) -> CHHapticEngine? {
-        lock.lock(); let existing = hapticEngine[hand]; lock.unlock()
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        let existing = hapticEngine[hand]
+        let retryAt = hapticRetryAt[hand]
+        lock.unlock()
         if let existing { return existing }
+        // In backoff after a failed or short-lived engine: don't knock on
+        // gamecontrollerd again yet. Creation is the call that blocks hardest
+        // when the daemon is down, and a daemon mid-crash answers nobody.
+        if now < retryAt { return nil }
         guard #available(visionOS 26.0, *) else { return nil }
         guard let device = Self.spatialControllers().first(where: { Self.hand(of: $0) == hand })
         else { return nil }
@@ -1440,6 +1515,7 @@ final class KleptonControllers {
         guard let engine = made else {
             noteHaptics("[cp] haptics: no engine for hand \(hand); "
                         + "localities \(haptics.supportedLocalities)")
+            armHapticsBackoff(hand, at: now)
             return nil
         }
         engine.stoppedHandler = { [weak self] reason in
@@ -1457,11 +1533,32 @@ final class KleptonControllers {
         }
         do { try engine.start() } catch {
             noteHaptics("[cp] haptics: hand \(hand) engine would not start: \(error)")
+            armHapticsBackoff(hand, at: now)
             return nil
         }
         NSLog("[cp] haptics: hand \(hand) engine up on \(device.vendorName ?? "?")")
-        lock.lock(); hapticEngine[hand] = engine; lock.unlock()
+        lock.lock()
+        hapticEngine[hand] = engine
+        hapticEngineUpAt[hand] = ProcessInfo.processInfo.systemUptime
+        lock.unlock()
         return engine
+    }
+
+    /// A failed creation, a failed start, or an engine that died young doubles
+    /// the wait before the next rebuild attempt (2 s → 30 s cap). An engine
+    /// that lived ≥ 30 s before dying resets the ladder: that is ordinary
+    /// churn (controller sleep, session handoff), not a daemon coming apart.
+    private func armHapticsBackoff(_ hand: Int, at now: TimeInterval) {
+        lock.lock()
+        if hapticEngineUpAt[hand] != 0, now - hapticEngineUpAt[hand] >= 30 {
+            hapticBackoff[hand] = 0
+        }
+        hapticEngineUpAt[hand] = 0
+        hapticBackoff[hand] = min(max(hapticBackoff[hand] * 2, 2), 30)
+        hapticRetryAt[hand] = now + hapticBackoff[hand]
+        let wait = hapticBackoff[hand]
+        lock.unlock()
+        NSLog("[cp] haptics: hand \(hand) engine rebuild backed off \(Int(wait)) s")
     }
 
     private func dropHapticsEngine(_ hand: Int) {
@@ -1473,7 +1570,13 @@ final class KleptonControllers {
         hapticRunning[hand] = false
         hapticSilentSince[hand] = 0
         lock.unlock()
-        engine?.stop()
+        // A drop is an engine that died on us — count it against the rebuild
+        // ladder so a daemon in a crash loop is not re-knocked every frame.
+        armHapticsBackoff(hand, at: ProcessInfo.processInfo.systemUptime)
+        // `stop` is the same synchronous XPC as everything else in CoreHaptics,
+        // and this is reachable from the provider-rebuild path on the
+        // compositor thread. Queue it; nothing here waits on the result.
+        if let engine { hapticsQueue.async { engine.stop() } }
     }
 
     /// Every engine, for a disconnect or teardown.
@@ -1485,7 +1588,12 @@ final class KleptonControllers {
         hapticRunning = [false, false]
         hapticSilentSince = [0, 0]
         lock.unlock()
-        for (_, e) in engines { e.stop() }
+        // Same rule as `dropHapticsEngine`: the stops are XPC, the caller is
+        // the compositor thread (forgetAccessoryPoses, provider rebuild), and
+        // nobody needs the result — queue them.
+        if !engines.isEmpty {
+            hapticsQueue.async { for (_, e) in engines { e.stop() } }
+        }
     }
 
     /// Once per distinct message. These are all "this device cannot do

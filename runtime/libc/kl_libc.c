@@ -407,6 +407,191 @@ static void stat_to_bionic(const struct stat *d, bionic_stat *b) {
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
 static void kl_fs_trace(const char *op, const char *path, const char *extra, int failed);
 
+// ---------- expansion-file / soundbank probe (always on) ----------
+// Wwise's OBB reader is libzip, linked statically into libAkSoundEngine, and it
+// collapses every failure it can have into ONE guest-visible result:
+// "Failed load Init.bnk with result: AK_FileNotFound". That string is the
+// default return of CAkFileHelpers::OpenFile — the value it holds when the whole
+// location chain (POSIX, APK-via-AAssetManager, OBB-via-libzip) has been walked
+// and nothing opened the file. It cannot distinguish "the .obb would not open"
+// from "the .obb opened and has no such entry", and those two have completely
+// different causes on our side: the first is ours, the second is the guest's
+// idea of the in-zip path.
+//
+// libzip's zip_open() stats the archive before it opens it, so both host calls
+// are visible from here, and logging them splits the two cases outright. This is
+// NOT behind KL_TRACE_FS: a soundbank failure surfaces on a headset launch from
+// the Home View, which carries no environment, and the whole cost is a strrchr
+// on paths the guest opens a few dozen times in a run.
+#define KL_BANK_SEEN 48
+static int kl_is_bank_path(const char *path) {
+    if (!path) return 0;
+    const char *dot = strrchr(path, '.');
+    return dot && (strcmp(dot, ".obb") == 0 || strcmp(dot, ".bnk") == 0 ||
+                   strcmp(dot, ".pck") == 0);
+}
+static void kl_bank_note(const char *op, const char *path, int failed) {
+    if (!kl_is_bank_path(path)) return;
+    // One line per (op, path). A bank tree is re-stat'd constantly; the first
+    // answer for each is the evidence and the rest is noise.
+    static struct { const char *op, *path; } seen[KL_BANK_SEEN];
+    static int n;
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lk);
+    for (int i = 0; i < n; i++)
+        if (seen[i].op == op && strcmp(seen[i].path, path) == 0) {
+            pthread_mutex_unlock(&lk); return;
+        }
+    if (n < KL_BANK_SEEN) { seen[n].op = op; seen[n].path = strdup(path); n++; }
+    pthread_mutex_unlock(&lk);
+    fprintf(stderr, "  [bank] %s(\"%s\") %s%s%s\n", op, path,
+            failed ? "FAILED: " : "ok", failed ? strerror(errno) : "",
+            n >= KL_BANK_SEEN ? "  (probe table full)" : "");
+}
+
+// The open archives, kept HERE and not read back out of kl_file_path()'s
+// registry: that registry is 256 entries deep and shared with every other
+// fopen the guest makes, and a Unity guest can re-open /proc/cpuinfo ~150 times
+// a second during its loading crawl — the registry is full before Wwise has
+// started. Eight slots, bank paths only, is a table that cannot be crowded out.
+//
+// Two rules keep that true:
+//
+//   * Slots are RELEASED at fclose and reused. An append-only table is a
+//     lifetime budget, not a census of what is open now: Unity opens a 622 MB
+//     main obb, mmap()s it through fileno() and closes it, over and over, and
+//     each of those would spend a slot. A slot held past its fclose is also a
+//     trap — stdio hands the freed FILE address to the next fopen, which would
+//     inherit a dead archive's spent budget.
+//   * Four of the eight slots are RESERVED for `Audio_*` archives and cannot be
+//     claimed by anything else, so no amount of main-obb churn can starve the
+//     files the probe exists to watch. An open that finds no slot SAYS SO
+//     instead of going quiet.
+#define KL_BANK_OPEN 8
+#define KL_BANK_AUDIO_SLOTS 4       // slots [0,4) — audio only, never evictable
+// `io_n`/`io_max` are the seek/read trace's budget, and they are PER ARCHIVE
+// rather than global: Unity's own local-header sweep across the first 19 MB of
+// its main obb would otherwise spend a shared budget before Wwise has opened
+// anything. `f == NULL` means the slot is FREE; every slot is walked every time,
+// so a released slot in the middle of the table is reusable.
+static struct { void *f; const char *path; int io_n, io_max; } g_bank_open[KL_BANK_OPEN];
+// The "is any archive open" fast-out for the fread gate: a count of LIVE slots.
+static int g_bank_open_n;
+// The audio archives get the deep budget; every other archive keeps a small
+// allowance, enough to show that it was walked.
+#define KL_BANK_IO_AUDIO 96
+#define KL_BANK_IO_OTHER 16
+static void kl_bank_note_opened(void *f, const char *path) {
+    if (!f || !kl_is_bank_path(path)) return;
+    int audio = strstr(path, "Audio_") != NULL;
+    // Audio archives may take any free slot; everything else is confined to the
+    // tail of the table.
+    int lo = audio ? 0 : KL_BANK_AUDIO_SLOTS;
+    int slot = -1;
+    for (int i = lo; i < KL_BANK_OPEN; i++)
+        if (!g_bank_open[i].f) { slot = i; break; }
+    if (slot < 0) {
+        // Say it — not through kl_bank_note(), whose FAILED branch would print
+        // a stale errno.
+        static int said;
+        if (said++ < 4)
+            fprintf(stderr, "  [bank] NO TRACE SLOT for \"%s\" — this archive's "
+                            "io is UNOBSERVED\n", path);
+        return;
+    }
+    free((void *)g_bank_open[slot].path);
+    g_bank_open[slot].path  = strdup(path);
+    g_bank_open[slot].io_n  = 0;
+    g_bank_open[slot].io_max = audio ? KL_BANK_IO_AUDIO : KL_BANK_IO_OTHER;
+    // `f` is published LAST: it is what every other reader tests, so a slot is
+    // never visible to the io gate while its path is still the previous file's.
+    g_bank_open[slot].f = f;
+    g_bank_open_n++;
+    // The arming line. An archive that is being traced says so at open, so
+    // "no io events" can never be confused with "no trace".
+    if (audio) {
+        const char *base = strrchr(path, '/');
+        fprintf(stderr, "  [bank] trace armed: %s slot=%d budget=%d fd=%d\n",
+                base ? base + 1 : path, slot, g_bank_open[slot].io_max,
+                fileno((FILE *)f));
+    }
+}
+// Called from kl_shim.c's fclose. WHEN an archive is closed is the whole
+// signal: libzip's zip_open() fcloses the file the instant its
+// end-of-central-directory scan fails, and holds it open for the life of the
+// handle when the scan succeeds. So a `[bank] fopen(...obb) ok` with NO fclose
+// behind it means the archive parsed and the fault is downstream of us; the
+// same line WITH an fclose means our stdio answered that scan wrong. The note
+// is printed BEFORE the slot is released so it still names the path.
+void kl_bank_note_close(void *f) {
+    if (!f) return;
+    for (int i = 0; i < KL_BANK_OPEN; i++) {
+        if (g_bank_open[i].f != f) continue;
+        kl_bank_note("fclose", g_bank_open[i].path, 0);
+        g_bank_open[i].f = NULL;        // free the slot; path is kept for reuse
+        if (g_bank_open_n > 0) g_bank_open_n--;
+        return;
+    }
+}
+
+// ---- the seek/read trace on an OPEN archive -------------------------------
+// "fopen ok, no fclose" says the end-of-central-directory scan worked and the
+// fault is downstream — but downstream forks again, and the two halves have
+// nothing to do with each other:
+//
+//   central directory read, then NOTHING     zip_fopen missed the NAME
+//   a seek to the entry's local header, then
+//     a short/failed read                    our stdio broke the DATA path
+//
+// Those are told apart by the OFFSETS. A 3.4 GB audio archive (Batman: Arkham
+// Shadow's) has its central directory and `assets/Android/Init.bnk` both above
+// 2^31; anything on our side that narrows an offset to a signed 32-bit value
+// turns those into negatives, so seeing the real numbers come back out of
+// ftello is the check, not an assumption.
+//
+// Bank FILE*s only, and hard-capped PER ARCHIVE: this is a trace of the first
+// few dozen events on each file, which is where each one's answer is. Off after
+// that, at the cost of one pointer compare.
+static int kl_bank_slot(void *f) {
+    if (!f) return -1;
+    for (int i = 0; i < KL_BANK_OPEN; i++)
+        if (g_bank_open[i].f == f) return i;   // f==NULL slots can never match
+    return -1;
+}
+// The gate the stdio cells test FIRST. Every fread and fseeko the guest makes
+// goes through them, and the trace wants an ftello beside each one — a cost
+// worth paying on the archives still in budget and on nothing else.
+int kl_bank_is_open(void *f) {
+    if (!g_bank_open_n) return 0;
+    int i = kl_bank_slot(f);
+    return i >= 0 && g_bank_open[i].io_n < g_bank_open[i].io_max;
+}
+// `res` is the call's own answer (the new offset, the byte count, 0/-1) and is
+// printed as a signed 64-bit number precisely so a truncation shows as one.
+void kl_bank_note_io(const char *op, void *f, long long a, long long b, long long res) {
+    int i = kl_bank_slot(f);
+    if (i < 0 || g_bank_open[i].io_n >= g_bank_open[i].io_max) return;
+    const char *path = g_bank_open[i].path;
+    const char *base = strrchr(path, '/');
+    int full = ++g_bank_open[i].io_n == g_bank_open[i].io_max;
+    fprintf(stderr, "  [bank] %s(%s, %lld, %lld) -> %lld%s\n", op, base ? base + 1 : path,
+            a, b, res, full ? "  (io trace full for this archive)" : "");
+}
+// The FILE* behind an open archive's fd, so klb_fstat can report the SIZE the
+// guest is told AGAINST THE RIGHT NAME. libzip's file source fstat()s the
+// handle to learn where the archive ends and scans backwards from there for the
+// EOCD; a size that came back truncated would send that scan into the middle of
+// the file. Not memoised: descriptor numbers are recycled the moment an archive
+// closes, and the table is eight entries.
+void *kl_bank_fd_file(int fd) {
+    if (fd < 0) return NULL;
+    for (int i = 0; i < KL_BANK_OPEN; i++) {
+        void *f = g_bank_open[i].f;
+        if (f && fileno((FILE *)f) == fd) return f;
+    }
+    return NULL;
+}
+
 // hl2 (HL2Q3VR): the engine exec's autoexec.cfg at startup, but that file isn't
 // staged, so we serve it synthetically (see klb_fopen). The engine's `exec`
 // enforces a 1 MB cap by STAT'ing the file FIRST — so stat must report the
@@ -675,6 +860,7 @@ int klb_stat(const char *p, bionic_stat *b)  { char kp[1024]; const char *q = kl
                                                    }
                                                }
                                                kl_fs_trace("stat", p, NULL, r != 0);
+                                               kl_bank_note("stat", p, r != 0);
                                                if (!r) stat_to_bionic(&s, b); return r; }
 int klb_lstat(const char *p, bionic_stat *b) { char kp[1024]; const char *q = kl_guest_path(p, kp, sizeof kp);
                                                struct stat s; int r = lstat(q, &s);
@@ -687,7 +873,13 @@ int klb_fstat(int fd, bionic_stat *b)        { long long osz; int handled;
                                                    stat_to_bionic(&s, b); return 0;
                                                }
                                                struct stat s; int r = fstat(fd, &s);
-                                               if (!r) stat_to_bionic(&s, b); return r; }
+                                               if (!r) stat_to_bionic(&s, b);
+                                               // libzip learns where an archive ENDS from here.
+                                               void *bf = kl_bank_fd_file(fd);
+                                               if (bf)
+                                                   kl_bank_note_io("fstat", bf, fd, 0,
+                                                                   r ? -1 : (long long)b->st_size);
+                                               return r; }
 // ---------- statfs ----------
 // bionic/LP64's struct statfs is 120 bytes of uint64_t; Darwin's is a different
 // shape entirely (32-bit f_bsize, two embedded 1024-byte path strings). Never
@@ -1725,6 +1917,8 @@ FILE *klb_fopen(const char *path, const char *mode) {
         }
     }
     kl_fs_trace("fopen", path, mode, f == NULL);
+    kl_bank_note("fopen", path, f == NULL);
+    kl_bank_note_opened(f, path);
     if (f) kl_file_note(f, path);
     // /proc/cpuinfo gets re-read ~150x/s during the loading crawl — log the
     // caller once so the polling site is an address, not a rumour.
@@ -2719,6 +2913,13 @@ void *klb_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     if (kl_file_watch && p != MAP_FAILED && fd >= 0)
         kl_file_watch("mmap", NULL, fd, p, len, (long long)off,
                       __builtin_return_address(0));
+    // An archive read through a mapping makes NO stdio calls, so without this
+    // the bank trace reports an open file that never moved: whoever maps an obb
+    // is reading it somewhere the fread cell will never see.
+    if (p != MAP_FAILED && fd >= 0) {
+        void *bf = kl_bank_fd_file(fd);
+        if (bf) kl_bank_note_io("mmap", bf, (long long)off, (long long)len, (long long)(uintptr_t)p);
+    }
     return p;
 }
 
@@ -3103,6 +3304,7 @@ int klb_madvise(void *a, size_t n, int advice) {
 void kl_fs_trace_open(const char *path, int flags, int fd) {
     (void)flags;
     kl_fs_trace("open", path, NULL, fd < 0);
+    kl_bank_note("open", path, fd < 0);
     if (kl_file_watch && fd >= 0) kl_file_watch("open", path, fd, NULL, 0, 0, NULL);
 }
 

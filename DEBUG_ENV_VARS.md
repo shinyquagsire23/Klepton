@@ -1684,8 +1684,8 @@ The composite/timewarp pass — one file, compiled by both compositors
 
 ## Audio (`runtime/media/kl_audio.c`)
 
-The CoreAudio output sink behind `kl_opensl.c`'s buffer queue (which itself
-reads no knobs).
+The CoreAudio output sink behind `kl_opensl.c`'s buffer queue and
+`kl_aaudio.c`'s streams.
 
 - `KL_AUDIO=0` — no CoreAudio device at all: the OpenSL feeder goes back to
   pacing each buffer with `usleep` and dropping it, which is what this runtime
@@ -1694,8 +1694,14 @@ reads no knobs).
   since it defaults on.
 - `KL_AAUDIO_BURST=<frames>` — the frames-per-callback the AAudio surface
   (`runtime/media/kl_aaudio.c`) reports and asks the guest's data callback to fill.
-  Default 240, which is 5 ms at 48 kHz and the unit Steam Link's own jitter
-  buffer is configured in multiples of. Clamped to 32..8192. AAudio is a *pull*
+  Default **256** (`KL_AUDIO_NATIVE_FRAMES` in `kl_audio.h`), the same number
+  the guest is told through `AudioManager.getProperty(OUTPUT_FRAMES_PER_BUFFER)`.
+  It must be a size that divides the guest mixer's block: Wwise renders in
+  1024-frame blocks and serves a pull out of the block it has, so at 240 every
+  fifth callback came back with 64 lit frames and 176 zeros — a 40 Hz gate on
+  the music that also ran it ~15% slow. `KL_AAUDIO_BURST=240` restores that for
+  an A/B. A guest's own `setFramesPerDataCallback` still wins. Clamped to
+  32..8192. AAudio is a *pull*
   API, unlike OpenSL's buffer queue, so this is the size of every call INTO the
   guest; the device is still the clock, because the feeder paces on
   `kl_audio_write`. There is no knob for the input direction: capture streams
@@ -1706,7 +1712,31 @@ reads no knobs).
   rather than merely that something is: counts and peak levels cannot tell
   music from a wrong resample ratio or swapped channels. Records what the
   producer accepted, contiguously, so pauses are elided and the file is
-  shorter than the run.
+  shorter than the run. It arms on the first buffer that carries signal (not
+  the boot window's silence), records `KL_AUDIO_DUMP_S` seconds, then patches
+  its own header and closes — a headset run is killed, never exited, so a file
+  that only became valid at exit would never be playable.
+- `KL_AAUDIO_DUMP=<path>` — the same capture at the GUEST end: each AAudio
+  stream's callback bytes as delivered, at the guest's own rate, before the sink
+  resamples or arbitrates. Compare the two files: damage present in both is the
+  guest's (or the format it was handed); damage only in `KL_AUDIO_DUMP` is ours.
+  On visionOS a bare filename for either resolves against the app's data
+  container; `visionos/pull_audio.sh` copies both off the headset.
+- `KL_AUDIO_DUMP_S=<n>` — seconds either capture records (default 20, clamped
+  0..300; `0` disables both).
+- `KL_AAUDIO_HOLE_DROP=<n>` / `KL_AAUDIO_SEAM_WAIT_MS=<ms>` /
+  `KL_AAUDIO_SEAM_LEAD_MS=<ms>` — the block-seam handling in the AAudio feeder,
+  **on by default** (32 / 12 / 30). A copy-callback guest (Wwise) hands back
+  its mixer block and then an empty buffer while its own thread mixes the next
+  one; playing that empty buffer is a 5 ms hole per block and makes the music
+  run behind the wall clock. The feeder instead waits for the next block out of
+  the sink's lead (`kl_audio_lead_ms`), bounded by the wait budget, a lead floor
+  below which it never waits, and "the stream was lit within the last 100 ms"
+  so a genuinely silent stream paces exactly as before. `KL_AAUDIO_HOLE_DROP=0`
+  plays every empty buffer; `KL_AAUDIO_SEAM_WAIT_MS=0` drops and re-pulls with no
+  wait (which measurably does not help — the mixer needs wall time, not pulls).
+  The census line `[aaudio]   seams: N waited (M resolved, ...)` says whether
+  it is engaged.
 - `KL_AUDIO_LATENCY_MS=<n>` — how much audio the ring aims to hold (default
   80, clamped 10..500). This is the whole latency budget — the ring itself is
   a second long so a hiccup cannot wrap it, but the *fill target* is what the
@@ -1722,6 +1752,43 @@ reads no knobs).
   for a head-mounted listener, and visionOS otherwise pans it a second time
   into a sound stage anchored to the app's scene — which is the sound following
   the window. Turn this on only to A/B that.
+- `KL_AUDIO_REPORT_SECS=<n>` — print `kl_audio_report` every n seconds during
+  the run (default 15; `0` disables). The exit report never runs on hardware —
+  a headset app is killed, not exited — so this is the only place a device log
+  says whether the guest's PCM was ever anything but zero. Grep `[au] --- live`;
+  each AAudio stream appends its own census (burst, all-zero callbacks, zero-run
+  histogram with a PERIODIC/CLUMPED verdict, `PARTIAL FILLS` / `partial fills:
+  none`, OUTPUT silent %, seams). The watchdog's own line and `restart ok` are
+  rate-limited to one every five seconds (with a count of what went unsaid),
+  because a stream that alternates healthy/unhealthy printed 4,746 of them in
+  one run; and the watchdog names WHICH condition fired — "the render callback
+  has stopped" (the OS took the stream) against "the unit is not running" (it
+  was stopped underneath us).
+- `KL_AUDIO_SOURCE=<name>` / `KL_AUDIO_MIX_SOURCES=1` / `KL_AUDIO_STEAL_MS=<n>`
+  — **which guest audio backend owns the one output.** A title can bring up two
+  and run both: Tetris Effect gives UE4's own Android mixer an OpenSL ES
+  buffer-queue player at 44100 Hz *and* Wwise an AAudio stream at 48000 Hz, and
+  on hardware they are live together for the whole run. Everything under
+  `kl_audio_write` is single-producer by construction — one ring with a
+  non-atomic write cursor, one resampler position, one `realloc`'d scratch
+  buffer — so two of them meant a racing cursor, a scratch buffer reallocated
+  under a thread reading it, each backend resampled at whichever ratio the
+  other's `open()` last installed, and (because a ring draining at 48 kHz cannot
+  accept two 48 kHz streams) each producer blocked half the time while the
+  other's buffers were interleaved into the same output: constant stutter.
+  So the sink picks ONE owner: the first source to produce a **non-silent**
+  buffer. Silence never claims — the silent backend is also the one that spins
+  up first there, because everything audible goes through Wwise — and the claim
+  is revocable after `KL_AUDIO_STEAL_MS` (default 2000) of owner silence, so a
+  wrong guess costs two seconds instead of the run. Non-owners are paced for
+  their own buffer's duration and dropped, which keeps their mixer's clock
+  honest and stops it wedging. `KL_AUDIO_SOURCE=opensl` or `=aaudio` forces the
+  choice outright. `KL_AUDIO_MIX_SOURCES=1` restores the unarbitrated
+  free-for-all for an A/B — that is the configuration that stuttered.
+  The `[au]` report breaks its counts down per backend (`source '<name>' ...
+  OWNS the output` / `paced and dropped`), and a DROPPED source that is
+  producing audible audio says so once, because that is the one case this
+  design gets wrong and it would mean the sink needs a real mixer.
 - `KL_AUDIO_WATCHDOG=0` — stop the independent watchdog thread from running.
   **On by default, and it is the thing that keeps audio alive on visionOS.**
   This OS silently stops calling CoreAudio's render callback across a scene
@@ -1738,7 +1805,33 @@ reads no knobs).
   restarts anyway (default 3000). `.began` without `.ended` is a documented
   hazard on this OS family and used to be silence for the rest of the run,
   because the write loop breaks out of its spin *before* the watchdog on that
-  flag. Raise it if a real interruption is being fought over.
+  flag. Raise it if a real interruption is being fought over. A DELIBERATE
+  silence is exempt: when the scene goes `.inactive` or the compositor's render
+  loop ends (a Digital Crown press), `KleptonAudio.setSilenced` deactivates the
+  session and latches `kl_audio_set_silenced(1)`, and neither this escape nor
+  the route-change/interruption recoveries resume the stream until `.active`
+  clears it — otherwise the music kept playing for the ~30 s visionOS takes to
+  background the app.
+
+Log lines that show the audio path is live (no knobs): `[sl] audio player:
+<rate> Hz, <ch> ch, <bits> bit, <fmt>` and `[aaudio] openStream: ...` (with
+`the builder asked for: ...` under it) name each backend and its parsed sample
+format; `[au] CoreAudio out: guest <rate> Hz/<ch> ch/<fmt> -> device ...` is
+the sink opening; `[au] '<name>' (...) now owns the output` is arbitration;
+`[sl] heartbeat: ...` followed by `[au] heartbeat: ...` prints every 10 s from
+the app's `[hb]` loop. `[sl] GetConfiguration("...") -> N` shows the OpenSL
+Android configuration interface answering (it used to refuse every key, which
+oboe's OpenSL open treats as fatal — Wwise then reports "Unsupported format").
+`[aaudio] no <name> — answering NULL` names an optional AAudio entry point the
+guest probed and we do not serve.
+
+Soundbank / expansion-file I/O (`kl_libc.c`, always on, no knob): `[bank]`
+lines record the first stat/open/fopen/fclose of each `.obb`/`.bnk`/`.pck`
+path, and for open archives (four slots reserved for `Audio_*` archives) the
+first few dozen fread/fseek/ftello/fstat/mmap calls with their 64-bit offsets.
+`fopen(...obb) ok` with no `fclose` behind it means libzip parsed the archive
+and a Wwise `AK_FileNotFound` is downstream of the runtime; the same line WITH
+an `fclose` means our stdio answered the end-of-central-directory scan wrong.
 
 ## x18 (`runtime/kl_x18.c`)
 
@@ -2344,6 +2437,20 @@ written down is a value found twice.
   purely "is the buzzing the guest's, or ours". Playback is CoreHaptics on a
   `GCDeviceHaptics` engine per hand; **hands cannot be vibrated**, so a
   hand-tracked run drains the queue and drops it.
+
+  Every CoreHaptics call (engine creation, `start`, `stop`, the players) is a
+  synchronous XPC round trip into gamecontrollerd, and gamecontrollerd can die
+  mid-session (a physical knock on a Sense controller did it); each call then
+  blocks for a one-second XPC timeout. visionOS kills an immersive app whose
+  `cp_layer_renderer_t` has not submitted a frame for 2.0 s — no crash report,
+  only `wakeboardd: killing [<pid>] because it hasn't been sending frames for
+  2.0s` in the system log. So none of those calls run on the compositor
+  thread: they go to a serial `klepton.haptics` queue, one update in flight per
+  hand (a busy queue drops that frame's level rather than queueing a backlog),
+  and engine rebuilds back off 2 s doubling to 30 s after a failed or
+  short-lived engine (`[cp] haptics: hand N engine rebuild backed off N s`).
+  When anything stalled, every 10 s the compositor prints `[cp] haptics: worst
+  CoreHaptics call N ms, N frame(s) of envelope dropped while it was busy`.
 - `KL_HAPTICS_GAIN=<0..1>` — scales every pulse's intensity. Default **0.25**,
   which is ALVR's own PSVR2 scale (it uses 0.7 for everything else): the Sense
   actuators are strong enough that a guest amplitude of 1.0 played at full

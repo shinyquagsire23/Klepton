@@ -1439,6 +1439,7 @@ final class KleptonCompositor {
         var presented = 0
         var iterations = 0
         var nextReport = Date()
+        var nextHapticsReport = Date().addingTimeInterval(10)
         NSLog("[cp] render loop entered (startup frame-trace on; build has fence content-gate + diag)")
         loop: while true {
             switch layerRenderer.state {
@@ -1482,10 +1483,22 @@ final class KleptonCompositor {
                       + (noFence ? " (NOFENCE)" : ""))
                 NSLog("[cp] \(cadenceSummary())")
                 NSLog("[cp] \(stageSummary())")
+                // The haptics queue's own census, every 10 s and only when it
+                // has something to say (see KleptonControllers.hapticsQueue).
+                if Date() >= nextHapticsReport {
+                    nextHapticsReport = Date().addingTimeInterval(10)
+                    if let h = controllers.hapticsSummary() { NSLog("[cp] \(h)") }
+                }
             }
         }
         NSLog("[cp] render loop ended after \(presented) presented frames, "
               + "\(iterations) iterations, state=\(String(describing: layerRenderer.state))")
+        // The crown press invalidates the layer with NO scenePhase change at
+        // all (measured on device: none fires), and the system then takes
+        // ~30-60 s to background the process — which is when Lifecycle exits.
+        // Go silent the moment the picture is gone, not when the OS gets to
+        // it; the guest may keep rendering until the join below.
+        KleptonAudio.setSilenced(true)
         // Ends the guest's loop and joins it, so its report — which is the
         // lifecycle report, and belongs to the guest's end of the run rather than
         // to this one — has been written before this returns.
