@@ -118,6 +118,16 @@ static int klf_readable(const void *p, size_t n) {
     return (vm_address_t)(uintptr_t)p + n <= start + sz;
 }
 
+// The handler's env knobs, read ONCE in kl_fault_install. Never getenv from
+// the handler: libc's environ lock is an os_unfair_lock, and a fault taken
+// while the faulting thread holds it (any getenv / ProcessInfo.environment
+// caller — Batman: Arkham Shadow died this way inside strdup under the
+// compositor's per-frame environment read) re-locks it recursively, which
+// aborts with no report at all. Set them before launch; a later setenv is not
+// seen.
+static int g_fault_peek = 16;    // KL_FAULT_PEEK, clamped to 16..512
+static int g_fault_wait;         // KL_FAULT_WAIT
+
 // This has to survive being called in a broken process, so it uses write(2)
 // rather than stdio and does not attempt a symbolised backtrace.
 static volatile unsigned long g_x18_recoveries;
@@ -359,9 +369,8 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // bigger one is for the question "is this object live or is it freed memory
     // somebody else has since written" — that needs the shape of the whole
     // object, not its first word.
-    int want = kl_env_int("KL_FAULT_PEEK", 16);
-    if (want < 16) want = 16;
-    if (want > 512) want = 512;
+    // Read at install (g_fault_peek above), already clamped.
+    int want = g_fault_peek;
     if (uc) {
         const uint64_t *x = (const uint64_t *)uc->uc_mcontext->__ss.__x;
         for (int i = 0; i < 29; i++) {
@@ -493,7 +502,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // AGX abort is masked when the guest runs *under* lldb from the start (the
     // debugger's signal traffic serializes the run enough to avoid the race),
     // so the only way to get a symbolicated look at it is post-mortem attach.
-    if (kl_env_on("KL_FAULT_WAIT", 0)) {
+    if (g_fault_wait) {
         n = snprintf(buf, sizeof buf,
                      "[klepton] KL_FAULT_WAIT: pid %d parked on signal %d — "
                      "attach with `lldb -p %d`, then `bt all`\n", getpid(), sig,
@@ -525,6 +534,13 @@ void kl_fault_install(void) {
     static int done;
     if (done) return;
     done = 1;
+    // Every env knob the handler uses, read here and never inside it (see
+    // g_fault_peek).
+    int peek = kl_env_int("KL_FAULT_PEEK", 16);
+    if (peek < 16) peek = 16;
+    if (peek > 512) peek = 512;
+    g_fault_peek = peek;
+    g_fault_wait = kl_env_on("KL_FAULT_WAIT", 0);
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = report_fault;

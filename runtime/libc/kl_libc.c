@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <signal.h>
+#include <utime.h>
 #include <setjmp.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -36,6 +37,7 @@
 int getentropy(void *buf, size_t buflen);
 #endif
 #include <wchar.h>
+#include <wctype.h>
 #include <ctype.h>
 #include "klepton.h"
 #include "guest/kl_obbmap.h"
@@ -129,13 +131,60 @@ int kl_errno_from_linux(int e) {
 
 // bionic spells it __errno(), and it returns the *location* rather than the
 // value — so the translation has to be staged through a per-thread slot that is
-// refreshed on every call. Reads are what matter and they are always fresh; a
-// guest that writes here (errno = 0 before a call) sets the slot, and the next
-// read re-derives from Darwin's real errno anyway.
-static _Thread_local int g_guest_errno;
+// refreshed on every call.
+//
+// A GUEST WRITE HAS TO SURVIVE THE NEXT CALL. The slot used to be re-derived
+// from Darwin's errno unconditionally, which threw away every value the guest
+// stored itself the moment it asked for the location again — and the common
+// save/restore idiom does exactly that:
+//
+//     *__errno() = EEXIST;          // a guest's own libc-like code failing
+//     int saved = *__errno();       // ...save it across an unlock
+//     pthread_mutex_unlock(&m);
+//     *__errno() = saved;
+//
+// read back Darwin's stale errno instead of EEXIST (the Half-Life: Alyx launcher's
+// SysV-semaphore self-test failed on precisely this and refused to start the
+// game). So the refresh now asks WHO wrote last. If
+// Darwin's errno moved since the slot was filled, a host call failed in
+// between and its value wins (translated); if it did not and the slot no
+// longer holds what was filled, the guest wrote it, and that value is kept —
+// and pushed down to Darwin's errno, so a host function that reads errno (the
+// strtol family's callers, perror) sees the same thing the guest does.
+//
+// One case stays ambiguous and is resolved for the host: a guest write
+// followed by a host call that fails with exactly the errno the slot was last
+// filled from, with no __errno() call in between, reads as "Darwin did not
+// move" and keeps the guest's value. That needs the same code twice in a row
+// around a guest write, and it is no worse than the old rule, which lost every
+// guest write.
+static _Thread_local int g_guest_errno, g_errno_filled, g_errno_darwin;
 int *klb_errno(void) {
-    g_guest_errno = kl_errno_to_linux(*__error());
+    int d = *__error();
+    if (d == g_errno_darwin && g_guest_errno != g_errno_filled) {
+        *__error() = kl_errno_from_linux(g_guest_errno);        // the guest wrote
+        g_errno_darwin = *__error();
+        g_errno_filled = g_guest_errno;
+        return &g_guest_errno;
+    }
+    g_errno_darwin = d;
+    g_guest_errno = g_errno_filled = kl_errno_to_linux(d);
     return &g_guest_errno;
+}
+
+// Set errno for the guest from inside a shim, in BOTH places it can be read:
+// Darwin's errno (what the next __errno() call re-derives from) and the slot
+// __errno() last handed out. The second is not redundant. bionic declares
+// __errno() __attribute_const__, so a compiler may call it ONCE and keep the
+// pointer across later calls — the Half-Life: Alyx launcher's affinity self-test does exactly
+// that (x19 = __errno() at entry, then syscall(...), then `ldr w8, [x19]`), and
+// a shim that set only Darwin's errno left it reading its own earlier write.
+// Direct forwards cannot do this (Darwin's libc sets its own errno and nothing
+// here runs afterwards); every hand-written shim that fails on purpose can.
+void kl_errno_set(int darwin_errno) {
+    *__error() = darwin_errno;
+    g_errno_darwin = darwin_errno;
+    g_guest_errno = g_errno_filled = kl_errno_to_linux(darwin_errno);
 }
 
 extern char **environ;
@@ -352,8 +401,24 @@ void klb_sysprop_read(const void *p, char *n, char *v) {
     if (v) klb_sysprop_get(prop, v);
 }
 int  klb_prctl(int op, ...)                  { (void)op; return 0; }
+// Every CPU the guest is told it has (kl_cpu_count — the same number
+// sysconf(_SC_NPROCESSORS_*) and /proc/cpuinfo give), and NO others. It used to
+// set every bit of the caller's buffer, which describes 8*sz CPUs — a machine
+// that does not exist, and one a caller that checks the mask against the count
+// catches: the Half-Life: Alyx launcher's affinity self-test requires the bits past
+// the last CPU to be zero ("zero-tail=1"). bionic's wrapper zeroes the tail
+// past what the kernel wrote in the same way.
+long kl_cpu_count(void);             // below, with sysconf
+static void kl_affinity_mask(void *m, size_t sz) {
+    memset(m, 0, sz);
+    long n = kl_cpu_count();
+    for (long i = 0; i < n && (size_t)(i / 8) < sz; i++)
+        ((unsigned char *)m)[i / 8] |= (unsigned char)(1u << (i % 8));
+}
 int  klb_sched_getaffinity(int p, size_t sz, void *m) {
-    (void)p; if (m && sz) memset(m, 0xFF, sz);       // pretend every CPU is available
+    (void)p;
+    if (!m || !sz) { errno = EINVAL; return -1; }
+    kl_affinity_mask(m, sz);
     return 0;
 }
 int  klb_sched_setaffinity(int p, size_t sz, const void *m) { (void)p;(void)sz;(void)m; return 0; }
@@ -377,6 +442,45 @@ int  klb___sched_cpucount(size_t sz, const void *m) {
 // sigset was built for.
 int  klb___libc_current_sigrtmin(void) { return 35; }
 int  klb___libc_current_sigrtmax(void) { return 64; }
+
+// The rest of the scheduler family, which UE4.27 (Deadpool) imports where the
+// earlier titles stopped at the affinity calls. Darwin has no
+// sched_setscheduler at all and nothing here runs with the privileges a real
+// SCHED_FIFO would need, so the setter is the usual attr-setter answer —
+// accept, change nothing, report success, same as klb_prctl. The getter
+// reports SCHED_OTHER (0), which is the truth: every thread in this process
+// is on the normal policy, and 0 is the value an unprivileged caller on
+// Android would see for one too.
+int  klb_sched_setscheduler(int pid, int policy, const void *param) {
+    (void)pid; (void)policy; (void)param; return 0;
+}
+int  klb_sched_getscheduler(int pid) { (void)pid; return 0; }   // SCHED_OTHER
+
+// Linux-only; Darwin has plain nanosleep. TIMER_ABSTIME is mapped to a
+// relative sleep measured against the SAME clock (kl_clock_to_darwin's
+// mapping, via klb_clock_gettime), so both flag forms work. Two bionic-isms
+// to keep: the return is the errno VALUE rather than -1, and `rem` is written
+// only for a relative sleep interrupted by a signal — writing it for an
+// abstime sleep is the bug POSIX warns about.
+int klb_clock_gettime(int clk, struct timespec *ts);   // defined below
+int klb_clock_nanosleep(int clk, int flags, const struct timespec *req,
+                        struct timespec *rem) {
+    struct timespec rel = *req;
+    if (flags & 1) {                                   // TIMER_ABSTIME
+        struct timespec now;
+        if (klb_clock_gettime(clk, &now) != 0) return errno;
+        rel.tv_sec  = req->tv_sec - now.tv_sec;
+        rel.tv_nsec = req->tv_nsec - now.tv_nsec;
+        if (rel.tv_nsec < 0) { rel.tv_sec--; rel.tv_nsec += 1000000000L; }
+        if (rel.tv_sec < 0) return 0;                  // the deadline already passed
+    }
+    if (nanosleep(&rel, &rel) != 0) {
+        int e = errno;
+        if (e == EINTR && rem && !(flags & 1)) *rem = rel;
+        return e;
+    }
+    return 0;
+}
 
 // ---------- struct stat ----------
 // bionic/aarch64 layout (128 bytes) is unrelated to Darwin's; translate field by field.
@@ -680,6 +784,27 @@ int klb_lstat(const char *p, bionic_stat *b) { char kp[1024]; const char *q = kl
                                                struct stat s; int r = lstat(q, &s);
                                                kl_fs_trace("lstat", p, NULL, r != 0);
                                                if (!r) stat_to_bionic(&s, b); return r; }
+// fstatat was a raw forward, so it wrote DARWIN's struct stat into a bionic
+// buffer and handed Darwin the Linux flag bits — AT_SYMLINK_NOFOLLOW is 0x100
+// on Linux and 0x20 here, and 0x100 is not a flag Darwin knows (EINVAL). The
+// Half-Life: Alyx launcher's faccessat self-test measured it: its faccessat is an
+// fstatat(..., AT_SYMLINK_NOFOLLOW) underneath. AT_FDCWD is -100 on Linux, -2
+// here; AT_EMPTY_PATH (0x1000) with an empty path is fstat(dirfd);
+// AT_NO_AUTOMOUNT (0x800) has nothing to do on Darwin.
+int klb_fstat(int fd, bionic_stat *b);
+int klb_fstatat(int dirfd, const char *p, bionic_stat *b, int flags) {
+    if (flags & ~(0x100 | 0x800 | 0x1000)) { errno = EINVAL; return -1; }
+    if ((flags & 0x1000) && p && !*p) return klb_fstat(dirfd, b);
+    if (dirfd == -100) dirfd = AT_FDCWD;
+    char kp[1024];
+    const char *q = kl_guest_path(p, kp, sizeof kp);
+    struct stat s;
+    int r = fstatat(dirfd, q, &s, (flags & 0x100) ? AT_SYMLINK_NOFOLLOW : 0);
+    if (r) kl_errno_set(errno);
+    kl_fs_trace("fstatat", p, NULL, r != 0);
+    if (!r) stat_to_bionic(&s, b);
+    return r;
+}
 int klb_fstat(int fd, bionic_stat *b)        { long long osz; int handled;
                                                if (kl_obbmap_fstat_size(fd, &osz, &handled), handled) {
                                                    struct stat s; memset(&s, 0, sizeof s);
@@ -878,10 +1003,29 @@ long klb_sysconf(int guest_name) {
     case 0x8d: case 0x90: case 0x93: case 0x96: case 0x99:     // *_CACHE_ASSOC
         return 8;                                             // plausible, never a divisor of 0
     }
-    // bionic's _SC_AVPHYS_PAGES (0x63) has no Darwin equivalent and lands here.
-    // -1 is sysconf's own "no such name", which is the truthful answer; the log
-    // line is what keeps it from being a silent zero.
+    // bionic's _SC_AVPHYS_PAGES (0x63): Darwin's sysconf has no such name, but
+    // the quantity exists — bionic answers it as sysinfo().freeram / page size,
+    // i.e. pages that are FREE right now, and Mach reports exactly that count
+    // (vm_statistics64.free_count, in the same page size _SC_PAGESIZE answers).
+    // The Half-Life: Alyx launcher's sysconf self-test requires it to be >= 0
+    // and refuses to start the game otherwise.
+    if (guest_name == 0x0063) {
+        vm_statistics64_data_t vs;
+        mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+        if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                              (host_info64_t)&vs, &cnt) == KERN_SUCCESS) {
+            long v = (long)((uint64_t)vs.free_count * vm_kernel_page_size /
+                            (uint64_t)sysconf(_SC_PAGESIZE));
+            if (kl_env_on("KL_TRACE_SYSCONF", 0))
+                fprintf(stderr, "  [libc] sysconf(_SC_AVPHYS_PAGES) -> %ld\n", v);
+            return v;
+        }
+    }
+    // Anything else is a name this table does not carry. -1 with EINVAL is
+    // sysconf's own "no such name" (bionic sets EINVAL there, and callers test
+    // it); the log line is what keeps it from being a silent failure.
     fprintf(stderr, "[libc] sysconf: no Darwin equivalent for bionic name 0x%x\n", guest_name);
+    errno = EINVAL;
     return -1;
 }
 
@@ -1616,15 +1760,38 @@ static int kl_fs_trace_mode(void) {
     }
     return mode;
 }
+// Every path shim reports here right after its call, so this is also where a
+// FAILURE is published to the guest's errno slot (kl_errno_set) — not only to
+// Darwin's errno. A guest that cached the __errno() pointer and cleared or
+// wrote it before the call otherwise reads its own stale value whenever the
+// failure repeats the errno the slot was last filled from (klb_errno's one
+// ambiguous case): Valve's tier0 Plat_CreateDirectory, run four threads wide
+// by the Half-Life: Alyx launcher's directory self-test, saw 5 such misses in 1,024 calls.
 static void kl_fs_trace(const char *op, const char *path, const char *extra, int failed) {
+    int saved = errno;
+    if (failed) kl_errno_set(saved);
     if (!extra) extra = "";
     int mode = kl_fs_trace_mode();
     if (!mode || (mode == 1 && !failed)) return;
-    if (failed) fprintf(stderr, "[fs] %s(\"%s\", \"%s\") FAILED: %s\n", op, path, extra, strerror(errno));
+    if (failed) fprintf(stderr, "[fs] %s(\"%s\", \"%s\") FAILED: %s\n", op, path, extra, strerror(saved));
     else        fprintf(stderr, "[fs] %s(\"%s\", \"%s\") ok\n", op, path, extra);
+    errno = saved;
 }
 
 void kl_file_note(void *f, const char *path);
+// freopen has fopen's path problem and one of its own: the FILE* it is handed
+// is the GUEST's, so it has to be translated the same way every other stdio
+// entry point here does. The common use is redirecting stdout/stderr to a log,
+// which is exactly what QuakeQuest does with it.
+FILE *klb_freopen(const char *path, const char *mode, void *guest_stream) {
+    KL_GUEST_PATH(path);
+    FILE *hf = kl_host_file(guest_stream);
+    FILE *f = freopen(_p, mode, hf);
+    kl_fs_trace("freopen", path, mode, f == NULL);
+    if (f) kl_file_note(f, path);
+    return f;
+}
+
 FILE *klb_fopen(const char *path, const char *mode) {
     // hl1/cs1: the launcher UI lets the player edit commandline.txt, but the picked
     // game folder can be read-only. When KL_XASH_COMMANDLINE_FILE points at a writable
@@ -1805,6 +1972,87 @@ int klb_mkdir(const char *path, mode_t mode) {
     kl_fs_trace("mkdir", path, NULL, r != 0);
     return r;
 }
+// ---- the rest of the path family ----
+// These were raw forwards, so a guest path (/sdcard/..., /data/...) reached
+// Darwin as written: the Half-Life: Alyx launcher's directory self-test made its directories
+// through the translating mkdir and then failed all five rmdir()s of them
+// (ENOENT on the untranslated spelling). Same shape as the shims above: the
+// path goes through kl_guest_path, the call is Darwin's, and kl_fs_trace
+// publishes a failure to the guest's errno slot. The *at forms also map
+// AT_FDCWD (-100 -> -2) and the Linux AT_* flag bits, which Darwin numbers
+// differently (AT_SYMLINK_NOFOLLOW 0x100 -> 0x20, AT_REMOVEDIR 0x200 -> 0x80).
+#define KL_PATH2(a, b) char _ka[1024], _kb[1024]; \
+    const char *_pa = kl_guest_path((a), _ka, sizeof _ka); \
+    const char *_pb = kl_guest_path((b), _kb, sizeof _kb)
+static int kl_at_fd(int fd) { return fd == -100 ? AT_FDCWD : fd; }
+static int kl_at_flags(int f) {
+    int d = 0;
+    if (f & 0x100) d |= AT_SYMLINK_NOFOLLOW;
+    if (f & 0x200) d |= AT_REMOVEDIR;          // unlinkat; AT_EACCESS for faccessat
+    if (f & 0x400) d |= AT_SYMLINK_FOLLOW;     // linkat
+    return d;
+}
+int klb_rmdir(const char *p)          { KL_GUEST_PATH(p); int r = rmdir(_p); kl_fs_trace("rmdir", p, NULL, r != 0); return r; }
+int klb_remove(const char *p)         { KL_GUEST_PATH(p); int r = remove(_p); kl_fs_trace("remove", p, NULL, r != 0); return r; }
+int klb_chmod(const char *p, mode_t m) { KL_GUEST_PATH(p); int r = chmod(_p, m); kl_fs_trace("chmod", p, NULL, r != 0); return r; }
+int klb_chown(const char *p, uid_t u, gid_t g) { KL_GUEST_PATH(p); int r = chown(_p, u, g); kl_fs_trace("chown", p, NULL, r != 0); return r; }
+int klb_lchown(const char *p, uid_t u, gid_t g) { KL_GUEST_PATH(p); int r = lchown(_p, u, g); kl_fs_trace("lchown", p, NULL, r != 0); return r; }
+int klb_truncate(const char *p, off_t n) { KL_GUEST_PATH(p); int r = truncate(_p, n); kl_fs_trace("truncate", p, NULL, r != 0); return r; }
+int klb_mkfifo(const char *p, mode_t m) { KL_GUEST_PATH(p); int r = mkfifo(_p, m); kl_fs_trace("mkfifo", p, NULL, r != 0); return r; }
+ssize_t klb_readlink(const char *p, char *buf, size_t n) {
+    KL_GUEST_PATH(p); ssize_t r = readlink(_p, buf, n); kl_fs_trace("readlink", p, NULL, r < 0); return r;
+}
+int klb_symlink(const char *target, const char *linkp) {
+    // The target is the link's CONTENT: it is stored translated only when it
+    // names a guest path, so the link resolves on this side as it would there.
+    KL_PATH2(target, linkp); int r = symlink(_pa, _pb); kl_fs_trace("symlink", linkp, target, r != 0); return r;
+}
+int klb_link(const char *a, const char *b) { KL_PATH2(a, b); int r = link(_pa, _pb); kl_fs_trace("link", a, b, r != 0); return r; }
+int klb_utimes(const char *p, const struct timeval *tv) { KL_GUEST_PATH(p); int r = utimes(_p, tv); kl_fs_trace("utimes", p, NULL, r != 0); return r; }
+int klb_utime(const char *p, const void *t) {
+    // struct utimbuf is { time_t actime, modtime } on both.
+    KL_GUEST_PATH(p); int r = utime(_p, (const struct utimbuf *)t); kl_fs_trace("utime", p, NULL, r != 0); return r;
+}
+int klb_unlinkat(int fd, const char *p, int f) {
+    if (f & ~0x200) { kl_errno_set(EINVAL); return -1; }
+    KL_GUEST_PATH(p); int r = unlinkat(kl_at_fd(fd), _p, kl_at_flags(f)); kl_fs_trace("unlinkat", p, NULL, r != 0); return r;
+}
+int klb_mkdirat(int fd, const char *p, mode_t m) {
+    KL_GUEST_PATH(p); int r = mkdirat(kl_at_fd(fd), _p, m); kl_fs_trace("mkdirat", p, NULL, r != 0); return r;
+}
+int klb_fchmodat(int fd, const char *p, mode_t m, int f) {
+    KL_GUEST_PATH(p); int r = fchmodat(kl_at_fd(fd), _p, m, kl_at_flags(f & 0x100)); kl_fs_trace("fchmodat", p, NULL, r != 0); return r;
+}
+int klb_fchownat(int fd, const char *p, uid_t u, gid_t g, int f) {
+    KL_GUEST_PATH(p); int r = fchownat(kl_at_fd(fd), _p, u, g, kl_at_flags(f & 0x100)); kl_fs_trace("fchownat", p, NULL, r != 0); return r;
+}
+ssize_t klb_readlinkat(int fd, const char *p, char *buf, size_t n) {
+    KL_GUEST_PATH(p); ssize_t r = readlinkat(kl_at_fd(fd), _p, buf, n); kl_fs_trace("readlinkat", p, NULL, r < 0); return r;
+}
+int klb_renameat(int fa, const char *a, int fb, const char *b) {
+    KL_PATH2(a, b); int r = renameat(kl_at_fd(fa), _pa, kl_at_fd(fb), _pb); kl_fs_trace("renameat", a, b, r != 0); return r;
+}
+int klb_symlinkat(const char *target, int fd, const char *linkp) {
+    KL_PATH2(target, linkp); int r = symlinkat(_pa, kl_at_fd(fd), _pb); kl_fs_trace("symlinkat", linkp, target, r != 0); return r;
+}
+// utimensat: UTIME_NOW / UTIME_OMIT are ((1<<30)-1) / ((1<<30)-2) on Linux
+// and -1 / -2 here, and they ride in tv_nsec.
+int klb_utimensat(int fd, const char *p, const struct timespec *ts, int f) {
+    struct timespec t[2];
+    if (ts) {
+        for (int i = 0; i < 2; i++) {
+            t[i] = ts[i];
+            if (ts[i].tv_nsec == (1l << 30) - 1) t[i].tv_nsec = UTIME_NOW;
+            else if (ts[i].tv_nsec == (1l << 30) - 2) t[i].tv_nsec = UTIME_OMIT;
+        }
+    }
+    int r;
+    if (!p) r = futimens(fd, ts ? t : NULL);        // Linux allows a NULL path: the fd itself
+    else { KL_GUEST_PATH(p); r = utimensat(kl_at_fd(fd), _p, ts ? t : NULL, kl_at_flags(f & 0x100)); }
+    kl_fs_trace("utimensat", p ? p : "(fd)", NULL, r != 0);
+    return r;
+}
+
 int klb_unlink(const char *path) {
     KL_GUEST_PATH(path);
     int r = unlink(_p);
@@ -1901,6 +2149,9 @@ int klb_rename(const char *a, const char *b) {
     kl_fs_trace("rename", a, b, r != 0);
     return r;
 }
+// statfs64 is the same struct statfs on LP64 bionic (the 64 suffix is a 32-bit
+// ABI marker); delegate rather than duplicate the translation.
+int klb_statfs64(const char *path, void *out) { return klb_statfs(path, out); }
 
 // ---------- struct dirent ----------
 typedef struct { uint64_t d_ino; int64_t d_off; uint16_t d_reclen;
@@ -1986,6 +2237,156 @@ int klb_scandir(const char *p, bionic_dirent ***namelist,
 // KL_FWD'd to the host's alphasort (Darwin dirent layout).
 int klb_alphasort(const bionic_dirent **a, const bionic_dirent **b) {
     return strcoll((*a)->d_name, (*b)->d_name);
+}
+
+// ---------- the case-insensitive wcs pair Darwin does not have ----------
+// wcscasecmp/wcsncasecmp are glibc-isms the Source engine's portable layer uses. towlower
+// is real on both platforms, so these are one-liners rather than table entries.
+int klb_wcscasecmp(const wchar_t *a, const wchar_t *b) {
+    for (;; a++, b++) {
+        wchar_t x = towlower((wint_t)*a), y = towlower((wint_t)*b);
+        if (x != y) return x < y ? -1 : 1;
+        if (!x) return 0;
+    }
+}
+int klb_wcsncasecmp(const wchar_t *a, const wchar_t *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        wchar_t x = towlower((wint_t)a[i]), y = towlower((wint_t)b[i]);
+        if (x != y) return x < y ? -1 : 1;
+        if (!x) return 0;
+    }
+    return 0;
+}
+
+// ---------- bionic's math helpers, bionic's numbering ----------
+// __fpclassifyd CANNOT forward to Darwin's: Darwin's FP_* constants are
+// numbered 1..5 where glibc/bionic number them 0..4 (FP_NAN is 1 on Darwin, 0
+// on bionic), and the guest compares the result against ITS header's values.
+// A direct forward would be a wrong answer the compiler cannot see — answer in
+// bionic's numbers.
+int klb___fpclassifyd(double x) {
+    if (__builtin_isnan(x)) return 0;                        // FP_NAN
+    if (__builtin_isinf(x)) return 1;                        // FP_INFINITE
+    if (x == 0.0)             return 2;                      // FP_ZERO
+    double a = __builtin_fabs(x);
+    if (a < 2.2250738585072014e-308) return 3;               // FP_SUBNORMAL (< DBL_MIN)
+    return 4;                                                // FP_NORMAL
+}
+
+// Tracks which FILE* came from the getprop path: pclose on an fmemopen stream
+// is an error (nothing was forked), and fclose on a real popen stream leaks a
+// zombie. Eight concurrent getprop pipes is generous for a startup probe.
+static struct { FILE *f; char *buf; } g_popen_fmem[8];
+
+FILE *klb_popen(const char *cmd, const char *mode) {
+    if (cmd) {
+        char prop[96];
+        // "getprop <name>" and nothing else — a getprop with flags falls
+        // through to the real thing rather than being answered half-right.
+        if (sscanf(cmd, " getprop %95s", prop) == 1 && prop[0] != '-') {
+            const char *val = sysprop_value(prop);
+            // fmemopen does NOT copy: it reads the caller's buffer for as long
+            // as the stream lives, so a local here is a use-after-return the
+            // moment popen returns. It read correctly on the host — the dead
+            // frame was still intact — and came back EMPTY on device, which is
+            // how the guest saw every property as "". The buffer outlives the
+            // stream now and klb_pclose frees it.
+            char *line = malloc(128);
+            if (!line) return NULL;
+            snprintf(line, 128, "%s\n", val ? val : "");
+            // fmemopen rather than a pipe: no subprocess, no /bin/sh, and the
+            // answer is a string we already hold. klb_pclose knows.
+            FILE *f = fmemopen(line, strlen(line), "r");
+            if (!f) { free(line); return NULL; }
+            size_t i = 0, cap = sizeof g_popen_fmem / sizeof *g_popen_fmem;
+            for (; i < cap; i++) if (!g_popen_fmem[i].f) {
+                g_popen_fmem[i].f = f; g_popen_fmem[i].buf = line; break;
+            }
+            // No slot left: the stream still answers, and pclose falls through
+            // to the real one. Leak 128 bytes rather than close over a freed
+            // buffer — this path is a startup probe, not a loop.
+            return f;
+        }
+    }
+    return popen(cmd, mode);
+}
+
+int klb_pclose(FILE *f) {
+    for (size_t i = 0; i < sizeof g_popen_fmem / sizeof *g_popen_fmem; i++) {
+        if (g_popen_fmem[i].f == f) {
+            char *buf = g_popen_fmem[i].buf;
+            g_popen_fmem[i].f = NULL; g_popen_fmem[i].buf = NULL;
+            int r = fclose(f);
+            free(buf);
+            return r;
+        }
+    }
+    return pclose(f);
+}
+
+// ---------- signal NUMBERS ----------
+// Linux and Darwin agree on 1-6, 8, 9, 11, 13-15 and disagree on most of the
+// rest, and this runtime has always passed guest signal numbers through
+// UNtranslated. That has held because it is self-consistent: a guest that
+// installs a handler for N and later sends N gets it, whatever N means to
+// Darwin — Unity's Boehm GC signals by Linux SIGPWR (30) and SIGXCPU (24),
+// which land on Darwin 30 and 24 and work as private signals.
+//
+// It breaks where the Darwin number is FATAL, because sigaction below refuses
+// a guest handler for a fatal signal. Linux SIGUSR2 is 12, and Darwin 12 is
+// SIGSYS: the guest's SIGUSR2 handler was refused as a "fatal-signal handler",
+// the guest then pthread_kill'ed 12, and Darwin delivered SIGSYS with no
+// handler — the process died (the Half-Life: Alyx launcher's SysV-semaphore
+// self-test interrupts a waiter with SIGUSR2 exactly this way).
+//
+// So ONE pair is swapped: Linux 12 (SIGUSR2) <-> Darwin 31 (SIGUSR2), and Linux
+// 31 (SIGSYS) <-> Darwin 12 (SIGSYS). A swap is a bijection, so every other
+// number keeps its old self-consistent pass-through, and both members now mean
+// what they say. Masks carry the same swap on bits 11 and 30. Linux SIGUSR1
+// (10, Darwin SIGBUS) is NOT remapped: its Darwin twin (30) is Boehm's SIGPWR.
+// Entry points that apply it: sigaction, signal, kill, raise, pthread_kill,
+// pthread_sigmask/sigprocmask, sigsuspend/sigwait/sigpending (below).
+int kl_sig_to_darwin(int sig) {
+    return sig == 12 ? 31 : sig == 31 ? 12 : sig;
+}
+uint64_t kl_sigmask_to_darwin(uint64_t m) {
+    uint64_t b11 = (m >> 11) & 1, b30 = (m >> 30) & 1;
+    m &= ~((1ull << 11) | (1ull << 30));
+    return (m | (b11 << 30) | (b30 << 11)) & 0xFFFFFFFFu;
+}
+int  klb_kill(pid_t pid, int sig) { return kill(pid, kl_sig_to_darwin(sig)); }
+
+// The three that take a whole mask. A guest builds its mask in LINUX numbering
+// (sigaddset(&m, SIGUSR2) sets bit 11), while the signal arrives as Darwin 31:
+// forwarded raw, a sigwait on Linux SIGUSR2 waits for Darwin SIGSYS and never
+// wakes for the signal it asked for. The mask goes over with the swap, and what
+// comes back — sigwait's signal number, sigpending's mask — comes back through
+// it too (the swap is its own inverse). bionic's sigset_t is 8 bytes and
+// Darwin's 4: only the low word carries signals Darwin has, and the guest's
+// high word (Linux 33..64, realtime) is written as zero.
+int klb_sigwait(const uint64_t *set, int *sig) {
+    if (!set || !sig) return EINVAL;
+    sigset_t d = (sigset_t)kl_sigmask_to_darwin(*set);
+    int got = 0;
+    int r = sigwait(&d, &got);
+    if (!r) *sig = kl_sig_to_darwin(got);
+    return r;
+}
+int klb_sigsuspend(const uint64_t *set) {
+    if (!set) { errno = EFAULT; return -1; }
+    sigset_t d = (sigset_t)kl_sigmask_to_darwin(*set);
+    return sigsuspend(&d);
+}
+int klb_sigpending(uint64_t *set) {
+    if (!set) { errno = EFAULT; return -1; }
+    sigset_t d;
+    int r = sigpending(&d);
+    if (!r) *set = kl_sigmask_to_darwin((uint64_t)d);
+    return r;
+}
+int  klb_raise(int sig)           { return raise(kl_sig_to_darwin(sig)); }
+void *klb_signal(int sig, void *handler) {
+    return (void *)signal(kl_sig_to_darwin(sig), (void (*)(int))handler);
 }
 
 // ---------- sigaction ----------
@@ -2099,8 +2500,9 @@ static void kl_sig_x18_tramp(int sig, siginfo_t *info, void *uctx) {
     }
 }
 
-int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
+int klb_sigaction(int linux_sig, const bionic_sigaction *in, bionic_sigaction *old) {
     struct sigaction d, o;
+    int sig = kl_sig_to_darwin(linux_sig);
     if (kl_env_on("KL_TRACE_SIG", 0))
         fprintf(stderr, "  [sig] sigaction(%d, handler=%p)\n", sig,
                 in ? in->handler : NULL);
@@ -2109,7 +2511,7 @@ int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
     if (in && in->handler && in->handler != (void *)SIG_DFL &&
         in->handler != (void *)SIG_IGN && klb_fatal_signal(sig) && !allow_guest) {
         fprintf(stderr, "[sig] refusing the guest's handler for signal %d "
-                        "(Linux ucontext; set KL_GUEST_SIGNALS=1 to install it)\n", sig);
+                        "(Linux ucontext; set KL_GUEST_SIGNALS=1 to install it)\n", linux_sig);
         if (old) { memset(old, 0, sizeof *old); }
         return 0;                    // the guest believes it is installed
     }
@@ -2123,11 +2525,11 @@ int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
             g_guest_sig[sig].siginfo = (in->flags & KL_SA_SIGINFO) ? 1 : 0;
             d.sa_sigaction = kl_sig_x18_tramp;
             d.sa_flags     = kl_sa_flags((uint32_t)in->flags) | SA_SIGINFO;
-            d.sa_mask      = (sigset_t)(in->mask & 0xFFFFFFFFu);
+            d.sa_mask      = (sigset_t)kl_sigmask_to_darwin(in->mask);
         } else {
             d.sa_handler = (void (*)(int))in->handler;
             d.sa_flags   = kl_sa_flags((uint32_t)in->flags);
-            d.sa_mask    = (sigset_t)(in->mask & 0xFFFFFFFFu);
+            d.sa_mask    = (sigset_t)kl_sigmask_to_darwin(in->mask);
         }
     }
     int r = sigaction(sig, in ? &d : NULL, old ? &o : NULL);
@@ -2138,7 +2540,7 @@ int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
             oh = g_guest_sig[sig].handler;      // unwrap our trampoline
         old->handler = oh;
         old->flags   = (int32_t)kl_sa_flags_back(o.sa_flags);
-        old->mask    = o.sa_mask;
+        old->mask    = kl_sigmask_to_darwin(o.sa_mask);
     }
     return r;
 }
@@ -2218,6 +2620,8 @@ int    klb_getpwuid_r(unsigned uid, void *pw, char *buf, size_t n, void **res) {
 }
 int    klb_execl(const char *p, const char *a, ...) { (void)p; (void)a;
                                                       warn_once("execl"); errno = ENOSYS; return -1; }
+int    klb_execlp(const char *p, const char *a, ...) { (void)p; (void)a;
+                                                       warn_once("execlp"); errno = ENOSYS; return -1; }
 // system(): hand-written rather than forwarded, because visionOS marks it
 // __API_UNAVAILABLE — a generated KL_FWD does not compile for xrOS at all,
 // which is how the Steam Link libc sweep broke `make xros`. Refusing is also
@@ -2246,6 +2650,11 @@ int    klb_system(const char *cmd) { (void)cmd; warn_once("system"); return 127;
 #define KL_SYS_futex 98                 // aarch64 Linux
 #define KL_SYS_getrandom 278            // ...and the other one a guest depends on
 #define KL_SYS_gettid 178               // ...and the third, via libc++'s guards
+#define KL_SYS_sched_getaffinity 123    // Half-Life: Alyx's affinity self-test
+#define KL_SYS_process_vm_readv 270     // Half-Life: Alyx's code guards read itself
+#define KL_SYS_process_vm_writev 271
+#define KL_SYS_tkill 130               // thread liveness probes: tkill(tid, 0) /
+#define KL_SYS_tgkill 131              //   tgkill(getpid(), tid, 0) — see kl_tid_alive
 
 enum {
     KL_FUTEX_WAIT = 0, KL_FUTEX_WAKE = 1, KL_FUTEX_WAKE_OP = 5,
@@ -2538,6 +2947,30 @@ static void syscall_warn_once(long n, void *ra) {
             n, img ? img : "", img ? "+" : "pc ", img ? off : (size_t)(uintptr_t)ra);
 }
 
+// Is `tid` (an id klb_gettid handed out) a live thread of this process? The
+// kernel's answer to tgkill(pid, tid, 0): the null signal is a pure existence
+// probe. Answered from the task's own thread list — thread_identifier_info's
+// thread_id is the same number pthread_threadid_np gives klb_gettid, truncated
+// the same way, so the two doors agree about identity.
+static int kl_tid_alive(int tid) {
+    thread_act_array_t th = NULL;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) return -1;
+    int found = 0;
+    for (mach_msg_type_number_t i = 0; i < n; i++) {
+        if (!found) {
+            thread_identifier_info_data_t id;
+            mach_msg_type_number_t cnt = THREAD_IDENTIFIER_INFO_COUNT;
+            if (thread_info(th[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&id, &cnt) == KERN_SUCCESS
+                && (int)id.thread_id == tid)
+                found = 1;
+        }
+        mach_port_deallocate(mach_task_self(), th[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof(*th));
+    return found;
+}
+
 long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
     // futex is the only syscall here that reads past the fourth argument, so a5
     // and a6 must be carried through: without them FUTEX_WAKE_OP cannot be
@@ -2585,9 +3018,110 @@ long klb_syscall(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
     // different hat: the guard would then compare an id from one door against an
     // id from the other and call every acquisition recursive.
     if (n == KL_SYS_gettid) return klb_gettid();
+    // sched_getaffinity, raw: the KERNEL's contract, which differs from libc's
+    // in its return — the number of bytes of cpumask the kernel wrote (8 for
+    // up to 64 CPUs on arm64), EINVAL if the buffer is smaller than that — and
+    // in writing nothing past those bytes. The mask is the libc door's, so the
+    // two agree about which CPUs exist.
+    if (n == KL_SYS_sched_getaffinity) {
+        size_t len = (size_t)a2;
+        void *mask = (void *)(uintptr_t)a3;
+        if (len < 8) { kl_errno_set(EINVAL); return -1; }
+        if (!mask) { kl_errno_set(EFAULT); return -1; }
+        kl_affinity_mask(mask, 8);
+        return 8;
+    }
+
+    // process_vm_readv/writev on THIS process: a fault-safe memcpy (the
+    // reason a guest uses it on itself — the Half-Life: Alyx launcher's native-general guard
+    // reads Valve's instruction words and a flag byte this way, and a refused
+    // call is its fatal `guest-local-read fatal=native-general-guard`). Another
+    // pid is refused. vm_read_overwrite/vm_write fail cleanly on
+    // unmapped memory instead of faulting, which is the contract.
+    if (n == KL_SYS_process_vm_readv || n == KL_SYS_process_vm_writev) {
+        struct kiov { void *base; size_t len; };
+        const struct kiov *loc = (const struct kiov *)(uintptr_t)a2, *rem = (const struct kiov *)(uintptr_t)a4;
+        unsigned long nl = (unsigned long)a3, nr = (unsigned long)a5;
+        if ((pid_t)a1 != getpid()) {
+            syscall_warn_once(n, __builtin_return_address(0));
+            kl_errno_set(EPERM);
+            return -1;
+        }
+        if ((nl && !loc) || (nr && !rem)) { kl_errno_set(EFAULT); return -1; }
+        long total = 0;
+        unsigned long li = 0, ri = 0;
+        size_t lo = 0, ro = 0;
+        while (li < nl && ri < nr) {
+            size_t k = loc[li].len - lo, rk = rem[ri].len - ro;
+            if (k > rk) k = rk;
+            if (k) {
+                uint8_t *l = (uint8_t *)loc[li].base + lo, *r = (uint8_t *)rem[ri].base + ro;
+                kern_return_t kr;
+                // vm_* (not mach_vm_*): the only spelling every SDK carries
+                // (visionOS has no mach_vm.h); addresses are 64-bit on arm64.
+                if (n == KL_SYS_process_vm_readv) {
+                    vm_size_t got = 0;
+                    kr = vm_read_overwrite(mach_task_self(), (vm_address_t)(uintptr_t)r, k,
+                                           (vm_address_t)(uintptr_t)l, &got);
+                } else {
+                    kr = vm_write(mach_task_self(), (vm_address_t)(uintptr_t)r,
+                                  (vm_offset_t)(uintptr_t)l, (mach_msg_type_number_t)k);
+                }
+                if (kr != KERN_SUCCESS) {
+                    if (total) return total;
+                    kl_errno_set(EFAULT);
+                    return -1;
+                }
+                total += (long)k;
+            }
+            lo += k; ro += k;
+            if (lo == loc[li].len) { li++; lo = 0; }
+            if (ri < nr && ro == rem[ri].len) { ri++; ro = 0; }
+        }
+        return total;
+    }
+
+    // tgkill / tkill with the NULL signal — "is that thread still alive?" —
+    // and refusing it is a WRONG ANSWER, not a missing feature: -1 reads as
+    // "no such thread". Half-Life: Alyx's libvideo keeps a 2048-slot per-thread
+    // registry (libvideo.so+0x11a0f8) that, when a thread registers, probes each
+    // occupied slot with tgkill(getpid(), tid, 0) (+0x114ee0) and RECLAIMS the
+    // first slot whose owner looks dead — destroying that thread's 0x220-byte
+    // state (+0x11a030 zeroes its +0x18 object) while the owner still runs.
+    // With every probe refused, the second VideoPlayer Decoder thread to
+    // register tore down the first one's state, and the first faulted on the
+    // NULL at libvideo.so+0x1180b0 (`ldr w1, [x0, #0x48]`) as the level
+    // finished loading a save that plays a video.
+    //
+    // Only the null signal is answered. Delivering a real signal would run a
+    // Darwin default action (guest handlers are refused by default — see
+    // [sig]), so those keep falling through to the logged refusal below.
+    if ((n == KL_SYS_tgkill && a3 == 0) || (n == KL_SYS_tkill && a2 == 0)) {
+        long tid = n == KL_SYS_tgkill ? a2 : a1;
+        if (n == KL_SYS_tgkill && (pid_t)a1 != getpid()) { kl_errno_set(ESRCH); return -1; }
+        if (tid <= 0) { kl_errno_set(EINVAL); return -1; }
+        int alive = kl_tid_alive((int)tid);
+        static _Atomic int told;
+        if (!atomic_exchange(&told, 1)) {
+            size_t off = 0;
+            void *ra = __builtin_return_address(0);
+            const char *img = kl_addr_image(ra, &off);
+            fprintf(stderr, "  [klepton] %s(tid %ld, 0) liveness probe from %s%s0x%zx answered from "
+                            "the task's thread list -> %s (logged once)\n",
+                    n == KL_SYS_tgkill ? "tgkill" : "tkill", tid, img ? img : "", img ? "+" : "pc ",
+                    img ? off : (size_t)(uintptr_t)ra,
+                    alive > 0 ? "alive" : alive == 0 ? "ESRCH" : "thread list unreadable, alive");
+        }
+        // The thread list itself failing is the one case with no honest
+        // answer; "alive" is the safe one — a live thread's state is never
+        // reclaimed, and a dead one's only leaks a slot.
+        if (alive != 0) return 0;
+        kl_errno_set(ESRCH);
+        return -1;
+    }
 
     syscall_warn_once(n, __builtin_return_address(0));
-    errno = ENOSYS;
+    kl_errno_set(ENOSYS);
     return -1;
 }
 int    klb_swprintf(wchar_t *s, size_t n, const wchar_t *f, ...) {
@@ -2700,6 +3234,27 @@ static int klb_refuse_exec(const char *what, int anon, int prot) {
     return 1;
 }
 
+// KL_TRACE_MMAP=1: every guest mmap/mprotect, with its result and its caller
+// as image+offset. The instrument for a guest that runs its OWN loader (the
+// Half-Life: Alyx launcher maps Valve's ELFs itself): what it asked for, what it
+// got, and which call left a page without the permission it later needed.
+static int mmap_trace(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_TRACE_MMAP", 0);
+    return on;
+}
+static void mmap_trace_line(const char *what, void *ra, void *addr, size_t len,
+                            int prot, int flags, int fd, long long off, void *res,
+                            int err) {
+    size_t o = 0;
+    const char *img = kl_addr_image(ra, &o);
+    fprintf(stderr, "  [mm] %s(%p, %#zx, %c%c%c, flags %#x, fd %d, off %#llx) -> %p%s%s "
+                    "from %s+%#zx\n", what, addr, len,
+            prot & PROT_READ ? 'r' : '-', prot & PROT_WRITE ? 'w' : '-',
+            prot & PROT_EXEC ? 'x' : '-', flags, fd, off, res,
+            err ? " errno " : "", err ? strerror(err) : "", img ? img : "?", o);
+}
+
 void *klb_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     int df = kl_mmap_flags(flags);
     // A memory-map of an OBB read-through fd cannot be served: the pak's bytes
@@ -2712,8 +3267,15 @@ void *klb_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
         return MAP_FAILED;
     }
     if (df & MAP_ANON) fd = -1;                  // Darwin insists on -1 for anonymous
-    if (klb_refuse_exec("mmap", (df & MAP_ANON) != 0, prot)) return MAP_FAILED;
+    if (klb_refuse_exec("mmap", (df & MAP_ANON) != 0, prot)) {
+        if (mmap_trace()) mmap_trace_line("mmap", __builtin_return_address(0), addr, len,
+                                          prot, flags, fd, (long long)off, MAP_FAILED, EPERM);
+        return MAP_FAILED;
+    }
     void *p = mmap(addr, len, prot, df, fd, off); // PROT_* match on both sides
+    if (mmap_trace()) mmap_trace_line("mmap", __builtin_return_address(0), addr, len, prot,
+                                      flags, fd, (long long)off, p,
+                                      p == MAP_FAILED ? errno : 0);
     // __builtin_return_address(0) is the GUEST here: mmap is not variadic, so
     // nothing of ours sits between this frame and the caller's.
     if (kl_file_watch && p != MAP_FAILED && fd >= 0)
@@ -2764,8 +3326,68 @@ void *klb_sbrk(intptr_t incr) {
 // nothing that legitimately maps a signed image comes through here. A guest
 // asking to make memory executable is a guest generating code.
 int klb_mprotect(void *addr, size_t len, int prot) {
-    if (klb_refuse_exec("mprotect", 1, prot)) return -1;
-    return mprotect(addr, len, prot);
+    if (klb_refuse_exec("mprotect", 1, prot)) {
+        if (mmap_trace()) mmap_trace_line("mprotect", __builtin_return_address(0), addr,
+                                          len, prot, 0, -1, 0, (void *)-1, EPERM);
+        return -1;
+    }
+    // 4 KiB guests on 16 KiB pages. A Linux/Android arm64 guest may assume
+    // 4 KiB pages and commit a reservation one 4 KiB page at a time (Alyx's
+    // Panorama arena: mmap 64 KiB PROT_NONE, then mprotect(+0x1000, 0x1000,
+    // RW) — EINVAL here, "OUT OF MEMORY! attempted allocation size: 4096"). What a 4 KiB kernel would do is approximated per direction: a
+    // request that grants WRITE widens to the enclosing pages (the extra is
+    // part of the same mapping the guest is committing); any other request
+    // narrows to the pages it fully covers, so no neighbour ever loses access
+    // it had (and a sub-page restriction becomes a successful no-op). Named,
+    // the first few times per caller.
+    {
+        uintptr_t pg = (uintptr_t)getpagesize(), a = (uintptr_t)addr, e = a + len;
+        if (len && ((a | e) & (pg - 1))) {
+            uintptr_t na, ne;
+            if (prot & PROT_WRITE) { na = a & ~(pg - 1); ne = (e + pg - 1) & ~(pg - 1); }
+            else                   { na = (a + pg - 1) & ~(pg - 1); ne = e & ~(pg - 1); }
+            static _Atomic unsigned said;
+            if (atomic_fetch_add(&said, 1) < 8) {
+                size_t off = 0;
+                const char *img = kl_addr_image(__builtin_return_address(0), &off);
+                fprintf(stderr, "  [klepton] mprotect(%p, %#zx, %d) is not %zu KiB-aligned — %s "
+                                "to [%p, %p) (from %s+%#zx)\n", addr, len, prot, (size_t)(pg >> 10),
+                        (prot & PROT_WRITE) ? "widened" : "narrowed", (void *)na, (void *)ne,
+                        img ? img : "?", off);
+            }
+            if (ne <= na) return 0;
+            // Widening for WRITE reapplies the guest's bits (never EXEC: refused
+            // above) to the whole page, so a page that currently holds
+            // executable guest text would lose it. That is the one neighbour
+            // the widening could hurt: keep the pre-widening answer (EINVAL)
+            // for it, named, instead of stripping EXEC.
+            if ((prot & PROT_WRITE) && !(prot & PROT_EXEC)) {
+                for (vm_address_t q = na; q < ne;) {
+                    vm_address_t start = q; vm_size_t sz = 0;
+                    vm_region_basic_info_data_64_t info;
+                    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+                    mach_port_t obj = MACH_PORT_NULL;
+                    if (vm_region_64(mach_task_self(), &start, &sz, VM_REGION_BASIC_INFO_64,
+                                     (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS ||
+                        start >= ne) break;
+                    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+                    if (start < ne && start + sz > na && (info.protection & VM_PROT_EXECUTE)) {
+                        fprintf(stderr, "  [klepton] mprotect widening refused: [%p, %p) is "
+                                        "executable — EINVAL as before\n", (void *)na, (void *)ne);
+                        errno = EINVAL;
+                        return -1;
+                    }
+                    q = start + sz;
+                }
+            }
+            addr = (void *)na;
+            len = ne - na;
+        }
+    }
+    int r = mprotect(addr, len, prot);
+    if (mmap_trace()) mmap_trace_line("mprotect", __builtin_return_address(0), addr, len,
+                                      prot, 0, -1, 0, (void *)(intptr_t)r, r ? errno : 0);
+    return r;
 }
 
 #define LX_O_CREAT 0x40
@@ -2865,13 +3487,29 @@ int kl_fcntl(int fd, int cmd, uintptr_t arg) {
     case LX_F_SETOWN:        return fcntl(fd, F_SETOWN, (int)arg);
     case LX_F_GETOWN:        return fcntl(fd, F_GETOWN);
     // struct flock is laid out differently on the two platforms (Linux leads
-    // with l_type/l_whence, Darwin with l_start/l_len), so forwarding the
-    // pointer would silently lock a different range. Refused by name until
-    // something needs it — no guest has yet.
-    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW:
-        warn_once("fcntl file locking (struct flock layout differs) — refused");
-        errno = EINVAL;
-        return -1;
+    // with l_type/l_whence, Darwin with l_start/l_len) and the lock TYPES are
+    // numbered differently (Linux RDLCK 0 / WRLCK 1 / UNLCK 2, Darwin 1 / 3 /
+    // 2), so the record is rebuilt both ways. Source 2's tier0 takes its
+    // one-instance lock this way (/tmp/source_engine_<hash>.lock, F_SETLK):
+    // refused, it reports "Only one instance" and reaches for a message box.
+    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW: {
+        // bionic/glibc AArch64: { short l_type, l_whence; off_t l_start, l_len; pid_t l_pid; }
+        struct lx_flock { int16_t l_type, l_whence; int64_t l_start, l_len; int32_t l_pid; } *lx =
+            (struct lx_flock *)arg;
+        if (!lx) { errno = EFAULT; return -1; }
+        static const short to_d[3] = { F_RDLCK, F_WRLCK, F_UNLCK };
+        if (lx->l_type < 0 || lx->l_type > 2) { errno = EINVAL; return -1; }
+        struct flock d = { .l_start = lx->l_start, .l_len = lx->l_len, .l_pid = lx->l_pid,
+                           .l_type = to_d[lx->l_type], .l_whence = lx->l_whence };
+        int dc = cmd == LX_F_GETLK ? F_GETLK : cmd == LX_F_SETLK ? F_SETLK : F_SETLKW;
+        int r = fcntl(fd, dc, &d);
+        if (r == 0 && cmd == LX_F_GETLK) {
+            lx->l_type = d.l_type == F_RDLCK ? 0 : d.l_type == F_WRLCK ? 1 : 2;
+            lx->l_whence = d.l_whence;
+            lx->l_start = d.l_start; lx->l_len = d.l_len; lx->l_pid = d.l_pid;
+        }
+        return r;
+    }
     default:
         fcntl_warn_once("fcntl", cmd);
         errno = EINVAL;

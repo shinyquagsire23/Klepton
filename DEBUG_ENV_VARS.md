@@ -21,6 +21,11 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   SIGABRT to `waitpid`). The guard in `kl_ovrplat.c` itself is unaffected.
 - `KL_FAULT_WAIT=1` — park in m_boot's fault handler on SIGSEGV/SIGBUS/
   SIGABRT/SIGALRM and print the pid, for post-mortem `lldb -p` attach.
+  Read ONCE by `kl_fault_install` (as is `KL_FAULT_PEEK`, bytes of memory
+  peeked per register, 16..512, default 16) — the handler itself never calls
+  getenv, since a fault taken while the thread holds libc's environ lock would
+  re-lock it and abort with no report. Set both before launch; a later
+  `setenv` is not seen.
 - `KL_LIFECYCLE=1` — drive the UnityPlayer lifecycle sequence
   (nativeRecreateGfxState, nativeResume, nativeRender) instead of stopping
   after initJni.
@@ -653,9 +658,47 @@ m_boot's fault handler on every fatal path:
   backtrace — a hang names the parked owner, not just the waiters.
 - mutex waiters: who is blocked on which guest mutex and from where.
 
+- rwlock holders and waiters, on the same terms: a WRITE-holder that is also
+  a waiter is printed as `** AND ALREADY WRITE-HOLDS IT — self-deadlock **`.
+
+Rwlocks are keyed by guest address too (`rwl_entry`): Unreal memcpy's TArrays
+holding rwlocks, and most of its lock sites never call `pthread_rwlock_init`,
+so a slot index in guest storage was believed after a move. `destroy` leaves a
+tombstone in the mutex map (an empty would cut every probe chain running
+through the slot and duplicate the entries behind it). Barriers still keep a
+slot index in guest storage; that side table grows in 4096-slot chunks and logs
+`[klb] sync side table g_bar grew past N slots` at each power of two past
+65536.
+
 - `KL_TRACE_MUTEX=1` — log the first 200 mutex init/destroy events (guest
   address, slot/map index, tid, return address). How the slot-23 double-init
   was caught.
+- `KL_MUTEX_POLICY=fairshare` — create every guest mutex with Darwin's
+  `_PTHREAD_MUTEX_POLICY_FAIRSHARE` (hand the mutex to a waiter on unlock)
+  instead of the default first-fit, where an unlocking thread that re-locks at
+  once nearly always wins. Engines that pass ONE mutex between two threads as a
+  baton (`Unlock(); Sleep(0); Lock();`) starve under first-fit: The Simpsons:
+  Hit & Run's streaming loader took 2+ s per 1.4 MB zone. Prints
+  `[thr] guest mutexes use the FAIRSHARE policy` once. Default off; any other
+  value (`firstfit`) is the A/B.
+
+## Guest thread scheduling (`runtime/libc/kl_pthread.c`)
+
+- `KL_GUEST_QOS=off|background|utility|default|initiated|interactive` — the QoS
+  class **every guest thread** is created at. Default `initiated`
+  (`QOS_CLASS_USER_INITIATED`); `off` restores `QOS_CLASS_UNSPECIFIED`, which is
+  what this runtime did before and is the exact revert. `1`/`on` (the old
+  opt-in spelling, still set by the Steam Link door) mean `initiated`.
+
+  Why it is not `unspecified`: a plain `pthread_attr` carries
+  `QOS_CLASS_UNSPECIFIED`, and on Apple silicon that is the legacy tier the
+  scheduler may satisfy from an efficiency core. `kl_app.c` already gives the
+  guest's own frame thread `USER_INTERACTIVE` — but every OTHER guest thread
+  comes through `klb_pthread_create`, so UE4's render thread, its RHI thread,
+  its task-graph pool, its streaming threads and the audio engine's mixer
+  thread all got nothing. Deadpool VR measured it on a one-to-two-minute load.
+  Logged once as `[thr] guest threads are created at QoS user-initiated`;
+  `KL_TRACE_THREADS=1` adds `qos=` to each `[thr] pthread_create` line.
 
 ## Guest-thread sampler (`runtime/diag/kl_sample.c`, `runtime/guest/kl_il2cpp.c`)
 
@@ -1798,6 +1841,19 @@ reads no knobs).
   without ever checking saved state. It checks; the files simply do not exist.
 - `KL_TRACE_IMAGES=1` — log each loaded image's base and span, the stub pool
   mapping, and each emitted stub. Read by `kl_image.c`.
+- `KL_TRACE_MMAP=1` — log every guest `mmap`/`mprotect` (`[mm]` lines): the
+  request, the result or errno, and the caller as image+offset. Read by
+  `kl_libc.c`. The instrument for a guest that runs its own ELF loader: which
+  call left a page without the permission it later needed. Unaligned
+  `mprotect` on 16 KiB pages is widened (write) or narrowed (otherwise) and
+  named in `[klepton] mprotect(...) is not 16 KiB-aligned` either way.
+
+Signal numbers: Linux and Darwin disagree on SIGUSR2 (12 vs 31) and SIGSYS
+(31 vs 12), and Darwin 12 is fatal, so a guest's SIGUSR2 handler was refused
+and its `pthread_kill(…, SIGUSR2)` killed the process. That one pair is
+swapped on every entry point that takes a signal number or mask (`sigaction`,
+`signal`, `kill`, `raise`, `pthread_kill`, `pthread_sigmask`, `sigwait`,
+`sigsuspend`, `sigpending`); every other number passes through as before.
 
 ## Steam Link (`runtime/guest/kl_slink.c`, `build_run_host.sh`)
 

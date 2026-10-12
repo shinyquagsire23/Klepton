@@ -231,6 +231,10 @@ void kl_shim_set_guest_gl(kl_image *img);
 // mutex and from where it was locked. Called from t_boot's fault handler so
 // a hang names the contested mutex's owner, not just its waiters.
 void kl_pthread_report(FILE *out);
+// Guest (Linux) signal number / sigset -> Darwin. One swapped pair,
+// SIGUSR2 <-> SIGSYS; everything else passes through. See kl_libc.c.
+int      kl_sig_to_darwin(int linux_sig);
+uint64_t kl_sigmask_to_darwin(uint64_t linux_mask);
 
 // XR_KHR_android_thread_settings (kl_pthread.c): raise a guest-flagged
 // scheduling-critical thread to USER_INTERACTIVE QoS so a streaming guest's

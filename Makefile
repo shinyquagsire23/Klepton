@@ -460,6 +460,37 @@ build/t_bcast: tests/t_bcast.c $(RUNTIME) $(RUNTIME_HDRS)
 bcast: build/t_bcast
 	./build/t_bcast
 
+# The semaphore slot table: churn, exhaustion, stale handles, destroy with a
+# waiter parked. The shims bind through the guest symbol table rather than a
+# header, so the test declares the handful it drives and links the runtime.
+build/t_sem: tests/t_sem.c $(RUNTIME) runtime/klepton.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_sem.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: sem
+sem: build/t_sem
+	./build/t_sem
+
+# The mutex map (tombstones, first-touch races), address-keyed rwlocks,
+# barriers, and the growable side table. When the mutex map filled, the guest
+# froze at 100% CPU with no crash and no log.
+build/t_mtx: tests/t_mtx.c $(RUNTIME) runtime/klepton.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_mtx.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: mtx
+mtx: build/t_mtx
+	./build/t_mtx
+
+# tgkill/tkill(tid, 0) liveness probes answered by the raw-syscall door.
+build/t_tgkill: tests/t_tgkill.c $(RUNTIME)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_tgkill.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: tgkill
+tgkill: build/t_tgkill
+	./build/t_tgkill
+
 # ...and the preemptive version of the same question: what OTHER system
 # registers do these guests touch, and which of them may EL0 not execute?
 #
@@ -540,8 +571,14 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps build/t_sem build/t_mtx build/t_tgkill
 	@echo "=== variadic ABI ===" && ./build/t_variadic
+	@./build/t_sem > build/sem.log 2>&1 || { cat build/sem.log; exit 1; }
+	@grep -E '=== semaphore|highest slot' build/sem.log && tail -1 build/sem.log
+	@./build/t_mtx > build/mtx.log 2>&1 || { cat build/mtx.log; exit 1; }
+	@grep -E 'mutex slot table|counter |newest slot' build/mtx.log && tail -1 build/mtx.log
+	@./build/t_tgkill > build/tgkill.log 2>&1 || { cat build/tgkill.log; exit 1; }
+	@grep -E '=== tgkill' build/tgkill.log && tail -1 build/tgkill.log
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
