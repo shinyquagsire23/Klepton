@@ -29,6 +29,13 @@ void *kl_ovrp_sym(const char *name);
 // Which ovrp_* the guest resolved and which it called — the work list.
 void kl_ovrp_report(FILE *f);
 
+// The eye swapchain's health alone — frames per stage, the stage draw counts,
+// and the pose<->picture association. Split out of the report above so it can
+// be printed DURING a run: on device the exit report is often unreachable (a
+// target may keep the process alive when its window closes, and a force quit
+// is SIGKILL), and these are the lines a bring-up needs.
+void kl_ovrp_eye_census(FILE *f);
+
 // Which space those poses are in: 0 = eye level, 1 = floor level, 2 = stage,
 // as the guest last set with ovrp_SetTrackingOriginType. Beat Saber asks for
 // floor level, so y=0 is the floor and a head belongs at standing eye height —
@@ -45,12 +52,20 @@ int kl_ovrp_tracking_origin(void);
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
 
+// Stamp the NEXT head pose with an opaque frontend key, so the frame record can
+// name the object the pose was decomposed from. Call it immediately before
+// kl_ovrp_set_head_pose, from the same thread; the tag travels inside the pose
+// through every latch and comes back out as kl_ovrp_render_pose.pose_tag, which
+// is where the reason for it is written down. A frontend that never calls this
+// (the viewer, every host run) leaves every tag 0 and nothing changes.
+void kl_ovrp_set_head_pose_tag(uint64_t tag);
+
 // Date the NEXT head pose: the instant that pose IS ABOUT, on any monotonic
 // clock the frontend likes, as long as it is the same clock every time. On
 // visionOS that is the PRESENTATION TIME the device anchor was predicted to,
 // not the moment the call is made — those differ by the render thread's
 // scheduling jitter, and the head velocity we derive is the pose difference
-// divided by exactly this interval. Taking it from the call clock instead
+// divided by exactly this interval. Getting it from the call clock instead
 // multiplies the velocity by a per-frame noise factor; see klovrp_derive_motion
 // for the full account. Call immediately before kl_ovrp_set_head_pose, from the
 // same thread. A frontend that never calls this keeps the call-time behaviour.
@@ -77,7 +92,12 @@ void kl_ovrp_get_head_pose(float *px, float *py, float *pz,
 //
 // Idempotent in the sense that calling it more often than once per frame is not
 // unsafe, only less useful: each call re-pins to the newest published pose.
-// KL_OVRP_LATCH=0 disables it and restores the live read.
+// KL_OVRP_LATCH=0 disables it and restores the live read; default ON.
+//
+// This latch is NOT what an OVRPlugin guest reads — that guest's poses all come
+// from the ovrp_Update2 step sample. Which frame's step sample gets FILED as a
+// frame's render pose is a separate question again, answered by
+// KL_OVRP_POSE_KEY: the guest's own frame index, not "whatever is live now".
 void kl_ovrp_frame_latch(void);
 
 // The frame clock, for a guest that owns its own frame loop — kl_openxr's
@@ -298,6 +318,42 @@ typedef struct {
     // alone cannot: an angle is a rate times an interval, so a large delta is
     // either a fast head or a stale pose and the two want opposite fixes.
     uint64_t submit_ns;
+    // **Which frontend pose PUSH the head pose above came from**, or 0 if the
+    // frontend never stamped one (every host run, and every frame before the
+    // first stamp).
+    //
+    // The seven floats say what the pose WAS; this says where it came from, and
+    // the difference matters to exactly one caller. visionOS reprojection is not
+    // ours alone: the system warps whatever we present from the drawable's
+    // `deviceAnchor` to the pose at scanout. Handing it the DISPLAY pose means
+    // our pass does the whole correction and the system's is a no-op; handing it
+    // the anchor the guest's pixels actually embody means the SYSTEM does the
+    // one and only warp, from the true render pose, with its own depth-aware
+    // machinery. The second arm needs a real `ar_device_anchor_t` object, which
+    // cannot be fabricated from seven floats — so the frontend keeps a small
+    // ring of the anchors it pushed and this is the key back into it.
+    //
+    // See kl_ovrp_set_head_pose_tag, and KL_WARP in KleptonCompositor.swift.
+    uint64_t pose_tag;
+    // **How many times this record's STAGE had been claimed by a guest frame,
+    // at the moment this record claimed it.** 1-based; 0 on a record that never
+    // went through the stage decision (the external path).
+    //
+    // The record ring and the texture ring are both keyed by stage, and that is
+    // the ONLY thing pairing them. It is not enough: with N stages, guest frame
+    // F and guest frame F+N draw into the same texture, so a record still in
+    // flight when F+N starts drawing describes pixels that no longer exist. The
+    // Vulkan path makes that reachable rather than theoretical — a record is
+    // held in the defer ring until the GPU retires its frame, and that ring is
+    // four deep against three stages.
+    //
+    // A compositor compares this against kl_ovrp_stage_epoch_now(stage): equal
+    // means the texture still holds the pixels the record describes, larger
+    // means the pair has come apart and by how many guest frames. There is no
+    // GL draw count to ask on the Vulkan path (kl_glfb watches framebuffer
+    // attachments and a Vulkan guest makes none), so this is the only identity
+    // the texture has.
+    uint64_t stage_epoch;
 } kl_ovrp_render_pose;
 
 // What the guest rendered `stage` with. Returns 0 (and leaves *out untouched)
@@ -308,6 +364,31 @@ int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out);
 // This is the stage a compositor should be sampling, and the only stage index
 // a caller has any business passing to the call above.
 int kl_ovrp_last_complete_stage(void);
+
+// **The last completed frame's stage and record, out of ONE lock.**
+//
+// The pair above is the same answer in two calls, and two calls are two
+// instants: between "which stage" and "what is in it" the guest's fence thread
+// can commit any number of later frames, so the record that comes back may be a
+// frame the stage index never named. That is how a present can jump ahead of
+// the true newest and the NEXT present come back to it — serials out of order,
+// with every per-frame instrument reading clean. Selecting the tuple once, under
+// the lock the committer holds, removes the window entirely.
+//
+// Returns 0 (leaving *out untouched) before the first completed frame. The stage
+// to sample the texture from is `out->stage`, not a separately-read index.
+int kl_ovrp_last_complete_record(kl_ovrp_render_pose *out);
+
+// How many guest frames have claimed `stage` so far — the live counterpart of
+// kl_ovrp_render_pose.stage_epoch. See that field.
+uint64_t kl_ovrp_stage_epoch_now(int stage);
+
+// How many guest frames submitted NO eye layer, and how many of those had the
+// last known render viewport carried into their record instead of being left at
+// zero. See klovrp_submit_viewports: a zero rect is read as "the whole texture"
+// by every compositor, and on a DoubleWide eye that shows BOTH halves to BOTH
+// eyes. An Unreal guest does this on every loading screen.
+uint64_t kl_ovrp_viewport_carry_stats(uint64_t *carried);
 
 // ---------------------------------------------------------------------------
 // The OTHER layers — what a compositor has to draw ON TOP of the eye picture
@@ -616,9 +697,31 @@ int  kl_ovrp_battery_temperature(void);
 // display frequency and eye texture size. Monotonic, never wall-clock — every
 // consumer compares it against other monotonic times, and the XR side already
 // defines its clock as CLOCK_MONOTONIC.
+// The pose-boundary invariant, as a host check: every head query inside one
+// guest frame cycle returns one pose, and the pose BeginFrame files is that
+// pose. Drives the real entry points with the gameplay call pattern (the two
+// ovrp_Update2 steps carrying different frame indices, the frontend publishing
+// in between). `make posebound`, in `make check`. Returns 1 on pass.
+int    kl_ovrp_pose_boundary_selftest(FILE *f);
+// A Vulkan frame naming NO eye layer files no record
+// (the loading-screen shake). Driven through BeginFrame/EndFrame's own bodies.
+int    kl_ovrp_no_eye_drop_selftest(FILE *f);
+
 void   kl_ovrp_set_predicted_display_time(double t);
 double kl_ovrp_predicted_display_time(void);
+
+// What the GUEST is told (and what every guest-facing consumer must read, so
+// that OVRPlugin, OpenXR and the Choreographer cannot disagree)...
 float kl_ovrp_display_frequency(void);
+
+// ...and what the PANEL was measured at, which KL_DISPLAY_HZ deliberately
+// allows to differ from the above: a 72 Hz title on a 120 Hz panel is the
+// arrangement a Quest actually presents, and the compositor reprojects across
+// the difference. Host-side code that is measuring OUR OWN presentation rate
+// (the cadence report) must read this one; reading the guest's there would
+// score a perfectly paced compositor at 0.6 periods. Falls back to the
+// guest-facing number when nothing has been measured.
+float kl_ovrp_display_frequency_panel(void);
 
 // The per-eye render target size the guest is told to use
 // (ovrp_GetEyeTextureSize). Defaults to the Quest 2's recommended 2290x2400,
@@ -646,6 +749,16 @@ float kl_ovrp_display_frequency(void);
 //.
 void kl_ovrp_set_eye_texture_size(int w, int h);
 void kl_ovrp_eye_texture_size(int *w, int *h);
+
+// KL_OVRP_EYE_MAX, applied to a size in place, aspect preserved. The
+// advertisement above answers to it and so does the eye-layer DESC the guest
+// allocates from — that second caller is the fix, because the desc is
+// the advertisement times the guest's own render scale and nothing bounded the
+// product. See kl_ovrp.c for the jetsam it cost.
+void kl_ovrp_cap_eye_size(int *w, int *h);
+// KL_OVRP_EYE_SCALE_MIN: the floor under a guest's render scale (0 = off);
+// returns the scale the eye desc is built from. Applied before the cap.
+float kl_ovrp_eye_scale_floor(float asked);
 
 // Do we tell the guest the two eyes may be ARRAY LAYERS of one texture rendered
 // in a single pass — Unity's Single Pass Instanced / Multiview? This is the one
@@ -706,6 +819,16 @@ int kl_ovrp_head_motion(float *vel, float *ang);
 // OpenXR's STAGE space (floor) and its LOCAL space (where the head started).
 float kl_ovrp_eye_height(void);
 
+// The floor gate. Asserts, in kl_ovrp.c where the model lives, that the two
+// halves of the floor answer are one number and cannot drift apart:
+// ovrp_GetUserEyeHeight2 answers the user's standing height in BOTH tracking
+// origins, KL_OVRP_FLOOR_OFFSET raises the node positions by exactly that
+// number under FloorLevel and by nothing under EyeLevel, and the raise never
+// double-counts the default head's own. Written here rather than in the test
+// because it composes klovrp_GetNodePoseState_impl — the shipping entry point —
+// rather than a copy of its arithmetic. Returns 1 on pass.
+int kl_ovrp_floor_selftest(FILE *f);
+
 // ---------------------------------------------------------------------------
 // The read side of the pose seam, for the OTHER XR API
 //
@@ -738,6 +861,23 @@ int kl_ovrp_hand_motion(int hand, float *pos, float *quat, float *vel, float *an
 // velocity of zero, which asserts the thing is stationary. KL_OVRP_DERIVE_VELOCITY=0
 // turns the derivation off, and is the A/B for anything that looks velocity-shaped.
 int kl_ovrp_hand_motion_known(int hand);
+
+// --- "has the frontend published yet?" — the boot-race seam -----------------
+//
+// Side-effect-free readiness, for the one caller that must not read a pose at
+// all until there IS one: kl_openxr's boot gate. Both are STICKY — once a
+// frontend has published, they stay 1 for the process — so they answer "has
+// tracking ever started", not "is it live now".
+//
+// The distinction matters because the pose getters cannot answer it. Before the
+// first publish `kl_ovrp_get_guest_head_pose` returns the IDENTITY orientation
+// at eye height, which is a perfectly plausible pose and indistinguishable from
+// a user facing straight ahead — so a guest that captures its VR origin from
+// the first head pose it sees captures a lie, and wears the difference as a
+// tilted world for the rest of the session.
+int kl_ovrp_head_pose_published(void);
+int kl_ovrp_hand_pose_published(int hand);
+
 int kl_ovrp_controller_input(int hand, uint32_t *buttons, uint32_t *touches,
                              float *index_trigger, float *hand_trigger,
                              float *stick_x, float *stick_y);

@@ -203,6 +203,157 @@ static int check_drm_guard(void) {
     return 0;
 }
 
+// ---- the eye-size ceiling, asserted where the guest ALLOCATES from ----
+//
+// ovrpLayerDesc_EyeFov's TextureSize, the only two fields these guards read.
+#define KLBOOT_DESC_TEXSIZE_W  0x08
+#define KLBOOT_DESC_TEXSIZE_H  0x0c
+
+static int eye_desc_scaled(unsigned char *desc, float scale) {
+    uint64_t (*calc)(int, int, int, int, int, int, int, int, void *, float, float) =
+        kl_ovrp_sym("ovrp_CalculateEyeLayerDesc3");
+    if (!calc) return fail("eye cap guard: ovrp_CalculateEyeLayerDesc3 resolved "
+                           "to nothing");
+    memset(desc, 0, 0x80);
+    // (layout=Array, mips=1, samples=1, colour=0 sRGB, depth=10 D24_S8,
+    //  motion vectors=2 RGBA16F, motion-vector depth=7, flags=0, desc, scale, 1)
+    if (calc(3, 1, 1, 0, 10, 2, 7, 0, desc, scale, 1.0f) != 0)
+        return fail("eye cap guard: ovrp_CalculateEyeLayerDesc3 refused a desc");
+    return 0;
+}
+
+// KL_OVRP_EYE_MAX used to bound only the size we ADVERTISE, and Unity does not
+// allocate from the advertisement: it multiplies it by
+// `XRSettings.eyeTextureResolutionScale` and allocates from THAT. Paint the
+// Town Red VR ships 1.5, so a 4032x3234 advertisement became a 7584x4851 eye
+// layer — 2.25x the pixels in our images and in every render target Unity
+// sizes off them — and the process was jetsammed seconds into its first
+// picture. SUPERHOT died of the same shape at 2x.
+//
+// Both directions, so this cannot regress into either a ceiling that does not
+// hold or a ceiling that has eaten the scale-down case a guest legitimately
+// asks for.
+static int check_eye_cap_guard(void) {
+    unsigned char desc[0x80];
+    int base_w, base_h, big_w, big_h, small_w, small_h;
+    const char *env = getenv("KL_OVRP_EYE_MAX");
+    int cap = env ? atoi(env) : 3072;
+    if (cap <= 0) { printf("  eye cap: KL_OVRP_EYE_MAX is off, nothing to assert\n");
+                    return 0; }
+
+    if (eye_desc_scaled(desc, 1.0f)) return 1;
+    memcpy(&base_w, desc + KLBOOT_DESC_TEXSIZE_W, 4);
+    memcpy(&base_h, desc + KLBOOT_DESC_TEXSIZE_H, 4);
+    if (base_w > cap || base_h > cap)
+        return fail("eye cap guard: the unscaled desc is already over "
+                    "KL_OVRP_EYE_MAX");
+
+    // (a) a render scale of 4 does not become four times the pixels. Not "no
+    //     bigger than the unscaled desc": under the cap a render scale is a
+    //     legitimate supersample. The ceiling is the invariant.
+    if (eye_desc_scaled(desc, 4.0f)) return 1;
+    memcpy(&big_w, desc + KLBOOT_DESC_TEXSIZE_W, 4);
+    memcpy(&big_h, desc + KLBOOT_DESC_TEXSIZE_H, 4);
+    if (big_w > cap || big_h > cap)
+        return fail("eye cap guard: a guest render scale walked the eye desc "
+                    "past KL_OVRP_EYE_MAX — that is the allocation jetsam kills "
+                    "the process for, and the cap is supposed to hold HERE");
+
+    // (b) ...and a guest that asks for LESS still gets less. A cap that clamped
+    //     both directions would be a resolution cut wearing a ceiling's name.
+    //     KL_OVRP_EYE_SCALE_MIN is the deliberate, opt-in exception: case (b)
+    //     runs with the floor suspended, and with a floor set the same 0.5 must
+    //     come back at the floor.
+    const char *floor_env = getenv("KL_OVRP_EYE_SCALE_MIN");
+    char floor_saved[32] = {0};
+    if (floor_env) snprintf(floor_saved, sizeof floor_saved, "%s", floor_env);
+    unsetenv("KL_OVRP_EYE_SCALE_MIN");
+    int rc_small = eye_desc_scaled(desc, 0.5f);
+    if (floor_env) setenv("KL_OVRP_EYE_SCALE_MIN", floor_saved, 1);
+    if (rc_small) return 1;
+    memcpy(&small_w, desc + KLBOOT_DESC_TEXSIZE_W, 4);
+    memcpy(&small_h, desc + KLBOOT_DESC_TEXSIZE_H, 4);
+    if (small_w >= base_w || small_h >= base_h)
+        return fail("eye cap guard: a render scale below 1 did not shrink the "
+                    "eye desc — the cap must be a ceiling, not a fixed size");
+    if (floor_env && atof(floor_saved) >= 1.0f) {
+        int fw, fh;
+        if (eye_desc_scaled(desc, 0.5f)) return 1;
+        memcpy(&fw, desc + KLBOOT_DESC_TEXSIZE_W, 4);
+        memcpy(&fh, desc + KLBOOT_DESC_TEXSIZE_H, 4);
+        if (fw < base_w || fh < base_h)
+            return fail("eye cap guard: KL_OVRP_EYE_SCALE_MIN >= 1 is set but a "
+                        "render scale of 0.5 still shrank the eye desc");
+        printf("  eye scale floor: KL_OVRP_EYE_SCALE_MIN=%s holds scale 0.5 at "
+               "%dx%d (unscaled %dx%d)\n", floor_saved, fw, fh, base_w, base_h);
+    }
+
+    printf("  eye cap: KL_OVRP_EYE_MAX=%d holds the DESC (scale 1 -> %dx%d, "
+           "scale 4 -> %dx%d, scale 0.5 -> %dx%d)\n",
+           cap, base_w, base_h, big_w, big_h, small_w, small_h);
+    return 0;
+}
+
+// The common caps, asserted as ARITHMETIC: kl_ovrp_cap_eye_size scales the
+// longer axis down to the cap and holds the aspect, and leaves a request that
+// is already under it alone. The input is a measured guest request — 6048x4851,
+// a 1.5x render scale applied to a 4032x3234 advertisement.
+static int check_eye_rung_guard(void) {
+    const char *saved = getenv("KL_OVRP_EYE_MAX");
+    char keep[32];
+    if (saved) snprintf(keep, sizeof keep, "%s", saved);
+    // KL_OVRP_EYE_ALIGN is a separate, opt-in rounding AFTER the cap, and these
+    // rungs assert the cap's own arithmetic, so the guard runs with it
+    // suspended (a row that sets ALIGN=4 would otherwise fail on 3234 -> 3232).
+    const char *align = getenv("KL_OVRP_EYE_ALIGN");
+    char align_keep[32];
+    if (align) snprintf(align_keep, sizeof align_keep, "%s", align);
+    unsetenv("KL_OVRP_EYE_ALIGN");
+    struct { const char *cap; int w, h; } rung[] = {
+        { "4032", 4032, 3234 },
+        { "3584", 3584, 2875 },
+        { "3072", 3072, 2464 },
+    };
+    int bad = 0;
+    for (size_t i = 0; i < sizeof rung / sizeof *rung; i++) {
+        setenv("KL_OVRP_EYE_MAX", rung[i].cap, 1);
+        int w = 6048, h = 4851;
+        kl_ovrp_cap_eye_size(&w, &h);
+        if (w != rung[i].w || h != rung[i].h) {
+            printf("  eye rungs: KL_OVRP_EYE_MAX=%s turned 6048x4851 into "
+                   "%dx%d, not %dx%d\n", rung[i].cap, w, h, rung[i].w, rung[i].h);
+            bad = 1;
+        }
+        // Under the cap nothing moves: a ceiling that also shrinks a small
+        // request is a resolution cut wearing a ceiling's name.
+        int sw = 1024, sh = 822;
+        kl_ovrp_cap_eye_size(&sw, &sh);
+        if (sw != 1024 || sh != 822) {
+            printf("  eye rungs: KL_OVRP_EYE_MAX=%s moved a 1024x822 request "
+                   "that was already under it (-> %dx%d)\n", rung[i].cap, sw, sh);
+            bad = 1;
+        }
+    }
+    // ...and the alignment itself, on the rung where it bites.
+    setenv("KL_OVRP_EYE_MAX", "4032", 1);
+    setenv("KL_OVRP_EYE_ALIGN", "4", 1);
+    int aw = 6048, ah = 4851;
+    kl_ovrp_cap_eye_size(&aw, &ah);
+    if (aw != 4032 || ah != 3232) {
+        printf("  eye rungs: KL_OVRP_EYE_ALIGN=4 turned 6048x4851 into %dx%d at "
+               "4032, not 4032x3232\n", aw, ah);
+        bad = 1;
+    }
+    if (saved) setenv("KL_OVRP_EYE_MAX", keep, 1); else unsetenv("KL_OVRP_EYE_MAX");
+    if (align) setenv("KL_OVRP_EYE_ALIGN", align_keep, 1); else unsetenv("KL_OVRP_EYE_ALIGN");
+    if (bad) return fail("eye rung guard: a cap does not produce the size its "
+                         "arithmetic says");
+    printf("  eye rungs: 6048x4851 caps to 4032x3234 at 4032, 3584x2875 at "
+           "3584 and 3072x2464 at 3072, aspect held; KL_OVRP_EYE_ALIGN=4 gives "
+           "4032x3232; a request already under the cap is untouched\n");
+    return 0;
+}
+
 // ---- the guest run, in one function ----
 // This is everything from libmain.so entry through the lifecycle recon. It
 // runs either in the re-exec'd child (normal), or in-process (KL_NOFORK=1,
@@ -886,6 +1037,8 @@ int main(int argc, char **argv) {
     // waitpid. KL_SKIP_GUARD_TEST skips this self-test when running under
     // lldb — the guard itself in kl_ovrplat.c is unaffected.
     if (!getenv("KL_SKIP_GUARD_TEST") && check_drm_guard()) return 1;
+    if (!getenv("KL_SKIP_GUARD_TEST") && check_eye_cap_guard()) return 1;
+    if (!getenv("KL_SKIP_GUARD_TEST") && check_eye_rung_guard()) return 1;
 
     // ---- phase 2: reconnaissance, in a child ----
     // Unimplemented JNI slots abort the process on purpose, so this runs in a

@@ -56,12 +56,51 @@ def real_symbols(so):
     return syms
 
 
-def out_param_regs(so, addr, span=0x60):
-    """Which xN the real function refuses as NULL with -1001."""
+def text_bounds(so):
+    """Every global text address in the file, sorted — the function boundaries.
+
+    Not just the ovrp_ ones: what this is for is knowing where the function
+    under examination ENDS, and the thing that follows it may be any symbol.
+    """
+    out = subprocess.run(["nm", "-D", so], capture_output=True, text=True).stdout
+    addrs = set()
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) == 3 and p[1] in ("T", "t", "W"):
+            addrs.add(int(p[0], 16))
+    return sorted(addrs)
+
+
+def out_param_regs(so, addr, span=0x60, bounds=None):
+    """Which xN the real function refuses as NULL with -1001.
+
+    The window is clipped at the NEXT symbol, and that clip is load-bearing
+    rather than an optimisation. A flat 0x60 runs off the end of any function
+    shorter than 96 bytes and into its neighbour, and the neighbour's `cbz xN,
+    <-1001>` then reads as this function's: Beat Saber 1.40's plugin has
+    ovrp_Shutdown2 (0x38 bytes, no arguments at all, its own cbz answering
+    -1002 for a missing singleton) sitting immediately before ovrp_GetVersion2,
+    whose out-parameter check is a textbook -1001 — so the gate reported
+    Shutdown2 as taking a pointer and stayed red on a correct implementation.
+    """
+    if bounds:
+        nxt = next((b for b in bounds if b > addr), None)
+        if nxt is not None:
+            span = min(span, nxt - addr)
     d = subprocess.run(
         ["objdump", "-d", f"--start-address={addr}", f"--stop-address={addr + span}", so],
         capture_output=True, text=True).stdout
+    # ...and STOP AT THE NEXT SYMBOL. The 0x60 span is a ceiling, not a length:
+    # a short entry point is followed inside it by the next one, and reading on
+    # attributes that neighbour's argument refusals to this function. Measured:
+    # ovrp_Shutdown2 is 0x38 bytes and answers -1002 on a null session (it takes
+    # no arguments at all), but ovrp_GetVersion2 begins 0x38 in and refuses a
+    # NULL x0 with -1001 — so the unbounded read reported Shutdown2 as needing a
+    # pointer and failed `make check` against a correct implementation.
     body = d.split(">:", 1)[-1] if ">:" in d else d
+    nxt = re.search(r"\n[0-9a-f]+ <[^>]+>:", body)
+    if nxt:
+        body = body[:nxt.start()]
     regs = set()
     for m in re.finditer(r"cbz\s+x(\d+),\s+0x([0-9a-f]+)", body):
         reg, target = int(m.group(1)), m.group(2)
@@ -88,6 +127,7 @@ def main(argv):
     so  = argv[1] if len(argv) > 1 else "beatsaber/lib/arm64-v8a/libOVRPlugin.so"
     csrc = argv[2] if len(argv) > 2 else "runtime/xr/kl_ovrp.c"
     syms = real_symbols(so)
+    bounds = text_bounds(so)
     if not syms:
         print(f"  ovrp ABI: no real libOVRPlugin.so at {so} — nothing to compare against")
         return 0
@@ -97,7 +137,7 @@ def main(argv):
         if name not in syms:
             continue                      # ours only — Unity's plugin interface, etc.
         checked += 1
-        regs = out_param_regs(so, syms[name])
+        regs = out_param_regs(so, syms[name], bounds=bounds)
         if not regs:
             continue
         if params is None:

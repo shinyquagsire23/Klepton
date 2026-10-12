@@ -286,6 +286,10 @@ final class KleptonCompositor {
     private var guestFrameEvent: MTLSharedEvent!
     private var lastGuestFrame: UInt64 = 0
     private var staleInARow = 0
+    // The fence verdict — see the block in renderFrame that writes it.
+    private var loggedFenceVerdict = false
+    private var fenceAtStart: UInt64 = 0
+    private var fenceWatchFrames = 0
 
     // Keyed by (eye, stage). Indexed by stage from the start rather than kept
     // as a "last texture" global, because ovrp_GetEyeTextureStageCount is ours
@@ -647,6 +651,27 @@ final class KleptonCompositor {
     /// Called once per frame, *before* kl_app_frame(), so the guest renders
     /// with this frame's pose rather than the previous one's — the same
     /// ordering reason the Choreographer is ticked before nativeRender.
+    /// The last few `DeviceAnchor`s pushed to the guest, and the tag each went
+    /// out under. A ring rather than one slot: the guest is decoupled, so the
+    /// frame being composited can be several pushes old — at 120 Hz pushes and
+    /// a 72 Hz guest that is two or three, and a stall makes it more. 128 is
+    /// over a second of them and costs a pointer each.
+    ///
+    /// Only ever touched from the frame loop (`updatePoses` and `renderFrame`
+    /// are the same thread), so it needs no lock. A miss — the tag has been
+    /// overwritten, or the guest's frame predates the first push — falls back to
+    /// the display anchor, which is the behaviour that existed before this.
+    private static let poseAnchorRing = 128
+    private var poseAnchors = [(tag: UInt64, anchor: DeviceAnchor)?](
+        repeating: nil, count: poseAnchorRing)
+    private var poseTag: UInt64 = 0
+
+    private func poseAnchor(tag: UInt64) -> DeviceAnchor? {
+        guard tag != 0 else { return nil }
+        let slot = poseAnchors[Int(tag % UInt64(Self.poseAnchorRing))]
+        return slot?.tag == tag ? slot?.anchor : nil
+    }
+
     private func updatePoses(at presentationTime: TimeInterval) {
         guard arRunning else { return }
 
@@ -658,20 +683,30 @@ final class KleptonCompositor {
             // it into the stage record when the guest reaches ovrp_BeginFrame —
             // which is what the composite pass reads back to know where the
             // picture it is about to show was drawn from.
+            //
+            // Keep the ANCHOR OBJECT too, under a tag that travels with the pose
+            // (kl_ovrp.h, `pose_tag`). Seven floats are enough to build a
+            // model-view from; they are not enough to hand Compositor Services a
+            // `deviceAnchor`, and KL_WARP=system needs exactly that — the anchor
+            // the guest's pixels embody, so the SYSTEM does the one and only
+            // warp instead of correcting on top of our correction.
+            poseTag &+= 1
+            poseAnchors[Int(poseTag % UInt64(Self.poseAnchorRing))] = (poseTag, anchor)
+            kl_ovrp_set_head_pose_tag(poseTag)
+            // ...and DATE it with the instant it is about. The pose above was
+            // predicted to `presentationTime`, so that — not "now" — is the
+            // clock the head velocity has to be differenced on. The two differ
+            // by this thread's scheduling jitter, and dividing a uniform
+            // presentation-time step by a jittery call-time one multiplies the
+            // derived velocity by a per-frame noise factor. See
+            // klovrp_derive_motion in runtime/xr/kl_ovrp.c.
+            kl_ovrp_set_head_pose_time(presentationTime)
             // In head space, not device space — see the midpoint argument at
             // originFromHead. The guest derives its eye positions from this
             // pose and the offsets pushEyeOffsets sent, and those two have to
             // be stated about one origin or every near object sits wrong.
             let (p, q) = Self.decompose(
                 Self.headFrom(anchor.originFromAnchorTransform, midpoint: eyeMidpointInDevice))
-            // Date the pose with the instant it is about. It was predicted to
-            // `presentationTime`, so that — not "now" — is the clock the head
-            // velocity has to be differenced on. The two differ by this
-            // thread's scheduling jitter, and dividing a uniform
-            // presentation-time step by a jittery call-time one multiplies the
-            // derived velocity by a per-frame noise factor. See
-            // klovrp_derive_motion in runtime/xr/kl_ovrp.c.
-            kl_ovrp_set_head_pose_time(presentationTime)
             kl_ovrp_set_head_pose(p.x, p.y, p.z, q.imag.x, q.imag.y, q.imag.z, q.real)
         }
 
@@ -1243,6 +1278,42 @@ final class KleptonCompositor {
             }
             t.label = "klepton eye stage \(stage)"
             tex = t
+            // CLEARED, once, before the guest is ever handed it.
+            //
+            // A `.private` allocation of half a gigabyte holds whatever was in
+            // that memory, and the guest does not write all of it: under a
+            // foveation rate map Tetris Effect rasterizes 31.5% of the fragments
+            // (12288x4928 screen -> 7874x2422 physical), so about two thirds of
+            // every stage is never touched by anything at all. Any sampling
+            // that reaches past the written region — an off-by-one at the grid's
+            // outer ring, a rect measured against the wrong texture, a rate map
+            // one generation stale — reads that memory and shows it, and it
+            // shows it as a CONSTANT COLOUR because that is what recycled
+            // texture memory looks like.
+            //
+            // Tetris Effect's blue fill was that shape of defect: a large flat
+            // colour with a boundary that moves with the head and is not in the
+            // game's own art. This does not diagnose such a thing, but it
+            // removes the only thing this class of bug can be filled WITH, for
+            // one clear per stage at allocation.
+            // If the blue survives this, it is in the picture the guest drew and
+            // the hunt moves inside the guest.
+            if let cmd = queue?.makeCommandBuffer() {
+                for slice in 0..<t.arrayLength {
+                    let pass = MTLRenderPassDescriptor()
+                    pass.colorAttachments[0].texture     = t
+                    pass.colorAttachments[0].slice       = slice
+                    pass.colorAttachments[0].loadAction  = .clear
+                    pass.colorAttachments[0].storeAction = .store
+                    pass.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 1)
+                    cmd.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+                }
+                cmd.commit()
+            } else {
+                NSLog("[cp] stage \(stage): no queue yet — the eye texture is "
+                      + "handed over UNCLEARED, and anything sampled outside the "
+                      + "guest's rendered region is recycled memory")
+            }
             // The real cost, not the arithmetic one. Metal reports what it
             // actually reserved, so this is the only honest input to "is the
             // eye swapchain why we are at 3.5 GB".
@@ -1463,7 +1534,18 @@ final class KleptonCompositor {
                 kl_audio_resume()
                 continue loop
             default:
+                // How long ONE slot took, wall clock, outside in. visionOS kills an
+                // immersive app whose layer renderer has gone 2.0 s without
+                // submitting a drawable, the kill leaves NO crash report of any
+                // kind, and the only trace is `wakeboardd: killing [pid]
+                // because it hasn't been sending frames for 2.0s` in the system
+                // log. Anything this loop calls that can block — a synchronous
+                // XPC round trip most of all — is therefore a fatal bug, and
+                // this is the number that names it while the process is still
+                // alive to print it.
+                let slotStart = CACurrentMediaTime()
                 autoreleasepool { presented += renderFrame() }
+                noteSlot(CACurrentMediaTime() - slotStart)
             }
             iterations += 1
             if Date() >= nextReport {
@@ -1699,7 +1781,7 @@ final class KleptonCompositor {
         // reprojected was the thing blocking this loop.
         if syncGuest {
             _ = kl_app_frame()
-        } else {
+        } else if paceMayPublish() {
             kl_app_guest_publish()
             // A guest that has *ended* looks exactly like a guest that is
             // merely slow — both leave the stage record where it was and both
@@ -1741,11 +1823,32 @@ final class KleptonCompositor {
         // guest decoupled it may well be *mid-draw* into exactly that texture,
         // so the frames before the first EndFrame would be a torn picture
         // rather than an empty one, and reprojected against no pose at all.
-        let completeStage = Int(kl_ovrp_last_complete_stage())
-        let stage = max(0, completeStage)
+        //
+        // KL_PRESENT_ORDER=strict (default) takes the stage and the record as
+        // ONE selection, out of the lock the committer holds
+        // (kl_ovrp_last_complete_record). `off` is the old arm: ask for
+        // the stage, then ask what is in it — two lock acquisitions with the
+        // guest's GPU fence thread free to commit later frames in between, so
+        // the record that comes back can be a frame the stage index never named.
+        // That is how a present jumps ahead of the true newest and the NEXT
+        // present comes back to it: serials out of order, every per-frame
+        // instrument clean, and the world alternating between two positions one
+        // guest frame of head rotation apart.
         var rendered = kl_ovrp_render_pose()
-        var haveRendered = withUnsafeMutablePointer(to: &rendered) {
-            kl_ovrp_stage_render_pose(Int32(stage), $0) != 0
+        var haveRendered: Bool
+        let completeStage: Int
+        if Self.presentOrderStrict {
+            haveRendered = withUnsafeMutablePointer(to: &rendered) {
+                kl_ovrp_last_complete_record($0) != 0
+            }
+            completeStage = haveRendered ? Int(rendered.stage)
+                                         : Int(kl_ovrp_last_complete_stage())
+        } else {
+            completeStage = Int(kl_ovrp_last_complete_stage())
+            let s = max(0, completeStage)
+            haveRendered = withUnsafeMutablePointer(to: &rendered) {
+                kl_ovrp_stage_render_pose(Int32(s), $0) != 0
+            }
         }
         // `complete` is redundant today and will not be: with one stage, the
         // guest's *next* ovrp_BeginFrame overwrites the record this one is
@@ -1755,6 +1858,22 @@ final class KleptonCompositor {
         // silent wrong answer, so it is checked now rather than after the
         // change that makes it possible.
         if haveRendered && rendered.complete == 0 { haveRendered = false }
+
+        // **Never go backwards.** A serial older than the one already on the
+        // panel is a frame the viewer has seen the future of; showing it puts
+        // the world back where it was one guest frame ago, which under head
+        // motion is a jump and under a repeating cadence is a shake. Under
+        // `strict` the previous selection is shown again instead — a repeat,
+        // which reprojection already handles and the eye reads as smooth.
+        if Self.presentOrderStrict, haveRendered,
+           let held = lastPresentedRecord, rendered.serial < held.serial {
+            rendered = held
+            presentHeldBack += 1
+        }
+        // The stage to sample the TEXTURE from comes off the record itself, not
+        // from a separately-read index: the pair is only a pair if both halves
+        // name the same frame.
+        let stage = max(0, haveRendered ? Int(rendered.stage) : completeStage)
 
         // Order this pass after the guest's rendering. The value only advances
         // when the guest swaps, so an unchanged one also means "no new picture"
@@ -1833,6 +1952,38 @@ final class KleptonCompositor {
             staleInARow = 0
             lastGuestFrame = frameValue
         }
+        // **Is the fence actually moving?** It is the only thing ordering this
+        // composite against ANGLE's queue, and a FROZEN one is silent: the wait
+        // is satisfied for ever, the drawable is presented, every counter here
+        // reads clean, and the eye texture is sampled while the guest may be
+        // part-way through redrawing it. That was true for a whole Tetris Effect
+        // session — `kl_glfb_present` was gated on "the guest has never
+        // swapped", and that guest swaps exactly once at bring-up (kl_ovrp.c's
+        // klovrp_EndFrame4). The only trace was `stale in a row` climbing to
+        // 10,767 of 10,857 iterations, which was read as an instrument fault.
+        //
+        // So it is a line now, and it is one-shot on each side: the value's
+        // first advance says the ordering is live, and its failure to advance
+        // says the composite is unordered — which is a picture made of two
+        // guest frames, not a missing screenshot.
+        if !loggedFenceVerdict, guestFrameEvent != nil, !noFence, haveRendered {
+            if fenceWatchFrames == 0 { fenceAtStart = glFence }
+            fenceWatchFrames += 1
+            if glFence > fenceAtStart {
+                loggedFenceVerdict = true
+                NSLog("[cp] the guest's GPU fence is advancing (\(fenceAtStart) "
+                      + "-> \(glFence) over \(fenceWatchFrames) composites) — "
+                      + "the composite waits for ANGLE before it samples the "
+                      + "eye texture")
+            } else if fenceWatchFrames > 600 {
+                loggedFenceVerdict = true
+                NSLog("[cp] *** the guest's GPU fence has NOT advanced in 600 "
+                      + "composites (stuck at \(glFence)) — the composite is "
+                      + "UNORDERED against the guest's rendering and the panel "
+                      + "may be showing two guest frames at once. See "
+                      + "klovrp_EndFrame4's swap gate.")
+            }
+        }
 
         // The pose the picture will be *shown* at, as freshly predicted as we
         // can make it: re-queried here rather than reused from updatePoses,
@@ -1842,7 +1993,49 @@ final class KleptonCompositor {
         let presentation = LayerRenderer.Clock.Instant.epoch
             .duration(to: main.frameTiming.presentationTime).timeInterval
         let displayAnchor = displayAnchor(at: presentation)
-        let originFromDevice = originFromDevice(displayAnchor)
+        let displayFromOrigin = originFromDevice(displayAnchor)
+
+        // WHO DOES THE WARP — KL_WARP=ours (default here) or KL_WARP=system.
+        //
+        // There are two reprojections on this display and only one of them is
+        // ours. The system warps whatever we present from the drawable's
+        // `deviceAnchor` to the pose the hardware reports at scanout; our pass
+        // corrects from the guest's render pose to the pose we predict for
+        // presentation. Telling the system the DISPLAY pose (what this loop did
+        // from the beginning) declares "this frame is already correct for
+        // presentation", so its own correction is a no-op and ours is the whole
+        // of it — the guest's picture is warped once, by a rotation-only pass
+        // over a flat proxy, and any inexactness in that pass shows up scaled by
+        // the correction magnitude. Correction magnitude ALTERNATES by
+        // construction: a freshly-rendered showing needs almost none and a held
+        // showing needs a full guest period's worth, so a 72 Hz guest on a
+        // 120 Hz panel produces a repeating small/large/small cadence. An error
+        // proportional to it is an image alternating between two positions,
+        // which is the symptom this hunt is chasing.
+        //
+        // `system` hands the system the anchor the pixels ACTUALLY embody — the
+        // one cached at this frame's pose freeze — and neutralises our own
+        // correction by reprojecting towards that same pose (the model-view then
+        // reduces to the display's per-eye view rotation, which is a property of
+        // the panel and not a delta). The system then does the one and only
+        // warp, from the true render pose, with the machinery that kept the ETT
+        // test lattice welded through corrections that shook the game's content.
+        //
+        // The fallback is `ours` in all but name: no cached anchor (the guest's
+        // frame predates the first push, or the tag has rolled out of the ring)
+        // means the display anchor and the correction we always did.
+        let renderAnchor = Self.warpBySystem && haveRendered
+            ? poseAnchor(tag: rendered.pose_tag) : nil
+        let drawableAnchor = renderAnchor ?? displayAnchor
+        let warpOriginFromDevice = renderAnchor?.originFromAnchorTransform ?? displayFromOrigin
+        if Self.warpBySystem && !loggedWarpArm && haveRendered {
+            loggedWarpArm = true
+            NSLog("[cp] KL_WARP=system: the drawable is stamped with the pose "
+                  + "freeze's own anchor and our model-view is neutral — the "
+                  + "SYSTEM does the one warp. Frame \(rendered.serial) tag "
+                  + "\(rendered.pose_tag) -> \(renderAnchor == nil ? "NO CACHED ANCHOR (falling back to the display anchor, i.e. our warp)" : "cached anchor")")
+        }
+
         // OpenXR's VIEW space is DEFINED as the midpoint between the eyes.
         // visionOS's device anchor is a point on the hardware and is not that
         // midpoint, so treating the two as equal declares an equality that is
@@ -1856,7 +2049,7 @@ final class KleptonCompositor {
         // The drawable states the midpoint every frame and it needs no tuning:
         // it is the average of the two eyes' own transforms. `deviceAnchor`
         // below still gets the raw anchor, which is what that API means.
-        let originFromHead = Self.headFrom(originFromDevice, midpoint: eyeMidpointInDevice)
+        let originFromHead = Self.headFrom(warpOriginFromDevice, midpoint: eyeMidpointInDevice)
         if Self.pendingRecenter {
             Self.pendingRecenter = false
             // Yaw + horizontal position only, exactly Quest's recenter: height
@@ -1877,6 +2070,19 @@ final class KleptonCompositor {
             NSLog("[cp] RECENTER: yaw %.1f deg, pos (%.2f, %.2f) folded into the origin",
                   yaw * 180 / .pi, px, pz)
         }
+
+        // What this present will actually put on the panel. Here rather than at encodePresent because this is where
+        // all three halves of the tuple are in hand at once: the record, the
+        // stage whose texture will be bound, and the anchor the drawable will
+        // be stamped with.
+        // `bridged`: the guest published no new picture for this slot, so what
+        // is about to be presented is the content already in hand, reprojected
+        // to a fresh pose. `staleInARow` was set above from exactly that
+        // comparison; a slot with no record at all is bridged too — there is
+        // nothing newer by definition.
+        notePresentOrder(rendered: haveRendered ? rendered : nil, stage: stage,
+                         anchorHit: renderAnchor != nil,
+                         bridged: !haveRendered || staleInARow > 0)
 
         // Measure the pose the composite is about to DRAW with, which is not
         // always the frame record. With the layer path live the eye picture is
@@ -1909,8 +2115,14 @@ final class KleptonCompositor {
             let rendYaw = atan2f(2*(qw*qy + qx*qz), 1 - 2*(qy*qy + qz*qz)) * 180 / .pi
             NSLog("[cp] headlock-probe: display yaw %.1f  render yaw %.1f", dispYaw, rendYaw)
         }
+        // Always against the DISPLAY pose, whichever arm is running: this is the
+        // instrument that says how big the corrections are, and under `system`
+        // our own delta is zero by construction — reporting that would replace
+        // the measurement with a tautology.
         noteReprojection(rendered: measured,
-                         originFromHead: originFromHead, stage: stage)
+                         originFromHead: Self.headFrom(displayFromOrigin,
+                                                       midpoint: eyeMidpointInDevice),
+                         stage: stage)
 
         // The drawable's depth range, once, with the depth our quad actually
         // reaches. This is not curiosity. The quad's distance is what the
@@ -2007,7 +2219,7 @@ final class KleptonCompositor {
         for drawable in drawables {
             // Per drawable, not once: each one is presented separately and each
             // is reprojected by the system against its own anchor.
-            drawable.deviceAnchor = displayAnchor
+            drawable.deviceAnchor = drawableAnchor
             encoded += encodeComposite(drawable, cmd: cmd, stage: stage,
                                        completeStage: completeStage,
                                        rendered: rendered, haveRendered: haveRendered,
@@ -2073,6 +2285,10 @@ final class KleptonCompositor {
     ///
     /// The `.dedicated` layout keeps the old per-view pass, with that view's
     /// own single-layer rate map, because there is nothing to amplify.
+    /// KL_CP_AMPLIFY, read once: encodeComposite runs per drawable per frame,
+    /// and klEnvOn rebuilds the whole environment dictionary on every call.
+    private static let amplifyOn = klEnvOn("KL_CP_AMPLIFY", default: true)
+
     private func encodeComposite(_ drawable: LayerRenderer.Drawable,
                                  cmd: MTLCommandBuffer, stage: Int, completeStage: Int,
                                  rendered: kl_ovrp_render_pose, haveRendered: Bool,
@@ -2093,7 +2309,7 @@ final class KleptonCompositor {
         let layered = layerRenderer.configuration.layout == .layered
                       && drawable.views.count > 1
                       && amplification >= drawable.views.count
-                      && klEnvOn("KL_CP_AMPLIFY", default: true)
+                      && Self.amplifyOn
         if layered {
             return encodeViews(Array(drawable.views.indices), drawable: drawable,
                                layered: true,
@@ -3014,6 +3230,29 @@ final class KleptonCompositor {
     /// The last per-eye placement described by `[cp] eye placement`, so the line
     /// is printed when it CHANGES rather than only on the first frame.
     private var lastEyeShape = ""
+    /// KL_WARP=system|ours — which reprojection actually corrects the guest's
+    /// picture. See the long note at the call site in `renderFrame`.
+    ///
+    /// Default `ours`, deliberately, even though `system` is what cured
+    /// Pistol Whip's and The Simpsons Hit & Run's head-turn jitter. `system`
+    /// reshapes the present path for EVERY title — it stamps the drawable with
+    /// the render pose and hands the whole correction to the compositor — so
+    /// making it the default is a per-title decision (a target row sets it),
+    /// one environment variable away (`KL_WARP=system`).
+    private static let warpBySystem: Bool = {
+        let e = ProcessInfo.processInfo.environment["KL_WARP"] ?? ""
+        let sys = e.hasPrefix("s") || e.hasPrefix("S")
+        let ours = !sys
+        NSLog("[cp] KL_WARP=\(e.isEmpty ? "ours (default)" : e) — "
+              + (ours ? "OUR pass does the correction and the drawable is "
+                        + "stamped with the display pose (the default arm)"
+                      : "the SYSTEM does the correction; the drawable is "
+                        + "stamped with the render pose and our model-view is "
+                        + "neutral"))
+        return !ours
+    }()
+    private var loggedWarpArm = false
+
     /// KL_CP_EYE=<0|1>, the binocular/temporal split. See encodeViews.
     private static let onlyEye: Int? = {
         guard let e = ProcessInfo.processInfo.environment["KL_CP_EYE"],
@@ -3054,7 +3293,12 @@ final class KleptonCompositor {
         // device run. Falling back to the rate the guest is being told keeps
         // the ratio meaningful; failing that the raw milliseconds still are.
         if displayPeriod <= 0 {
-            let hz = Double(kl_ovrp_display_frequency())
+            // The PANEL's rate, not the guest's: this measures how often WE
+            // present, and those two numbers are deliberately allowed to differ
+            // (a 72 Hz guest on a 120 Hz panel — see kl_ovrp_set_display_
+            // frequency). Reading the guest's here would make the cadence ratio
+            // report 0.6 periods on a perfectly paced compositor.
+            let hz = Double(kl_ovrp_display_frequency_panel())
             displayPeriod = hz > 1 ? 1.0 / hz : 0
         }
         let seconds = presentation - lastPresentation
@@ -3100,7 +3344,15 @@ final class KleptonCompositor {
         // the latched period by more than 10% is not a hitch.
         if displayPeriod > 0 && cadenceN >= 30 && abs(periods - 1.0) > 0.10 {
             cadenceDisagreed += 1
-            if cadenceDisagreed == 3 {
+            // Print at three, then keep saying it every fifteen windows (~30 s).
+            // `== 3` printed once and went silent for the rest of the run, which
+            // is backwards: a hitch is the case that deserves one line, and a
+            // PERMANENT disagreement is the case that has to stay on the screen.
+            // One run held a 2x disagreement — a 60 Hz present against the
+            // 120 Hz we latched and told the guest — for 130 seconds; the log
+            // said so twice inside the first 26 and never again, so the run's
+            // smoothness looked unconfounded when every frame of it was.
+            if cadenceDisagreed >= 3 && (cadenceDisagreed - 3) % 15 == 0 {
                 NSLog(String(format: "[cp] THE PANEL IS NO LONGER RUNNING AT THE RATE WE "
                              + "LATCHED. We latched %.2f Hz at boot and told the guest "
                              + "%.2f Hz; the last six seconds present every %.2f ms, "
@@ -3442,7 +3694,6 @@ final class KleptonCompositor {
     /// The midpoint the callback uses — the instance's, copied out so a C
     /// function pointer can reach it.
     nonisolated(unsafe) static var headAtMidpoint = SIMD3<Float>(0, 0, 0)
-    nonisolated(unsafe) static var loggedEyeMidpoint = false
 
     /// The eye midpoint in the device anchor's frame — the offset between what
     /// visionOS calls the device and what OpenXR calls VIEW.
@@ -3472,25 +3723,32 @@ final class KleptonCompositor {
         return t * deviceFromView
     }
 
+    /// KL_HEAD_MIDPOINT, read ONCE. pushEyeOffsets runs every frame, and every
+    /// `ProcessInfo.environment` access rebuilds the whole dictionary (a strdup
+    /// per variable) under libc's environ lock — Batman: Arkham Shadow died
+    /// inside exactly that strdup, on this line, at render rate.
+    private static let headMidpointOn =
+        ProcessInfo.processInfo.environment["KL_HEAD_MIDPOINT"] != "0"
+    /// The midpoint last logged; the line is printed when it moves, not per
+    /// frame (it was 18,843 lines of one boot log).
+    private var loggedEyeMidpoint: SIMD3<Float>?
+
     private func pushEyeOffsets(_ drawable: LayerRenderer.Drawable) {
         // Latched, not re-read per frame. A streaming guest sends its eye
         // transform to the host ONCE and the host will not revise it, so the
         // number the guest was given has to stay the number it was given; the
         // display side is free to move underneath it, and bridging the two is
         // the composite's job rather than something to hide by re-pushing.
-        if ProcessInfo.processInfo.environment["KL_HEAD_MIDPOINT"] != "0",
-           drawable.views.count >= 2 {
+        if Self.headMidpointOn, drawable.views.count >= 2 {
             let a = drawable.views[0].transform.columns.3
             let b = drawable.views[1].transform.columns.3
             eyeMidpointInDevice = SIMD3<Float>((a.x + b.x) * 0.5,
                                                (a.y + b.y) * 0.5,
                                                (a.z + b.z) * 0.5)
             Self.headAtMidpoint = eyeMidpointInDevice
-            // Once, not per frame: this fires on every drawable and the value is
-            // ~constant, so an unconditional NSLog is thousands of writes/sec on
-            // the render thread — a frame-pacing / watchdog hazard.
-            if !Self.loggedEyeMidpoint {
-                Self.loggedEyeMidpoint = true
+            if loggedEyeMidpoint.map({ simd_distance($0, eyeMidpointInDevice) > 0.0005 })
+                ?? true {
+                loggedEyeMidpoint = eyeMidpointInDevice
                 NSLog(String(format: "[cp] eye midpoint (%.4f, %.4f, %.4f) m from the "
                                      + "device anchor — head space is this, not the anchor "
                                      + "(KL_HEAD_MIDPOINT=0 restores the anchor)",
@@ -3772,6 +4030,10 @@ final class KleptonCompositor {
             let hz = Float(1.0 / mid)
             NSLog(String(format: "[cp] display %.2f Hz measured over %d frames",
                          hz, chosenGaps))
+            // The measurement always lands, but a pinned guest keeps its own
+            // rate — kl_ovrp_set_display_frequency records this as the panel
+            // and says so once. The "guest will be told" line below is the one
+            // that answers what the guest actually got.
             kl_ovrp_set_display_frequency(hz)
         } else {
             NSLog("[cp] could not measure the display rate — the guest keeps "
@@ -3841,6 +4103,409 @@ final class KleptonCompositor {
                      ageMs, worstAgeMs, staleInARow))
         worstDelta = 0
         worstAgeMs = 0
+    }
+
+    // MARK: - present order
+
+    /// KL_PRESENT_ORDER=strict|off. `strict` (default) selects the stage, the
+    /// record and therefore the texture and the anchor as ONE tuple out of one
+    /// lock, and refuses to present a guest frame older than the one already
+    /// shown. `off` is the old two-read arm, bit for bit, so the measurement
+    /// below can be taken on both.
+    private static let presentOrderStrict: Bool = {
+        let e = ProcessInfo.processInfo.environment["KL_PRESENT_ORDER"] ?? ""
+        let off = ["off", "0", "no", "none"].contains(e.lowercased())
+        NSLog("[cp] KL_PRESENT_ORDER=\(e.isEmpty ? "strict (default)" : e) — "
+              + (off ? "the stage index and the record are read SEPARATELY and a "
+                       + "present may show a guest frame older than the last "
+                       + "(the old two-read arm)"
+                     : "the record, its stage's texture and its anchor are one "
+                       + "selection, and a present never goes backwards"))
+        return !off
+    }()
+
+    /// The last record actually presented, so a regression can be detected and
+    /// (under `strict`) held back. Only the frame loop touches it.
+    private var lastPresentedRecord: kl_ovrp_render_pose?
+    private var presentCount: UInt64 = 0
+    /// When the current 300-present window opened, so the line below can
+    /// report the rate the GUEST actually delivered rather than leaving it
+    /// to arithmetic on `repeats`. Distinct serials per second is the guest's true frame rate, and it
+    /// is the one quantity no other instrument here prints.
+    private var presentWindowStart: TimeInterval = 0
+    private var presentRegressions: UInt64 = 0
+    private var presentWorstRegression: UInt64 = 0
+    private var presentRepeats: UInt64 = 0
+    /// How many panel slots each DISTINCT guest frame occupied, bucketed
+    /// 1..5 and 6+. A smooth run is one bucket, a juddering run is two
+    /// adjacent buckets in a ragged mix: one title's menu read `1x:296`
+    /// (smooth) and its gameplay `2x:~100 3x:~40` (judder) in the same build
+    /// with the same warp arm.
+    private var presentHoldRun = 0
+    private var presentHolds = [UInt64](repeating: 0, count: 7)
+    private var presentMispairs: UInt64 = 0
+    private var presentWorstMispair: UInt64 = 0
+    private var presentAnchorMisses: UInt64 = 0
+    private var presentHeldBack: UInt64 = 0
+    private var presentNoRecord: UInt64 = 0
+    /// Panel slots the guest had no new picture for and this loop bridged by
+    /// re-presenting the held content — see `bridged` in the census note below.
+    private var presentBridged: UInt64 = 0
+    private var presentBridgeRun: UInt64 = 0
+    private var presentWorstBridgeRun: UInt64 = 0
+    private var loggedBridge = false
+
+    // MARK: - the frame loop's own liveness
+
+    /// The slowest single iteration of the render loop, and how many were slow
+    /// enough to matter. **This is a watchdog instrument, not a performance
+    /// one.** visionOS kills an immersive app whose `cp_layer_renderer_t` has
+    /// not submitted a frame for 2.0 seconds and leaves no crash report behind
+    /// — `wakeboardd: killing [pid] because it hasn't been sending frames for
+    /// 2.0s` in the system log is the entire evidence. So the question this has
+    /// to be able to answer after the fact is "was any slot ever close to the
+    /// line, and when", and the answer has to be printed *before* the kill.
+    private var slotSlow: UInt64 = 0
+    private var worstSlotMs: Double = 0
+    private var lifetimeWorstSlotMs: Double = 0
+    private var notedSlotStall = false
+    /// A slot over this is not jitter — it is something in the loop blocking.
+    /// 100 ms is twelve panel periods; a fifth of the way to the kill.
+    private static let slotSlowMs = 100.0
+
+    private func noteSlot(_ seconds: Double) {
+        let ms = seconds * 1000
+        if ms > worstSlotMs { worstSlotMs = ms }
+        if ms > lifetimeWorstSlotMs { lifetimeWorstSlotMs = ms }
+        guard ms >= Self.slotSlowMs else { return }
+        slotSlow += 1
+        guard !notedSlotStall else { return }
+        notedSlotStall = true
+        NSLog(String(format: "[cp] FRAME LOOP STALLED: one slot took %.0f ms "
+                     + "(%.0f panel periods). The system kills this process at "
+                     + "2000 ms with no crash report — anything in this loop "
+                     + "that can block is fatal, and the first suspect is a "
+                     + "synchronous XPC call (CoreHaptics, GameController, "
+                     + "audio). See KleptonControllers, hapticQueue.", ms,
+                     ms / 8.33))
+    }
+
+
+    // --- KL_GUEST_FPS_DIV — an EVEN guest cadence ---------------------------
+    //
+    // What a ragged cadence looks like, measured on one build with the warp
+    // arm, the eye size and everything else held fixed:
+    //
+    //   menu      guest 118-120 fps | repeats 0    | bridged 16-18, worst run 1
+    //             frozen series alternation index 0.28-0.46      -> SMOOTH
+    //   gameplay  guest  45-60 fps  | repeats 145+ | bridged 145-188, worst run 2-3
+    //             frozen series alternation index 1.17-1.59      -> JUDDERS
+    //
+    // At the menu every guest frame occupies exactly one panel slot; in
+    // gameplay each one occupies two slots or three, in a ragged mix.
+    //
+    // Neither warp arm can fix that. Both correct ROTATION exactly — `ours` by
+    // rebuilding the model-view, `system` by handing the compositor the anchor
+    // the pixels embody. Neither corrects what is left over, because what is
+    // left over is not a rotation: the eye quad is a flat proxy at
+    // KL_REPROJECT_DEPTH, so reprojection has no parallax to give and every
+    // error that scales with the frame's AGE survives it. A constant age is
+    // invisible — it reads as latency, not motion. An age that alternates 2, 3,
+    // 2, 3 slots is an image that alternates between two positions.
+    //
+    // So this gate makes the age CONSTANT. `kl_app_guest_publish()` is what
+    // wakes the guest for a frame (kl_app.c: the guest sleeps until
+    // `published != consumed`, level-triggered, so extra publishes do not
+    // queue), and releasing it only on a grid tick paces the guest's frame
+    // STARTS onto that grid. A guest that beats the grid then delivers exactly
+    // one frame per `div` slots, forever, and every frame is held exactly `div`
+    // slots. A guest that overruns waits for the NEXT grid tick rather than
+    // free-running, so the holds are div, 2*div, 3*div — still on the grid,
+    // never the 2/3 ragged mix.
+    //
+    //   KL_GUEST_FPS_DIV unset|0|off   the gate is not built; publish every slot
+    //                                  (the default for every target)
+    //   KL_GUEST_FPS_DIV=auto          adaptive
+    //   KL_GUEST_FPS_DIV=N             pinned to N panel slots per guest frame
+    //
+    // Pinball FX VR, an Unreal title that cannot hold 120, is the title it
+    // cured: `=2` (an even 60) removed its head-turn judder. Paint the Town Red
+    // VR's judder turned out to be the pose boundary (kl_ovrp.c), not this.
+    //
+    // The gate CANNOT reduce the compositor's present rate. `paceMayPublish()`
+    // gates ONE call — `kl_app_guest_publish()` in renderFrame — and nothing
+    // else. `queryDrawables` / `startSubmission` / `encodePresent` / `commit`
+    // sit BELOW it and run on every frame the loop sees, held picture or not.
+    // Withholding a publish costs the guest a frame START, never the panel a
+    // present. A mid-session panel demotion (120 -> 90 or 60, system-initiated,
+    // seen with the gate on and off) is not this gate: read the `[cp] THE PANEL
+    // IS NO LONGER RUNNING AT THE RATE WE LATCHED` warn before believing any
+    // smoothness verdict from a session.
+    //
+    // Adaptive, because no single divisor fits a title whose load varies: a
+    // menu that makes 120 (div 1), gameplay that makes 55-60 (div 2 is
+    // marginal, div 3 is comfortable) and stretches that make 45 (div 3). A
+    // pinned 2 across that range would produce a 2/4 mix, which is the same
+    // disease with a longer beat. So: start at 1, raise when the guest overruns
+    // the grid on more than a quarter of publishes in a 128-publish window,
+    // lower again after two consecutive windows under 3%. Capped at 4 (30 fps)
+    // — below that the cure is worse than the disease and the answer is scene
+    // work, not pacing.
+    //
+    // Trading rate for evenness is the whole point and it is a real trade: at
+    // div 3 a ragged 55 becomes an even 40. If the cadence reads even and the
+    // judder is still there, the suspects are the guest's own view matrices
+    // (KL_OVRP_ZERO_HEAD_VEL as the A/B) — which is the point of making the
+    // cadence readable either way.
+    private static let paceSpec: (on: Bool, auto: Bool, fixed: Int) = {
+        let e = (ProcessInfo.processInfo.environment["KL_GUEST_FPS_DIV"] ?? "")
+                    .trimmingCharacters(in: .whitespaces).lowercased()
+        if e.isEmpty || e == "0" || e == "off" { return (false, false, 0) }
+        if e == "auto" || e == "adaptive" { return (true, true, 1) }
+        if let n = Int(e), n >= 1, n <= 8 { return (true, false, n) }
+        NSLog("[cp] KL_GUEST_FPS_DIV=\(e) is not a divisor, `auto` or `off` — "
+              + "the guest cadence gate stays OFF")
+        return (false, false, 0)
+    }()
+    private var paceDiv = 1
+    private var paceSlots = 0
+    private var paceLastSerial: UInt64 = 0
+    private var paceWindowPublishes = 0
+    private var paceWindowOverruns = 0
+    private var paceGoodWindows = 0
+    private var paceValve: UInt64 = 0
+    private var paceOverruns: UInt64 = 0
+    private var pacePublishes: UInt64 = 0
+    private var paceLogged = false
+
+    /// The gate. `true` releases the guest for one frame; `false` holds it to
+    /// the grid. Always `true` when the gate is off, so the un-gated shape is
+    /// byte-for-byte what it was.
+    private func paceMayPublish() -> Bool {
+        guard Self.paceSpec.on else { return true }
+        if !paceLogged {
+            paceLogged = true
+            paceDiv = Self.paceSpec.auto ? 1 : Self.paceSpec.fixed
+            NSLog("[cp] KL_GUEST_FPS_DIV="
+                  + (Self.paceSpec.auto ? "auto" : "\(Self.paceSpec.fixed)")
+                  + " — the guest is released on a grid of \(paceDiv) panel "
+                  + "slot(s) per frame so every frame is held the SAME number "
+                  + "of slots. Ragged 2/3 holds alternate the picture "
+                  + "between two positions; `pace` on the present-order census says whether "
+                  + "the grid held.")
+        }
+        paceSlots += 1
+
+        // What the guest has actually finished. Before its first completed
+        // frame there is nothing to pace and a great deal to lose: boot, the
+        // OBB mount and the first scene load must run free, or the gate is a
+        // deadlock wearing a pacer's clothes.
+        var rec = kl_ovrp_render_pose()
+        let have = withUnsafeMutablePointer(to: &rec) {
+            kl_ovrp_last_complete_record($0)
+        } != 0
+        let serial = have ? rec.serial : 0
+        if serial == 0 { paceSlots = 0; return true }
+        let ready = serial != paceLastSerial
+
+        // The safety valve. A guest inside a scene load delivers nothing for
+        // hundreds of slots, and `ready` would stay false through all of them
+        // — a gate that stops publishing to a stalled guest never restarts it.
+        // Past eight grid periods the gate opens regardless. Counted, because
+        // a valve that fires every frame means the gate is not pacing anything.
+        if paceSlots >= paceDiv * 8 {
+            paceValve += 1
+            paceRelease(serial)
+            return true
+        }
+        guard paceSlots % paceDiv == 0 else { return false }
+        // Overran this tick: wait for the next multiple rather than releasing
+        // late, which is what keeps the holds on the grid instead of ragged.
+        guard ready else { return false }
+        paceRelease(serial)
+        return true
+    }
+
+    /// The gate's own line on the present-order census — empty when the gate
+    /// is off, so an un-gated log reads exactly as it did.
+    private func paceLine() -> String {
+        guard Self.paceSpec.on else { return "" }
+        let n = pacePublishes
+        pacePublishes = 0
+        let o = paceOverruns
+        paceOverruns = 0
+        let v = paceValve
+        paceValve = 0
+        return String(format: " | pace grid %d slots, %llu released, %llu "
+                      + "overran, %llu valve", paceDiv, n, o, v)
+    }
+
+    private func paceRelease(_ serial: UInt64) {
+        pacePublishes += 1
+        paceWindowPublishes += 1
+        if paceSlots > paceDiv {
+            paceOverruns += 1
+            paceWindowOverruns += 1
+        }
+        paceLastSerial = serial
+        paceSlots = 0
+        guard Self.paceSpec.auto, paceWindowPublishes >= 128 else { return }
+        let rate = Double(paceWindowOverruns) / Double(paceWindowPublishes)
+        let was = paceDiv
+        if rate > 0.25 && paceDiv < 4 {
+            paceDiv += 1
+            paceGoodWindows = 0
+        } else if rate < 0.03 && paceDiv > 1 {
+            paceGoodWindows += 1
+            if paceGoodWindows >= 2 { paceDiv -= 1; paceGoodWindows = 0 }
+        } else {
+            paceGoodWindows = 0
+        }
+        paceWindowPublishes = 0
+        paceWindowOverruns = 0
+        if paceDiv != was {
+            NSLog(String(format: "[cp] guest cadence grid %d -> %d slots per "
+                         + "frame (%.0f%% of the last window overran); the "
+                         + "guest is now paced at %.1f fps against a %.1f Hz "
+                         + "panel, EVENLY", was, paceDiv, rate * 100,
+                         displayPeriod > 0 ? 1.0 / (displayPeriod * Double(paceDiv)) : 0,
+                         displayPeriod > 0 ? 1.0 / displayPeriod : 0))
+        }
+    }
+
+    /// **Which guest frame is on the panel at each slot, and is its texture the
+    /// one that frame drew?**
+    ///
+    /// Every per-frame instrument in this hunt reads clean — pose, projection,
+    /// warp. What none of them can see is the SEQUENCE. If the panel shows
+    /// serials interleaved (N, N-1, N, N+1) or pairs texture N with record N±1,
+    /// each frame is individually correct and the world still alternates between
+    /// two positions exactly one guest frame of head rotation apart. That is the
+    /// symptom, so this is the measurement.
+    ///
+    /// - `regressions` a serial lower than the previous present's. Under
+    ///   `strict` this is what is refused, and the refusal is `held back`.
+    /// - `repeats` the same serial twice. **Expected and not a fault** — a 72 Hz
+    ///   guest against a 120 Hz panel repeats roughly two presents in five.
+    /// - `mispairs` the record's `stage_epoch` against the live count for that
+    ///   stage: the guest has claimed that texture again since, so the pixels
+    ///   being sampled are NOT the ones the record describes. Structurally
+    ///   reachable whenever a record can still be in flight when the guest
+    ///   starts redrawing its stage. Worst is by how many guest frames.
+    /// - `anchor misses` KL_WARP=system fell back to the display anchor, i.e.
+    ///   to our own warp, for that present.
+    /// - `bridged` panel slots the guest had **no new picture** for, which this
+    ///   loop crossed by re-presenting the content already in hand against a
+    ///   fresh pose. Not a fault — it is the whole reason the present path never
+    ///   waits on the guest — and the run length is the number that matters: a
+    ///   run of ~120 is a full second of guest stall (a scene load, an IL2CPP
+    ///   hitch) crossed without the layer renderer ever going quiet. The 2.0 s
+    ///   no-frames kill is what happens when a loop does NOT do this, so `worst
+    ///   run` is the margin against it stated in slots.
+    private func notePresentOrder(rendered: kl_ovrp_render_pose?, stage: Int,
+                                  anchorHit: Bool, bridged: Bool) {
+        presentCount += 1
+        if bridged {
+            presentBridged += 1
+            presentBridgeRun += 1
+            if presentBridgeRun > presentWorstBridgeRun {
+                presentWorstBridgeRun = presentBridgeRun
+            }
+            // Once, the first time a stall long enough to be a scene load is
+            // crossed on held content. Twelve slots is a tenth of a second —
+            // the age at which wakeboardd starts counting ("past mitigate age
+            // after 0.100000s") — so this is the log line that says the bridge
+            // is what stands between a load and the kill.
+            if presentBridgeRun == 12 && !loggedBridge {
+                loggedBridge = true
+                NSLog("[cp] stall bridge: the guest has had no new frame for 12 "
+                      + "panel slots (0.1 s) and every one of them was presented "
+                      + "from the picture already in hand, reprojected to a fresh "
+                      + "pose. The layer renderer never goes quiet on a guest "
+                      + "stall; `bridged` on the present-order census counts it.")
+            }
+        } else {
+            presentBridgeRun = 0
+        }
+        if let r = rendered {
+            if let prev = lastPresentedRecord {
+                if r.serial < prev.serial {
+                    presentRegressions += 1
+                    presentWorstRegression = max(presentWorstRegression,
+                                                 prev.serial - r.serial)
+                } else if r.serial == prev.serial {
+                    presentRepeats += 1
+                    presentHoldRun += 1
+                } else {
+                    // A NEW guest frame reached the panel: the one before it
+                    // is finished and its hold length is now known.
+                    presentHolds[min(max(presentHoldRun, 1), 6)] += 1
+                    presentHoldRun = 1
+                }
+            } else {
+                presentHoldRun = 1
+            }
+            let live = kl_ovrp_stage_epoch_now(Int32(stage))
+            if r.stage_epoch != 0 && live > r.stage_epoch {
+                presentMispairs += 1
+                presentWorstMispair = max(presentWorstMispair, live - r.stage_epoch)
+            }
+            if Self.warpBySystem && !anchorHit { presentAnchorMisses += 1 }
+            lastPresentedRecord = r
+        } else {
+            presentNoRecord += 1
+        }
+
+        if presentCount == 1 { presentWindowStart = CACurrentMediaTime() }
+        guard presentCount % 300 == 0 else { return }
+        let shown = presentCount - presentNoRecord
+        // The guest's DELIVERED rate. A present whose serial repeats the
+        // previous one is a panel slot the guest had no new picture for, so
+        // `presents - repeats - no record` over the window's own wall clock is
+        // exactly how many distinct guest frames reached the display per
+        // second. It is not what the guest was TOLD (KL_DISPLAY_HZ) and not
+        // what the panel runs at (the cadence line); when those three disagree
+        // the difference is the whole story, and it used to have to be
+        // computed by hand from `repeats`.
+        let windowSecs = max(1e-6, CACurrentMediaTime() - presentWindowStart)
+        let distinct = shown > presentRepeats ? shown - presentRepeats : 0
+        let guestFps = Double(distinct) / windowSecs
+        let monotonic = shown > 0
+            ? 100.0 * Double(shown - presentRegressions) / Double(shown) : 100.0
+        // No defer-ring counters here: this branch files a frame's record
+        // straight from ovrp_EndFrame4, so there is no in-flight queue to
+        // report. The port that carries the GPU-completion deferral prints
+        // them beside these.
+        NSLog(String(format: "[cp] present order: %llu presents, serials "
+                             + "monotonic %.0f%% | regressions %llu (worst -%llu) "
+                             + "| repeats %llu | tex/record mispairs %llu "
+                             + "(worst +%llu) | anchor misses %llu | held back "
+                             + "%llu | no record %llu | bridged %llu (worst run "
+                             + "%llu) | slot worst %.0f ms (%llu over %.0f) "
+                             + "| GUEST DELIVERED %llu distinct in %.2f s "
+                             + "= %.1f fps | holds 1x:%llu 2x:%llu 3x:%llu "
+                             + "4x:%llu 5x:%llu 6+x:%llu%@",
+                     presentCount, monotonic, presentRegressions,
+                     presentWorstRegression, presentRepeats, presentMispairs,
+                     presentWorstMispair, presentAnchorMisses, presentHeldBack,
+                     presentNoRecord, presentBridged, presentWorstBridgeRun,
+                     worstSlotMs, slotSlow, Self.slotSlowMs,
+                     distinct, windowSecs, guestFps,
+                     presentHolds[1], presentHolds[2], presentHolds[3],
+                     presentHolds[4], presentHolds[5], presentHolds[6],
+                     paceLine()))
+        presentCount = 0; presentNoRecord = 0
+        presentWindowStart = CACurrentMediaTime()
+        presentRegressions = 0; presentWorstRegression = 0
+        presentRepeats = 0
+        presentMispairs = 0; presentWorstMispair = 0
+        for i in presentHolds.indices { presentHolds[i] = 0 }
+        presentAnchorMisses = 0; presentHeldBack = 0
+        // The bridge RUN deliberately survives the window boundary: a stall
+        // does not stop being one because 300 presents happened to elapse
+        // inside it. Only the totals reset.
+        presentBridged = 0; presentWorstBridgeRun = presentBridgeRun
+        slotSlow = 0; worstSlotMs = 0
     }
 }
 

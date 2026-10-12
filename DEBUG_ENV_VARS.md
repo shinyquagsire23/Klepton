@@ -901,7 +901,10 @@ puts the camera on the ground with its hands underneath it.
   the view and the default hands sit ~1.7 m below the frustum.
 - `KL_OVRP_HANDS_IN_VIEW=1` — park both hands at a fixed spot inside the
   *current head's* frustum (head-relative, 15 cm out, 12 cm down, 55 cm
-  forward), overriding whatever the frontend last wrote. Read side, so it
+  forward), overriding whatever the frontend last wrote, **and assert
+  controller presence** — on the OpenXR path too (`kl_ovrp_hand_motion`),
+  where an action space reads presence as tracking and the park alone left
+  the hands at the origin. Read side, so it
   beats the viewer's per-frame writes. Answers one question only — does the
   guest draw controllers at all. Diagnostic: the hands do not move with your
   real hands. The offset was absolute tracking-space coordinates until the
@@ -986,6 +989,25 @@ puts the camera on the ground with its hands underneath it.
   measurement was taken against, and its tearing; each extra stage costs a
   full-size RGBA16F two-slice eye texture (~160 MB at map resolution). The
   A/B in both directions.
+
+  **On a GL guest the stage a frame drew into is OBSERVED** (kl_glfb watches
+  which eye texture is attached to the bound framebuffer), and a frame that
+  drew into none is dropped rather than filed. So the observation has to
+  survive the guest re-creating its eye swapchain. It used not to: the
+  sixteen-slot eye-FBO map was filled once per swapchain generation and never
+  given back, so after a few re-creations the new eye FBOs found no slot,
+  every frame was booked as "drew into no eye stage", and two of three stages
+  stopped being filed. Beat Saber reaches that at its main menu (it re-creates
+  its eye textures 3072x2464 <-> 3686x2957 about 25-35 s in): the `[cp]
+  stages: s0 ... serial=N` line froze for two stages while the guest kept
+  rendering, the compositor warped an ever-older picture, and a quick head
+  turn showed the room at the edges. Releasing an eye texture now frees its
+  map slots (`[glfb] eye=E stage=S: N eye-FBO map slot(s) given back ...`),
+  `glDeleteFramebuffers` frees its own, and a lookup the map cannot answer
+  falls back to the 48-slot colour table. Every 300 frames:
+
+      [eyemap] eye0[a b c] eye1[d e f] | fbo map U/16 slots | F freed by releases, 0 full refusals, ...
+
 - `KL_OVRP_TRACE=1` — log the live call SEQUENCE, with a global ordinal and the
   caller's image+offset, for the frame/layer/display family; `=all` for every
   entry point (the input pollers run thousands of times a frame and bury it).
@@ -1007,6 +1029,173 @@ puts the camera on the ground with its hands underneath it.
   head+hands once per frame at `ovrp_Update2` (the guest's real per-step latch
   point). The A/B if the pinning is ever suspected of costing latency;
   controller *buttons* stay live either way.
+- `KL_OVRP_ONE_POSE=index` (default, ON) or `=live` / `=off` / `=0` — **one
+  head pose per guest frame.** At the frame boundary one head pose is frozen
+  (with the eye transform, `kl_ovrp_set_eye_offset` / `_rotation`, promoted in
+  the same breath) and EVERY head-derived answer for the rest of that frame —
+  both `ovrp_Update2` steps, every `GetNodePoseState`, the eye view, the
+  OpenXR head query — returns it; the record filed for reprojection is that
+  same pose. Without it the guest's ~26 pose queries per frame are answered
+  live across a 13.9 ms window (the frontend publishes at panel rate on its
+  own thread) and the picture embodies a mixture of up to ~3 deg of head
+  motion while reprojection subtracts one pose: a sub-degree alternating
+  displacement that grows with head speed. Hands and controllers stay live.
+  `live` is the A/B.
+- `KL_OVRP_POSE_BOUNDARY=cycle` (default) or `=index` — **where the frozen
+  pose is renewed.** `cycle`: once per `ovrp_WaitToBeginFrame`, which the
+  guest calls exactly once per frame. `index`: whenever `ovrp_Update2/3`
+  carries a new frame index — which splits a frame in two whenever Unity's
+  render thread trails its sim thread, because the frame's two Update3 calls
+  then carry DIFFERENT indices (Physics N, Render N-1) and the second one
+  re-freezes mid-frame. Measured on Paint the Town Red VR with `index`:
+  `poses/frame` 1.00 in the menu (smooth) and 1.70 in gameplay (head-turn
+  judder); with `cycle` it reads 1.00 everywhere and the judder is gone. A
+  guest that never calls WaitToBeginFrame (OpenXR, headless) keeps the index
+  keying. The tell, every 300 frames:
+
+      [ovrp] pose boundary: freezes 300, reuses 300, guest frame cycles 300 | poses/frame 1.00 (MUST be 1.00) | ...
+
+- `KL_OVRP_POSE_KEY=index` (default) or `=live` — BeginFrame files the
+  Render-step pose stored under the guest's OWN frame index, rather than
+  whatever step sample is live when BeginFrame runs (the next frame's Update2
+  can race it on another thread). `[ovrp] pose filing: by-index N% ...
+  filed-at-lag 0x/1x/2+x` is the measurement; a steady nonzero `1x` under
+  `live` is that race caught.
+- `KL_OVRP_ZERO_HEAD_VEL=1` — hand the guest a head velocity of zero (still
+  `motion_valid`) instead of the finite-differenced one. An A/B for "is the
+  synthesized head motion feeding the guest's own predictor the noise";
+  hands and controllers keep their velocities either way. `[ovrp] derived
+  motion:` prints mean/std of what is handed over every 300 publishes.
+- `KL_OVRP_DROP_NO_EYE=0` — default **on**. A Vulkan OVRPlugin frame that
+  names NO eye layer (Unreal's loading screens and shader compiles) used to
+  fall through to `serial % stages` and file its fresh head pose over an older
+  picture — a different one of the three every frame — so a loading screen
+  shook whenever the head moved (Into the Radius: 1720 such frames). Such a
+  frame is now dropped, the GL path's "drew into no eye stage" rule: the last
+  real eye frame stays on screen with its own pose. `=0` files them on the
+  counter again. `make posebound` covers it.
+- `KL_OVRP_VIEWPORT_CARRY=0` — default on. A frame that submits no eye layer
+  carries the last eye-layer render viewport into its record instead of the
+  zero rect every reader takes as "the whole texture" — which on an Unreal
+  guest's DoubleWide eye shows BOTH halves to BOTH eyes (Into the Radius: the
+  whole picture twice, on every loading screen).
+- `KL_OVRP_SUBMIT_FOV=0` — record the frustum we **offered** instead of the one
+  the guest **submits** (`ovrpLayerSubmit_EyeFov.Fov[2]`). Default on. A
+  plugin doing symmetric projection puts the UNION cone there and leaves the
+  `ViewportRect` full width, so only this field says what was rendered:
+  GORN 2 (OVRPlugin 1.106) turns a 4032-wide desc into a 5088-wide layer with
+  both eyes at l=r=1.73205, and placing that with the per-eye cones doubles
+  the picture.
+- `KL_OVRP_FRAME_SYNC_FIRST=0` — default 1. On the Vulkan path, drain the
+  guest's queue BEFORE the frame record is filed rather than after. The record
+  is what makes a stage eligible for the compositor to sample, and on Vulkan
+  nothing else orders that sampling against the guest's rendering: the old
+  order left the stage eligible while still being written for 5.31 ms mean /
+  117 ms worst (Into the Radius), so a composite every 8.3 ms caught a
+  PARTIALLY DRAWN frame about one time in three — objects flickering in and
+  out. `0` restores the old order.
+- `KL_OVRP_ARRAY_EYE_VIEWPORT=1` — for an Array eye layer whose two submitted
+  viewports differ, crop both eyes by the LEFT eye's rect. A multiview render
+  pass rasterizes every view through the same viewport, so a right-eye rect
+  that starts inside the left eye's describes nothing the guest drew, and
+  cropping by it slid one eye's picture against the other's (two images that
+  cannot be fused). Default off: differing rects are legitimate elsewhere
+  (BONELAB).
+- `KL_OVRP_QUAD=0` — drop the guest's non-eye OVRPlugin layers instead of
+  compositing them (a wrongly placed overlay is worse than an absent one).
+- `KL_OVRP_QUAD_FALLBACK_M=<m>` / `KL_OVRP_QUAD_FALLBACK_Z=<m>` — the size
+  (long edge, default 1.2 m) and distance (default 1.5 m) of the head-locked
+  fallback for a LONE splash quad whose world size neither header offset holds.
+  The quad's Size is read at 0xb0 (RE4's UE4.25 header) or 0xbc (Deadpool VR's
+  UE4.27 header, where 0xb0 is two zeroed blend-factor ints), first plausible
+  pair wins; a guest with a whole UI's worth of overlays never takes the
+  fallback.
+- `KL_OVRP_LEFT_HANDED=1` — `ovrp_GetDominantHand` answers left (default
+  right, the Quest's default; `Unsupported` leaves titles that branch on it
+  without a dominant controller).
+- `KL_XR_BOOT_GATE=0|1` / `KL_XR_BOOT_GATE_MS=<ms>` (default 4000) — hold the
+  OpenXR guest's FIRST `xrWaitFrame` until a head pose and both hands have been
+  published (or the deadline passes). On by default where a display frontend
+  publishes poses. A guest that banks its origin from the first pose otherwise
+  got the identity placeholder (the floor ran downhill for the rest of the
+  session) and, with no hands yet, fell back to flat-screen aim (Half-Life 2
+  VR's crosshair became a mouse cursor). One line says which seam was late:
+  `[xr] boot gate: head pose +N ms, left hand +N ms, right hand +N ms, ...`.
+- `KL_XR_HONEST_HEAD=0` — before a frontend has published, `xrLocateSpace(VIEW)`
+  and `xrLocateViews` report the head as untracked (no VALID bits) instead of
+  a valid identity pose. Default on where a frontend is expected; `0` restores
+  the always-valid answer.
+- `KL_OVRP_EYE_LAYOUT=<n>` — force the `ovrpLayout` the eye layer is DESCRIBED
+  as. Unset: an `ovrpLayout_Array` (3) request from a GLES guest is answered as
+  `ovrpLayout_Stereo` (0), because the GL gateway has no multiview (Tetris
+  Effect asks for Array unconditionally, and refusing it leaves UE4's eye swap
+  chain null and faults later in the RHI). The Vulkan path serves Array for
+  real. `3` restores the guest's request.
+
+### Tracking origin, eye height and the floor
+
+- `KL_OVRP_ORIGIN_REBASE=0` / `KL_OVRP_ORIGIN_Y=<metres>` — **the poses we file
+  are in the space the guest named.** EyeLevel means y = 0 at the user's eyes;
+  ARKit's world origin is near the floor, so a guest that asked for EyeLevel
+  got a head at y ~ 1.5 and everything it placed at its origin landed a
+  standing height low (Tetris Effect's menu had to be looked down at). When a
+  guest has EXPLICITLY called `SetTrackingOriginType` with EyeLevel, the head's
+  height at that moment is captured and subtracted from every pose filed for
+  it (captured, so a seated player gets a seated origin). Gated on the setter
+  having been called. `=0` reverts; `KL_OVRP_ORIGIN_Y` forces the value.
+- `KL_OVRP_QUAD_ORIGIN=0` — the other half of the rebase: a world-locked
+  OVRPlugin quad's pose comes FROM the guest's (rebased) space, so the rebase
+  is added back before the compositor places it. Without it a quad the guest
+  put straight ahead at y=0 lands on the floor (FNAF: Help Wanted 2's opening
+  logos). Head-locked quads are left alone. Default on.
+- `KL_OVRP_ORIGIN_TRAIL=0` / `KL_OVRP_QUAD_TRAIL=0` — silence the two placement
+  trails: one `[ovrp] origin #N HH:MM:SS.mmm A -> B ...` line per CHANGE of the
+  guest's tracking origin (cap 400), and one `[ovrp] quad layer N ...` line per
+  layer when it appears or moves by > 2 cm (cap 300). An Unreal guest that
+  flips EyeLevel/FloorLevel per level (~37 times a session) is unreadable
+  without them.
+- `KL_OVRP_ORIGIN_RELATIVE=0` — make `ovrp_GetTrackingTransformRelativePose`
+  answer identity for every origin instead of the floor/eye offset
+  (`height(requested) - height(current)`, y only). For a guest that applies the
+  offset on top of poses that already carry it.
+- `KL_OVRP_USER_EYE_HEIGHT=origin` (default) or `=standing` — what
+  `ovrp_GetUserEyeHeight2` (and its un-suffixed wrapper) answers. `origin`: 0
+  under EyeLevel, `KL_OVRP_EYE_HEIGHT` under FloorLevel/Stage, i.e. the offset
+  the origin family already applies (FNAF: Help Wanted 2). `standing`: the
+  standing height whatever the origin (Pinball FX VR's lobby, which asks the
+  moment it switches to FloorLevel, and died on the unimplemented name before).
+- `KL_OVRP_FLOOR_OFFSET=1` — raise node positions by the standing height under
+  a non-EyeLevel origin once a real tracker publishes. **Off, and selected by
+  nothing**: shipped together with the getter it double-added (a guest asks
+  how tall the user is in order to build that offset itself) and floated the
+  camera ~3.2 m up. Kept for a guest that trusts a FloorLevel pose without ever
+  asking. `make ovrpfloor` asserts both directions.
+
+### Eye size
+
+- `KL_OVRP_EYE_ALIGN=<n>` — round each eye axis DOWN to a multiple of `n`
+  (2..64) after the cap. Default off. Unreal quantizes its scene buffers UP to
+  a multiple of 4, so RE4 rendered a 4032x3236 scene into a 4032x3234 eye and
+  anything matching eye passes by exact extent missed every one; `=4` gives
+  4032x3232.
+- `KL_OVRP_EYE_SCALE_MIN=<x>` — a FLOOR under the guest's own render scale
+  (Unity's `eyeTextureResolutionScale`, arriving as
+  `ovrp_CalculateEyeLayerDesc3`'s textureScale). Default 0 (off). Applied
+  before the cap, so it never pushes past `KL_OVRP_EYE_MAX`. Paint the Town Red
+  VR sets a per-level scale (1.5 / 1.0 / 0.87); each change re-creates the eye
+  layer while the old one is alive (a 7.84 GB peak against a ~8.19 GB limit).
+  With the floor at 1.0 every level asks for the same desc and the storage is
+  reused.
+- `KL_OVRP_EYE_CAP_ALLOC=1` — bound the ALLOCATION rather than the
+  recommendation: a guest doing symmetric projection on a canted display
+  widens its own eye texture by the union of the two cones (4032 asked became
+  5088 wide), so the cap is applied to the predicted width. Default 0.
+- `KL_OVRP_LAYER_REC_DISPLAY=1` — answer `ovrp_GetLayerRecommendedResolution`
+  for an EYE layer from the capped display size at scale 1.0 rather than from
+  the measured per-eye size, so an engine that derives its next desc from our
+  recommendation times its own pixel density (UE5.3: 1.300) cannot ratchet the
+  eye size up. Default 0.
+
 - `KL_OVRP_EYE_CANT=0` — ignore the per-eye rotation the frontend pushes
   (`kl_ovrp_set_eye_rotation`) and restore the dropped-cant behaviour as the
   A/B. Identity by default, so host and headless runs are unchanged.
@@ -1155,7 +1344,11 @@ puts the camera on the ground with its hands underneath it.
   cost. The aspect ratio is preserved when it clamps, because the frustum
   tangents pushed alongside would otherwise disagree with the picture's shape.
   Every change logs the requested size, the applied size and the resulting
-  swapchain MiB.
+  swapchain MiB. **It also bounds the eye-layer DESC the guest allocates
+  from** (`kl_ovrp_cap_eye_size`), not only the advertisement: Unity multiplies
+  the advertised size by its own render scale, and Paint the Town Red VR's 1.5
+  turned a 4032x3234 advertisement into a 7584x4851 eye layer and a jetsam
+  kill. `make check`'s boot guard asserts both directions.
 - `KL_OVRP_VIEWPORT_SCALE=<x>` — force the **render viewport** to that fraction
   of the eye texture, default 1.0, accepted in 0..1 and multiplied by whatever
   the guest itself asked for. This is not a resolution knob, it is the **A/B for
@@ -1235,6 +1428,17 @@ that reports what came due since the frontend last asked. Platform-independent
   available. Using 72.0`). Under `KL_XR_PACE` a guest that owns its frame loop
   is held to the composite, so the two numbers agree unless the guest cannot
   keep up; nothing paces the other host guests.
+
+  **On device it is a PIN, kept separate from the panel's measured rate.** The
+  guest paces itself off the number it is told (Unity sizes its frame budget,
+  fixed timestep and audio scheduler from it); a 72 Hz title told "120" misses
+  every deadline while every compositor statistic stays perfect, because the
+  compositor reprojects whatever the guest last submitted. With a pin the guest
+  keeps its rate (`[ovrp] display frequency PINNED to ...`) and the compositor
+  still runs at the panel's (`[ovrp] the panel measures ... the guest keeps its
+  pinned ...`); with no pin the measured panel rate is the guest's, as before.
+  `kl_ovrp_set_forced_hz_hint()` is the frontend's door to the same pin; the
+  environment wins.
 
   For Steam Link this knob decides the far end's ENCODE rate, and the pixel
   count is not ours to set: the host packs four 1536x1536 tiles into one
@@ -2380,6 +2584,39 @@ written down is a value found twice.
 - `KL_CP_EYE=<0|1>` — composite ONLY that eye, leaving the other black. The
   binocular-vs-temporal split for a doubled image: one second, halves the
   search space.
+- `KL_WARP=ours` (default) or `=system` — **which reprojection corrects the
+  guest's picture.** `ours`: our pass reprojects from the guest's render pose
+  to the pose predicted for presentation, and the drawable is stamped with the
+  display pose (the system's own warp then has nothing to do). The correction
+  magnitude ALTERNATES by construction — a fresh frame needs almost none, a
+  held one a full guest period's worth — so any inexactness in our flat-proxy
+  pass shows as an image alternating between two positions. `system`: the
+  drawable is stamped with the `DeviceAnchor` the guest's pixels actually
+  embody (cached per pose push, found through the record's `pose_tag`) and our
+  model-view is neutral, so the system does the one warp. Cured head-turn
+  jitter on Pistol Whip and The Simpsons Hit & Run; a target row opts in.
+  `[cp] KL_WARP=...` at boot; `anchor misses` on the present-order census
+  counts frames that fell back to the display anchor.
+- `KL_GUEST_FPS_DIV=<n>|auto|off` (default off) — release the guest for a new
+  frame only on a grid of `n` panel slots, so every guest frame is held the
+  SAME number of slots. A guest that cannot hold the panel rate otherwise
+  lands on a ragged 2/3-slot mix, and with a flat-proxy reprojection an age
+  that alternates is a picture that alternates. `auto` starts at 1 and raises
+  the divisor when more than a quarter of publishes overrun the grid (cap 4).
+  It gates only the guest's frame START (`kl_app_guest_publish`), never the
+  compositor's presents. On Pinball FX VR `=2` (an even 60) removed its
+  head-turn judder. `pace` on the present-order census line says
+  whether the grid held.
+- `KL_PRESENT_ORDER=strict` (default) or `=off` — select the stage, its
+  record, its texture and its anchor as ONE tuple under the lock the frame
+  committer holds (`kl_ovrp_last_complete_record`), and never present a guest
+  frame older than the one already shown (it is held back and the previous one
+  re-presented instead). `off` reads the stage index and then the record
+  separately, which lets a present jump ahead and the next come back: serials
+  out of order, a world alternating between two positions one guest frame
+  apart. The `[cp] present order:` census (every 300 presents) reports
+  regressions, repeats, mispairs, holds per distinct frame (`1x:.. 2x:..`),
+  the guest's delivered fps and the slowest loop slot.
 - `KL_CP_AMPLIFY=0` — one render pass per eye instead of the single
   vertex-amplified composite. Takes foveation down with it (the rate map
   needs the amplified pass).

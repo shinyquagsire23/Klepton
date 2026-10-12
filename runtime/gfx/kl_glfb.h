@@ -127,7 +127,15 @@ void kl_glfb_set_live_eye_image(int eye, uint32_t tex, int32_t w, int32_t h, int
 // that keep an eye texture's storage alive — the EGLImage and the GL texture —
 // so the provider's own release on reallocation can actually reclaim it. A
 // no-op for a slot that was never bound; out-of-range says so and does nothing.
+// Also drops the stage attribution of that texture and the eye-FBO map slots
+// that pointed at it, so a re-created swapchain's FBOs always find room.
 void kl_glfb_release_eye_texture(int eye, int stage);
+
+// The stage-association state in one `[eyemap]` line: the registered eye
+// texture names, eye-FBO map slots in use, and how often a release gave slots
+// back, the map was full, or the colour-table fallback answered. Silent for a
+// guest that never registered a GL eye texture.
+void kl_glfb_eye_map_census(FILE *f);
 
 // Which swapchain stage the guest most recently RENDERED into, or -1 if that
 // has not been observed.

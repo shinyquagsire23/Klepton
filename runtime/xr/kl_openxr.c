@@ -111,11 +111,14 @@ enum {
     XR_TYPE_ACTION_SPACE_CREATE_INFO    = 38,
     XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING = 51,
     XR_TYPE_INTERACTION_PROFILE_STATE   = 53,
-    XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO = 54,
+    // 62/63 are Khronos's values (openxr.h 1.1.49). 54/62 were transcribed
+    // wrong, and every correct caller of these two getters was refused with
+    // VALIDATION_FAILURE. Vivecraft calls bound-sources for every action read.
+    XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO = 62,
     XR_TYPE_ACTION_STATE_GET_INFO       = 58,
     XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO = 60,
     XR_TYPE_ACTIONS_SYNC_INFO           = 61,
-    XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO = 62,
+    XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO = 63,
     XR_TYPE_SWAPCHAIN_CREATE_INFO       = 9,
     XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO = 55,
     XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO   = 56,
@@ -1188,7 +1191,7 @@ static XrResult klxr_EnumerateViewConfigurations(void *instance, XrSystemId syst
 // frusta here are the display's own (kl_ovrp_eye_view / the compositor's
 // measured tangents). A guest told it could mutate them would submit a picture
 // rendered for a projection the compositor is not going to use.
-#define KLXR_TYPE_VIEW_CONFIGURATION_PROPERTIES 42
+#define KLXR_TYPE_VIEW_CONFIGURATION_PROPERTIES 45   /* Khronos; was 42 (= SPACE_LOCATION) */
 static XrResult klxr_GetViewConfigurationProperties(void *instance, XrSystemId system_id,
                                                     int32_t view_config_type, void *props) {
     if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
@@ -1986,6 +1989,18 @@ static int64_t klxr_now(void) {
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
+// The two instants the boot gate reports against. Defined here, above every
+// writer, because the gate itself lives down in the frame path: t0 is
+// xrCreateSession — the moment the guest starts bringing VR up — and everything
+// the gate prints is an offset from it.
+static int64_t g_boot_t0;            // xrCreateSession
+static int64_t g_boot_profile_ns;    // first xrGetCurrentInteractionProfile
+
+// Is the head pose we would hand out a MEASUREMENT? Forward-declared here
+// because the two locate calls and klxr_space_pose_ex all ask it and all sit
+// above the frontend seam it reads. Defined beside the boot gate.
+static int klxr_head_pose_ready(void);
+
 static const char *klxr_state_name(int s) {
     switch (s) {
         case KLXR_SESSION_STATE_IDLE:         return "IDLE";
@@ -2061,6 +2076,11 @@ static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *in
         KLXR_RET(KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING);
     if (vk && !inst->vk_requirements_queried)
         KLXR_RET(KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING);
+
+    // Bring-up starts here as far as the boot gate is concerned: every offset
+    // it prints is measured from this instant, so a reader can tell "the hands
+    // were already there" from "the hands took another second".
+    g_boot_t0 = klxr_now();
 
     memset(&g_session, 0, sizeof g_session);
     g_session.magic = KLXR_MAGIC_SESSION;
@@ -2770,6 +2790,11 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
     if (motion_known) *motion_known = 0;
     if (!sp) return base;
     if (sp->reference_type == KLXR_REF_SPACE_VIEW) {
+        // Untracked until a frontend has published one — see
+        // klxr_head_pose_ready. The pose is still filled in below (a caller
+        // that ignores the flags gets the same plausible placeholder it always
+        // got); the flags are what stop a guest banking it as its origin.
+        if (tracked) *tracked = klxr_head_pose_ready();
         kl_ovrp_get_guest_head_pose(&base.position.x, &base.position.y,
                                     &base.position.z, &base.orientation.x,
                                     &base.orientation.y, &base.orientation.z,
@@ -2942,7 +2967,11 @@ static XrResult klxr_GetReferenceSpaceBoundsRect(void *session, int32_t ref_type
 // inactive is the truth.
 enum { KLXR_MAGIC_ACTION_SET = 0x584b4c41 /* 'XKLA' */,
        KLXR_MAGIC_ACTION     = 0x584b4c61 /* 'XKLa' */ };
-enum { KLXR_PATH_MAX = 256, KLXR_ACTION_SET_MAX = 16, KLXR_ACTION_MAX = 128 };
+// Sized for Vivecraft, the largest action map so far. It creates one action
+// per Minecraft key mapping plus Vivecraft's hidden keys (~100 before mods)
+// across 8 sets. At 128, a modded instance hit LIMIT_REACHED, and the guest
+// then suggests a NULL action, which fails its whole profile.
+enum { KLXR_PATH_MAX = 512, KLXR_ACTION_SET_MAX = 16, KLXR_ACTION_MAX = 256 };
 
 enum { KLXR_ACTION_TYPE_BOOLEAN = 1, KLXR_ACTION_TYPE_FLOAT = 2,
        KLXR_ACTION_TYPE_VECTOR2F = 3, KLXR_ACTION_TYPE_POSE = 4,
@@ -3262,10 +3291,16 @@ static klxr_action_set *klxr_action_set_of(void *h) {
         if (h == &g_action_sets[i] && g_action_sets[i].magic) return &g_action_sets[i];
     return NULL;
 }
+// The action pool is checked by address arithmetic rather than a scan. A
+// scan costs O(pool) on every getter, and Vivecraft makes ~4 getter calls per
+// action per frame over ~100 actions. The answer is the same: an in-pool,
+// element-aligned address with a live magic word.
 static klxr_action *klxr_action_of(void *h) {
-    for (int i = 0; i < KLXR_ACTION_MAX; i++)
-        if (h == &g_actions[i] && g_actions[i].magic) return &g_actions[i];
-    return NULL;
+    uintptr_t base = (uintptr_t)g_actions, p = (uintptr_t)h;
+    if (p < base || p >= base + sizeof g_actions) return NULL;
+    if ((p - base) % sizeof g_actions[0]) return NULL;
+    klxr_action *a = h;
+    return a->magic ? a : NULL;
 }
 
 static XrResult klxr_DestroyActionSet(void *action_set) {
@@ -3543,6 +3578,12 @@ static XrResult klxr_GetCurrentInteractionProfile(void *session, XrPath top_leve
                                                   : KLXR_ACTIVE_PROFILE;
         klxr_StringToPath(s->instance, profile, &state->interactionProfile);
     }
+    // When the guest first asked which controller it has — the third seam of
+    // the boot race, and the one that is already race-free: the answer above
+    // does not wait for a controller to appear, it is the profile the guest
+    // itself suggested. Timestamped anyway, so the gate's line can show that it
+    // was answered early and rule it out rather than leave it arguable.
+    if (!g_boot_profile_ns) g_boot_profile_ns = klxr_now();
     static int said;
     if (!said++)
         fprintf(stderr, "  [xr] interaction profile for %s: %s\n",
@@ -5100,6 +5141,139 @@ static void klxr_fovea_trace(int eye, float x0, float y0, float x1, float y1,
     memset(&fv[eye], 0, sizeof fv[eye]);
 }
 
+// ---- the boot gate: nothing the guest reads on frame 0 may be a placeholder --
+//
+// **The bug this exists to close.** A guest brings VR up in one straight line —
+// create the session, attach the actions, sample the head, sample the hands,
+// and DECIDE, once, what kind of session it is in. Everything after that
+// decision is downstream of it. On this frontend the two things it samples do
+// not arrive together and do not arrive at bring-up: the head pose comes from
+// ARKit's device anchor on the compositor's first frame, and the hands only
+// after visionOS has connected the Sense controllers AND rebuilt its spatial
+// providers around them — measured at +2.2 s after the first compositor frame
+// in every captured launch (`[cp] spatial controllers: []` at +0 ms, the real
+// list at +2.2 s). Bring-up reaches xrCreateSession at about +6 s, so the good
+// launch clears both by four seconds. Nothing enforces that four seconds.
+//
+// When it is not cleared, neither seam refuses — they answer plausibly:
+//
+//   * the head reads as the IDENTITY orientation at eye height (kl_ovrp's
+//     `g_head_set` is still 0), which a guest that captures its VR origin from
+//     the first pose banks as "the user is facing straight ahead, level" while
+//     the user is in fact looking down at the floor putting the headset on. The
+//     whole world is then pitched by that difference forever: the floor runs
+//     DOWNHILL.
+//   * both hands read as absent — kl_ovrp_hand_motion returns 0, so every
+//     action space is untracked and every action inactive. A guest whose aim
+//     comes from the controller and cannot find one falls back to its
+//     flat-screen aim: HL2VR's `vr_moveaim_mode`, a reticle pushed around the
+//     screen by the thumbstick. The crosshair behaves like a MOUSE CURSOR.
+//
+// Both symptoms seen in the headset — a downhill floor and a mouse-cursor
+// crosshair in Half-Life 2 VR — from one missed sample, and a relaunch cures
+// it because a relaunch re-rolls the race. The log line below names which seam
+// was missing on the next occurrence.
+//
+// The fix is to make the first frame WAIT rather than to make the placeholder
+// better, because there is no better placeholder — "facing straight ahead at
+// eye height" is exactly what a correct pose looks like. xrWaitFrame is where a
+// runtime is allowed to hold an app back (it exists to throttle the frame loop)
+// and it is the last call before the guest's first rendered frame, so it is the
+// gate. Held once, on the first wait of the session, never again.
+//
+// Armed only where there is a frontend that publishes poses — `g_frame_pacer`
+// is set exactly by the visionOS compositor (kl_app.c) and by nothing else — so
+// the host path, which publishes no head pose at all in mono, is untouched and
+// waits for nothing. KL_XR_BOOT_GATE=0 disables it, =1 forces it on anywhere;
+// KL_XR_BOOT_GATE_MS sets the deadline (default 4000).
+static int klxr_boot_gate_ms(void) {
+    static int ms = -1;
+    if (ms < 0) {
+        ms = kl_env_int("KL_XR_BOOT_GATE_MS", 4000);
+        if (ms < 0) ms = 0;
+    }
+    return ms;
+}
+
+// Whether the gate is armed at all. Auto = "a display frontend is publishing".
+static int klxr_boot_gate_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_XR_BOOT_GATE", g_frame_pacer ? 1 : 0);
+    return on;
+}
+
+// The head pose as a claim about the world, rather than as seven floats.
+//
+// Before a frontend has published, kl_ovrp answers the identity orientation at
+// eye height — a pose, not a refusal — and OpenXR has exactly one way to say
+// "this is not a measurement": leave the VALID bits out. Saying so is the
+// second half of the boot-race fix and the half that survives the gate timing
+// out: a guest that recentres off an untracked head has been told not to.
+//
+// Only where a frontend is expected to publish at all. The host path runs
+// mono, never calls kl_ovrp_set_head_pose, and must keep locating its head —
+// which is why this is gated on the same frame pacer the boot gate is, and not
+// on the published flag alone. KL_XR_HONEST_HEAD=0 restores the old
+// always-valid answer.
+static int klxr_head_pose_ready(void) {
+    static int honest = -1;
+    if (honest < 0) honest = kl_env_on("KL_XR_HONEST_HEAD", 1);
+    if (!honest || !g_frame_pacer) return 1;
+    return kl_ovrp_head_pose_published();
+}
+
+static void klxr_boot_gate(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    if (!klxr_boot_gate_on()) return;
+
+    int64_t t_enter = klxr_now();
+    int64_t deadline = t_enter + (int64_t)klxr_boot_gate_ms() * 1000000LL;
+    int64_t head_ns = kl_ovrp_head_pose_published() ? t_enter : 0;
+    int64_t hand_ns[2] = { kl_ovrp_hand_pose_published(0) ? t_enter : 0,
+                           kl_ovrp_hand_pose_published(1) ? t_enter : 0 };
+
+    // 4 ms is well under a display period at any rate this runtime serves, so
+    // the gate costs at most one frame of latency past the instant the last
+    // seam goes live — and on a good launch it costs nothing, because
+    // everything is already true on entry and the loop never runs.
+    while (!head_ns || !hand_ns[0] || !hand_ns[1]) {
+        int64_t now = klxr_now();
+        if (!head_ns && kl_ovrp_head_pose_published()) head_ns = now;
+        for (int h = 0; h < 2; h++)
+            if (!hand_ns[h] && kl_ovrp_hand_pose_published(h)) hand_ns[h] = now;
+        if (head_ns && hand_ns[0] && hand_ns[1]) break;
+        if (now >= deadline) break;
+        usleep(4000);
+    }
+
+    int64_t t_exit = klxr_now();
+    int64_t t0 = g_boot_t0 ? g_boot_t0 : t_enter;
+    // "never" rather than a negative number: a seam that did not arrive inside
+    // the deadline has no offset, and printing one invites reading it as an
+    // offset. Four buffers because all four go into one printf.
+    char b[4][32];
+    const int64_t nsv[4] = { head_ns, hand_ns[0], hand_ns[1], g_boot_profile_ns };
+    for (int i = 0; i < 4; i++) {
+        if (nsv[i]) snprintf(b[i], sizeof b[i], "+%.0f ms",
+                             (double)(nsv[i] - t0) / 1e6);
+        else        snprintf(b[i], sizeof b[i], "NEVER");
+    }
+    // ONE line, and it is the whole diagnosis. On a good launch every offset is
+    // small and none is NEVER. On a bad launch, the missing seam is the one
+    // reading NEVER — and if it is the hands, the flat-screen aim and
+    // the tilted world both follow from it.
+    fprintf(stderr,
+            "  [xr] boot gate: head pose %s, left hand %s, right hand %s, "
+            "profile %s; first frame held %.0f ms of %d ms%s\n",
+            b[0], b[1], b[2], b[3],
+            (double)(t_exit - t_enter) / 1e6, klxr_boot_gate_ms(),
+            (head_ns && hand_ns[0] && hand_ns[1]) ? ""
+                : " — TIMED OUT, the guest starts VR without them "
+                  "(tilted floor / thumbstick crosshair)");
+}
+
 static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
                                XrFrameState *state) {
     KLXR_TRACE("xrWaitFrame");
@@ -5113,6 +5287,10 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
     if (!state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info) klxr_log_chain("xrWaitFrame", info->next);
     if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);
+
+    // Before the pacer and before the latch: the first frame must not be
+    // latched against a pose no frontend has published.
+    klxr_boot_gate();
 
     // Block here if the driver has a display to be paced by, BEFORE the latch:
     // the pose this frame is pinned to must be the one the compositor just
@@ -6261,8 +6439,13 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
     if (!base) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
 
     view_state->type = XR_TYPE_VIEW_STATE;
-    view_state->viewStateFlags = KLXR_VIEW_ORIENTATION_VALID | KLXR_VIEW_POSITION_VALID |
-                                 KLXR_VIEW_ORIENTATION_TRACKED | KLXR_VIEW_POSITION_TRACKED;
+    // Same claim as xrLocateSpace(VIEW) makes, and it must be the same claim:
+    // a guest told its head is untracked by one call and tracked by the other
+    // has been told nothing. Zero flags is the specified "no measurement".
+    view_state->viewStateFlags = klxr_head_pose_ready()
+        ? (KLXR_VIEW_ORIENTATION_VALID | KLXR_VIEW_POSITION_VALID |
+           KLXR_VIEW_ORIENTATION_TRACKED | KLXR_VIEW_POSITION_TRACKED)
+        : 0;
 
     XrResult r = klxr_two_call(capacity, count_out, 2);
     if (r != KLXR_SUCCESS || capacity == 0) return r;

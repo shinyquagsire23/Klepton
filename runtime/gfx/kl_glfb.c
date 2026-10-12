@@ -1830,9 +1830,13 @@ KLFB_GENDEL(Buffers,      KLC_BUF)
 KLFB_GENDEL(VertexArrays, KLC_VAO)
 // glGenFramebuffers already has a thunk (the FBO trace); only the delete half
 // is new, and the gen half calls klfb_census_made itself.
+static void klfb_forget_fbo(uint32_t fbo);           // with the stage map below
 static void (*g_real_DeleteFramebuffers)(int32_t, const uint32_t *);
 static void klfb_DeleteFramebuffers(int32_t n, const uint32_t *ids) {
     klfb_census_killed(KLC_FBO, n);
+    // Drop the stage attribution with the object. GL recycles names, so an
+    // entry kept past the delete answers for whatever inherits the name next.
+    for (int32_t i = 0; ids && i < n; i++) klfb_forget_fbo(ids[i]);
     if (g_real_DeleteFramebuffers) g_real_DeleteFramebuffers(n, ids);
 }
 
@@ -2748,6 +2752,7 @@ static uint32_t g_eye_tex[2];
 // stage, with nothing to infer.
 #define KLFB_MAX_STAGES 4
 static uint32_t g_eye_tex_stage[2][KLFB_MAX_STAGES];
+static int      g_eye_ever;   // an eye texture was registered at some point
 
 void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex) {
     if (eye < 0 || eye > 1 || !tex) return;
@@ -2768,6 +2773,7 @@ void kl_glfb_note_eye_texture(int eye, int stage, uint32_t tex) {
         for (int s = 0; s < KLFB_MAX_STAGES; s++)
             if (g_eye_tex_stage[e][s] == tex) g_eye_tex_stage[e][s] = 0;
     g_eye_tex_stage[eye][stage] = tex;
+    g_eye_ever = 1;
 }
 
 // Which of an eye's images the guest most recently PRESENTED.
@@ -2837,9 +2843,45 @@ static int klfb_stage_of_tex(uint32_t tex) {
     return -1;
 }
 
+// How often the sixteen-slot map could not answer and the colour table did,
+// how often an eye FBO found no free slot, and how many slots a released eye
+// texture gave back. Printed by kl_glfb_eye_map_census.
+static uint64_t g_stage_via_color;
+static uint64_t g_map_full;
+static uint64_t g_map_freed;
+static uint64_t g_forget_refused;
+
 static int klfb_stage_of_fbo(uint32_t fbo) {
+    // A hit that RESOLVES wins; a hit that resolves to -1 does not end the
+    // search. The narrow map's row can name a texture that has since stopped
+    // being an eye texture while the colour table has the FBO's current
+    // attachment, and returning the stale -1 there loses a frame that was
+    // drawn into a perfectly good eye stage.
     for (int i = 0; i < KLFB_FBO_MAP; i++)
-        if (g_fbo_stage[i].fbo == fbo) return klfb_stage_of_tex(g_fbo_stage[i].tex);
+        if (g_fbo_stage[i].fbo == fbo) {
+            int s = klfb_stage_of_tex(g_fbo_stage[i].tex);
+            if (s >= 0) return s;
+            break;
+        }
+    // The fallback. g_fbo_stage is the narrower of two tables filled from the
+    // SAME two call sites: klfb_note_fbo_color takes every framebuffer into 48
+    // slots, klfb_map_fbo only those whose colour attachment is a registered
+    // eye texture AT THE MOMENT OF ATTACHMENT, into 16. A guest that re-creates
+    // its eye swapchain gives the narrow one two ways to miss: an attachment
+    // made before the texture is registered is refused a slot, and sixteen
+    // slots do not go far once several generations of eye FBOs have each taken
+    // one. The texture is the identity either way — klfb_stage_of_tex is still
+    // the only authority on what a name means — so consulting the wider table
+    // can only add resolutions the narrow one should have had.
+    for (unsigned i = 0; i < g_nfbo_color; i++)
+        if (g_fbo_color[i].fbo == fbo) {
+            int s = klfb_stage_of_tex(g_fbo_color[i].tex);
+            if (s >= 0 && __atomic_fetch_add(&g_stage_via_color, 1, __ATOMIC_RELAXED) == 0)
+                fprintf(stderr, "  [glfb] fb %u resolved to eye stage %d through the "
+                                "colour table — the sixteen-slot eye-FBO map did not "
+                                "have it (counted in the eyemap census)\n", fbo, s);
+            return s;
+        }
     return -1;
 }
 
@@ -2854,6 +2896,93 @@ static void klfb_map_fbo(uint32_t fbo, uint32_t tex) {
     for (int i = 0; i < KLFB_FBO_MAP; i++)
         if (!g_fbo_stage[i].fbo) { g_fbo_stage[i].fbo = fbo;
                                    g_fbo_stage[i].tex = tex; return; }
+    // Full. Not fatal — klfb_stage_of_fbo falls back to g_fbo_color — but
+    // counted, because it is how a re-created swapchain used to lose every
+    // frame it drew.
+    if (__atomic_fetch_add(&g_map_full, 1, __ATOMIC_RELAXED) == 0)
+        fprintf(stderr, "  [glfb] eye-FBO map full (%d slots) at fb %u — the stage "
+                        "lookup falls back to the colour table\n", KLFB_FBO_MAP, fbo);
+}
+
+// Forgetting, which is the half that was missing.
+//
+// kl_glfb_note_eye_texture drops a stale (eye, stage) when a NAME is
+// re-registered, but nothing dropped one when the storage was DESTROYED, and
+// nothing ever gave back an FBO slot. Between ovrp_DestroyEyeTexture and the
+// next ovrp_SetupEyeTexture2 there is a window six textures wide on a Unity
+// swapchain reconfigure; in it, klfb_stage_of_tex still answers for names that
+// no longer mean anything, and GL hands those names straight back out. And the
+// sixteen FBO slots are filled once per swapchain generation and never
+// reclaimed, so the map saturates after a few reconfigures and stops recording
+// the eye FBOs it exists for.
+//
+// That second half is a visible bug, not just a skewed count. Beat Saber
+// re-creates its eye swapchain at boot and twice more at its main menu
+// (3072x2464 <-> 3686x2957, ~25-35 s in). After the last one the new eye FBOs
+// find no slot, every frame they draw is booked as "drew into no eye stage",
+// klovrp_end_frame_impl drops its record, and the stages stop being filed: the
+// `[cp] stages` serial freezes for two of three stages while the guest keeps
+// rendering, and the compositor warps a picture that keeps getting older — the
+// room shows at the edges on a quick head turn.
+static void klfb_forget_fbo(uint32_t fbo) {
+    if (!fbo) return;
+    for (int i = 0; i < KLFB_FBO_MAP; i++)
+        if (g_fbo_stage[i].fbo == fbo) { g_fbo_stage[i].fbo = 0;
+                                         g_fbo_stage[i].tex = 0; }
+}
+
+// Frees every slot whose attachment is `tex`; returns how many.
+static int klfb_forget_fbo_tex(uint32_t tex) {
+    int n = 0;
+    if (!tex) return 0;
+    for (int i = 0; i < KLFB_FBO_MAP; i++)
+        if (g_fbo_stage[i].tex == tex) { g_fbo_stage[i].fbo = 0;
+                                         g_fbo_stage[i].tex = 0; n++; }
+    __atomic_fetch_add(&g_map_freed, (uint64_t)n, __ATOMIC_RELAXED);
+    return n;
+}
+
+// `released` is the GL name whose storage is going away, or 0 when the caller
+// cannot say. The registration is only dropped when it still names THAT
+// texture: the "replaced with no teardown" backstop in
+// kl_glfb_bind_eye_mtl_texture releases the slot's OLD texture after the new
+// name has already been registered, and clearing unconditionally there would
+// wipe the registration made one line earlier — every frame after it would be
+// unattributable. The ordinary ovrp_DestroyEyeTexture path releases while the
+// slot still holds the old name, where the guard agrees and the clear happens.
+// Returns how many FBO slots the release gave back.
+static int klfb_forget_eye_stage(int eye, int stage, uint32_t released) {
+    if ((unsigned)eye > 1 || (unsigned)stage >= KLFB_MAX_STAGES) return 0;
+    uint32_t tex = g_eye_tex_stage[eye][stage];
+    if (released && tex && tex != released) {
+        __atomic_fetch_add(&g_forget_refused, 1, __ATOMIC_RELAXED);
+        // The FBO rows for the DEAD name are still stale, though, and leaving
+        // them saturates the sixteen slots one generation at a time.
+        return klfb_forget_fbo_tex(released);
+    }
+    g_eye_tex_stage[eye][stage] = 0;
+    // An FBO whose attachment just died is unattributable, not stage-something:
+    // klfb_stage_of_fbo would resolve it through a texture with no stage and
+    // answer -1 anyway, so freeing the slot loses nothing and un-saturates the
+    // map for the swapchain generation that follows.
+    return klfb_forget_fbo_tex(tex);
+}
+
+// The association state, for the exit report and kl_ovrp's periodic report.
+// One line: registered names, slots in use, and the counters above.
+void kl_glfb_eye_map_census(FILE *f) {
+    if (!g_eye_ever) return;     // a guest with no GL eye textures has no map
+    int used = 0;
+    for (int i = 0; i < KLFB_FBO_MAP; i++) used += g_fbo_stage[i].fbo != 0;
+    fprintf(f, "  [eyemap] eye0[%u %u %u] eye1[%u %u %u] | fbo map %d/%d slots | "
+               "%llu freed by releases, %llu full refusals, %llu colour-table "
+               "lookups, %llu releases kept a re-registered slot\n",
+            g_eye_tex_stage[0][0], g_eye_tex_stage[0][1], g_eye_tex_stage[0][2],
+            g_eye_tex_stage[1][0], g_eye_tex_stage[1][1], g_eye_tex_stage[1][2],
+            used, KLFB_FBO_MAP,
+            (unsigned long long)g_map_freed, (unsigned long long)g_map_full,
+            (unsigned long long)g_stage_via_color,
+            (unsigned long long)g_forget_refused);
 }
 
 // --- The observation window -------------------------------------------------
@@ -3266,8 +3395,14 @@ void kl_glfb_release_eye_texture(int eye, int stage) {
         klfb_census_killed(KLC_TEX, 1);
     }
     g_eye_mtl[eye][stage] = (typeof(g_eye_mtl[0][0])){0};
+    // ...and the stage attribution that named it — guarded, see
+    // klfb_forget_eye_stage.
+    int freed = klfb_forget_eye_stage(eye, stage, gl_tex);
     fprintf(stderr, "  [glfb] eye=%d stage=%d released (GL texture %u, image %p)\n",
             eye, stage, gl_tex, img);
+    if (freed)
+        fprintf(stderr, "  [glfb] eye=%d stage=%d: %d eye-FBO map slot(s) given back "
+                        "with GL texture %u\n", eye, stage, freed, gl_tex);
 }
 
 // ---------------------------------------------------------------------------

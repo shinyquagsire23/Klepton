@@ -347,6 +347,34 @@ build/t_xrspace: tests/t_xrspace.c $(RUNTIME) $(RUNTIME_HDRS)
 xrspace: build/t_xrspace
 	./build/t_xrspace
 
+# The pose-boundary gate — one head pose per guest frame cycle, and the anchor
+# filed for reprojection equal to it. Unity's render and sim threads number the
+# same frame differently in gameplay, so a boundary keyed on that number froze
+# two head poses inside one frame (`poses/frame` 1.70 instead of 1.00, a
+# sub-degree judder on head turns). Also: a frame that names no eye layer files
+# no record. Seconds; in `make check`.
+build/t_posebound: tests/t_posebound.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_posebound.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: posebound
+posebound: build/t_posebound
+	./build/t_posebound
+
+# The floor gate. ARKit's world origin sits at the device's own start pose — at
+# EYE level — while a guest that asks for a FloorLevel tracking origin reads the
+# poses as though y=0 were the ground, and asks ovrp_GetUserEyeHeight2 for the
+# number it needs to place its camera. The getter's answer and the (opt-in)
+# pose raise are two halves of ONE height; when they drift the failure is a
+# correct-looking picture a metre and a half out. Milliseconds; in `make check`.
+build/t_ovrpfloor: tests/t_ovrpfloor.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_ovrpfloor.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: ovrpfloor
+ovrpfloor: build/t_ovrpfloor
+	./build/t_ovrpfloor
+
 # The OpenXR action-surface gate — the same argument as xrspace above,
 # one API family across. A binding decoded to the wrong bit, two hands combined
 # the wrong way, a stale press surviving a controller being put down, an action
@@ -540,7 +568,7 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_posebound build/t_ovrpfloor build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
@@ -548,6 +576,10 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@grep -E '=== HEVC|30 access units' build/hevc.log && tail -1 build/hevc.log
 	@./build/t_xrspace > build/xrspace.log 2>&1 || { cat build/xrspace.log; exit 1; }
 	@head -2 build/xrspace.log && tail -1 build/xrspace.log
+	@./build/t_posebound > build/posebound.log 2>&1 || { cat build/posebound.log; exit 1; }
+	@grep -E '^(PASS|FAIL)' build/posebound.log
+	@./build/t_ovrpfloor > build/ovrpfloor.log 2>&1 || { cat build/ovrpfloor.log; exit 1; }
+	@tail -1 build/ovrpfloor.log
 	@./build/t_xrinput > build/xrinput.log 2>&1 || { cat build/xrinput.log; exit 1; }
 	@grep -E '=== OpenXR actions' build/xrinput.log && tail -1 build/xrinput.log
 	@./build/t_softinput > build/softinput.log 2>&1 || { cat build/softinput.log; exit 1; }
@@ -595,7 +627,7 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	 else echo "=== guest differential: SKIPPED (set ANDROID_NDK_HOME) ==="; fi
 	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so $(TARGET)/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log
 	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/m_boot $(LIBS) > build/boot.log 2>/dev/null && \
-	  grep -E 'guard verified|DLC enumeration|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|EXIT CRITERION' build/boot.log
+	  grep -E 'guard verified|eye cap:|eye rungs:|DLC enumeration|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|EXIT CRITERION' build/boot.log
 
 # ---- the translated-dylib path / the visionOS port ----
 #
