@@ -72,4 +72,13 @@ int kl_gl_cap_internalformativ(uint32_t target, uint32_t internalformat,
 int kl_gl_cap_floatv(uint32_t pname, float *data);
 int kl_gl_cap_integer64v(uint32_t pname, int64_t *data);
 
+// Extensions ADOPTED from the backend: kl_glfb hands over ANGLE's own
+// glGetString(GL_EXTENSIONS) once the real context exists, and a name from the
+// runtime's candidate list (kl_egl.c) is added to what the guest is told only
+// if the driver named it first.
+void        kl_gl_cap_adopt_backend_extensions(const char *backend_ext);
+int         kl_gl_cap_backend_has_dxt(void);
+int         kl_gl_cap_adopted_extension_count(void);
+const char *kl_gl_cap_adopted_extension(int i);
+
 #endif

@@ -316,6 +316,16 @@ static const char *const g_gl_extensions[] = {
     // ASTC / Supported: ETC2" and then dies uploading the assets it does have).
     "GL_KHR_texture_compression_astc_ldr",
     "GL_OES_texture_compression_astc",
+    // Vertex array objects: CORE in ES 3.0, so at the 3.2 we claim in
+    // GL_VERSION naming it states nothing new, and ANGLE carries the OES entry
+    // points (aliases of the core ones).
+    //
+    // Leaving it out is a NULL function pointer inside the guest, and it is a
+    // glad-loader hazard rather than a title quirk: glad fills
+    // `glad_glBindVertexArrayOES` only when this string names the extension,
+    // and a renderer that calls it with no null test (the Simpsons Hit & Run VR
+    // port's Pure3D layer does) branches to address zero on its first draw.
+    "GL_OES_vertex_array_object",
     // Framebuffer blit + multisample. These are CORE in GLES 3 (glBlitFramebuffer,
     // glRenderbufferStorageMultisample) and fully backed by ANGLE, but Source's
     // togl is a desktop-GL translator that gates its scene->eye RESOLVE on the old
@@ -364,20 +374,112 @@ static int klgl_want_multiview(void) {
            strcmp(t, "portal") == 0;
 }
 
+// ...and a SECOND list, admitted by a different door: not "core at the level
+// we claim", but "the backend in this process told us, this run, that it has
+// it". Nothing here is named unless ANGLE's own glGetString(GL_EXTENSIONS)
+// named it first (kl_gl_cap_adopt_backend_extensions, called from kl_glfb once
+// the real context exists), so a promise made here is one ANGLE has already
+// made to us.
+//
+//   * The DXT/BC family. Source-engine ports ship DXT1/DXT5 texture packs, and
+//     libtogl, finding no compression extension in the string, takes the
+//     engine's CPU-decompress path and uploads RGBA8888 — 4-8x the bytes, which
+//     on a large pack is the difference between fitting in the memory budget
+//     and not. ANGLE-on-Metal spells the capability per format (_dxt1 and the
+//     two GL_ANGLE_ names) and not as the umbrella _s3tc, so all four are
+//     candidates.
+//   * GL_EXT_texture_filter_anisotropic: a sampler parameter, free in memory,
+//     and without it a floor at a grazing angle samples from the mip chosen for
+//     its worst axis.
+//   * GL_EXT_texture_format_BGRA8888, which is not core at any GLES level. A
+//     glad-bound renderer can build its upload pair from two places — the
+//     internalformat from a table that says GL_BGRA_EXT unconditionally, the
+//     format from a flag glad sets from this name — so an unnamed extension
+//     selects a MIXED pair (GL_BGRA_EXT with GL_RGBA), invalid in every GLES
+//     profile: every texture upload fails GL_INVALID_OPERATION and samples
+//     black (the Simpsons Hit & Run VR port). Quest drivers tolerate the pair.
+static const char *const g_gl_ext_candidates[] = {
+    "GL_EXT_texture_compression_s3tc",
+    "GL_EXT_texture_compression_dxt1",
+    "GL_ANGLE_texture_compression_dxt3",
+    "GL_ANGLE_texture_compression_dxt5",
+    "GL_EXT_texture_filter_anisotropic",
+    "GL_EXT_texture_format_BGRA8888",
+};
+#define KL_GL_EXT_CANDIDATES \
+    ((int)(sizeof g_gl_ext_candidates / sizeof g_gl_ext_candidates[0]))
+
+static const char *g_gl_ext_adopted[KL_GL_EXT_CANDIDATES];
+static int g_gl_ext_adopted_n = 0;
+
+// Called once, from kl_glfb, with whatever the real driver answers. A name the
+// driver does not carry is simply not adopted — there is no override, because
+// the failure this guards against (a guest uploading blocks to a driver that
+// cannot decode them) is a black world, not a slow one.
+void kl_gl_cap_adopt_backend_extensions(const char *backend_ext) {
+    g_gl_ext_adopted_n = 0;
+    if (!backend_ext) backend_ext = "";
+    // The A/B back to the core-only description, and the escape hatch if a
+    // guest turns out to mishandle a capability it now has.
+    if (kl_env_on("KL_GL_NO_BACKEND_EXT", 0)) {
+        fprintf(stderr, "  [gl] KL_GL_NO_BACKEND_EXT=1 — adopting nothing from "
+                        "the backend\n");
+        return;
+    }
+    for (int i = 0; i < KL_GL_EXT_CANDIDATES; i++) {
+        const char *name = g_gl_ext_candidates[i];
+        size_t len = strlen(name);
+        // Whole-token match: "..._s3tc" is a prefix of "..._s3tc_srgb" in some
+        // drivers, and strstr alone would adopt the shorter name off the longer.
+        const char *q = backend_ext;
+        int have = 0;
+        while ((q = strstr(q, name)) != NULL) {
+            char after = q[len];
+            char before = (q == backend_ext) ? ' ' : q[-1];
+            if ((after == 0 || after == ' ') && before == ' ') { have = 1; break; }
+            q += len;
+        }
+        if (have) g_gl_ext_adopted[g_gl_ext_adopted_n++] = name;
+    }
+}
+
+int kl_gl_cap_backend_has_dxt(void) {
+    for (int i = 0; i < g_gl_ext_adopted_n; i++)
+        if (strstr(g_gl_ext_adopted[i], "texture_compression_"))
+            return 1;
+    return 0;
+}
+
+int kl_gl_cap_adopted_extension_count(void) { return g_gl_ext_adopted_n; }
+const char *kl_gl_cap_adopted_extension(int i) {
+    return (i >= 0 && i < g_gl_ext_adopted_n) ? g_gl_ext_adopted[i] : NULL;
+}
+
 // ...and none of it is offered below ES 3. Steam Link is told GLES 2.0
 // (kl_egl_set_gles_version) and has always run against an empty list; the
 // argument above is an ES 3.2 argument and does not carry over, so that target
 // stays exactly as it was rather than being changed by a fix it did not need.
-static int klgl_ext_count(void) {
+static int klgl_ext_base_count(void) {
     if (g_es_major < 3) return 0;
     int n = (int)(sizeof g_gl_extensions / sizeof g_gl_extensions[0]);
     // Hide the two trailing OVR_multiview entries from targets that don't use it.
     if (!klgl_want_multiview()) n -= 2;
     return n;
 }
+static int klgl_ext_count(void) {
+    int n = klgl_ext_base_count();
+    return n ? n + g_gl_ext_adopted_n : 0;
+}
+static const char *klgl_ext_at(int i) {
+    int base = klgl_ext_base_count();
+    if (i < 0 || i >= base + g_gl_ext_adopted_n) return NULL;
+    return i < base ? g_gl_extensions[i] : g_gl_ext_adopted[i - base];
+}
 
 static const char *klgl_GetString(uint32_t name) {
-    static char ver[64], glsl[64], exts[256];
+    // The extension string was already ~240 bytes of a 256-byte buffer, and
+    // strlcat truncates silently, so any addition would have cut a name in half.
+    static char ver[64], glsl[64], exts[768];
     switch (name) {
     case GL_VENDOR:     return "Klepton";
     case GL_RENDERER:   return "Klepton GLES";
@@ -397,7 +499,7 @@ static const char *klgl_GetString(uint32_t name) {
         exts[0] = 0;
         for (int i = 0; i < n; i++) {
             if (i) strlcat(exts, " ", sizeof exts);
-            strlcat(exts, g_gl_extensions[i], sizeof exts);
+            strlcat(exts, klgl_ext_at(i), sizeof exts);
         }
         return exts;
     }
@@ -408,7 +510,7 @@ static const char *klgl_GetString(uint32_t name) {
 
 static const char *klgl_GetStringi(uint32_t name, uint32_t index) {
     if (name == GL_EXTENSIONS && (int)index < klgl_ext_count())
-        return g_gl_extensions[index];
+        return klgl_ext_at((int)index);
     return "";           // consistent with GL_NUM_EXTENSIONS
 }
 
@@ -513,6 +615,14 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     // glGetStringi will hand out makes the guest read past the end or stop
     // short, and either one is silent.
     if (pname == GL_NUM_EXTENSIONS) { params[0] = klgl_ext_count(); return 1; }
+    // The compressed-format pair is described as EMPTY in the table below, which
+    // is only true while no compression extension is named. Once one is adopted
+    // from the backend, "s3tc, and zero compressed formats" is two different
+    // answers; hand both questions to ANGLE, which owns the real one.
+    if ((pname == 0x86A2 /* NUM_COMPRESSED_TEXTURE_FORMATS */ ||
+         pname == 0x86A3 /* COMPRESSED_TEXTURE_FORMATS     */) &&
+        g_gl_ext_adopted_n > 0)
+        return 0;
     for (size_t i = 0; i < sizeof g_gl_int / sizeof g_gl_int[0]; i++)
         if (g_gl_int[i].pname == pname) {
             params[0] = g_gl_int[i].value;
@@ -1233,8 +1343,8 @@ static unsigned klegl_Terminate(EGLDisplay dpy) {
     (void)dpy; g_display.initialised = 0; return EGL_TRUE;
 }
 
-// EGL_EXTENSIONS names exactly the three extensions this runtime implements
-// entry points for, and nothing else. Every name here is a promise, and Unity
+// EGL_EXTENSIONS names exactly the extensions this runtime implements entry
+// points (or, for the last, the attributes) for, and nothing else. Every name here is a promise, and Unity
 // branches hard on this string — advertising one we do not serve buys a failure
 // much further from its cause, which is why the list is the implemented set
 // rather than a plausible one:
@@ -1243,6 +1353,23 @@ static unsigned klegl_Terminate(EGLDisplay dpy) {
 //   EGL_ANDROID_image_native_buffer       ...and EGL_NATIVE_BUFFER_ANDROID, the
 //                                         only image target we accept
 //   EGL_ANDROID_get_native_client_buffer  eglGetNativeClientBufferANDROID
+//   EGL_KHR_create_context                no new entry point — it is the
+//                                         eglCreateContext ATTRIBUTE set, and
+//                                         the one that matters
+//                                         (EGL_CONTEXT_MAJOR_VERSION_KHR) is
+//                                         token 0x3098, the same number as
+//                                         EGL_CONTEXT_CLIENT_VERSION, which
+//                                         klegl_CreateContext already reads.
+//
+// EGL_KHR_create_context is not optional for an SDL2 guest. SDL_EGL_
+// CreateContext will not ask for a GLES 3 context on a display that does not
+// advertise it: it refuses BEFORE calling eglCreateContext ("Could not create
+// EGL context (context attributes are not supported)"). The guest then runs on
+// with no context at all — our GL entry points answer glGetString without one,
+// so its renderer banner looks healthy — creates its XR session against context
+// 0, and submits stereo layers from swapchain textures nothing ever drew into:
+// an all-black immersive space with no crash and no complaint. (A GLES 2 SDL
+// guest never hits it; that is the branch SDL takes without the extension.)
 //
 // The empty string is NOT the safe answer, legal as it is: AVPro Video's
 // OpenGLESPlayerRenderer::setupEglContext strdup()s this string and walks it
@@ -1259,7 +1386,8 @@ static const char *klegl_extensions(void) {
     if (!s) s = kl_env_str("KL_EGL_EXTENSIONS",
                            "EGL_KHR_image_base "
                            "EGL_ANDROID_image_native_buffer "
-                           "EGL_ANDROID_get_native_client_buffer");
+                           "EGL_ANDROID_get_native_client_buffer "
+                           "EGL_KHR_create_context");
     return s;
 }
 
@@ -1481,10 +1609,19 @@ static EGLContext klegl_CreateContext(EGLDisplay dpy, EGLConfig cfg,
     // the EGLConfig for XrGraphicsBindingOpenGLESAndroidKHR; without a real id it
     // finds no config and refuses the session.
     c->config_id = cfg ? ((const typeof(g_configs[0]) *)cfg)->id : g_configs[0].id;
-    for (const int32_t *a = attribs; a && *a != EGL_NONE; a += 2)
-        if (a[0] == 0x3098 /* EGL_CONTEXT_CLIENT_VERSION */) c->client_version = a[1];
-    fprintf(stderr, "  [egl] context %u = %p, GLES %d (created on t%llu)\n",
-            g_nctx - 1, (void *)c, c->client_version, klegl_tid());
+    // 0x3098 is EGL_CONTEXT_CLIENT_VERSION and EGL_CONTEXT_MAJOR_VERSION_KHR —
+    // one token under two names. The minor version is read for the log line
+    // only: ANGLE hands kl_glfb whatever ES 3.x context it has. The rest of the
+    // KHR list (flags, profile mask, robustness) is ignored on purpose.
+    int minor = 0;
+    for (const int32_t *a = attribs; a && *a != EGL_NONE; a += 2) {
+        if (a[0] == 0x3098 /* EGL_CONTEXT_CLIENT_VERSION / MAJOR_VERSION_KHR */)
+            c->client_version = a[1];
+        else if (a[0] == 0x30FB /* EGL_CONTEXT_MINOR_VERSION_KHR */)
+            minor = a[1];
+    }
+    fprintf(stderr, "  [egl] context %u = %p, GLES %d.%d (created on t%llu)\n",
+            g_nctx - 1, (void *)c, c->client_version, minor, klegl_tid());
     return (EGLContext)c;
 }
 
@@ -1868,6 +2005,7 @@ void kl_egl_report(FILE *f) {
     // swap: the last census before the abort is the one that names the class.
     kl_glfb_gl_census(f);
     kl_glfb_draw_census(f);
+    kl_glfb_program_binary_census(f);
     unsigned called = 0;
     for (unsigned i = 0; i < g_ngl; i++) if (g_gl[i].calls) called++;
     // `calls` counts the NULL driver's own stubs. Under KL_GLFB=1 the guest gets

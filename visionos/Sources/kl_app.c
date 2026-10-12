@@ -1,4 +1,5 @@
 // See kl_app.h.
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>          // task_info(TASK_VM_INFO) — the heartbeat's footprint
@@ -7,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -124,6 +126,150 @@ static int missing(const char *what, const char *path) {
     return 1;
 }
 
+// --- the shader cache outlives the driver, and must not -------------------
+//
+// A GLES guest that keeps a program binary cache (UE4's `ProgramBinaryCache`,
+// Unity's shader cache) writes `glGetProgramBinary` blobs into its files
+// directory and reads them back with `glProgramBinary` on the next launch.
+// Those blobs are only valid for the driver that produced them — on Android
+// the vendor blob cache is keyed on the driver build and thrown away when it
+// changes. **Here there is no such key.** ANGLE hands the Metal shader compiler
+// through, the binaries carry the OS build they were compiled under, and
+// nothing on this platform invalidates them.
+//
+// The first launch after a visionOS update therefore reloads a cache into
+// programs that `glProgramBinary` silently refuses to link. UE4 uses them
+// anyway, every `glUseProgram` answers GL_INVALID_OPERATION, the RHI raises
+// Fatal, and the guest asks to quit hundreds of times before its game thread
+// crashes. Seen on Tetris Effect: "it crashes right after the Loading screen",
+// i.e. at the first level whose shaders came from the cache.
+//
+// The fix is the key Android has and we did not: fingerprint the driver, store
+// it beside the cache, and delete the cache when it changes. It lives here at
+// the platform level rather than per-target, because every guest that persists
+// compiled GL programs is one OS update away from the same crash.
+//
+// KL_SHADER_CACHE_GUARD=0 leaves the cache alone (to reproduce the failure).
+#define KL_CACHE_STAMP ".klepton-gl-driver"
+
+// What the guard decided, kept so kl_app_boot can repeat it into the boot log:
+// the guard runs from kl_app_configure, before the log file exists, so its own
+// line reaches only the console — and a Home View launch has none.
+static char g_cache_guard_note[512];
+
+static void rm_rf(const char *path, int depth) {
+    if (depth > 8) return;
+    DIR *d = opendir(path);
+    if (!d) { unlink(path); return; }
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[1400];
+        snprintf(p, sizeof p, "%s/%s", path, e->d_name);
+        struct stat st;
+        if (lstat(p, &st) == 0 && S_ISDIR(st.st_mode)) rm_rf(p, depth + 1);
+        else unlink(p);
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+// The directory names guests use for compiled-program caches. Matched by name
+// at any depth under the files directory, because each engine buries it
+// differently (UE4 puts ProgramBinaryCache at the root, Unity puts its cache
+// under a per-company subtree).
+static int is_cache_dir(const char *name) {
+    static const char *const names[] = {
+        "ProgramBinaryCache",   // UE4 FOpenGLProgramBinaryCache
+        "ShaderCache",          // UE4 FShaderCache / misc
+        "il2cpp_cache",         // Unity, when it caches compiled output
+        "UnityShaderCache",
+        "GPUCache",
+        NULL,
+    };
+    for (int i = 0; names[i]; i++) if (!strcmp(name, names[i])) return 1;
+    return 0;
+}
+
+static int purge_caches(const char *root, int depth) {
+    if (depth > 6) return 0;
+    DIR *d = opendir(root);
+    if (!d) return 0;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[1400];
+        snprintf(p, sizeof p, "%s/%s", root, e->d_name);
+        struct stat st;
+        if (lstat(p, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (is_cache_dir(e->d_name)) {
+            fprintf(stderr, "  [klepton] shader cache: dropping %s "
+                            "(compiled under a different GL driver)\n", p);
+            rm_rf(p, 0);
+            n++;
+        } else {
+            n += purge_caches(p, depth + 1);
+        }
+    }
+    closedir(d);
+    return n;
+}
+
+// The fingerprint. `kern.osversion` is the OS BUILD, which is what moves when a
+// beta lands and what the Metal compiler versions its output by; hw.model pins
+// the GPU family so a restore onto different hardware counts as a change too;
+// KL_GLFB_REWRITE_GEN is our own half of what the cache holds (the blobs are
+// compiled from the text klfb_rewrite_glsl produced).
+static void shader_cache_guard(const char *files) {
+    if (!kl_env_on("KL_SHADER_CACHE_GUARD", 1)) return;
+
+    char want[256] = "", tmp[128];
+    size_t n = sizeof tmp;
+    if (sysctlbyname("kern.osversion", tmp, &n, NULL, 0) != 0) return;
+    snprintf(want, sizeof want, "os=%s", tmp);
+    n = sizeof tmp;
+    if (sysctlbyname("hw.model", tmp, &n, NULL, 0) == 0) {
+        size_t at = strlen(want);
+        snprintf(want + at, sizeof want - at, " hw=%s", tmp);
+    }
+    {
+        size_t at = strlen(want);
+        snprintf(want + at, sizeof want - at, " glsl=%d", KL_GLFB_REWRITE_GEN);
+    }
+
+    char stamp[1200];
+    snprintf(stamp, sizeof stamp, "%s/%s", files, KL_CACHE_STAMP);
+
+    char have_s[256] = "";
+    FILE *f = fopen(stamp, "r");
+    if (f) {
+        if (!fgets(have_s, sizeof have_s, f)) have_s[0] = 0;
+        fclose(f);
+        for (char *p = have_s; *p; p++) if (*p == '\n') { *p = 0; break; }
+    }
+    if (!strcmp(have_s, want)) {          // same driver — the cache is valid
+        snprintf(g_cache_guard_note, sizeof g_cache_guard_note,
+                 "GL driver fingerprint unchanged (%s): compiled-program caches kept",
+                 want);
+        return;
+    }
+
+    // A fresh install has no stamp and no cache either, so the sweep is free;
+    // it is only ever expensive when it is also necessary.
+    int dropped = purge_caches(files, 0);
+    snprintf(g_cache_guard_note, sizeof g_cache_guard_note,
+             "GL driver fingerprint %s -> %s: %d compiled-program cache(s) dropped",
+             have_s[0] ? have_s : "(none)", want, dropped);
+    fprintf(stderr, "  [klepton] %s. A guest's glProgramBinary blobs do not "
+                    "survive an OS update, and using them is a silent unlinked "
+                    "program (KL_SHADER_CACHE_GUARD=0 keeps them).\n",
+            g_cache_guard_note);
+
+    f = fopen(stamp, "w");
+    if (f) { fprintf(f, "%s\n", want); fclose(f); }
+}
+
 int kl_app_configure(const char *resources, const char *container) {
     if (!resources || !container) return missing("path", "(null)");
 
@@ -201,6 +347,9 @@ int kl_app_configure(const char *resources, const char *container) {
     if (!folder_fed && !have(g_apk))
         return missing("staged APK (run stage_assets.sh)", g_apk);
     mkdir(g_files, 0755);
+    // Before any guest code runs, and before the guest's own file layer can
+    // hand it a stale blob. See shader_cache_guard.
+    shader_cache_guard(g_files);
 
     if (kl_app_target_is_steamlink()) {
         // Which front door this launch opens. The SHELL is the default because
@@ -672,6 +821,9 @@ int kl_app_boot(void) {
 
     if (!*g_libdir) return fail("kl_app_configure was not called");
     if (open_log()) return fail("could not open the log file");
+    // shader_cache_guard ran in kl_app_configure, before the log existed.
+    if (g_cache_guard_note[0])
+        fprintf(stderr, "  [klepton] shader cache guard: %s\n", g_cache_guard_note);
 
     // Every thread that runs guest code must seed bionic's stack-guard canary
     // into TSD slot 5 first, and this is the thread the whole boot runs on.

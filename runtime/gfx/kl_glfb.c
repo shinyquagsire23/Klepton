@@ -448,6 +448,16 @@ int kl_glfb_init(void) {
                         "EXT_color_buffer_half_float=%s\n",
                 strstr(ext, "GL_EXT_color_buffer_float") ? "yes" : "NO",
                 strstr(ext, "GL_EXT_color_buffer_half_float") ? "yes" : "NO");
+
+        // ...and the extensions the description may REPEAT rather than assert
+        // (kl_egl.c): adopted only if this string names them.
+        kl_gl_cap_adopt_backend_extensions(ext);
+        int adopted = kl_gl_cap_adopted_extension_count();
+        fprintf(stderr, "  [glfb] backend extensions adopted: %d%s", adopted,
+                adopted ? " —" : " (none of the candidates are present)");
+        for (int i = 0; i < adopted; i++)
+            fprintf(stderr, " %s", kl_gl_cap_adopted_extension(i));
+        fprintf(stderr, "\n");
     }
 
     // Release it. EGL binds a context to one thread at a time and *refuses* to
@@ -1204,9 +1214,72 @@ static int klfb_rename_varying(char *buf, char *p, int is_frag) {
     return 1;
 }
 
+// ESSL's default INT precision is per-STAGE, and a uniform declared in both
+// stages without one is therefore two different types.
+//
+// The spec: a vertex shader defaults `int` to highp, a fragment shader defaults
+// it to mediump. A uniform (or a struct member) that states no precision picks
+// up its stage's default, and a strict linker then refuses the program because
+// the two declarations disagree. ANGLE is strict; Quest drivers are not, which
+// is why a Quest title can ship shaders that do not link here. The Simpsons
+// Hit & Run VR port is the case that found it — six lit programs failed with
+//
+//   Precisions of uniform 'lights' member 'lights.enabled' differ between
+//   VERTEX and FRAGMENT shaders.
+//
+// against `struct LightParams { int enabled; vec4 position; ... }`, and the
+// engine then dereferenced the null program it got back for one of them on the
+// first level load.
+//
+// The repair states the vertex stage's default OUT LOUD in both stages, which
+// is a no-op in the vertex shader (it already defaults to highp int) and a
+// PROMOTION in the fragment shader (mediump -> highp). Nothing is narrowed, so
+// no value that fitted before stops fitting; pinning both to mediump instead
+// would demote vertex-stage loop counters and index arithmetic.
+//
+// Placement is directly after the source's FIRST precision statement, which is
+// guaranteed to follow #version and #extension. A source that states an int
+// precision already has no mismatch to fix, and a source with no precision
+// statement at all is left alone. KL_GLFB_NO_INT_PRECISION=1 disables it.
+static int klfb_rewrite_int_precision(char *buf, size_t cap) {
+    static int off = -1;
+    if (off < 0) off = kl_env_on("KL_GLFB_NO_INT_PRECISION", 0);
+    if (off) return 0;
+
+    static const char *const q[] = { "precision highp int;", "precision mediump int;",
+                                     "precision lowp int;" };
+    for (unsigned i = 0; i < sizeof q / sizeof q[0]; i++)
+        if (strstr(buf, q[i])) return 0;
+
+    char *p = strstr(buf, "precision ");
+    if (!p) return 0;
+    char *semi = strchr(p, ';');
+    if (!semi) return 0;
+    char *at = semi + 1;                       // insert directly after it
+
+    static const char ins[] = "\nprecision highp int;";
+    size_t n = sizeof ins - 1;
+    if (strlen(buf) + n + 1 > cap) return 0;   // no slack: leave the text alone
+    memmove(at + n, at, strlen(at) + 1);
+    memcpy(at, ins, n);
+    return 1;
+}
+
 static char *klfb_rewrite_glsl(char *buf, size_t cap, uint32_t shader) {
     int changed = 0;
     klfb_pin_reset(shader);
+    // First, because it inserts a line and the rules below either shrink or
+    // preserve length.
+    if (klfb_rewrite_int_precision(buf, cap)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] `precision highp int;` stated in shaders that "
+                            "left it to the stage default — ESSL defaults int to "
+                            "highp in a vertex shader and mediump in a fragment "
+                            "one, so a uniform declared in both is two types and "
+                            "the link fails (KL_GLFB_NO_INT_PRECISION=1 disables)\n");
+        changed = 1;
+    }
     if (strncmp(buf, "#version 3", 10) == 0 &&
         buf[10] >= '0' && buf[10] <= '9' && buf[11] >= '0' && buf[11] <= '9' &&
         (buf[10] > '0' || buf[11] > '0') && strncmp(buf + 12, " es", 3) == 0) {
@@ -1498,6 +1571,78 @@ static void klfb_CompileShader(uint32_t shader) {
     }
     pthread_mutex_unlock(&g_compile_lock);
 }
+// ----------------------------------------------------- the OTHER way to link
+//
+// glLinkProgram reports a failed link (below); glProgramBinary was passed
+// straight through, so a program loaded from a cached binary that FAILS to link
+// left no line anywhere. The guest then uses it, every glUseProgram answers
+// GL_INVALID_OPERATION ("program has not been successfully linked" — the same
+// error as "not a program object", so it reads like a name bug), and UE4 turns
+// its RHI's Fatal into a ForceQuit storm and, eventually, a crash.
+//
+// That is exactly what a stale ProgramBinaryCache does on the first launch
+// after an OS update; kl_app.c's shader_cache_guard is the cure, and this is
+// the alarm that names it in one line.
+//
+// KL_GLFB_PROGRAM_BINARY=0 refuses the binary path outright: the program is
+// left unlinked, which is precisely what the spec says a rejected binary looks
+// like, so a guest that checks GL_LINK_STATUS falls back to its shader source.
+static void (*g_real_ProgramBinary)(uint32_t, uint32_t, const void *, int32_t);
+static _Atomic unsigned g_pb_loads, g_pb_failed, g_pb_refused;
+static void klfb_ProgramBinary(uint32_t program, uint32_t format,
+                               const void *binary, int32_t length) {
+    static int allow = -1;
+    if (allow < 0) allow = kl_env_on("KL_GLFB_PROGRAM_BINARY", 1);
+    g_pb_loads++;
+    if (!allow) {
+        if (g_pb_refused++ == 0)
+            fprintf(stderr, "  [glfb] glProgramBinary REFUSED "
+                            "(KL_GLFB_PROGRAM_BINARY=0) — every cached program "
+                            "is left unlinked so the guest recompiles from "
+                            "source\n");
+        return;
+    }
+    if (!g_real_ProgramBinary) return;
+    g_real_ProgramBinary(program, format, binary, length);
+
+    static void (*r_GetProgramiv)(uint32_t, uint32_t, int32_t *);
+    static void (*r_GetProgramInfoLog)(uint32_t, int32_t, int32_t *, char *);
+    if (!r_GetProgramiv) r_GetProgramiv = asym("glGetProgramiv");
+    if (!r_GetProgramiv) return;
+    int32_t ok = 1;
+    r_GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &ok);
+    if (ok) return;
+
+    unsigned nth = ++g_pb_failed;
+    if (nth <= 4)
+        fprintf(stderr, "  [glfb] glProgramBinary(%u) REJECTED — format 0x%x, "
+                        "%d bytes, program left UNLINKED (failure #%u). A "
+                        "compiled-program cache does not survive a driver "
+                        "change; see kl_app.c shader_cache_guard.\n",
+                program, format, length, nth);
+    else if (nth == 5)
+        fprintf(stderr, "  [glfb] glProgramBinary: further rejections counted, "
+                        "not printed\n");
+    // The info log is the driver's own reason and is usually empty for a
+    // format mismatch, but it costs nothing to ask on the first one.
+    if (nth == 1) {
+        if (!r_GetProgramInfoLog) r_GetProgramInfoLog = asym("glGetProgramInfoLog");
+        char log[1024]; log[0] = 0;
+        if (r_GetProgramInfoLog) r_GetProgramInfoLog(program, sizeof log, NULL, log);
+        if (log[0]) fprintf(stderr, "  [glfb]   info log: %s\n", log);
+    }
+}
+
+void kl_glfb_program_binary_census(FILE *f) {
+    unsigned n = g_pb_loads, bad = g_pb_failed, ref = g_pb_refused;
+    if (!n) return;
+    fprintf(f, "  [glfb] glProgramBinary: %u load(s), %u REJECTED, %u refused "
+               "by KL_GLFB_PROGRAM_BINARY=0\n", n, bad, ref);
+    if (bad)
+        fprintf(f, "  [glfb]   a rejected binary is an UNLINKED program — every "
+                   "glUseProgram on it is GL_INVALID_OPERATION\n");
+}
+
 static void klfb_LinkProgram(uint32_t program) {
     if (!g_real_LinkProgram) return;
     pthread_mutex_lock(&g_compile_lock);
@@ -2559,6 +2704,154 @@ static void klfb_FramebufferTextureLayer(uint32_t target, uint32_t attachment,
 #define GL_TEXTURE_SWIZZLE_R 0x8E42
 #define GL_TEXTURE_SWIZZLE_A 0x8E45
 
+// ---- KL_GLFB_NOMIP: sample level 0 only ------------------------------------
+//
+// KL_GLFB_NOMIP=1 demotes every MIPMAP min filter to its non-mipmapped base
+// (LINEAR_MIPMAP_* -> LINEAR, NEAREST_MIPMAP_* -> NEAREST), on textures and on
+// sampler objects both, so no sample in the run can come from anywhere but
+// level 0.
+//
+// It exists for a title that reads a mip level it should not. Tetris Effect's
+// well backdrop on this path is a fine particle field drawn as one magnifying
+// quad; something drives its LOD far above 0, and at its top levels the texture
+// has collapsed to its own average — a flat dark-blue fill over the scene. With
+// level 0 forced the backdrop renders as it does on a Quest, and the steady-
+// state frame time was unchanged on device. Why a magnifying draw consults the
+// minification chain at all is not settled, which is why this is a knob and not
+// a rule: forcing level 0 everywhere costs minification aliasing and texture
+// bandwidth across the whole title. Default off.
+static int klfb_nomip(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_GLFB_NOMIP", 0);
+    return on;
+}
+static int klfb_nomip_filter(uint32_t pname, int32_t param) {
+    static unsigned said;
+    if (pname != 0x2801 /* TEXTURE_MIN_FILTER */ || !klfb_nomip()) return param;
+    int32_t out = param;
+    if (param == 0x2700 || param == 0x2702) out = 0x2600;      // NEAREST_MIPMAP_*
+    if (param == 0x2701 || param == 0x2703) out = 0x2601;      // LINEAR_MIPMAP_*
+    if (out != param && said++ < 3)
+        fprintf(stderr, "  [glfb] NOMIP: min filter 0x%04x -> 0x%04x (level 0 only; "
+                        "KL_GLFB_NOMIP=0 restores the guest's choice)\n",
+                (unsigned)param, (unsigned)out);
+    return out;
+}
+
+// The other spellings of the min-filter write. They forward unchanged unless
+// KL_GLFB_NOMIP is on.
+static void (*g_real_TexParameterf)(uint32_t, uint32_t, float);
+static void klfb_TexParameterf(uint32_t target, uint32_t pname, float param) {
+    if (pname == 0x2801) param = (float)klfb_nomip_filter(pname, (int32_t)param);
+    if (g_real_TexParameterf) g_real_TexParameterf(target, pname, param);
+}
+static void (*g_real_SamplerParameteri)(uint32_t, uint32_t, int32_t);
+static void klfb_SamplerParameteri(uint32_t sampler, uint32_t pname, int32_t param) {
+    param = klfb_nomip_filter(pname, param);
+    if (g_real_SamplerParameteri) g_real_SamplerParameteri(sampler, pname, param);
+}
+static void (*g_real_SamplerParameterf)(uint32_t, uint32_t, float);
+static void klfb_SamplerParameterf(uint32_t sampler, uint32_t pname, float param) {
+    if (pname == 0x2801) param = (float)klfb_nomip_filter(pname, (int32_t)param);
+    if (g_real_SamplerParameterf) g_real_SamplerParameterf(sampler, pname, param);
+}
+
+// ---- depth textures sampled with LINEAR, which ES leaves UNDEFINED ---------
+//
+// A depth texture is not filterable unless the driver says so. ES 3.0 §3.8.13:
+// a texture whose internal format is DEPTH_COMPONENT* is incomplete for
+// sampling if its minification or magnification filter is anything but NEAREST
+// **and** its compare mode is NONE — and an incomplete texture samples as
+// (0,0,0,1). Hardware PCF (compare mode COMPARE_REF_TO_TEXTURE) is the one case
+// where LINEAR is legal, because the filtering then happens on the comparison
+// rather than on the depth value.
+//
+// Quest drivers sample it anyway; Metal does not. The failure is silent — no GL
+// error, no incomplete-framebuffer status, no link error: the shadow lookup
+// returns 0.0, every `depth > shadowSample` test passes, and the whole world is
+// in shadow. The Simpsons Hit & Run VR port is the case that found it: its
+// cascades are depth-only targets sampled with "manual bilinear PCF" (four
+// texels, lerped in the shader), which needs NEAREST; the LINEAR filter left on
+// the texture is a leftover, not a filtering choice, and the level rendered
+// black.
+//
+// So: for a texture this runtime knows to be depth-formatted, a LINEAR filter
+// written while the compare mode is NONE is rewritten to NEAREST, and the swap
+// is UNDONE if the guest later turns compare mode on (the order of the two
+// writes is the guest's business, and a hardware-PCF texture is entitled to its
+// LINEAR). Reported once per texture either way.
+//
+// KL_GLFB_DEPTH_LINEAR=1 leaves the guest's write alone.
+#define KLFB_MAX_DEPTHTEX 32
+static struct {
+    uint32_t name;
+    int      cmp;                  // compare mode is COMPARE_REF_TO_TEXTURE
+    int      want_min, want_mag;   // what the guest asked for
+    int      forced;               // we rewrote at least one filter for it
+    int      said;
+} g_dtex[KLFB_MAX_DEPTHTEX];
+static unsigned g_ndtex;
+
+static int klfb_fmt_is_depth(uint32_t f) {
+    return f == 0x81A5 /* DEPTH_COMPONENT16 */ || f == 0x81A6 /* DEPTH_COMPONENT24 */ ||
+           f == 0x81A7 /* DEPTH_COMPONENT32 */ || f == 0x8CAC /* DEPTH_COMPONENT32F */ ||
+           f == 0x88F0 /* DEPTH24_STENCIL8 */  || f == 0x8CAD /* DEPTH32F_STENCIL8 */ ||
+           f == 0x1902 /* DEPTH_COMPONENT */;
+}
+
+static unsigned klfb_dtex_slot(uint32_t name) {
+    for (unsigned i = 0; i < g_ndtex; i++) if (g_dtex[i].name == name) return i;
+    if (g_ndtex >= KLFB_MAX_DEPTHTEX) return (unsigned)-1;
+    g_dtex[g_ndtex].name = name;
+    g_dtex[g_ndtex].want_min = g_dtex[g_ndtex].want_mag = 0x2600 /* NEAREST */;
+    return g_ndtex++;
+}
+
+// Returns the parameter to actually pass. `name` is the bound texture.
+static int32_t klfb_depth_filter_fix(uint32_t name, uint32_t pname, int32_t param) {
+    static int off = -1;
+    if (off < 0) off = kl_env_on("KL_GLFB_DEPTH_LINEAR", 0);
+    if (off || !name) return param;
+    if (pname != 0x884C /* TEXTURE_COMPARE_MODE */ &&
+        pname != 0x2801 /* MIN_FILTER */ && pname != 0x2800 /* MAG_FILTER */)
+        return param;
+    uint32_t fmt = 0;
+    if (!klfb_tex_info(name, &fmt, NULL, NULL) || !klfb_fmt_is_depth(fmt)) return param;
+    unsigned i = klfb_dtex_slot(name);
+    if (i == (unsigned)-1) return param;
+
+    if (pname == 0x884C /* TEXTURE_COMPARE_MODE */) {
+        int now_cmp = (param == 0x884E /* COMPARE_REF_TO_TEXTURE */);
+        if (now_cmp && !g_dtex[i].cmp && g_dtex[i].forced) {
+            // The guest wants hardware PCF after all: give the filters back.
+            if (g_real_TexParameteri) {
+                g_real_TexParameteri(0x0DE1, 0x2801 /* MIN_FILTER */, g_dtex[i].want_min);
+                g_real_TexParameteri(0x0DE1, 0x2800 /* MAG_FILTER */, g_dtex[i].want_mag);
+            }
+            fprintf(stderr, "  [glfb] depth tex %u went into COMPARE_REF_TO_TEXTURE — "
+                            "its LINEAR filters are legal now and have been restored\n",
+                    name);
+            g_dtex[i].forced = 0;
+        }
+        g_dtex[i].cmp = now_cmp;
+        return param;
+    }
+    if (pname == 0x2801) g_dtex[i].want_min = param; else g_dtex[i].want_mag = param;
+    // NEAREST and NEAREST_MIPMAP_NEAREST are the two complete choices; anything
+    // else filters, and filtering a depth texture with compare mode NONE is the
+    // undefined case.
+    if (g_dtex[i].cmp) return param;
+    if (param == 0x2600 /* NEAREST */ || param == 0x2700 /* NEAREST_MIPMAP_NEAREST */)
+        return param;
+    if (!g_dtex[i].said++)
+        fprintf(stderr, "  [glfb] depth tex %u (fmt 0x%x) asked for filter 0x%x with "
+                        "compare mode NONE — ES leaves that sample UNDEFINED and Metal "
+                        "returns 0. Forced to NEAREST (KL_GLFB_DEPTH_LINEAR=1 restores "
+                        "the guest's write)\n", name, fmt, param);
+    g_dtex[i].forced = 1;
+    return 0x2600 /* NEAREST */;
+}
+
 static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     if (klfb_trace_tex())
         fprintf(stderr, "  [glfb] #%u glTexParameteri target=0x%04x pname=0x%04x "
@@ -2577,6 +2870,15 @@ static void klfb_TexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     // filtering and wrap on GL_TEXTURE_EXTERNAL_OES right after binding it, and
     // those calls have to land on the same object the bind did.
     if (target == 0x8D65 /* TEXTURE_EXTERNAL_OES */) target = 0x0DE1;
+    param = klfb_nomip_filter(pname, param);
+    // The depth-texture completeness rule, which needs to know WHICH texture
+    // is bound rather than only what was asked for.
+    if (target == 0x0DE1 /* TEXTURE_2D */ && a_glGetIntegerv &&
+        (pname == 0x2801 || pname == 0x2800 || pname == 0x884C)) {
+        int32_t bound = 0;
+        a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &bound);
+        if (bound > 0) param = klfb_depth_filter_fix((uint32_t)bound, pname, param);
+    }
     if (g_real_TexParameteri) g_real_TexParameteri(target, pname, param);
     if (kl_env_on("KL_GLFB_ERRPROBE", 0) && a_glGetError) {
         uint32_t e = a_glGetError();
@@ -3800,6 +4102,11 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
     a_glGetIntegerv(0x85B5 /* VERTEX_ARRAY_BINDING */, &s_vao);
     a_glGetIntegerv(0x8894 /* ARRAY_BUFFER_BINDING */, &s_vbo);
     a_glGetIntegerv(0x84E0 /* ACTIVE_TEXTURE */, &s_at);
+    // TEXTURE_BINDING_2D is per UNIT, and the restore below puts it back on
+    // unit 0 — so unit 0 is where it has to be READ. Saving the binding of
+    // whichever unit the guest had selected and restoring it onto unit 0
+    // overwrites unit 0 with another unit's texture, once per eye per frame.
+    r_ActiveTexture(0x84C0 /* TEXTURE0 */);
     a_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &s_tex2d);
     a_glGetIntegerv(0x0BA2 /* VIEWPORT */, s_vp);
     a_glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &s_draw_fb);
@@ -3816,6 +4123,7 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
     r_FramebufferTexture2D(0x8CA9, 0x8CE0, 0x0DE1, dst_tex, 0);
     if (r_CheckFbStatus && r_CheckFbStatus(0x8CA9) != 0x8CD5) {
         r_BindFramebuffer2(0x8CA9, (uint32_t)s_draw_fb);
+        if (s_at != 0x84C0) r_ActiveTexture((uint32_t)s_at);  // switched above
         return 1;   // let the caller blit instead
     }
 
@@ -7282,6 +7590,90 @@ static void klfb_Disable(uint32_t cap) {
     if (g_real_Disable) g_real_Disable(cap);
 }
 
+// ---- the indexed (per-draw-buffer) state family, on an ES 3.0 backend -------
+//
+// glColorMaski / glEnablei / glDisablei / glBlendFunc[Separate]i /
+// glBlendEquation[Separate]i are ES 3.2 (EXT_draw_buffers_indexed). kl_egl.c
+// describes the gateway as ES 3.2, so UE4 uses them; ANGLE's Metal context is
+// ES 3.0 and rejects every one with GL_INVALID_OPERATION. UE4 never checks, so
+// a colour mask it believes it wrote is simply not there, and a frame drawn
+// with the previous mask can be entirely black. An error scan named the five
+// that fire every frame on a UE4 title: glColorMaski, glEnablei, glDisablei,
+// glBlendFuncSeparatei and glBlendEquationSeparatei.
+//
+// For draw buffer 0 the indexed call means exactly what the unindexed one
+// means, and buffer 0 is what these targets have. So index 0 is served by the
+// ES 3.0 entry point and any other index is reported and dropped — which is
+// what ANGLE was doing anyway, silently.
+//
+// glEnablei/glDisablei go through klfb_Enable/klfb_Disable, so they read the
+// very pointers the thunk table fills for glEnable/glDisable. There is
+// deliberately no second "real glEnable" pointer here: one that the table did
+// not fill would turn every glEnable in the process into a silent no-op for a
+// guest that never resolves an indexed form first.
+static void (*g_real_ColorMask)(uint8_t, uint8_t, uint8_t, uint8_t);
+static void (*g_real_BlendFuncSeparate)(uint32_t, uint32_t, uint32_t, uint32_t);
+static void (*g_real_BlendEquationSeparate)(uint32_t, uint32_t);
+// The thunk table stores ANGLE's pointer unconditionally; these slots exist for
+// that and are never called (ANGLE rejects every one of them).
+static void *g_real_ColorMaski_, *g_real_ColorMaskiEXT_;
+static void *g_real_Enablei_, *g_real_EnableiEXT_;
+static void *g_real_Disablei_, *g_real_DisableiEXT_;
+static void *g_real_BlendFuncSeparatei_, *g_real_BlendFuncSeparateiEXT_;
+static void *g_real_BlendFunci_, *g_real_BlendFunciEXT_;
+static void *g_real_BlendEquationSeparatei_, *g_real_BlendEquationSeparateiEXT_;
+static void *g_real_BlendEquationi_, *g_real_BlendEquationiEXT_;
+static void klfb_indexed_resolve(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    g_real_ColorMask             = asym("glColorMask");
+    g_real_BlendFuncSeparate     = asym("glBlendFuncSeparate");
+    g_real_BlendEquationSeparate = asym("glBlendEquationSeparate");
+    // Only a fallback: a guest that resolved glEnable has these from the table.
+    if (!g_real_Enable)  g_real_Enable  = asym("glEnable");
+    if (!g_real_Disable) g_real_Disable = asym("glDisable");
+}
+static void klfb_indexed_drop(const char *what, uint32_t buf) {
+    static int said;
+    if (said++ < 4)
+        fprintf(stderr, "  [glfb] %s(draw buffer %u) dropped — ES 3.0 has no "
+                        "per-draw-buffer state and this target has one buffer\n",
+                what, buf);
+}
+static void klfb_ColorMaski(uint32_t buf, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    klfb_indexed_resolve();
+    if (buf != 0) { klfb_indexed_drop("glColorMaski", buf); return; }
+    if (g_real_ColorMask) g_real_ColorMask(r, g, b, a);
+}
+static void klfb_Enablei(uint32_t cap, uint32_t buf) {
+    klfb_indexed_resolve();
+    if (buf != 0) { klfb_indexed_drop("glEnablei", buf); return; }
+    klfb_Enable(cap);
+}
+static void klfb_Disablei(uint32_t cap, uint32_t buf) {
+    klfb_indexed_resolve();
+    if (buf != 0) { klfb_indexed_drop("glDisablei", buf); return; }
+    klfb_Disable(cap);
+}
+static void klfb_BlendFuncSeparatei(uint32_t buf, uint32_t sr, uint32_t dr,
+                                    uint32_t sa, uint32_t da) {
+    klfb_indexed_resolve();
+    if (buf != 0) { klfb_indexed_drop("glBlendFuncSeparatei", buf); return; }
+    if (g_real_BlendFuncSeparate) g_real_BlendFuncSeparate(sr, dr, sa, da);
+}
+static void klfb_BlendFunci(uint32_t buf, uint32_t src, uint32_t dst) {
+    klfb_BlendFuncSeparatei(buf, src, dst, src, dst);
+}
+static void klfb_BlendEquationSeparatei(uint32_t buf, uint32_t rgb, uint32_t alpha) {
+    klfb_indexed_resolve();
+    if (buf != 0) { klfb_indexed_drop("glBlendEquationSeparatei", buf); return; }
+    if (g_real_BlendEquationSeparate) g_real_BlendEquationSeparate(rgb, alpha);
+}
+static void klfb_BlendEquationi(uint32_t buf, uint32_t mode) {
+    klfb_BlendEquationSeparatei(buf, mode, mode);
+}
+
 static void (*g_real_GenerateMipmap)(uint32_t);
 static void klfb_GenerateMipmap(uint32_t t) {
     if (a_glGetError) while (a_glGetError()) {}
@@ -7293,6 +7685,21 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glActiveTexture", (void *)klfb_ActiveTexture, (void **)&g_real_ActiveTexture},
     {"glUseProgram",  (void *)klfb_UseProgram,  (void **)&g_real_UseProgram},
     {"glBindTexture", (void *)klfb_BindTexture, (void **)&g_real_BindTexture},
+    // the indexed per-draw-buffer state family, served for draw buffer 0
+    {"glColorMaski", (void *)klfb_ColorMaski, (void **)&g_real_ColorMaski_},
+    {"glColorMaskiEXT", (void *)klfb_ColorMaski, (void **)&g_real_ColorMaskiEXT_},
+    {"glEnablei", (void *)klfb_Enablei, (void **)&g_real_Enablei_},
+    {"glEnableiEXT", (void *)klfb_Enablei, (void **)&g_real_EnableiEXT_},
+    {"glDisablei", (void *)klfb_Disablei, (void **)&g_real_Disablei_},
+    {"glDisableiEXT", (void *)klfb_Disablei, (void **)&g_real_DisableiEXT_},
+    {"glBlendFuncSeparatei", (void *)klfb_BlendFuncSeparatei, (void **)&g_real_BlendFuncSeparatei_},
+    {"glBlendFuncSeparateiEXT", (void *)klfb_BlendFuncSeparatei, (void **)&g_real_BlendFuncSeparateiEXT_},
+    {"glBlendFunci", (void *)klfb_BlendFunci, (void **)&g_real_BlendFunci_},
+    {"glBlendFunciEXT", (void *)klfb_BlendFunci, (void **)&g_real_BlendFunciEXT_},
+    {"glBlendEquationSeparatei", (void *)klfb_BlendEquationSeparatei, (void **)&g_real_BlendEquationSeparatei_},
+    {"glBlendEquationSeparateiEXT", (void *)klfb_BlendEquationSeparatei, (void **)&g_real_BlendEquationSeparateiEXT_},
+    {"glBlendEquationi", (void *)klfb_BlendEquationi, (void **)&g_real_BlendEquationi_},
+    {"glBlendEquationiEXT", (void *)klfb_BlendEquationi, (void **)&g_real_BlendEquationiEXT_},
     {"glTexBuffer",      (void *)klfb_TexBuffer,      (void **)&g_real_TexBuffer},
     {"glTexBufferRange", (void *)klfb_TexBufferRange, (void **)&g_real_TexBufferRange},
     {"glTexBufferEXT",   (void *)klfb_TexBuffer,      (void **)&g_real_TexBuffer},
@@ -7362,6 +7769,12 @@ static const struct { const char *name; void *thunk; void **real; } g_thunks[] =
     {"glShaderSource", (void *)klfb_ShaderSource, (void **)&g_real_ShaderSource},
     {"glCompileShader", (void *)klfb_CompileShader, (void **)&g_real_CompileShader},
     {"glLinkProgram",   (void *)klfb_LinkProgram,   (void **)&g_real_LinkProgram},
+    // the other way a program gets linked, and the only one that was silent
+    {"glProgramBinary", (void *)klfb_ProgramBinary, (void **)&g_real_ProgramBinary},
+    // the min-filter writes KL_GLFB_NOMIP can demote (glTexParameteri has its own row)
+    {"glTexParameterf", (void *)klfb_TexParameterf, (void **)&g_real_TexParameterf},
+    {"glSamplerParameteri", (void *)klfb_SamplerParameteri, (void **)&g_real_SamplerParameteri},
+    {"glSamplerParameterf", (void *)klfb_SamplerParameterf, (void **)&g_real_SamplerParameterf},
     // the texture storage census — which format the AGX abort follows
     {"glTexStorage2D", (void *)klfb_TexStorage2D, (void **)&g_real_TexStorage2D},
     {"glTexStorage3D", (void *)klfb_TexStorage3D, (void **)&g_real_TexStorage3D},
@@ -7458,20 +7871,55 @@ static int glfb_state_pname(uint32_t p) {
     case 0x8A28:                // UNIFORM_BUFFER_BINDING
     case 0x88ED: case 0x88EF:   // PIXEL_PACK / PIXEL_UNPACK_BUFFER_BINDING
     case 0x8F36: case 0x8F37:   // COPY_READ / COPY_WRITE_BUFFER_BINDING
+    // The rest of the save/restore set a guest brackets a pass with. A zero
+    // here is not a missing answer but a WRONG one, and it does its damage on
+    // the restore: GL_ZERO is a valid blend factor, so a guest that saves
+    // BLEND_SRC/DST_RGB around a quad and puts them back gets
+    // glBlendFunc(GL_ZERO, GL_ZERO), and everything it draws afterwards blends
+    // to black (the Simpsons Hit & Run VR port's HUD minimap). The equations
+    // and the depth/cull enums are the same family. All are ES 3.0 state that
+    // ANGLE's context accepts.
+    case 0x80C8: case 0x80C9:   // BLEND_DST_RGB, BLEND_SRC_RGB
+    case 0x80CA: case 0x80CB:   // BLEND_DST_ALPHA, BLEND_SRC_ALPHA
+    case 0x0BE0: case 0x0BE1:   // BLEND_DST, BLEND_SRC (ES 1.x names, same state)
+    case 0x8009: case 0x883D:   // BLEND_EQUATION_RGB, BLEND_EQUATION_ALPHA
+    case 0x0B74: case 0x0B45:   // DEPTH_FUNC, CULL_FACE_MODE
+    case 0x0B71: case 0x0BE2:   // DEPTH_TEST, BLEND (as integers)
         return 1;
     }
     return 0;
 }
 
+// The pnames that stop being ours the moment an extension is adopted from the
+// backend. Each is a question ABOUT that extension, so the driver that answered
+// "I have it" is the only thing that can answer "and here is what it costs".
+// Our tables say 0 to all three, and a guest reading a maximum anisotropy of 0
+// turns anisotropy straight back off.
+static int glfb_backend_ext_pname(uint32_t pname) {
+    if (kl_gl_cap_adopted_extension_count() == 0) return 0;
+    return pname == 0x84FF /* MAX_TEXTURE_MAX_ANISOTROPY_EXT */
+        || pname == 0x86A2 /* NUM_COMPRESSED_TEXTURE_FORMATS */
+        || pname == 0x86A3 /* COMPRESSED_TEXTURE_FORMATS     */;
+}
+
 static void klfb_GetIntegerv(uint32_t pname, int32_t *params) {
-    if (glfb_state_pname(pname)) {
+    if (glfb_state_pname(pname) || glfb_backend_ext_pname(pname)) {
         if (g_real_GetIntegerv) g_real_GetIntegerv(pname, params);
         return;
     }
     if (kl_gl_cap_integerv(pname, params)) return;
     // Same contract as the null driver: named, not guessed — and crucially
     // no GL error set, which forwarding to the ES 3.0 context would do.
-    fprintf(stderr, "  [glfb] glGetIntegerv: unhandled pname 0x%x (kept ours)\n", pname);
+    //
+    // Said ONCE per pname: a guest that asks every draw asks a hundred thousand
+    // times a session, and an unthrottled line here buries the rest of the log.
+    static uint32_t said[64]; static int said_n;
+    int seen = 0;
+    for (int i = 0; i < said_n; i++) if (said[i] == pname) { seen = 1; break; }
+    if (!seen) {
+        { int n = said_n; if (n < (int)(sizeof said / sizeof said[0])) { said[n] = pname; said_n = n + 1; } }
+        fprintf(stderr, "  [glfb] glGetIntegerv: unhandled pname 0x%x (kept ours; said once)\n", pname);
+    }
     if (params) params[0] = 0;
 }
 static void klfb_GetFloatv(uint32_t pname, float *data) {

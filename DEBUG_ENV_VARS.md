@@ -60,9 +60,11 @@ answers GL and kl_glfb never initializes.
   Host-only; it exists to produce the known-good frame a real backend gets
   diffed against.
 - `KL_EGL_EXTENSIONS=<space-separated list>` — override what
-  `eglQueryString(EGL_EXTENSIONS)` answers. The default names the three we
+  `eglQueryString(EGL_EXTENSIONS)` answers. The default names the four we
   actually implement (`EGL_KHR_image_base`,
-  `EGL_ANDROID_image_native_buffer`, `EGL_ANDROID_get_native_client_buffer`);
+  `EGL_ANDROID_image_native_buffer`, `EGL_ANDROID_get_native_client_buffer`,
+  and `EGL_KHR_create_context`, without which SDL2 refuses to request a GLES 3
+  context at all);
   set it EMPTY to restore the pre-VRChat behaviour. Worth having as an A/B
   because a guest may branch on a name here — and because an empty list, though
   legal, is what no Android driver actually ships: AVPro Video walks this string
@@ -127,6 +129,27 @@ answers GL and kl_glfb never initializes.
   sRGB).
 - `KL_GLFB_NOSWIZZLE=1` — drop the four `GL_TEXTURE_SWIZZLE_*` parameters.
   Single-channel textures then sample as red; a probe only.
+- `KL_GL_NO_BACKEND_EXT=1` — adopt nothing from ANGLE's own extension string.
+  By default the GL description repeats a short candidate list
+  (`GL_EXT_texture_format_BGRA8888`, the DXT/BC family, and
+  `GL_EXT_texture_filter_anisotropic`) when, and only when, ANGLE names them;
+  `[glfb] backend extensions adopted:` lists what was taken. Once anything is
+  adopted, `MAX_TEXTURE_MAX_ANISOTROPY` and the compressed-format pair are
+  answered by ANGLE instead of the table.
+- `KL_GLFB_DEPTH_LINEAR=1` — leave a LINEAR filter on a depth texture whose
+  compare mode is NONE. By default it is rewritten to NEAREST (ES leaves that
+  sample undefined and Metal returns 0, which reads as "everything is in
+  shadow"), and restored if the guest later turns compare mode on.
+- `KL_GLFB_NO_INT_PRECISION=1` — do not insert `precision highp int;` into
+  shaders that leave int precision to the stage default (which differs between
+  vertex and fragment, so a uniform declared in both fails to link).
+- `KL_GLFB_NOMIP=1` — demote every mipmapped min filter to its level-0 form,
+  on textures and sampler objects. Default off; a per-title workaround for a
+  guest that samples a mip level it should not (Tetris Effect's backdrop).
+- `KL_GLFB_PROGRAM_BINARY=0` — refuse `glProgramBinary` outright, leaving the
+  program unlinked so the guest recompiles from source. By default the binary
+  is forwarded and a rejected one (LINK_STATUS 0) is named in the log and
+  counted in the exit report.
 - `KL_GLFB_ERRPROBE=1` — bracket draws and blits with `glGetError` and print
   the first 20 with the state around them (draw FBO, program, viewport;
   `glCheckFramebufferStatus` on 0x506). Consumes the pending error. Also
@@ -1091,10 +1114,33 @@ puts the camera on the ground with its hands underneath it.
   - `KL_ANGLE_VRR_TRACE=1` alongside it shows the ANGLE half: which render
     passes found the map, and whether each eye resolve took the
     physical-passthrough path (`passthrough=1`) rather than warping twice.
+  - **Zone seams are the trade-off.** A Metal rate map holds one constant rate
+    per zone, so a guest whose screen-space post-processing samples across zone
+    boundaries shows each rate step as a line — Beat Saber's menu, looking down:
+    one or two horizontal lines across the view. `KL_VRR=0` removes them at the
+    full fragment cost; `KL_VRR_FLOOR` does not. They appear only where the
+    guest renders straight into the eye textures (the OVRPlugin path): on the
+    copy path (an OpenXR array swapchain) `kl_glfb` already drops the guest's
+    rate map.
 - `KL_VRR_EDGE=<0..1>` — the rate at the edge of the eye, default 0.35 (the
   fovea is always 1.0, falling off linearly). Lower is cheaper and blurrier in
   the periphery; 1.0 is a map that does nothing. Ignored on device when the
   drawable's own curve was sampled.
+- `KL_VRR_FLOOR=<0.01..1>` — **the smallest per-zone rate the guest's map may
+  carry**, default **0.50**, applied on device after the display's curve is
+  sampled (and to the synthetic curve alike). A fragment shader under a rate map
+  runs in physical space, so `dFdx`/`dFdy` and every texture LOD derived from
+  them measure physical pixels: a zone at rate `r` samples `log2(1/r)` mip
+  levels higher than it would unfoveated. The display's own periphery
+  (≈0.12 x, ≈0.10 y) is +3.1/+3.3 levels, a soft, screen-fixed over-blur.
+  The floor bounds it at `log2(1/floor)` levels — 0.50 is +1 — at a fragment
+  cost of 28.6% -> 48.8% of the unfoveated eye on the measured curve. One
+  `[cp] foveation LOD:` line states the worst bias on both axes before and
+  after, and the fragment fraction. `KL_VRR_FLOOR=0.01` restores the raw
+  display curve.
+  - **It does not remove zone seams.** The horizontal lines in Beat Saber's
+    menu (looking down) are the rate map's own zone boundaries, and they stay
+    with the floor engaged; see `KL_VRR` above — `KL_VRR=0` is the only cure.
 - `KL_VRR_ZONES=<n>` — how many equal screen-space zones each axis of that
   synthetic curve is divided into, default 16, capped at 64. Also the unwarp
   grid's cell count, which is what makes the unwarp exact rather than a sampling
@@ -2190,6 +2236,14 @@ these are the gate's own knobs.
 
 Read on the device/simulator; `visionos/run.sh` forwards every `KL_*` it sees
 except its own control vars (next section).
+
+- `KL_SHADER_CACHE_GUARD=0` — keep a guest's compiled-program caches across a
+  driver change. By default `kl_app.c` stamps `kern.osversion`, `hw.model` and
+  `KL_GLFB_REWRITE_GEN` into `<files>/.klepton-gl-driver` and, when the stamp
+  moves (an OS update, a rewrite-rule change), deletes every
+  `ProgramBinaryCache` / `ShaderCache` / `UnityShaderCache` / `il2cpp_cache` /
+  `GPUCache` directory beneath it, once. A stale cache reloads into programs
+  that never link, which UE4 titles turn into a crash on the first level load.
 
 - `KL_TARGET=<name>` — which guest the app boots: `beatsaber`, `superhot` or
   `steamlink-vr` (`visionos/targets.py --list`). The **default is compiled in**
