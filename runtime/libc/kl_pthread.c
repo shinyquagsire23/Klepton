@@ -1361,7 +1361,13 @@ int klb_pthread_atfork(void (*p)(void), void (*c)(void), void (*ch)(void)) {
 // ---------- semaphores ----------
 // bionic sem_t is 4 bytes -- too small for a pointer, so it holds a table index.
 // Darwin's POSIX sem_init is deprecated/unimplemented, so back them with GCD.
-#define KL_MAX_SEMS 1024
+// Bionic has no limit of its own, and 1024 was not enough: Arizona Sunshine
+// holds more than that LIVE while it loads (1,395 sem_init calls answered
+// ENOSPC, every "Failed to open a semaphore" in Unity's log, then FMOD's
+// Studio::System::initialize failing ERR_INTERNAL on the same shortage). 64K
+// slots is 1 MiB of table; the high-water mark is logged at each power of two
+// past 1024, so a genuine leak still shows itself.
+#define KL_MAX_SEMS 65536
 
 // The count is tracked alongside the dispatch semaphore rather than left to GCD.
 // It has to be: GCD gives no way to read the count, and IL2CPP POLLS it, so a
@@ -1398,7 +1404,13 @@ int klb_sem_init(int *s, int pshared, unsigned value) {
     pthread_mutex_lock(&g_sem_lock);
     if (g_sem_nfree) i = g_sem_free[--g_sem_nfree];
     pthread_mutex_unlock(&g_sem_lock);
-    if (!i) i = atomic_fetch_add(&g_nsems, 1);
+    if (!i) {
+        i = atomic_fetch_add(&g_nsems, 1);
+        // A fresh slot means the free list was empty: i is the live high-water.
+        if (i >= 1024 && (i & (i - 1)) == 0)
+            fprintf(stderr, "  [klepton] sem: %d semaphores live at once (high-water; "
+                            "table %d)\n", i, KL_MAX_SEMS);
+    }
     if (i >= KL_MAX_SEMS) { errno = ENOSPC; return -1; }
     // Fill the slot BEFORE publishing the index. The old order bumped g_nsems
     // first, which made the range check pass while the slot was still empty — a
