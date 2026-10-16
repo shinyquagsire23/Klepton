@@ -44,6 +44,7 @@
 #include "kl_reproject.h"  // kl_reproject_set_srgb_decode — see klfb_srgb_settle
 #include "kl_fault.h"      // kl_fault_print_frames — who issued a GL call
 #include "klepton.h"       // kl_trace_stub, for the per-name GL call trace
+#include "kl_guestpoke.h"  // kl_texunit_mask_active — the GL half of unity-texunit-mask
 
 // ---- the EGL/GLES constants used here, so there is nothing to include ----
 #define EGL_DEFAULT_DISPLAY  ((void *)0)
@@ -7177,10 +7178,50 @@ KLFB_UM(UniformMatrix2x3fv) KLFB_UM(UniformMatrix3x2fv)
 KLFB_UM(UniformMatrix2x4fv) KLFB_UM(UniformMatrix4x2fv)
 KLFB_UM(UniformMatrix3x4fv) KLFB_UM(UniformMatrix4x3fv)
 
+// Is the uniform at `loc` in the current program a sampler? Asked of the
+// linker's own reflection, so an int uniform that happens to hold 40 is never
+// mistaken for a texture unit. Only reached for values of 32 and up, which is
+// sampler setup once per program, so the walk is not on a per-draw path.
+static int klfb_loc_is_sampler(int32_t loc) {
+    static void (*r_gpi)(uint32_t, uint32_t, int32_t *);
+    static void (*r_gau)(uint32_t, uint32_t, int32_t, int32_t *, int32_t *, uint32_t *, char *);
+    if (!r_gpi) r_gpi = asym("glGetProgramiv");
+    if (!r_gau) r_gau = asym("glGetActiveUniform");
+    int32_t prog = 0, nu = 0;
+    if (a_glGetIntegerv) a_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &prog);
+    if (!prog || !r_gpi || !r_gau) return 0;
+    r_gpi((uint32_t)prog, 0x8B86 /* ACTIVE_UNIFORMS */, &nu);
+    for (int32_t i = 0; i < nu; i++) {
+        char n[96]; int32_t len = 0, size = 0; uint32_t type = 0;
+        n[0] = 0;
+        r_gau((uint32_t)prog, (uint32_t)i, sizeof n, &len, &size, &type, n);
+        int32_t at = klfb_actual_loc((uint32_t)prog, n);
+        if (at < 0 || loc < at || loc >= at + (size > 0 ? size : 1)) continue;
+        return (type >= 0x8B5D && type <= 0x8B64)    // SAMPLER_1D .. 2D_RECT_SHADOW
+            || (type >= 0x8DC0 && type <= 0x8DD8)    // array/shadow/int/uint samplers
+            || type == 0x8D66                         // SAMPLER_EXTERNAL_OES
+            || (type >= 0x9108 && type <= 0x910D);   // multisample samplers
+    }
+    return 0;
+}
+
 static void (*g_real_Uniform1i)(int32_t, int32_t);
 static void klfb_Uniform1i(int32_t loc, int32_t v) {
     if (a_glGetError) while (a_glGetError()) {}
     loc = klfb_remap_loc(loc);
+    // The GL half of unity-texunit-mask (kl_guestpatch.c): libunity binds a
+    // texture for unit u at u & 31, so the sampler that reads it has to name
+    // u & 31 too. Only when the loaded image carries the patch, only for
+    // sampler-typed uniforms, and only above 31, where nothing else could have
+    // put the value.
+    if (v >= 32 && kl_texunit_mask_active() && klfb_loc_is_sampler(loc)) {
+        static int said;
+        if (said < 8) {
+            said++;
+            fprintf(stderr, "  [glfb] sampler unit %d -> %d (unity-texunit-mask)\n", v, v & 31);
+        }
+        v &= 31;
+    }
     if (g_real_Uniform1i) g_real_Uniform1i(loc, v);
     static int said;
     if (said < 30 && a_glGetError) {
