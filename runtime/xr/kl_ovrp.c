@@ -469,6 +469,16 @@ static int klovrp_GetSystemRecommendedMSAALevel(void) {
     return (int)kl_env_int("KL_OVRP_MSAA", 4);
 }
 
+// ovrp_GetSystemHeadphonesPresent: OVRP_1_1_0, no arguments, the ovrpBool
+// DIRECTLY. On a Quest it says whether something is in the 3.5 mm jack; a
+// Vision Pro has none, and its audio pods are the built-in speakers a Quest's
+// answer of false describes. Battle Sister (x3231001163584154) asks during
+// startup and aborted here on the unimplemented entry point.
+static int klovrp_GetSystemHeadphonesPresent(void) {
+    ovrp_hit("ovrp_GetSystemHeadphonesPresent");
+    return 0;
+}
+
 static uint64_t klovrp_GetSystemRecommendedMSAALevel2(int *out) {
     ovrp_hit("ovrp_GetSystemRecommendedMSAALevel2");
     if (!out) return OVRP_FAIL_INVALID_PARAM;
@@ -782,6 +792,51 @@ static uint64_t klovrp_GetSystemMultiViewSupported(void) {
 static uint64_t klovrp_GetBoundaryConfigured2(int *out) {
     ovrp_hit("ovrp_GetBoundaryConfigured2");
     if (out) *out = 0;
+    return OVRP_SUCCESS;
+}
+
+// The rest of UE4's guardian surface (OculusFunctionLibrary GetGuardianPoints /
+// GetGuardianDimensions / GetPointGuardianIntersection / GetNodeGuardian-
+// Intersection, SetGuardianVisibility). Every caller checks OVRP_SUCCESS and
+// falls back to an empty answer, so "unsupported" with zeroed outs is the
+// no-boundary reply. A Fisherman's Tale asks GetBoundaryGeometry3 on boot.
+// Shapes: Geometry3(type, ovrpVector3f *points, int *count),
+// Dimensions2(type, ovrpVector3f *out), TestBoundaryNode2(node, type,
+// ovrpBoundaryTestResult *), TestBoundaryPoint2(const ovrpVector3f *, type,
+// ovrpBoundaryTestResult *) — the result is {int IsTriggering; float
+// ClosestDistance; vec3 ClosestPoint; vec3 ClosestPointNormal}, 32 bytes.
+static uint64_t klovrp_GetBoundaryGeometry3(int type, float *points, int *count) {
+    (void)type; (void)points;
+    ovrp_hit("ovrp_GetBoundaryGeometry3");
+    if (count) *count = 0;
+    return (uint64_t)(int64_t)OVRP_FAIL_UNSUPPORTED;
+}
+static uint64_t klovrp_GetBoundaryDimensions2(int type, float *out) {
+    (void)type;
+    ovrp_hit("ovrp_GetBoundaryDimensions2");
+    if (out) memset(out, 0, 3 * sizeof(float));
+    return (uint64_t)(int64_t)OVRP_FAIL_UNSUPPORTED;
+}
+static uint64_t klovrp_TestBoundaryNode2(int node, int type, void *result) {
+    (void)node; (void)type;
+    ovrp_hit("ovrp_TestBoundaryNode2");
+    if (result) memset(result, 0, 32);
+    return (uint64_t)(int64_t)OVRP_FAIL_UNSUPPORTED;
+}
+static uint64_t klovrp_TestBoundaryPoint2(const float *point, int type, void *result) {
+    (void)point; (void)type;
+    ovrp_hit("ovrp_TestBoundaryPoint2");
+    if (result) memset(result, 0, 32);
+    return (uint64_t)(int64_t)OVRP_FAIL_UNSUPPORTED;
+}
+static uint64_t klovrp_GetBoundaryVisible2(int *out) {
+    ovrp_hit("ovrp_GetBoundaryVisible2");
+    if (out) *out = 0;
+    return OVRP_SUCCESS;
+}
+static uint64_t klovrp_SetBoundaryVisible2(int visible) {
+    (void)visible;
+    ovrp_hit("ovrp_SetBoundaryVisible2");
     return OVRP_SUCCESS;
 }
 
@@ -6522,6 +6577,7 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetAppShouldRecreateDistortionWindow2",
      (void *)klovrp_GetAppShouldRecreateDistortionWindow2},
     {"ovrp_GetSystemRecommendedMSAALevel", (void *)klovrp_GetSystemRecommendedMSAALevel},
+    {"ovrp_GetSystemHeadphonesPresent", (void *)klovrp_GetSystemHeadphonesPresent},
     {"ovrp_GetSystemRecommendedMSAALevel2", (void *)klovrp_GetSystemRecommendedMSAALevel2},
     {"ovrp_GetGPUFrameTime",   (void *)klovrp_GetGPUFrameTime},
     {"ovrp_InitializeMixedReality", (void *)klovrp_InitializeMixedReality},
@@ -6542,6 +6598,12 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetTrackingPositionSupported2", (void *)klovrp_GetTrackingPositionSupported2},
     {"ovrp_GetEyeTextureArraySupported",  (void *)klovrp_GetEyeTextureArraySupported},
     {"ovrp_GetBoundaryConfigured2", (void *)klovrp_GetBoundaryConfigured2},
+    {"ovrp_GetBoundaryGeometry3", (void *)klovrp_GetBoundaryGeometry3},
+    {"ovrp_GetBoundaryDimensions2", (void *)klovrp_GetBoundaryDimensions2},
+    {"ovrp_TestBoundaryNode2", (void *)klovrp_TestBoundaryNode2},
+    {"ovrp_TestBoundaryPoint2", (void *)klovrp_TestBoundaryPoint2},
+    {"ovrp_GetBoundaryVisible2", (void *)klovrp_GetBoundaryVisible2},
+    {"ovrp_SetBoundaryVisible2", (void *)klovrp_SetBoundaryVisible2},
     {"ovrp_GetAppHasVrFocus2", (void *)klovrp_GetAppHasVrFocus2},
     {"ovrp_GetUserPresent2", (void *)klovrp_GetUserPresent2},
     {"ovrp_GetNodePresent2", (void *)klovrp_GetNodePresent2},

@@ -761,6 +761,9 @@ static const char *const g_plat_request[] = {
     "ovr_User_GetOrgScopedID",
     "ovr_User_LaunchFriendRequestFlow",
     "ovr_User_GetLoggedInUserManagedInfo",
+    // Pending room invites for that user — the same social graph. Battle
+    // Sister asks at its title screen (2026-10-12).
+    "ovr_Notification_GetRoomInvites",
 };
 
 // Whole families where EVERY entry point is request-returning, so the same
@@ -839,6 +842,26 @@ static uint64_t klplat_options_create(const char *name) {
 
 static int plat_is_options_create(const char *name) {
     return strstr(name, "Options_Create") != NULL;
+}
+
+// ovr_Microphone_*: the platform's own mic capture for in-game voice chat.
+// Arizona Sunshine creates one on boot. As with ovr_Voip_SetMicrophoneMuted
+// above, nothing here captures audio, so this is a microphone that hears
+// silence: Create hands back a non-NULL cookie (the managed MicrophoneInput
+// wrapper Starts it with no NULL check), Start/Stop/Destroy have nothing to
+// do, and every read — GetNumSamplesAvailable, GetPCM/GetPCMFloat,
+// ReadData — reports 0 samples.
+static const char g_mic_cookie[] = "klepton-ovr-microphone";
+
+static uint64_t klplat_microphone_create(const char *name) {
+    plat_hit(name);
+    fprintf(stderr, "  [plat] %s -> silent microphone (no audio capture on this "
+                    "host; every read returns 0 samples)\n", name);
+    return (uint64_t)(uintptr_t)g_mic_cookie;
+}
+
+static int plat_is_microphone(const char *name) {
+    return strncmp(name, "ovr_Microphone_", 15) == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,6 +1129,10 @@ void *kl_ovrplat_sym(const char *name) {
     if (plat_is_unity_hook(name))
         return kl_named_stub(name, (void *)klplat_void);
     if (plat_is_drop(name))
+        return kl_named_stub(name, (void *)klplat_void);
+    if (strcmp(name, "ovr_Microphone_Create") == 0)
+        return kl_named_stub(name, (void *)klplat_microphone_create);
+    if (plat_is_microphone(name))
         return kl_named_stub(name, (void *)klplat_void);
     if (plat_is_options_create(name))
         return kl_named_stub(name, (void *)klplat_options_create);
