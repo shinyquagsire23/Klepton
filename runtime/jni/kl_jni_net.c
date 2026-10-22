@@ -291,7 +291,7 @@ static klj_val klj_AudioManager_getDevices(void *env, void *self, const klj_val 
 static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *route;
-    if (!route) route = kl_jni_new_object("android/media/MediaRouter$RouteInfo");
+    if (!route) { route = kl_jni_new_object("android/media/MediaRouter$RouteInfo"); kl_jni_pin_object(route); }
     return (klj_val){.l = route};
 }
 
@@ -306,10 +306,14 @@ static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj
 // well-formed one. Stable across runs because callers cache it and compare.
 #define KLJ_ANDROID_ID "4b6c6570746f6e01"      /* "Klepton\1" as hex */
 
+// The same value for UE4, which asks GameActivity rather than Settings.Secure:
+// one device, one id, whichever door the guest knocks on.
+const char *klj_android_id(void) { return KLJ_ANDROID_ID; }
+
 static klj_val klj_Context_getContentResolver(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *resolver;
-    if (!resolver) resolver = kl_jni_new_object("android/content/ContentResolver");
+    if (!resolver) { resolver = kl_jni_new_object("android/content/ContentResolver"); kl_jni_pin_object(resolver); }
     return (klj_val){.l = resolver};
 }
 

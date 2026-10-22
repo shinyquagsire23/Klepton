@@ -107,6 +107,11 @@ static klj_val klj_InputDevice_getDeviceIds(void *env, void *self, const klj_val
     static void *ids;
     if (!ids) {
         ids = klj_new_array('I', NULL, 2);
+        // Pinned: cached for the run and handed out on every call. Unpinned, a
+        // guest PopLocalFrame retired it and the next caller got a dead pointer —
+        // End Space's C# reached it through reflection inside a local frame and
+        // aborted on "GetObjectClass on an untagged pointer" (2026-10-12).
+        kl_jni_pin_object(ids);
         int32_t *v = klj_arr(ids)->data;
         v[0] = KLJ_INPUT_DEV_LTOUCH;
         v[1] = KLJ_INPUT_DEV_RTOUCH;
@@ -400,6 +405,22 @@ static klj_val klj_View_setOnApplyWindowInsetsListener(void *env, void *self,
     (void)env; (void)self; (void)a; (void)n;
     KLJ_LOG("View.setOnApplyWindowInsetsListener() — recorded; insets never change, "
             "so it is never called back");
+    return (klj_val){.l = NULL};
+}
+
+// The same for layout: the guest's view is laid out once at the size of the
+// surface and never again, so an OnLayoutChangeListener has nothing to hear.
+// Mini Motor Racing X (x2371757336252737) registers one at boot.
+static klj_val klj_View_addOnLayoutChangeListener(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("View.addOnLayoutChangeListener() — recorded; the layout never changes, "
+            "so it is never called back");
+    return (klj_val){.l = NULL};
+}
+static klj_val klj_View_removeOnLayoutChangeListener(void *env, void *self,
+                                                     const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.l = NULL};
 }
 
@@ -809,6 +830,12 @@ const klj_binding klj_bind_window[] = {
     {"android/hardware/input/InputManager", "registerInputDeviceListener",
      "(Landroid/hardware/input/InputManager$InputDeviceListener;Landroid/os/Handler;)V",
      klj_InputManager_registerListener},
+    // ...and as Unity's reflection spells it when C# passes a null Handler:
+    // dotted class names, and Object for the argument it could not type. End
+    // Space (x2434361173248640) registers its controller watcher this way.
+    {"android/hardware/input/InputManager", "registerInputDeviceListener",
+     "(Landroid.hardware.input.InputManager$InputDeviceListener;Ljava/lang/Object;)V",
+     klj_InputManager_registerListener},
     {"android/hardware/input/InputManager", "getInputDeviceIds", "()[I",
      klj_InputManager_getInputDeviceIds},
     {"android/hardware/input/InputManager", "getInputDevice",
@@ -830,6 +857,8 @@ const klj_binding klj_bind_window[] = {
     {"android/view/View", "getRootWindowInsets", "()Landroid/view/WindowInsets;", klj_View_getRootWindowInsets},
     {"android/view/View", "onApplyWindowInsets", "(Landroid/view/WindowInsets;)Landroid/view/WindowInsets;", klj_View_onApplyWindowInsets},
     {"android/view/View", "setOnApplyWindowInsetsListener", "(Landroid/view/View$OnApplyWindowInsetsListener;)V", klj_View_setOnApplyWindowInsetsListener},
+    {"android/view/View", "addOnLayoutChangeListener", "(Landroid/view/View$OnLayoutChangeListener;)V", klj_View_addOnLayoutChangeListener},
+    {"android/view/View", "removeOnLayoutChangeListener", "(Landroid/view/View$OnLayoutChangeListener;)V", klj_View_removeOnLayoutChangeListener},
     {"android/view/WindowInsets", "getDisplayCutout", "()Landroid/view/DisplayCutout;", klj_WindowInsets_getDisplayCutout},
     {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
     {"android/content/Context", "checkCallingOrSelfPermission", "(Ljava/lang/String;)I", klj_Context_checkPermission},

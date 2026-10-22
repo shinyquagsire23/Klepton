@@ -966,6 +966,7 @@ static const klj_kv *klj_manifest_metadata(void) {
                     g_assets_dir);
         }
         bundle = klj_new_object_data("android/os/Bundle", (void *)kv);
+        kl_jni_pin_object(bundle);   // cached for the run: pinned, or a frame pop retires it (kl_jni_pin_object)
     }
     return (klj_val){.l = bundle};
 }
@@ -1526,8 +1527,10 @@ static klj_val klj_UnityPlayer_initializeGoogleAr(void *env, void *self, const k
 static klj_val klj_PlayAssetDelivery_init(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *singleton;      // init() is a singleton factory; getInstance()
-    if (!singleton)              // hands back the same object, so identity matters
+    if (!singleton) {            // hands back the same object, so identity matters
         singleton = klj_new_object_data("com/unity3d/player/PlayAssetDeliveryUnityWrapper", NULL);
+        kl_jni_pin_object(singleton);   // cached for the run: pinned, or a frame pop retires it (kl_jni_pin_object)
+    }
     KLJ_LOG("PlayAssetDeliveryUnityWrapper.init() -> wrapper "
             "(playCoreApiMissing will answer true: no Play Store here)");
     return (klj_val){.l = singleton};

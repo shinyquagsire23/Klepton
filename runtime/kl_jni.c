@@ -594,6 +594,13 @@ static const struct { const char *cls, *super; } g_supers[] = {
     // getIntent() on it. That is an Activity method, so without this edge every
     // inherited Activity method would need re-declaring against NativeActivity.
     {"android/app/NativeActivity",             "android/app/Activity"},
+    // UE4's GameActivity extends NativeActivity, so everything an Activity or a
+    // Context answers is answerable through it — and the guest calls those
+    // through the GameActivity class it holds. Without this edge only the rows
+    // keyed on GameActivity itself resolved: Red Matter aborted on
+    // GameActivity.getPackageName() deep into play (2026-10-12), with
+    // Context.getPackageName bound all along.
+    {"com/epicgames/ue4/GameActivity",         "android/app/NativeActivity"},
     // BONELAB's own libSLZQuestNative reaches its Context the way a native
     // plugin with no Context has to: ActivityThread.currentActivityThread()
     // .getApplication(). An Application IS a Context (through ContextWrapper),
