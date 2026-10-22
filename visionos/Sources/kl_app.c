@@ -1069,10 +1069,35 @@ static void *guest_thread(void *unused) {
         pthread_mutex_unlock(&g_guest.mu);
         if (stop) break;
 
-        if (kl_app_frame() < 0) {
+        int rendered = kl_app_frame();
+        if (rendered < 0) {
             printf("[guest] nativeRender is gone — the frame loop ends here\n");
             fflush(NULL);
             break;
+        }
+        // nativeRender's bool is Unity's quit signal. UnityPlayer's render
+        // handler on Android reads `if (!nativeRender()) finish();` — that is
+        // where Application.Quit lands, and nothing else tells Java. Ignored,
+        // a game's Exit stops drawing and the app sits there (Air Brigade 2).
+        // One false is enough, as it is on Android: Unity 2018 (Air Brigade 2)
+        // keeps answering false once it has quit, but Unity 2022 (Beat Saber)
+        // answers it ONCE and goes on drawing, expecting finish() to have taken
+        // the activity down — an earlier "twice running" rule never saw it.
+        // Only after the guest has rendered at all, so a start-up frame is not
+        // read as a quit. Android's finish() ends in Process.killProcess, so
+        // _exit, not exit: no atexit handlers inside a guest whose threads are
+        // still live. KL_UNITY_QUIT=0 ignores it again.
+        {
+            static int seen_true, said, honour = -1;
+            if (honour < 0) honour = kl_env_on("KL_UNITY_QUIT", 1);
+            if (rendered) seen_true = 1;
+            else if (seen_true && (honour || !said++)) {
+                printf("[guest] nativeRender returned false — Unity asked to quit "
+                       "(Application.Quit)%s\n", honour ? "; exiting, as Android's finish() would"
+                                                        : "; ignored (KL_UNITY_QUIT=0)");
+                fflush(NULL);
+                if (honour) _exit(0);
+            }
         }
         if (limit && kl_driver_frames() >= limit) {
             printf("[guest] reached KL_FRAMES=%u\n", limit);
