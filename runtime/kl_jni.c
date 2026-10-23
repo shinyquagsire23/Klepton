@@ -1483,6 +1483,15 @@ static const char *klj_field_sval(const klj_field *f) {
         if (!strcmp(f->name, "FINGERPRINT"))
             return "oculus/eureka/eureka:10/SQ3A.220605.009.A1/1:user/release-keys";
     }
+    // Red Matter 2 picks its tracking mode by exact model string
+    // (CCrossPlatform::InitPlatformData): "Quest" is 6DOF, "Pacific" (Go) and
+    // "Pico Goblin" are 3DOF, and "Quest 2" falls through to a comparison
+    // against the XR system's name ("OculusHMD") that leaves it 3DOF — where a
+    // turn is a tracking reset, so every snap and smooth turn replayed from
+    // the starting direction, backwards. It tells Quest 2/Pro/3 apart by
+    // headset type afterwards, not by this string.
+    if (t && strcmp(t, "redmatter2") == 0 && !strcmp(f->name, "MODEL"))
+        return "Quest";
     return f->sval;
 }
 
