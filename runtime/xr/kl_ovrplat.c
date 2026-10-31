@@ -3147,10 +3147,15 @@ static const char *const g_plat_request_prefix[] = {
 //     connection is ever made here, so there is nothing for them to apply to.
 //     Space Pirate Trainer DX sets it while its start screen's hold-the-button
 //     timer runs, and the refusal ended the game there (2026-10-28).
+//   ovr_Voip_Stop(ovrID) — hang up the voice connection with that user. None
+//     was ever made here, so there is nothing to hang up and no reply. Arizona
+//     Sunshine calls it as it leaves its calibration scene for the menu, and
+//     the refusal ended the game there (2026-10-31).
 static const char *const g_plat_drop[] = {
     "ovr_Log_NewEvent",
     "ovr_Voip_SetMicrophoneMuted",
     "ovr_Voip_SetNewConnectionOptions",
+    "ovr_Voip_Stop",
 };
 
 static int plat_is_drop(const char *name) {
