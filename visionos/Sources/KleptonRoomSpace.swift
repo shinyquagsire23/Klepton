@@ -327,6 +327,14 @@ enum KLRoomLogFile {
         guard let session, let world, let scene else { return }
         accessoryAnchors = [:]
         guard let acc = await makeAccessoryProvider() else { return }
+        // Making the provider waits on the accessories, and the room can be
+        // recognised and the space closed meanwhile (stop()). Running the
+        // stopped session's stopped providers again is not an error ARKit
+        // returns but an exception it raises, which Swift cannot catch: the
+        // app aborted when the Sense controllers connected just after the room
+        // was recognised (Arizona Sunshine, 2026-10-31, three crash reports
+        // in KLRoomFlow.controllersChanged -> ARKitSession.run).
+        guard active, self.session === session else { return }
         var providers: [any DataProvider] = [world, scene, acc]
         if let planes, PlaneDetectionProvider.isSupported { providers.append(planes) }
         if let hands { providers.append(hands) }
