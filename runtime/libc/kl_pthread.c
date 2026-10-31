@@ -1463,21 +1463,35 @@ int klb_sem_post(int *s) {
     return 0;
 }
 
+// The count is taken BEFORE the thread blocks, as Linux takes it: a waiter is
+// a count below zero, and sem_getvalue (which reports 0 then) never shows a
+// token that has already been claimed. Taken after the wait returned — as it
+// was — there was a window, between dispatch_semaphore_wait handing the token
+// over and the decrement, in which the value still read 1. A producer that
+// posts only when it reads 0 (wake the consumer unless a wake is pending) then
+// skipped its post while the consumer, already awake and finding its queue
+// empty, went back to sleep: a wake lost for good. Found chasing Arizona
+// Sunshine's intermittent start freeze (2026-10-31).
 int klb_sem_wait(int *s) {
     kl_sem *k = sem_of(s);
     if (!k) { errno = EINVAL; return -1; }
     sem_wait_enter(s, __builtin_return_address(0));
+    atomic_fetch_sub(&k->count, 1);
     dispatch_semaphore_wait(k->d, DISPATCH_TIME_FOREVER);
     sem_wait_leave();
-    atomic_fetch_sub(&k->count, 1);
     return 0;
 }
 
+// A token is claimed only if one is there; claimed, it is ours — the post that
+// made it may still be on its way to dispatch_semaphore_signal, so the wait for
+// it is unbounded, and short.
 int klb_sem_trywait(int *s) {
     kl_sem *k = sem_of(s);
     if (!k) { errno = EINVAL; return -1; }
-    if (dispatch_semaphore_wait(k->d, DISPATCH_TIME_NOW) != 0) { errno = EAGAIN; return -1; }
-    atomic_fetch_sub(&k->count, 1);
+    int c = atomic_load(&k->count);
+    while (c > 0 && !atomic_compare_exchange_weak(&k->count, &c, c - 1)) {}
+    if (c <= 0) { errno = EAGAIN; return -1; }
+    dispatch_semaphore_wait(k->d, DISPATCH_TIME_FOREVER);
     return 0;
 }
 
@@ -1528,8 +1542,15 @@ int klb_sem_timedwait(int *s, const struct timespec *ts) {
     kl_sem *k = sem_of(s);
     if (!k) { errno = EINVAL; return -1; }
     dispatch_time_t when = dispatch_walltime(ts, 0);
-    if (dispatch_semaphore_wait(k->d, when) != 0) { errno = ETIMEDOUT; return -1; }
-    atomic_fetch_sub(&k->count, 1);
+    atomic_fetch_sub(&k->count, 1);              // claimed before blocking, as in klb_sem_wait
+    if (dispatch_semaphore_wait(k->d, when) != 0) {
+        // Given back. A post that lands meanwhile leaves its signal in the
+        // dispatch semaphore, matched by the count it raised: the next waiter
+        // takes both.
+        atomic_fetch_add(&k->count, 1);
+        errno = ETIMEDOUT;
+        return -1;
+    }
     return 0;
 }
 
