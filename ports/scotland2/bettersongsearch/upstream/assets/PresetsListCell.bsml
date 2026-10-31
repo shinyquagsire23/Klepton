@@ -1,0 +1,3 @@
+﻿<horizontal id='bgContainer' bg='round-rect-panel' pad='1' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<text id='presetNameLabel' align='MidlineLeft' overflow-mode='Ellipsis' word-wrapping='false' rich-text='false'/>
+</horizontal>

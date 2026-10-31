@@ -1,0 +1,20 @@
+[
+  {
+    "name": "songdownloader",
+    "repository": "darknight1050/SongDownloader",
+    "tag": "v0.8.8",
+    "commit": "b2aacb11142a9f915c18a945760d98da1410fde4",
+    "archive": "songdownloader-b2aacb1.tar.gz",
+    "sha256": "c523f095c64673a1295f2b62cabe78e914ea22e4c977bea817d135e8f0a5ec34",
+    "scope": "Exact original released source downloaded for port work; not built or tested."
+  },
+  {
+    "name": "playlistcore",
+    "repository": "Metalit/PlaylistCore",
+    "tag": "v1.5.5",
+    "commit": "41f80c02bfe1c2e1edd9fcdee28a49e7c3aeda18",
+    "archive": "playlistcore-41f80c0.tar.gz",
+    "sha256": "4357072a26dc548aa91104ad8d1d90fb5df42d88a9c729da9a1ef58650ef0ee3",
+    "scope": "Exact original released source downloaded for port work; not built or tested."
+  }
+]

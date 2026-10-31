@@ -1,0 +1,622 @@
+--- a/include/Configuration.hpp
++++ b/include/Configuration.hpp
+@@ -3,7 +3,8 @@
+ #include <string>
+ #include <string_view>
+ 
+-#include "beatsaber-hook/shared/config/config-utils.hpp"
++#include "ConfigurationStore.hpp"
++#include "beatsaber-hook/shared/utils.hpp"
+ 
+ namespace AirbudsSearch {
+ 
+--- /dev/null
++++ b/include/ConfigurationStore.hpp
+@@ -0,0 +1,69 @@
++#pragma once
++// Preserve the original JSON schema while using the SDK 9 filesystem API.
++#include "beatsaber-hook/shared/rapidjson.hpp"
++#include "safe-save.hpp"
++#include "beatsaber-hook/shared/rapidjson/include/rapidjson/stringbuffer.h"
++#include <filesystem>
++#include <fstream>
++#include <string>
++
++namespace AirbudsSearch {
++class Configuration {
++    std::string path;
++    bool writable = true;
++public:
++    rapidjson::Document config;
++    explicit Configuration(std::string filePath) : path(std::move(filePath)) { config.SetObject(); }
++    void Load() {
++        std::error_code error;
++        const auto status = std::filesystem::symlink_status(path, error);
++        if (error && error != std::errc::no_such_file_or_directory) { writable = false; return; }
++        if (status.type() == std::filesystem::file_type::not_found) return;
++        if (error || !std::filesystem::is_regular_file(status)) { writable = false; return; }
++        auto size = std::filesystem::file_size(path, error);
++        if (error || size > 2*1024*1024) { writable = false; return; }
++        std::ifstream input(path, std::ios::binary);
++        std::string contents(static_cast<size_t>(size), '\0');
++        input.read(contents.data(),contents.size());
++        if (!input) { writable = false; return; }
++        rapidjson::Document parsed;
++        parsed.Parse(contents.data(), contents.size());
++        if (parsed.HasParseError() || !parsed.IsObject()) { writable = false; return; }
++        config.Swap(parsed);
++    }
++    void Write() {
++        if (!writable || !config.IsObject()) return;
++        // Write a private unique file, then use the already tested atomic save
++        // boundary. Failure preserves the previous settings and refresh token.
++        std::lock_guard<std::recursive_mutex> lock(sc2_save::mutex);
++        rapidjson::StringBuffer buffer;
++        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
++        if (!config.Accept(writer) || buffer.GetSize() > 2*1024*1024) return;
++        static std::atomic<unsigned long long> sequence{0};
++        std::filesystem::path temporary;
++        int fd = -1;
++        try {
++            std::filesystem::create_directories(std::filesystem::path(path).parent_path());
++            for (unsigned attempt = 0; attempt < 128; ++attempt) {
++                auto candidate = path + ".sc2-" + std::to_string(getpid()) + "-" + std::to_string(sequence.fetch_add(1));
++                fd = open(candidate.c_str(), O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0600);
++                if (fd >= 0) { temporary = candidate; break; }
++                if (errno != EEXIST) return;
++            }
++            if (fd < 0) return;
++            size_t copied = 0;
++            while (copied < buffer.GetSize()) {
++                auto count = write(fd, buffer.GetString()+copied, buffer.GetSize()-copied);
++                if (count < 0 && errno == EINTR) continue;
++                if (count <= 0) throw std::runtime_error("settings write failed");
++                copied += count;
++            }
++            if (fsync(fd)) throw std::runtime_error("settings sync failed");
++            auto result = close(fd); fd = -1;
++            if (result) throw std::runtime_error("settings close failed");
++            sc2_save::atomic_copy(temporary,path);
++        } catch (...) { if (fd >= 0) close(fd); }
++        if (!temporary.empty()) { std::error_code ignored; std::filesystem::remove(temporary,ignored); }
++    }
++};
++}
+--- a/include/UI/FlowCoordinators/AirbudsSearchFlowCoordinator.hpp
++++ b/include/UI/FlowCoordinators/AirbudsSearchFlowCoordinator.hpp
+@@ -2,7 +2,7 @@
+ 
+ #include "HMUI/FlowCoordinator.hpp"
+ #include "HMUI/ViewController.hpp"
+-#include "beatsaber-hook/shared/utils/il2cpp-utils.hpp"
++#include "beatsaber-hook/shared/utils.hpp"
+ #include "custom-types/shared/macros.hpp"
+ 
+ #include "UI/ViewControllers/DownloadHistoryViewController.hpp"
+--- a/include/Utils.hpp
++++ b/include/Utils.hpp
+@@ -11,7 +11,7 @@
+ 
+ std::string toLowerCase(const std::string& text);
+ 
+-void getCoverImageSprite(const std::string& songHash, std::function<void(const UnityW<UnityEngine::Sprite> sprite)> onLoadComplete);
++void getCoverImageSprite(const std::string& songHash, std::function<void(UnityW<UnityEngine::Sprite> sprite)> onLoadComplete);
+ 
+ std::string getCoverImageFilePath(const SongCore::SongLoader::CustomBeatmapLevel& beatmap);
+ 
+@@ -19,7 +19,7 @@
+ 
+ std::string toLowerCase(std::string_view text);
+ 
+-void getImageAsSprite(std::string url, std::function<void(const UnityW<UnityEngine::Sprite> sprite)> onLoadComplete);
++void getImageAsSprite(std::string url, std::function<void(UnityW<UnityEngine::Sprite> sprite)> onLoadComplete);
+ 
+ custom_types::Helpers::Coroutine getAudioClipFromUrl(const std::string_view url, std::function<void(UnityW<UnityEngine::AudioClip> audioClip)> onLoadComplete);
+ 
+@@ -58,6 +58,7 @@
+ 
+ }// namespace AirbudsSearch::Utils
+ 
++#if SC2_DIAGNOSTICS
+ namespace AirbudsSearch::Debug {
+ 
+ void dumpViewHierarchy(UnityW<UnityEngine::Transform> transform, int depth = 0);
+@@ -65,3 +66,5 @@
+ void dumpAllSprites();
+ 
+ }// namespace AirbudsSearch::Debug
++
++#endif
+--- a/include/main.hpp
++++ b/include/main.hpp
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
++#if !defined(SC2_DIAGNOSTICS) || SC2_DIAGNOSTICS
+ #define CT_DEBUG
++#endif
+ 
+ // Include the modloader header, which allows us to tell the modloader which mod
+ // this is, and the version etc.
+@@ -9,10 +11,11 @@
+ // beatsaber-hook is a modding framework that lets us call functions and fetch
+ // field values from in the game It also allows creating objects, configuration,
+ // and importantly, hooking methods to modify their values
+-#include "beatsaber-hook/shared/config/config-utils.hpp"
+-#include "beatsaber-hook/shared/utils/hooking.hpp"
+-#include "beatsaber-hook/shared/utils/il2cpp-functions.hpp"
+-#include "beatsaber-hook/shared/utils/logging.hpp"
++#include "ConfigurationStore.hpp"
++#include "beatsaber-hook/shared/hooking.hpp"
++#include "beatsaber-hook/shared/api.hpp"
++#include "beatsaber-hook/shared/safeptr.hpp"
++#include "paper2_scotland2/shared/logger.hpp"
+ 
+ #include "_config.hpp"
+ 
+@@ -25,7 +28,7 @@
+ 
+ inline std::shared_ptr<airbuds::Client> airbudsClient;
+ 
+-inline SafePtrUnity<AirbudsSearch::UI::FlowCoordinators::AirbudsSearchFlowCoordinator> airbudsSearchFlowCoordinator_;
++inline safe_ptr<AirbudsSearch::UI::FlowCoordinators::AirbudsSearchFlowCoordinator*, true> airbudsSearchFlowCoordinator_;
+ 
+ void openAirbudsSearchFlowCoordinator();
+ 
+--- a/src/Airbuds/AirbudsClient.cpp
++++ b/src/Airbuds/AirbudsClient.cpp
+@@ -8,7 +8,7 @@
+ #include <sstream>
+ #include <unordered_map>
+ #include <unordered_set>
+-#include <openssl/evp.h>
++#include "search-port-support.hpp"
+ 
+ #include <web-utils/shared/WebUtils.hpp>
+ 
+@@ -38,6 +38,7 @@
+     size_t totalBytes = 0;
+ 
+     bool AcceptData(std::span<uint8_t const> data) override {
++        if (data.size() > (8u << 20) - totalBytes) return false;
+         totalBytes += data.size();
+         if (!responseData) {
+             responseData = std::string();
+@@ -564,7 +565,7 @@
+         std::string(url),
+         WebUtils::URLOptions::QueryMap{},
+         headers,
+-        false,
++        true,
+         "",
+         std::string(userAgent),
+         10);
+@@ -638,32 +639,7 @@
+ }
+ 
+ std::string base64UrlDecode(std::string_view input) {
+-    std::string b64(input);
+-    std::replace(b64.begin(), b64.end(), '-', '+');
+-    std::replace(b64.begin(), b64.end(), '_', '/');
+-    while (b64.size() % 4 != 0) {
+-        b64.push_back('=');
+-    }
+-
+-    std::string output;
+-    output.resize((b64.size() * 3) / 4);
+-    const int decodedLen = EVP_DecodeBlock(
+-        reinterpret_cast<unsigned char*>(output.data()),
+-        reinterpret_cast<const unsigned char*>(b64.data()),
+-        static_cast<int>(b64.size()));
+-    if (decodedLen < 0) {
+-        return "";
+-    }
+-
+-    size_t padding = 0;
+-    if (!b64.empty() && b64[b64.size() - 1] == '=') {
+-        padding++;
+-    }
+-    if (b64.size() >= 2 && b64[b64.size() - 2] == '=') {
+-        padding++;
+-    }
+-    output.resize(decodedLen - padding);
+-    return output;
++    return sc2_search::base64_url_decode(input);
+ }
+ 
+ std::string getJwtClaim(std::string_view token, std::string_view claim) {
+--- a/src/Configuration.cpp
++++ b/src/Configuration.cpp
+@@ -6,12 +6,12 @@
+ // other config tools such as config-utils don't use this config, so it can be
+ // removed if those are in use
+ Configuration& getConfig() {
+-    static Configuration config(modInfo);
++    static Configuration config(get_config_path(modInfo));
+     return config;
+ }
+ 
+ std::filesystem::path getDataDirectory() {
+-    static const std::string dataDirectoryString = getDataDir(modInfo);
++    static const std::string dataDirectoryString = get_data_dir(modInfo);
+     static const std::filesystem::path dataDirectory {dataDirectoryString};
+     if (!std::filesystem::exists(dataDirectory)) {
+         std::filesystem::create_directories(dataDirectory);
+--- a/src/SpriteCache.cpp
++++ b/src/SpriteCache.cpp
+@@ -15,7 +15,7 @@
+     }
+ 
+     // Even if the sprite itself is valid, the underlying texture might have been destroyed
+-    const UnityW<UnityEngine::Texture2D> texture = sprite->get_texture();
++    UnityW<UnityEngine::Texture2D> texture = sprite->get_texture();
+     if (!texture) {
+         return false;
+     }
+@@ -32,7 +32,7 @@
+     // Check the memory cache
+     auto iterator = memoryCache_.find(hashedKey);
+     if (iterator != memoryCache_.end()) {
+-        const UnityW<UnityEngine::Sprite> sprite = iterator->second;
++        UnityW<UnityEngine::Sprite> sprite = iterator->second;
+         if (isSpriteValid(sprite)) {
+             return sprite;
+         }
+@@ -44,7 +44,7 @@
+     // Check disk cache
+     const std::filesystem::path path = AirbudsSearch::getDataDirectory() / "cache" / hashedKey;
+     if (std::filesystem::exists(path)) {
+-        const UnityW<UnityEngine::Sprite> sprite = BSML::Lite::FileToSprite(path.string());
++        UnityW<UnityEngine::Sprite> sprite = BSML::Lite::FileToSprite(path.string());
+         if (sprite) {
+             memoryCache_[hashedKey] = sprite;
+             return sprite;
+--- a/src/UI/TableViewCells/AirbudsPlaylistTableViewCell.cpp
++++ b/src/UI/TableViewCells/AirbudsPlaylistTableViewCell.cpp
+@@ -10,7 +10,7 @@
+ using namespace AirbudsSearch::UI;
+ 
+ void AirbudsPlaylistTableViewCell::ctor() {
+-    INVOKE_BASE_CTOR(classof(HMUI::TableCell*));
++    INVOKE_BASE_CTOR(i2c::class_of<HMUI::TableCell*>());
+     playlist_ = nullptr;
+ }
+ 
+@@ -42,13 +42,13 @@
+     songCountTextView_->set_text(std::format("{} tracks", playlist_->totalItemCount));
+ 
+     // Loading sprite
+-    const UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getPlaylistPlaceholderSprite();
++    UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getPlaylistPlaceholderSprite();
+     image_->set_sprite(placeholderSprite);
+ 
+     // Load cover image
+     if (!playlist_->imageUrl.empty()) {
+         const std::string playlistId = playlist_->id;
+-        Utils::getImageAsSprite(playlist_->imageUrl, [this, playlistId](const UnityW<UnityEngine::Sprite> sprite) {
++        Utils::getImageAsSprite(playlist_->imageUrl, [this, playlistId](UnityW<UnityEngine::Sprite> sprite) {
+             // Check if the selected song has changed
+             if (!playlist_ || playlist_->id != playlistId) {
+                 AirbudsSearch::Log.warn("Cancelled sprite update");
+--- a/src/UI/TableViewCells/AirbudsTrackHeaderTableViewCell.cpp
++++ b/src/UI/TableViewCells/AirbudsTrackHeaderTableViewCell.cpp
+@@ -7,7 +7,7 @@
+ using namespace AirbudsSearch::UI;
+ 
+ void AirbudsTrackHeaderTableViewCell::ctor() {
+-    INVOKE_BASE_CTOR(classof(HMUI::TableCell*));
++    INVOKE_BASE_CTOR(i2c::class_of<HMUI::TableCell*>());
+ }
+ 
+ void AirbudsTrackHeaderTableViewCell::WasPreparedForReuse() {
+--- a/src/UI/TableViewCells/AirbudsTrackTableViewCell.cpp
++++ b/src/UI/TableViewCells/AirbudsTrackTableViewCell.cpp
+@@ -9,7 +9,7 @@
+ using namespace AirbudsSearch::UI;
+ 
+ void AirbudsTrackTableViewCell::ctor() {
+-    INVOKE_BASE_CTOR(classof(HMUI::TableCell*));
++    INVOKE_BASE_CTOR(i2c::class_of<HMUI::TableCell*>());
+ }
+ 
+ void AirbudsTrackTableViewCell::OnDestroy() {
+@@ -47,13 +47,13 @@
+     trackArtistsTextView_->set_text(stringStream.str());
+ 
+     // Loading sprite
+-    const UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getAlbumPlaceholderSprite();
++    UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getAlbumPlaceholderSprite();
+     image_->set_sprite(placeholderSprite);
+ 
+     // Load cover image
+     if (!track.album.url.empty()) {
+         const std::string trackId = track.id;
+-        Utils::getImageAsSprite(track.album.url, [this, trackId](const UnityW<UnityEngine::Sprite> sprite) {
++        Utils::getImageAsSprite(track.album.url, [this, trackId](UnityW<UnityEngine::Sprite> sprite) {
+             // Check if the selected song has changed
+             if (track_.id != trackId) {
+                 AirbudsSearch::Log.warn("Cancelled sprite update");
+--- a/src/UI/TableViewCells/CustomSongTableViewCell.cpp
++++ b/src/UI/TableViewCells/CustomSongTableViewCell.cpp
+@@ -13,7 +13,7 @@
+ DEFINE_TYPE(AirbudsSearch::UI, CustomSongTableViewCell);
+ 
+ void CustomSongTableViewCell::ctor() {
+-    INVOKE_BASE_CTOR(classof(HMUI::TableCell*));
++    INVOKE_BASE_CTOR(i2c::class_of<HMUI::TableCell*>());
+ }
+ 
+ void CustomSongTableViewCell::OnDestroy() {
+@@ -74,12 +74,12 @@
+     upvoteRatioTextView_->set_text(upvoteRatioText);
+ 
+     // Loading sprite
+-    const UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getAlbumPlaceholderSprite();
++    UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getAlbumPlaceholderSprite();
+     image_->set_sprite(placeholderSprite);
+ 
+     // Load cover image
+     const std::string songHash = song_->hash();
+-    Utils::getCoverImageSprite(songHash, [this, songHash](const UnityW<UnityEngine::Sprite> sprite) {
++    Utils::getCoverImageSprite(songHash, [this, songHash](UnityW<UnityEngine::Sprite> sprite) {
+         // Check if the selected song has changed
+         if (!song_ || song_->hash() != songHash) {
+             AirbudsSearch::Log.warn("Cancelled sprite update");
+--- a/src/UI/TableViewCells/DownloadHistoryTableViewCell.cpp
++++ b/src/UI/TableViewCells/DownloadHistoryTableViewCell.cpp
+@@ -15,7 +15,7 @@
+ DEFINE_TYPE(AirbudsSearch::UI, DownloadHistoryTableViewCell);
+ 
+ void DownloadHistoryTableViewCell::ctor() {
+-    INVOKE_BASE_CTOR(classof(HMUI::TableCell*));
++    INVOKE_BASE_CTOR(i2c::class_of<HMUI::TableCell*>());
+     downloadHistoryItem_ = nullptr;
+     guard_ = std::make_shared<bool>(true);
+ }
+@@ -53,14 +53,14 @@
+     uploaderNameTextView_->set_text(song->uploaderName());
+ 
+     // Loading sprite
+-    const UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getAlbumPlaceholderSprite();
++    UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getAlbumPlaceholderSprite();
+     image_->set_sprite(placeholderSprite);
+ 
+     // Load cover image
+     const std::string songHash = song->hash();
+     const std::weak_ptr<DownloadHistoryItem> weakDownloadHistoryItem = downloadHistoryItem_;
+     std::weak_ptr<bool> weakGuard = guard_;
+-    Utils::getCoverImageSprite(songHash, [this, weakGuard, songHash, weakDownloadHistoryItem](const UnityW<UnityEngine::Sprite> sprite) {
++    Utils::getCoverImageSprite(songHash, [this, weakGuard, songHash, weakDownloadHistoryItem](UnityW<UnityEngine::Sprite> sprite) {
+         if (!weakGuard.lock()) {
+             AirbudsSearch::Log.warn("weakGuard was null!");
+             return;
+--- a/src/UI/TableViewCells/FriendListTableViewCell.cpp
++++ b/src/UI/TableViewCells/FriendListTableViewCell.cpp
+@@ -9,7 +9,7 @@
+ using namespace AirbudsSearch::UI;
+ 
+ void FriendListTableViewCell::ctor() {
+-    INVOKE_BASE_CTOR(classof(HMUI::TableCell*));
++    INVOKE_BASE_CTOR(i2c::class_of<HMUI::TableCell*>());
+ }
+ 
+ void FriendListTableViewCell::OnDestroy() {
+--- a/src/UI/ViewControllers/MainViewController.cpp
++++ b/src/UI/ViewControllers/MainViewController.cpp
+@@ -2090,7 +2090,7 @@
+         previewSongAuthorTextView_->set_text("-");
+ 
+         // Loading sprite
+-        const UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getAlbumPlaceholderSprite();
++        UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getAlbumPlaceholderSprite();
+         previewSongImage_->set_sprite(placeholderSprite);
+ 
+         // Song uploader
+@@ -2126,11 +2126,11 @@
+     previewSongAuthorTextView_->set_text(song->songAuthorName());
+ 
+     // Loading sprite
+-    const UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getAlbumPlaceholderSprite();
++    UnityW<UnityEngine::Sprite> placeholderSprite = Utils::getAlbumPlaceholderSprite();
+     previewSongImage_->set_sprite(placeholderSprite);
+ 
+     // Load cover image
+-    Utils::getCoverImageSprite(songHash, [this, songHash](const UnityW<UnityEngine::Sprite> sprite) {
++    Utils::getCoverImageSprite(songHash, [this, songHash](UnityW<UnityEngine::Sprite> sprite) {
+         // Check if the selected song has changed
+         if (!previewSong_ || previewSong_->hash() != songHash) {
+             AirbudsSearch::Log.warn("Cancelled sprite update");
+@@ -2539,7 +2539,7 @@
+             // Check if the selected song has changed
+             if (!previewSong_ || previewSong_->hash() != songHash) {
+                 AirbudsSearch::Log.warn("Cancelled audio update");
+-                UnityEngine::Object::Destroy(audioClip);
++                UnityEngine::Object::Destroy(UnityW<UnityEngine::AudioClip>(audioClip).ptr());
+                 return;
+             }
+ 
+@@ -2548,7 +2548,7 @@
+                     return;
+                 }
+                 try {
+-                    UnityEngine::Object::Destroy(audioClip);
++                    UnityEngine::Object::Destroy(UnityW<UnityEngine::AudioClip>(audioClip).ptr());
+                 } catch (...) {
+                     AirbudsSearch::Log.error("Error destroying clip");
+                 }
+--- a/src/UI/ViewControllers/SettingsViewController.cpp
++++ b/src/UI/ViewControllers/SettingsViewController.cpp
+@@ -2,7 +2,7 @@
+ 
+ #include "HMUI/CurvedTextMeshPro.hpp"
+ #include "HMUI/Touchable.hpp"
+-#include "beatsaber-hook/shared/utils/il2cpp-utils.hpp"
++#include "beatsaber-hook/shared/utils.hpp"
+ #include "bsml/shared/BSML/Components/ExternalComponents.hpp"
+ #include <bsml/shared/BSML/Components/ButtonIconImage.hpp>
+ #include <UnityEngine/Mesh.hpp>
+@@ -134,8 +134,9 @@
+ }
+ 
+ void SettingsViewController::onPasteRefreshTokenButtonClicked() {
+-    static auto UnityEngine_GUIUtility_get_systemCopyBuffer = il2cpp_utils::resolve_icall<StringW>("UnityEngine.GUIUtility::get_systemCopyBuffer");
+-    const std::string text = UnityEngine_GUIUtility_get_systemCopyBuffer();
++    static auto UnityEngine_GUIUtility_get_systemCopyBuffer = i2c::resolve_icall<StringW>("UnityEngine.GUIUtility::get_systemCopyBuffer");
++    if (!UnityEngine_GUIUtility_get_systemCopyBuffer) { AirbudsSearch::Log.warn("Clipboard is unavailable"); return; }
++    const std::string text = (*UnityEngine_GUIUtility_get_systemCopyBuffer)();
+     refreshTokenTextField_->set_text(text);
+ }
+ 
+--- a/src/Utils.cpp
++++ b/src/Utils.cpp
+@@ -82,9 +82,9 @@
+     return lower;
+ }
+ 
+-void AirbudsSearch::Utils::getImageAsSprite(std::string url, std::function<void(const UnityW<UnityEngine::Sprite> sprite)> onLoadComplete) {
++void AirbudsSearch::Utils::getImageAsSprite(std::string url, std::function<void(UnityW<UnityEngine::Sprite> sprite)> onLoadComplete) {
+     // Check the cache
+-    const UnityW<UnityEngine::Sprite> sprite = SpriteCache::getInstance().get(url);
++    UnityW<UnityEngine::Sprite> sprite = SpriteCache::getInstance().get(url);
+     if (sprite) {
+         onLoadComplete(sprite);
+         return;
+@@ -120,7 +120,7 @@
+ 
+         // Create sprite on the main game thread
+         BSML::MainThreadScheduler::Schedule([data, onLoadComplete, url] {
+-            const UnityW<UnityEngine::Sprite> sprite = BSML::Lite::ArrayToSprite(ArrayW<uint8_t>(*data));
++            UnityW<UnityEngine::Sprite> sprite = BSML::Lite::ArrayToSprite(ArrayW<uint8_t>(*data));
+             if (!sprite) {
+                 AirbudsSearch::Log.error("Failed to create sprite from response data! url = {} data length = {}", url, data->size());
+                 onLoadComplete(nullptr);
+@@ -132,7 +132,7 @@
+     }).detach();
+ }
+ 
+-void AirbudsSearch::Utils::getCoverImageSprite(const std::string& songHash, std::function<void(const UnityW<UnityEngine::Sprite> sprite)> onLoadComplete) {
++void AirbudsSearch::Utils::getCoverImageSprite(const std::string& songHash, std::function<void(UnityW<UnityEngine::Sprite> sprite)> onLoadComplete) {
+     // Check if we have this beatmap loaded locally
+     const SongCore::SongLoader::CustomBeatmapLevel* beatmap = SongCore::API::Loading::GetLevelByHash(songHash);
+     if (!beatmap) {
+@@ -212,7 +212,7 @@
+         co_return;
+     }
+ 
+-    const UnityW<UnityEngine::AudioClip> audioClip = UnityEngine::Networking::DownloadHandlerAudioClip::GetContent(request);
++    UnityW<UnityEngine::AudioClip> audioClip = UnityEngine::Networking::DownloadHandlerAudioClip::GetContent(request);
+     request->Dispose();
+     onLoadComplete(audioClip);
+     co_return;
+@@ -288,7 +288,7 @@
+ 
+         auto soloFreePlayFlowCoordinator = BSML::Helpers::GetDiContainer()->Resolve<SoloFreePlayFlowCoordinator*>();
+         soloFreePlayFlowCoordinator->Setup(state);
+-        SafePtrUnity<UnityEngine::GameObject> songSelectButton = UnityEngine::GameObject::Find("SoloButton").unsafePtr();
++        safe_ptr<UnityEngine::GameObject*, true> songSelectButton = UnityEngine::GameObject::Find("SoloButton").unsafe_ptr();
+         if (!songSelectButton) {
+             songSelectButton = UnityEngine::GameObject::Find("Wrapper/BeatmapWithModifiers/BeatmapSelection/EditButton");
+         }
+@@ -305,6 +305,7 @@
+ #include "System/Type.hpp"
+ #include "UnityEngine/Object.hpp"
+ 
++#if SC2_DIAGNOSTICS
+ namespace AirbudsSearch::Debug {
+ 
+ void dumpViewHierarchy(UnityW<UnityEngine::Transform> root, int depth) {
+@@ -327,7 +328,7 @@
+ 
+     // Print attached components
+     auto comps = go->GetComponents<UnityEngine::Component*>();
+-    for (int i = 0; i < comps->get_Length(); i++) {
++    for (int i = 0; i < ArrayW<UnityEngine::Component*>(comps).size(); i++) {
+         auto comp = comps->_values[i];
+         if (!comp) continue;
+         auto type = comp->GetType();
+@@ -338,13 +339,13 @@
+             std::string(type->get_FullName()),
+             static_cast<void*>(comp));
+ 
+-        if (auto behavior = il2cpp_utils::try_cast<UnityEngine::Behaviour>(comp)) {
+-            line.append(std::format(" (enabled = {})", (*behavior)->get_enabled()));
++        if (auto behavior = i2c::try_cast<UnityEngine::Behaviour*>(comp)) {
++            line.append(std::format(" (enabled = {})", behavior->get_enabled()));
+         }
+-        if (auto canvasGroup = il2cpp_utils::try_cast<UnityEngine::CanvasGroup>(comp)) {
++        if (auto canvasGroup = i2c::try_cast<UnityEngine::CanvasGroup*>(comp)) {
+             line.append(std::format(
+                 " (alpha = {})",
+-                (*canvasGroup)->get_alpha()
++                canvasGroup->get_alpha()
+             ));
+         }
+ 
+@@ -359,13 +360,14 @@
+ 
+ void dumpAllSprites() {
+     auto sprites = UnityEngine::Resources::FindObjectsOfTypeAll<UnityEngine::Sprite*>();
+-    AirbudsSearch::Log.info("SPRITE LEN: {}", sprites->get_Length());
+-    for (int i = 0; i < sprites->get_Length(); i++) {
++    AirbudsSearch::Log.info("SPRITE LEN: {}", ArrayW<UnityEngine::Sprite*>(sprites).size());
++    for (int i = 0; i < ArrayW<UnityEngine::Sprite*>(sprites).size(); i++) {
+         auto s = sprites->_values[i];
+-        if (s && !s->get_name()->IsNullOrEmpty(s->get_name())) {
++        if (s && !std::string(s->get_name()).empty()) {
+             AirbudsSearch::Log.info("SPRITE NAME: {}", s->get_name());
+         }
+     }
+ }
+ 
+-}// namespace AirbudsSearch::Debug
+\ No newline at end of file
++}// namespace AirbudsSearch::Debug
++#endif
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -36,26 +36,8 @@
+ 
+     AirbudsSearch::Log.info("Version: {}", info->version);
+ 
+-    // Capture fatal logs from logcat to get crash stacks
+-    std::thread([]() {
+-        AirbudsSearch::Log.info("Logcat thread started");
++    // visionOS has no Android logcat process. Use the existing app log.
+ 
+-        const char* command = "logcat *:F";
+-
+-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(command, "r"), pclose);
+-        if (!pipe) {
+-            AirbudsSearch::Log.info("Logcat thread failed!");
+-            return;
+-        }
+-
+-        char buffer[512];
+-        while (fgets(buffer, sizeof(buffer), pipe.get()) != nullptr) {
+-            const std::string line(buffer);
+-            AirbudsSearch::Log.info("[LOGCAT] {}", line);
+-        }
+-        AirbudsSearch::Log.info("Logcat thread stopped!");
+-    }).detach();
+-
+     if (!getConfig().config.HasMember("filter")) {
+         rapidjson::Value filterJson;
+         filterJson.SetObject();
+@@ -119,7 +101,7 @@
+     // Return to the Airbuds Search flow coordinator
+     if (AirbudsSearch::returnToAirbudsSearch) {
+         auto currentFlowCoordinator = BSML::Helpers::GetMainFlowCoordinator()->YoungestChildFlowCoordinatorOrSelf();
+-        UnityW<AirbudsSearch::UI::FlowCoordinators::AirbudsSearchFlowCoordinator> airbudsSearchFlowCoordinator = UnityEngine::Resources::FindObjectsOfTypeAll<AirbudsSearch::UI::FlowCoordinators::AirbudsSearchFlowCoordinator*>()->FirstOrDefault();
++        UnityW<AirbudsSearch::UI::FlowCoordinators::AirbudsSearchFlowCoordinator> airbudsSearchFlowCoordinator = UnityEngine::Resources::FindObjectsOfTypeAll<AirbudsSearch::UI::FlowCoordinators::AirbudsSearchFlowCoordinator*>().front_or_default();
+         if (airbudsSearchFlowCoordinator) {
+             currentFlowCoordinator->PresentFlowCoordinator(airbudsSearchFlowCoordinator, nullptr, HMUI::ViewController::AnimationDirection::Horizontal, true, false);
+         }
+@@ -141,7 +123,7 @@
+ 
+ // Called later on in the game loading - a good time to install function hooks
+ MOD_EXTERN_FUNC void late_load() noexcept {
+-    il2cpp_functions::Init();
++    i2c::functions::initialize();
+ 
+     // make sure this is after il2cpp_functions::Init()
+     BSML::Init();

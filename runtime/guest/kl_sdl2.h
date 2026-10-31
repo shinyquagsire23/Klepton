@@ -21,6 +21,12 @@ int         kl_sdl2_load(FILE *out);     // map the graph (kl_native) + libSDL2 
 unsigned    kl_sdl2_gap(FILE *out);      // unresolved imports across the graph
 int         kl_sdl2_begin(FILE *out);    // setupJNI + surface + spawn the SDL main thread
 double      kl_sdl2_pump(double seconds, const volatile int *quit);
+// Ask the guest to quit the way Android does when the activity is destroyed:
+// SDLActivity.nativeSendQuit posts SDL_QUIT, the guest's own loop takes it and
+// shuts down in order — which is where an engine writes its configuration.
+// Returns 1 if the request was delivered.
+int         kl_sdl2_send_quit(void);
+int         kl_sdl2_main_returned(void);   // the guest's main is through
 void        kl_sdl2_report(FILE *out);
 
 #endif

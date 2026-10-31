@@ -1,0 +1,9 @@
+{
+  "name": "beatsaverplusplus",
+  "repository": "bsq-ports/BeatSaverPlusPlus",
+  "tag": "v0.2.1",
+  "commit": "d3efd36abb82bcbbef62f1c2b09b411cde547936",
+  "archive": "beatsaverplusplus-d3efd36.tar.gz",
+  "sha256": "df2041d6df4ce203a206f321799131a8e4811ee9de1aadfa53e2271985d6e8de",
+  "scope": "Exact original released source downloaded for port work; not built or tested."
+}

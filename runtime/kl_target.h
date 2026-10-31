@@ -60,6 +60,13 @@ typedef enum {
     // handle threaded through onStart/onResume/onSurface*. Half-Life on Xash3D
     // (hl1, com.drbeef.lambda1vr) is here; kl_jkxr keeps JKXR's own data layout.
     KL_GUEST_GLES3JNI,
+    // A whole Linux (glibc) process — kl_linuxproc's door. No Android in it at
+    // all: the program is started as a kernel would start it, with the Steam
+    // Runtime's ld.so doing the loading and Linux emulated at the system-call
+    // boundary (runtime/linux/). Half-Life: Alyx (Valve's Linux ARM64 build) is
+    // here. `libdir`, `apk` and `assets` mean nothing to it; its files are the
+    // staged tree kl_linuxproc.h describes.
+    KL_GUEST_LINUX,
 } kl_guest_kind;
 
 typedef struct {

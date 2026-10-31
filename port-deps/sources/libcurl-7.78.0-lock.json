@@ -1,0 +1,11 @@
+{
+  "repository": "darknight1050/openssl-curl-android",
+  "version": "7.78.0",
+  "headerCommit": "a079bdcdf8b4ecd4a44baa32fbd7efa96a5e6641",
+  "headerArchive": "libcurl-a079bdc.tar.gz",
+  "headerArchiveSha256": "d42a5950b241de26d9bdeaa27562c1dc29097425ec1db37ab432d02aa61db514",
+  "binary": "libcurl-7.78.0.a",
+  "binarySha256": "4c19c42982f5c512337ddb9f2e035fee256b9de3e5f0269877a0e1ef1ae24102",
+  "binaryBytes": 6187998,
+  "binaryUrl": "https://github.com/darknight1050/openssl-curl-android/releases/download/v7.78.0/libcurl.a"
+}

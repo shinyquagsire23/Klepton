@@ -1,0 +1,53 @@
+--- a/src/UI/ViewControllers/SongList.cpp
++++ b/src/UI/ViewControllers/SongList.cpp
+@@ -15,7 +15,7 @@
+ #include "bsml/shared/Helpers/getters.hpp"
+ #include "bsml/shared/Helpers/utilities.hpp"
+ #include "DataHolder.hpp"
+-#include "fmt/fmt/include/fmt/core.h"
++#include <fmt/core.h>
+ #include "GlobalNamespace/LevelCollectionNavigationController.hpp"
+ #include "GlobalNamespace/LevelCollectionTableView.hpp"
+ #include "GlobalNamespace/LevelCollectionViewController.hpp"
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -52,6 +52,7 @@
+     }).detach();
+ }
+ 
++SC2_RECORD_SEARCH_HOOK(ReturnToBSS, &HMUI::FlowCoordinator::DismissFlowCoordinator)
+ MAKE_HOOK_MATCH(
+     ReturnToBSS,
+     &HMUI::FlowCoordinator::DismissFlowCoordinator,
+@@ -86,6 +87,7 @@
+ };
+ 
+ // Soft restart in settings
++SC2_RECORD_SEARCH_HOOK(MenuTransitionsHelper_RestartGame, &GlobalNamespace::MenuTransitionsHelper::RestartGame)
+ MAKE_HOOK_MATCH(
+     MenuTransitionsHelper_RestartGame,
+     &GlobalNamespace::MenuTransitionsHelper::RestartGame,
+@@ -99,6 +101,7 @@
+     MenuTransitionsHelper_RestartGame(self, finishCallback);
+ }
+ 
++SC2_RECORD_SEARCH_HOOK(GameplaySetupViewController_RefreshContent, &GlobalNamespace::GameplaySetupViewController::RefreshContent)
+ MAKE_HOOK_MATCH(
+     GameplaySetupViewController_RefreshContent,
+     &GlobalNamespace::GameplaySetupViewController::RefreshContent,
+@@ -161,6 +164,7 @@
+     button->set_active(multiplayer);
+ }
+ 
++SC2_RECORD_SEARCH_HOOK(LevelFilteringNavigationController_Setup, &GlobalNamespace::LevelFilteringNavigationController::Setup)
+ MAKE_HOOK_MATCH(
+     LevelFilteringNavigationController_Setup,
+     &GlobalNamespace::LevelFilteringNavigationController::Setup,
+@@ -183,6 +187,7 @@
+     }
+ }
+ 
++SC2_RECORD_SEARCH_HOOK(MultiplayerLevelScenesTransitionSetupDataSO_Init, &GlobalNamespace::MultiplayerLevelScenesTransitionSetupDataSO::Init)
+ MAKE_HOOK_MATCH(
+     MultiplayerLevelScenesTransitionSetupDataSO_Init,
+     &GlobalNamespace::MultiplayerLevelScenesTransitionSetupDataSO::Init,

@@ -38,3 +38,25 @@
 // where it reads the fence value. The eye TEXTURE still arrives through
 // kl_glfb's own table, so nothing else about this seam widens.
 #import "kl_vulkan.h"
+// ...and by one for the panel that shows how the game runs (KL_STATS_CARD):
+// the compositor counts what it presents into it and reads back a sample a
+// second.
+#import "kl_metrics.h"
+// ...and by one for the play area (KleptonRoom*.swift): the room scan's grid,
+// the suggested and drawn areas, the distance to their edge the virtual wall is
+// drawn from, and finding a room measured before.
+#import "kl_room.h"
+// One call, declared here rather than importing kl_mediandk.h: that header is
+// the guest-facing media table and wants <stdio.h> and CoreVideo context the
+// Swift side has no other use for.
+void kl_mediandk_set_video_default(int on);
+// ...and two from the Oculus Platform stand-in (kl_ovrplat.c), for the start
+// window's "Player name": is this a game that is handed the offline user, and
+// is it one whose user gets an id of this installation's own.
+int kl_ovrplat_offline_user_for(const char *target);
+int kl_ovrplat_user_id_per_install(const char *target);
+// ...and Surreal Interactive's controller API (KleptonSurrealSDK.swift), which
+// is linked only into a Surreal build that has their framework; see kl_surreal_sdk.h.
+#import "kl_surreal_sdk.h"
+
+#import "kl_mprobe.h"

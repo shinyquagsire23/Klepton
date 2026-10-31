@@ -32,6 +32,12 @@
 #include "kl_x18.h"
 #include "kl_env.h"
 
+// Which guest ABI the decoder serves (kl_x18.h). A plain global: it is set once,
+// before the first decode, and every pass over an image has to agree on it.
+static int g_abi = KLX_ABI_ANDROID;
+void kl_x18_set_abi(int abi) { g_abi = abi; }
+int  kl_x18_abi(void)        { return g_abi; }
+
 static void addfld(klx_info *o, uint32_t w, uint8_t shift, uint8_t role) {
     unsigned r = (w >> shift) & 31;
     if (r == 31) return;                      // XZR / SP
@@ -106,7 +112,12 @@ static int dp_imm(uint32_t w, klx_info *o) {
 static int branch_sys(uint32_t w, klx_info *o) {
     if (((w >> 26) & 0x1f) == 0x05) return 1;  // b / bl — [4:0] is part of imm26
     if (((w >> 25) & 0x7f) == 0x2a) return 1;  // b.cond
-    if (((w >> 24) & 0xff) == 0xd4) return 1;  // svc / brk / hlt
+    if (((w >> 24) & 0xff) == 0xd4) {          // svc / brk / hlt
+        // `svc #0` and nothing else: it is the only immediate a Linux toolchain
+        // emits, and a different one is more likely a constant than a syscall.
+        if (g_abi == KLX_ABI_LINUX && w == 0xD4000001u) o->sysreg = KLX_SYS_SVC;
+        return 1;
+    }
     if (((w >> 22) & 0x3ff) == 0x354) {        // system: mrs / msr / hints / barriers
         // `mrs Xt, CTR_EL0` is S3_3_C0_C0_1, i.e. 0xD53B0020 | Rt, and
         // reading it from EL0 is an ILLEGAL INSTRUCTION on Darwin — measured on
@@ -114,6 +125,13 @@ static int branch_sys(uint32_t w, klx_info *o) {
         // because the veneer answers it; note the flag is orthogonal to the x18
         // fields, so `mrs x18, CTR_EL0` is both and the emitter serves both.
         if ((w & 0xFFFFFFE0u) == 0xD53B0020u) o->sysreg = KLX_SYS_CTR_EL0;
+        // TPIDR_EL0 is S3_3_C13_C0_2. Under the Linux ABI the guest's thread
+        // pointer is not a register at all (see kl_x18.h), so both directions
+        // are sites. Like CTR_EL0 the flag is orthogonal to the x18 field.
+        if (g_abi == KLX_ABI_LINUX) {
+            if ((w & 0xFFFFFFE0u) == 0xD53BD040u) o->sysreg = KLX_SYS_TP_READ;
+            if ((w & 0xFFFFFFE0u) == 0xD51BD040u) o->sysreg = KLX_SYS_TP_WRITE;
+        }
         // Hints and barriers encode Rt as 31, so they fall out via addfld.
         addfld(o, w, KLX_RD, ((w >> 21) & 1) ? KLX_W : KLX_R);
         return 1;
@@ -160,6 +178,27 @@ static int ldst(uint32_t w, klx_info *o) {
     // Load/store exclusive
     if ((w & 0x3F000000) == 0x08000000) {
         unsigned L = (w >> 22) & 1, o2 = (w >> 23) & 1;
+        // Compare-and-swap lives in this group too (o1 set, Rt2 all ones) and
+        // shares none of the roles below: Rs is the expected value AND receives
+        // what was in memory, Rt is only read, whatever L says — there it is the
+        // acquire bit. Treating it as an exclusive load made Rt write-only, so a
+        // veneer never loaded the shadow slot, and missed Rs altogether.
+        if (((w >> 21) & 1) && ((w >> 10) & 31) == 31) {
+            addfld(o, w, KLX_RN, KLX_R);
+            addfld(o, w, KLX_RM, KLX_R | KLX_W);
+            addfld(o, w, KLX_RD, KLX_R);
+            if (!o2) {
+                // CASP: bit 31 clear, and each field is a pair (see KLX_HZ_PAIR).
+                // The implied second registers are operands like any other, so a
+                // veneer must not pick them as scratch.
+                if (w >> 31) return 0;
+                unsigned rs = (w >> 16) & 31, rt = w & 31;
+                if ((rs | rt) & 1) return 0;                // unallocated
+                o->gp_used |= (1u << (rs + 1)) | (1u << (rt + 1));
+                o->hazard = KLX_HZ_PAIR;
+            }
+            return 1;
+        }
         addfld(o, w, KLX_RN, KLX_R);
         addfld(o, w, KLX_RD, L ? KLX_W : KLX_R);
         addfld(o, w, KLX_RA, L ? KLX_W : KLX_R);            // Rt2, pair forms
@@ -369,6 +408,7 @@ uint32_t klx_substitute(uint32_t w, const klx_info *info, unsigned reg) {
 // The slot is a compile-time constant now (see kl_x18.h for why, and for the
 // measurement behind the number). g_slot only records that it has been checked.
 static int g_slot = -1;
+static int g_lx_slots;      // KLX_TP_SLOT and KLX_SVC_SLOT are ours too
 static struct { uint32_t word; unsigned n; } g_refused[REFUSE_KINDS];
 static unsigned g_nrefused_kinds, g_refused_total;
 
@@ -430,6 +470,20 @@ int kl_x18_init(void) {
         if ((unsigned)k > KLX_TSD_SLOT) { spare[nspare++] = k; break; }
         spare[nspare++] = k;
     }
+    // The Linux ABI's two slots, while everything below them is still held: the
+    // next two keys issued are 501 and 502 or they are already someone else's.
+    // Not fatal here — an Android guest never looks at them — but recorded, and
+    // kl_x18_init_linux() is what a Linux-ABI load asks.
+    if (got) {
+        pthread_key_t k1 = 0, k2 = 0;
+        int r1 = pthread_key_create(&k1, NULL), r2 = pthread_key_create(&k2, NULL);
+        if (!r1 && !r2 && k1 == KLX_TP_SLOT && k2 == KLX_SVC_SLOT) {
+            g_lx_slots = 1;
+        } else {
+            if (!r1) pthread_key_delete(k1);
+            if (!r2) pthread_key_delete(k2);
+        }
+    }
     for (unsigned i = 0; i < nspare; i++) pthread_key_delete(spare[i]);
     if (!got) {
         // WHICH keys it was offered, because "something else holds it" has two
@@ -457,6 +511,30 @@ int kl_x18_init(void) {
     pthread_setspecific(KLX_TSD_SLOT, NULL);
 
     g_slot = KLX_TSD_SLOT;
+    return 0;
+}
+
+int kl_x18_init_linux(void) {
+    if (kl_x18_init() != 0) return -1;
+    if (!g_lx_slots) {
+        fprintf(stderr, "  [klepton] linux abi: TSD keys %d/%d could not be claimed "
+                        "next to %d — something else holds them in this process\n",
+                KLX_TP_SLOT, KLX_SVC_SLOT, KLX_TSD_SLOT);
+        return -1;
+    }
+    // Same proof as for the x18 slot, and for the same reason: the veneers read
+    // these inline.
+    uint64_t tp;
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+    void *was = pthread_getspecific(KLX_TP_SLOT);
+    pthread_setspecific(KLX_TP_SLOT, (void *)(uintptr_t)0x5A5A5A5AU);
+    int ok = ((void **)(uintptr_t)tp)[KLX_TP_SLOT] == (void *)(uintptr_t)0x5A5A5A5AU;
+    pthread_setspecific(KLX_TP_SLOT, was);
+    if (!ok) {
+        fprintf(stderr, "  [klepton] linux abi: TSD key %d is not at tsd[%d] on this OS\n",
+                KLX_TP_SLOT, KLX_TP_SLOT);
+        return -1;
+    }
     return 0;
 }
 
@@ -516,13 +594,58 @@ static int klx_unallocated(uint32_t w) {
 // `i` is a word index into `w`; the window is clamped to the chunk, which is a
 // whole executable section minus its known data ranges, so clamping only ever
 // bites at a section edge.
+//
+// ...and, for ONE target, one adjacent pair is not a table either. Robo
+// Recall: Unplugged (x1906871599408213, UE 4.21) keeps two-entry literal pools
+// in .text right after a function's last branch — GCC, the NDK that built its
+// PhysX — and two floats or two words of a byte table there read as two
+// "unallocated" words to this test: 0x42c80000 0x42c80000 (100.0f twice),
+// 0x05040706 0x01000302, 0x40ea0ea1 0x447fe000, all measured in its libUE4.so.
+// Six real x18 sites sat within 16 words of such a pair and were left raw:
+// `ldr x18, [x0]` at the top of Gu::SweepGeomGeom<CapsuleV, CapsuleV> wrote the
+// REAL x18 while the two reads after it, outside the window, read the shadow
+// slot — a stale value, a fault at 0x10 in a capsule sweep a minute into play
+// (community fix 40, 2026-10-14; the owner confirmed the fix on a headset).
+//
+// It is NOT safe as a general rule, which is why it is scoped. Measured over
+// the 557 distinct guest libraries on this machine, a lone adjacent pair flips
+// 18 refused words to "code": 15 are real sites of the same pool shape (Tales
+// from the Galaxy's Edge's PhysX, Tetris Effect, Wwise, Resonance Audio), but
+// three are one word of BoringSSL's P-256 table — Beat Saber 1.40's
+// libcrypto.so+0x17e800, libEOSSDK.so+0x12c3800, libUnreal.so+0x88c2800 — whose
+// ±16-word window holds exactly one adjacent pair. Patching that word is the
+// `bad_record_mac` failure this test exists to prevent. So the pair rule is on
+// only where it was verified: when KLEPTON_TARGET names that target — AVP Play
+// and visionos/run.sh export it to the build, so klepton-ld's translation sees
+// it; build_run_host.sh does not, so a host run says KL_X18_PAIR_POOL=1 — or
+// when KL_X18_PAIR_POOL=1 says so; KL_X18_PAIR_POOL=0 turns it off there too.
+// Every other target keeps the window test exactly as it was.
+static int klx_pair_pool_on(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *t = kl_env_str("KLEPTON_TARGET", NULL);
+        cached = kl_env_on("KL_X18_PAIR_POOL", t && strcmp(t, "x1906871599408213") == 0);
+    }
+    return cached;
+}
+
 static int klx_looks_like_data(const uint32_t *w, size_t n, size_t i) {
     size_t lo = i > KLX_WIN_HALF ? i - KLX_WIN_HALF : 0;
     size_t hi = i + KLX_WIN_HALF + 1 < n ? i + KLX_WIN_HALF + 1 : n;
     unsigned bad = 0;
+    if (!klx_pair_pool_on()) {
+        for (size_t k = lo; k < hi; k++)
+            if (klx_unallocated(w[k]) && ++bad >= KLX_WIN_LIMIT) return 1;
+        return 0;
+    }
+    // Counted over the whole window rather than stopping at the limit, so the
+    // pair can be told apart.
+    size_t first = 0, last = 0;
     for (size_t k = lo; k < hi; k++)
-        if (klx_unallocated(w[k]) && ++bad >= KLX_WIN_LIMIT) return 1;
-    return 0;
+        if (klx_unallocated(w[k])) { if (!bad) first = k; last = k; bad++; }
+    if (bad < KLX_WIN_LIMIT) return 0;
+    if (bad == 2 && last == first + 1) return 0;   // a two-entry literal pool
+    return 1;
 }
 
 // Exposed so the offline tool reports the same verdict the loader acts on —
@@ -541,27 +664,34 @@ int kl_x18_is_data(const void *code, size_t size, size_t index) {
 // move a number that is meant to be stable. The data-word test applies to both,
 // for the same reason — 0xd53b0029 is a perfectly ordinary word to find in a
 // constant table.
+//
+// `tp` and `svc` are the Linux ABI's populations (always zero for an Android
+// image, whose decoder never flags them), apart again for the same reason.
 static unsigned klx_survey(const void *code, size_t size, unsigned *data,
-                           unsigned *ctr) {
+                           unsigned *ctr, unsigned *tp, unsigned *svc) {
     const uint32_t *w = (const uint32_t *)code;
     size_t n = size / 4;
     unsigned c = 0;
     if (data) *data = 0;
     if (ctr) *ctr = 0;
+    if (tp)  *tp = 0;
+    if (svc) *svc = 0;
     for (size_t i = 0; i < n; i++) {
         klx_info in;
         klx_decode(w[i], &in);
         if (!in.nfields && !in.sysreg) continue;
         if (klx_looks_like_data(w, n, i)) { if (data && in.nfields) (*data)++; continue; }
         if (in.nfields) c++;
-        if (in.sysreg && ctr) (*ctr)++;
+        if (in.sysreg == KLX_SYS_CTR_EL0 && ctr) (*ctr)++;
+        if ((in.sysreg == KLX_SYS_TP_READ || in.sysreg == KLX_SYS_TP_WRITE) && tp) (*tp)++;
+        if (in.sysreg == KLX_SYS_SVC && svc) (*svc)++;
     }
     return c;
 }
 
 unsigned kl_x18_count(const void *code, size_t size) {
-    unsigned ctr = 0;
-    return klx_survey(code, size, NULL, &ctr) + ctr;
+    unsigned ctr = 0, tp = 0, svc = 0;
+    return klx_survey(code, size, NULL, &ctr, &tp, &svc) + ctr + tp + svc;
 }
 
 // `br x18` alone. Same data-word test as the survey, for the same reason:
@@ -590,6 +720,33 @@ static uint32_t enc_str(unsigned t, unsigned n, unsigned off) {
     return 0xF9000000u | ((off / 8) << 10) | (n << 5) | t;
 }
 static uint32_t enc_mrs_tpidrro(unsigned t) { return 0xD53BD060u | t; }
+static uint32_t enc_push(unsigned t, unsigned t2) {           // stp xT, xT2, [sp, #-16]!
+    return 0xA9BF0000u | (t2 << 10) | (31u << 5) | t;
+}
+static uint32_t enc_pop(unsigned t, unsigned t2) {            // ldp xT, xT2, [sp], #16
+    return 0xA8C10000u | (t2 << 10) | (31u << 5) | t;
+}
+static uint32_t enc_blr(unsigned n) { return 0xD63F0000u | (n << 5); }
+static uint32_t enc_mov(unsigned d, unsigned m) {             // mov xD, xM
+    return 0xAA0003E0u | (m << 16) | d;
+}
+static int enc_bl(uint64_t from, uint64_t to, uint32_t *out) {
+    int64_t d = (int64_t)to - (int64_t)from;
+    if ((d & 3) || d < -(1LL << 27) || d >= (1LL << 27)) return 0;
+    *out = 0x94000000u | (uint32_t)((d >> 2) & 0x03ffffffu);
+    return 1;
+}
+// `adr xT, target`, rebuilt where it no longer sits: adrp to the page, then add
+// the low twelve bits. Two instructions for one, which is why it needs a veneer
+// at all — adr only reaches 1 MB and the pool may be further than that.
+static int enc_addr(unsigned t, uint64_t pc, uint64_t target, uint32_t *out) {
+    int64_t d = ((int64_t)(target & ~0xFFFULL) - (int64_t)(pc & ~0xFFFULL)) >> 12;
+    if (d < -(1LL << 20) || d >= (1LL << 20)) return 0;
+    uint32_t v = (uint32_t)((uint64_t)d & 0x1fffff);
+    out[0] = 0x90000000u | ((v & 3) << 29) | ((v >> 2) << 5) | t;
+    out[1] = 0x91000000u | ((uint32_t)(target & 0xFFF) << 10) | (t << 5) | t;
+    return 1;
+}
 // cbz xT, #<insns> — a 64-bit compare-and-branch, offset in INSTRUCTIONS and
 // signed. Only ever emitted with a tiny negative offset here, so the imm19
 // range is not worth checking.
@@ -956,12 +1113,17 @@ int kl_x18_emit_img(void *code, size_t size, uint64_t code_va,
     uint32_t *w = (uint32_t *)code;
     size_t    n = size / 4;
 
-    unsigned want = klx_survey(code, size, &st->data_words, &st->ctr_sites);
+    unsigned want = klx_survey(code, size, &st->data_words, &st->ctr_sites,
+                               &st->tp_sites, &st->svc_sites);
     st->sites = want;
     if (pool_used) *pool_used = 0;
     int do_x18 = want && veneer_enabled();
     int do_ctr = st->ctr_sites && ctr_enabled();
-    if (!do_x18 && !do_ctr) return 0;
+    // No knob for the Linux ABI's sites: with them left alone the guest reads a
+    // register the kernel clobbers and traps into Darwin's syscall table with
+    // Linux numbers, so there is no control run worth having.
+    int do_lx  = st->tp_sites || st->svc_sites;
+    if (!do_x18 && !do_ctr && !do_lx) return 0;
 
     // Pass A: recognise the `br x18` jump-table dispatches BEFORE anything is
     // patched. This has to happen first and it is not an optimisation: the
@@ -995,12 +1157,75 @@ int kl_x18_emit_img(void *code, size_t size, uint64_t code_va,
         // it can put the constant into the shadow slot but the x18 veneer
         // cannot avoid executing the `mrs`.
         int ctr_site = in.sysreg == KLX_SYS_CTR_EL0 && do_ctr;
-        int x18_site = in.nfields && do_x18 && !ctr_site;
-        if (!ctr_site && !x18_site) continue;
+        int lx_site  = in.sysreg >= KLX_SYS_TP_READ;
+        int x18_site = in.nfields && do_x18 && !ctr_site && !lx_site;
+        if (!ctr_site && !x18_site && !lx_site) continue;
 
         uint64_t spc = code_va + (uint64_t)i * 4;
         uint64_t vpc = pool_va + (uint64_t)((uint8_t *)out - (uint8_t *)pool);
         uint32_t word = w[i];
+
+        // The Linux ABI's three shapes (kl_x18.h). None of them executes the
+        // original instruction, so there is nothing pc-relative to rebuild.
+        //
+        //   mrs Xt, TPIDR_EL0      mrs  Xt, tpidrro_el0
+        //                          ldr  Xt, [Xt, #TP*8]
+        //
+        //   msr TPIDR_EL0, Xt      stp  a, b, [sp, #-16]
+        //                          mrs  a, tpidrro_el0
+        //                          str  Xt, [a, #TP*8]
+        //                          ldp  a, b, [sp, #-16]
+        //
+        //   svc #0                 stp  x16, x30, [sp, #-16]!
+        //                          mrs  x16, tpidrro_el0
+        //                          ldr  x16, [x16, #SVC*8]
+        //                          blr  x16
+        //                          ldp  x16, x30, [sp], #16
+        //
+        // The read needs no scratch because its destination is free to hold the
+        // TSD base on the way. When Xt is x18 the value goes to or comes from
+        // the shadow slot instead, through `b`, as every other x18 site does.
+        //
+        // The svc veneer is the one shape here that MOVES sp, and it has to: it
+        // makes a call, and the callee owns everything below sp. The kernel
+        // preserves every register but x0 across a syscall and compilers rely on
+        // it — glibc's inline syscalls declare no clobbers — so x16 and x30 are
+        // put back here and the entry it calls preserves the rest.
+        if (lx_site) {
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0, rt = word & 31u, a, b;
+            int ok = rt != 31 || in.sysreg == KLX_SYS_SVC;   // xzr as Xt: never emitted
+            pick_scratch(in.gp_used, &a, &b);
+            if (in.sysreg == KLX_SYS_SVC) {
+                body[k++] = enc_push(16, 30);
+                body[k++] = enc_mrs_tpidrro(16);
+                body[k++] = enc_ldr(16, 16, (unsigned)KLX_SVC_SLOT * 8);
+                body[k++] = enc_blr(16);
+                body[k++] = enc_pop(16, 30);
+            } else if (in.sysreg == KLX_SYS_TP_READ && !in.nfields) {
+                body[k++] = enc_mrs_tpidrro(rt);
+                body[k++] = enc_ldr(rt, rt, (unsigned)KLX_TP_SLOT * 8);
+            } else {
+                // A write, or a read into x18: one slot to the other through `b`.
+                int rd = in.sysreg == KLX_SYS_TP_READ;
+                body[k++] = enc_stp(a, b, -16);
+                body[k++] = enc_mrs_tpidrro(a);
+                if (in.nfields)
+                    body[k++] = enc_ldr(b, a, (unsigned)(rd ? KLX_TP_SLOT : KLX_TSD_SLOT) * 8);
+                body[k++] = enc_str(in.nfields ? b : rt, a,
+                                    (unsigned)(rd ? KLX_TSD_SLOT : KLX_TP_SLOT) * 8);
+                body[k++] = enc_ldp(a, b, -16);
+            }
+            ok &= out + VEN_MAX_INSN <= pool_end;
+            if (ok) { ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++; }
+            if (ok) ok &= enc_b(spc, vpc, &patch);
+            if (!ok) { note_refusal(word); st->lx_refused++; continue; }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            if (in.sysreg == KLX_SYS_SVC) st->svc_patched++; else st->tp_patched++;
+            continue;
+        }
 
         // `mrs Xt, CTR_EL0`. No spill, no TSD and no scratch — the
         // veneer materialises a constant into the destination the instruction
@@ -1216,46 +1441,117 @@ int kl_x18_emit_img(void *code, size_t size, uint64_t code_va,
             continue;
         }
 
-        if (out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
-
-        // `blr x18` — the one hazard shape that IS separable, for the mirror of
-        // the reason `br x18` is. It cannot simply fall through the veneer (the
-        // callee would return into the pool with x30 naming a veneer address,
-        // which no unwinder recognises), but the return address is a constant at
-        // emit time, so the veneer can SET x30 itself and finish with a `br`.
+        // CASP with x18:x19 as one of its pairs (KLX_HZ_PAIR). The scratch is a
+        // PAIR p:p+1, p even, and x19 travels with it:
         //
-        // The branch must not go through x18. Darwin zeroes x18 on an exception
-        // return, so loading the target into x18 and running the x30 setup
-        // before `br x18` would leave the widest window in the pool, with no
-        // guard. Half-Life: Alyx's mpg123 (a `blr x18` per granule in
-        // INT123_do_layer3, every few microseconds on an audio thread) hits
-        // exactly that in two runs of two: signal 11, pc 0, the shadow holding
-        // the right target. A call site may clobber x16/x17 (AAPCS64 IP0/IP1:
-        // every linker veneer and PLT stub does), so the target goes through
-        // x16, which the kernel never touches, and x18 gets a copy:
+        //   Rt is x18:x19 (the new value, only read)
+        //      stp  p, p+1, [sp, #-16]
+        //      mrs  p, tpidrro_el0
+        //      ldr  p, [p, #slot*8]
+        //      mov  p+1, x19
+        //      casp Xs, Xs+1, p, p+1, [Xn]
+        //      ldp  p, p+1, [sp, #-16]
         //
-        //      mrs  x16, tpidrro_el0
-        //      ldr  x16, [x16, #slot]      the target
-        //      mov  x18, x16               what a native blr leaves in x18
-        //      adrp x17, page(spc + 4)
-        //      add  x30, x17, #off(spc + 4)  ...which is what `blr` would set
-        //      br   x16                    (BTI: br x16 may land on `bti c`)
+        //   Rs is x18:x19 (compared, then overwritten with what memory held)
+        //      stp  p, p+1, [sp, #-16]
+        //      mrs  p+1, tpidrro_el0
+        //      ldr  p, [p+1, #slot*8]
+        //      mov  p+1, x19
+        //      casp p, p+1, Xt, Xt+1, [Xn]
+        //      mrs  x19, tpidrro_el0        x19 is about to be overwritten, so
+        //      str  p, [x19, #slot*8]       it is free to hold the TSD base
+        //      mov  x19, p+1
+        //      ldp  p, p+1, [sp, #-16]
         //
-        // No spill is needed, and the shadow is untouched, so the guest's view
-        // of x18 stays what a native `blr x18` would have left.
-        if (in.hazard == KLX_HZ_NOFALL && (word & 0xFFFFFC1Fu) == 0xD63F0000u
-            && ((word >> 5) & 31) == 18) {
+        // Neither touches the flags, which is what the guest tests afterwards
+        // (it compares Rs against its own copy). Refused, by name, if x18 turns
+        // up in more than one field or the base is x19 itself.
+        if (in.hazard == KLX_HZ_PAIR) {
+            unsigned rs = (word >> 16) & 31, rn = (word >> 5) & 31, p = 32;
+            static const unsigned even[] = {16, 8, 10, 12, 14};
+            for (unsigned c = 0; c < sizeof even / sizeof *even && p == 32; c++)
+                if (!(in.gp_used & (3u << even[c]))) p = even[c];
             uint32_t body[VEN_MAX_INSN], patch;
             unsigned k = 0;
-            int ok = 1;
-            uint64_t ret = spc + 4;
-            body[k++] = enc_mrs_tpidrro(16);
-            body[k++] = enc_ldr(16, 16, (unsigned)KLX_TSD_SLOT * 8);
-            body[k++] = 0xAA1003F2u;                       // mov x18, x16
-            body[k]   = enc_adrp_to(17, vpc + k * 4, ret, &ok); k++;
-            body[k++] = enc_add_imm(30, 17, (unsigned)(ret & 0xfff));
-            body[k++] = 0xD61F0200u;                       // br x16
-            ok &= (k <= VEN_MAX_INSN);
+            int ok = in.nfields == 1 && p != 32 && out + VEN_MAX_INSN <= pool_end;
+            if (ok && rs == 18) {
+                ok &= rn != 19;
+                body[k++] = enc_stp(p, p + 1, -16);
+                body[k++] = enc_mrs_tpidrro(p + 1);
+                body[k++] = enc_ldr(p, p + 1, (unsigned)KLX_TSD_SLOT * 8);
+                body[k++] = enc_mov(p + 1, 19);
+                body[k++] = klx_substitute(word, &in, p);
+                body[k++] = enc_mrs_tpidrro(19);
+                body[k++] = enc_str(p, 19, (unsigned)KLX_TSD_SLOT * 8);
+                body[k++] = enc_mov(19, p + 1);
+                body[k++] = enc_ldp(p, p + 1, -16);
+            } else if (ok) {
+                body[k++] = enc_stp(p, p + 1, -16);
+                body[k++] = enc_mrs_tpidrro(p);
+                body[k++] = enc_ldr(p, p, (unsigned)KLX_TSD_SLOT * 8);
+                body[k++] = enc_mov(p + 1, 19);
+                body[k++] = klx_substitute(word, &in, p);
+                body[k++] = enc_ldp(p, p + 1, -16);
+            }
+            if (ok) { ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++; }
+            if (ok) ok &= enc_b(spc, vpc, &patch);
+            if (!ok) {
+                note_refusal(word); st->refused++;
+                if (out_of_reach(spc, vpc)) st->far_refused++;
+                continue;
+            }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            st->patched++;
+            continue;
+        }
+
+        // `blr x18` — a call through x18. Refused as KLX_HZ_NOFALL for as long
+        // as the site had to be a `b`, because then x30 would point into the
+        // veneer. It does not have to be: patch the site with `bl` and the link
+        // register is the instruction after it, exactly what `blr` would have
+        // left, with the return predictor kept in step as well.
+        //
+        //      mrs  x16, tpidrro_el0
+        //      ldr  x16, [x16, #slot*8]
+        //      br   x16
+        //
+        // x16 needs no spill: it is the intra-procedure-call scratch register,
+        // which no callee may read on entry. Source 2 has 53 of these.
+        if (word == 0xD63F0240u) {
+            uint32_t patch;
+            if (out + VEN_MAX_INSN > pool_end || !enc_bl(spc, vpc, &patch)) {
+                note_refusal(word); st->refused++;
+                if (out_of_reach(spc, vpc)) st->far_refused++;
+                continue;
+            }
+            *out++ = enc_mrs_tpidrro(16);
+            *out++ = enc_ldr(16, 16, (unsigned)KLX_TSD_SLOT * 8);
+            *out++ = 0xD61F0200u;                       // br x16
+            w[i] = patch;
+            st->patched++;
+            continue;
+        }
+
+        // `adr x18, label` — the address goes to the shadow slot. The one
+        // pc-relative shape that cannot be re-encoded in place of itself (see
+        // enc_addr), so it is rebuilt as a pair. Source 2 has 33.
+        if (in.pcrel == KLX_PC_ADR && !in.hazard && in.nfields == 1 &&
+            out + VEN_MAX_INSN <= pool_end) {
+            unsigned a, b;
+            pick_scratch(in.gp_used, &a, &b);
+            int64_t imm = (int64_t)((((word >> 5) & 0x7ffff) << 2) | ((word >> 29) & 3));
+            imm = (imm << 43) >> 43;
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            body[k++] = enc_stp(a, b, -16);
+            body[k++] = enc_mrs_tpidrro(a);
+            int ok = enc_addr(b, vpc + k * 4, spc + (uint64_t)imm, body + k);
+            k += 2;
+            body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
+            body[k++] = enc_ldp(a, b, -16);
+            ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
             ok &= enc_b(spc, vpc, &patch);
             if (!ok) {
                 note_refusal(word); st->refused++;
@@ -1269,6 +1565,8 @@ int kl_x18_emit_img(void *code, size_t size, uint64_t code_va,
             continue;
         }
 
+        if (out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
+
         if (in.hazard) { note_refusal(word); st->refused++; continue; }
 
         unsigned a, b;
@@ -1277,6 +1575,10 @@ int kl_x18_emit_img(void *code, size_t size, uint64_t code_va,
         // The two pc-relative WRITES, rebuilt rather than relocated. See the
         // block comment above enc_adrp_to for why a refusal here is worse than
         // a refusal anywhere else in this loop.
+        //
+        // In this fork the plain `adr x18` was already rebuilt by the block
+        // above (enc_addr), so what arrives here in practice is the literal
+        // load; the adr arm stays for the shapes that block leaves alone.
         if (in.pcrel == KLX_PC_ADR || in.pcrel == KLX_PC_LITERAL) {
             uint32_t body[VEN_MAX_INSN], patch;
             unsigned k = 0;
@@ -1475,11 +1777,14 @@ int kl_x18_patch(void *code, size_t size, void *arena, size_t arena_size,
 
     // Same reason as in kl_x18_emit: the data-word tally has to survive the
     // "nothing to veneer here" path, or a chunk of pure data reports nothing.
-    unsigned want = klx_survey(code, size, &st->data_words, &st->ctr_sites);
+    unsigned want = klx_survey(code, size, &st->data_words, &st->ctr_sites,
+                               &st->tp_sites, &st->svc_sites);
     st->sites = want;
     unsigned veneers = (veneer_enabled() ? want : 0) +
-                       (ctr_enabled() ? st->ctr_sites : 0);
+                       (ctr_enabled() ? st->ctr_sites : 0) +
+                       st->tp_sites + st->svc_sites;
     if (!veneers) return 0;
+    if ((st->tp_sites || st->svc_sites) && kl_x18_init_linux() != 0) return -1;
     // The TSD slot is only needed by the x18 half; a chunk whose only veneer is
     // a CTR_EL0 one does not touch it. Checking it anyway would refuse to fix a
     // SIGILL because of a register the code in question never names.
@@ -1628,6 +1933,7 @@ int kl_x18_next_code(uint64_t sec_va, size_t sec_size,
     *cursor = end;
     return 0;
 }
+
 
 static unsigned g_refused_offline;
 unsigned kl_x18_refusals(void) { return g_refused_total + g_refused_offline; }

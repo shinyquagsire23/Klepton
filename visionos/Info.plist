@@ -1,133 +1,33 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  The app's Info.plist base. Xcode still GENERATES the ordinary keys (bundle id,
-  version, scene manifest) and still merges every INFOPLIST_KEY_* build setting
-  from gen_xcodeproj.py on top of this file; what lives here is the part that
-  build settings cannot express, plus the privacy strings, which are grouped
-  with it so the whole TCC surface can be read in one place.
-
-  Why this file exists at all: on visionOS a missing usage description is not a
-  refused permission, it is a PROCESS KILL. The system sends SIGKILL and writes
-  a TCC-namespace crash report, so it presents as "the app died instantly for no
-  reason" rather than as a permissions problem — and none of it reproduces in
-  the Simulator, which does not enforce TCC. That cost a run to find:
-
-      Klepton-2026-08-07-161125.ips
-      namespace TCC — "This app has crashed because it attempted to access
-      privacy-sensitive data without a usage description. The app's Info.plist
-      must contain an NSAccessoryTrackingUsageDescription key..."
-
-  Note WHICH key that was. We declared hand tracking, which is the one that
-  looks like it needs consent, and were killed for accessory tracking — which
-  KleptonControllers requests even with zero controllers paired, because it
-  builds an AccessoryTrackingProvider from an empty list. The lesson is that
-  the trigger is *requesting* the authorization, not obtaining data, so the key
-  set has to match the providers we construct, not the data we end up using.
-
-  The set below is taken from ../VisionOSALVRClient/ALVRClient/Info.plist — the
-  user's own visionOS client, which runs on this same headset and has already
-  paid for this discovery once. Taking the whole set rather than adding them one
-  kill at a time is deliberate.
--->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Microphone: required or visionOS KILLS the process the instant anything
-	     touches the mic. It is only ever touched when the Microphone toggle is
-	     ON (off by default — KleptonMic.swift), so most sessions never trigger
-	     the prompt this string backs. A guest such as Steam Link uses it for
-	     voice chat. -->
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Klepton uses the microphone only when you turn on the Microphone toggle, so a running app (such as Steam Link voice chat) can hear you.</string>
-	<!-- The app icon's asset-catalog name. Filled per target by the generated
-	     KL_APPICON_NAME build setting (gen_xcodeproj.py): the target's own
-	     AppIcon-<name> stack when Assets.xcassets carries one, a benign
-	     placeholder otherwise. Without this key visionOS never looks in
-	     Assets.car and the Home View shows the blank default. -->
+    <key>KLScotland2Diagnostics</key>
+    <string>$(KL_SCOTLAND2_DIAGNOSTICS)</string>
+    <key>KLScotland2Profile</key>
+    <string>$(KL_SCOTLAND2_PROFILE)</string>
+    <key>KLAllowTestSwitches</key>
+    <string>$(KL_ALLOW_TEST_SWITCHES)</string>
+    <key>KLScotland2Test</key>
+    <string>$(KL_SCOTLAND2_TEST)</string>
+    <key>KLScotland2MetaCore</key>
+    <string>$(KL_SCOTLAND2_METACORE)</string>
+    <key>KLScotland2CoreMods</key>
+    <string>$(KL_SCOTLAND2_COREMODS)</string>
+    <key>KLScotland2SongDownloader</key>
+    <string>$(KL_SCOTLAND2_SONGDOWNLOADER)</string>
+    <key>KLScotland2SongCore</key>
+    <string>$(KL_SCOTLAND2_SONGCORE)</string>
+    <key>KLScotland2BSML</key>
+    <string>$(KL_SCOTLAND2_BSML)</string>
+    <key>KLScotland2Lapiz</key>
+    <string>$(KL_SCOTLAND2_LAPIZ)</string>
+    <key>KLScotland2CustomTypes</key>
+    <string>$(KL_SCOTLAND2_CUSTOMTYPES)</string>
+    <key>KLScotland2Hooks</key>
+    <string>$(KL_SCOTLAND2_HOOKS)</string>
 	<key>CFBundleIconName</key>
 	<string>$(KL_APPICON_NAME)</string>
-	<!-- THE SCENE MANIFEST — and specifically the immersive-space ROLE.
-	     Without this the app has no immersive scene session, and the failure is
-	     silent in every direction that can be checked from inside the app:
-	     openImmersiveSpace returns .opened, a CompositorLayer is created, its
-	     LayerRenderer reaches .running, queryDrawable(s) hands back a drawable
-	     with correct textures, slices, viewports and depth range, deviceAnchor
-	     is accepted, command buffers complete without error, and every frame
-	     presents. Nothing composites, because there is no immersive scene to
-	     composite into.
-	     Xcode generates the rest of this dictionary, but it generated
-	     UISceneConfigurations as an EMPTY dict — the window role only. That is
-	     what a `plutil -extract UIApplicationSceneManifest` on the built app
-	     showed, next to Apple's MetalImmersiveTemplate which declares the role
-	     below. It cost a session: the entire compositor was verified correct
-	     against a display that could never show it. -->
-	<key>UIApplicationSceneManifest</key>
-	<dict>
-		<key>UIApplicationPreferredDefaultSceneSessionRole</key>
-		<string>UIWindowSceneSessionRoleApplication</string>
-		<key>UIApplicationSupportsMultipleScenes</key>
-		<true/>
-		<key>UISceneConfigurations</key>
-		<dict>
-			<key>UISceneSessionRoleImmersiveSpaceApplication</key>
-			<array>
-				<dict>
-					<!-- Mixed, matching the app's default (Immersive.mixed).
-					     Declaring one style here and selecting another in
-					     SwiftUI is a mismatch worth avoiding: it is not obviously
-					     fatal, but this file's whole reason for existing is that
-					     scene declarations which disagree with the app fail
-					     silently. KL_FULL=1 selects .full at runtime and the
-					     scene accepts both (`in: .mixed, .full`). -->
-					<key>UISceneInitialImmersionStyle</key>
-					<string>UIImmersionStyleMixed</string>
-				</dict>
-			</array>
-		</dict>
-	</dict>
-
-	<!-- ARKit providers we construct in KleptonCompositor.runARKit(). All three
-	     are required: worldTracking is unconditional, handTracking is added
-	     whenever the platform supports it, and the accessory provider is built
-	     even when no Sense controllers are paired. -->
-	<key>NSWorldSensingUsageDescription</key>
-	<string>Klepton reads the headset's own pose, which is the head pose the guest renders from.</string>
-	<key>NSHandsTrackingUsageDescription</key>
-	<string>Klepton maps your hands onto the guest's two Touch controllers.</string>
-	<key>NSAccessoryTrackingUsageDescription</key>
-	<string>Klepton maps PSVR2 Sense controllers onto the guest's two Touch controllers.</string>
-	<!-- Sense controllers reach us through GameController. ALVR carries the
-	     Bluetooth string for controllers the system does not surface as
-	     standard gamepads; declared here for the same reason the rest are —
-	     the cost of a missing one is a kill, and the cost of a spare is a
-	     string nobody reads. -->
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Klepton connects to spatial controllers that are not visible to the system as standard game controllers.</string>
-
-	<!-- The LOCAL network, which on this platform is a separate permission from
-	     "the network" and fails in the worst available way without it.
-	     (SL-19.)
-
-	     Steam Link finds hosts by UDP broadcast on port 27036 — SL-5 measured
-	     that, and measured it colliding with a Mac running Steam. On iOS 14 and
-	     later, and on visionOS, an app that has not declared this key gets no
-	     prompt and its local-network traffic is DISCARDED: no errno, no error
-	     on the socket, nothing in any log. That is why the device run shows
-	     `Connected to Remote Client service` — the Steam backend is on the
-	     internet and needs none of this — while the computer list stays empty.
-
-	     Same class as trap 13, one step quieter: there a missing usage string
-	     is a process kill on the request, here it is silence. So the failure to
-	     look for is "the feature does nothing", not "the feature errors".
-
-	     No NSBonjourServices: this guest does not browse mDNS, it broadcasts.
-	     A service type we invented would be a declaration we cannot back up. -->
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Steam Link finds the PCs on your network by broadcasting to them, and streams from the one you pair with.</string>
-
-	<!-- Array-valued, so it cannot be an INFOPLIST_KEY_ build setting — which
-	     is the reason this file exists rather than four more settings. Without
-	     it the Sense controllers are not offered to the app as spatial
-	     gamepads at all. -->
 	<key>GCSupportedGameControllers</key>
 	<array>
 		<dict>
@@ -139,11 +39,99 @@
 			<string>ExtendedGamepad</string>
 		</dict>
 	</array>
-
-	<!-- The run's whole log is Documents/klepton-boot.log, and this makes it
-	     reachable from the Files app as well as from devicectl — worth having
-	     on a headset that is often not tethered to the Mac that built it. -->
+	<key>KLApkName</key>
+	<string>$(KL_DATA_APK)</string>
+	<key>KLControllerModeDefault</key>
+	<string>$(KL_CONTROLLER_MODE_DEFAULT)</string>
+	<key>KLSurrealAvailable</key>
+	<string>$(KL_SURREAL_AVAILABLE)</string>
+	<key>KLGamepadMap</key>
+	<string>$(KL_GAMEPAD_MAP)</string>
+	<key>KLHandMattingDefault</key>
+	<string>$(KL_HAND_MATTING_DEFAULT)</string>
+	<key>KLRenderScaleDefault</key>
+	<string>$(KL_RENDER_SCALE_DEFAULT)</string>
+	<key>KLVideoDefault</key>
+	<string>$(KL_VIDEO_DEFAULT)</string>
+	<key>KLAutoBootDefault</key>
+	<string>$(KL_AUTOBOOT_DEFAULT)</string>
+	<key>KLFoveationDefault</key>
+	<string>$(KL_FOVEATION_DEFAULT)</string>
+	<key>KLFoveationReset</key>
+	<string>$(KL_FOVEATION_RESET)</string>
+	<key>KLVkMsaaDefault</key>
+	<string>$(KL_VK_MSAA_DEFAULT)</string>
+	<key>KLVkFoveationDefault</key>
+	<string>$(KL_VK_FOVEATION_DEFAULT)</string>
+	<key>KLPictureReset</key>
+	<string>$(KL_PICTURE_RESET)</string>
+	<key>KLMaxRateDefault</key>
+	<string>$(KL_MAX_RATE_DEFAULT)</string>
+	<key>KLFrameGenDefault</key>
+	<string>$(KL_FRAMEGEN_DEFAULT)</string>
+	<key>KLTestOn</key>
+	<string>$(KL_TEST_ON)</string>
+	<key>KLTestBuild</key>
+	<string>$(KL_TEST_BUILD)</string>
+	<key>KLRoomGuardDefault</key>
+	<string>$(KL_ROOM_GUARD_DEFAULT)</string>
+	<key>KLGameLanguageDefault</key>
+	<string>$(KL_GAME_LANGUAGE_DEFAULT)</string>
+	<key>KLOutputDefault</key>
+	<string>$(KL_OUTPUT_DEFAULT)</string>
+	<key>KLStartScreen</key>
+	<string>$(KL_START_SCREEN)</string>
+	<key>KLOvrpGuestVersion</key>
+	<string>$(KL_OVRP_GUEST_VERSION)</string>
+	<key>KLMetaApkID</key>
+	<string>$(KL_DATA_APK_ID)</string>
+	<key>KLMetaObbID</key>
+	<string>$(KL_DATA_OBB_ID)</string>
+	<key>KLObbFile</key>
+	<string>$(KL_DATA_OBB_FILE)</string>
+	<key>KLObbRel</key>
+	<string>$(KL_DATA_OBB_REL)</string>
+	<key>KLTree</key>
+	<string>$(KL_DATA_TREE)</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationPreferredDefaultSceneSessionRole</key>
+		<string>UIWindowSceneSessionRoleApplication</string>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UISceneSessionRoleImmersiveSpaceApplication</key>
+			<array>
+				<dict>
+					<key>UISceneInitialImmersionStyle</key>
+					<string>UIImmersionStyleMixed</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 	<key>UIFileSharingEnabled</key>
 	<true/>
+	<!-- Privacy strings. Also emitted as INFOPLIST_KEY_* by gen_xcodeproj.py,
+	     because Xcode moves them out of this file when the project is edited
+	     in its Info tab. Missing from the built app = TCC kill at launch. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Klepton uses the microphone only when you turn on the Microphone toggle, so a running app (such as Steam Link voice chat) can hear you.</string>
+	<key>NSWorldSensingUsageDescription</key>
+	<string>Klepton reads the headset's own pose, which is the head pose the guest renders from, the floor and walls of your room for a mixed-reality game, and, when you measure your room, its floor, walls and furniture to find the play area.</string>
+	<key>KLSharedKeychainGroup</key>
+	<string>$(AppIdentifierPrefix)avpplay.shared</string>
+	<key>NSHandsTrackingUsageDescription</key>
+	<string>Klepton maps your hands onto the guest's two Touch controllers.</string>
+	<key>NSAccessoryTrackingUsageDescription</key>
+	<string>Klepton maps PSVR2 Sense controllers onto the guest's two Touch controllers.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Klepton connects to spatial controllers that are not visible to the system as standard game controllers.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Steam Link finds the PCs on your network by broadcasting to them, and streams from the one you pair with.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_klepton-lan._udp</string>
+	</array>
 </dict>
 </plist>

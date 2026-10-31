@@ -1,0 +1,19 @@
+﻿<vertical id='bgContainer' bg='round-rect-panel' pad='1' pad-bottom='2' horizontal-fit='Unconstrained' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<horizontal spacing='3'>
+		<text id='fullFormattedSongName' align='MidlineLeft' overflow-mode='Ellipsis' word-wrapping='false' rich-text='false'/>
+		<text id='uploadDateFormatted' align='MidlineRight' word-wrapping='false' color='#AAA' rich-text='false'/>
+	</horizontal>
+	<horizontal pad-top='1' pad-bottom='2' spacing='2'>
+		<text id='levelAuthorName' align='MidlineLeft' overflow-mode='Ellipsis' word-wrapping='false' color='#CCC' rich-text='false'/>
+		<text id='songLengthAndRating' align='MidlineRight' font-color='#CCC' word-wrapping='false'/>
+	</horizontal>
+	<horizontal id='diffsContainer' bg='round-rect-panel' bg-color='#000D'>
+		<text align='Center' overflow-mode='Truncate' text=""/>
+		<text align='Center' overflow-mode='Truncate' text=""/>
+		<text align='Center' overflow-mode='Truncate' text=""/>
+		<text align='Center' overflow-mode='Truncate' text=""/>
+		<text align='Center' overflow-mode='Truncate' text=""/>
+		<text align='Center' overflow-mode='Truncate' text=""/>
+		<text align='Center' overflow-mode='Truncate' text=""/>
+	</horizontal>
+</vertical>

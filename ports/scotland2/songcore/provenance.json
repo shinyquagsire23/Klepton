@@ -1,0 +1,11 @@
+{
+  "name": "songcore",
+  "repository": "raineaeternal/Quest-SongCore",
+  "tag": "v1.1.24",
+  "commit": "4556891fb93a2a71549df11404074589daf8b31d",
+  "sha256": "6481e3ab2d7837ed8c4b0d116b6636252b08c09891bd5c7bbef2354c80c74d44",
+  "modifiedFiles": [
+    "include/hooking.hpp"
+  ],
+  "scope": "Original SongCore source staged with compiler hook catalog instrumentation. Not compiled, loaded or song-playback verified."
+}

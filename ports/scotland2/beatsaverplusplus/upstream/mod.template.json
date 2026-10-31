@@ -1,0 +1,16 @@
+{
+    "_QPVersion": "0.1.1",
+    "name": "BeatSaverPlusPlus",
+    "id": "beatsaverplusplus",
+    "author": "RedBrumbler",
+    "version": "${version}",
+    "packageId": "com.beatgames.beatsaber",
+    "isLibrary": true,
+    "description": "C++ library to interact with beatsaver",
+    "dependencies": [],
+    "lateModFiles": [],
+    "libraryFiles": [
+        "${binary}"
+    ],
+    "fileCopies": []
+  }

@@ -1,0 +1,42 @@
+{
+  "configurations": [
+    {
+      "defines": ["__GNUC__", "__aarch64__"],
+      "includePath": [
+        "${workspaceFolder}/extern/includes/libil2cpp/il2cpp/libil2cpp",
+        "${workspaceFolder}/extern/includes/codegen/include",
+        "${workspaceFolder}/extern/includes",
+        "${workspaceFolder}/include",
+        "${workspaceFolder}/shared",
+        "${workspaceFolder}",
+        "${workspaceFolder}/**",
+        "${env:VCPKG_ROOT}/installed/arm64-android/include/**",
+        "${env:ANDROID_NDK_HOME}/sources/**",
+        "${default}"
+      ],
+      "name": "Quest",
+      "cStandard": "c11",
+      "cppStandard": "c++20",
+      "compileCommands": "${workspaceFolder}/build/compile_commands.json",
+      "intelliSenseMode": "clang-arm64"
+    },
+    {
+      "includePath": [
+        "${workspaceFolder}/extern/includes/libil2cpp/il2cpp/libil2cpp",
+        "${workspaceFolder}/extern/includes/codegen/include",
+        "${workspaceFolder}/extern/includes",
+        "${workspaceFolder}/include",
+        "${workspaceFolder}/shared",
+        "${workspaceFolder}",
+        "${workspaceFolder}/**",
+        "${default}"
+      ],
+      "name": "Linux",
+      "cStandard": "c11",
+      "cppStandard": "c++20",
+      "intelliSenseMode": "linux-clang-x64",
+      "compileCommands": "${workspaceFolder}/build_linux/compile_commands.json",
+    }
+  ],
+  "version": 4
+}

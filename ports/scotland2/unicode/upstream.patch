@@ -1,0 +1,228 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -65,7 +65,7 @@
+ }
+ 
+ bool IsCustomAsset(TMP_SpriteAsset* asset) {
+-    if (!asset)
++    if (!asset || !rootEmojiAsset)
+         return false;
+     if (rootEmojiAsset == asset)
+         return true;
+@@ -123,6 +123,11 @@
+ 
+ TMP_SpriteGlyph* PushSprite(int unicode) {
+     if (currentEmojiIndex >= SHEET_TILES * SHEET_TILES) {
++#ifdef SC2_UNICODE_APPLE_GLYPHS
++        // Bound the original cache to 32 atlases (3200 styled glyphs). Exhaustion
++        // returns to TMP's ordinary fallback rather than growing until OOM.
++        if (rootEmojiAsset->fallbackSpriteAssets->get_Count() >= 31) return nullptr;
++#endif
+         auto newSheet = CreateSpriteAsset();
+         rootEmojiAsset->fallbackSpriteAssets->Add(newSheet);
+         currentEmojiAsset = newSheet;
+@@ -164,7 +169,22 @@
+ // #include "UnityEngine/RenderTextureFormat.hpp"
+ // #include "UnityEngine/RenderTextureReadWrite.hpp"
+ 
+-void DrawTexture(uint unicode, TMP_SpriteGlyph* glyph) {
++#ifdef SC2_UNICODE_APPLE_GLYPHS
++extern int sc2_unicode_draw_glyph(uint32_t,int,int,int,uint8_t*,uint32_t,uint32_t,float,float) asm("sc2_unicode_draw_glyph");
++static bool RasterizeTexture(uint unicode, uint32_t* raster) {
++    return !sc2_unicode_draw_glyph(unicode, GetTypefaceStyle(), currentIsUnderline,
++                                   currentIsStrikethrough, reinterpret_cast<uint8_t*>(raster),
++                                   EMOJI_SIZE, EMOJI_SIZE, EMOJI_SIZE * 0.75f, EMOJI_SIZE * 0.8f);
++}
++#endif
++void DrawTexture(uint unicode, TMP_SpriteGlyph* glyph, uint32_t* rendered = nullptr) {
++#ifdef SC2_UNICODE_APPLE_GLYPHS
++    // Preserve the original cache, atlas and TMP hooks. A failed platform glyph
++    // must fall back without inserting a blank character into the cache.
++    uint32_t raster[EMOJI_SIZE * EMOJI_SIZE] = {};
++    if (!rendered) { if (!RasterizeTexture(unicode, raster)) return; rendered = raster; }
++    uint32_t* pixels = rendered;
++#else
+     auto env = Java::GetEnv();
+ 
+     auto id = std::this_thread::get_id();
+@@ -268,6 +288,7 @@
+     uint32_t* pixels = nullptr;
+     AndroidBitmap_lockPixels(env, globals.bitmap, (void**) &pixels);
+ 
++#endif
+     // ARGB8888: 4 sets of 8 bits per pixel
+     int pixelsSizeU32 = EMOJI_SIZE * EMOJI_SIZE;
+ 
+@@ -299,13 +320,17 @@
+             upper = row;
+     }
+ 
++#ifndef SC2_UNICODE_APPLE_GLYPHS
+     AndroidBitmap_unlockPixels(env, globals.bitmap);
++#endif
+ 
++#ifndef SC2_UNICODE_APPLE_GLYPHS
+     auto tex = Texture2D::New_ctor(EMOJI_SIZE, EMOJI_SIZE, TextureFormat::RGBA32, false);
+     // tex->LoadRawTextureData(flippedPixels, pixelsSizeU32 * 4);  // size in uint8_t*
+     static auto method = il2cpp_utils::FindMethodUnsafe(tex, "LoadRawTextureData", 2);
+     il2cpp_utils::RunMethod<void, false>(tex, method, System::IntPtr(flippedPixels), pixelsSizeU32 * 4);
+     tex->Apply();
++#endif
+ 
+     // debug: saves texure after copy
+     // static bool saved2 = false;
+@@ -321,11 +346,22 @@
+     int x = column * EMOJI_SIZE;
+     int y = SHEET_SIZE - ((row + 1) * EMOJI_SIZE);
+ 
++#ifdef SC2_UNICODE_APPLE_GLYPHS
++    // CopyTexture_Region was stripped from the supplied Unity image. Update
++    // the same original atlas through the retained managed region API instead.
++    static_assert(sizeof(UnityEngine::Color32)==4);
++    auto colors=Array<UnityEngine::Color32>::NewLength(pixelsSizeU32);
++    std::memcpy(colors->begin(),flippedPixels,pixelsSizeU32*4);
++    auto *atlas=static_cast<Texture2D*>(currentEmojiAsset->spriteSheet.ptr());
++    atlas->SetPixels32(x,y,EMOJI_SIZE,EMOJI_SIZE,colors);
++    atlas->Apply(false,false);
++#else
+     static auto CopyTexture_Region =
+         il2cpp_utils::resolve_icall<void, UnityEngine::Texture*, int, int, int, int, int, int, UnityEngine::Texture*, int, int, int, int>(
+             "UnityEngine.Graphics::CopyTexture_Region"
+         );
+     CopyTexture_Region(tex, 0, 0, 0, 0, tex->width, tex->height, currentEmojiAsset->spriteSheet, 0, 0, x, y);
++#endif
+ 
+     // add a little bit of spacing
+     right = std::min(right + (EMOJI_SIZE / 10), EMOJI_SIZE);
+@@ -347,6 +383,17 @@
+ 
+ using namespace GlobalNamespace;
+ 
++#ifdef SC2_AOT_HOOKS
++struct SC2BuildHookTarget { uint64_t address; uint32_t originalHook,reserved; char name[128]; };
++static_assert(sizeof(SC2BuildHookTarget)==144);
++#define SC2_RECORD_HOOK(name_, mPtr) \
++    static const SC2BuildHookTarget sc2_target_##name_ __attribute__((used,section(".sc2_hooks"))) = { \
++        ::il2cpp_utils::il2cpp_type_check::MetadataGetter<mPtr>::addrs, 0, 0, #name_ };
++#else
++#define SC2_RECORD_HOOK(name_, mPtr)
++#endif
++
++SC2_RECORD_HOOK(MainFlowCoordinator_DidActivate, &MainFlowCoordinator::DidActivate)
+ MAKE_HOOK_MATCH(
+     MainFlowCoordinator_DidActivate,
+     &MainFlowCoordinator::DidActivate,
+@@ -368,6 +415,7 @@
+     MainFlowCoordinator_DidActivate(self, firstActivation, addedToHierarchy, screenSystemEnabling);
+ }
+ 
++SC2_RECORD_HOOK(TMP_Text_GetTextElement, &TMP_Text::GetTextElement)
+ MAKE_HOOK_MATCH(
+     TMP_Text_GetTextElement,
+     &TMP_Text::GetTextElement,
+@@ -387,6 +435,7 @@
+     return TMP_Text_GetTextElement(self, unicode, fontAsset, fontStyle, fontWeight, isUsingAlternativeTypeface);
+ }
+ 
++SC2_RECORD_HOOK(TMP_FontAssetUtilities_GetSpriteCharacterFromSpriteAsset, &TMP_FontAssetUtilities::GetSpriteCharacterFromSpriteAsset)
+ MAKE_HOOK_MATCH(
+     TMP_FontAssetUtilities_GetSpriteCharacterFromSpriteAsset,
+     &TMP_FontAssetUtilities::GetSpriteCharacterFromSpriteAsset,
+@@ -396,6 +445,10 @@
+     bool includeFallbacks
+ ) {
+     uint originalUnicode = unicode;
++#ifdef SC2_UNICODE_APPLE_GLYPHS
++    if (!rootEmojiAsset || !spriteAsset) return TMP_FontAssetUtilities_GetSpriteCharacterFromSpriteAsset(unicode, spriteAsset, includeFallbacks);
++    if(spriteAsset==rootEmojiAsset && (unicode>0x10ffff || (unicode>=0xd800 && unicode<=0xdfff)))return nullptr;
++#endif
+     // don't offset multible times for the fallbacks
+     if (spriteAsset == rootEmojiAsset)
+         unicode += GetStyleOffset();
+@@ -405,9 +458,17 @@
+     if (!result && spriteAsset == rootEmojiAsset) {
+         logger.debug("unicode {} with style {}", originalUnicode, unicode);
+ 
++#ifdef SC2_UNICODE_APPLE_GLYPHS
++        uint32_t raster[EMOJI_SIZE * EMOJI_SIZE] = {};
++        if (!RasterizeTexture(originalUnicode, raster)) return nullptr;
++#endif
+         auto glyph = PushSprite(unicode);
+-
++        if(!glyph)return nullptr;
++#ifdef SC2_UNICODE_APPLE_GLYPHS
++        DrawTexture(originalUnicode, glyph, raster);
++#else
+         DrawTexture(originalUnicode, glyph);
++#endif
+         currentEmojiIndex++;
+ 
+         currentEmojiAsset->spriteCharacterLookupTable->TryGetValue(unicode, byref(result));
+@@ -419,6 +480,7 @@
+     return result;
+ }
+ 
++SC2_RECORD_HOOK(TMP_Text_SaveSpriteVertexInfo, &TMP_Text::SaveSpriteVertexInfo)
+ MAKE_HOOK_MATCH(TMP_Text_SaveSpriteVertexInfo, &TMP_Text::SaveSpriteVertexInfo, void, TMP_Text* self, Color32 vertexColor) {
+     // this check may not be necessary if there are no other sprite assets in the game
+     std::optional<bool> tintState = std::nullopt;
+@@ -433,7 +495,7 @@
+         self->m_tintSprite = *tintState;
+ }
+ 
+-extern "C" void setup(CModInfo* info) {
++extern "C" __attribute__((visibility("default"))) void setup(CModInfo* info) {
+     info->id = MOD_ID;
+     info->version = VERSION;
+     modInfo.assign(*info);
+@@ -443,7 +505,7 @@
+     logger.info("Completed setup!");
+ }
+ 
+-extern "C" void late_load() {
++extern "C" __attribute__((visibility("default"))) void late_load() {
+     il2cpp_functions::Init();
+ 
+     logger.info("Installing hooks...");
+@@ -453,3 +515,41 @@
+     INSTALL_HOOK(logger, TMP_Text_SaveSpriteVertexInfo);
+     logger.info("Installed all hooks!");
+ }
++
++#if defined(SC2_UNICODE_APPLE_GLYPHS) && SC2_DIAGNOSTICS
++#include "bsml/shared/BSML.hpp"
++#include "bsml/shared/BSML/MainThreadScheduler.hpp"
++extern "C" int sc2_test_unicode_raster();
++extern "C" __attribute__((visibility("default"))) int sc2_test_unicode_upload_api(){
++    auto *region=il2cpp_utils::FindMethodUnsafe(classof(Texture2D*),"SetPixels32",5);
++    auto *apply=il2cpp_utils::FindMethodUnsafe(classof(Texture2D*),"Apply",2);
++    auto *read=il2cpp_utils::FindMethodUnsafe(classof(Texture2D*),"GetPixels32",0);
++    if(!region||!region->methodPointer||!apply||!apply->methodPointer||!read||!read->methodPointer)return 1;
++    std::fprintf(stderr,"UNICODE_UPLOAD_API_READY retained managed SetPixels32(region), Apply and GetPixels32 methods found\n");return 0;
++}
++extern "C" __attribute__((visibility("default"))) int sc2_test_unicode_lifecycle(){
++    if(sc2_test_unicode_raster()||sc2_test_unicode_upload_api())return 1;
++    auto *texture=Texture2D::New_ctor(2,2,TextureFormat::RGBA32,false);
++    auto colors=Array<UnityEngine::Color32>::NewLength(1);
++    colors->_values[0].r=17;colors->_values[0].g=34;
++    colors->_values[0].b=51;colors->_values[0].a=255;
++    texture->SetPixels32(1,1,1,1,colors);texture->Apply(false,false);
++    auto readback=texture->GetPixels32();
++    auto c=readback[3];bool correct=c.r==17&&c.g==34&&c.b==51&&c.a==255;
++    UnityEngine::Object::DestroyImmediate(texture);
++    if(!correct)return 2;
++    std::fprintf(stderr,"[scotland2] UNICODE_REGION_UPLOAD_OK actual Unity managed region write, Apply and pixel readback passed\n");
++    BSML::Register::RegisterMenuButton("Unicode test: 漢 😀", "Unicode rendering check", []{});
++    BSML::MainThreadScheduler::ScheduleUntil([]{return added&&rootEmojiAsset;},[]{
++        for(uint32_t cp:{0x6f22u,0x1f600u}){
++            auto *glyph=TMP_FontAssetUtilities::GetSpriteCharacterFromSpriteAsset(cp,rootEmojiAsset,true);
++            int count=currentEmojiIndex;
++            auto *again=TMP_FontAssetUtilities::GetSpriteCharacterFromSpriteAsset(cp,rootEmojiAsset,true);
++            if(!glyph||!glyph->glyph||glyph->glyph->metrics.width<=0||again!=glyph||currentEmojiIndex!=count){
++                std::fprintf(stderr,"[scotland2] UNICODE_GLYPH_CACHE_FAILED U+%X\n",cp);return;
++            }
++        }
++        std::fprintf(stderr,"[scotland2] UNICODE_GLYPH_CACHE_OK original TMP fallback, texture atlas creation/upload and repeat lookup for CJK and color emoji\n");
++    });return 0;
++}
++#endif

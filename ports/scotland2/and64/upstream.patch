@@ -1,0 +1,15 @@
+--- a/shared/inline-hook/And64InlineHook.cpp
++++ b/shared/inline-hook/And64InlineHook.cpp
+@@ -1,3 +1,6 @@
++#ifdef SC2_AOT_HOOKS
++#include "../../../src/android-and64.cpp"
++#else
+ /*
+  *  @date   : 2018/04/18
+  *  @author : Rprop (r_prop@outlook.com)
+@@ -565,3 +568,5 @@
+ }
+ 
+ #endif // defined(__aarch64__)
++
++#endif // SC2_AOT_HOOKS

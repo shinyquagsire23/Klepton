@@ -31,6 +31,9 @@
 // case kl_app_status() explains which one. Checking here is the point: a
 // missing asset tree otherwise presents as a shim bug deep inside Unity.
 int kl_app_configure(const char *resources, const char *container);
+// A test of a cold shader start, asked for by a file in Documents; kl_app.c
+// has the story. From the App's init, before Metal is used.
+void kl_app_shader_cache_test(void);
 
 // Run the boot sequence. Returns 0 if initJni completed with no unimplemented
 // JNI call. Everything printed goes to the log file below as well as stdout,
@@ -103,12 +106,39 @@ void kl_app_lifecycle_report(void);
 // the time the caller continues.
 int  kl_app_guest_start(void);
 void kl_app_guest_publish(void);
+
+// The panel's own refresh rate, as the compositor measured it: what
+// KL_GUEST_PACE_DIV divides. Not the rate the guest is told (KL_DISPLAY_HZ can
+// force that), and not the rate the app is being shown at, which the system
+// may halve.
+void kl_app_set_panel_hz(float hz);
+// The system's thermal state (ProcessInfo.ThermalState's raw value, 0 nominal
+// .. 3 critical), for the [perf] line.
+void kl_app_note_thermal(int state);
+// The least memory left before the app's limit while the game drew, in MB; -1
+// where that is not known.
+long long kl_app_min_avail_mb(void);
 void kl_app_guest_stop(void);
 
 // Where the guest thread has got to. 0 = still in _begin (nothing to present
 // yet), 1 = running frames, -1 = _begin failed or the loop has ended; in the
 // last case kl_app_status() says why.
 int  kl_app_guest_state(void);
+// Before the app ends itself on being backgrounded: ask a guest that has a quit
+// of its own to take it. 1 means a request went out and the guest should be
+// given a moment — it ends the process itself when it is done.
+int  kl_app_guest_request_quit(void);
+// ...and before that, for a game that is being watched for a stop with every
+// thread waiting: who waits on what, written to the log. A player ends such a
+// run by leaving it, so this is the only moment that sees it.
+void kl_app_exit_report(void);
+// ...and whether it has: its main has returned.
+int  kl_app_guest_quit_done(void);
+// Did the guest's loop end because the game itself asked to quit — a Unity
+// guest's nativeRender returning false, where that is taken for the end of the
+// run (KL_UNITY_QUIT_EXITS; see guest_thread)? Then there is nothing left to
+// show and the app is to leave, as Android finishes the activity.
+int  kl_app_guest_asked_quit(void);
 
 // Which guest this app was built for, and whether it is the Steam Link one.
 //
@@ -173,5 +203,10 @@ const char *kl_app_log_path(void);
 
 // Human-readable status of the last call, for the UI. Never NULL.
 const char *kl_app_status(void);
+
+// While kl_app_boot is compiling a pipeline list ahead of the game ("preparing
+// graphics"): returns 1 and how many pipelines are done of how many. 0 at any
+// other time.
+int kl_app_prepare_progress(unsigned *done, unsigned *total);
 
 #endif

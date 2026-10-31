@@ -1,0 +1,23 @@
+[
+  {
+    "repository": "RedBrumbler/Kaleb",
+    "commit": "01e34eab1a1bf34c899485a9d334aa2c772623bc",
+    "version": "0.1.9",
+    "archive": "kaleb-01e34ea.tar.gz",
+    "sha256": "b89e641db2992aa9954d264bf0d36b76b6774dce8fd28bf1575ccfbb7ef35b1d"
+  },
+  {
+    "repository": "RedBrumbler/gif-lib-QPM",
+    "commit": "019805d88c61f150f74655a98a9f50f240d54b35",
+    "version": "5.2.2",
+    "archive": "gif-lib-019805d.tar.gz",
+    "sha256": "47ca916dad37a7d8b659d3e242ee1197b70afffa718cbb3ed92764b553888727"
+  },
+  {
+    "repository": "MillzyDev/NDK-tinyxml2",
+    "commit": "3a9698dedab1e1e77e2a4b91ff55483ca6498399",
+    "version": "10.0.0",
+    "archive": "tinyxml2-3a9698d.tar.gz",
+    "sha256": "f4e0b20914c686bceff24f140ef62310fa8ae53ed38215be14e3b2531c640681"
+  }
+]

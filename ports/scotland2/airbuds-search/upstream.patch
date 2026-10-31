@@ -1,0 +1,111 @@
+--- a/include/main.hpp
++++ b/include/main.hpp
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
++#if !defined(SC2_DIAGNOSTICS) || SC2_DIAGNOSTICS
+ #define CT_DEBUG
++#endif
+ 
+ // Include the modloader header, which allows us to tell the modloader which mod
+ // this is, and the version etc.
+--- a/src/Airbuds/AirbudsClient.cpp
++++ b/src/Airbuds/AirbudsClient.cpp
+@@ -8,7 +8,7 @@
+ #include <sstream>
+ #include <unordered_map>
+ #include <unordered_set>
+-#include <openssl/evp.h>
++#include "search-port-support.hpp"
+ 
+ #include <web-utils/shared/WebUtils.hpp>
+ 
+@@ -38,6 +38,7 @@
+     size_t totalBytes = 0;
+ 
+     bool AcceptData(std::span<uint8_t const> data) override {
++        if (data.size() > (8u << 20) - totalBytes) return false;
+         totalBytes += data.size();
+         if (!responseData) {
+             responseData = std::string();
+@@ -564,7 +565,7 @@
+         std::string(url),
+         WebUtils::URLOptions::QueryMap{},
+         headers,
+-        false,
++        true,
+         "",
+         std::string(userAgent),
+         10);
+@@ -638,32 +639,7 @@
+ }
+ 
+ std::string base64UrlDecode(std::string_view input) {
+-    std::string b64(input);
+-    std::replace(b64.begin(), b64.end(), '-', '+');
+-    std::replace(b64.begin(), b64.end(), '_', '/');
+-    while (b64.size() % 4 != 0) {
+-        b64.push_back('=');
+-    }
+-
+-    std::string output;
+-    output.resize((b64.size() * 3) / 4);
+-    const int decodedLen = EVP_DecodeBlock(
+-        reinterpret_cast<unsigned char*>(output.data()),
+-        reinterpret_cast<const unsigned char*>(b64.data()),
+-        static_cast<int>(b64.size()));
+-    if (decodedLen < 0) {
+-        return "";
+-    }
+-
+-    size_t padding = 0;
+-    if (!b64.empty() && b64[b64.size() - 1] == '=') {
+-        padding++;
+-    }
+-    if (b64.size() >= 2 && b64[b64.size() - 2] == '=') {
+-        padding++;
+-    }
+-    output.resize(decodedLen - padding);
+-    return output;
++    return sc2_search::base64_url_decode(input);
+ }
+ 
+ std::string getJwtClaim(std::string_view token, std::string_view claim) {
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -36,26 +36,8 @@
+ 
+     AirbudsSearch::Log.info("Version: {}", info->version);
+ 
+-    // Capture fatal logs from logcat to get crash stacks
+-    std::thread([]() {
+-        AirbudsSearch::Log.info("Logcat thread started");
++    // visionOS has no Android logcat process. Use the existing app log.
+ 
+-        const char* command = "logcat *:F";
+-
+-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(command, "r"), pclose);
+-        if (!pipe) {
+-            AirbudsSearch::Log.info("Logcat thread failed!");
+-            return;
+-        }
+-
+-        char buffer[512];
+-        while (fgets(buffer, sizeof(buffer), pipe.get()) != nullptr) {
+-            const std::string line(buffer);
+-            AirbudsSearch::Log.info("[LOGCAT] {}", line);
+-        }
+-        AirbudsSearch::Log.info("Logcat thread stopped!");
+-    }).detach();
+-
+     if (!getConfig().config.HasMember("filter")) {
+         rapidjson::Value filterJson;
+         filterJson.SetObject();
+@@ -96,6 +78,7 @@
+     getConfig().Write();
+ }
+ 
++SC2_RECORD_SEARCH_HOOK(onDismissFlowCoordinator, &HMUI::FlowCoordinator::DismissFlowCoordinator)
+ MAKE_HOOK_MATCH(
+     onDismissFlowCoordinator,
+     &HMUI::FlowCoordinator::DismissFlowCoordinator,

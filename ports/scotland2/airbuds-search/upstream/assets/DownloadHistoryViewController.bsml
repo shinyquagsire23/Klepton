@@ -1,0 +1,13 @@
+<vertical xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+    xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd' horizontal-fit="Unconstrained" pad-left="24" pad-right="24">
+
+    <!-- Header -->
+    <horizontal>
+        <text text='Downloads' align="Center" font-align="Center"/>
+    </horizontal>
+
+    <vertical horizontal-fit="Unconstrained">
+        <list id='customSongsList_' show-scrollbar='true' stick-scrolling="true"/>
+    </vertical>
+
+</vertical>

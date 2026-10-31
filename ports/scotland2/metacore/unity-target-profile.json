@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "unitySha256": "8203664e3b9203e9731251ea958ca2b1d9f0fc1e3b10032c34a61e5ee8068891",
+  "target": {
+    "name": "delete_object_internal_step1",
+    "vaddr": "0x511008",
+    "expect": "0xd10083ff"
+  },
+  "entryWords": [
+    "0xd10083ff",
+    "0xa9014ffe",
+    "0xf0007208",
+    "0xf947a908",
+    "0xaa0003f3",
+    "0xf90007e0"
+  ],
+  "callsites": [
+    {
+      "vaddr": "0x5108b8",
+      "expect": "0x940001d4"
+    },
+    {
+      "vaddr": "0x5e86f4",
+      "expect": "0x97fca245"
+    }
+  ],
+  "lookup": "Common native cleanup before instance ID is cleared: +0x5108a8 calls +0x511008; GameObject deletion list cleanup +0x5e86cc also calls +0x511008 directly at +0x5e86f4. This bypasses preliminary +0x5107ec, which failed the real GameObject destruction callback test. Entry has void(Object*) ABI; body reads ID at +8 and later clears it.",
+  "status": "Corrected common cleanup target structurally validated; physical immediate/deferred callback re-test pending.",
+  "bodyWords": [
+    {
+      "vaddr": "0x511064",
+      "expect": "0xb9400a68"
+    },
+    {
+      "vaddr": "0x5110c8",
+      "expect": "0xb900091f"
+    }
+  ],
+  "rejectedTargets": [
+    {
+      "vaddr": "0x8d2898",
+      "reason": "Upstream offset is an interior BL in supplied Unity."
+    },
+    {
+      "vaddr": "0x5107ec",
+      "reason": "Physical destruction probe missed callback. GameObject batch deletion bypasses this preliminary helper; boot-first.log result2."
+    }
+  ]
+}

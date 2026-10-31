@@ -1,0 +1,62 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "NDK Build",
+            "detail": "Builds the library using ndk-build.cmd",
+            "type": "shell",
+            "command": "ndk-build",
+            "windows": {
+                "command": "ndk-build.cmd"
+            },
+            "args": ["NDK_PROJECT_PATH=.", "APP_BUILD_SCRIPT=./Android.mk", "NDK_APPLICATION_MK=./Application.mk"],
+            "group": "build",
+            "options": {
+                "env": {}
+            }
+        },
+        {
+            "label": "Powershell Build",
+            "detail": "Builds the library using Powershell (recommended)",
+            "type": "shell",
+            "command": "./build.ps1",
+            "windows": {
+                "command": "./build.ps1"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "options": {
+                "env": {}
+            }
+        },
+        {
+            "label": "Powershell Build and Copy",
+            "detail": "Builds and copies the library to the Quest using adb and force-quits Beat Saber",
+            "type": "shell",
+            "command": "./copy.ps1",
+            "windows": {
+                "command": "./copy.ps1"
+            },
+            "group": "build",
+            "options": {
+                "env": {}
+            }
+        },
+        {
+            "label": "BMBF Build",
+            "detail": "Builds a .zip to be uploaded into BMBF",
+            "type": "shell",
+            "command": "./buildBMBF.ps1",
+            "windows": {
+                "command": "./buildBMBF.ps1"
+            },
+            "args": [],
+            "group": "build",
+            "options": {
+                "env": {}
+            }
+        },
+    ]
+}

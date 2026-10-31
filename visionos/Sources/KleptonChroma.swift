@@ -28,7 +28,13 @@ struct KLChromaSettings: Codable, Equatable {
     /// a person reaching for a real object wants; off is what a guest that
     /// draws its own hands wants, because two pairs of hands in one place is
     /// worse than either alone.
-    var handMatting = true
+    var handMatting = KLChromaSettings.targetHandMatting
+
+    /// The target's own default (targets.py "hand_matting", baked into
+    /// Info.plist as KLHandMattingDefault). Anything but "0" is on, so a bundle
+    /// built without the key behaves as before.
+    static let targetHandMatting: Bool =
+        (Bundle.main.object(forInfoDictionaryKey: "KLHandMattingDefault") as? String) != "0"
 
     /// SIMD3 is not Codable, so the colour rides as three keyed floats. Spelled
     /// out rather than reached for a wrapper: this is the file format, and a
@@ -71,6 +77,7 @@ final class KleptonChroma: ObservableObject {
     static let shared = KleptonChroma()
 
     private static let defaultsKey = "klepton.chroma"
+    private static let mattingDefaultKey = "klepton.chroma.handMattingDefault"
 
     @Published var settings = KLChromaSettings() { didSet { publish(); save() } }
 
@@ -87,6 +94,19 @@ final class KleptonChroma: ObservableObject {
             s = saved
             NSLog("[chroma] restored: \(Self.describe(s))")
         }
+        // A saved blob always carries handMatting, so a build that CHANGES the
+        // target's default would never be seen by an app that has run once —
+        // which is every installed one. Remember which default the blob was
+        // written under; when the build's differs, the new default applies
+        // once, and the panel's toggle decides again from there. No record
+        // means a blob from before this existed, i.e. the old default of on.
+        let builtDefault = KLChromaSettings.targetHandMatting
+        let savedUnder = UserDefaults.standard.object(forKey: Self.mattingDefaultKey) as? Bool ?? true
+        if savedUnder != builtDefault {
+            s.handMatting = builtDefault
+            NSLog("[chroma] hand-matting default changed to \(builtDefault ? 1 : 0); applied")
+        }
+        UserDefaults.standard.set(builtDefault, forKey: Self.mattingDefaultKey)
         let env = ProcessInfo.processInfo.environment
         if let v = env["KL_CHROMA"]       { s.enabled = v != "0" }
         if let v = env["KL_CHROMA_COLOR"] {
@@ -104,7 +124,17 @@ final class KleptonChroma: ObservableObject {
     /// What the App reads to decide whether the system draws the user's hands
     /// over the guest. Published, so toggling it re-evaluates the scene rather
     /// than waiting for a relaunch.
-    var upperLimbVisibility: Visibility { settings.handMatting ? .automatic : .hidden }
+    var upperLimbVisibility: Visibility {
+        // Half-Life: Alyx draws its own hands where the player's are, so the
+        // system's cut-out of the real arms — and of the controllers in them —
+        // is a second pair on top of the game's. Hidden for it whatever the
+        // matting switch was last left at; KL_HAND_MATTING=1 on a launch brings
+        // the cut-out back for looking at alignment.
+        if klIsAlyx(), ProcessInfo.processInfo.environment["KL_HAND_MATTING"] != "1" {
+            return .hidden
+        }
+        return settings.handMatting ? .automatic : .hidden
+    }
 
     /// Whether the immersive space opens FULLY immersive (no passthrough). This
     /// lives here — on the object the scene already observes — rather than in a

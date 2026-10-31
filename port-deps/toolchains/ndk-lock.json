@@ -1,0 +1,10 @@
+{
+  "version": "27.2.12479018",
+  "release": "r27c",
+  "url": "https://dl.google.com/android/repository/android-ndk-r27c-darwin.zip",
+  "manifest": "https://dl.google.com/android/repository/repository2-3.xml",
+  "sha1": "0217c10ffbec496bb9fbfbb3c6fc2477c6b77297",
+  "sha256": "8c5685457c58a88527367d46d3f14e8c727d962c39f85344cff0c0768a73c3b7",
+  "size": 836128272,
+  "purpose": "Android C++ ABI bridge; supplied beatsaber-hook binary contains r27c identifier."
+}

@@ -1,0 +1,105 @@
+{
+  "$schema": "https://raw.githubusercontent.com/QuestPackageManager/QPM.Package/refs/heads/main/qpm.shared.schema.json",
+  "config": {
+    "version": "0.4.0",
+    "sharedDir": "shared",
+    "dependenciesDir": "extern",
+    "info": {
+      "name": "scotland2",
+      "id": "scotland2",
+      "version": "0.1.7",
+      "url": "https://github.com/sc2ad/scotland2",
+      "additionalData": {
+        "overrideSoName": "libsl2.so"
+      }
+    },
+    "workspace": {
+      "scripts": {
+        "build": [
+          "pwsh ./build.ps1"
+        ],
+        "copy": [
+          "pwsh ./copy.ps1"
+        ]
+      },
+      "qmodIncludeDirs": [],
+      "qmodIncludeFiles": [],
+      "qmodOutput": null
+    },
+    "dependencies": [
+      {
+        "id": "fmt",
+        "versionRange": "^11.0.0",
+        "additionalData": {
+          "private": true
+        }
+      },
+      {
+        "id": "capstone",
+        "versionRange": "^0.1.0",
+        "additionalData": {
+          "private": true
+        }
+      },
+      {
+        "id": "flamingo",
+        "versionRange": "^1.1.1",
+        "additionalData": {
+          "extraFiles": [
+            "src/fixups.cpp",
+            "src/installer.cpp",
+            "src/page-allocator.cpp"
+          ],
+          "private": true
+        }
+      }
+    ]
+  },
+  "restoredDependencies": [
+    {
+      "dependency": {
+        "id": "fmt",
+        "versionRange": "=11.0.2",
+        "additionalData": {
+          "headersOnly": true,
+          "branchName": "version/v11_0_2",
+          "compileOptions": {
+            "systemIncludes": [
+              "fmt/include/"
+            ],
+            "cppFlags": [
+              "-DFMT_HEADER_ONLY"
+            ]
+          }
+        }
+      },
+      "version": "11.0.2"
+    },
+    {
+      "dependency": {
+        "id": "capstone",
+        "versionRange": "=0.1.0",
+        "additionalData": {
+          "staticLinking": true,
+          "soLink": "https://github.com/sc2ad/capstone-qpm/releases/download/v0.1.0/libcapstone.a",
+          "overrideSoName": "libcapstone.a"
+        }
+      },
+      "version": "0.1.0"
+    },
+    {
+      "dependency": {
+        "id": "flamingo",
+        "versionRange": "=1.1.2",
+        "additionalData": {
+          "soLink": "https://github.com/sc2ad/Flamingo/releases/download/v1.1.2/libflamingo.so",
+          "debugSoLink": "https://github.com/sc2ad/Flamingo/releases/download/v1.1.2/debug_libflamingo.so",
+          "overrideSoName": "libflamingo.so",
+          "modLink": "https://github.com/sc2ad/Flamingo/releases/download/v1.1.2/flamingo.qmod",
+          "branchName": "version/v1_1_2"
+        }
+      },
+      "version": "1.1.2"
+    }
+  ]
+}

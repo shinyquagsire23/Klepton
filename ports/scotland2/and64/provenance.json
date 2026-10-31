@@ -1,0 +1,8 @@
+{
+  "repository": "QuestPackageManager/beatsaber-hook",
+  "commit": "dd9f4cf0565ff46f9c2844a1512bc1786a7f2446",
+  "source": "shared/inline-hook/And64InlineHook.cpp",
+  "sourceSha256": "bf37f249ff86b56a20330a8a92c530a83882359dcfe5359e8d71a56a7acc5683",
+  "mode": "SC2_AOT_HOOKS selects data-only prepared-entry backend; default source preserved",
+  "scope": "Source adapter; released QMODs embed/inline hidden And64 code and need rebuilding or independently verified instrumentation."
+}

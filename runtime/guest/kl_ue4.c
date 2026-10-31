@@ -16,11 +16,15 @@
 #include "kl_egl.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_steamapi.h"
+#include "kl_openxr.h"
 #include "kl_mediandk.h"
 #include <sys/stat.h>
 #include "kl_aaudio.h"
 #include "kl_obbmap.h"
 #include "kl_opensl.h"
+#include "kl_env.h"
+#include "kl_vulkan.h"
 
 // The library the chain ENDS at — "libUE4.so" for every UE4 title, and
 // "libUnreal.so" for UE5, which renamed the monolith and its Java package in
@@ -74,6 +78,14 @@ static const char *ue4_meta_str(const char *key);   // defined below; used by co
 // is skipped with a note; only the entry library failing is fatal.
 static const char *const UE4_CHAIN[] = {
     "libc++_shared.so",
+    // Older UE4 (pre-4.20 NDK toolchains) links GNU STL instead of libc++:
+    // libUE4 NEEDS libgnustl_shared.so and its static initializers call
+    // std::ios_base::Init (_ZNSt8ios_base4InitC1Ev, no __1 namespace), which
+    // only gnustl exports. Absent from the chain, Tales from the Galaxy's Edge
+    // (x3484270071659289) died on that unresolved import before JNI_OnLoad.
+    "libgnustl_shared.so",
+    "libEOSSDK.so",         // Epic Online Services — Tetris Effect links it,
+                            // RE4 and Deadpool VR do not ship it
     // FMOD, dependencies first (libfmodstudio is built on the libfmod core).
     // libUE4 has these as DT_NEEDED and binds FMOD_* / FMOD::* against them, but
     // the translated libUE4 carries no LC_LOAD_DYLIB, so a symbol only resolves
@@ -82,8 +94,24 @@ static const char *const UE4_CHAIN[] = {
     // first FMOD_Debug_Initialize aborted. Loaded here, before libUE4, they bind.
     "libfmod.so",
     "libfmodstudio.so",
-    "libovraudio64.so",     // the Oculus audio spatializer
+    "libovraudio64.so",     // the Oculus audio spatializer — RE4/Deadpool VR
+                            // ship it, Tetris Effect does not
     "libplaycore.so",       // Google Play core — the OBB downloader's half
+    // Vivox voice chat, the same case as FMOD: libUE4 binds its vx_* imports
+    // against it, and without it in the pool the first call — Medal of Honor:
+    // Above and Beyond's vx_jni_set_java_vm at start — aborted as unresolved.
+    "libvivox-sdk.so",
+    // Virtuix Omni treadmill support, the same case again: libUE4 NEEDS it and
+    // binds OmniConnectShared_* against it. Absent from the pool, Zero Caliber 2
+    // (x6072194326150034) aborted on OmniConnectShared_Create right after Vivox
+    // came up. Self-contained (libc only); skipped where a guest does not ship it.
+    "libOmniConnectShared.so",
+    // Heroic Labs' Nakama client (its C API: createDefaultNakamaClient,
+    // NClient_*, NSession_*), the same case once more: libUE4 binds against it,
+    // and Contractors (x2436897736439055) aborted on createDefaultNakamaClient
+    // as unresolved right after the platform check (2026-10-28). Built on
+    // libc++_shared, so after it; skipped where a guest does not ship it.
+    "libnakama-cpp.so",
     UE4_LIB,
 };
 
@@ -99,11 +127,65 @@ static char g_libdir[1024];
 static char g_err[512] = "no error";
 static kl_image *g_ue4;
 
+// ---- the 4.x / 5.x dialect ------------------------------------------------
+//
+// Between UE4.27 and UE5, Epic renamed its Java package and its entry library:
+// `com.epicgames.ue4.*` became `com.epicgames.unreal.*`, `libUE4.so` became
+// `libUnreal.so`, and with them went the exported native symbols
+// (`Java_com_epicgames_ue4_GameActivity_native*` ->
+// `Java_com_epicgames_unreal_…`) and every `<meta-data>` key the manifest
+// carries. NOTHING ELSE about the door changed: the NativeActivity entry, the
+// onCreate/onResume transcription below, the argument shapes and the
+// AndroidThunkJava_* surface are the same calls under new names.
+//
+// So it is a spelling, not a second door. The entry library, activity class and
+// native prefix are set together from the target row (kl_ue4_configure);
+// manifest keys fall back across the two spellings in ue4_meta_raw; the JNI
+// surface folds `com/epicgames/unreal/` onto `com/epicgames/ue4/` at its
+// class-intern funnel (kl_jni.c, klj_fold_class_name); and guest natives are
+// looked up in both spellings (ue4_native_symbol, below). This prints which
+// spelling the guest is in, read off the MANIFEST — the guest's own statement
+// about itself — beside the entry library, so a mismatch between the two is
+// visible in the first lines of the boot log.
+static void ue4_dialect(FILE *out) {
+    int unreal = kl_jni_manifest_meta("com.epicgames.unreal.GameActivity.ProjectName") != NULL
+              || strcmp(g_entry_so, "libUnreal.so") == 0;
+    if (!out) return;
+    const char *branch = kl_jni_manifest_meta(
+        unreal ? "com.epicgames.unreal.GameActivity.EngineBranch"
+               : "com.epicgames.ue4.GameActivity.EngineBranch");
+    const char *ver = kl_jni_manifest_meta(
+        unreal ? "com.epicgames.unreal.GameActivity.EngineVersion"
+               : "com.epicgames.ue4.GameActivity.EngineVersion");
+    fprintf(out, "  [ue4] dialect:  com.epicgames.%s (%s, engine %s %s)\n",
+            unreal ? "unreal" : "ue4", g_entry_so, branch ? branch : "?", ver ? ver : "?");
+    fflush(out);
+}
+
 // A native of the guest's, by exported symbol. Registered with the JNI surface
 // so `AndroidThunkJava_*` handlers can make the call GameActivity.java would
 // have made; see kl_jni.h's kl_jni_set_guest_native_resolver.
+//
+// The JNI surface asks in 4.27's spelling, because that is the one spelling its
+// tables keep — the same choice kl_jni.c's klj_intern_class_locked makes when
+// it folds `com/epicgames/unreal/` onto `com/epicgames/ue4/`. A 5.x guest
+// exports `Java_com_epicgames_unreal_…`, so the same fold happens HERE, at the
+// one funnel every such lookup passes through, rather than at each call site.
+//
+// What the miss costs is worth naming, because it is silent: on Pinball FX
+// `AndroidThunkJava_InitHMDs` resolved NULL and that is an error nowhere —
+// nativeInitHMDs is simply never called, no HMD module ever gets its PreInit,
+// and the guest runs on with no XR path at all.
 static void *ue4_native_symbol(const char *symbol) {
-    return (g_ue4 && symbol) ? kl_sym(g_ue4, symbol) : NULL;
+    if (!g_ue4 || !symbol) return NULL;
+    void *p = kl_sym(g_ue4, symbol);
+    if (p) return p;
+    static const char ue4_pfx[] = "Java_com_epicgames_ue4_";
+    if (strncmp(symbol, ue4_pfx, sizeof ue4_pfx - 1)) return NULL;
+    char alt[256];
+    snprintf(alt, sizeof alt, "Java_com_epicgames_unreal_%s",
+             symbol + sizeof ue4_pfx - 1);
+    return kl_sym(g_ue4, alt);
 }
 
 static int ue4_fail(const char *why) {
@@ -184,8 +266,11 @@ static void ue4_report_command_line(FILE *out) {
 // user runs on device, where an env var cannot be set. olar (UE5) quits during
 // PreInit with nothing in our capture; forcing its engine log out is the only
 // diagnostic. Remove from this list once its fatal is understood and fixed.
+// x5190288877703616 is twd2 as a store install (The Walking Dead: Saints &
+// Sinners - Chapter 2: Retribution, 32342700): it is listed so that the
+// override file below is written for it too and carries twd2's loading fix.
 static int ue4_stdout_default(void) {
-    static const char *on[] = { "olar", "wrath2", "twd2" };
+    static const char *on[] = { "olar", "wrath2", "twd2", "x5190288877703616" };
     const char *t = kl_driver_target_name();
     if (t) for (unsigned i = 0; i < sizeof on / sizeof on[0]; i++)
         if (strcmp(t, on[i]) == 0) return 1;
@@ -323,10 +408,10 @@ static void ue4_maybe_stdout_cmdline(const char *proj) {
             //     FShaderPipelineCache::NumPrecompilesRemaining() reaching 0. The
             //     precompile stalls (~529 PSOs then never drains), so the segment
             //     never advances to Calibration. DISABLING the cache made it worse
-            //     (the segment then never sees the cache open/complete). Instead a
-            //     guest patch forces NumPrecompilesRemaining()->0 (see
-            //     kl_guestpatch.c "wrath2-pso-done") so the segment completes while
-            //     the cache still opens normally; PSOs compile on demand.
+            //     (the segment then never sees the cache open/complete). A guest
+            //     patch that forced NumPrecompilesRemaining()->0 stood in for it
+            //     and is gone — see kl_guestpatch.c: the precompile drains now,
+            //     and the segment is left to the game.
             snprintf(extra_buf, sizeof extra_buf,
                      " -ini:Engine:[/Script/AndroidRuntimeSettings.AndroidRuntimeSettings]:"
                      "bSupportsVulkan=True%s",
@@ -339,8 +424,11 @@ static void ue4_maybe_stdout_cmdline(const char *proj) {
         // finalisation deadlock wrath2 hit, so the render thread never draws (0
         // glDraw* all run) and the eyes composite black. Same lever: run all
         // loading on the game thread. No Vulkan gate here — twd2 is GLES.
-        // KL_TWD2_ALT=1 restores the async thread to A/B.
-        else if (t && strcmp(t, "twd2") == 0 && !kl_env_on("KL_TWD2_ALT", 0))
+        // KL_TWD2_ALT=1 restores the async thread to A/B. The store install
+        // (x5190288877703616) is the same build and stayed black the same way
+        // on device: fence set, 0 layers, 0 draws, only shader compiles.
+        else if (t && (strcmp(t, "twd2") == 0 || strcmp(t, "x5190288877703616") == 0) &&
+                 !kl_env_on("KL_TWD2_ALT", 0))
             snprintf(extra_buf, sizeof extra_buf,
                      " -noasyncloadingthread"
                      " -ini:Engine:[ConsoleVariables]:s.AsyncLoadingThreadEnabled=0");
@@ -362,6 +450,196 @@ static void ue4_maybe_stdout_cmdline(const char *proj) {
                     "(engine log will follow on stdout)\n", ov, args, extra);
 }
 
+// KL_UE4_PSO_LIST=1 — Moss from Steam compiles Unreal's own pipeline list at
+// start, as the Meta build does.
+//
+// Both builds ship the list Polyarc recorded (Content/PipelineCaches/Android/
+// Moss_SF_VULKAN_ES31_ANDROID.stable.upipelinecache). The Meta build has
+// r.ShaderPipelineCache.Enabled=1 and compiles about 350 pipelines before its
+// first frames; the Steam build sets it to 0 (Config/Android/Extensions/
+// SteamAndroidEngine.ini — on Steam Frame, Steam pre-caches shaders itself), so
+// here every one of them waits for its first draw, a third of a second each on
+// the headset. -dpcvars on the command line does not reach this cvar (a Mac run
+// still compiled 50); a [ConsoleVariables] line in the game's user Engine.ini
+// does (357), and the game keeps the line when it saves its settings. So the
+// line is written there before the engine starts, and taken out again when the
+// switch is off — the file outlives every build. Every other line of the file
+// is left as it is.
+// One `key=value` line in one [section] of a game's user Engine.ini
+// (<files>/<native>/<Project>/<Project>/Saved/Config/Android/Engine.ini), put
+// there before the engine starts when `on`, and taken out again when not — the
+// file outlives every build. Every other line of the file is left as it is.
+// Returns 0 when the file already said what it should, 1 when it was written,
+// -1 when it could not be.
+static int ue4_user_engine_ini(const char *project, const char *section,
+                               const char *key, const char *value, int on,
+                               char *path_out, size_t path_cap) {
+    char dir[1024], path[1100], tmp[1110];
+    snprintf(dir, sizeof dir, "%s/%s/%s/%s/Saved/Config/Android",
+             kl_jni_files_dir(), g_native_dir, project, project);
+    snprintf(path, sizeof path, "%s/Engine.ini", dir);
+    snprintf(tmp, sizeof tmp, "%s.kltmp", path);
+    if (path_out) snprintf(path_out, path_cap, "%s", path);
+    size_t sl = strlen(section), kl = strlen(key), vl = strlen(value);
+
+    char *old = NULL; size_t n = 0;
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+        if (len > 0 && len < (8 << 20) && (old = malloc((size_t)len + 1)))
+            n = fread(old, 1, (size_t)len, f);
+        fclose(f);
+        if (old) old[n] = 0;
+    }
+    if (!old && !on) return 0;
+
+    // Copy the file line by line, without any line of ours: a key line in the
+    // section is dropped, and the section header remembered so the line goes
+    // right under it when the switch is on.
+    size_t cap = n + sl + kl + vl + 16;
+    char *nw = malloc(cap);
+    if (!nw) { free(old); return -1; }
+    size_t w = 0;
+    int in_sec = 0, had_sec = 0, had_key = 0, was_on = 0;
+    const char *p = old ? old : "";
+    while (*p) {
+        const char *e = strchr(p, '\n');
+        size_t ll = e ? (size_t)(e - p + 1) : strlen(p);
+        const char *s = p;
+        while (s < p + ll && (*s == ' ' || *s == '\t')) s++;
+        if (*s == '[') in_sec = !strncmp(s, section, sl);
+        int keyline = in_sec && !strncmp(s, key, kl) && (s[kl] == '=' || s[kl] == ' ');
+        if (keyline) {
+            had_key = 1;
+            const char *v = strchr(s, '=');
+            was_on |= v && !strncmp(v + 1, value, vl);
+        } else {
+            memcpy(nw + w, p, ll); w += ll;
+            if (in_sec && *s == '[' && on && !had_sec) {
+                if (nw[w - 1] != '\n') nw[w++] = '\n';
+                w += (size_t)snprintf(nw + w, cap - w, "%s=%s\n", key, value);
+                had_sec = 1;
+            }
+        }
+        p += ll;
+    }
+    if (on && !had_sec) {
+        if (w && nw[w - 1] != '\n') nw[w++] = '\n';
+        w += (size_t)snprintf(nw + w, cap - w, "\n%s\n%s=%s\n", section, key, value);
+    }
+    free(old);
+    if (on ? (had_key && was_on) : !had_key) {   // already as it should be
+        free(nw);
+        return 0;
+    }
+    char mk[1024];
+    snprintf(mk, sizeof mk, "%s/%s", kl_jni_files_dir(), g_native_dir);
+    const char *const parts[] = { project, project, "Saved", "Config", "Android" };
+    for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
+        mkdir(mk, 0777);
+        strncat(mk, "/", sizeof mk - strlen(mk) - 1);
+        strncat(mk, parts[i], sizeof mk - strlen(mk) - 1);
+    }
+    mkdir(mk, 0777);
+    f = fopen(tmp, "wb");
+    int ok = f && fwrite(nw, 1, w, f) == w;
+    if (f && fclose(f) != 0) ok = 0;
+    if (ok) ok = rename(tmp, path) == 0;
+    else remove(tmp);
+    free(nw);
+    return ok ? 1 : -1;
+}
+
+static void ue4_moss_steam_pso_list(FILE *out) {
+    const char *t = kl_driver_target_name();
+    if (!t || strcmp(t, "moss") || !kl_steamapi_shipped()) return;
+    int on = kl_env_on("KL_UE4_PSO_LIST", 0);
+    char path[1100];
+    int r = ue4_user_engine_ini("MossGame", "[ConsoleVariables]",
+                                "r.ShaderPipelineCache.Enabled", "1", on, path, sizeof path);
+    if (!out) return;
+    if (r == 0)
+        fprintf(out, "  [ue4] Moss from Steam: Unreal's own pipeline list %s (KL_UE4_PSO_LIST)\n",
+                on ? "on, as before" : "off, as the game ships");
+    else
+        fprintf(out, "  [ue4] Moss from Steam: Unreal's own pipeline list %s (KL_UE4_PSO_LIST, %s)%s\n",
+                on ? "switched on" : "back off, as the game ships", path,
+                r > 0 ? "" : " — could not write the file");
+}
+
+// KL_UE4_MOBILE_MULTIVIEW_OFF=1 — Star Wars Pinball VR (x3180994211970184,
+// UE 4.25 on GLES) is drawn one eye after the other instead of with mobile
+// multiview.
+//
+// The project ships vr.MobileMultiView=True, and in this engine's
+// FSceneView::FSceneView that cvar alone turns bIsMobileMultiViewEnabled on —
+// whether or not the RHI has multiview (GSupportsMobileMultiView stays 0 here:
+// the GL gateway does not name the extensions to it, see ue4_no_multiview).
+// The eye layer then is DoubleWide, so the renderer goes the non-direct way and
+// reads SceneContext.MobileMultiViewSceneColor in GetMultiViewSceneColor —
+// which was never made: a NULL read at its first scene frame (Mac, 2026-10-19).
+// Told multiview exists (KL_OVRP_GL_ARRAY, the Array eye layout Maestro and
+// Tetris Effect get) it runs, but every eye picture stayed empty, colour and
+// alpha 0. With the cvar off the same cooked shaders run single-view (UE4's own
+// `#define gl_ViewID_OVR 0`) and the room and its "Choose Your Side" screen are
+// in both halves of the eye picture.
+//
+// The cvar is read-only: -dpcvars and the -ini: override on the command line
+// (dropped in a Shipping build) do not reach it; the game's user Engine.ini
+// does. Written there before the engine starts, and taken out again with
+// KL_UE4_MOBILE_MULTIVIEW_OFF=0.
+static void ue4_mobile_multiview_off(FILE *out) {
+    const char *t = kl_driver_target_name();
+    if (!t || strcmp(t, "x3180994211970184")) return;
+    int on = kl_env_on("KL_UE4_MOBILE_MULTIVIEW_OFF", 1);
+    char path[1100];
+    int r = ue4_user_engine_ini("SWP_VR", "[/Script/Engine.RendererSettings]",
+                                "vr.MobileMultiView", "False", on, path, sizeof path);
+    if (out)
+        fprintf(out, "  [ue4] mobile multiview %s in the game's Engine.ini "
+                     "(KL_UE4_MOBILE_MULTIVIEW_OFF%s%s)%s\n",
+                on ? "off" : "as the project ships it", r > 0 ? ", " : "",
+                r > 0 ? path : "", r < 0 ? " — could not write the file" : "");
+}
+
+// KL_UE4_NO_OCCLUSION=0|1 — Roboquest VR, Meta Store build (x9269393463181825,
+// UE 5.6 mobile on Vulkan): the engine's occlusion culling off, so it draws
+// what is in view without first asking the depth buffer whether it is hidden.
+//
+// With foveated rendering on (kl_fove.m) at ANY level — Light, Medium, Strong —
+// objects blinked in and out; with it off they did not (on device, 2026-10-23).
+// Unreal decides visibility from the depth the scene pass leaves: occlusion
+// queries count the pixels of an object's bounds that pass the depth test, and
+// the scene pass also resolves its depth into an image of its own that it
+// stores for later. Under a rasterization rate map both are foveated: a small
+// box in the coarse part covers few or no pixels, and the stored depth is in
+// the physical (compressed) layout, which kl_fove expands for the eye colour
+// only ("nothing reads the eye depth after the eye pass" — this game does).
+// Either way a visible object is judged hidden for a frame and comes back the
+// next. Drawing everything in view costs this GPU little.
+//
+// Written under [ConsoleVariables] in the game's user Engine.ini, which a
+// device profile does not override; =0 takes the lines out again.
+static void ue4_roboquest_no_occlusion(FILE *out) {
+    const char *t = kl_driver_target_name();
+    if (!t || strcmp(t, "x9269393463181825")) return;
+    int on = kl_env_on("KL_UE4_NO_OCCLUSION", 1);
+    char path[1100];
+    static const char *const keys[] = { "r.AllowOcclusionQueries", "r.HZBOcclusion",
+                                        "r.Mobile.HZBOcclusion" };
+    int r = 0;
+    for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
+        int ri = ue4_user_engine_ini("RoboquestVR", "[ConsoleVariables]", keys[i], "0",
+                                     on, path, sizeof path);
+        if (ri < 0) r = -1; else if (ri > 0 && r == 0) r = 1;
+    }
+    if (out)
+        fprintf(out, "  [ue4] occlusion culling %s in the game's Engine.ini "
+                     "(KL_UE4_NO_OCCLUSION%s%s)%s\n",
+                on ? "off" : "as the project ships it", r > 0 ? ", " : "",
+                r > 0 ? path : "", r < 0 ? " — could not write the file" : "");
+}
+
 int kl_ue4_configure(const char *libdir, const char *entry_lib, FILE *out) {
     if (!libdir || !*libdir) return ue4_fail("no library directory");
     snprintf(g_libdir, sizeof g_libdir, "%s", libdir);
@@ -379,6 +657,7 @@ int kl_ue4_configure(const char *libdir, const char *entry_lib, FILE *out) {
     // Everything else — assets, apk, files, native lib dir — has already been
     // set from the target row by kl_target_apply_host(). Restating any of it
     // here is how two descriptions of one guest start to drift.
+    ue4_dialect(out);
     kl_jni_set_activity_class(g_activity);
     // ...and the way back. UE4's Java front end calls natives on itself, so a
     // driver standing in for that Java has to be able to make those calls; the
@@ -397,6 +676,9 @@ int kl_ue4_configure(const char *libdir, const char *entry_lib, FILE *out) {
             ue4_maybe_stdout_cmdline(proj);
         }
     }
+    ue4_moss_steam_pso_list(out);
+    ue4_mobile_multiview_off(out);
+    ue4_roboquest_no_occlusion(out);
     if (out) {
         fprintf(out, "  [ue4] activity: %s\n", g_activity);
         fprintf(out, "  [ue4] userdata: %s\n", kl_jni_files_dir());
@@ -411,6 +693,41 @@ int kl_ue4_configure(const char *libdir, const char *entry_lib, FILE *out) {
         ue4_report_command_line(out);
     }
     return 0;
+}
+
+// libc++_shared's own calls to operator new/delete, bound to libUE4's — which is
+// where bionic binds them, libUE4 being the root of the group that loads
+// libc++_shared. Our chain binds dependencies first, so libc++_shared's slots
+// for these named its own copies (plain malloc/free) instead. Zero Caliber 2
+// (x6072194326150034) is where that mattered: the AWS SDK's log formatting
+// (Aws::InitAPI -> UnrealLogSystem::LogStream) grows an ostringstream inside
+// libc++_shared, so on its own operator new, then libUE4 frees the string inline
+// through FMallocBinned2, which does not know the block and raises a Fatal —
+// AndroidThunkJava_ForceQuit one second into the boot, and a black screen.
+// KL_UE4_CXX_ALLOC=1 for any UE4 title, =0 for the old binding.
+static void ue4_cxx_alloc_from_ue4(FILE *out) {
+    static const char *const ops[] = { "_Znwm", "_Znam", "_ZdlPv", "_ZdaPv" };
+    const char *t = kl_driver_target_name();
+    if (!kl_env_on("KL_UE4_CXX_ALLOC", t && strcmp(t, "x6072194326150034") == 0)) return;
+    kl_image *cxx = kl_find_image("libc++_shared.so");
+    if (!cxx || !g_ue4) return;
+    int moved = 0;
+    for (size_t k = 0; k < sizeof ops / sizeof *ops; k++) {
+        void *own = kl_sym(cxx, ops[k]), *ue4 = kl_sym(g_ue4, ops[k]);
+        if (!own || !ue4) continue;
+        for (size_t i = 0; i < sizeof UE4_CHAIN / sizeof *UE4_CHAIN; i++) {
+            kl_image *img = kl_find_image(UE4_CHAIN[i]);
+            if (!img || img == g_ue4) continue;
+            int n = kl_rebind(img, ops[k], own, ue4);
+            if (n > 0) moved += n;
+        }
+    }
+    if (out) {
+        fprintf(out, "  [ue4] operator new/delete: %d slot(s) that bound libc++_shared's "
+                     "own copies now take %s's, as bionic binds them (KL_UE4_CXX_ALLOC)\n",
+                moved, UE4_LIB);
+        fflush(out);
+    }
 }
 
 int kl_ue4_load(FILE *out) {
@@ -465,6 +782,7 @@ int kl_ue4_load(FILE *out) {
         snprintf(g_err, sizeof g_err, "%s is not in the chain", g_entry_so);
         return 1;
     }
+    ue4_cxx_alloc_from_ue4(out);     // before any initializer allocates
 
     for (size_t i = 0; i < sizeof UE4_CHAIN / sizeof *UE4_CHAIN; i++) {
         char path[1200];
@@ -475,55 +793,58 @@ int kl_ue4_load(FILE *out) {
         kl_run_init(img);
     }
 
-    // FMOD's Android platform layer — the AudioTrack/OpenSL output and the JavaVM
-    // it needs for AudioManager queries — is set up in libfmod's JNI_OnLoad, which
-    // on Android is called by System.loadLibrary("fmod"). Here libfmod is mapped by
-    // the chain above (kl_load_auto), which only runs DT_INIT, never JNI_OnLoad. So
-    // call it explicitly, with the synthetic JavaVM, before libUE4's own JNI_OnLoad.
-    // Without it FMOD::getGlobals returns FMOD_ERR_INTERNAL (28) -> System::create
-    // fails -> Studio never comes up -> no banks, no events (vampire: silent). The
-    // DT_NEEDED path has its own hook (kl_maybe_jni_onload); this covers the UE4
-    // chain, which is how every FMOD title here actually loads it.
-    {
-        char fpath[1200];
-        snprintf(fpath, sizeof fpath, "%s/libfmod.so", g_libdir);
-        kl_image *fmod = kl_find_image(fpath);
-        if (fmod) {
-            int (*fonload)(void *, void *) = (int (*)(void *, void *))
-                kl_sym(fmod, "JNI_OnLoad");
-            if (fonload) {
-                kl_jni_local_frame_push();
-                int fr = fonload(kl_jni_vm(), NULL);
-                kl_jni_local_frame_pop();
-                if (out) { fprintf(out, "  libfmod JNI_OnLoad -> 0x%08x "
-                                        "(FMOD Android platform init)\n", fr); fflush(out); }
-            }
-        }
-    }
-
-    // JNI_OnLoad. UE4 exports all three doors — JNI_OnLoad,
-    // ANativeActivity_onCreate and android_main — and Android runs them in that
-    // order: System.loadLibrary first (which is what calls JNI_OnLoad), then
-    // the activity, then the engine's own thread inside android_main.
+    // JNI_OnLoad — for EVERY library in the chain that exports one, not just
+    // libUE4.
     //
-    // NOT fatal if it is absent, unlike the Unity path where JNI_OnLoad IS the
-    // entry point. Here it is the engine registering its GameActivity natives,
-    // and a build that registers them statically instead would be a different
-    // shape rather than a broken one — so this reports and carries on, and the
+    // UE4 exports all three doors — JNI_OnLoad, ANativeActivity_onCreate and
+    // android_main — and Android runs them in that order: System.loadLibrary
+    // first (which is what calls JNI_OnLoad), then the activity, then the
+    // engine's own thread inside android_main.
+    //
+    // The part that was missing is that GameActivity.java calls
+    // System.loadLibrary for each packaged library, so Android's linker calls
+    // JNI_OnLoad on each of them — that is the ONLY moment a library gets
+    // handed a JavaVM*, and a library loaded as somebody's DT_NEEDED never
+    // gets one. Running it for libUE4 alone left every other library in the
+    // chain without a VM, and the cost of that was invisible until it was
+    // enormous: libEOSSDK.so caches the VM in its JNI_OnLoad, and without it
+    // `EOS_Initialize` returns **17000, EOS_Android_JavaVMNotStored**. Epic
+    // Online Services then never starts, the Redpoint subsystem factory
+    // produces nothing, and Tetris Effect dereferences the resulting null
+    // `GetOnlineSubsystem(FName("RedpointEOS"))` at level BeginPlay — a
+    // SIGSEGV an hour of rendering work away from the missing call.
+    //
+    // Chain order, dependencies first, with libUE4 last exactly as it is in
+    // UE4_CHAIN: a library's JNI_OnLoad may call into what it links against.
+    //
+    // NOT fatal if a library has no JNI_OnLoad, and not fatal if libUE4's is
+    // absent either, unlike the Unity path where JNI_OnLoad IS the entry
+    // point. Here it is the engine registering its GameActivity natives, and a
+    // build that registers them statically instead would be a different shape
+    // rather than a broken one — so this reports and carries on, and the
     // NativeActivity door is what the run actually turns on.
     typedef int (*jni_onload_fn)(void *vm, void *reserved);
-    jni_onload_fn onload = (jni_onload_fn)kl_sym(g_ue4, "JNI_OnLoad");
-    if (!onload) {
-        if (out) fprintf(out, "  no JNI_OnLoad — the activity door is the entry\n");
-        return 0;
+    int ue4_saw_onload = 0;
+    for (size_t i = 0; i < sizeof UE4_CHAIN / sizeof *UE4_CHAIN; i++) {
+        char path[1200];
+        snprintf(path, sizeof path, "%s/%s", g_libdir, UE4_CHAIN[i]);
+        kl_image *img = kl_find_image(path);
+        if (!img) continue;
+        jni_onload_fn onload = (jni_onload_fn)kl_sym(img, "JNI_OnLoad");
+        if (!onload) continue;
+        kl_jni_local_frame_push();
+        int version = onload(kl_jni_vm(), NULL);
+        kl_jni_local_frame_pop();
+        if (img == g_ue4) ue4_saw_onload = 1;
+        if (out) {
+            fprintf(out, "  JNI_OnLoad %-22s returned 0x%08x\n",
+                    UE4_CHAIN[i], version);
+            fflush(out);
+        }
     }
-    kl_jni_local_frame_push();
-    int version = onload(kl_jni_vm(), NULL);
-    kl_jni_local_frame_pop();
-    if (out) {
-        fprintf(out, "  JNI_OnLoad returned 0x%08x\n", version);
-        fflush(out);
-    }
+    if (!ue4_saw_onload && out)
+        fprintf(out, "  no JNI_OnLoad in %s — the activity door is the entry\n",
+                UE4_LIB);
     return 0;
 }
 
@@ -587,11 +908,18 @@ typedef void (*ue4_fn_ZI)(void *, void *, ue4_jboolean, int);
 typedef void (*ue4_fn_Z)(void *, void *, ue4_jboolean);
 typedef void (*ue4_fn_ZZssZsZ)(void *, void *, ue4_jboolean, ue4_jboolean,
                                void *, void *, ue4_jboolean, void *, ue4_jboolean);
+// UE 4.21 and older: nativeSetGlobalActivity without bPublicLogFiles —
+// (bUseExternalFilesDir, internalFilePath, externalFilePath, bOBBinAPK, APKFilename).
+typedef void (*ue4_fn_ZssZs)(void *, void *, ue4_jboolean, void *, void *, ue4_jboolean, void *);
 typedef void (*ue4_fn_sssss)(void *, void *, void *, void *, void *, void *, void *);
 typedef void (*ue4_fn_ssIIs)(void *, void *, void *, void *, int, int, void *);
 // UE 4.26+ grew a TargetSDKVersion int as the 2nd arg of
 // nativeSetAndroidVersionInformation: (String, int, String, String, String, String).
 typedef void (*ue4_fn_sIssss)(void *, void *, void *, int, void *, void *, void *, void *);
+// (String, String): the Redpoint EOS plugin's nativeSetEOSCacheDirectories.
+typedef void (*ue4_fn_ss)(void *, void *, void *, void *);
+// (String[]): nativeSetConfigRulesVariables.
+typedef void (*ue4_fn_as)(void *, void *, void *);
 
 static void *ue4_native(const char *name) {
     if (!g_ue4) return NULL;
@@ -680,16 +1008,48 @@ static void kl_ue4_java_create(FILE *out) {
     void *jinternal = kl_jni_new_string(files);
     void *jexternal = kl_jni_new_string(files);
     void *japk      = kl_jni_new_string(kl_jni_apk_path());
-    UE4_CALL(out, "nativeSetGlobalActivity", ue4_fn_ZZssZsZ,
-             ue4_meta_bool("com.epicgames.ue4.GameActivity.bUseExternalFilesDir"),
-             ue4_meta_bool("com.epicgames.ue4.GameActivity.bPublicLogFiles"),
-             jinternal, jexternal,
-             ue4_meta_bool("com.epicgames.ue4.GameActivity.bPackageDataInsideApk"),
-             japk,
-             // The Java's last argument is `(ApplicationInfo.flags &
-             // FLAG_DEBUGGABLE) == 0`. A release APK unpacked from a device is
-             // not debuggable.
-             (ue4_jboolean)1);
+    // The shape of this native is the engine's, like nativeSetAndroidVersion-
+    // Information's below, and the manifest's EngineVersion says which. UE 4.21
+    // declares it WITHOUT bPublicLogFiles: (bUseExternalFilesDir, internalFilePath,
+    // externalFilePath, bOBBinAPK, APKFilename) — read off the dex of Robo
+    // Recall: Unplugged (x1906871599408213, 4.21.2, 2026-10-14). Called in the
+    // later shape, that engine reads bPublicLogFiles' register as its internal
+    // files path — a null jstring, an empty string — and in a Shipping build
+    // with bUseExternalFilesDir that empty string becomes GFilePathBase: the
+    // game then probes "/UE4Game/RoboRecall/..." at the root of the filesystem
+    // (KL_TRACE_FS), finds neither its paks nor a descriptor, and stops at
+    // "Failed to open descriptor file ../../../RoboRecall/RoboRecall.uproject"
+    // with a black screen. The extra arguments shift bOBBinAPK and APKFilename
+    // the same way. 4.22 and later carry the flag: every UE title in this tree
+    // whose manifest names its engine is 4.24 or newer (4.24.3, 4.25.3, 4.26.2,
+    // 4.27.x, 5.2.0), so none of them takes the old form, and a manifest that
+    // names no engine keeps the call it always had.
+    int global_major = 0, global_minor = 0;
+    {
+        const char *ev = ue4_meta_str("com.epicgames.ue4.GameActivity.EngineVersion");
+        if (sscanf(ev, "%d.%d", &global_major, &global_minor) != 2)
+            global_major = global_minor = 0;
+    }
+    if (global_major == 4 && global_minor <= 21) {
+        if (out) fprintf(out, "  engine %d.%d per the manifest: nativeSetGlobalActivity in the five-argument (4.21) form\n",
+                         global_major, global_minor);
+        UE4_CALL(out, "nativeSetGlobalActivity", ue4_fn_ZssZs,
+                 ue4_meta_bool("com.epicgames.ue4.GameActivity.bUseExternalFilesDir"),
+                 jinternal, jexternal,
+                 ue4_meta_bool("com.epicgames.ue4.GameActivity.bPackageDataInsideApk"),
+                 japk);
+    } else {
+        UE4_CALL(out, "nativeSetGlobalActivity", ue4_fn_ZZssZsZ,
+                 ue4_meta_bool("com.epicgames.ue4.GameActivity.bUseExternalFilesDir"),
+                 ue4_meta_bool("com.epicgames.ue4.GameActivity.bPublicLogFiles"),
+                 jinternal, jexternal,
+                 ue4_meta_bool("com.epicgames.ue4.GameActivity.bPackageDataInsideApk"),
+                 japk,
+                 // The Java's last argument is `(ApplicationInfo.flags &
+                 // FLAG_DEBUGGABLE) == 0`. A release APK unpacked from a device is
+                 // not debuggable.
+                 (ue4_jboolean)1);
+    }
 
     // nativeSetWindowInfo(bIsPortrait, DepthBufferPreference)
     UE4_CALL(out, "nativeSetWindowInfo", ue4_fn_ZI,
@@ -708,7 +1068,14 @@ static void kl_ue4_java_create(FILE *out) {
     kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);
     char locale[40];
     snprintf(locale, sizeof locale, "%s_%s", lang, country);
-    void *jrel   = kl_jni_new_string(kl_jni_build_string("VERSION.RELEASE"));
+    // "RELEASE", not "VERSION.RELEASE": kl_jni_build_string matches the FIELD
+    // name within Build / Build$VERSION, and the dotted spelling matched nothing
+    // — so every UE4 guest was told its Android version was the empty string.
+    // Most never look. Moss does: its device-profile rules only enable Vulkan
+    // for `SRC_AndroidVersion` matching "([0-9]+).*" with a major >= 9, and ""
+    // matches nothing, leaving r.Android.DisableVulkanSupport at the base
+    // profile's 1 and the engine at "This device does not support Vulkan".
+    void *jrel   = kl_jni_new_string(kl_jni_build_string("RELEASE"));
     void *jmake  = kl_jni_new_string(kl_jni_build_string("MANUFACTURER"));
     void *jmodel = kl_jni_new_string(kl_jni_build_string("MODEL"));
     void *jbuild = kl_jni_new_string(kl_jni_build_string("DISPLAY"));
@@ -727,27 +1094,28 @@ static void kl_ue4_java_create(FILE *out) {
     // Matter 2, Vampire) is 4.26+, and UE5 (Wanderer, libUnreal) inherited the
     // int-inserted form too. Resident Evil 4 VR (2021, built on 4.25) is the
     // only known five-string guest; it and any future 4.25 title are named here.
-    // The engine version is not cheaply readable from the stripped binary, so
-    // this is a name list rather than a probe — a wrong guess does not corrupt,
-    // it faults loudly in klj_str exactly as TWD2 did, which names the fix.
     //
-    // ...plus one probe, for a 4.25 guest under a name that is not in the list:
-    // Resident Evil 4 adopted from the user's own APK runs as a generic target
-    // (AVP Play names it x<store id>), took the 4.26+ shape, and died in klj_str
-    // exactly as described. The exported GameActivity natives tell the two
-    // apart: 4.26 added nativeOnTrimMemory, nativeOnThermalStatusChangedListener
-    // and nativeSetMemoryAdvisorState (measured: Wrath 2's 4.27 libUE4 exports
-    // all three, RE4's 4.25 none), so a guest exporting NONE of them is 4.25.
-    // Any one present keeps the 4.26+ default, so a 4.26+ build that dropped
-    // one of the three is still read correctly.
+    // Which form a guest takes is its engine's version, and the manifest says
+    // it: com.epicgames.ue4.GameActivity.EngineVersion ("4.27.2" for Wrath 2).
+    // 4.25 and older is the five-string form. Where the manifest does not say,
+    // the names decide as before — "re4", and the same game under its
+    // store-built target, which is how it was sent in as failing: the int 32
+    // read as a jstring, a fault at 0x20 before the first frame (fix 18,
+    // 2026-10-11). A wrong guess does not corrupt, it faults loudly in klj_str
+    // exactly as TWD2 did, which names the fix.
     const char *ue4_tgt = kl_driver_target_name();
-    int is_425 = ue4_tgt && strcmp(ue4_tgt, "re4") == 0;
-    if (!is_425 && !ue4_native("nativeOnTrimMemory") &&
-        !ue4_native("nativeOnThermalStatusChangedListener") &&
-        !ue4_native("nativeSetMemoryAdvisorState")) {
-        is_425 = 1;
-        if (out) fprintf(out, "  [ue4] no 4.26+ natives exported — taking UE 4.25's "
-                              "five-string nativeSetAndroidVersionInformation\n");
+    // Tales from the Galaxy's Edge (x3484270071659289, fix 16) is the third:
+    // an engine old enough to link GNU STL.
+    int is_425 = ue4_tgt && (strcmp(ue4_tgt, "re4") == 0 || strcmp(ue4_tgt, "x2637179839719680") == 0 ||
+                             strcmp(ue4_tgt, "x3484270071659289") == 0);
+    {
+        const char *ev = ue4_meta_str("com.epicgames.ue4.GameActivity.EngineVersion");
+        int major = 0, minor = 0;
+        if (sscanf(ev, "%d.%d", &major, &minor) == 2 && major >= 4) {
+            is_425 = major == 4 && minor <= 25;
+            fprintf(out, "  engine %s per the manifest: nativeSetAndroidVersionInformation in the %s form\n",
+              ev, is_425 ? "five-string (4.25)" : "4.26+");
+        }
     }
     if (is_425) {
         UE4_CALL(out, "nativeSetAndroidVersionInformation", ue4_fn_sssss,
@@ -770,6 +1138,43 @@ static void kl_ue4_java_create(FILE *out) {
     void *jtype = kl_jni_new_string(ue4_meta_str("com.epicgames.ue4.GameActivity.AppType"));
     UE4_CALL(out, "nativeSetObbInfo", ue4_fn_ssIIs,
              jproj, jpkg, (int)version, 0, jtype);
+
+    // nativeSetEOSCacheDirectories(InternalFilesDir, ExternalFilesDir)
+    // Not the engine's: Redpoint's EOS Online Subsystem adds it to onCreate
+    // through its UPL, right after nativeSetObbInfo, with the same two paths
+    // nativeSetGlobalActivity got. FEOSRuntimePlatformAndroid keeps them as
+    // InternalPath/ExternalPath and check()s both when the EOS platform is
+    // initialised; never set, that check() raised SIGTRAP on the game thread
+    // seven seconds into Ghostbusters: Rise of the Ghost Lord
+    // (x4746232908818706, headset log 2026-10-18, just after an
+    // AndroidThunkJava_ForceQuit from the same failure path). Only a build
+    // with that plugin exports the native, so the others are not told it is
+    // missing.
+    if (ue4_native("nativeSetEOSCacheDirectories")) {
+        UE4_CALL(out, "nativeSetEOSCacheDirectories", ue4_fn_ss,
+                 kl_jni_new_string(files), kl_jni_new_string(files));
+    }
+
+    // nativeSetConfigRulesVariables(String[] keyValuePairs)
+    //
+    // GameActivity.onCreate hands the engine the variables its config rules
+    // set — key, value, key, value — evaluated in Java against the device.
+    // Nothing here evaluates config rules, so the answer is the one a device
+    // that no rule matched gets: an empty array. Unreal 5.6 in Meta's fork
+    // (Roboquest VR: x3151760, and the Meta Store build x9269393463181825)
+    // WAITS for the call: its EventWorker's first config-rule lookup parks until
+    // this native has run, so the APP_CMD_START that onStart queues is never
+    // taken off the pipe and the game sits on a black screen with every counter
+    // healthy (KL_TRACE_CONDDUMP, 2026-10-22). Only for this title, so no other
+    // UE5 game is called with anything it was not called with before.
+    {
+        const char *t = kl_driver_target_name();
+        if (t && strcmp(t, "x9269393463181825") == 0 &&
+            ue4_native("nativeSetConfigRulesVariables")) {
+            UE4_CALL(out, "nativeSetConfigRulesVariables", ue4_fn_as,
+                     kl_jni_new_string_array(NULL, 0));
+        }
+    }
 }
 
 // ...and onResume's half, which is the one that starts the engine: the game
@@ -820,12 +1225,146 @@ void kl_ue4_start(FILE *out) {
 }
 void kl_ue4_stop(FILE *out)  { kl_na_stop(out); }
 
+// ------------------------------------------------------- mobile multiview
+//
+// UE4's OpenGL RHI decides mobile multiview ONCE, into two exported globals,
+// and every later decision reads them:
+//
+//   FOpenGLES::bSupportsMobileMultiView   set in FOpenGLES::ProcessExtensions,
+//                                         true only when the GL_EXTENSIONS
+//                                         string names GL_OVR_multiview,
+//                                         GL_OVR_multiview2 AND
+//                                         GL_OVR_multiview_multisampled_-
+//                                         render_to_texture, and both
+//                                         glFramebufferTexture*MultiviewOVR
+//                                         resolve through eglGetProcAddress
+//   GSupportsMobileMultiView              copied from it during RHI init
+//
+// GSupportsMobileMultiView is what GLSLToDeviceCompatibleGLSL branches on when
+// it rewrites every cooked shader (read at libUE4+0x9f0a620 in Tetris Effect):
+//
+//   true  -> it PREPENDS "#extension GL_OVR_multiview2 : enable" and
+//            "layout(num_views = 2) in;" to the shader
+//   false -> it prepends "#define gl_ViewID_OVR 0" instead
+//
+// That false branch is UE4's OWN fallback for a device without the extension,
+// and it turns the identical cooked shader into ordinary single-view ES 3.0.
+// So the multiview wall this gateway hits — ANGLE's Metal backend implements
+// no multiview at all, so every such shader fails to compile, the link fails,
+// and UE4 turns the Fatal into a ForceQuit — is not a wall that has to be
+// climbed. It only has to be told the truth.
+//
+// This gateway does NOT name any of the three extensions and does NOT serve
+// the two entry points, so the honest value of both flags is 0. Writing them
+// is belt-and-braces against a path that sets them from something other than
+// the extension string; when they are already 0 this costs one byte read per
+// pump tick and says nothing.
+//
+// EVERY WORD ABOVE IS ABOUT OPENGL ES, so the clear is gated on the guest
+// actually using the GL gateway (kl_vulkan_guest_active(), inside the
+// function). A Vulkan RHI rewrites no cooked GLSL and never reads an ANGLE
+// extension string; clearing there only forces UE4's two-sequential-view
+// DoubleWide mobile stereo path: on Into the Radius (Vulkan) that path makes
+// static meshes vanish and reappear as the head moves.
+//
+// KL_UE4_MULTIVIEW is a TRI-STATE override of that decision: unset = decide
+// from the RHI, 1 = never clear (the A/B, and the way back if a future ANGLE
+// grows GL_OVR_multiview2), 0 = always clear (also on Vulkan, the way back if a
+// Vulkan guest is ever found that needs the clear).
+static void ue4_no_multiview(void) {
+    static uint8_t *gsupports, *bsupports;
+    static int looked, said, said_vk, ever_vk;
+    static uint8_t saved_g, saved_b;
+    if (!g_ue4) return;
+    // In this fork ANGLE DOES have multiview, and a guest served the Array eye
+    // layout on GL (kl_ovrp_gl_array — Maestro) is named all three extensions
+    // and renders both eyes in one pass through them. Its flags are true
+    // because that is the truth here; clearing them would compile every one of
+    // its shaders single-view against a two-layer target. The clear below is
+    // only for a guest the extensions are not named to, where it is the
+    // belt-and-braces it was written as.
+    if (kl_gl_cap_names_multiview()) return;
+    // TRI-STATE, and the unset state is the interesting one:
+    //   unset -> decide from the RHI the guest actually brought up (below);
+    //   1     -> always leave the guest's answer alone;
+    //   0     -> always clear, even on Vulkan — the way back if a Vulkan guest
+    //            is ever found that needs the clear.
+    const char *knob = kl_env_str("KL_UE4_MULTIVIEW", NULL);
+    int force_keep  = knob && kl_env_on("KL_UE4_MULTIVIEW", 0);
+    int force_clear = knob && !force_keep;
+    if (force_keep) return;
+    if (!looked) {
+        looked = 1;
+        gsupports = ue4_native_symbol("GSupportsMobileMultiView");
+        bsupports = ue4_native_symbol("_ZN9FOpenGLES24bSupportsMobileMultiViewE");
+    }
+    // THE CLEAR IS A STATEMENT ABOUT THE GL GATEWAY, so it may only be made
+    // about a guest that is using it. ANGLE names no GL_OVR_multiview
+    // extension, UE4 prepends `layout(num_views = 2) in;` to every cooked
+    // shader when the flag is true, and the compile failure becomes a
+    // ForceQuit — that is a real wall for a GL guest and the reason this
+    // function exists. A VULKAN RHI rewrites no cooked GLSL and ANGLE is not in
+    // the picture: clearing there buys nothing and forces UE4 onto the
+    // two-sequential-view DoubleWide mobile stereo path the title never shipped
+    // with — on Into the Radius, static meshes that vanish as the head moves.
+    //
+    // kl_vulkan_guest_active() is the honest test rather than a renderer enum:
+    // it is a measurement of what the guest DID (resolved vk* symbols AND
+    // created a VkDevice through us, i.e. it is inside FVulkanDynamicRHI::Init)
+    // rather than a guess. It goes true before the first shader compile reads
+    // the flag, but AFTER some number of pump ticks — so an early tick can
+    // clear a flag the Vulkan RHI set moments earlier. Hence save-and-restore
+    // rather than merely declining future clears.
+    // Sticky: once a Vulkan device has been seen, the guest is a Vulkan guest
+    // for good — at quit vkDestroyDevice leaves none, and a tick after that
+    // would otherwise clear (and announce clearing) a flag nothing reads any
+    // more.
+    if (kl_vulkan_guest_active()) ever_vk = 1;
+    if (!force_clear && ever_vk) {
+        if (saved_g && gsupports) *gsupports = saved_g;
+        if (saved_b && bsupports) *bsupports = saved_b;
+        saved_g = saved_b = 0;
+        if (!said_vk) {
+            said_vk = 1;
+            fprintf(stderr, "  [ue4] mobile multiview left alone — this guest "
+                            "brought up a VULKAN device, so no cooked GLSL is "
+                            "rewritten and the GL gateway's extension string "
+                            "decides nothing. KL_UE4_MULTIVIEW=0 forces the "
+                            "clear back on.\n");
+        }
+        return;
+    }
+    int was = (gsupports && *gsupports) || (bsupports && *bsupports);
+    if (gsupports && *gsupports) saved_g = *gsupports;
+    if (bsupports && *bsupports) saved_b = *bsupports;
+    if (gsupports) *gsupports = 0;
+    if (bsupports) *bsupports = 0;
+    if (was && !said) {
+        said = 1;
+        fprintf(stderr, "  [ue4] mobile multiview was ON — cleared "
+                        "(GSupportsMobileMultiView / FOpenGLES::"
+                        "bSupportsMobileMultiView). The GL gateway names no "
+                        "GL_OVR_multiview extension, so UE4's own non-multiview "
+                        "shader path is the correct one; KL_UE4_MULTIVIEW=1 "
+                        "leaves the guest's answer alone.\n");
+    }
+}
+
+static int g_force_quit;
+void kl_ue4_note_force_quit(void) { __atomic_store_n(&g_force_quit, 1, __ATOMIC_RELEASE); }
+int kl_ue4_force_quit_obeyed(void) { return __atomic_load_n(&g_force_quit, __ATOMIC_ACQUIRE); }
+
 double kl_ue4_pump(double seconds, const volatile int *quit) {
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     double elapsed = 0;
-    for (unsigned t = 0; (quit ? !*quit : 1) && (seconds < 0 || elapsed < seconds); t++) {
+    for (unsigned t = 0; (quit ? !*quit : 1) && (seconds < 0 || elapsed < seconds)
+                         && !kl_ue4_force_quit_obeyed(); t++) {
         kl_ndk_pump_looper(100);
+        // Cheap and idempotent: the RHI decides multiview during its own init,
+        // which is somewhere inside this pump, and the answer is read much
+        // later at the first shader compile.
+        ue4_no_multiview();
         // The UI thread's task queue and the frame clock, on the same thread
         // that turns the looper — which is what makes it the UI thread by the
         // only definition that matters: "am I the UI thread" is answered by
@@ -855,7 +1394,126 @@ void kl_ue4_report(FILE *out) {
     kl_mediandk_report(out);
     kl_ovrp_report(out);
     kl_ovrplat_report(out);
+    // An Unreal guest from Steam (Moss, depot 846472): Steam instead of the
+    // Oculus platform, OpenXR instead of OVRPlugin. Both say nothing for a
+    // guest that used neither.
+    kl_steamapi_report(out);
+    if (kl_openxr_in_use()) kl_openxr_report(out);
     fprintf(out, "\n=== JNI surface ===\n");
     kl_jni_report(out);
     fflush(out);
 }
+
+// --- Medal of Honor: the desk's book and receivers answer a nearby hand ------
+//
+// The game's menu book and telephone receivers in Whitehall are BP_GrabButton
+// actors whose hover reaction is switched off in this build's own data: the
+// class default has TurnHoverAnimsOff = true and UseLabel = false (nothing in
+// the game sets UseLabel, and BFL_Global.SetHighlightForGrabObject only calls
+// HighlightOn behind it), and the level gives them no OnHoverTransform, so the
+// construction script copies their resting place into it. Only the hand opens
+// to say "you can grab this", which players do not read as the main menu.
+//
+// KL_MOH_HOVER (default on for this title): every 30 guest frames, on the game
+// thread, for every BP_GrabButton of the level 001_DesignLevel: UseLabel = 1,
+// TurnHoverAnimsOff = 0 (the game sets it again while its menu is open, and
+// back only when the player leaves the desk area), and — once, while it still
+// equals the resting place — OnHoverTransform = the resting place raised by
+// KL_MOH_HOVER_CM (default 4) cm. The game's own HighlightOn/HighlightOff then
+// play its ButtonLerp timeline there and back. Objects are found through the
+// guest's exported GUObjectArray, matched by FName index (memory reads, no
+// strings) against the UE 4.25 layout: FUObjectItem 24 bytes, 64K a chunk;
+// UObjectBase flags +0x8, index +0xC, class +0x10, name +0x18, outer +0x20;
+// UStruct super +0x40, ChildProperties +0x50; FField next +0x20, name +0x28;
+// FProperty offset +0x4C.
+#include <mach/mach.h>
+typedef struct { uint16_t *data; int32_t num, max; } klmoh_fstring;
+// A read that answers 0 instead of faulting, for a pointer not yet known good.
+static int klmoh_peek(const void *addr, void *out, size_t n) {
+    vm_size_t got = 0;
+    if ((uintptr_t)addr < 0x100000000ull) return 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)(uintptr_t)addr, n,
+                             (vm_address_t)(uintptr_t)out, &got) == KERN_SUCCESS && got == n;
+}
+// An FName (at `fname`) as ASCII, through the guest's own FName::ToString.
+static void klmoh_name(const void *fname, char *buf, size_t cap) {
+    static void (*tostring)(const void *, klmoh_fstring *);
+    static void (*mfree)(void *);
+    if (!tostring) tostring = kl_guest_sym_global("_ZNK5FName8ToStringER7FString");
+    if (!mfree) mfree = kl_guest_sym_global("_ZN7FMemory4FreeEPv");
+    buf[0] = 0;
+    if (!tostring) return;
+    klmoh_fstring s = {0};
+    tostring(fname, &s);
+    size_t n = 0;
+    for (int32_t i = 0; s.data && i < s.num && s.data[i] && n + 1 < cap; i++)
+        buf[n++] = s.data[i] < 128 ? (char)s.data[i] : '?';
+    buf[n] = 0;
+    if (s.data && mfree) mfree(s.data);   // the guest allocated it; give it back
+}
+static void klmoh_hover(void) {
+    static int on = -1;
+    static unsigned tick;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_MOH_HOVER", t && strcmp(t, "x3647259232032222") == 0);
+    }
+    if (!on || tick++ % 30) return;
+    static uint8_t *arr; static void (*mkname)(uint64_t *, const char *, int);
+    static uint64_t n_cls, n_lvl; static const uint8_t *cls; static float lift;
+    static int32_t off_label = -1, off_anims = -1, off_hover = -1, off_unhover = -1;
+    if (!arr) {
+        arr = kl_guest_sym_global("GUObjectArray");
+        mkname = kl_guest_sym_global("_ZN5FNameC1EPKc9EFindName");
+        if (!arr || !mkname) { on = 0; return; }
+        lift = kl_env_float("KL_MOH_HOVER_CM", 4.0f);
+    }
+    // FNAME_Find: NAME_None until the shell's packages are loaded.
+    if (!n_cls) { mkname(&n_cls, "BP_GrabButton_C", 0); mkname(&n_lvl, "001_DesignLevel", 0); }
+    if (!n_cls || !n_lvl) { n_cls = 0; return; }
+    uint8_t **chunks = *(uint8_t ***)(arr + 16);
+    int32_t num = *(int32_t *)(arr + 16 + 20);
+    for (int32_t i = 0; i < num; i++) {
+        uint8_t *chunk = chunks[i / 65536];
+        if (!chunk) continue;
+        uint8_t *o = *(uint8_t **)(chunk + (size_t)(i % 65536) * 24);
+        if (!o) continue;
+        const uint8_t *c = *(const uint8_t **)(o + 0x10);
+        if (!c || (cls && c != cls)) continue;
+        if (!cls) {
+            uint64_t cn;
+            if (!klmoh_peek(c + 0x18, &cn, 8) || cn != n_cls) continue;
+            cls = c;
+            for (const uint8_t *st = cls; st; st = *(const uint8_t **)(st + 0x40))
+                for (const uint8_t *f = *(const uint8_t **)(st + 0x50); f; f = *(const uint8_t **)(f + 0x20)) {
+                    char nm[64]; klmoh_name(f + 0x28, nm, sizeof nm);
+                    int32_t off = *(const int32_t *)(f + 0x4C);
+                    if (!strcmp(nm, "UseLabel")) off_label = off;
+                    else if (!strcmp(nm, "TurnHoverAnimsOff")) off_anims = off;
+                    else if (!strcmp(nm, "OnHoverTransform")) off_hover = off;
+                    else if (!strcmp(nm, "OnUnHoverTransform")) off_unhover = off;
+                }
+            fprintf(stderr, "  [ue4] KL_MOH_HOVER: BP_GrabButton found; UseLabel @0x%x TurnHoverAnimsOff @0x%x "
+                            "OnHoverTransform @0x%x OnUnHoverTransform @0x%x, lift %.1f cm\n",
+                    off_label, off_anims, off_hover, off_unhover, (double)lift);
+            if (off_label < 0 || off_anims < 0 || off_hover < 0 || off_unhover < 0) { on = 0; return; }
+        }
+        if (*(int32_t *)(o + 0xC) != i) continue;
+        if (*(const int32_t *)(o + 8) & 0x10) continue;          // RF_ClassDefaultObject
+        // only the desk in Whitehall: actor -> PersistentLevel -> world "001_DesignLevel"
+        const uint8_t *lvl = *(const uint8_t **)(o + 0x20);
+        const uint8_t *world = lvl ? *(const uint8_t **)(lvl + 0x20) : NULL;
+        uint64_t wn = 0;
+        if (!world || !klmoh_peek(world + 0x18, &wn, 8) || wn != n_lvl) continue;
+        o[off_label] = 1;
+        o[off_anims] = 0;
+        float *hov = (float *)(o + off_hover), *un = (float *)(o + off_unhover);
+        if (lift > 0 && !memcmp(hov, un, 48)) {                  // FTransform: quat, translation at +16
+            hov[6] = un[6] + lift;
+            char nm[96]; klmoh_name(o + 0x18, nm, sizeof nm);
+            fprintf(stderr, "  [ue4] KL_MOH_HOVER: %s lifts %.1f cm on hover\n", nm, (double)lift);
+        }
+    }
+}
+
+void kl_ue4_frame_tick(void) { klmoh_hover(); }

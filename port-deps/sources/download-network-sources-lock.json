@@ -1,0 +1,29 @@
+[
+  {
+    "name": "metacore",
+    "repository": "Metalit/MetaCore",
+    "tag": "v1.6.2",
+    "commit": "f54126c58b4604d5fe04c105a774aaa1bd81a593",
+    "archive": "metacore-f54126c.tar.gz",
+    "sha256": "55ed75653f1049dd4dcc2246ee6abfe00434de62545da37735f3c970c8f724cf",
+    "scope": "Exact original released source downloaded for port work; not built or tested."
+  },
+  {
+    "name": "beatsaverplusplus",
+    "repository": "bsq-ports/BeatSaverPlusPlus",
+    "tag": "v0.2.1",
+    "commit": "d3efd36abb82bcbbef62f1c2b09b411cde547936",
+    "archive": "beatsaverplusplus-d3efd36.tar.gz",
+    "sha256": "df2041d6df4ce203a206f321799131a8e4811ee9de1aadfa53e2271985d6e8de",
+    "scope": "Exact original released source downloaded for port work; not built or tested."
+  },
+  {
+    "name": "web-utils",
+    "repository": "bsq-ports/WebUtils",
+    "tag": "v0.6.8",
+    "commit": "d0ae1ef7f1557aa4055072a8326745ce303cf14c",
+    "archive": "web-utils-d0ae1ef.tar.gz",
+    "sha256": "443c43682d68f8e6d67aed63c51671a7f877eeef384e39a04826506667b5767d",
+    "scope": "Exact original released source downloaded for port work; not built or tested."
+  }
+]

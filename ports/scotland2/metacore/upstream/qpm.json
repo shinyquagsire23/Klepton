@@ -1,0 +1,98 @@
+{
+  "version": "0.1.0",
+  "sharedDir": "shared",
+  "dependenciesDir": "extern",
+  "info": {
+    "name": "MetaCore",
+    "id": "metacore",
+    "version": "1.6.2",
+    "url": "https://github.com/Metalit/MetaCore",
+    "additionalData": {
+      "overrideSoName": "libmetacore.so",
+      "cmake": true
+    }
+  },
+  "workspace": {
+    "scripts": {
+      "build": [
+        "pwsh ./scripts/build.ps1 $0?"
+      ],
+      "copy": [
+        "pwsh ./scripts/copy.ps1 $0:?",
+        "pwsh ./scripts/restart-game.ps1"
+      ],
+      "log": [
+        "pwsh ./scripts/start-logging.ps1 $0:?"
+      ],
+      "qmod": [
+        "pwsh ./scripts/build.ps1 $0?",
+        "pwsh ./scripts/createqmod.ps1"
+      ],
+      "restart": [
+        "pwsh ./scripts/restart-game.ps1"
+      ],
+      "stack": [
+        "pwsh ./scripts/ndk-stack.ps1 $0:?"
+      ],
+      "tomb": [
+        "pwsh ./scripts/pull-tombstone.ps1 -analyze"
+      ]
+    },
+    "qmodIncludeDirs": [
+      "./build",
+      "./extern/libs"
+    ],
+    "qmodIncludeFiles": [],
+    "qmodOutput": "./MetaCore.qmod"
+  },
+  "dependencies": [
+    {
+      "id": "beatsaber-hook",
+      "versionRange": "^6.4.2",
+      "additionalData": {}
+    },
+    {
+      "id": "scotland2",
+      "versionRange": "^0.1.6",
+      "additionalData": {
+        "includeQmod": false
+      }
+    },
+    {
+      "id": "bs-cordl",
+      "versionRange": "^4008.0.0",
+      "additionalData": {}
+    },
+    {
+      "id": "paper2_scotland2",
+      "versionRange": "^4.6.4",
+      "additionalData": {}
+    },
+    {
+      "id": "rapidjson-macros",
+      "versionRange": "^2.1.0",
+      "additionalData": {}
+    },
+    {
+      "id": "custom-types",
+      "versionRange": "^0.18.3",
+      "additionalData": {
+        "private": true
+      }
+    },
+    {
+      "id": "song-details",
+      "versionRange": "^1.0.4",
+      "additionalData": {
+        "private": true
+      }
+    },
+    {
+      "id": "web-utils",
+      "versionRange": "^0.6.8",
+      "additionalData": {
+        "private": true
+      }
+    }
+  ]
+}

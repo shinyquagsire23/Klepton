@@ -151,6 +151,44 @@ int main(void) {
         CHECK(!b1 && pk == 1, "curves1: %d samples off the profile, %d peaks (want 1)", b1, pk);
         CHECK(!kl_fove_curves1(E, E, ecx, ecy, 914, 457, 0.0f, N, eh, N, ev), "curves1 floor 0 accepted");
     }
+    // The envelope (kl_fove_curves_env, the default for every eye image and
+    // map layer): eye 0's and eye 1's points placed in the same 2400x2400 eye.
+    // The curve is the same for either eye, symmetric about the middle, both
+    // points at full rate — where the single peak above leaves the eye's outer
+    // side at the floor (the left eye blurred over its left half: Alien: Rogue
+    // Incursion, toolchain 565).
+    {
+        enum { E = 2400, N = E / 16 + 1 };
+        float e0[N], e1[N], ev[N], s0[N], s1[N], sv[N];
+        const float a[2] = { fx0 * E, fx1 * E }, b[2] = { fx1 * E, fx0 * E }, cyy[2] = { fy0 * E, fy1 * E };
+        CHECK(kl_fove_curves_env(E, E, a, cyy, 914, 457, 0.125f, N, e0, N, ev), "curves_env refused good input");
+        CHECK(kl_fove_curves_env(E, E, b, cyy, 914, 457, 0.125f, N, e1, N, ev), "curves_env refused good input");
+        CHECK(kl_fove_curves1(E, E, fx0 * E, fy0 * E, 914, 457, 0.125f, N, s0, N, sv), "curves1 refused good input");
+        CHECK(kl_fove_curves1(E, E, fx1 * E, fy1 * E, 914, 457, 0.125f, N, s1, N, sv), "curves1 refused good input");
+        int same = 0, sym = 0, pts = 0;
+        double l0 = 0, r0 = 0, l1 = 0, r1 = 0, sl0 = 0, sr0 = 0, sl1 = 0, sr1 = 0;
+        for (int k = 0; k < N; k++) {
+            float x = (float)k * E / (N - 1);
+            same += fabsf(e0[k] - e1[k]) > 1e-6f;
+            sym += fabsf(e0[k] - e0[N - 1 - k]) > 0.02f;
+            if ((fabsf(x - a[0]) < 8 || fabsf(x - a[1]) < 8 || fabsf(x - E / 2) < 8) && e0[k] != 1.0f) pts++;
+            if (e0[k] < s0[k] - 1e-6f) pts++;   // never coarser than the single peak
+            if (x < E / 2) { l0 += e0[k]; l1 += e1[k]; sl0 += s0[k]; sl1 += s1[k]; }
+            else           { r0 += e0[k]; r1 += e1[k]; sr0 += s0[k]; sr1 += s1[k]; }
+        }
+        CHECK(!same, "curves_env: the two eyes' curves differ at %d samples", same);
+        CHECK(!sym, "curves_env: %d samples not mirror-symmetric", sym);
+        CHECK(!pts, "curves_env: %d samples coarser than they must be", pts);
+        CHECK(fabs(l0 - r0) < 0.02 * N && fabs(l1 - r1) < 0.02 * N, "curves_env: halves %.1f / %.1f, %.1f / %.1f",
+              l0, r0, l1, r1);
+        // The single peak: the outer half is the coarse one, mirrored between the eyes.
+        CHECK(sl0 < 0.8 * sr0 && sr1 < 0.8 * sl1, "curves1: left eye halves %.1f / %.1f, right eye %.1f / %.1f",
+              sl0, sr0, sl1, sr1);
+        CHECK(!kl_fove_curves_env(E, E, a, cyy, 914, 457, 0.0f, N, e0, N, ev), "curves_env floor 0 accepted");
+        printf("envelope, high, 2400x2400 eye: mean horizontal rate left/right half %.3f / %.3f for either eye; "
+               "one peak per eye: left eye %.3f / %.3f, right eye %.3f / %.3f\n",
+               2 * l0 / N, 2 * r0 / N, 2 * sl0 / N, 2 * sr0 / N, 2 * sl1 / N, 2 * sr1 / N);
+    }
     // The [[position]] patch passes the map LAYER — its own argument
     // added, a [[render_target_array_index]] argument reused, a stage_in member
     // reached through the stage_in argument, and a shader without [[position]]
@@ -193,6 +231,57 @@ int main(void) {
         char *pg = kl_fove_patch_for_test(g);
         CHECK(!pg, "a non-entry-point name was patched");
         free(pg);
+        // UE4's mobile depth fetch (Moss: DepthFade translucency) reads the
+        // subpass input inside a helper that takes the position by reference.
+        // The call must get the PHYSICAL position; a helper that also uses the
+        // position otherwise keeps the remapped one.
+        const char *hs = "static inline __attribute__((always_inline))\n"
+                         "float VulkanSubpassDepthFetch(texture2d_ms_array<float> D, thread float4& gl_FragCoord, thread uint& gl_ViewIndex)\n"
+                         "{\n    return D.read(uint2(gl_FragCoord.xy), gl_ViewIndex, 0).x;\n}\n\n"
+                         "static inline float Other(thread float4& gl_FragCoord)\n{\n    return gl_FragCoord.x + float(uint2(gl_FragCoord.xy).x);\n}\n\n"
+                         "fragment main_00002aac_8392f5e1_out main_00002aac_8392f5e1(float4 gl_FragCoord [[position]], uint gl_ViewIndex [[render_target_array_index]])\n"
+                         "{\n    main_00002aac_8392f5e1_out out = {};\n"
+                         "    float f = VulkanSubpassDepthFetch(s.D, gl_FragCoord, gl_ViewIndex);\n"
+                         "    float o = Other(gl_FragCoord);\n    return out;\n}\n";
+        kl_fove_set_subpass_helpers_for_test(1);
+        char *ph = kl_fove_patch_for_test(hs);
+        CHECK(ph && strstr(ph, "float4 kl_fove_phys = gl_FragCoord;") &&
+              strstr(ph, "VulkanSubpassDepthFetch(s.D, kl_fove_phys, gl_ViewIndex)") &&
+              strstr(ph, "Other(gl_FragCoord)") &&
+              strstr(ph, "D.read(uint2(gl_FragCoord.xy), gl_ViewIndex, 0)"),
+              "KL_FOVE_SUBPASS_HELPERS=1: subpass read in a helper not fed the physical position:\n%s", ph ? ph : "(null)");
+        free(ph);
+        // KL_FOVE_SUBPASS_HELPERS=0, the A/B control: the old behaviour, the
+        // helper is called with the remapped position and nothing is saved.
+        kl_fove_set_subpass_helpers_for_test(0);
+        char *ph0 = kl_fove_patch_for_test(hs);
+        CHECK(ph0 && strstr(ph0, "VulkanSubpassDepthFetch(s.D, gl_FragCoord, gl_ViewIndex)") &&
+              !strstr(ph0, "kl_fove_phys") &&
+              strstr(ph0, "map_physical_to_screen_coordinates(gl_FragCoord.xy, gl_ViewIndex)"),
+              "KL_FOVE_SUBPASS_HELPERS=0: the helper call was changed:\n%s", ph0 ? ph0 : "(null)");
+        free(ph0);
+        kl_fove_set_subpass_helpers_for_test(1);
+        // Only a `.read(uint2(pos.xy)…)` from one of the helper's own TEXTURE
+        // parameters counts: not a texture reached through another parameter,
+        // not some other uint2 of the position. A texture type whose template
+        // arguments hold a comma still counts.
+        const char *hn = "static inline float ViaMember(constant Buf& b, thread float4& gl_FragCoord)\n"
+                         "{\n    return b.T.read(uint2(gl_FragCoord.xy)).x;\n}\n\n"
+                         "static inline float NotARead(texture2d<float> T, thread float4& gl_FragCoord)\n"
+                         "{\n    return T.sample(S, float2(uint2(gl_FragCoord.xy))).x;\n}\n\n"
+                         "static inline float Templ(texture2d<float, access::read> T, thread float4& gl_FragCoord)\n"
+                         "{\n    return T.read(uint2(gl_FragCoord.xy)).x;\n}\n\n"
+                         "fragment main0_out main0(float4 gl_FragCoord [[position]])\n"
+                         "{\n    main0_out out = {};\n"
+                         "    float a = ViaMember(b, gl_FragCoord);\n"
+                         "    float c = NotARead(t, gl_FragCoord);\n"
+                         "    float d = Templ(t, gl_FragCoord);\n    return out;\n}\n";
+        char *pn = kl_fove_patch_for_test(hn);
+        CHECK(pn && strstr(pn, "ViaMember(b, gl_FragCoord)") && strstr(pn, "NotARead(t, gl_FragCoord)") &&
+              strstr(pn, "Templ(t, kl_fove_phys)"),
+              "helper read matching: only a read from the helper's own texture parameter may count:\n%s",
+              pn ? pn : "(null)");
+        free(pn);
     }
     // The pending-expand table: buffers released without -commit leave nothing.
     int pb = kl_fove_pend_selftest();
@@ -354,9 +443,29 @@ int main(void) {
         if (g < 0) printf("re-centre GPU self-test SKIPPED: %s\n", why);
         else {
             CHECK(!g, "re-centre GPU self-test: %d failed checks", g);
-            if (!g) printf("re-centre GPU self-test: Deadpool's map built before the record (3226 / 1862) re-centred in "
-                           "place to 2544 / 2544 once the record arrived, not under a pending expand, not again for the "
-                           "same record, never for ITR's full-image record\n");
+            if (!g) printf("re-centre GPU self-test: Deadpool's map built before the record (3226 / 1862) re-centred to "
+                           "2544 / 2544 once the record arrived (into another slot while another buffer's expand was pending "
+                           "on the old map, which that buffer keeps), not again for the same record, never for ITR's "
+                           "full-image record\n");
+        }
+    }
+    {
+        char why[160] = "";
+        float r[2 * 2 * 8];
+        int g = kl_fove_layers_selftest(why, sizeof why, r, getenv("KL_FOVE_TEST_SHOTS"));
+        if (g < 0) printf("layered eye-pair GPU self-test SKIPPED: %s\n", why);
+        else {
+            CHECK(!g, "layered eye-pair GPU self-test: %d failed checks", g);
+            for (int m = 0; m < 2; m++)
+                for (int l = 0; l < 2; l++)
+                    printf("  drawn through the GPU, %-8s %-5s eye, rate by eighths of its picture: "
+                           "%.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f\n", m ? "envelope" : "per-eye", l ? "right" : "left",
+                           r[(m * 2 + l) * 8 + 0], r[(m * 2 + l) * 8 + 1], r[(m * 2 + l) * 8 + 2], r[(m * 2 + l) * 8 + 3],
+                           r[(m * 2 + l) * 8 + 4], r[(m * 2 + l) * 8 + 5], r[(m * 2 + l) * 8 + 6], r[(m * 2 + l) * 8 + 7]);
+            if (!g) printf("layered eye-pair GPU self-test (Alien: Rogue Incursion's shape, Vision Pro cones): with one "
+                           "peak per eye the left eye is coarse on its left, the right eye on its right; with the "
+                           "envelope both eyes are drawn equally sharp, symmetric about the middle, both straight-ahead "
+                           "points at full rate; the map follows 20 dynamic-resolution steps\n");
         }
     }
     {

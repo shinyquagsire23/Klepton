@@ -21,7 +21,9 @@
 // that survives a playtest and gets blamed on the hardware.
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 #include "kl_ovrp.h"
 
@@ -52,6 +54,7 @@ static int32_t (*set_haptics)(uint32_t, hbuffer);
 static int32_t (*set_vibration)(uint32_t, float, float);
 static int32_t (*set_pcm)(uint32_t, pcmvib);
 static int32_t (*get_rate)(uint32_t, float *);
+static int32_t (*get_dominant_hand)(int32_t *);
 
 #define LTOUCH 0x1u
 #define RTOUCH 0x2u
@@ -76,11 +79,39 @@ int main(void) {
     set_vibration = kl_ovrp_sym("ovrp_SetControllerVibration");
     set_pcm       = kl_ovrp_sym("ovrp_SetControllerHapticsPcm");
     get_rate      = kl_ovrp_sym("ovrp_GetControllerSampleRateHz");
+    get_dominant_hand = kl_ovrp_sym("ovrp_GetDominantHand");
     if (!get_desc || !get_state || !set_haptics || !set_vibration
-        || !set_pcm || !get_rate) {
+        || !set_pcm || !get_rate || !get_dominant_hand) {
         printf("  FAIL: an entry point did not resolve\n");
         return 1;
     }
+
+    // Startup input preference used by Richie's Plank Experience. This is an
+    // ovrpResult plus out-parameter ABI; a success return must also initialise
+    // the handedness value the guest reads.
+    int32_t dominant_hand = 0;
+    CHECK(get_dominant_hand(&dominant_hand) == 0,
+          "GetDominantHand did not return ovrpSuccess");
+    CHECK(dominant_hand == 2, "dominant hand %d, expected RightHanded (2)",
+          dominant_hand);
+    CHECK(get_dominant_hand(NULL) == -1001,
+          "GetDominantHand accepted a null out-parameter");
+
+    // A room-scale-only title can use the left stick to move the complete
+    // tracking rig without physically crossing visionOS's safety boundary.
+    // Enable the normally target-scoped path explicitly for this host test.
+    setenv("KL_OVRP_STICK_MOVE", "1", 1);
+    setenv("KL_OVRP_STICK_MOVE_SPEED", "4", 1);
+    kl_ovrp_set_head_pose(0, 1.6f, 0, 0, 0, 0, 1);
+    kl_ovrp_set_controller_input(0, 0, 0, 0, 0, 0, 1);
+    nap(0.05);
+    kl_ovrp_set_controller_input(0, 0, 0, 0, 0, 0, 1);
+    kl_ovrp_set_head_pose(0, 1.6f, 0, 0, 0, 0, 1);
+    float moved_x = 0, moved_y = 0, moved_z = 0;
+    kl_ovrp_get_guest_head_pose(&moved_x, &moved_y, &moved_z, NULL, NULL, NULL, NULL);
+    CHECK(fabsf(moved_x) < 0.01f && moved_z < -0.10f,
+          "forward stick moved the rig to (%.3f, %.3f), expected world -Z",
+          (double)moved_x, (double)moved_z);
 
     // 1. The descriptor. These are the numbers OVRHaptics sizes its buffer and
     //    paces itself from; a zero anywhere here is what "this controller
@@ -277,9 +308,19 @@ int main(void) {
         CHECK(s.queued >= 30 && s.queued <= 32, "%d queued after a 32-sample PCM push",
               s.queued);
         CHECK(get_state(LTOUCH).queued == 0, "the PCM push reached the OTHER hand");
-        nap(0.09);
+        // A THIRD of the way in, not ninety percent of the way in. 32 samples
+        // at 320 Hz is a 100 ms clip, so the old `nap(0.09)` read the ramp 90 ms
+        // into its own 100 ms and then asserted the level was still under 0.99 —
+        // a margin of ten milliseconds of scheduling jitter, on a check that is
+        // about neither scheduling nor jitter. It failed about one run in twelve,
+        // which in the DEFAULT gate is worse than no check at all: it teaches
+        // the reader to re-run instead of to look. 30 ms is what the assertion's
+        // own wording already claimed, and it lands near 0.3 with room on both
+        // sides. (A change in static data layout that shifted first-touch page
+        // faults was enough to make it fail visibly.)
+        nap(0.03);
         CHECK(kl_ovrp_haptics_pull(1, &amp, &secs), "no level out of a PCM clip");
-        printf("  pcm: level %.2f from the ramp's first 90 ms\n", (double)amp);
+        printf("  pcm: level %.2f from the ramp's first 30 ms\n", (double)amp);
         CHECK(amp > 0.0f && amp < 0.99f, "a ramp's first third came out at %.2f",
               (double)amp);
 

@@ -1,0 +1,298 @@
+--- a/src/installer.cpp
++++ b/src/installer.cpp
+@@ -19,6 +19,16 @@
+ #include "page-allocator.hpp"
+ #include "target-data.hpp"
+ #include "util.hpp"
++#ifdef SC2_AOT_HOOKS
++#include <mutex>
++extern "C" void *sc2_aot_current(const void *);
++extern "C" void sc2_aot_begin();
++extern "C" void sc2_aot_end();
++struct AOTTransaction {
++  AOTTransaction() { sc2_aot_begin(); }
++  ~AOTTransaction() { sc2_aot_end(); }
++};
++#endif
+ 
+ /// @brief This function is assigned to the orig of a hook when the hook in question has no fixups written.
+ extern "C" void no_fixups() {
+@@ -30,6 +40,9 @@
+ 
+ /// @brief The set of all targets hooked. An ordered map so we can perform large-scale walks by doing binary search.
+ inline static std::map<TargetDescriptor, TargetData> targets;
++#ifdef SC2_AOT_HOOKS
++inline static std::recursive_mutex install_mutex;
++#endif
+ 
+ // Rebuild the per-target priority graph from the current hooks list.
+ void rebuild_priority_graph(TargetData& target_data) {
+@@ -75,6 +88,9 @@
+   using ResultT = Result<std::list<HookInfo>, installation::TargetBadPriorities>;
+ 
+   std::list<HookInfo> sorted_hooks;
++#ifdef SC2_AOT_HOOKS
++  std::vector<HookNameMetadata> sorted_names;
++#endif
+ 
+   // build in-degree map
+   std::unordered_map<HookNameMetadata, int> in_degree;
+@@ -111,7 +127,11 @@
+     }
+ 
+     // move node's hook iterator into sorted_hooks
++#ifdef SC2_AOT_HOOKS
++    sorted_names.push_back(current_name);
++#else
+     sorted_hooks.splice(sorted_hooks.end(), target_data.hooks, it_node->second.hook_it);
++#endif
+ 
+     for (auto const& after : it_node->second.afters) {
+       in_degree[after]--;
+@@ -122,7 +142,11 @@
+   }
+ 
+   // if any hooks remain, they are part of cycles
++#ifdef SC2_AOT_HOOKS
++  if (sorted_names.size() != target_data.hooks.size()) {
++#else
+   if (!target_data.hooks.empty()) {
++#endif
+     std::vector<HookInfo> cycles;
+     for (auto const& h : target_data.hooks) cycles.push_back(h);
+ 
+@@ -143,6 +167,10 @@
+                                           "involved in the cycle will remain in their original order.") });
+   }
+ 
++#ifdef SC2_AOT_HOOKS
++  for (auto const& name : sorted_names)
++    sorted_hooks.splice(sorted_hooks.end(), target_data.hooks, target_data.priority_graph.at(name).hook_it);
++#endif
+   // swap sorted back into target_data.hooks
+   target_data.hooks.swap(sorted_hooks);
+ 
+@@ -166,7 +194,9 @@
+   // Perform the write of the jump to the first hook
+   // Head
+   auto it = hooks.begin();
++#ifndef SC2_AOT_HOOKS
+   target_entry->second.fixups.target.WriteJump(it->hook_ptr);
++#endif
+ 
+   while (std::next(it) != hooks.end()) {
+     it->assign_orig(std::next(it)->hook_ptr);
+@@ -175,6 +205,10 @@
+   it->assign_orig(target_entry->second.metadata.metadata.need_orig
+                       ? target_entry->second.fixups.fixup_inst_destination.addr.data()
+                       : reinterpret_cast<void*>(&no_fixups));
++#ifdef SC2_AOT_HOOKS
++  // Publish the head only after every original-call pointer is initialized.
++  target_entry->second.fixups.target.WriteJump(hooks.front().hook_ptr);
++#endif
+ }
+ 
+ /// @brief Finds a suitable location to install the given hook on the target, respecting priority constraints.
+@@ -238,7 +272,9 @@
+   // if we require a sort, do it then recompile
+   if (requires_sort) {
+     // copy hooks
++#ifndef SC2_AOT_HOOKS
+     auto old_hooks = hooks;
++#endif
+ 
+     TargetDescriptor target{ hook_to_install.target };
+     auto metadata = hook_to_install.metadata;
+@@ -248,7 +284,11 @@
+     auto trg_it = targets.find(target);
+     if (trg_it == targets.end()) {
+       // should not happen
++#ifdef SC2_AOT_HOOKS
++      hooks.erase(newIt);
++#else
+       hooks.swap(old_hooks);
++#endif
+       return ResultT::Err(installation::TargetBadPriorities{ metadata, "Target missing during priority sorting" });
+     }
+     auto& target_data = trg_it->second;
+@@ -256,7 +296,12 @@
+     auto cyclesResult = topological_sort_target(target_data);
+     if (!cyclesResult.has_value()) {
+       // revert hooks (we need to keep original order)
++#ifdef SC2_AOT_HOOKS
++      hooks.erase(newIt);
++      rebuild_priority_graph(target_data);
++#else
+       hooks.swap(old_hooks);
++#endif
+       return ResultT::Err(cyclesResult.error());
+     }
+ 
+@@ -365,6 +410,10 @@
+ }  // namespace
+ namespace flamingo {
+ std::optional<TargetData const> TargetDataFor(TargetDescriptor target) {
++#ifdef SC2_AOT_HOOKS
++  AOTTransaction transaction;
++  std::lock_guard guard(install_mutex);
++#endif
+   auto it = targets.find(target);
+   if (it == targets.end()) {
+     return std::nullopt;
+@@ -373,6 +422,17 @@
+ }
+ 
+ installation::Result Install(HookInfo&& hook) {
++#ifdef SC2_AOT_HOOKS
++  AOTTransaction transaction;
++  std::lock_guard guard(install_mutex);
++  if (hook.metadata.installation_metadata.is_midpoint)
++    return installation::Result::ErrAt<installation::TargetMismatch>(installation::MismatchMidpoint{hook.metadata,false});
++  auto prepared_original=sc2_aot_current(hook.target);
++  if (hook.target && !prepared_original) {
++    auto unavailable=hook.metadata; unavailable.method_num_insts=0;
++    return installation::Result::ErrAt<installation::TargetTooSmall>(unavailable,1);
++  }
++#endif
+   // Null targets to install to are prohibited, but null hook functions are allowed (and will most likely cause
+   // horrible crashes when called)
+   if (hook.target == nullptr) {
+@@ -385,15 +445,21 @@
+     // For leapfrog hooks, we need to do something special anyways.
+     // TODO: Support leapfrog hooks (where the installation space is fewer than 4U)
+     // If we have an orig, we need to have an instruction to jump back to
++#ifdef SC2_AOT_HOOKS
++    auto const method_size = 1U;
++#else
+     auto const method_size = Fixups::kNormalFixupInstCount + (hook.orig_ptr != nullptr ? 1 : 0);
++#endif
+     if (hook.metadata.method_num_insts < method_size) {
+       return installation::Result::ErrAt<installation::TargetTooSmall>(hook.metadata, method_size);
+     }
+     // The initial protection of the page that holds the target
+     auto target_initial_protection = PageProtectionType::kExecute | PageProtectionType::kRead;
++#ifndef SC2_AOT_HOOKS
+     if (hook.metadata.installation_metadata.write_prot) {
+       target_initial_protection |= PageProtectionType::kWrite;
+     }
++#endif
+     auto target_pointer = PointerWrapper<uint32_t>(
+         std::span<uint32_t>(reinterpret_cast<uint32_t*>(hook.target),
+                             reinterpret_cast<uint32_t*>(hook.target) + hook.metadata.method_num_insts),
+@@ -412,12 +478,17 @@
+                                      },
+                                  .fixups = Fixups{
+                                    // Our fixup target is a subspan the same size as our install size
+-                                   .target = { target_pointer.Subspan(Fixups::kNormalFixupInstCount) },
++                                   .target = { target_pointer.Subspan(method_size) },
+                                    .fixup_inst_destination =
++#ifdef SC2_AOT_HOOKS
++                                       PointerWrapper<uint32_t>{std::span<uint32_t>(static_cast<uint32_t*>(prepared_original),8),
++                                                                 PageProtectionType::kExecute | PageProtectionType::kRead},
++#else
+                                        Allocate(kHookAlignment,
+                                                 std::min(Page::PageSize, hook.metadata.method_num_insts *
+                                                                              sizeof(uint32_t) * kNumFixupsPerInst),
+                                                 PageProtectionType::kExecute | PageProtectionType::kRead),
++#endif
+ 
+                                  },
+                                  .priority_graph = {},
+@@ -439,6 +510,10 @@
+     target_data.fixups.target.WriteJump(hook_data_result->hook_ptr);
+     return installation::Result::Ok(flamingo::installation::Ok{ HookHandle{ .hook_location = hook_data_result } });
+   }
++#ifdef SC2_AOT_HOOKS
++  if (sc2_aot_current(hook.target)!=hooked_target->second.hooks.front().hook_ptr)
++    return installation::Result::ErrAt<installation::TargetBadPriorities>(hook.metadata,"A later hook engine owns this prepared entry");
++#endif
+   auto installation_checks = validate_install_metadata(hooked_target->second.metadata, hook.metadata);
+   if (!installation_checks.has_value()) {
+     return installation::Result::ErrAt<installation::TargetMismatch>(installation_checks.error());
+@@ -454,6 +529,12 @@
+     return installation::Result::ErrAt<installation::TargetBadPriorities>(location_or_err.error());
+   }
+   auto const hook_data_result = location_or_err.value();
++#ifdef SC2_AOT_HOOKS
++  // The incoming hook may become reachable through an existing hook's orig.
++  hook_data_result->assign_orig(std::next(hook_data_result)==hooked_target->second.hooks.end()
++      ? hooked_target->second.fixups.fixup_inst_destination.addr.data()
++      : std::next(hook_data_result)->hook_ptr);
++#endif
+ 
+   // TODO: Recompile fixups/origs for all hooks on this target or not?
+   // recompile_hooks(hooked_target->second.hooks, target_info);
+@@ -476,11 +557,19 @@
+ }
+ 
+ Result<bool, installation::Error> Reinstall(TargetDescriptor target) {
++#ifdef SC2_AOT_HOOKS
++  AOTTransaction transaction;
++  std::lock_guard guard(install_mutex);
++#endif
+   using RetType = Result<bool, installation::Error>;
+   auto itr = targets.find(target);
+   if (itr == targets.end()) {
+     return RetType::Ok(false);
+   }
++#ifdef SC2_AOT_HOOKS
++  if (sc2_aot_current(target.target)!=itr->second.hooks.front().hook_ptr)
++    return RetType::ErrAt<installation::TargetBadPriorities>(itr->second.hooks.front().metadata,"A later hook engine owns this prepared entry");
++#endif
+   // Reinstall the orig by calling PerformFixupsAndCallback() again (as needed)
+   itr->second.fixups.CopyOriginalInsts();
+   if (itr->second.metadata.metadata.need_orig) {
+@@ -496,12 +585,20 @@
+ }
+ 
+ Result<bool, bool> Uninstall(HookHandle handle) {
++#ifdef SC2_AOT_HOOKS
++  AOTTransaction transaction;
++  std::lock_guard guard(install_mutex);
++#endif
+   using RetType = Result<bool, bool>;
+   // Find the target entry. Note that this assumes the handle is not invalidated.
+   auto target_entry = targets.find(TargetDescriptor(handle.hook_location->target));
+   if (target_entry == targets.end()) {
+     return RetType::Err(false);
+   }
++#ifdef SC2_AOT_HOOKS
++  if (sc2_aot_current(handle.hook_location->target)!=target_entry->second.hooks.front().hook_ptr)
++    return RetType::Err(true);
++#endif
+   // 1. If it is the only hook, destroys the fixups, uninstalls the hook by replacing the original instructions. Note
+   // that this also destroys leapfrog hooks.
+   if (target_entry->second.hooks.size() == 1) {
+@@ -540,6 +637,10 @@
+ }
+ 
+ std::span<uint32_t> OriginalInstsFor(TargetDescriptor target) {
++#ifdef SC2_AOT_HOOKS
++  AOTTransaction transaction;
++  std::lock_guard guard(install_mutex);
++#endif
+   auto itr = targets.find(target);
+   if (itr != targets.end()) {
+     return itr->second.fixups.original_instructions;
+@@ -548,6 +649,10 @@
+ }
+ 
+ Result<TargetMetadata, std::monostate> MetadataFor(TargetDescriptor target) {
++#ifdef SC2_AOT_HOOKS
++  AOTTransaction transaction;
++  std::lock_guard guard(install_mutex);
++#endif
+   auto itr = targets.find(target);
+   if (itr != targets.end()) {
+     return Result<TargetMetadata, std::monostate>::Ok(itr->second.metadata);
+@@ -556,6 +661,10 @@
+ }
+ 
+ Result<std::span<uint32_t const>, std::monostate> FixupPointerFor(TargetDescriptor target) {
++#ifdef SC2_AOT_HOOKS
++  AOTTransaction transaction;
++  std::lock_guard guard(install_mutex);
++#endif
+   auto itr = targets.find(target);
+   if (itr != targets.end()) {
+     return Result<std::span<uint32_t const>, std::monostate>::Ok(itr->second.fixups.fixup_inst_destination.addr);

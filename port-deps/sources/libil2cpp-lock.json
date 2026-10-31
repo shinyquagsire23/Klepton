@@ -1,0 +1,10 @@
+{
+  "id": "libil2cpp",
+  "version": "0.4.0",
+  "metadata": "https://qpackages.com/libil2cpp/0.4.0",
+  "url": "https://cdn.frozenalex.com/libil2cpp_0.4.0.zip",
+  "sha256": "504709328fea8dc9af183c4d4ad1cd78585c307c80440416f0e7cb169918671c",
+  "size": 40680673,
+  "extracted": "il2cpp/libil2cpp and il2cpp/external; build executables not extracted",
+  "files": 1930
+}

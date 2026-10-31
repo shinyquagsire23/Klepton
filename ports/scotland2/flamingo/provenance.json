@@ -1,0 +1,14 @@
+{
+  "repository": "sc2ad/Flamingo",
+  "tag": "v1.1.2",
+  "commit": "461993fea629790bf499f41e807b00db25b0a148",
+  "modifiedFiles": [
+    "src/installer.cpp"
+  ],
+  "backend": "../src/android-flamingo-fixups.cpp",
+  "notes": "Preserves original registry/error variant ABI, size-only metadata validation, default/final priority and uninstall. Uses one prepared instruction and captured prior dispatch head; serializes registration with And64 through a native transaction. Refuses interleaved mutation when a later engine owns the head. No executable writes.",
+  "adapterSources": {
+    "ports/scotland2/src/android-flamingo-fixups.cpp": "2baf3c49d86626643379e70db42ba608bc1b7a2133a3945ebd6cab0450d70a2c",
+    "ports/scotland2/src/android-flamingo-scene.cpp": "40cb83aefc2757451ce46dcf64b988a3ea0bafe120f5eba3e3fcf7bd34372131"
+  }
+}

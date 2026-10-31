@@ -1,0 +1,13 @@
+{
+  "source": "https://curl.se/ca/cacert.pem",
+  "license": "MPL-2.0",
+  "sha256": "796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe",
+  "certificateCount": 118,
+  "retrieved": "2026-10-24",
+  "scope": "Public Mozilla CA bundle from curl project; verification required. Standalone asset, not a Mac filesystem dependency.",
+  "licenseText": {
+    "file": "LICENSE-MPL-2.0.txt",
+    "source": "https://www.mozilla.org/media/MPL/2.0/index.815ca599c9df.txt",
+    "sha256": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85"
+  }
+}

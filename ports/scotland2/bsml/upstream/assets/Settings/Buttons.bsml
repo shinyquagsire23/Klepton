@@ -1,0 +1,4 @@
+<horizontal id='bottomButtons' horizontal-fit='PreferredSize' child-control-height='false' child-expand-height='false' child-align='MiddleCenter' anchor-min-x='0.5' anchor-max-x='0.5' anchor-min-y='0' anchor-max-y='0' size-delta-x='120' size-delta-y='10' pivot-y='0' spacing='2'>
+    <button on-click='Cancel' text='cancel' pref-width='34' pref-height='10'/>
+    <primary-button on-click='Ok' text='ok' pref-width='34' pref-height='10'/>
+</horizontal>

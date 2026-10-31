@@ -131,7 +131,11 @@ static void klj_soft_push_text(void) {
 // reaches managed code, which is allowed to call setSoftInputStr straight back
 // at us, and that would deadlock against a lock held across the dispatch.
 unsigned klj_drain_soft_input(void) {
-    unsigned ran = 0;
+    // UE's keyboard shares this drain point rather than owning one, for the
+    // reason kl_jni_bridge.c folded this queue into the UI-task drain in the
+    // first place: a host loop that pumps one queue and not the other is a
+    // keyboard that is silently dead on exactly one engine.
+    unsigned ran = klj_ue_vk_drain();
     for (;;) {
         klj_soft_ev e;
         pthread_mutex_lock(&g_soft.mu);
@@ -331,7 +335,16 @@ static klj_val klj_UnityPlayer_getClipboardText(void *env, void *self,
     return (klj_val){.l = copy[0] ? kl_jni_new_string(copy) : NULL};
 }
 
+// ---- the frontend's four calls, for whichever engine is asking --------------
+//
+// A frontend implements ONE keyboard, not one per engine: it has no way to know
+// whether the guest it is typing into is Unity or Unreal, and it should not
+// have to. UE's GameActivity keyboard (kl_jni_ue4.c) is asked first and speaks
+// for itself while it is open; everything below is Unity's. A guest has one
+// engine, so the two fields can never both be open — the order only decides
+// which of two CLOSED fields gets to answer "no".
 int kl_jni_soft_input_active(void) {
+    if (klj_ue_vk_active()) return 1;
     pthread_mutex_lock(&g_soft.mu);
     int open = g_soft.open;
     pthread_mutex_unlock(&g_soft.mu);
@@ -339,6 +352,7 @@ int kl_jni_soft_input_active(void) {
 }
 
 int kl_jni_soft_input_get(char *buf, size_t cap, int *secure) {
+    if (klj_ue_vk_active()) return klj_ue_vk_get(buf, cap, secure);
     pthread_mutex_lock(&g_soft.mu);
     int open = g_soft.open;
     if (buf && cap) {
@@ -352,6 +366,7 @@ int kl_jni_soft_input_get(char *buf, size_t cap, int *secure) {
 
 void kl_jni_soft_input_set(const char *utf8) {
     if (!utf8) utf8 = "";
+    if (klj_ue_vk_active()) { klj_ue_vk_set(utf8); return; }
     pthread_mutex_lock(&g_soft.mu);
     if (!g_soft.open) { pthread_mutex_unlock(&g_soft.mu); return; }
     // The dialog's LengthFilter, which is the guest's own limit and not ours:
@@ -366,6 +381,7 @@ void kl_jni_soft_input_set(const char *utf8) {
 }
 
 void kl_jni_soft_input_close(int canceled) {
+    if (klj_ue_vk_active()) { klj_ue_vk_close(canceled); return; }
     pthread_mutex_lock(&g_soft.mu);
     if (!g_soft.open) { pthread_mutex_unlock(&g_soft.mu); return; }
     // reportSoftInputStr(text, 1, canceled), whose order is UnityPlayer$i's:
@@ -759,6 +775,20 @@ void *kl_jni_activity(void) {
     }
     return activity;
 }
+
+// ...and the single UnityPlayer, for the same reason and by the same rule. See
+// kl_jni.h: one per process, pinned, created lazily by whichever lifecycle call
+// runs first.
+static void *g_unity_player;
+void *kl_jni_unity_player(void) {
+    if (!g_unity_player) {
+        void *player = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+        ((klj_object *)player)->pinned = 1;
+        g_unity_player = player;
+    }
+    return g_unity_player;
+}
+void *klj_unity_player_made(void) { return g_unity_player; }
 
 // SensorManager.getDefaultSensor(type) -> null, for every type.
 //

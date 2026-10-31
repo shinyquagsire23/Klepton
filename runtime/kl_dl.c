@@ -11,13 +11,16 @@
 #include <wchar.h>
 #include "kl_egl.h"
 #include "guest/kl_driver.h"
+#include "kl_extension.h"
 #include "kl_jni.h"
 #include "kl_opensl.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_steamapi.h"
 #include "kl_mediandk.h"
 #include "kl_vulkan.h"
 #include "kl_aaudio.h"
+#include "kl_ndk.h"
 #include "kl_openxr.h"
 
 #define KL_MAX_IMAGES 64
@@ -29,6 +32,7 @@ static char   g_dlerr[256];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void kl_set_library_path(const char *dir) { snprintf(g_libdir, sizeof g_libdir, "%s", dir); }
+const char *kl_library_path(void) { return g_libdir; }
 
 static const char *basename_of(const char *p) {
     const char *s = strrchr(p, '/');
@@ -239,6 +243,15 @@ static int kl_fmod_trace_default(void) {
     return 0;
 }
 
+static void (*g_brink_set_depth)(int);
+static void kl_brink_set_depth(int mode) {
+    const char *t=kl_driver_target_name(), *e=getenv("KL_XR_DEPTH");
+    if(t && !strcmp(t,"x3635172946605196") && !(e && !strcmp(e,"0"))) {
+        mode=2; // Unity OpenXR Depth24Bit.
+        fprintf(stderr,"  [brink-depth] requesting Unity depth submission mode 2\n");
+    }
+    g_brink_set_depth(mode);
+}
 static void *kl_fmod_interpose(const char *name, void *real) {
     // Install UNCONDITIONALLY when an FMOD symbol resolves — this is the only
     // moment we can substitute the address, and it happens during libUE4's
@@ -250,6 +263,9 @@ static void *kl_fmod_interpose(const char *name, void *real) {
     // never a per-sample path). The one-time install line proves the seam caught
     // FMOD at all, independent of whether the game ever calls the function.
     if (!real) return NULL;
+    if(!strcmp(name,"NativeConfig_SetDepthSubmissionMode")) {
+        g_brink_set_depth=(void (*)(int))real; return (void *)kl_brink_set_depth;
+    }
     void *wrap = NULL;
     if (!strcmp(name, "_ZN4FMOD6Studio6System14loadBankMemoryEPKci28FMOD_STUDIO_LOAD_MEMORY_MODEjPPNS0_4BankE")) {
         g_fmod_loadBankMemory = (int (*)(void *, const char *, int, int, uint32_t, void **))real;
@@ -298,6 +314,7 @@ void *kl_guest_sym_global(const char *name) {
     for (int i = 0; i < g_nimgs && !v; i++)
         v = kl_sym(g_imgs[i].img, name);
     pthread_mutex_unlock(&g_lock);
+    if (!v) v = kl_extension_symbol(name);
     if (v) { void *w = kl_fmod_interpose(name, v); if (w) return w; }
     return v;
 }
@@ -309,6 +326,7 @@ void *kl_guest_sym_global(const char *name) {
 // Names Klepton serves from its own shims rather than from a bundled file, so
 // a missing file for one of these is expected, not a packaging error.
 static int kl_dep_is_shim_served(const char *name) {
+    if (kl_extension_claims(name)) return 1;
     static const char *shim[] = {
         "libc.so", "libm.so", "libdl.so", "liblog.so", "libstdc++.so",
         "libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so", "libEGL.so",
@@ -348,12 +366,28 @@ static void kl_maybe_jni_onload(const char *path, kl_image *img) {
             b, r);
 }
 
+static kl_image *load_recursive_impl(const char *path);
 kl_image *kl_load_recursive(const char *path) {
+    static _Thread_local const char *pending[64];
+    static _Thread_local unsigned depth;
+    if (!kl_extension_strict_load()) return load_recursive_impl(path);
+    if (!path || depth==64) { snprintf(g_dlerr,sizeof g_dlerr,"dlopen failed: dependency nesting limit");return NULL; }
+    for (unsigned i=0;i<depth;++i) if (!strcmp(path,pending[i])) {
+        snprintf(g_dlerr,sizeof g_dlerr,"dlopen failed: cyclic dependency");return NULL;
+    }
+    pending[depth++]=path;
+    kl_image *result=load_recursive_impl(path);
+    --depth;return result;
+}
+static kl_image *load_recursive_impl(const char *path) {
     kl_image *have = kl_find_image(path);
     if (have) return have;                       // cycle guard / already loaded
 
     char names[32][128];
     int nn = kl_list_needed(path, names, 32);
+    if (kl_extension_strict_load() && (nn<0 || nn>=32)) {
+        snprintf(g_dlerr,sizeof g_dlerr,"dlopen failed: invalid or excessive dependencies");return NULL;
+    }
     if (kl_env_on("KL_TRACE_NEEDED", 1)) {
         fprintf(stderr, "  [dl] %s: %d DT_NEEDED\n", path, nn);
         for (int i = 0; i < nn; i++) fprintf(stderr, "  [dl]     needs %s\n", names[i]);
@@ -402,6 +436,10 @@ kl_image *kl_load_recursive(const char *path) {
             fprintf(stderr, "  [klepton] DT_NEEDED %s of %s is neither loadable "
                     "nor shim-served — its imports will be UNRESOLVED\n",
                     names[i], path);
+            if (kl_extension_strict_load()) {
+                snprintf(g_dlerr,sizeof g_dlerr,"dlopen failed: missing dependency %.128s",names[i]);
+                return NULL;
+            }
             continue;
         }
         if (kl_env_on("KL_TRACE_NEEDED", 1))
@@ -415,6 +453,14 @@ kl_image *kl_load_recursive(const char *path) {
 
     kl_image *img = kl_load_auto(path);
     if (!img) return NULL;
+    if (kl_extension_strict_load() && kl_get_stats(img)->imports_missing) {
+        unsigned n=0;const char *const *missing=kl_missing_imports(img,&n);
+        fprintf(stderr,"  [extension] rejecting %s before constructors: %u unresolved imports\n",path,n);
+        for(unsigned i=0;i<n;++i)fprintf(stderr,"  [extension] missing import: %s\n",missing[i]);
+        snprintf(g_dlerr,sizeof g_dlerr,"dlopen failed: unresolved symbol %.160s",n?missing[0]:"(unknown)");
+        kl_unload(img);
+        return NULL;
+    }
     kl_register_image(path, img);
     kl_run_init(img);
     kl_maybe_jni_onload(path, img);
@@ -460,6 +506,62 @@ void kl_dl_report_images(FILE *f) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Meta XR Audio as an INSTALLED library whose every function does nothing.
+//
+// libMetaXRAudioUnity is refused by name for every guest (kl_target_default_
+// refused below: it trips AMFI). Most games take that as a plugin that is not
+// there. Walkabout Mini Golf does not: its own audio setup drives the SDK's
+// managed interface ("Meta XR Audio Native Interface initialized with Unity
+// plugin", "Setting spatial voice limit: 64", "No Meta XR Audio Room found,
+// setting default room"), and every P/Invoke behind those lines throws
+// DllNotFoundException — 300 in one minute's log, the room acoustics update
+// retrying each frame — and whatever the throwing method was about to do after
+// the call is not done. Served instead, for that target: a handle whose every
+// symbol is a function that returns 0, which is ovrSuccess, with the two
+// version calls answering the shipped plugin's version so a managed string
+// operation on the result does not throw. Unity's own plugin registration
+// goes through the same stub (UnityGetAudioEffectDefinitions -> 0 effects), so
+// the engine's side stays exactly what the refusal left it: no spatializer,
+// plain panning. KL_METAXR_AUDIO_STUB=0 is the refusal again; =1 serves the
+// stub on any target.
+static const char g_mxa_handle[] = "klepton-metaxraudio-stub";
+#if defined(__aarch64__)
+// 0 in both the integer and the floating-point return register: the ABI
+// has ovrResult/int/pointer results in x0 and the few float results in s0.
+__asm__(".text\n.p2align 2\n_kl_mxa_zero:\n    mov x0, #0\n    movi d0, #0\n    ret\n");
+extern void kl_mxa_zero(void);
+#else
+static long kl_mxa_zero(void) { return 0; }
+#endif
+static const char *kl_mxa_version(int *major, int *minor, int *patch) {
+    if (major) *major = 1;
+    if (minor) *minor = 103;
+    if (patch) *patch = 0;
+    return "1.103.0";
+}
+static int kl_mxa_claims(const char *path) {
+    if (!path || !strstr(path, "MetaXRAudioUnity")) return 0;
+    const char *t = kl_driver_target_name();
+    return kl_env_on("KL_METAXR_AUDIO_STUB", t && strcmp(t, "walkabout") == 0);
+}
+static void *kl_mxa_dlopen(const char *path) {
+    if (!kl_mxa_claims(path)) return NULL;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> no-op Meta XR Audio handle: "
+                        "every function returns 0 (ovrSuccess), the engine registers no "
+                        "spatializer (KL_METAXR_AUDIO_STUB=0 refuses it instead)\n", path);
+    return (void *)g_mxa_handle;
+}
+static int kl_mxa_is_handle(const void *h) { return h == (const void *)g_mxa_handle; }
+static void *kl_mxa_sym(const char *name) {
+    if (!name) return NULL;
+    if (!strcmp(name, "ovrAudio_GetVersion") || !strcmp(name, "MetaXRAudio_GetVersion"))
+        return (void *)kl_mxa_version;
+    return (void *)kl_mxa_zero;
+}
+
 // Would klb_dlopen() succeed for `path`? This is the question anything answering
 // an existence check on the guest's behalf has to ask, and it is strictly wider
 // than kl_can_load(): a library can be loadable two ways, and only one of them
@@ -492,9 +594,10 @@ static int kl_core_shim_claims(const char *path);
 int kl_can_dlopen(const char *path) {
     if (!path) return 0;
     return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||
-           kl_ovrplat_claims(path) || kl_mediandk_claims(path) ||
+           kl_ovrplat_claims(path) || kl_steamapi_claims(path) || kl_mediandk_claims(path) ||
            kl_vulkan_claims(path) || kl_aaudio_claims(path) ||
-           kl_openxr_claims(path) || kl_core_shim_claims(path) || kl_can_load(path);
+           kl_ndk_claims(path)    || kl_mxa_claims(path)    ||
+           kl_openxr_claims(path) || kl_core_shim_claims(path) || kl_extension_claims(path) || kl_can_load(path);
 }
 
 // KL_DLOPEN_REFUSE=<substr>[,<substr>...] — refuse these by name, as if the
@@ -700,6 +803,11 @@ void *klb_dlopen(const char *path, int flags) {
     (void)flags;
     { static int once; if (!once) { once = 1; kl_dl_trace_shims(); } }
     if (!path) return (void *)-1;                    // RTLD_DEFAULT-ish: whole process
+    void *sc2 = kl_extension_open(path);
+    if (sc2) return sc2;
+    // Before the refusals: this one stands in for a library that IS refused.
+    void *mxa = kl_mxa_dlopen(path);
+    if (mxa) return mxa;
     if (kl_dlopen_refused(path)) return NULL;
     // Asked before, and it was not here. The dlerror the guest reads next is set
     // to the same text the first attempt produced, so a caller that reports it
@@ -725,6 +833,10 @@ void *klb_dlopen(const char *path, int flags) {
     // OVRPlugin: the real one only forwards to a system service that is not here.
     void *plat = kl_ovrplat_dlopen(path);
     if (plat) return plat;
+    // The Steam API of an Android build from Steam: a client of the Steam on the
+    // headset, which is not here either (kl_steamapi.h).
+    void *steam = kl_steamapi_dlopen(path);
+    if (steam) return steam;
     void *md = kl_mediandk_dlopen(path);
     if (md) return md;
     // Vulkan (BONELAB). Same reasoning as the GL line above: there is no
@@ -738,6 +850,11 @@ void *klb_dlopen(const char *path, int flags) {
     // which is why this door was missing for so long.)
     void *aa = kl_aaudio_dlopen(path);
     if (aa) return aa;
+    // libandroid.so, the same shape as the AAudio line above: FMOD's Android
+    // file layer dlopens it by name rather than importing it, and there is no
+    // libandroid.so on disk to fall through to. See kl_ndk_dlopen.
+    void *ndk = kl_ndk_dlopen(path);
+    if (ndk) return ndk;
     // The OpenXR loader. This one is NOT like the lines above it: the file
     // really is in the guest tree, so this must come first to keep the real
     // Khronos loader from loading successfully and then failing at the Android
@@ -769,7 +886,8 @@ void *klb_dlopen(const char *path, int flags) {
         // path spelling (~150 chars) overflowed its 1024-byte buffer into a
         // __strlen_chk abort. The full detail still goes to the log below.
         const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
-        snprintf(g_dlerr, sizeof g_dlerr, "dlopen failed: library \"%s\" not found", base);
+        if (!kl_extension_strict_load() || !g_dlerr[0])
+            snprintf(g_dlerr, sizeof g_dlerr, "dlopen failed: library \"%s\" not found", base);
         fprintf(stderr, "  [klepton] guest dlopen(\"%s\") FAILED: %s\n", path, kl_error());
         // KL_TRACE_DLOPEN_FRAMES=1 — who asked. A P/Invoke that cannot resolve
         // throws from IL2CPP's resolver, and the managed method that declared it
@@ -808,6 +926,27 @@ void *klb_dlopen(const char *path, int flags) {
 
 static void *kl_dl_interpose(const char *name, void *real);
 
+// android_dlopen_ext(path, flags, android_dlextinfo *). With no extension asked
+// for it is dlopen, and that is the only form served. The struct begins with a
+// uint64_t of flags on both Android ABIs, and nothing after it is read: every
+// flag names something this loader does not do (a file descriptor instead of a
+// path, a reserved address range, a linker namespace), and loading by path
+// while ignoring one would load something other than what was asked for. Such
+// a request fails with a dlerror that says so. BattleGroupVR2 (fix 38,
+// 2026-10-13) imports the name; until now it was left unresolved, and a call
+// stopped the process by name.
+void *klb_android_dlopen_ext(const char *path, int flags, const void *info) {
+    uint64_t extflags = 0;
+    if (info) memcpy(&extflags, info, sizeof extflags);
+    if (extflags) {
+        snprintf(g_dlerr, sizeof g_dlerr,
+                 "android_dlopen_ext: unsupported extension flags 0x%llx",
+                 (unsigned long long)extflags);
+        return NULL;
+    }
+    return klb_dlopen(path, flags);
+}
+
 // KL_TRACE_DLSYM=1: name every dlsym that comes back NULL, with the guest image
 // that asked. A NULL returned here and then CALLED is the jump-to-0x0 AMFI kills
 // as an "Invalid Page" (OLAR) — uncatchable, so the crash report cannot name the
@@ -835,13 +974,21 @@ static void *klb_dlsym_null(const char *name) {
 }
 
 void *klb_dlsym(void *handle, const char *name) {
+    if (kl_extension_is_handle(handle)) {
+        void *symbol = kl_extension_symbol(name);
+        if (!symbol) snprintf(g_dlerr, sizeof g_dlerr, "klepton: unsupported extension export: %s", name);
+        return symbol;
+    }
+    if (kl_mxa_is_handle(handle)) return kl_mxa_sym(name);
     if (kl_egl_is_handle(handle)) return kl_egl_sym(name);
     if (kl_opensl_is_handle(handle)) return kl_opensl_sym(name);
     if (kl_ovrp_is_handle(handle)) return kl_ovrp_sym(name);
     if (kl_ovrplat_is_handle(handle)) return kl_ovrplat_sym(name);
+    if (kl_steamapi_is_handle(handle)) return kl_steamapi_sym(name);
     if (kl_mediandk_is_handle(handle)) return kl_mediandk_sym(name);
     if (kl_vulkan_is_handle(handle)) return kl_vulkan_sym(name);
     if (kl_aaudio_is_handle(handle)) return kl_aaudio_sym(name);
+    if (kl_ndk_is_handle(handle)) return kl_ndk_sym(name);
     if (kl_openxr_is_handle(handle)) return kl_openxr_sym(name);
     // A core system-library handle (libc.so &c.) resolves like RTLD_DEFAULT: the
     // shim serves libc, and the global image search covers anything a guest .so
@@ -861,6 +1008,8 @@ void *klb_dlsym(void *handle, const char *name) {
             void *v = kl_sym(g_imgs[i].img, name);
             if (v) return v;
         }
+        s = kl_extension_symbol(name);
+        if (s) return s;
         snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
         return klb_dlsym_null(name);
     }
@@ -880,6 +1029,7 @@ void *klb_dlsym(void *handle, const char *name) {
     void *v = kl_sym((kl_image *)handle, name);
     if (!v) { snprintf(g_dlerr, sizeof g_dlerr, "klepton: undefined symbol: %s", name);
               return klb_dlsym_null(name); }
+    { void *w = kl_extension_interpose(handle, name, v); if (w) return w; }
     { void *w = kl_dl_interpose(name, v); if (w) return w; }
     return v;
 }
@@ -991,6 +1141,10 @@ static void kl_dl_trace_shims(void) {
 }
 
 static void *kl_dl_interpose(const char *name, void *real) {
+    if(real && !strcmp(name,"NativeConfig_SetDepthSubmissionMode")) {
+        if(real!=(void *)kl_brink_set_depth) g_brink_set_depth=(void (*)(int))real;
+        return (void *)kl_brink_set_depth;
+    }
     if (strcmp(name, "iplHRTFCreate") == 0) {
         g_real_iplHRTFCreate = (int32_t (*)(void *, kl_ipl_audio_settings *,
                                             void *, void *))real;

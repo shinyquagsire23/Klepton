@@ -1,0 +1,11 @@
+{
+  "name": "lapiz",
+  "repository": "raineaeternal/Lapiz",
+  "tag": "v0.2.23",
+  "commit": "dce1d785d6aa7a8b61918c2210815ba25ec2391c",
+  "sha256": "3877124b2b2308f23aa0edcf42c6976ea99d3743d2c788f29d117ac6a9b3540c",
+  "modifiedFiles": [
+    "include/utilities/hooking.hpp"
+  ],
+  "scope": "Original Lapiz with read-only compiler-resolved hook target catalog. Hook installation and behavior retained; embedded engine excluded in favor of source-adapted And64."
+}

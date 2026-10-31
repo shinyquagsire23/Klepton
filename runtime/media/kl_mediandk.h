@@ -52,6 +52,22 @@ void *kl_mediandk_lookup(const char *name);
 // along do not have to include CoreVideo.
 void *kl_mediandk_buffer_pixels(const void *ahardwarebuffer);
 
+// The frontend's stored "try video anyway" choice: 1 turns the container
+// demuxer on even for a guest where it defaults off (a Vulkan one — see
+// klm_extractor_enabled), anything else leaves the default alone. Before boot.
+void kl_mediandk_set_video_default(int on);
+
+// SurfaceTexture uses the same bounded decoded-frame queue as AImageReader.
+void *kl_mediandk_texture_new(unsigned texture);
+void *kl_mediandk_texture_window(void *reader);
+void kl_mediandk_texture_listener(void *reader, void *context, void (*callback)(void *, void *));
+int kl_mediandk_texture_update(void *reader);
+long long kl_mediandk_texture_timestamp(void *reader);
+void kl_mediandk_texture_size(void *reader, int width, int height);
+void kl_mediandk_texture_attach(void *reader, unsigned texture);
+void kl_mediandk_texture_detach(void *reader);
+void kl_mediandk_texture_delete(void *reader);
+int kl_mediandk_texture_selftest(FILE *f);
 void kl_mediandk_report(FILE *f);
 
 #endif

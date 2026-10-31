@@ -1,0 +1,39 @@
+﻿<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+	xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<modal id="presetsModal" clickerino-offerino-closerino='true' size-delta-x='80'
+		size-delta-y='78'>
+		<vertical horizontal-fit='Unconstrained' pad='4' pad-bottom='2' pad-top='9'>
+			<horizontal bg='panel-top-gradient' ignore-layout='true' anchor-max-x='.97'
+				anchor-min-x='.03' anchor-min-y='1' anchor-pos-y='-5'>
+				<text text='BetterSongSearch - Filter Presets' align='Center' font-size='4' />
+			</horizontal>
+			<horizontal horizontal-fit='PreferredSize'>
+				<vertical horizontal-fit='Unconstrained'>
+					<list visible-cells='8' cell-size='8' id='presetListTableData'
+						select-cell='PresetSelected' show-scrollbar='true' stick-scrolling="true" />
+				</vertical>
+			</horizontal>
+			<horizontal>
+				<button text='Save..' on-click='OpenSavePresetModal' pref-width="15" />
+				<button text='Load' id='loadButton' on-click='LoadPreset' pref-width="15" />
+				<button text='Delete' id='deleteButton' on-click='DeletePreset' pref-width="15" />
+				<button text='Close' on-click='CloseModal' pref-width="15" />
+			</horizontal>
+		</vertical>
+	</modal>
+
+	<modal id="savePresetModal" size-delta-x='70' size-delta-y='45'>
+		<vertical horizontal-fit='Unconstrained' pad='4' pad-top='-1'>
+			<horizontal pad-right='-2' pad-left='-2'>
+				<horizontal bg='panel-top-gradient'>
+					<text text='BetterSongSearch - Save Preset' align='Center' font-size='4' />
+				</horizontal>
+			</horizontal>
+			<string-setting id="newPresetNameSetting" text='Name' />
+			<horizontal>
+				<button text='Save' on-click='AddPreset' pref-width="15" />
+				<button text='Cancel' on-click='CloseSavePresetModal' pref-width="15" />
+			</horizontal>
+		</vertical>
+	</modal>
+</bg>

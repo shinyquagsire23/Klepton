@@ -1,0 +1,93 @@
+﻿<!-- old preferred-width="130"  anchor-pos-y="10.5" anchor-min-y="0"  -->
+<vertical preferred-width="130" anchor-min-y="1" child-control-height="false" xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<horizontal bg='panel-top-gradient' id='filterbarContainer' child-align='MiddleRight' child-control-width='false'>
+		<horizontal ignore-layout='true' pad-top='1'>
+			<text text='FILTERS' align='Center' font-size='7' italics='true'/>
+		</horizontal>
+		<horizontal horizontal-fit='PreferredSize' spacing='2' pad-right='1'>
+			<button text='Clear' on-click='ClearFilters' pref-width="15" />
+			<button text='Presets' on-click='ShowPresets' pref-width="15" />
+		</horizontal>
+	</horizontal>
+	<!-- <macro.as-host host='currentFilter'> -->
+		<horizontal horizontal-fit='PreferredSize' pad='4' spacing='2' preferred-height='79' child-control-height='false'>
+			<vertical spacing='2'>
+				<vertical child-control-height='false' bg='panel-top' pad='2' pad-bottom='1' pad-top='1' preferred-width='64'>
+					<text text='&lt;color=#DDD>General' align='Center' underlined='true' bold='true' font-size='3.5' color='#69B' size-delta-y='5'/>
+					<list-setting id="existingSongsSetting" text='Downloaded' value="existingSongs" choices='downloadedFilterOptions' bind-value="true" apply-on-change="true" on-change="UpdateFilterSettings"/>
+					<list-setting id="existingScoreSetting" text='Local score' value="existingScore" choices='scoreFilterOptions' bind-value="true" apply-on-change="true" on-change="UpdateFilterSettings"/>
+					<slider-setting id="minimumSongLengthSlider" text='Length' value="minimumSongLength" bind-value="true" apply-on-change="true" max='10' increment='0.25' formatter='FormatSongLengthLimitFloat' on-change="UpdateFilterSettings"/>
+					<slider-setting id="maximumSongLengthSlider" text='MERGE_TO_PREV' value="maximumSongLength" bind-value="true" apply-on-change="true" max='15' increment='0.25' formatter='FormatSongLengthLimitFloat' on-change="UpdateFilterSettings"/>
+				</vertical>
+				<vertical child-control-height='false' bg='panel-top' pad='2' pad-bottom='1' pad-top='1' preferred-width='64'>
+					<text text='&lt;color=#DDD>Mapping' align='Center' underlined='true' bold='true'  font-size='3.5' color='#69B' size-delta-y='5'/>
+					<slider-setting id="minimumNjsSlider" text='NJS' value="minimumNjs" bind-value="true" apply-on-change="true" max='25' increment='0.5' formatter='FormatShortFloat' on-change="UpdateFilterSettings"/>
+					<slider-setting id="maximumNjsSlider" text='MERGE_TO_PREV' value="maximumNjs" bind-value="true" apply-on-change="true" max='25' increment='0.5' formatter='FormatMaxNjs' on-change="UpdateFilterSettings"/>
+					<slider-setting id="minimumNpsSlider" text='Notes/s' value="minimumNps" bind-value="true" apply-on-change="true" max='12' increment='0.5' formatter='FormatShortFloat' on-change="UpdateFilterSettings"/>
+					<slider-setting id="maximumNpsSlider" text='MERGE_TO_PREV' value="maximumNps" bind-value="true" apply-on-change="true" max='12' increment='0.5' formatter='FormatMaxNps' on-change="UpdateFilterSettings"/>
+				</vertical>
+				<vertical child-control-height='false' bg='panel-top' pad='2' pad-bottom='1' pad-top='1' preferred-width='64'>
+					<text text='&lt;color=#DDD>Ranked' align='Center' underlined='true' bold='true' font-size='3.5' color='#69B' size-delta-y='5'/>
+					<dropdown-list-setting id='rankedStateSetting' text='Ranked Status' value="rankedState" apply-on-change="true" bind-value="true" choices='rankedFilterOptions' on-change="UpdateFilterSettings"/>
+					<slider-setting id="minStarsSetting" text='Stars' value="minimumStars" bind-value="true" apply-on-change="true" max='18' increment='0.2' formatter='FormatShortFloat' on-change="UpdateFilterSettings"/>
+					<slider-setting id="maxStarsSetting" text='MERGE_TO_PREV' value="maximumStars" bind-value="true" apply-on-change="true" max='18' increment='0.2' formatter='FormatMaxStarsFloat' on-change="UpdateFilterSettings"/>
+				</vertical>
+			</vertical>
+			<vertical spacing='2'>
+				<vertical child-control-height='false' bg='panel-top' pad-top='1' preferred-width='64' pad-bottom='29' vertical-fit='PreferredSize'>
+					<text text='&lt;color=#DDD>BeatSaver' align='Center' underlined='true' bold='true' font-size='3.5' color='#69B' size-delta-y='5'/>
+					<scroll-view ignore-layout='true' size-delta-x='2' size-delta-y='-2' anchor-min-y='-0.2' anchor-max-y='0.8' anchor-max-x="1.09">
+						<vertical child-control-height='false' preferred-width='60' vertical-fit='PreferredSize' pad-left='1' pad-right='-2'>
+							<slider-setting text='Min upload date' id='hideOlderThanSlider' value="hideOlderThan"  bind-value="true" apply-on-change="true" min="0" max='2' increment='1' formatter='DateTimeToStr' on-change="UpdateFilterSettings"/>
+							<slider-setting id="minimumRatingSlider" text='Min Rating' value="minimumRating" bind-value="true" apply-on-change="true" max='0.9' increment='0.05' formatter='PercentFloat' on-change="UpdateFilterSettings"/>
+							<slider-setting text='Min Votes' id='minimumVotesSlider' value="minimumVotes" bind-value="true" apply-on-change="true" increment='1' max='100' on-change="UpdateFilterSettings"/>
+							<string-setting text='Uploader(s)' id='uploadersStringControl' value='uploadersString' bind-value='true' apply-on-change='true' on-change="UpdateFilterSettings" hover-hint='You can enter multiple Uploader names, seperated by spaces. If you have an Exclamation mark at the beginning of your input it becomes a blacklist for the given uploaders'/>
+							<dropdown-list-setting text='Map Style' id='mapStyleDropdown' value="mapStyleString" apply-on-change="true" bind-value="true" choices='mapStyles' formatter='FormatBeatSaverTag' on-change="UpdateFilterSettings"/>
+							<horizontal pad-right="-3">
+								<text text="Song Genre" align="MidlineLeft" italics="true"/>
+								<button id='genrePickButton' text="Any" preferred-width="29" on-click="ShowGenrePicker" all-uppercase="false"/>
+							</horizontal>
+							<checkbox-setting id="onlyCuratedMapsToggle" value="onlyCuratedMaps" text="Curated Maps" bind-value='true' apply-on-change='true' on-change="UpdateFilterSettings" />
+							<checkbox-setting id="onlyVerifiedMappersToggle" value="onlyVerifiedMappers" text="Verified Mappers" bind-value='true' apply-on-change='true' on-change="UpdateFilterSettings"/>
+							<checkbox-setting id="onlyV3MapsToggle" value="onlyV3Maps" text="Only V3 Maps" bind-value='true' apply-on-change='true' on-change="UpdateFilterSettings"/>
+						</vertical>
+					</scroll-view>
+				</vertical>
+				<vertical child-control-height='false' bg='panel-top' pad='2' pad-bottom='1' pad-top='1' preferred-width='64'>
+					<text text='&lt;color=#DDD>Characteristic / Difficulty' align='Center' underlined='true' bold='true' font-size='3.5' color='#69B' size-delta-y='5'/>
+					<dropdown-list-setting id="characteristicDropdown" text='Characteristic' value="characteristic" apply-on-change="true" bind-value="true" choices='characteristics' on-change="UpdateFilterSettings"/>
+					<dropdown-list-setting id="difficultyDropdown" text='Difficulty' value="difficulty" apply-on-change="true" bind-value="true" choices='difficulties' on-change="UpdateFilterSettings"/>
+				</vertical>
+				<vertical child-control-height='false' bg='panel-top' pad='2' pad-bottom='1' pad-top='1' preferred-width='64'>
+					<text text='&lt;color=#DDD>Mods' align='Center' underlined='true' bold='true' font-size='3.5' color='#69B' size-delta-y='5'/>
+					<dropdown-list-setting id='modsRequirementDropdown' text='Requirement' value="mods" apply-on-change="true" bind-value="true" choices='modOptions' on-change="UpdateFilterSettings"/>
+				</vertical>
+			</vertical>
+		</horizontal>
+	<!-- </macro.as-host> -->
+
+	<horizontal>
+		<horizontal preferred-width="65" child-expand-width="false" spacing='2' child-align='MiddleCenter'>
+			<text id="versionLabel" text="~version" font-size="3" font-color="#CC6E3B" align="Center"/>
+			<!-- <clickable-text text='♥ Donate' font-size="4" align="Center"  on-click="OpenSponsorsModal"/> -->
+		</horizontal>
+		<horizontal preferred-width="65">
+			<clickable-text id="datasetInfoLabel" font-size="3" font-color="#CCC" text="Loading dataset..." align="Center"  on-click="TryToDownloadDataset"/>
+		</horizontal>
+	</horizontal>
+
+	<bg>
+		<modal size-delta-x='80' size-delta-y='88' move-to-center="true" id="sponsorModal">
+			<vertical horizontal-fit='Unconstrained' pad='2' pad-top='9'>
+				<horizontal bg='panel-top-gradient' ignore-layout='true' anchor-max-x='.97' anchor-min-x='.03' anchor-min-y='1' anchor-pos-y='-5'>
+					<text text='BetterSongSearch - Sponsors' align='Center'/>
+				</horizontal>
+				<text text='Are you enjoying my stuff and want to support me?' align='Center'/>
+				<horizontal>
+					<primary-button text='Open Website' on-click='OpenSponsorsLink'/>
+					<button text='Close' on-click='CloseSponsorModal'/>
+				</horizontal>
+			</vertical>
+		</modal>
+	</bg>
+</vertical>

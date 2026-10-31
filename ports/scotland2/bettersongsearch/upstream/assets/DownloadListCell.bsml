@@ -1,0 +1,13 @@
+﻿<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<vertical id='bgContainer' bg='round-rect-panel' horizontal-fit='Unconstrained' preferred-height='7' vertical-fit='PreferredSize'/>
+	<vertical id='bgProgress' horizontal-fit='Unconstrained' preferred-height='1' vertical-fit='PreferredSize' background='panel-fade-gradient' anchor-pos-y='-2.875'/>
+	<vertical horizontal-fit='Unconstrained' pad='1' preferred-height='8' vertical-fit='PreferredSize'>
+		<horizontal spacing='2'>
+			<text id='songName' align='MidlineLeft' font-size='2.7' overflow-mode='Ellipsis' word-wrapping='false'/>
+			<text id='levelAuthorName' align='MidlineRight' font-size='2.3' overflow-mode='Ellipsis' word-wrapping='false' color='#CCC'/>
+		</horizontal>
+		<horizontal pad-top='2'>
+			<text id='statusLabel' align='MidlineLeft' font-size='3' word-wrapping='false' color='cyan'/>
+		</horizontal>
+	</vertical>
+</bg>

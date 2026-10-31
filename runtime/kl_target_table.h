@@ -11,14 +11,20 @@
 #error "include this through runtime/kl_target.c"
 #endif
 
+KL_TARGET_ROW("alyx", "lx", "", "", "", "hlvr", "alyx", "obb", KL_GUEST_LINUX)
+KL_TARGET_ROW("batman", "batman", "batman.apk", "batman/assets", "batman/lib/arm64-v8a", "libmain", "batman", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("beatsaber", "beatsaber", "beatsaber.apk", "beatsaber/assets", "beatsaber/lib/arm64-v8a", "libmain", "beatsaber", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("beatsaber128", "beatsaber128", "beatsaber-1.28.apk", "beatsaber128/assets", "beatsaber128/lib/arm64-v8a", "libmain", "beatsaber128", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("beatsaber140", "beatsaber140", "beatsaber-1.40.apk", "beatsaber140/assets", "beatsaber140/lib/arm64-v8a", "libmain", "beatsaber140", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("bonelab", "bonelab", "bonelab.apk", "bonelab/assets", "bonelab/lib/arm64-v8a", "libmain", "bonelab", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("cs1", "cs1", "cs1.apk", "cs1/assets", "cs1/lib/arm64-v8a", "libxash", "cs1", "obb", KL_GUEST_SDL2)
+KL_TARGET_ROW("doom3quest", "doom3quest", "doom3quest.apk", "doom3quest/assets", "doom3quest/lib/arm64-v8a", "libdoom3", "doom3quest", "obb", KL_GUEST_GLES3JNI)
 KL_TARGET_ROW("hl1", "hl1", "hl1.apk", "hl1/assets", "hl1/lib/arm64-v8a", "libxash", "hl1", "obb", KL_GUEST_GLES3JNI)
 KL_TARGET_ROW("hl2", "hl2", "hl2.apk", "hl2/assets", "hl2/lib/arm64-v8a", "liblauncher", "hl2", "obb", KL_GUEST_SDL2)
 KL_TARGET_ROW("intotheradius", "intotheradius", "intotheradius.apk", "intotheradius/assets", "intotheradius/lib/arm64-v8a", "libUE4", "intotheradius", "Android/obb/com.CMGames.IntoTheRadius", KL_GUEST_UE4)
 KL_TARGET_ROW("jkxr_ja", "jkxr", "jkxr.apk", "jkxr/assets", "jkxr/lib/arm64-v8a", "libopenjk_ja", "jkxr_ja", "obb", KL_GUEST_JKXR)
 KL_TARGET_ROW("jkxr_jo", "jkxr", "jkxr.apk", "jkxr/assets", "jkxr/lib/arm64-v8a", "libopenjk_jo", "jkxr_jo", "obb", KL_GUEST_JKXR)
+KL_TARGET_ROW("moss", "moss", "moss.apk", "moss/assets", "moss/lib/arm64-v8a", "libUE4", "moss", "Android/obb/com.polyarc.MossGame", KL_GUEST_UE4)
 KL_TARGET_ROW("openbrush", "openbrush", "openbrush.apk", "openbrush/assets", "openbrush/lib/arm64-v8a", "libmain", "openbrush", "obb", KL_GUEST_UNITY)
 KL_TARGET_ROW("portal", "portal", "portal.apk", "portal/assets", "portal/lib/arm64-v8a", "liblauncher", "portal", "obb", KL_GUEST_SDL2)
 KL_TARGET_ROW("re4", "re4", "re4.apk", "re4/assets", "re4/lib/arm64-v8a", "libUE4", "re4", "Android/obb/com.Armature.VR4", KL_GUEST_UE4)
@@ -28,6 +34,11 @@ KL_TARGET_ROW("superhot", "superhot", "superhot.apk", "superhot/assets", "superh
 KL_TARGET_ROW("vampire", "vampire", "vampire.apk", "vampire/assets", "vampire/lib/arm64-v8a", "libUE4", "vampire", "Android/obb/com.fasttravelgames.lollipop", KL_GUEST_UE4)
 KL_TARGET_ROW("vicecity", "vicecity", "vicecity.apk", "vicecity/assets", "vicecity/lib/arm64-v8a", "libmiamivr", "vicecity", "obb", KL_GUEST_NATIVE)
 KL_TARGET_ROW("vrchat", "vrchat", "vrchat.apk", "vrchat/assets", "vrchat/lib/arm64-v8a", "libmain", "vrchat", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("walkabout", "walkabout", "walkabout.apk", "walkabout/assets", "walkabout/lib/arm64-v8a", "libmain", "walkabout", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("wrath2", "wrath2", "wrath2.apk", "wrath2/assets", "wrath2/lib/arm64-v8a", "libUE4", "wrath2", "Android/obb/com.Sanzaru.Wrath2", KL_GUEST_UE4)
+KL_TARGET_ROW("x2426206484098337", "x2426206484098337", "x2426206484098337.apk", "x2426206484098337/assets", "x2426206484098337/lib/arm64-v8a", "libUE4", "x2426206484098337", "Android/obb/com.ILMxLAB.VaderImmortal.ep3", KL_GUEST_UE4)
+KL_TARGET_ROW("x2582932495064035", "x2582932495064035", "x2582932495064035.apk", "x2582932495064035/assets", "x2582932495064035/lib/arm64-v8a", "libmain", "x2582932495064035", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("x7527722310622065", "x7527722310622065", "x7527722310622065.apk", "x7527722310622065/assets", "x7527722310622065/lib/arm64-v8a", "libmain", "x7527722310622065", "Android/obb/com.rrrgames.CaveCrave", KL_GUEST_UNITY)
 KL_TARGET_ROW("zix", "zix", "zix.apk", "zix/assets", "zix/lib/arm64-v8a", "libmain", "zix", "obb", KL_GUEST_UNITY)
 
 #define KL_TARGET_DEFAULT_NAME "beatsaber"

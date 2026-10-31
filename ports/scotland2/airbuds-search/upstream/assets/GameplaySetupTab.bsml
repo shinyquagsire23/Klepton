@@ -1,0 +1,7 @@
+<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/monkeymanboy/BSML-Docs/gh-pages/BSMLSchema.xsd'>
+    <vertical child-control-height='false' vertical-fit='PreferredSize' spacing='2' pad='2'>
+        <text text='Airbuds Search' font-size='5' align='Center' />
+        <text text='Search your Airbuds listening history' font-size='3' color='#AAAAAA' align='Center' word-wrapping='true' />
+        <button id='openButton' text='Open Airbuds Search' on-click='onOpenButtonClicked' pref-width='40' pref-height='10' />
+    </vertical>
+</bg>

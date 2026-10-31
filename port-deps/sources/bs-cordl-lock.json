@@ -1,0 +1,15 @@
+{
+  "repository": "QuestPackageManager/bs-cordl",
+  "version": "4008.0.0",
+  "ref": "version/v4008_0_0",
+  "commit": "3b1bf58a4cb633bc7ec36913a298397e8541885a",
+  "sha256": "afcdf1b6baf6176b95b28b0062993cfe1b5307889ec329f61093fe44812ad477",
+  "archiveSize": 29294597,
+  "extractedBytes": 381646026,
+  "entries": 38455,
+  "sourceManifests": [
+    "lapiz/qpm.shared.json",
+    "bsml/qpm.shared.json",
+    "songcore/qpm.shared.json"
+  ]
+}

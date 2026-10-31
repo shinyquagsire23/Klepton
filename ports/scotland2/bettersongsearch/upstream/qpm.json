@@ -1,0 +1,125 @@
+{
+  "$schema": "https://raw.githubusercontent.com/QuestPackageManager/QPM.Package/refs/heads/main/qpm.schema.json",
+  "version": "0.4.0",
+  "sharedDir": "shared",
+  "dependenciesDir": "extern",
+  "info": {
+    "name": "BetterSongSearch",
+    "id": "BetterSongSearch",
+    "version": "2.2.0",
+    "url": "https://github.com/bsq-ports/BetterSongSearchQuest",
+    "additionalData": {
+      "overrideSoName": "libBetterSongSearch.so",
+      "cmake": true
+    }
+  },
+  "workspace": {
+    "scripts": {
+      "build": [
+        "pwsh build.ps1 $0:?"
+      ],
+      "clean": [
+        "qpm s build -- -clean"
+      ],
+      "copy": [
+        "pwsh copy.ps1 $0:?"
+      ],
+      "log": [
+        "pwsh start-logging.ps1 $0:?"
+      ],
+      "qmod": [
+        "pwsh createqmod.ps1 BetterSongSearch"
+      ],
+      "restart": [
+        "pwsh restart-game.ps1 $0:?"
+      ],
+      "tomb": [
+        "pwsh tomb.ps1 $0:?"
+      ]
+    },
+    "ndk": "^27.3.13750724",
+    "qmodIncludeDirs": [
+      "./build",
+      "./extern/libs"
+    ],
+    "qmodIncludeFiles": [],
+    "qmodOutput": "BetterSongSearch.qmod"
+  },
+  "dependencies": [
+    {
+      "id": "beatsaber-hook",
+      "versionRange": "^6.4.2",
+      "additionalData": {}
+    },
+    {
+      "id": "beatsaverplusplus",
+      "versionRange": "^0.2.1",
+      "additionalData": {}
+    },
+    {
+      "id": "bs-cordl",
+      "versionRange": "4008.*",
+      "additionalData": {}
+    },
+    {
+      "id": "bsml",
+      "versionRange": "^0.4.55",
+      "additionalData": {}
+    },
+    {
+      "id": "config-utils",
+      "versionRange": "^2.0.3",
+      "additionalData": {}
+    },
+    {
+      "id": "custom-types",
+      "versionRange": "^0.18.3",
+      "additionalData": {}
+    },
+    {
+      "id": "fmt",
+      "versionRange": "^11.0.2",
+      "additionalData": {}
+    },
+    {
+      "id": "kaleb",
+      "versionRange": "^0.1.9",
+      "additionalData": {
+        "private": true
+      }
+    },
+    {
+      "id": "paper2_scotland2",
+      "versionRange": "^4.6.4",
+      "additionalData": {}
+    },
+    {
+      "id": "scotland2",
+      "versionRange": "^0.1.6",
+      "additionalData": {
+        "includeQmod": false,
+        "private": true
+      }
+    },
+    {
+      "id": "sombrero",
+      "versionRange": "^0.1.43",
+      "additionalData": {}
+    },
+    {
+      "id": "song-details",
+      "versionRange": "^1.0.3",
+      "additionalData": {}
+    },
+    {
+      "id": "songcore",
+      "versionRange": "^1.1.24",
+      "additionalData": {}
+    },
+    {
+      "id": "web-utils",
+      "versionRange": "^0.6.7",
+      "additionalData": {}
+    }
+  ]
+}

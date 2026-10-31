@@ -56,6 +56,19 @@ The bundle id is set to `$USER.dev.klepton.target.<target>` in order to avoid co
 Set `KLEPTON_BUNDLE_SCOPE` to use something else instead of `$USER`, or `KLEPTON_BUNDLE_ID` 
 to override the the whole id.
 
+The name under the icon comes from the target's row in `visionos/targets.py`.
+`KLEPTON_DISPLAY_OVERRIDE` replaces it (for every target, generic ones included),
+and `KLEPTON_DISPLAY_SUFFIX` is appended to whatever name that leaves. Together
+with `KLEPTON_BUNDLE_ID`, that installs a test copy next to the one you already have:
+
+```sh
+KLEPTON_BUNDLE_ID=$USER.dev.klepton.target.beatsaber140.test \
+KLEPTON_DISPLAY_SUFFIX=" (Test)" \
+  ./build_run_vpro.sh beatsaber140      # -> "Beat Saber (Test)"
+```
+
+If neither is set, or both are empty, the name stays exactly as it is now.
+
 ---
 
 ## Guest applications
@@ -162,6 +175,18 @@ Everything below builds what it needs first. `<target>` is any name from
 | Steam Link config UI, macOS | `./build_run_host.sh steamlink-vr --shell --view` |
 | any target's shim work list, in seconds | `./build_run_host.sh <target> --gap` |
 | visionOS build gate, no device needed | `make xros` |
+
+### Icon and start picture
+
+The app's icon and the picture behind its start screen are whatever the
+installer left in `visionos/Assets.xcassets` for the target
+(`AppIcon-<target>.solidimagestack`, `StartHero-<target>.imageset`; both
+gitignored). A target whose game is not an APK and names a Steam app instead
+(`steam_app` in `targets.py`, today `alyx`) gets both from Steam's public store
+artwork at project-generation time (`visionos/steam_art.py`, into
+`visionos/build/steamart/<target>/`, kept for rebuilds without a network).
+`KL_NO_STEAM_ART=1` skips that, and a fetch that fails just leaves the build
+iconless, as it was before.
 
 ---
 

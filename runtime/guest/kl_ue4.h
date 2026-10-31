@@ -69,10 +69,20 @@ void kl_ue4_start(FILE *out);
 // so the driver's loop is a pump rather than a render call.
 double kl_ue4_pump(double seconds, const volatile int *quit);
 
+// The engine called AndroidThunkJava_ForceQuit and KL_UE4_FORCE_QUIT said to
+// obey it (kl_jni_ue4.c). The pump ends on it, and the app treats the run as
+// the game's own quit — the way a finished Unity guest is (kl_app.c).
+void kl_ue4_note_force_quit(void);
+int  kl_ue4_force_quit_obeyed(void);
+
 // The way back out, for a clean shutdown rather than an exit.
 void kl_ue4_stop(FILE *out);
 
 // Everything this target's subsystems have to say, in one place.
 void kl_ue4_report(FILE *out);
+
+// Once per guest frame, on the game thread (ovrp_WaitToBeginFrame): the per-title
+// adjustments that act on the running engine's objects (KL_MOH_HOVER).
+void kl_ue4_frame_tick(void);
 
 #endif

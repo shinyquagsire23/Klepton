@@ -1,0 +1,125 @@
+<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+    xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+
+    <!-- [Left] Airbuds history -->
+    <vertical horizontal-fit="Unconstrained" anchor-max-x="0.260">
+
+        <!-- Header -->
+        <horizontal pivot-y="1" child-expand-width="false" pref-height="6" pad-right="4">
+            <icon-button pad="0" id="playlistsMenuButton_" icon="#HorizontalArrowIcon" on-click="onPlaylistsMenuButtonClicked" pref-width="8" pref-height="6" pivot-x="0" pad-right="1"/>
+            <text id="airbudsColumnTitleTextView_" align="MidlineLeft" font-align="MidlineLeft" word-wrapping="false" font-size="3.5" overflow-mode="Ellipsis"/>
+        </horizontal>
+
+        <!-- playlists and tracks list -->
+        <vertical flex-height="100" horizontal-fit="Unconstrained" pad-top="1">
+
+            <!-- Placeholder content -->
+            <vertical ignore-layout="true" horizontal-fit="Unconstrained">
+
+                <!-- Loading indicator -->
+                <horizontal id="airbudsTrackListLoadingIndicatorContainer_" ignore-layout="true">
+                    <loading preserve-aspect="true" pref-height="8"/>
+                </horizontal>
+
+                <!-- Error message -->
+                <vertical id="airbudsListViewErrorContainer_" ignore-layout="true" pad-right="8">
+                    <vertical flex-height="100"/>
+                    <image src="#ExclamationMark" pref-width="3" pref-height="3" preserve-aspect="true"/>
+                    <text id="airbudsTrackListErrorMessageTextView_" font-size="3" color="red" align="Center"/>
+                    <button pad-top="2" on-click="onAirbudsTrackListRetryButtonClicked" text="Retry" pref-width="15"/>
+                    <vertical flex-height="100"/>
+                </vertical>
+
+                <vertical id="airbudsListViewStatusContainer_" ignore-layout="true">
+                    <text id="airbudsTrackListStatusTextView_" font-size="3" align="Center"/>
+                </vertical>
+
+            </vertical>
+
+            <vertical horizontal-fit="Unconstrained" pad-right="8" flex-width="0" flex-height="0">
+                <list active="true" id='airbudsTrackListView_' select-cell='onTrackSelected' show-scrollbar='true' stick-scrolling="true" list-width="12"/>
+                <list active="false" id='airbudsPlaylistListView_' select-cell='onPlaylistSelected' show-scrollbar='true' stick-scrolling="true" list-width="12"/>
+            </vertical>
+
+            <!-- Bottom bar -->
+            <vertical pad="0" pad-right="8" spacing="0.8" child-control-height="false" child-expand-height="false" child-align="MiddleCenter" pref-height="12">
+                <horizontal id="randomScopeToggleContainer_" spacing="0.5" child-expand-width="false" child-align="MiddleCenter" pref-height="5" min-height="5">
+                    <button id="randomScopeButton_" text="[ ] All history" font-size="2.6" pref-width="22" min-width="22" pref-height="4.5" on-click="onRandomScopeToggleClicked"/>
+                </horizontal>
+                <horizontal spacing="1" child-expand-width="false" child-align="MiddleCenter" pref-height="6" min-height="6">
+                    <icon-button pad="0" id="randomTrackButton_" icon="#RandomIcon" on-click="onRandomTrackButtonClicked" pref-width="8" pref-height="6" hover-hint="Select a random song"/>
+                </horizontal>
+            </vertical>
+
+        </vertical>
+    </vertical>
+
+    <!-- [Center] Search results -->
+    <vertical horizontal-fit="Unconstrained" anchor-min-x="0.260" anchor-max-x="0.740">
+        <!-- Header -->
+        <horizontal pref-height="6" child-expand-width="false" pivot-y="1" child-align="MiddleRight">
+            <text font-size="3.5" text='Search Results' align="MidlineLeft"/>
+            <horizontal child-align="MiddleRight" spacing="1" child-expand-width="false" flex-width="1" pad-right="8">
+                <icon-button active="false" pad="0" id="showAllByArtistButton_" icon="#GuestUserIcon" on-click="onShowAllByArtistButtonClicked" pref-width="8" pref-height="6" hover-hint="Show all songs from this artist"/>
+                <icon-button active="false" pad="0" id="hideDownloadedMapsButton_" on-click="onHideDownloadedMapsButtonClicked" pref-width="8" pref-height="6" hover-hint="Hide downloaded maps"/>
+            </horizontal>
+        </horizontal>
+
+        <!-- Main content -->
+        <vertical flex-height="100" horizontal-fit="Unconstrained">
+
+            <!-- Placeholder content -->
+            <vertical ignore-layout="true" horizontal-fit="Unconstrained">
+
+                <!-- Loading indicator -->
+                <horizontal id="searchResultsListLoadingIndicatorContainer_" ignore-layout="true">
+                    <loading preserve-aspect="true" pref-height="8"/>
+                </horizontal>
+
+                <!-- Error message -->
+                <vertical id="searchResultsListViewErrorContainer_" ignore-layout="true">
+                    <text id="searchResultsListStatusTextView_" font-size="3" align="Center"/>
+                </vertical>
+
+            </vertical>
+
+            <!-- List view -->
+            <vertical horizontal-fit="Unconstrained" pad-right="8" flex-width="0" flex-height="0" ignore-layout="true">
+                <list active="false" id='searchResultsList_' select-cell='onSearchResultSelected' show-scrollbar='true' stick-scrolling="true" list-width="30"/>
+            </vertical>
+
+        </vertical>
+
+    </vertical>
+
+    <!-- [Right] Preview song -->
+    <vertical horizontal-fit="Unconstrained" anchor-min-x="0.740" anchor-max-x="1" background="round-rect-panel">
+        <vertical vertical-fit="PreferredSize" pad-bottom="1" pref-width="40">
+            <text id="previewSongNameTextView_" align="Center" word-wrapping="false" overflow-mode="Ellipsis"/>
+            <text id="previewSongAuthorTextView_" font-size="3" align="Center" word-wrapping="false" overflow-mode="Ellipsis"/>
+        </vertical>
+        <image id="previewSongImage_" image-color="white" src="UI/Skin/Background" preserve-aspect="true" pref-width="30" pref-height="30"/>
+        <horizontal child-expand-width="true" pad-top="2">
+            <vertical pref-width="20">
+                <text font-size="3" color='#AAA' text="Uploader" overflow-mode="Truncate" word-wrapping="false" font-align="Right"/>
+                <text font-size="3" color='#AAA' text="Length" overflow-mode="Truncate" word-wrapping="false" font-align="Right"/>
+                <text font-size="3" color='#AAA' text="NPS" overflow-mode="Truncate" word-wrapping="false" font-align="Right"/>
+                <text font-size="3" color='#AAA' text="NJS" overflow-mode="Truncate" word-wrapping="false" font-align="Right"/>
+            </vertical>
+            <vertical pref-width="20">
+                <text font-size="3" id="previewSongUploaderTextView_" overflow-mode="Truncate" word-wrapping="false"/>
+                <text font-size="3" id="previewSongLengthTextView_" overflow-mode="Truncate" word-wrapping="false"/>
+                <text font-size="3" id="previewSongNPSTextView_" overflow-mode="Truncate" word-wrapping="false"/>
+                <text font-size="3" id="previewSongNJSTextView_" overflow-mode="Truncate" word-wrapping="false"/>
+            </vertical>
+        </horizontal>
+        <vertical vertical-fit="Unconstrained" flex-height="100">
+            <!-- Dummy -->
+        </vertical>
+        <vertical pad="2">
+            <primary-button id="downloadButton_" text="Download" on-click="onDownloadButtonClicked"/>
+            <primary-button id="playButton_" text="Play" on-click="onPlayButtonClicked" active="false"/>
+        </vertical>
+    </vertical>
+
+</bg>

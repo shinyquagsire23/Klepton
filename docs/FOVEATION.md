@@ -284,6 +284,25 @@ outer edge and ~46% from the top on the Vision Pro, not at the image centre).
 | high | 0.381 H (768 px) | 0.19 H | 0.125 | 2816x1340 | 36.1% |
 
 (The continuous curves are 64/49/32%; Metal rounds each 32-px tile up.)
+
+**Both eyes' points, not one (the envelope).** On the Vision Pro each eye's
+cone is wider outward than inward (60 / 45 degrees), so its straight-ahead
+point is 63% across the left eye and 37% across the right. A profile peaked
+there alone leaves the outer side of each eye in the ramp and floor: in
+Alien: Rogue Incursion (toolchain 565, `high`) the left eye was blurred over
+its left half and the right eye over its right half. Doom 3's owner had made
+the same complaint about the display's own per-eye curves on the GL path
+(f9f514f). Since then every eye image and every map layer is, per axis, the
+larger of two profiles: one at its own eye's point, one at the other eye's
+point placed in the same rect (its fraction, this eye's viewport). The two
+eyes' maps are then the same relative to their pictures and symmetric about
+the middle, and both points stay at full rate. A symmetric cone (or Unity's
+union cone) makes the two points one, which changes nothing. Measured through
+the GPU on Alien's shape (`t_fove`, rate by eighths of the left eye's
+picture): one peak 0.16 0.27 0.69 0.99 | 1.00 1.00 1.00 0.76; envelope 0.77
+1.00 1.00 1.00 | 1.00 1.00 1.00 0.75, the same for the right eye. It costs
+fragments: 49% of the image instead of 39% at `high` there.
+`KL_FOVE_PER_EYE=1` brings back the single peak.
 `KL_FOVE_BOX`, `KL_FOVE_RAMP` and `KL_FOVE_FLOOR` override the numbers.
 Box 0.30 / floor 0.08 at `high` was found invisible through the lenses in
 Half-Life: Alyx, and is the setting the targets that bake foveation use.
@@ -324,6 +343,24 @@ Reads that must stay PHYSICAL keep the original position
   `uint2(gl_FragCoord.xy)` is rewritten to `uint2(kl_fove_phys.xy)`. The
   guest's own texelFetch (spelled `uint2(int2(gl_FragCoord.xy))`) is remapped
   as it should be.
+- **Subpass inputs read in a helper function.** Unreal 4's mobile renderer
+  reads the scene depth (DepthFade, soft-edge translucency) through
+  `VulkanSubpassDepthFetch(texture2d_ms_array<float> …, thread float4&
+  gl_FragCoord, thread uint& gl_ViewIndex)`, a static inline function ABOVE
+  the entry point that does the `.read(uint2(gl_FragCoord.xy), …)` itself.
+  A scan of the entry body alone misses it: the helper then gets the remapped
+  screen position and reads the physical-layout depth at the wrong texel. In
+  Moss that showed as a hard black band in place of the soft shadow in the
+  book's fold, with foveation on only (Moss's eye: a 2-layer x4 MSAA scene, a
+  depth-read subpass, both under one map). So a helper that takes the
+  position as `thread float4& <pos>` and uses it ONLY as
+  `<tex>.read(uint2(<pos>.xy)…`, with `<tex>` one of its own texture
+  parameters, is passed `kl_fove_phys` at its call sites in the entry body
+  instead; a helper that uses the position for anything else (or reads a
+  texture it does not take as a parameter) keeps the remapped one.
+  Moss's Archive level: 22 of 28 patched fragment entry points have such a
+  call (0 were kept physical before). `KL_FOVE_SUBPASS_HELPERS=0` restores the
+  old behaviour as an A/B control.
 - **Multisampled reads of an eye image** at its own pixel
   (`<ms texture>.read(uint2(int2(gl_FragCoord.xy)), sample)`, used by
   Source 2's soft particles on an MSAA eye): physical, see §6.
@@ -402,8 +439,8 @@ whose resolve attachment 0 is (**MSAA + resolve**: an eye-size MSAA target
 resolved into the eye inside the pass), with a depth attachment of the same
 extent and sample count.
 
-- A 2-layer eye gets ONE map with two layers, layer l centred on eye l's
-  projection centre. It is foveated only as a LAYERED Metal pass
+- A 2-layer eye gets ONE map with two layers, layer l built around eye l's
+  projection centre (and, by default, the other eye's: §4.2). It is foveated only as a LAYERED Metal pass
   (`renderTargetArrayLength` 2, MoltenVK's lowering of multiview on Apple
   GPUs); a one-slice pass over the pair draws unfoveated (counted). A one-eye
   image gets a one-layer map for that eye.
@@ -426,8 +463,15 @@ extent and sample count.
   eye into a ~4012-wide sub-rect of a 5088 texture, so its fovea sat 682 px
   off (a hard clear/blurry seam in both eyes). An ARRAY map's centres are
   recomputed on lookup and the map is rebuilt in place when one moves more
-  than 4 px, never while a pending expand refers to it, at most 8 times per
-  run (old maps kept alive for frames in flight).
+  than 4 px: in place when no pending expand refers to it, else into another
+  map slot, the old one kept unchanged for the expands still pending on it
+  and recycled once none is (a command buffer that already drew with a map
+  keeps it for its remaining passes, so a scene subpass and its eye subpass
+  share one). Replaced maps are kept alive 2 s for frames in flight, then
+  released. Until toolchain 565 a referenced map was kept as it was, at most
+  8 re-centres a run: Alien: Rogue Incursion (dynamic resolution, an expand
+  always in flight) kept its 5th map while the viewport went from 79% to 55%
+  of the image.
 - **Render-area snap** (`KL_FOVE_AREA_SNAP`, default 1). MoltenVK honours
   loadOp CLEAR as a Metal clear only when the render area IS the framebuffer
   extent; otherwise every attachment opens with LOAD and the clear is drawn as

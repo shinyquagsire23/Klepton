@@ -1,0 +1,219 @@
+{
+  "$schema": "https://raw.githubusercontent.com/QuestPackageManager/QPM.Package/refs/heads/main/qpm.shared.schema.json",
+  "config": {
+    "version": "0.1.0",
+    "sharedDir": "shared",
+    "dependenciesDir": "extern",
+    "info": {
+      "name": "Unicode",
+      "id": "unicode",
+      "version": "0.1.7",
+      "url": null,
+      "additionalData": {
+        "overrideSoName": "libunicode.so"
+      }
+    },
+    "workspace": {
+      "scripts": {
+        "build": [
+          "pwsh ./scripts/build.ps1 $0?"
+        ],
+        "copy": [
+          "pwsh ./scripts/copy.ps1 $0:?",
+          "pwsh ./scripts/restart-game.ps1"
+        ],
+        "log": [
+          "pwsh ./scripts/start-logging.ps1 $0:"
+        ],
+        "qmod": [
+          "pwsh ./scripts/build.ps1 $0?",
+          "pwsh ./scripts/createqmod.ps1"
+        ],
+        "restart": [
+          "pwsh ./scripts/restart-game.ps1"
+        ],
+        "stack": [
+          "pwsh ./scripts/ndk-stack.ps1 $0?"
+        ],
+        "tomb": [
+          "pwsh ./scripts/pull-tombstone.ps1 -analyze"
+        ]
+      },
+      "ndk": "^27.2.12479018",
+      "qmodIncludeDirs": [
+        "build",
+        "extern/lib"
+      ],
+      "qmodIncludeFiles": [],
+      "qmodOutput": "Unicode.qmod"
+    },
+    "dependencies": [
+      {
+        "id": "beatsaber-hook",
+        "versionRange": "^6.4.2",
+        "additionalData": {}
+      },
+      {
+        "id": "scotland2",
+        "versionRange": "^0.1.6",
+        "additionalData": {
+          "includeQmod": false
+        }
+      },
+      {
+        "id": "bs-cordl",
+        "versionRange": "^4008.0.0",
+        "additionalData": {}
+      },
+      {
+        "id": "paper2_scotland2",
+        "versionRange": "^4.6.4",
+        "additionalData": {}
+      },
+      {
+        "id": "metacore",
+        "versionRange": "^1.4.0",
+        "additionalData": {}
+      }
+    ]
+  },
+  "restoredDependencies": [
+    {
+      "dependency": {
+        "id": "bs-cordl",
+        "versionRange": "=4008.0.0",
+        "additionalData": {
+          "headersOnly": true,
+          "branchName": "version/v4008_0_0",
+          "compileOptions": {
+            "includePaths": [
+              "include"
+            ],
+            "cppFeatures": [],
+            "cppFlags": [
+              "-DNEED_UNSAFE_CSHARP",
+              "-fdeclspec",
+              "-DUNITY_2021",
+              "-DHAS_CODEGEN",
+              "-Wno-invalid-offsetof"
+            ]
+          }
+        }
+      },
+      "version": "4008.0.0"
+    },
+    {
+      "dependency": {
+        "id": "paper2_scotland2",
+        "versionRange": "=4.6.4",
+        "additionalData": {
+          "soLink": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/libpaper2_scotland2.so",
+          "overrideSoName": "libpaper2_scotland2.so",
+          "modLink": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod",
+          "branchName": "version/v4_6_4",
+          "compileOptions": {
+            "systemIncludes": [
+              "shared/utfcpp/source"
+            ]
+          },
+          "cmake": false
+        }
+      },
+      "version": "4.6.4"
+    },
+    {
+      "dependency": {
+        "id": "metacore",
+        "versionRange": "=1.4.0",
+        "additionalData": {
+          "soLink": "https://github.com/Metalit/MetaCore/releases/download/v1.4.0/libmetacore.so",
+          "overrideSoName": "libmetacore.so",
+          "modLink": "https://github.com/Metalit/MetaCore/releases/download/v1.4.0/MetaCore.qmod",
+          "branchName": "version/v1_4_0",
+          "cmake": true
+        }
+      },
+      "version": "1.4.0"
+    },
+    {
+      "dependency": {
+        "id": "rapidjson-macros",
+        "versionRange": "=2.1.0",
+        "additionalData": {
+          "headersOnly": true,
+          "branchName": "version/v2_1_0",
+          "cmake": false
+        }
+      },
+      "version": "2.1.0"
+    },
+    {
+      "dependency": {
+        "id": "fmt",
+        "versionRange": "=11.0.2",
+        "additionalData": {
+          "headersOnly": true,
+          "branchName": "version/v11_0_2",
+          "compileOptions": {
+            "systemIncludes": [
+              "fmt/include/"
+            ],
+            "cppFlags": [
+              "-DFMT_HEADER_ONLY"
+            ]
+          }
+        }
+      },
+      "version": "11.0.2"
+    },
+    {
+      "dependency": {
+        "id": "beatsaber-hook",
+        "versionRange": "=6.4.2",
+        "additionalData": {
+          "soLink": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/libbeatsaber-hook.so",
+          "debugSoLink": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/debug_libbeatsaber-hook.so",
+          "overrideSoName": "libbeatsaber-hook.so",
+          "modLink": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod",
+          "branchName": "version/v6_4_2",
+          "compileOptions": {
+            "cppFlags": [
+              "-Wno-extra-qualification"
+            ]
+          },
+          "cmake": true
+        }
+      },
+      "version": "6.4.2"
+    },
+    {
+      "dependency": {
+        "id": "scotland2",
+        "versionRange": "=0.1.6",
+        "additionalData": {
+          "soLink": "https://github.com/sc2ad/scotland2/releases/download/v0.1.6/libsl2.so",
+          "debugSoLink": "https://github.com/sc2ad/scotland2/releases/download/v0.1.6/debug_libsl2.so",
+          "overrideSoName": "libsl2.so",
+          "branchName": "version/v0_1_6"
+        }
+      },
+      "version": "0.1.6"
+    },
+    {
+      "dependency": {
+        "id": "libil2cpp",
+        "versionRange": "=0.4.0",
+        "additionalData": {
+          "headersOnly": true,
+          "compileOptions": {
+            "systemIncludes": [
+              "il2cpp/external/baselib/Include",
+              "il2cpp/external/baselib/Platforms/Android/Include"
+            ]
+          }
+        }
+      },
+      "version": "0.4.0"
+    }
+  ]
+}

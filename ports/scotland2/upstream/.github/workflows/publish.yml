@@ -1,0 +1,79 @@
+name: Publish QPM Package
+
+env:
+  module_id: sl2
+  cache-name: sl2_cache
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+        name: Checkout
+        with:
+          submodules: true
+          lfs: true
+
+      - uses: seanmiddleditch/gha-setup-ninja@v3
+
+      - name: Create ndkpath.txt
+        run: |
+          echo "$ANDROID_NDK_LATEST_HOME" > ${GITHUB_WORKSPACE}/ndkpath.txt
+          cat ${GITHUB_WORKSPACE}/ndkpath.txt
+
+      - name: Get Tag Version
+        id: get_tag_version
+        run: |
+          echo ${GITHUB_REF#refs/tags/}
+          echo ::set-output name=TAG::${GITHUB_REF#refs/tags/}
+          echo ::set-output name=VERSION::${GITHUB_REF#refs/tags/v}
+
+      - name: QPM Rust Action
+        uses: Fernthedev/qpm-action@v1
+        with:
+          #required
+          workflow_token: ${{secrets.GITHUB_TOKEN}}
+
+          restore: true # will run restore on download
+          cache: true #will cache dependencies
+
+          publish: "late"
+          publish_token: ${{secrets.QPM_TOKEN}}
+
+          version: ${{ steps.get_tag_version.outputs.VERSION }}
+          tag: ${{ steps.get_tag_version.outputs.TAG }}
+
+          # set to true if applicable, ASSUMES the file is already a release asset
+          qpm_release_bin: true
+          qpm_debug_bin: true
+
+      - name: Build
+        run: |
+          cd ${GITHUB_WORKSPACE}
+          qpm s build
+
+      - name: Get Library Name
+        id: libname
+        run: |
+          cd ./build/
+          pattern="lib${module_id}*.so"
+          files=( $pattern )
+          echo ::set-output name=NAME::"${files[0]}"
+
+      - name: Upload to Release
+        id: upload_file_release
+        uses: softprops/action-gh-release@v0.1.15
+        with:
+          name: ${{ github.event.inputs.release_msg }}
+          tag_name: ${{ github.event.inputs.version }}
+          files: |
+            ./build/${{ steps.libname.outputs.NAME }}
+            ./build/debug_${{ steps.libname.outputs.NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

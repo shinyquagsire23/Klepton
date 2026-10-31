@@ -70,6 +70,15 @@ typedef struct {
 // into the veneer, and ret is a return-predictor hint whose register is x30's
 // business, not x18's.
 #define KLX_HZ_TERMBR   3
+// CASP — compare-and-swap PAIR. Its Rs and Rt each name TWO registers, the one
+// in the field and the next one up, and both fields must be even. So x18 here
+// means the pair x18:x19, and substituting a single scratch register for it is
+// wrong twice over: an odd one is an unallocated encoding, and an even one
+// silently swaps x19 for its neighbour. The emitter has a shape of its own for
+// it (a scratch PAIR, with x19 copied across), which is why it is a hazard for
+// the general path rather than something the general path half-handles.
+// Android toolchains do not emit it into x18; Valve's Source 2 build does.
+#define KLX_HZ_PAIR     4
 
 // System registers that need translating, which is a different job from x18 but
 // the same machinery: the site is rewritten in place to a branch into a stub
@@ -78,6 +87,32 @@ typedef struct {
 // TPIDR_EL0 is not here — it is a one-bit rewrite and needs no stub.
 #define KLX_SYS_NONE    0
 #define KLX_SYS_CTR_EL0 1   // SIGILL from EL0 on Darwin
+// The Linux guest ABI only (KLX_ABI_LINUX) — an Android image never has these
+// flagged, so its site counts do not move:
+#define KLX_SYS_TP_READ  2  // mrs Xt, TPIDR_EL0 — answered from tsd[KLX_TP_SLOT]
+#define KLX_SYS_TP_WRITE 3  // msr TPIDR_EL0, Xt — stored there
+#define KLX_SYS_SVC      4  // svc #0 — a call through tsd[KLX_SVC_SLOT]
+
+// ---------------------------------------------------- which guest ABI
+//
+// An Android guest keeps its TLS in pthread keys, so its thread pointer can BE
+// Darwin's and the one-bit TPIDR_EL0 -> TPIDRRO_EL0 flip is the whole rewrite.
+// A glibc guest cannot share it: local-exec and initial-exec TLS are link-time
+// constant offsets from the thread pointer (`tp + 16 + off`), which against
+// Darwin's would land in the middle of its TSD array. So under the Linux ABI the
+// guest gets a thread pointer of its own, kept in a TSD slot, and every read or
+// write of TPIDR_EL0 is veneered to that slot instead of flipped.
+//
+// The same ABI has no libc of ours underneath it — the guest brings glibc — so
+// the boundary to the host is the kernel's: `svc #0` is veneered into a call
+// through a second slot, which holds the syscall entry (runtime/linux/).
+//
+// Process-wide, and set before anything is decoded: klepton-ld takes it from
+// --abi, the runtime from the kind of guest it is loading.
+#define KLX_ABI_ANDROID 0
+#define KLX_ABI_LINUX   1
+void kl_x18_set_abi(int abi);
+int  kl_x18_abi(void);
 
 // Decode one instruction word. Returns out->ok. Sites where x18 does not appear
 // come back ok with nfields == 0.
@@ -124,6 +159,17 @@ uint32_t klx_substitute(uint32_t insn, const klx_info *info, unsigned reg);
 // bake it in, and visionos/run.sh rebuilds klepton-ld for exactly this reason.
 #define KLX_TSD_SLOT 500
 
+// The Linux ABI's two slots, baked into veneers exactly as KLX_TSD_SLOT is and
+// claimed in the same walk. They sit directly above it so the walk that reaches
+// 500 is handed these next, while every key below is still held.
+//
+//   KLX_TP_SLOT   the guest's thread pointer (what TPIDR_EL0 reads as)
+//   KLX_SVC_SLOT  the address a veneered `svc #0` calls. A slot rather than a
+//                 constant because the veneer is emitted offline, where the
+//                 runtime's address does not exist yet.
+#define KLX_TP_SLOT  501
+#define KLX_SVC_SLOT 502
+
 // ---------------------------------------------------- CTR_EL0
 //
 // What a veneered `mrs Xt, CTR_EL0` answers. Baked into the veneer as a
@@ -161,8 +207,9 @@ uint32_t klx_substitute(uint32_t insn, const klx_info *info, unsigned reg);
 uint64_t kl_x18_ctr_value(void);
 
 // Longest veneer, in instructions. Public because klepton-ld sizes its pool from
-// the site count before it emits anything.
-#define KLX_VEN_MAX_INSN 8
+// the site count before it emits anything. The longest is the CASP one whose
+// compared pair is x18:x19 (ten, see KLX_HZ_PAIR); everything else fits in eight.
+#define KLX_VEN_MAX_INSN 10
 
 typedef struct {
     unsigned sites;     // instructions found naming x18
@@ -184,6 +231,8 @@ typedef struct {
     // and `make check` gates on them, so a second population sharing the same
     // counters would move a number that is supposed to be stable.
     unsigned ctr_sites, ctr_patched, ctr_refused;
+    // ...and the Linux ABI's two populations, apart for the same reason.
+    unsigned tp_sites, tp_patched, svc_sites, svc_patched, lx_refused;
     // The `br x18` jump-table rewrite. `jt_sites` counts `br x18` dispatches
     // recognised and converted to branch through x16 into a per-target thunk;
     // `jt_thunks` is how many targets those tables held, which is what the
@@ -232,6 +281,11 @@ typedef struct {
 // already baked into its text, so a collision there is fatal rather than
 // recoverable, and has to be found at load time instead of as a wrong answer.
 int  kl_x18_init(void);
+
+// The Linux ABI's half of that check: KLX_TP_SLOT and KLX_SVC_SLOT were claimed
+// too, and read back through the raw TSD array. Non-zero means a Linux-ABI image
+// must not be run in this process.
+int  kl_x18_init_linux(void);
 
 // Emit veneers for every x18 site in an executable range. Pure with respect to
 // memory: it writes only into `code` and `pool`, and takes the addresses those
@@ -302,7 +356,7 @@ unsigned kl_x18_count_termbr(const void *code, size_t size);
 // recognise BY NAME rather than ignoring it. A record that merely got longer
 // would fail the `statsz >= sizeof` test and be skipped silently — which also
 // skips the TSD-slot check that is the whole reason it is read.
-#define KLX_STAT_MAGIC 0x39315838u   /* "8X19" */
+#define KLX_STAT_MAGIC 0x41315838u   /* "8X1A" */
 typedef struct {
     uint32_t magic;
     uint32_t sites, patched, refused;
@@ -310,6 +364,8 @@ typedef struct {
     uint32_t slot;          // KLX_TSD_SLOT the veneers were built against
     uint32_t ctr_sites, ctr_patched;   // the CTR_EL0 population
     uint32_t ctr_value;     // ...and what they were built to answer
+    uint32_t abi;           // KLX_ABI_*: whose thread pointer the text reads
+    uint32_t tp_patched, svc_patched;  // the Linux ABI populations
 } klx_stat_section;
 
 // Encodings that were refused, with counts — the work list for extending the

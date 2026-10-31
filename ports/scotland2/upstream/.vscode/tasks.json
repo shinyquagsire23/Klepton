@@ -1,0 +1,12 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "shell",
+      "command": "${workspaceFolder}/setup_linux.sh",
+      "problemMatcher": ["$gcc"],
+      "group": "build",
+      "label": "cmake: compile",
+    }
+  ]
+}

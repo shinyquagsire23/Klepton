@@ -31,8 +31,19 @@ static int sdl2_fail(const char *msg) {
 }
 const char *kl_sdl2_error(void) { return g_error[0] ? g_error : "(none)"; }
 
+// Set when the guest's main has returned: for an engine that leaves through
+// SDL_QUIT that is the end of its shutdown.
+static int g_main_returned;
+
 int kl_sdl2_configure(const char *libdir, const char *entry_lib, FILE *out) {
     if (!libdir || !entry_lib || !*entry_lib) return sdl2_fail("no library directory / entry");
+    // Absolute, whatever was handed in. On a device this is a path inside the
+    // bundle already; a host run names the tree relative to where it was started
+    // ("cs1/lib/arm64-v8a"), and Xash changes directory to its game folder before
+    // it loads its renderer and game libraries by that same name — after which
+    // none of them is found ("Can't initialize any renderer").
+    static char abs_libdir[1024];
+    if (libdir[0] != '/' && realpath(libdir, abs_libdir)) libdir = abs_libdir;
     snprintf(g_libdir, sizeof g_libdir, "%s", libdir);
     snprintf(g_entry,  sizeof g_entry,  "%s.so", entry_lib);
     // The SDL natives register on org.libsdl.app.SDLActivity regardless of which
@@ -161,6 +172,7 @@ static void *sdl2_thread(void *arg) {
         env, cls, kl_jni_new_string(libpath), kl_jni_new_string(g_mainfn), jargs);
     kl_jni_local_frame_pop();
     if (out) { fprintf(out, "  [sdl2] nativeRunMain returned %d\n", rc); fflush(out); }
+    __atomic_store_n(&g_main_returned, 1, __ATOMIC_RELEASE);
 
     if (g_slot[2]) {
         if (out) { fprintf(out, "  [sdl2] nativeCleanupMainThread()\n"); fflush(out); }
@@ -247,6 +259,28 @@ int kl_sdl2_begin(FILE *out) {
         return sdl2_fail("pthread_create for the SDL thread failed");
     pthread_detach(th);
     return 0;
+}
+
+int kl_sdl2_main_returned(void) { return __atomic_load_n(&g_main_returned, __ATOMIC_ACQUIRE); }
+
+static void *sdl2_quit_thread(void *arg) {
+    (void)arg;
+    extern void kl_thread_init(void);
+    kl_thread_init();                 // guest code runs on this thread
+    void *fn = kl_jni_native(SDLA, "nativeSendQuit", NULL);
+    if (fn) {
+        kl_jni_local_frame_push();
+        ((void (*)(void *, void *))fn)(kl_jni_env(), kl_jni_class(SDLA));
+        kl_jni_local_frame_pop();
+    }
+    return NULL;
+}
+int kl_sdl2_send_quit(void) {
+    if (!kl_jni_native(SDLA, "nativeSendQuit", NULL)) return 0;
+    pthread_t th;
+    if (pthread_create(&th, NULL, sdl2_quit_thread, NULL) != 0) return 0;
+    pthread_detach(th);
+    return 1;
 }
 
 double kl_sdl2_pump(double seconds, const volatile int *quit) {

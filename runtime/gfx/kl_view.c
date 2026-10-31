@@ -625,6 +625,45 @@ int kl_view_main(const char *libdir, int hw) {
             }
         }
 
+        // KL_VIEW_SCRIPT="<secs>:<yaw>,<pitch>[,c];..." — what a person would do with the mouse here,
+        // timed from the window opening: at <secs>, turn the head to <yaw>/<pitch> degrees (the hands
+        // turn with it, as with mouse-look) and, with ",c", click the right trigger for 0.3 s. So a run
+        // can find its own way through a game's menus with no one at the window.
+        {
+            static int n = -1;
+            static struct { double t; float yaw, pitch; int click, done; } step[24];
+            static uint64_t t0;
+            if (n < 0) {
+                n = 0;
+                t0 = t_now;
+                const char *sc = getenv("KL_VIEW_SCRIPT");
+                while (sc && *sc && n < 24) {
+                    double t; float yw, pt; char c = 0; int used = 0;
+                    if (sscanf(sc, "%lf:%f,%f%n", &t, &yw, &pt, &used) >= 3) {
+                        if (sc[used] == ',' && sc[used + 1] == 'c') { c = 1; used += 2; }
+                        step[n].t = t; step[n].yaw = yw; step[n].pitch = pt;
+                        step[n].click = c; step[n].done = 0; n++;
+                    }
+                    sc = strchr(sc + (used > 0 ? used - 1 : 0), ';');
+                    if (sc) sc++;
+                }
+                if (n) fprintf(stderr, "  [view] KL_VIEW_SCRIPT: %d step(s)\n", n);
+            }
+            double ts = (double)(t_now - t0) / 1000.0;
+            for (int i = 0; i < n; i++) {
+                if (ts >= step[i].t && !step[i].done) {
+                    step[i].done = 1;
+                    yaw = step[i].yaw * (float)M_PI / 180.0f;
+                    pitch = step[i].pitch * (float)M_PI / 180.0f;
+                    fprintf(stderr, "  [view] KL_VIEW_SCRIPT at %.1f s: yaw %.1f pitch %.1f%s\n", ts,
+                            (double)step[i].yaw, (double)step[i].pitch, step[i].click ? ", click" : "");
+                }
+                if (step[i].click && step[i].done && !mouselook)
+                    mouse_l = ts >= step[i].t && ts < step[i].t + 0.3;
+                if (step[i].click && step[i].done && ts < step[i].t + 0.3) break;
+            }
+        }
+
         // Movement, in the yaw plane: forward is (−sin yaw, 0, −cos yaw) and
         // right is (cos yaw, 0, −sin yaw) under the convention above. R/Space
         // rise, F/Shift sink — vertical is not yaw-relative, it is +y itself.

@@ -2,6 +2,14 @@
 
 Running Android ARM64 VR APKs on Apple Vision Pro, no JIT required!
 
+## This fork: the AVP Play toolchain
+
+This is the Klepton fork that [AVP Play](https://github.com/myMartek/avp-play) builds games with. The branch `avp-play` carries one commit per toolchain that shipped with an AVP Play release, on top of upstream [`shinyquagsire23/Klepton`](https://github.com/shinyquagsire23/Klepton) at `ce74582`, each tagged `toolchain-N`. Such a commit is the source in the `klepton-toolchain-N-<hash>.tar.gz` attached to that release; the hash in its subject and the short hashes in its message are the ones AVP Play's recipes name as `toolchain.minCommit`.
+
+Day-to-day work happens in a private tree and lands here with each release, so the history is coarse. Pull requests against `avp-play` are welcome: a merged change is carried into the working tree and is part of the next toolchain. Reports about a game belong in [AVP Play's issues](https://github.com/myMartek/avp-play/issues).
+
+`main` follows upstream unchanged.
+
 ## Architecture
 
 `klepton-ld` translates Android `.so` libraries into loadable Apple `.dylib` and `.framework` libraries, which then link into the Klepton runtime. Klepton currently focuses on Java-thin applications only (no ART, no JVM).

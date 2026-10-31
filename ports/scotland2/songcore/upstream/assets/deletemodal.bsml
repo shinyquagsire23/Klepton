@@ -1,0 +1,9 @@
+<modal id='_deleteModal' move-to-center='true' size-delta-x='60' size-delta-y='30' click-off-closes='true'
+    xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+    <text text='Are you sure you want to delete this level?' align='Center' italics='true' anchor-pos-y='10'/>
+    <text id='_levelText' align='Center' italics='true' font-size='6' font-color='#dddddd' word-wrapping='true' overflow-mode='Ellipsis' anchor-pos-y='0'/>
+    <horizontal pref-width='60' anchor-pos-y='-10'>
+        <button text='&lt;color=#dd2233&gt;Delete&lt;/color&gt;' on-click='CommitDelete' pref-width='20'/>
+        <button text='&lt;color=#33dd11&gt;Cancel&lt;/color&gt;' on-click='_deleteModal#Hide' pref-width='20'/>
+    </horizontal>
+</modal>

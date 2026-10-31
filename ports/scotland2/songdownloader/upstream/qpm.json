@@ -1,0 +1,98 @@
+{
+  "$schema": "https://raw.githubusercontent.com/QuestPackageManager/QPM.Package/refs/heads/main/qpm.schema.json",
+  "version": "0.1.0",
+  "sharedDir": "shared",
+  "dependenciesDir": "extern",
+  "info": {
+    "name": "SongDownloader",
+    "id": "songdownloader",
+    "version": "0.8.7",
+    "url": "https://github.com/darknight1050/SongDownloader",
+    "additionalData": {
+      "overrideSoName": "libsongdownloader.so",
+      "cmake": true
+    }
+  },
+  "workspace": {
+    "scripts": {
+      "build": [
+        "pwsh ./build.ps1"
+      ],
+      "clean": [
+        "pwsh ./build.ps1 -clean"
+      ],
+      "qmod": [
+        "pwsh ./build.ps1 -clean",
+        "qpm qmod build",
+        "pwsh ./createqmod.ps1 SongDownloader"
+      ]
+    },
+    "ndk": "^27.2.12479018",
+    "qmodIncludeDirs": [
+      "build",
+      "extern/libs"
+    ],
+    "qmodIncludeFiles": [],
+    "qmodOutput": "SongDownloader.qmod"
+  },
+  "dependencies": [
+    {
+      "id": "beatsaber-hook",
+      "versionRange": "^6.4.2",
+      "additionalData": {}
+    },
+    {
+      "id": "bs-cordl",
+      "versionRange": "4008.*",
+      "additionalData": {}
+    },
+    {
+      "id": "bsml",
+      "versionRange": "^0.4.54",
+      "additionalData": {}
+    },
+    {
+      "id": "config-utils",
+      "versionRange": "^2.0.3",
+      "additionalData": {}
+    },
+    {
+      "id": "custom-types",
+      "versionRange": "^0.18.3",
+      "additionalData": {}
+    },
+    {
+      "id": "libcurl",
+      "versionRange": "^7.78.0",
+      "additionalData": {}
+    },
+    {
+      "id": "paper2_scotland2",
+      "versionRange": "^4.6.4",
+      "additionalData": {}
+    },
+    {
+      "id": "playlistcore",
+      "versionRange": "^1.5.3",
+      "additionalData": {}
+    },
+    {
+      "id": "rapidjson-macros",
+      "versionRange": "^2.1.0",
+      "additionalData": {}
+    },
+    {
+      "id": "scotland2",
+      "versionRange": "^0.1.6",
+      "additionalData": {
+        "includeQmod": false,
+        "private": true
+      }
+    },
+    {
+      "id": "songcore",
+      "versionRange": "^1.1.23",
+      "additionalData": {}
+    }
+  ]
+}

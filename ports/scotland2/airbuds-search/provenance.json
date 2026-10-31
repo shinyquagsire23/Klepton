@@ -1,0 +1,68 @@
+{
+  "name": "airbuds-search",
+  "repository": "zilewang7/Beat-Saber-Airbuds-Search",
+  "commit": "7b6d223b85631a2bd96753dad6a64bb82927a09d",
+  "version": "2.0.2",
+  "sourceBuilt": true,
+  "declaredDependencies": [
+    {
+      "id": "beatsaber-hook",
+      "versionRange": "^6.4.2",
+      "additionalData": {}
+    },
+    {
+      "id": "scotland2",
+      "versionRange": "^0.1.4",
+      "additionalData": {
+        "includeQmod": false
+      }
+    },
+    {
+      "id": "bs-cordl",
+      "versionRange": "^4008.0.0",
+      "additionalData": {}
+    },
+    {
+      "id": "paper2_scotland2",
+      "versionRange": "^4.7.0",
+      "additionalData": {}
+    },
+    {
+      "id": "bsml",
+      "versionRange": "^0.4.55",
+      "additionalData": {}
+    },
+    {
+      "id": "custom-types",
+      "versionRange": "^0.18.4",
+      "additionalData": {}
+    },
+    {
+      "id": "web-utils",
+      "versionRange": "^0.6.8",
+      "additionalData": {}
+    },
+    {
+      "id": "song-details",
+      "versionRange": "^1.0.4",
+      "additionalData": {}
+    },
+    {
+      "id": "beatsaverplusplus",
+      "versionRange": "^0.2.3",
+      "additionalData": {}
+    },
+    {
+      "id": "songcore",
+      "versionRange": "^1.1.25",
+      "additionalData": {}
+    },
+    {
+      "id": "metacore",
+      "versionRange": "^1.6.2",
+      "additionalData": {}
+    }
+  ],
+  "adaptation": "Original UI, client, searching and downloading retained. Existing pinned shared ABI and verified HTTPS WebUtils retained. Bounded JWT base64 decoder replaces EVP_DecodeBlock; unused Encryption.cpp is excluded from build. Android logcat subprocess removed; release debug logging disabled. Signed AOT hook catalog replaces executable writes. Optional Kakasi is not bundled; original kana fallback remains.",
+  "scope": "Host build validation only; no headset or authenticated Airbuds history testing"
+}

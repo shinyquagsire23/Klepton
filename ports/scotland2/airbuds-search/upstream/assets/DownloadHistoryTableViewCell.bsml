@@ -1,0 +1,31 @@
+<horizontal xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+            xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'
+            horizontal-fit="Unconstrained"
+            id="root_"
+            bg="round-rect-panel" pad="1">
+
+    <image id="image_" image-color="white" src="UI/Skin/Background" preserve-aspect="true" pref-width="6"
+           pref-height="6" min-width="6" min-height="6"/>
+
+    <vertical horizontal-fit="Unconstrained" pad-left="1" spacing="-1">
+        <text id='songNameTextView_' font-align="Left" overflow-mode='Ellipsis' font-size="2.7"
+              word-wrapping='false'
+              rich-text='false'/>
+        <text id='uploaderNameTextView_' font-align='Left' overflow-mode='Ellipsis' font-size="2.2"
+              word-wrapping='false' color='#AAA'
+              rich-text='false'/>
+    </vertical>
+
+    <!-- Spacer -->
+    <vertical flex-width="100" horizontal-fit="Unconstrained"/>
+
+    <horizontal vertical-fit="Unconstrained" child-align="MiddleCenter">
+        <text id='downloadProgressTextView_' font-size="3"
+              align="Center"
+              font-align="Center"
+              word-wrapping='false'
+              rich-text='false'/>
+        <primary-button pref-height="5" font-size="2.8" pad="0" id="playButton_" text="Play" on-click="onPlayButtonClicked" pref-width="16"/>
+    </horizontal>
+
+</horizontal>

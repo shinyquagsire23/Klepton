@@ -45,6 +45,19 @@ typedef struct kl_vtdec kl_vtdec;
 // serve that codec — the caller reports it, because the guest's own error path
 // for "no decoder for this type" is better than anything we could invent.
 kl_vtdec *kl_vtdec_create(const char *mime);
+// Ask for frames a CPU can read: plain 8-bit bi-planar 4:2:0 (NV12) rather than
+// whatever the decoder prefers, which on a headset is a compressed format only
+// a GPU can sample. For a codec with no output surface, whose client reads the
+// bytes. Call before the first kl_vtdec_submit.
+void kl_vtdec_want_nv12(kl_vtdec *d, int on);
+// Hand frames out in PRESENTATION order (VideoToolbox's temporal processing),
+// as Android's MediaCodec does, rather than in decode order. Needed for a file
+// whose video has B-frames: in decode order a frame is shown before one that
+// precedes it, which a player sees as the picture jumping back (LES MILLS
+// BODYCOMBAT's workout clips). Call before the first kl_vtdec_submit;
+// kl_vtdec_finish then releases the frames still held back at end of stream.
+void kl_vtdec_want_reorder(kl_vtdec *d, int on);
+void kl_vtdec_finish(kl_vtdec *d);
 void      kl_vtdec_destroy(kl_vtdec *d);
 
 // Feed one access unit, Annex-B, with or without parameter sets in front of it.
@@ -64,15 +77,17 @@ int kl_vtdec_submit(kl_vtdec *d, const uint8_t *annexb, size_t len,
 // Take the oldest decoded frame, or NULL if none is ready. The caller owns one
 // reference and must CVPixelBufferRelease it.
 //
-// Frames come out in the order VideoToolbox emits them. For this guest that is
+// Frames come out in the order VideoToolbox emits them. For Steam Link that is
 // also presentation order: the stream is a real-time game capture with no
-// B-frames, and Steam Link's encoder does not reorder. If a stream ever does,
-// the fix is to sort on the pts that is already carried here, not to guess.
+// B-frames, and its encoder does not reorder. A file that does reorder asks
+// for kl_vtdec_want_reorder.
 CVPixelBufferRef kl_vtdec_pull(kl_vtdec *d, int64_t *pts_us_out);
 
 // Drop everything in flight and everything decoded, and tell VideoToolbox to
 // forget its inter-frame state. What AMediaCodec_flush means.
 void kl_vtdec_flush(kl_vtdec *d);
+void kl_vtdec_flush_playback(kl_vtdec *d); // wait for file frames before clearing
+unsigned kl_vtdec_pending(const kl_vtdec *d); // submitted frames not yet pulled/discarded
 
 // How many frames have been submitted, decoded and dropped since creation, and
 // the current frame size. For the fault reporter and for `make hevc`.

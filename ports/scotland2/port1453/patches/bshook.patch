@@ -1,0 +1,103 @@
+--- a/shared/capstone.hpp
++++ b/shared/capstone.hpp
+@@ -6,6 +6,8 @@
+ #include "flamingo/shared/installer.hpp"
+ #include "flamingo/shared/target-data.hpp"
+ 
++extern "C" void* sc2_aot_original(void const*);
++
+ namespace cs {
+     csh get_handle();
+ 
+@@ -26,6 +28,10 @@
+     };
+ 
+     auto find_through_hooks(void const* hook, uint32_t init_search_size, auto&& func) {
++#ifdef SC2_AOT_HOOKS
++        if (sc2_aot_original(hook))
++            return func(cs::AddrSearchPair(reinterpret_cast<uint32_t const*>(hook), init_search_size));
++#endif
+         // First, check to see if we are hooked.
+         i2c::logger.debug("Finding through potential hook: {} and size: {}", fmt::ptr(hook), init_search_size);
+         auto original_insts = flamingo::OriginalInstsFor(flamingo::TargetDescriptor{const_cast<void*>(hook)});
+--- a/shared/hooking.hpp
++++ b/shared/hooking.hpp
+@@ -205,6 +205,7 @@
+         using cast_t = ::i2c::detail::method_check<cast_test, func_t>::type;                                                    \
+         static_assert(cast_test.operator()<cast_t>(), "Hook method signature does not match!");                                  \
+         static_assert(::i2c::detail::match_hookable<static_cast<cast_t>(method)>, "Method cannot be hooked!");                  \
++        SC2_RECORD_MATCH_1453(name_, method, cast_t) \
+         __INTERNAL_HOOK_STRUCT(name_, ::i2c::metadata_getter<static_cast<cast_t>(method)>::method_info(), ret_type, __VA_ARGS__) \
+     };                                                                                                                           \
+     ret_type hook_##name_::hook_m_##name_(__VA_ARGS__)
+--- a/src/tests/hooking.cpp
++++ b/src/tests/hooking.cpp
+@@ -122,3 +122,51 @@
+ static_assert(std::is_same_v<MethodInfo const*, std::invoke_result_t<decltype(hook_test_minfo_hook::addr)>>);
+ 
+ MAKE_HOOK(test_nullptr_hook, (nullptr), void, int*) {}
++
++#ifdef SC2_AOT_HOOKS
++TEST(sc2_catalog_overload_metadata) {
++    if (hook_match_test::sc2_build_target.address != i2c::metadata_getter<&foo>::addrs ||
++        hook_match_minfo_test::sc2_build_target.address != i2c::metadata_getter<&foo>::addrs ||
++        hook_match_overload_test::sc2_build_target.address != 0x5678 ||
++        hook_match_inst_overload_test::sc2_build_target.address != 0x999) {
++        LOG_FAIL("Prepared-hook catalog differs from compiler-selected metadata");
++        return;
++    }
++    LOG_OK("Prepared-hook catalog preserves overload and MethodInfo matching");
++}
++#endif
++
++#ifdef SC2_AOT_HOOKS
++#include <filesystem>
++#include <fstream>
++#include <cstdlib>
++#include <unistd.h>
++TEST(sc2_shell_free_mkpath) {
++    const char* fixture = std::getenv("SC2_TEST_ROOT");
++    if (!fixture || !*fixture) {
++        LOG_FAIL("mkpath fixture requires an isolated SC2_TEST_ROOT; not run");
++        return;
++    }
++    namespace fs = std::filesystem;
++    auto root = fs::path(fixture) / ("sc2-mkpath-" + std::to_string(getpid()));
++    // Never clean or reuse a pre-existing directory.
++    if (!fs::create_directory(root)) { LOG_FAIL("mkpath fixture already exists"); return; }
++    try {
++        auto nested = root / "literal $(false) [x]" / "nested";
++        auto blocked = root / "blocked";
++        { std::ofstream file(blocked); file << "retained"; }
++        std::string nul("bad\0path", 8);
++        bool valid = ::mkpath(nested.string()) == 0 && fs::is_directory(nested) &&
++                     ::mkpath(nested.string()) == 0 && ::mkpath("") != 0 &&
++                     ::mkpath(std::string_view(nul)) != 0 && ::mkpath((blocked/"child").string()) != 0;
++        std::ifstream file(blocked); std::string retained; file >> retained;
++        valid = valid && retained == "retained";
++        fs::remove_all(root);
++        if (!valid) { LOG_FAIL("mkpath success/invalid-path/preservation checks failed"); return; }
++        LOG_OK("Actual mkpath preserves literal path text, rejects invalid inputs and keeps existing data");
++    } catch (std::exception const& error) {
++        fs::remove_all(root);
++        LOG_FAIL("mkpath fixture failed: {}", error.what());
++    }
++}
++#endif
+--- a/src/utils.cpp
++++ b/src/utils.cpp
+@@ -13,9 +13,14 @@
+     }
+ }
+ 
++extern "C" int sc2_bshook_mkpath(std::string_view);
+ int mkpath(std::string_view file_path) {
++#ifdef SC2_AOT_HOOKS
++    return sc2_bshook_mkpath(file_path);
++#else
+     std::string command = fmt::format("mkdir -p -m +rw {}", file_path);
+     return system(command.c_str());
++#endif
+ }
+ 
+ std::string readfile(std::string_view filename) {

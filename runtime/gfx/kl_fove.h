@@ -29,7 +29,8 @@ int  kl_fove_msaa(void);
 // colour the eye pass draws (the swapchain image itself, or the eye-size MSAA
 // target it resolves into one); layers 2 = both eyes as the two slices of one
 // 2D-array image (multiview: foveated as a layered pass, one map layer per eye,
-// each centred on that eye's projection centre from kl_ovrp_eye_tangents);
+// each built around that eye's projection centre from kl_ovrp_eye_tangents and, unless
+// KL_FOVE_PER_EYE=1, the other eye's in the same rect: kl_fove_curves_env);
 // layers 1 = one eye's own image (`eye` 0/1).
 void kl_fove_note_eye_array(void *mtl_colour, void *mtl_depth, uint32_t w, uint32_t h, uint32_t samples,
                             uint32_t layers, int eye);
@@ -49,6 +50,17 @@ int  kl_fove_curves(uint32_t W, uint32_t H, const float cx[2], float cy,
 // point is (cx, cy) screen px.
 int  kl_fove_curves1(uint32_t W, uint32_t H, float cx, float cy,
                      float box, float ramp, float floor_, int nh, float *h, int nv, float *v);
+// The envelope of two such peaks, (cx[0], cy[0]) and (cx[1], cy[1]): per axis
+// the larger of the two profiles. What a one-eye image or a map layer gets by
+// default — its own eye's straight-ahead point and the other eye's, placed in
+// the same rect, so both eyes' maps are the same relative to their pictures
+// (KL_FOVE_PER_EYE=1: the single peak). Returns 0 on bad input.
+int  kl_fove_curves_env(uint32_t W, uint32_t H, const float cx[2], const float cy[2],
+                        float box, float ramp, float floor_, int nh, float *h, int nv, float *v);
+// kl_fove_curves with the envelope: eye 0's half of the double-wide target
+// peaks at cx0[0] and cx0[1], eye 1's at cx1[0] and cx1[1].
+int  kl_fove_curves_env2(uint32_t W, uint32_t H, const float cx0[2], const float cx1[2], float cy,
+                         float box, float ramp, float floor_, int nh, float *h, int nv, float *v);
 // The straight-ahead point of an eye from its frustum tangents, as a fraction
 // of the eye's width from its left edge / of its height from the top.
 void kl_fove_centre(const float tan_lrdu[4], float *fx, float *fy);
@@ -81,6 +93,10 @@ int   kl_fove_pend_selftest(void);
 // t_fove: kl_fove's MSL patch applied to `src` with the default
 // knobs; a malloc'd patched copy, or NULL when the source is left alone.
 char *kl_fove_patch_for_test(const char *src);
+// t_fove: KL_FOVE_SUBPASS_HELPERS for the next kl_fove_patch_for_test calls
+// (1, the default: a helper's subpass read gets the physical position; 0: the
+// old behaviour). kf_read_env sets the same knob from the environment.
+void  kl_fove_set_subpass_helpers_for_test(int on);
 
 // The guest's OWN eye-size scene target ("intermediate") that reaches an eye
 // image — e.g. Batman: Arkham Shadow's render pipeline draws its 2-layer MSAA
@@ -156,6 +172,17 @@ int      kl_fove_recentre_selftest(char *why, unsigned cap);
 // footprint by gigabytes in seconds). Runs after
 // kl_fove_inter_gpu_selftest. Returns failed checks, -1 skipped.
 int      kl_fove_scratch_selftest(char *why, unsigned cap);
+// t_fove: the layered eye pair of a guest on the Vision Pro's canted cones
+// (Alien: Rogue Incursion's shape, a render viewport smaller than the image):
+// both layers' maps are the same relative to their eye's rect, symmetric
+// about its middle, both straight-ahead points at full rate; with
+// KL_FOVE_PER_EYE's single peak the outer side of each eye is the coarse one
+// (the bug, reproduced). Then dynamic resolution: the map follows 20 viewport
+// changes (the old cap was 8). `rates` (may be NULL) gets, per mode (0 per eye,
+// 1 envelope), layer and eighth of the rect, the rate along the middle row
+// (2 x 2 x 8 floats); `shots_dir` (may be NULL) gets the four pictures as BMP.
+// Returns failed checks, -1 skipped.
+int      kl_fove_layers_selftest(char *why, unsigned cap, float *rates, const char *shots_dir);
 // The frustum fractions and frame record kf_eye_point reads, for the test
 // (on = 0 goes back to kl_ovrp's). vp NULL / of {0,0}: no record.
 void     kl_fove_test_eye_record(int on, const float fx[2], const float fy[2], const int vp[2][4], const int of[2]);

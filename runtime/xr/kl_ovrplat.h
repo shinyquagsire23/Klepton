@@ -36,7 +36,13 @@
 // else is measured and answered as the trace forces it.
 //
 // Reporting that the platform is unavailable is true here; answering "yes,
-// entitled" would not be.
+// entitled" to content we cannot see would not be.
+//
+// Walkabout courses are the narrow exception that stays on that side of the
+// line. A course is reported installed, and its own store ids are reported
+// purchased, only when the real track bundle is already on disk — files the
+// user copied from a Quest they own. A stub bundle does not count. Download,
+// delete, consume and checkout still abort.
 #ifndef KL_OVRPLAT_H
 #define KL_OVRPLAT_H
 #include <stdio.h>
@@ -49,5 +55,24 @@ void *kl_ovrplat_sym(const char *name);
 // Which ovr_* the guest resolved and called, and which DRM entry points it asked
 // for — the last of those is worth seeing even when nothing aborted.
 void kl_ovrplat_report(FILE *f);
+
+// The completion queue and the call-surface table, exercised in-process: more
+// requests outstanding than a pool block holds, popped handles held across new
+// requests, ovr_FreeMessage misuse, details riding in the message, and both
+// structures under concurrent threads. Returns 1 when everything held. Leaves
+// the queue empty, but its requests and names stay counted — call it in a
+// process of its own (tests/t_ovrplat.c), never in a guest run.
+int kl_ovrplat_queue_selftest(FILE *f);
+
+// Whether the installation gave this title a list of its asset files
+// (KL_ASSET_FILES_PATH, or klepton-asset-files.txt in its files directory; see
+// kl_assetcfg.h). Where it did, the asset-file questions are answered from it
+// and the guest is told the device's language by default (kl_jni_services.c).
+// Where it did not, nothing changes for any title.
+int kl_ovrplat_asset_files_configured(void);
+
+// KL_PLAT_TRACE=1: whether the asset-file, language-pack and locale answers
+// are traced (default off). See kl_ovrplat.c.
+int kl_ovrplat_trace_on(void);
 
 #endif

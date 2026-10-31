@@ -3,9 +3,36 @@
 //
 #include "kl_env.h"
 
+#include <crt_externs.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+// The lookup every helper below uses, and why it is not getenv().
+//
+// libc's getenv takes a lock. These helpers are called from everywhere,
+// including once or more per guest frame and from klb_pthread_kill — and an
+// IL2CPP/Boehm guest stops the world by SIGNALLING its threads, which park in
+// sigsuspend inside the handler wherever they happened to be. A thread stopped
+// inside getenv holds that lock; the collector thread then calls
+// klb_pthread_kill to signal the next one, which reads a knob, which waits for
+// the lock — held by a thread that only the collector can resume. Seen as a
+// host run frozen for good at frame 300 with three threads in
+// _os_unfair_lock_lock_slow under getenv and the main thread in sigsuspend
+// under it; on a headset the same thing is a picture that stops.
+//
+// Walking environ takes no lock. What that gives up is safety against a
+// concurrent setenv moving the array, and the only setenv calls here are the
+// per-target defaults made during boot, before the guest has threads.
+static const char *env_get(const char *name) {
+    char ***ep = _NSGetEnviron();
+    char **e = ep ? *ep : NULL;
+    if (!e || !name) return NULL;
+    size_t n = strlen(name);
+    for (; *e; e++)
+        if (!strncmp(*e, name, n) && (*e)[n] == '=') return *e + n + 1;
+    return NULL;
+}
 
 // KL_VERBOSE_ALL / KL_FULL: a master switch for a full-debug run. When on, any
 // boolean flag whose NAME reads diagnostic (a trace / probe / verbose / log /
@@ -17,8 +44,8 @@
 static int verbose_all(void) {
     static int v = -1;
     if (v < 0) {
-        const char *s = getenv("KL_VERBOSE_ALL");
-        if (!s) s = getenv("KL_FULL");
+        const char *s = env_get("KL_VERBOSE_ALL");
+        if (!s) s = env_get("KL_FULL");
         v = s && *s && strcmp(s, "0") && strcasecmp(s, "off")
             && strcasecmp(s, "no") && strcasecmp(s, "false");
     }
@@ -46,7 +73,7 @@ static int is_diag_name(const char *n) {
 }
 
 int kl_env_on(const char *name, int dflt) {
-    const char *v = getenv(name);
+    const char *v = env_get(name);
     if (!v) {
         if (!dflt && verbose_all() && is_diag_name(name)) return 1;
         return dflt;
@@ -56,32 +83,32 @@ int kl_env_on(const char *name, int dflt) {
 }
 
 const char *kl_env_str(const char *name, const char *dflt) {
-    const char *v = getenv(name);
+    const char *v = env_get(name);
     if (!v) return dflt;
     return v;
 }
 
 int kl_env_int(const char *name, int dflt) {
-    const char *v = getenv(name);
+    const char *v = env_get(name);
     if (!v) return dflt;
     return strtol(v, NULL, 0);
 }
 
 unsigned int kl_env_uint(const char *name, unsigned int dflt) {
-    const char *v = getenv(name);
+    const char *v = env_get(name);
     if (!v) return dflt;
     return strtoul(v, NULL, 0);
 }
 
 
 float kl_env_float(const char *name, float dflt) {
-    const char *v = getenv(name);
+    const char *v = env_get(name);
     if (!v) return dflt;
     return atof(v);
 }
 
 static int g_permissive = -1;
 int kl_permissive(void) {
-    if (g_permissive < 0) g_permissive = getenv("KL_PERMISSIVE") != NULL;
+    if (g_permissive < 0) g_permissive = env_get("KL_PERMISSIVE") != NULL;
     return g_permissive;
 }

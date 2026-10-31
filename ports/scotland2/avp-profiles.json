@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "profiles": [
+    {
+      "name": "1.45.3",
+      "target": "beatsaber140",
+      "versionName": "1.45.3_30054",
+      "versionCode": 3237,
+      "selection": "port1453/selected-mods.json",
+      "prebuilt": "prebuilt/3237",
+      "defaultOn": true
+    }
+  ]
+}

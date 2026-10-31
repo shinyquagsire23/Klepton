@@ -1,0 +1,88 @@
+name: Publish
+
+env:
+  module_id: metacore
+  qmodName: MetaCore
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (v will be added to the tag)'
+        required: true
+      release_msg:
+        description: 'Message for release'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+        name: Checkout
+        with:
+          submodules: true
+          lfs: true
+
+      - uses: seanmiddleditch/gha-setup-ninja@v3
+
+      - name: Create ndkpath.txt
+        run: |
+          echo "$ANDROID_NDK_LATEST_HOME" > ${GITHUB_WORKSPACE}/ndkpath.txt
+          cat ${GITHUB_WORKSPACE}/ndkpath.txt
+
+      - name: QPM Action
+        uses: Fernthedev/qpm-action@v1
+        with:
+          workflow_token: ${{ secrets.GITHUB_TOKEN }}
+
+          restore: true
+          cache: true
+
+          publish: late
+          publish_token: ${{ secrets.QPM_KEY }}
+          version: ${{ github.event.inputs.version }}
+          tag: v${{ github.event.inputs.version }}
+
+          qpm_release_bin: true
+          qpm_debug_bin: false
+
+          qpm_qmod: ${{ env.qmodName }}.qmod
+
+      - name: List Post Restore
+        run: |
+          echo includes:
+          ls -la ${GITHUB_WORKSPACE}/extern/includes
+          echo libs:
+          ls -la ${GITHUB_WORKSPACE}/extern/libs
+
+      - name: Build & create qmod
+        run: |
+          cd ${GITHUB_WORKSPACE}
+          qpm s qmod
+
+      - name: Get Library Name
+        id: libname
+        run: |
+          cd ./build/
+          pattern="lib${module_id}*.so"
+          files=( $pattern )
+          echo NAME="${files[0]}" >> $GITHUB_OUTPUT
+
+      - name: Rename debug
+        run: |
+          mv ./build/debug/${{ steps.libname.outputs.NAME }} ./build/debug/debug_${{ steps.libname.outputs.NAME }}
+
+      - name: Upload to Release
+        id: upload_file_release
+        uses: softprops/action-gh-release@v0.1.12
+        with:
+          name: ${{ github.event.inputs.release_msg }}
+          tag_name: "v${{ github.event.inputs.version }}"
+          files: |
+            ./build/${{ steps.libname.outputs.NAME }}
+            ./build/debug/debug_${{ steps.libname.outputs.NAME }}
+            ./${{ env.qmodName }}.qmod
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

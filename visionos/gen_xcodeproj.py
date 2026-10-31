@@ -34,6 +34,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import targets as targets_mod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+SC2_PROFILE = os.environ.get('SC2_GAME_PROFILE', '1.40.8')
+if SC2_PROFILE not in ('1.40.8', '1.45.3'):
+    raise SystemExit('Unknown Scotland2 game profile')
 KLT = targets_mod.resolve(os.environ.get("KLEPTON_TARGET") or targets_mod.DEFAULT)
 # The PRODUCT name, which is also the .xcodeproj's, the .app's and the scheme's.
 # The Swift sources are still Klepton*.swift whatever the product is called —
@@ -41,6 +44,28 @@ KLT = targets_mod.resolve(os.environ.get("KLEPTON_TARGET") or targets_mod.DEFAUL
 # would be five file copies to say one thing.
 NAME = KLT["product"]
 BUNDLE_ID = os.environ.get("KLEPTON_BUNDLE_ID", KLT["bundle"])
+
+# Whether this is a TEST build — a copy beside the real game, for trying
+# something on the headset — and not what a player has (KL_TEST_BUILD below,
+# KLTestBuild in Info.plist, KleptonTestBuild in KleptonTestBuild.swift). Only
+# what a tester's command line sets counts: a name of its own
+# (KLEPTON_DISPLAY_SUFFIX / _OVERRIDE — `avpplay install --display-suffix`), a
+# bundle id ending in "-test" or ".test" in any case (regex [-.]test$; testing.md's
+# convention for a test copy), KL_TEST_BUILD among KLEPTON_TEST_ON, or
+# KLEPTON_TEST_BUILD=1. Deliberately NOT
+# any bundle id that differs from the target's, nor a non-empty KLEPTON_TEST_ON:
+# AVP Play sets the first for every install (a team's own prefix) and the
+# second for a player who chose its experimental switches.
+_bundle_test = re.search(r"[-.]test$", BUNDLE_ID or "", re.I) is not None and BUNDLE_ID != KLT["bundle"]
+TEST_BUILD = (os.environ.get("KLEPTON_TEST_BUILD", "").strip().lower() in ("1", "true", "yes", "on")
+              or bool(os.environ.get("KLEPTON_DISPLAY_SUFFIX", "").strip())
+              or bool(os.environ.get("KLEPTON_DISPLAY_OVERRIDE", "").strip())
+              or _bundle_test
+              or "KL_TEST_BUILD" in re.split(r"[,\s]+", os.environ.get("KLEPTON_TEST_ON", "")))
+if os.environ.get("SC2_BUILD_MODE") == "release":
+    TEST_BUILD = False
+if TEST_BUILD:
+    print("gen_xcodeproj: test build (KLTestBuild=1): tester-only controls are in it", file=sys.stderr)
 
 # Klepton.entitlements — the two memory capabilities (see that file for what
 # they buy and why this app wants them). **On by default: they fixed the
@@ -100,8 +125,21 @@ ENTITLEMENTS = os.environ.get("KLEPTON_ENTITLEMENTS", "1") != "0"
 #       survive. Do not diagnose a stream problem from its presence alone —
 #       runtime/xr/kl_openxr.c's KL_XR_PROFILE is the A/B for the change that
 #       actually altered what the client publishes.
+#   com.apple.developer.kernel.extended-virtual-addressing (KLEPTON_EVA=0 drops it)
+#       A paid-program capability. Xcode's own capability table (DVTPortal.framework,
+#       DVTPortalCachedPortalCapabilities.json; read in Xcode 27.1 on 2026-10-11) lists
+#       its validTeamTypes as the Developer Program and the Enterprise Program only,
+#       while Increased Memory Limit also names XCODE_FREE_PROGRAM, and Low-Latency
+#       Streaming the Developer Program alone. So a build for a free Personal Team
+#       drops this key and the streaming key and KEEPS the memory limit, which is the
+#       one that stopped the jetsam kills. What a guest loses without it is address
+#       space above the default ceiling, not resident memory.
 OPTIONAL_ENTITLEMENTS = {
     "com.apple.developer.low-latency-streaming": "KLEPTON_LOW_LATENCY",
+    "com.apple.developer.kernel.extended-virtual-addressing": "KLEPTON_EVA",
+    # The play area's shared rooms (KleptonRoomStore.swift). Without it each
+    # game keeps its own.
+    "keychain-access-groups": "KLEPTON_SHARED_KEYCHAIN",
 }
 ENTITLEMENTS_FILE = "Klepton.entitlements"
 _dropped = [k for k, env in OPTIONAL_ENTITLEMENTS.items()
@@ -142,7 +180,45 @@ ANGLE_DIR = "Frameworks"
 # Both sets are embedded-not-linked, so the pbxproj treatment is identical and
 # the generator stays data-driven — the two lists differ only in what a missing
 # one means, which is why main() reports them separately.
-EMBED = GUEST + ANGLE + MVK
+SC2 = ["Scotland2Core", "SC2_libtinyxml2"] if os.environ.get("KLEPTON_SCOTLAND2") == "1" else []
+if SC2:
+    if os.environ.get('SC2_TEST_SET', 'tinyxml2') in ('paper','hooks','customtypes','lapiz','bsml','songcore','metacore','songdownloader','coremods'):
+        SC2.append('SC2_libpaper2_scotland2')
+    if os.environ.get('SC2_TEST_SET') in ('hooks','customtypes','lapiz','bsml','songcore','metacore','songdownloader','coremods'):
+        SC2 += ['SC2_'+name for name in ['libbeatsaber-hook','libsl2_abi','libcxx_shared','libsc2_flamingo','libsc2_flamingo_probe']]
+    if os.environ.get('SC2_TEST_SET') in ('customtypes','lapiz','bsml','songcore','metacore','songdownloader','coremods'):
+        SC2 += ['SC2_libcustom-types','SC2_libsc2_customtypes_probe']
+    if os.environ.get('SC2_TEST_SET') in ('lapiz','bsml','songcore','metacore','songdownloader','coremods'):
+        SC2 += ['SC2_liblapiz']
+    if os.environ.get('SC2_TEST_SET') in ('bsml','songcore','metacore','songdownloader','coremods'):
+        SC2 += ['SC2_libbsml','SC2_libsc2_bsml_probe']
+    if os.environ.get('SC2_TEST_SET') in ('songcore','metacore','songdownloader','coremods'):
+        SC2 += ['SC2_libsongcore','SC2_libsc2_songcore_probe']
+    if os.environ.get('SC2_TEST_SET') in ('metacore','songdownloader','coremods'):
+        SC2 += ['SC2_'+name for name in ['libmetacore','libsc2_metacore_probe','libweb-utils','libbeatsaverplusplus','libzip','libsongdetails']]
+    if os.environ.get('SC2_TEST_SET') in ('songdownloader','coremods'):
+        SC2 += ['SC2_libplaylistcore','SC2_libsongdownloader']
+    if os.environ.get('SC2_TEST_SET') == 'coremods':
+        SC2 += ['SC2_libdatakeeper','SC2_libunicode']
+    # The bundle id is the target's usual one (or AVP Play's prefix): mods are an update of the same app.
+    if KLT['name'] != 'beatsaber140':
+        raise SystemExit('Scotland2 mods exist for beatsaber140 only.')
+    if os.environ.get('SC2_BUILD_MODE') == 'release':
+        import json as _sc2_json
+        _sc2_manifest = '../ports/scotland2/port1453/selected-mods.json' if SC2_PROFILE == '1.45.3' else '../ports/scotland2/selected-mods.json'
+        with open(os.path.join(HERE, _sc2_manifest)) as _sc2_file:
+            _sc2_selection = _sc2_json.load(_sc2_file)
+        SC2 = ['Scotland2Core', 'SC2_libcxx_shared'] + [
+            'SC2_' + os.path.basename(path)[:-3] for path in _sc2_selection['metadata']]
+    for name in SC2:
+        if not os.path.isdir(os.path.join(HERE, 'Frameworks', name + '.xcframework')):
+            raise SystemExit('Use ports/scotland2/tools/build_release.py to stage the selected release.' if os.environ.get('SC2_BUILD_MODE')=='release' else 'Run bash ports/scotland2/package.sh xros before generating the diagnostic app.')
+# The newer APK carries its own Android C++ runtime. The mod composition has
+# one explicitly selected shared runtime for the game and all guest mods.
+# Both translate to libcxx_shared.framework, so embedding both is ambiguous.
+if SC2 and 'SC2_libcxx_shared' in SC2:
+    GUEST = [name for name in GUEST if name not in ('libc++_shared', 'libcxx_shared')]
+EMBED = GUEST + ANGLE + MVK + SC2
 
 
 def detect_team():
@@ -183,6 +259,124 @@ B_C = oid("BC")
 # emitted, so the icon is strictly additive.
 F_ASSETS = oid("FASSET"); B_ASSETS = oid("BASSET"); BP_RES = oid("BPRES")
 import os as _os
+# The Test switches an installer wants on from the start (KL_TEST_ON below):
+# names of environment variables and nothing else, so that what lands in the
+# project file and in Info.plist cannot be anything but a list of names.
+# KLEPTON_TEST_ON_EXTRA adds a tester's own names to the installer's: AVP Play
+# sets KLEPTON_TEST_ON itself and drops one from the shell, so a test copy that
+# needs one more switch (e.g. KL_FOVE_SUBPASS_HELPERS) names it here. The
+# target's own "test_on" (targets.py) comes last: the switches a game starts
+# with for every player. Unset and empty: the same list as before, byte for
+# byte.
+TEST_ON = ",".join(dict.fromkeys(
+    n for n in re.split(r"[,\s]+", os.environ.get("KLEPTON_TEST_ON", "") + ","
+                        + os.environ.get("KLEPTON_TEST_ON_EXTRA", "") + ","
+                        + KLT.get("test_on", ""))
+    if re.fullmatch(r"KL_[A-Z0-9_]{1,60}", n)))
+
+# The OVRPlugin version the game ships (targets.ovrp_guest_version), for the
+# profile for untested games; KLOvrpGuestVersion in Info.plist. The reader only
+# ever returns digits and dots or "", so nothing else reaches the project.
+OVRP_GUEST_VERSION = targets_mod.ovrp_guest_version(KLT["tree"]) if KLT.get("tree") else ""
+if not re.fullmatch(r"(1\.\d{1,3}\.\d{1,3})?", OVRP_GUEST_VERSION):
+    OVRP_GUEST_VERSION = ""
+if OVRP_GUEST_VERSION:
+    print(f"  OVRPlugin in the game: {OVRP_GUEST_VERSION}", file=sys.stderr)
+
+# The language a game starts with (KLEPTON_GAME_LANGUAGE: "device", "en" or a
+# locale such as "fr_FR"; AVP Play's setting for the games it installs),
+# KLGameLanguageDefault in Info.plist (KleptonLanguage). A choice made in the
+# game wins over it. Unset, or not of that shape: empty, the target's default.
+GAME_LANGUAGE = os.environ.get("KLEPTON_GAME_LANGUAGE", "").strip()
+if GAME_LANGUAGE and not re.fullmatch(r"device|en|[a-z]{2,3}_[A-Z]{2}", GAME_LANGUAGE):
+    print(f"gen_xcodeproj: KLEPTON_GAME_LANGUAGE={GAME_LANGUAGE!r} is not device, en or a locale "
+          f"like fr_FR - the target's default stays", file=sys.stderr)
+    GAME_LANGUAGE = ""
+
+# Typed wire values only: never interpolate arbitrary installer input into a project.
+CONTROLLER_MODE = os.environ.get("KLEPTON_CONTROLLER_MODE", "standard")
+if CONTROLLER_MODE not in ("standard", "surreal"):
+    raise ValueError("KLEPTON_CONTROLLER_MODE must be standard or surreal")
+# AVP Play's "Surreal Touch support" (KLEPTON_SURREAL_SUPPORT=0: off). Off, the game is
+# built for standard controllers only: Standard mode whatever was asked, no SDK fetched
+# or linked, and KLSurrealAvailable NO, so the start window offers no controller type and
+# no Surreal panel (KleptonControllerMode.available). On, as before.
+SURREAL_SUPPORT = os.environ.get("KLEPTON_SURREAL_SUPPORT", "1") != "0"
+if not SURREAL_SUPPORT and CONTROLLER_MODE == "surreal":
+    print("gen_xcodeproj: Surreal Touch support is off (KLEPTON_SURREAL_SUPPORT=0) - "
+          "building for standard controllers", file=sys.stderr)
+    CONTROLLER_MODE = "standard"
+
+# Surreal Interactive's visionOS SDK (github.com/surreal-interactive/SwiftSDKBinary,
+# Apache-2.0), the pose source of Surreal mode (KleptonSurrealSDK.swift,
+# docs/SURREAL.md). A STATIC framework, so linked and never embedded.
+#
+# Linked into EVERY build, whichever mode it starts in: the mode is the player's
+# choice in the game's start window, read when the game starts
+# (KleptonControllers.usesSurrealSDK), so a game installed for standard
+# controllers can be switched to Surreal Touch there and gets the SDK as well –
+# its owner asked for exactly that (2026-10-29). In Standard mode nothing calls
+# it. The generator fetches it the first time (tools/surreal_sdk_fetch.sh pins
+# and verifies it). A build that STARTS in Surreal mode stops when it cannot have
+# it, rather than quietly shipping the old Bluetooth backend; any other build goes
+# on without it and says so – a GitHub outage must not stop a game that has
+# nothing to do with Surreal Touch (Surreal mode then uses the Bluetooth backend).
+# KLEPTON_SURREAL_SDK=0 builds without it on purpose. Only when run as the
+# generator, not when a test loads this file.
+SVR_NAME = "surreal_interactive_openxr_framework"
+_svr_dir = os.path.join(HERE, "Frameworks", f"{SVR_NAME}.xcframework")
+_svr_wanted = SURREAL_SUPPORT and os.environ.get("KLEPTON_SURREAL_SDK", "1") != "0"
+_svr_fetched = os.path.isdir(_svr_dir) and any(
+    n.startswith(".klepton-fetched-") for n in os.listdir(_svr_dir))
+if _svr_wanted and not _svr_fetched and __name__ == "__main__":
+    # Its progress goes to stderr, like everything else this says: run.sh reads the generator's
+    # stdout through `| head -1`, and the fetch's second line then hit a closed pipe – `set -e`
+    # ended it right after the download, and every first Surreal build stopped here (AVP Play's
+    # installer, 2026-10-29).
+    if subprocess.run([os.path.join(HERE, "..", "tools", "surreal_sdk_fetch.sh")],
+                      stdout=sys.stderr).returncode != 0:
+        if CONTROLLER_MODE == "surreal":
+            sys.exit("!! a Surreal Touch build needs Surreal Interactive's SDK, and it could not be "
+                     "fetched (above). Check the connection and build again, stage it with "
+                     "`make surreal-sdk`, or set KLEPTON_SURREAL_SDK=0 to build with Klepton's "
+                     "own Bluetooth backend instead.")
+        print("  Surreal Interactive's SDK could not be fetched (above) - building without it; "
+              "Surreal Touch in this game then uses Klepton's own Bluetooth backend. The next "
+              "build tries again.", file=sys.stderr)
+SURREAL_SDK = _svr_wanted and os.path.isfile(
+    os.path.join(_svr_dir, "xros-arm64", f"{SVR_NAME}.framework", SVR_NAME))
+
+# The render scale an installer wants the game to START at (KLEPTON_RENDER_SCALE,
+# a fraction such as 0.75; AVP Play sets it with its MetalFX switch). It replaces
+# the target's own default (targets.py "render_scale") as KLRenderScaleDefault, so
+# a choice made in the game still wins. Unset: the target's, as before. Anything
+# that is not a number in 0.5..1.0 (the range KleptonTuning's targetRenderScale
+# accepts; outside it the bundle would quietly start at 1.0) is said and ignored.
+RENDER_SCALE = float(KLT["render_scale"])
+_rs_env = os.environ.get("KLEPTON_RENDER_SCALE", "").strip()
+if _rs_env:
+    try:
+        _rs = float(_rs_env)
+    except ValueError:
+        _rs = None
+    if _rs is not None and 0.5 <= _rs <= 1.0:
+        RENDER_SCALE = _rs
+    else:
+        print(f"gen_xcodeproj: KLEPTON_RENDER_SCALE={_rs_env!r} is not a fraction in 0.5..1.0 "
+              f"- the target's {RENDER_SCALE:.2f} stays", file=sys.stderr)
+
+# The frame generation a tester's install starts at (KLEPTON_FRAMEGEN=off|ahead|between):
+# replaces the target's own (targets.py "framegen") as KLFrameGenDefault, so a choice
+# made in the game still wins. Unset: the target's, as before.
+FRAMEGEN = KLT["framegen"]
+_fg_env = os.environ.get("KLEPTON_FRAMEGEN", "").strip().lower()
+if _fg_env:
+    if _fg_env in ("off", "ahead", "between"):
+        FRAMEGEN = _fg_env
+    else:
+        print(f"gen_xcodeproj: KLEPTON_FRAMEGEN={_fg_env!r} is not off, ahead or between "
+              f"- the target's {FRAMEGEN} stays", file=sys.stderr)
+
 # Compile-time launcher opt-in (also drives LAUNCHER_COND + the display name below).
 _launcher_on = _os.environ.get("KL_CUSTOM_LAUNCHER", "").strip().lower() in ("1", "true", "yes", "on")
 # NB: the bundle id is deliberately NOT switched by the launcher flag. It is a SIGNING
@@ -191,7 +385,25 @@ _launcher_on = _os.environ.get("KL_CUSTOM_LAUNCHER", "").strip().lower() in ("1"
 # store id, register the App ID first, then archive with an explicit
 # KLEPTON_BUNDLE_ID=com.noosphere.hl1vr. Local launcher builds keep the dev id and sign.
 _assets_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "Assets.xcassets")
-def _stack_exists(n): return _os.path.isdir(_os.path.join(_assets_dir, n + ".solidimagestack"))
+# A target without an icon in the shared catalog but with a Steam app id
+# (targets.py "steam_app") gets its icon and start picture from Steam's store
+# artwork, built into build/steamart/<target> by steam_art.py. The installer's
+# own stacks, when it left any, still win: that directory is only looked at
+# second. KL_NO_STEAM_ART=1 skips the fetch (the build is then iconless, as a
+# target with no artwork always was).
+_steam_art_dir = _os.path.join(HERE, "build", "steamart", KLT['name'])
+def _art_path(n):
+    for d in (_assets_dir, _steam_art_dir):
+        p = _os.path.join(d, n)
+        if _os.path.isdir(p):
+            return p
+    return None
+if (KLT['steam_app'] and _os.environ.get("KL_NO_STEAM_ART", "") != "1"
+        and not _os.path.isdir(_os.path.join(_assets_dir, f"AppIcon-{KLT['name']}.solidimagestack"))):
+    # On stderr: run.sh keeps this script's first stdout line, "wrote ...".
+    subprocess.run([sys.executable, _os.path.join(HERE, "steam_art.py"),
+                    KLT['steam_app'], KLT['name'], _steam_art_dir], stdout=sys.stderr)
+def _stack_exists(n): return _art_path(n + ".solidimagestack") is not None
 # With the launcher on, a trademark-free monogram icon (AppIcon-<t>-launcher) replaces
 # the target's normal icon when one is present; otherwise the normal icon stands. Both
 # are gitignored, so this is strictly local/opt-in.
@@ -206,7 +418,115 @@ ASSETCATALOG_SETTING = ((f"\t\t\t\tASSETCATALOG_COMPILER_APPICON_NAME = \"{_icon
                         # always defined so expansion never leaves a literal
                         # "$(...)" in the bundle; the placeholder names no stack
                         # and behaves exactly like the old no-icon build.
-                        + f"\t\t\t\tKL_APPICON_NAME = \"{_icon_name if HAS_ICON else 'AppIcon'}\";\n")
+                        + f"\t\t\t\tKL_APPICON_NAME = \"{_icon_name if HAS_ICON else 'AppIcon'}\";\n"
+                        # Same route for the target's hand-matting default
+                        # (targets.py "hand_matting"): Info.plist's
+                        # KLHandMattingDefault is $(KL_HAND_MATTING_DEFAULT).
+                        + f"\t\t\t\tKL_HAND_MATTING_DEFAULT = {1 if KLT['hand_matting'] else 0};\n"
+                        # The target's gamepad face-button layout (targets.py
+                        # "gamepad_map"), KLGamepadMap in Info.plist. Quoted: the
+                        # value carries '=' and ','.
+                        + f"\t\t\t\tKL_GAMEPAD_MAP = \"{KLT['gamepad_map']}\";\n"
+                        # ...and its render-scale default (targets.py
+                        # "render_scale", or KLEPTON_RENDER_SCALE above),
+                        # KLRenderScaleDefault in Info.plist.
+                        + f"\t\t\t\tKL_RENDER_SCALE_DEFAULT = {RENDER_SCALE:.2f};\n"
+                        # ...and whether in-game video is tried by default
+                        # (targets.py "video"), KLVideoDefault in Info.plist.
+                        + f"\t\t\t\tKL_VIDEO_DEFAULT = {1 if KLT['video'] else 0};\n"
+                        # ...whether the guest boots by itself or waits for the
+                        # Start button (targets.py "autoboot"), and what the
+                        # foveated-rendering setting starts at ("foveation").
+                        + f"\t\t\t\tKL_AUTOBOOT_DEFAULT = {1 if KLT['autoboot'] else 0};\n"
+                        + f"\t\t\t\tKL_FOVEATION_DEFAULT = {1 if KLT['foveation'] else 0};\n"
+                        # ...and the number that drops a stored foveation
+                        # choice once (targets.py "foveation_reset"),
+                        # KLFoveationReset in Info.plist.
+                        + f"\t\t\t\tKL_FOVEATION_RESET = {int(KLT['foveation_reset'])};\n"
+                        # ...what edge smoothing for a Vulkan guest starts at
+                        # (targets.py "vk_msaa", KLVkMsaaDefault) and how
+                        # finely the picture is put on the display ("output",
+                        # KLOutputDefault).
+                        + f"\t\t\t\tKL_VK_MSAA_DEFAULT = {int(KLT['vk_msaa'])};\n"
+                        # ...and the level foveated rendering for a Vulkan
+                        # guest starts at (targets.py "vk_foveation",
+                        # KLVkFoveationDefault).
+                        + f"\t\t\t\tKL_VK_FOVEATION_DEFAULT = {KLT['vk_foveation']};\n"
+                        # ...and the number that drops a stored resolution and
+                        # foveation level once (targets.py "picture_reset").
+                        + f"\t\t\t\tKL_PICTURE_RESET = {int(KLT['picture_reset'])};\n"
+                        # ...and the frame rate the start window starts at
+                        # (targets.py "max_rate", KLMaxRateDefault): 100 or 120.
+                        + f"\t\t\t\tKL_MAX_RATE_DEFAULT = {int(KLT['max_rate'])};\n"
+                        # ...and the frame generation it starts with (targets.py
+                        # "framegen", KLFrameGenDefault): off, ahead or between.
+                        + f"\t\t\t\tKL_FRAMEGEN_DEFAULT = {FRAMEGEN};\n"
+                        + f"\t\t\t\tKL_OUTPUT_DEFAULT = {KLT['output']};\n"
+                        # ...and which front the app shows: the boot report
+                        # this project was developed against, or the start
+                        # screen an installed game presents (KleptonApp.swift,
+                        # `productStart`). An installer asks for the second with
+                        # KLEPTON_START_SCREEN=1; KLStartScreen in Info.plist.
+                        + f"\t\t\t\tKL_START_SCREEN = {1 if os.environ.get('KLEPTON_START_SCREEN') == '1' else 0};\n"
+                        # ...and the OVRPlugin version the game ships
+                        # (OVRP_GUEST_VERSION above; KLOvrpGuestVersion).
+                        + f"\t\t\t\tKL_OVRP_GUEST_VERSION = \"{OVRP_GUEST_VERSION}\";\n"
+                        # ...and which Test switches this installation has ON
+                        # until its owner says otherwise in the game
+                        # (KLEPTON_TEST_ON, the variables' names with commas
+                        # between them; KLTestOn in Info.plist,
+                        # KleptonTestSwitches). An installer names them for
+                        # someone who wants a change that is built in but off
+                        # in every game at once, without a visit to each.
+                        + f"\t\t\t\tKL_TEST_ON = \"{TEST_ON}\";\n"
+                        # ...and whether it is a test build (TEST_BUILD above;
+                        # KLTestBuild in Info.plist).
+                        + f"\t\t\t\tKL_TEST_BUILD = {1 if TEST_BUILD else 0};\n"
+                        # ...and whether the play area (KleptonRoom*.swift) is on in
+                        # this game until its owner says otherwise there: on unless
+                        # the installer says KLEPTON_ROOM_GUARD=0 (AVP Play's
+                        # setting for games it installs); KLRoomGuardDefault.
+                        + f"\t\t\t\tKL_ROOM_GUARD_DEFAULT = {0 if os.environ.get('KLEPTON_ROOM_GUARD') == '0' else 1};\n"
+                        # ...and the language it starts with (GAME_LANGUAGE
+                        # above; KLGameLanguageDefault, empty for the target's).
+                        + f"\t\t\t\tKL_GAME_LANGUAGE_DEFAULT = \"{GAME_LANGUAGE}\";\n"
+                        # ...and what KleptonGameData.swift reads: which files
+                        # this build's guest needs and the store ids to fetch
+                        # them by. KL_DATA_TREE is empty for a target without the
+                        # panel, which is how the app tells.
+                        + f"\t\t\t\tKL_DATA_TREE = \"{KLT['tree'] if KLT['data_panel'] else ''}\";\n"
+                        + f"\t\t\t\tKL_DATA_APK = \"{KLT['apk']}\";\n"
+                        + f"\t\t\t\tKL_DATA_OBB_REL = \"{KLT['obb']}\";\n"
+                        + f"\t\t\t\tKL_DATA_OBB_FILE = \"{KLT['obb_file']}\";\n"
+                        + f"\t\t\t\tKL_DATA_APK_ID = \"{KLT['meta_apk_id']}\";\n"
+                        + f"\t\t\t\tKL_DATA_OBB_ID = \"{KLT['meta_obb_id']}\";\n")
+
+# The privacy strings, as BUILD SETTINGS and from here.
+#
+# They used to live only in Info.plist, and that is not a safe place for them:
+# open the generated project in Xcode, touch the target's Info tab, and Xcode
+# MOVES every usage description it recognises out of the plist and into the
+# project file as INFOPLIST_KEY_* (it is consolidating them where
+# GENERATE_INFOPLIST_FILE reads them). The plist is left without them — and the
+# project file is rewritten by this script on the next build. So the strings
+# vanish from both, nothing fails, and the app is killed by TCC two seconds
+# after launch the moment it asks for accessory tracking (twice now: Beat Saber
+# 1.40, then batman). Emitted here, they are in every project this writes,
+# wherever else they do or do not survive. visionos/run.sh checks the product.
+USAGE_DESCRIPTIONS = {
+    "NSMicrophoneUsageDescription": "Klepton uses the microphone only when you turn on the Microphone toggle, so a running app (such as Steam Link voice chat) can hear you.",
+    "NSWorldSensingUsageDescription": "Klepton reads the headset's own pose, which is the head pose the guest renders from, the floor and walls of your room for a mixed-reality game, and, when you measure your room, its floor, walls and furniture to find the play area.",
+    "NSHandsTrackingUsageDescription": "Klepton maps your hands onto the guest's two Touch controllers.",
+    "NSAccessoryTrackingUsageDescription": "Klepton maps PSVR2 Sense controllers onto the guest's two Touch controllers.",
+    "NSBluetoothAlwaysUsageDescription": "Klepton connects to spatial controllers that are not visible to the system as standard game controllers.",
+    "NSLocalNetworkUsageDescription": "Steam Link finds the PCs on your network by broadcasting to them, and streams from the one you pair with.",
+}
+_usage_settings = "".join(
+    '\t\t\t\tINFOPLIST_KEY_%s = "%s";\n' % (k, v.replace("\\", "\\\\").replace('"', '\\"'))
+    for k, v in USAGE_DESCRIPTIONS.items())
+ASSETCATALOG_SETTING += _usage_settings
+ASSETCATALOG_SETTING += f'\t\t\t\tKL_CONTROLLER_MODE_DEFAULT = "{CONTROLLER_MODE}";\n'
+ASSETCATALOG_SETTING += f'\t\t\t\tKL_SURREAL_AVAILABLE = {"YES" if SURREAL_SUPPORT else "NO"};\n'
 
 # Trim the asset catalog to THIS target. The shared Assets.xcassets holds one icon
 # stack per target (~26), and actool compiles ALL of them into the app's Assets.car
@@ -226,17 +546,59 @@ else:
     open(_os.path.join(_cat_abs, "Contents.json"), "w").write(
         '{\n  "info" : { "author" : "xcode", "version" : 1 }\n}\n')
 for _stack in (_icon_base, f"{_icon_base}-launcher"):
-    _s = _os.path.join(_assets_dir, _stack + ".solidimagestack")
-    if _os.path.isdir(_s):
+    _s = _art_path(_stack + ".solidimagestack")
+    if _s:
         _shutil.copytree(_s, _os.path.join(_cat_abs, _stack + ".solidimagestack"))
+# The start screen's picture, if an installer left one for this target
+# (StartHero-<target>.imageset) or steam_art.py made one. It goes into the app
+# under ONE name, so the Swift side asks for "StartHero" whatever the guest is.
+_hero = _art_path(f"StartHero-{KLT['name']}.imageset")
+if _hero:
+    _shutil.copytree(_hero, _os.path.join(_cat_abs, "StartHero.imageset"))
+
+# The two files apktool decodes out of the APK and a headset cannot (the
+# manifest is binary XML in the archive): carried as data assets, so the in-app
+# data panel can put them beside the assets it unpacks. They describe exactly
+# the APK this build's libraries came from, which is why they may ride along.
+if KLT['data_panel']:
+    _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    for _asset, _file in (("KLMeta-apktool", "apktool.yml"),
+                          ("KLMeta-manifest", "AndroidManifest.xml")):
+        _src = _os.path.join(_root, KLT['tree'], _file)
+        if not _os.path.isfile(_src):
+            continue
+        _ds = _os.path.join(_cat_abs, _asset + ".dataset")
+        _os.makedirs(_ds, exist_ok=True)
+        _shutil.copy(_src, _os.path.join(_ds, _file))
+        open(_os.path.join(_ds, "Contents.json"), "w").write(
+            '{\n  "info" : { "author" : "xcode", "version" : 1 },\n'
+            '  "data" : [ { "filename" : "%s", "idiom" : "universal" } ]\n}\n' % _file)
 
 # The Swift half of the language split: the App/UI, and the Compositor Services
 # renderer adds. A list rather than an id pair each, for the same reason
 # the guest libraries are one.
-SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
+SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift", "KleptonBrinkSelection.swift",
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
-         "KleptonChroma.swift", "KleptonMic.swift",
-         "KleptonLauncher.swift", "KleptonHL1.swift"]
+         "KleptonChroma.swift", "KleptonMic.swift", "KleptonFrameGen.swift",
+         "KleptonLauncher.swift", "KleptonHL1.swift", "KleptonGameData.swift",
+         "KleptonAlyx.swift", "KleptonText.swift", "KleptonSteamCloud.swift",
+         "KleptonBackup.swift", "KleptonMetrics.swift", "KleptonPinch.swift",
+         "KleptonTestBuild.swift", "KleptonLogTail.swift", "KleptonAppleMusic.swift", "KleptonModCredits.swift",
+         "KleptonArrayViews.swift",
+         "KleptonControllerInput.swift", "KleptonControllerMode.swift",
+         "KleptonSurrealInput.swift", "KleptonSurrealBackend.swift", "KleptonSurrealView.swift",
+         "KleptonSurrealAim.swift", "KleptonSurrealAimView.swift", "KleptonSurrealSDK.swift",
+         "KleptonMetalFXPreset.swift", "KleptonMetalFXAlpha.swift",
+         "KleptonEyeMax.swift", "KleptonOverlayDepth.swift", "KleptonHologram.swift",
+         "KleptonWalkaboutSave.swift",
+         "KleptonRealityPresent.swift",
+         "KleptonRoomStore.swift", "KleptonRoomSpace.swift", "KleptonBoundary.swift"]
+# Steam's connection, sign-in and Steam Cloud (SteamCloudKit/README.md: parts of
+# Glovebox's SteamLauncherKit, MIT), compiled into the app's own module. The
+# folder is a Swift package only so that its tests run on a Mac.
+SWIFT += [f"../SteamCloudKit/Sources/SteamCloudKit/{n}.swift" for n in (
+    "CMClient", "Transport", "Messages", "ProtoWire", "KeyValues", "Codec",
+    "SteamAuth", "SteamApps", "SteamCloud", "CloudGame")]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(
@@ -248,6 +610,20 @@ swift_filerefs = "\n".join(
 swift_children = "\n".join(f'\t\t\t\t{s["ref"]},' for s in swift)
 swift_sources  = "\n".join(f'\t\t\t\t{s["bld"]},' for s in swift)
 F_RT    = oid("FRT");   B_RT_LNK = oid("BRTLK")
+SC2_REF = oid("FSC2META"); SC2_BUILD = oid("BSC2META")
+sc2_buildfile = f'{SC2_BUILD} = {{isa = PBXBuildFile; fileRef = {SC2_REF}; }};' if SC2 else ''
+sc2_filereference = f'{SC2_REF} = {{isa = PBXFileReference; lastKnownFileType = folder; path = Scotland2Metadata; sourceTree = "<group>"; }};' if SC2 else ''
+sc2_resource = f'{SC2_BUILD},' if SC2 else ''
+sc2_group = f'{SC2_REF},' if SC2 else ''
+# Surreal Interactive's SDK, when SURREAL_SDK: one file ref, one link, no embed.
+F_SVR   = oid("FSVR");  B_SVR_LNK = oid("BSVRLK")
+SVR_BUILDFILE = (f"\t\t{B_SVR_LNK} /* {SVR_NAME}.xcframework in Frameworks */ = "
+                 f"{{isa = PBXBuildFile; fileRef = {F_SVR}; }};\n" if SURREAL_SDK else "")
+SVR_FILEREF = (f"\t\t{F_SVR} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; "
+               f"name = {SVR_NAME}.xcframework; path = Frameworks/{SVR_NAME}.xcframework; "
+               f"sourceTree = \"<group>\"; }};\n" if SURREAL_SDK else "")
+SVR_LINK = f"\t\t\t\t{B_SVR_LNK},\n" if SURREAL_SDK else ""
+SVR_CHILD = f"\t\t\t\t{F_SVR},\n" if SURREAL_SDK else ""
 
 # One file ref + one embed build-file per embedded framework.
 guest = [{"name": g, "ref": oid(f"FG{i}"), "emb": oid(f"BG{i}"),
@@ -281,19 +657,76 @@ fwchildren = "\n".join(f'\t\t\t\t{g["ref"]},' for g in guest)
 # the project-level DEBUG condition.
 # With the launcher on, the game builds present a compact trademark-free name; every
 # other build (and every other target) keeps its normal display name from targets.py.
+# KLT['display'] has already been through targets.display_for (the
+# KLEPTON_DISPLAY_OVERRIDE / KLEPTON_DISPLAY_SUFFIX overrides — a second install
+# of the same target beside the first needs a name of its own on the headset);
+# the launcher's compact name takes the same overrides, so an override still
+# wins over it and a suffix is still appended to it.
 _launcher_display = {"hl1": "HL1VR", "hl2": "HL2VR", "portal": "P1VR"}
-_display = (_launcher_display.get(KLT['name'], KLT['display']) if _launcher_on
+_display = (targets_mod.display_for(_launcher_display[KLT['name']])
+            if _launcher_on and KLT['name'] in _launcher_display
             else KLT['display'])
+# Inside a quoted pbxproj string: a quote or backslash in an override would end
+# the string early and leave the project unparseable.
+_display = _display.replace("\\", "\\\\").replace('"', '\\"')
 # Trailing newline, glued at line-start to the next setting — the same shape as
 # ENTITLEMENTS_SETTING / ASSETCATALOG_SETTING above, so it lands on its own line in
 # the output and expands to nothing (no blank line) when the flag is off.
-LAUNCHER_COND = ('\t\t\t\tSWIFT_ACTIVE_COMPILATION_CONDITIONS = "KL_CUSTOM_LAUNCHER $(inherited)";\n'
-                 if _launcher_on else "")
+# ...and KL_SURREAL_SDK, which is what lets KleptonSurrealSDK.swift call the SDK at all.
+_conds = ((["KL_CUSTOM_LAUNCHER"] if _launcher_on else []) + (["KL_SURREAL_SDK"] if SURREAL_SDK else [])
+          + (["KL_SCOTLAND2"] if SC2 else []))
+LAUNCHER_COND = (f'\t\t\t\tSWIFT_ACTIVE_COMPILATION_CONDITIONS = "{" ".join(_conds)} $(inherited)";\n'
+                 if _conds else "")
+
+# What the installed app says about itself: CFBundleShortVersionString and
+# CFBundleVersion. An installer sets these (KLEPTON_APP_VERSION — the guest's own
+# version — and KLEPTON_APP_BUILD — which build of it this is), because the app
+# list of a headset is the only place a Mac can ask what is installed, and "1.0
+# (1)" for every guest answers nothing. Up to three dot-separated integers each,
+# which is all the two keys take; anything else keeps the old constant.
+import re as _re
+def _plist_version(env, dflt):
+    v = os.environ.get(env, "")
+    return v if _re.fullmatch(r"\d{1,9}(\.\d{1,9}){0,2}", v) else dflt
+APP_VERSION = _plist_version("KLEPTON_APP_VERSION", "1.0")
+APP_BUILD = _plist_version("KLEPTON_APP_BUILD", "1")
+
+# Build settings for the Beat Saber mods (Info.plist KLScotland2*). Only a build
+# with the mods writes them, so every other project file stays as it was.
+def _sc2_settings():
+    if not SC2:
+        return ""
+    release = os.environ.get("SC2_BUILD_MODE") == "release"
+    test_set = os.environ.get("SC2_TEST_SET", "")
+    def on(*sets):
+        return 1 if test_set in sets else 0
+    rows = {
+        "KL_SCOTLAND2_TEST": 1,
+        "KL_SCOTLAND2_PROFILE": SC2_PROFILE,
+        "KL_SCOTLAND2_DIAGNOSTICS": 0 if release else 1,
+        "KL_SCOTLAND2_CUSTOMTYPES": on("customtypes"),
+        "KL_SCOTLAND2_METACORE": on("metacore", "songdownloader", "coremods"),
+        "KL_SCOTLAND2_SONGDOWNLOADER": on("songdownloader", "coremods"),
+        "KL_SCOTLAND2_COREMODS": on("coremods"),
+        "KL_SCOTLAND2_SONGCORE": on("songcore", "metacore", "songdownloader", "coremods"),
+        "KL_SCOTLAND2_BSML": on("bsml", "songcore", "metacore", "songdownloader", "coremods"),
+        "KL_SCOTLAND2_LAPIZ": on("lapiz"),
+        "KL_SCOTLAND2_HOOKS": on("hooks", "customtypes", "lapiz", "bsml", "songcore",
+                                 "metacore", "songdownloader", "coremods"),
+    }
+    text = "".join(f'\t\t\t\t{key} = "{value}";\n' for key, value in rows.items())
+    # The song search reads the Apple Music history (KleptonAppleMusic.swift); visionOS asks with this text.
+    text += ('\t\t\t\tINFOPLIST_KEY_NSAppleMusicUsageDescription = "Beat Saber\'s song search lists the songs you '
+             'played recently in Apple Music and finds maps for them on BeatSaver. No song is played from Apple Music.";\n')
+    if release:
+        text += '\t\t\t\tENABLE_DEBUG_DYLIB = NO;\n'
+    return text
+SC2_SETTINGS = _sc2_settings()
 
 COMMON = f"""
-				CLANG_ENABLE_MODULES = YES;
+{SC2_SETTINGS}				CLANG_ENABLE_MODULES = YES;
 {ENTITLEMENTS_SETTING}				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = {APP_BUILD};
 				DEVELOPMENT_TEAM = {TEAM};
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -349,7 +782,7 @@ COMMON = f"""
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = {APP_VERSION};
 				// VideoToolbox/CoreMedia/CoreVideo are kl_vtdec's, and
 				// they were missing here for the whole of the Steam Link arc:
 				// kl_vtdec joined RUNTIME_SHIP, `make xros` kept passing because
@@ -357,7 +790,7 @@ COMMON = f"""
 				// second target needed one. The failure is a link error naming
 				// VTDecompressionSession*, which reads as a missing SDK rather
 				// than as a build setting that was never updated.
-				OTHER_LDFLAGS = "-lz -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface";
+				OTHER_LDFLAGS = "-lz -lc++ -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface{" -framework Accelerate" if SURREAL_SDK else ""}{" -framework CoreText -framework CoreGraphics" if SC2 else ""}";
 				PRODUCT_BUNDLE_IDENTIFIER = {BUNDLE_ID};
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = xros;
@@ -383,14 +816,16 @@ PBX = f"""// !$*UTF8*$!
 	objects = {{
 
 /* Begin PBXBuildFile section */
+{sc2_buildfile}
 {swift_buildfiles}
 		{B_C} /* kl_app.c in Sources */ = {{isa = PBXBuildFile; fileRef = {F_C}; }};
 		{B_ASSETS} /* Assets.xcassets in Resources */ = {{isa = PBXBuildFile; fileRef = {F_ASSETS}; }};
 		{B_RT_LNK} /* Klepton.xcframework in Frameworks */ = {{isa = PBXBuildFile; fileRef = {F_RT}; }};
-{buildfiles}
+{SVR_BUILDFILE}{buildfiles}
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+{sc2_filereference}
 		{PRODUCT} /* {NAME}.app */ = {{isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = {NAME}.app; sourceTree = BUILT_PRODUCTS_DIR; }};
 {swift_filerefs}
 		{F_C} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = kl_app.c; sourceTree = "<group>"; }};
@@ -398,7 +833,7 @@ PBX = f"""// !$*UTF8*$!
 		{F_BRIDGE} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Klepton-Bridging-Header.h"; sourceTree = "<group>"; }};
 		{F_ASSETS} = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = {_appicon_catalog}; sourceTree = "<group>"; }};
 		{F_RT} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Klepton.xcframework; path = ../build/Klepton.xcframework; sourceTree = "<group>"; }};
-{filerefs}
+{SVR_FILEREF}{filerefs}
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -407,7 +842,7 @@ PBX = f"""// !$*UTF8*$!
 			buildActionMask = 2147483647;
 			files = (
 				{B_RT_LNK},
-			);
+{SVR_LINK}			);
 			runOnlyForDeploymentPostprocessing = 0;
 		}};
 /* End PBXFrameworksBuildPhase section */
@@ -434,6 +869,7 @@ PBX = f"""// !$*UTF8*$!
 				{G_FW},
 				{G_PROD},
 				{F_ASSETS},
+                {sc2_group}
 			);
 			sourceTree = "<group>";
 		}};
@@ -452,7 +888,7 @@ PBX = f"""// !$*UTF8*$!
 			isa = PBXGroup;
 			children = (
 				{F_RT},
-{fwchildren}
+{SVR_CHILD}{fwchildren}
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -518,6 +954,7 @@ PBX = f"""// !$*UTF8*$!
 			buildActionMask = 2147483647;
 			files = (
 				{B_ASSETS},
+                {sc2_resource}
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		}};
@@ -636,6 +1073,13 @@ def main():
     # Vulkan guest is on a headset — so the build says which one it made.
     print(f"  embedded MoltenVK:         "
           + (', '.join(MVK) if MVK else "(none - run 'make mvk' for a Vulkan guest)"))
+    if not SURREAL_SUPPORT:
+        print("  Surreal Touch:             off (KLEPTON_SURREAL_SUPPORT=0) - standard controllers only")
+    else:
+        print(f"  Surreal Touch poses:       "
+              + ("Surreal Interactive's SDK (linked)" if SURREAL_SDK
+                 else "KleptonSurrealBackend (no SDK in this build)")
+              + f", starting in {CONTROLLER_MODE} mode")
     return 0
 
 

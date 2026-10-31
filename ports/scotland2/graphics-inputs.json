@@ -1,0 +1,282 @@
+{
+  "schema": 1,
+  "purpose": "Independently verified public graphics input cache; no mod/game frameworks",
+  "sourceRecipes": [
+    "make angle-xros angle-xrsim",
+    "make mvk"
+  ],
+  "files": [
+    {
+      "path": "vendor/out/xros/libEGL.framework/Info.plist",
+      "sha256": "f99d81d672bdde1d5ba62f571cb24a50125de2b671a8421b9d88217b16668583"
+    },
+    {
+      "path": "vendor/out/xros/libEGL.framework/libEGL",
+      "sha256": "dd35af8f3c83d4c01ab439bf8e342d03a3adcd866e46c80282efaa00c626b679"
+    },
+    {
+      "path": "vendor/out/xros/libGLESv2.framework/Info.plist",
+      "sha256": "904d36ed34a414ac0124b19cb397f7b0200f054a7ab331650416b706badd19e3"
+    },
+    {
+      "path": "vendor/out/xros/libGLESv2.framework/libGLESv2",
+      "sha256": "fe4d4b0ad1c50d60cb847fec415b7360785092d01e3fa831ec6c79a7aa0c0b55"
+    },
+    {
+      "path": "vendor/out/xrsim/libEGL.framework/Info.plist",
+      "sha256": "7d8a2fbd2cdd90e47c0c3b47e0ddabb467a2fc269f62990ad5869f71aa50e5b6"
+    },
+    {
+      "path": "vendor/out/xrsim/libEGL.framework/libEGL",
+      "sha256": "1b1b74f74578f7a389351321c0928cfe3e5fe002117cfddf388816086b25190d"
+    },
+    {
+      "path": "vendor/out/xrsim/libGLESv2.framework/Info.plist",
+      "sha256": "00c38a285be2e6b498bfd016b8abe06064ae73127f730364805bce3dc4f5f967"
+    },
+    {
+      "path": "vendor/out/xrsim/libGLESv2.framework/libGLESv2",
+      "sha256": "64dc82dc4b182968ae03d82fa1c92ce52544aa63631689c5ffd8458d2b16359e"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/MoltenVK/mvk_config.h",
+      "sha256": "af29d0b556f91c5435ab9dd7173d64d2133ff3bdc67f7cf3ce4398ac2c815e18"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/MoltenVK/mvk_datatypes.h",
+      "sha256": "137fb8b9d39719ca013fc459fd873f924c93c28744fb9993acfba64250054fc7"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/MoltenVK/mvk_deprecated_api.h",
+      "sha256": "ba263887ae74215a1bc562374e6af6a688fccd4ae3ad9e15ed6befc687038cb0"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/MoltenVK/mvk_private_api.h",
+      "sha256": "eb0c20649a3f377723aa8d24ae2de7bf0931d1568d9d16ca152a89bbbf2faa9d"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/MoltenVK/mvk_vulkan.h",
+      "sha256": "4559af38c2f9a02c68bf3acbabfc8002e745a6a6f77c5b88ee399de3dd3e4dd2"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/MoltenVK/vk_mvk_moltenvk.h",
+      "sha256": "9e2a2f0ef6cd8404f6b06298be285cbd1f54a7208b3038ea555cad80e3256603"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_av1std.h",
+      "sha256": "c75c1d324b97d247aef0008024bc7f3adb98c741ab7f66c882ec38fdacc7ee33"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_av1std_decode.h",
+      "sha256": "7e3a1ce177c12546d410f3179ce1b81f2da7a8eba4f525b29cd563ab4099c0e5"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_av1std_encode.h",
+      "sha256": "8d166b4543260a38347860443b1a59c7a5e86cdb0d0facaf4c704f667de030e3"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_h264std.h",
+      "sha256": "fded484cef9f90fbbd089e0647268f36e5f4292179fbc5428a2c9e8d7709bbe9"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_h264std_decode.h",
+      "sha256": "37b970c3d80536ad1ac074cfe19b58ee03c3075378e02179e1dc5e4351266821"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_h264std_encode.h",
+      "sha256": "227e092b53c4e7ca1a948ed021704511c1ed16040cd6188ff6703e5ae66db64d"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_h265std.h",
+      "sha256": "0b81f8986ada015ef2e127449eff9d9634899bb59a0a9277a4054e9ec4416c12"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_h265std_decode.h",
+      "sha256": "879a0dd370a1b1ad184638906c52bdfe7d80d639fbc5a5baa8b02d7c5b60b147"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_h265std_encode.h",
+      "sha256": "abb3e72af22e4e0a3dbe5dff7be1b275949388809fb3987830341e8f495ea1c7"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_vp9std.h",
+      "sha256": "0a47125865376a3fe7014b69ff6db9d04e30ebf8c4d15664f1d894649ad5c09d"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codec_vp9std_decode.h",
+      "sha256": "1ceb1a8d0e3370e508cf688a6e57dc314cd82186b60f3cef420ea4b1b483865d"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vk_video/vulkan_video_codecs_common.h",
+      "sha256": "d2e7caa396c521d03d491a269572b1d31b925b5127d22fda14199951ebae89f8"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vk_icd.h",
+      "sha256": "ba22828f76de7231e7dfbb5d8564e7a58dd9f5dbeac8c1f0ff6c056c92db744a"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vk_layer.h",
+      "sha256": "a9fb1343e7e1fa3456189bf146f2186b8df46c1b1a01f88f8b9ae4cd25b1623c"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vk_platform.h",
+      "sha256": "a2cd9085c66776845d2524c3b0e73ccf4827ba046aa6f676c4b8ddbed47d6552"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan.cppm",
+      "sha256": "0636d9b30ba9af217d810603ede7107c6299962383de48b6bc5f116d67aa5487"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan.h",
+      "sha256": "096f50152d0b298d8df84a561a37d8190c8a60af34dff0e2cc8328b24491a640"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan.hpp",
+      "sha256": "1b381bb1c00c36006ea5d8cb4cce6435702c6e30be784b3420d2edaf1911b1e1"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_android.h",
+      "sha256": "9dcce545a790b5b1ce00e103ade95c8efa4c8a0bf2ff39865d76a7d2f987aef2"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_beta.h",
+      "sha256": "bb43577a445c357c3f0c03572b3dd3ebd9fca39914c0092f7d77e942af05d3fc"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_core.h",
+      "sha256": "a7ac0d7e35e77f642c175af5d36729cfdae2d626d2aaa9145c030a42bd44edc6"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_directfb.h",
+      "sha256": "efecf5a15380f61c16ef257ed55a998f2cc651789bec22056ccc81d2518daefc"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_enums.hpp",
+      "sha256": "8d5de6fa92ca6ebf72a48cc10f25a83df9c1bd4ca481f3c2028be0e3ee2ab6fa"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_extension_inspection.hpp",
+      "sha256": "0b21a6d9fee393938e513fc2ebf47a54573ce9bad754cbd7d911944a3442c65d"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_format_traits.hpp",
+      "sha256": "b980aefbb629a1bfebdfd475532f9f2214660a6532c39dffb91c2fe6c38ec0d2"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_fuchsia.h",
+      "sha256": "17aedccaae68825bfa2954faec1bc9e953b106f1161e1b2ab26ab4cdccf21a06"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_funcs.hpp",
+      "sha256": "6beb302c8f8ab26afc4056718f63087f3829f65467a0628ee142844043992136"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_ggp.h",
+      "sha256": "b68cbbf19b9397ee63dd6ba94526059bd2ff000c66083243758e3a04e215bd2c"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_handles.hpp",
+      "sha256": "1bfbf0d70d5f6a0a623f5803e3d25fc6ec98095e8ea459c087d2ae28d2ff8cd9"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_hash.hpp",
+      "sha256": "f225e0fb261fd9c3c567dd596e764d598e64fbc14eb29b7ef383e5b4b10e3da5"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_hpp_macros.hpp",
+      "sha256": "b9a71f468bde2facb989164186c99e4ec565ca0bc45b3c2675ebb4056a236a4b"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_ios.h",
+      "sha256": "ebaeffc3f4ec0484dcf34753678f1642caf73f6db4e17f11f1b82302151b918c"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_macos.h",
+      "sha256": "3ae5522081741e9021be86727e11949ad8c695e66f75e1c422e577afd7657f59"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_metal.h",
+      "sha256": "d5fe0caf881cc9c72ea2ba31ca86c684e97cdec6741d6e6298ecbd8f58dc8c5e"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_ohos.h",
+      "sha256": "3cc40f845b5fd75cda0d8a3b1f2782522a3591657f67c656a211b4639eb23b16"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_raii.hpp",
+      "sha256": "5336b82c63b6229ff9d05229df44817c9b8533b0e63da5aed435f18399222f1b"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_screen.h",
+      "sha256": "b9e7e7921b4be199c8ecfe518bd71bd8e533adbbab193714c542157b87b10e86"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_shared.hpp",
+      "sha256": "9fe25e7cae294e71ce1683b15c78a3f57d772a889b7f0e4319e5a8a7b5d94e59"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_static_assertions.hpp",
+      "sha256": "d66c5b9f332fa2e7da407887a2a90afe599e81c22ff89d9057a44d5d02b23023"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_structs.hpp",
+      "sha256": "03d0b7a96fb43ac05b98d829054de685eb148a2facce2e284a4c13fedb997ef4"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_to_string.hpp",
+      "sha256": "c26500482fc87dbbdcf254cdb00eae33f3dd8bab8a1dd6112e83e6516733d9ae"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_ubm.h",
+      "sha256": "ac106317c017d1975f26184d3979dba0352f10aa1cfc7ef5373be92fef6bd137"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_vi.h",
+      "sha256": "a53e35bb1b3113e6ef4932cb9358a27861a198d7865227ecd93555fecc73dd68"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_video.cppm",
+      "sha256": "aa8f15aa490d52337acf06a0de6165da8c1a589ced8caf732aedbfec7e00d268"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_video.hpp",
+      "sha256": "0d1166ce914ba96a561c79f0905426419cd833b77d5b1a297f8ebe7d53f637df"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_wayland.h",
+      "sha256": "6c4146149d45bcbb5a22c7540feaa396ee9a49f077737c7a343c62de5199fbc7"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_win32.h",
+      "sha256": "72f0b6de71287d3b04d12235e4f2fef8f343126f85be4963c516d31d5bb4c099"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_xcb.h",
+      "sha256": "3d49f5eb52090e72e1cf7cde545088225ac524a2ff1d1f35737e7d944474c1b7"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_xlib.h",
+      "sha256": "3c44e97d3f380eb912e01a79e9667457fdf5e18164f0b09b3c61431f421bc551"
+    },
+    {
+      "path": "vendor-moltenvk/out/include/vulkan/vulkan_xlib_xrandr.h",
+      "sha256": "188233d112d812cca1777cfa6c1585073f1f2b033fa08b2f11c8d0757fcc232e"
+    },
+    {
+      "path": "vendor-moltenvk/out/xros/MoltenVK.framework/Info.plist",
+      "sha256": "3efc5dfc137cfc92f3b20300c2349f60b2d56d972df033f4cbc7811a3be2763b"
+    },
+    {
+      "path": "vendor-moltenvk/out/xros/MoltenVK.framework/MoltenVK",
+      "sha256": "2425497d479dd7b096b93319e45fa127a8887433ebcc6b9661fad3acc23403e7"
+    },
+    {
+      "path": "vendor-moltenvk/out/xrsim/MoltenVK.framework/Info.plist",
+      "sha256": "8f20bd65056306a70bf5955c282f4c31474739d880d13cc6a823db1c6dcc97fe"
+    },
+    {
+      "path": "vendor-moltenvk/out/xrsim/MoltenVK.framework/MoltenVK",
+      "sha256": "cd19f1f9e65930281ba1329e3bfe86a8302c18859f0061b127013e39f3d1b295"
+    }
+  ]
+}

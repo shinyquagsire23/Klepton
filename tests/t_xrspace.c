@@ -21,7 +21,15 @@ int main(void) {
     setenv("KL_OVRP_IPD", "0.063", 0);
 
     printf("=== OpenXR reference spaces ===\n");
-    int ok = kl_openxr_space_selftest(stdout);
+    int ok = 1;
+    // Head prediction is off unless asked for (KL_XR_PREDICT=1). Checked before the
+    // self-test, which switches it on for the checks that are about it.
+    if (!getenv("KL_XR_PREDICT")) {
+        int off = kl_openxr_predict() == 0;
+        printf("  %s head prediction is off by default\n", off ? "ok  " : "FAIL");
+        ok &= off;
+    }
+    ok &= kl_openxr_space_selftest(stdout);
     printf("%s: the space algebra holds\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

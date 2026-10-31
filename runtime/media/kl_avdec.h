@@ -65,6 +65,10 @@ int       kl_avdec_complete(kl_avdec *d);
 // frame-update path both actually want to know.
 const void *kl_avdec_frame(kl_avdec *d, int *w, int *h, size_t *bytes,
                            unsigned long long *serial);
+// Hold the frame still while it is copied out: between these two the decode
+// thread cannot write the next frame over the one kl_avdec_frame returned.
+void kl_avdec_frame_lock(kl_avdec *d);
+void kl_avdec_frame_unlock(kl_avdec *d);
 
 // ---------------------------------------------------------------------------
 // Demux-only path, for Unity's NDK video (AMediaExtractor + AMediaCodec).
@@ -99,6 +103,15 @@ long      kl_avdemux_read(kl_avdemux *m, unsigned char *buf, unsigned long cap);
 int  kl_avdemux_advance(kl_avdemux *m);
 // Seek so the next current sample is at/after us; 1 on success.
 int  kl_avdemux_seek_us(kl_avdemux *m, long long us);
+
+// The clip's SOUND, when it has an audio track: decoded to 16-bit interleaved
+// PCM (at most two channels) and served in chunks of 1024 frames, the same
+// current-sample shape as the video above. info is 0 for a clip without sound.
+int       kl_avdemux_audio_info(kl_avdemux *m, int *rate, int *channels);
+long long kl_avdemux_audio_time_us(kl_avdemux *m);     // -1 at end of stream
+long      kl_avdemux_audio_read(kl_avdemux *m, unsigned char *buf, unsigned long cap);
+int       kl_avdemux_audio_advance(kl_avdemux *m);
+int       kl_avdemux_audio_seek_us(kl_avdemux *m, long long us);
 
 #ifdef __cplusplus
 }

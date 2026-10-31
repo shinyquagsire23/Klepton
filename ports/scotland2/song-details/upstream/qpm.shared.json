@@ -1,0 +1,112 @@
+{
+  "$schema": "https://raw.githubusercontent.com/QuestPackageManager/QPM.Package/refs/heads/main/qpm.shared.schema.json",
+  "config": {
+    "version": "0.4.0",
+    "sharedDir": "shared",
+    "dependenciesDir": "extern",
+    "info": {
+      "name": "SongDetails",
+      "id": "song-details",
+      "version": "1.0.4",
+      "url": "https://github.com/bsq-ports/SongDetails",
+      "additionalData": {
+        "overrideSoName": "libsongdetails.so",
+        "cmake": false
+      }
+    },
+    "workspace": {
+      "scripts": {
+        "build": [
+          "pwsh ./scripts/build.ps1"
+        ],
+        "clean": [
+          "pwsh ./scripts/build.ps1 -clean"
+        ],
+        "copy": [
+          "pwsh ./scripts/copy.ps1"
+        ],
+        "log": [
+          "pwsh ./scripts/log.ps1"
+        ],
+        "qmod": [
+          "pwsh ./scripts/build.ps1 -clean -release",
+          "qpm qmod manifest",
+          "pwsh ./scripts/createqmod.ps1 SongDetails -clean"
+        ]
+      },
+      "ndk": "^27.2.12479018",
+      "qmodIncludeDirs": [],
+      "qmodIncludeFiles": [],
+      "qmodOutput": null
+    },
+    "dependencies": [
+      {
+        "id": "libcurl",
+        "versionRange": "^7.78.0",
+        "additionalData": {
+          "private": true
+        }
+      },
+      {
+        "id": "paper2_scotland2",
+        "versionRange": "^4.6.4",
+        "additionalData": {
+          "private": true
+        }
+      }
+    ]
+  },
+  "restoredDependencies": [
+    {
+      "dependency": {
+        "id": "fmt",
+        "versionRange": "=11.0.2",
+        "additionalData": {
+          "headersOnly": true,
+          "branchName": "version/v11_0_2",
+          "compileOptions": {
+            "systemIncludes": [
+              "fmt/include/"
+            ],
+            "cppFlags": [
+              "-DFMT_HEADER_ONLY"
+            ]
+          }
+        }
+      },
+      "version": "11.0.2"
+    },
+    {
+      "dependency": {
+        "id": "paper2_scotland2",
+        "versionRange": "=4.6.4",
+        "additionalData": {
+          "soLink": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/libpaper2_scotland2.so",
+          "overrideSoName": "libpaper2_scotland2.so",
+          "modLink": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod",
+          "branchName": "version/v4_6_4",
+          "compileOptions": {
+            "systemIncludes": [
+              "shared/utfcpp/source"
+            ]
+          },
+          "cmake": false
+        }
+      },
+      "version": "4.6.4"
+    },
+    {
+      "dependency": {
+        "id": "libcurl",
+        "versionRange": "=7.78.0",
+        "additionalData": {
+          "staticLinking": true,
+          "soLink": "https://github.com/darknight1050/openssl-curl-android/releases/download/v7.78.0/libcurl.a",
+          "overrideSoName": "libcurl.a",
+          "branchName": "version-v7.78.0"
+        }
+      },
+      "version": "7.78.0"
+    }
+  ]
+}

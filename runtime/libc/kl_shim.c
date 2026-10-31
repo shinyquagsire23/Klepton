@@ -6,6 +6,7 @@
 //                          kl_dl.c) and AAPCS64 variadic thunks (kl_va_thunks.S)
 //   3. local statics    — small bionic-isms defined right here
 #include <stdio.h>
+#include "kl_extension.h"
 #include <stdlib.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -88,7 +89,9 @@ int getentropy(void *buffer, size_t size);
 #include "kl_aaudio.h"
 #include "kl_vulkan.h"
 #include "kl_ovrp.h"
+#include "kl_target.h"   // kl_guest_kind, for the ovrp_ tier of kl_shim_lookup
 #include "kl_ovrplat.h"
+#include "kl_steamapi.h"
 #include "kl_jni.h"
 
 // ---------- bionic stack-guard canary in Darwin TSD slot 5 ----------
@@ -160,6 +163,25 @@ __attribute__((noreturn)) static void kl_stack_chk_fail(void) {
 // not known here, so anything landing inside the block routes to stderr. Known
 // gap: the true stride is recoverable from the GLOB_DAT addend.
 static char g_sF[4096] __attribute__((aligned(16)));
+// Where a bogus FILE * goes: NOT stderr itself. A read through it fails, and a
+// failed read sets the stream's error flag — on Darwin's stderr that makes every
+// later fprintf(stderr) of this runtime return -1 and print nothing (one
+// fgets(NULL) in Half-Life: Alyx's tier0 silenced the rest of the log, fault
+// report included). So a stream of its own: writes go to fd 2 (the log, as
+// before), reads are EOF.
+static int kl_bogus_read(void *c, char *b, int n)        { (void)c; (void)b; (void)n; return 0; }
+static int kl_bogus_write(void *c, const char *b, int n) { (void)c; return (int)write(2, b, (size_t)n); }
+static FILE *kl_bogus_file_sink(void) {
+    static FILE *f;
+    if (!f) {
+        FILE *n = funopen(NULL, kl_bogus_read, kl_bogus_write, NULL, NULL);
+        if (!n) return stderr;
+        setvbuf(n, NULL, _IONBF, 0);
+        f = n;
+    }
+    clearerr(f);
+    return f;
+}
 FILE *kl_host_file(void *guest) {
     if ((char *)guest >= g_sF && (char *)guest < g_sF + sizeof g_sF) return stderr;
     // A FILE * small enough to be a page-zero offset is not a FILE * — it is an
@@ -181,7 +203,7 @@ FILE *kl_host_file(void *guest) {
             seen[n++] = guest;
             fprintf(stderr, "[klepton] bogus guest FILE * %p — routed to stderr\n", guest);
         }
-        return stderr;
+        return kl_bogus_file_sink();
     }
     return (FILE *)guest;
 }
@@ -192,9 +214,15 @@ static size_t kl_fwrite(const void *p, size_t a, size_t b, void *f) { return fwr
 // async loader's throughput is the loading-screen pacing question. Bytes are
 // attributed per open file (kl_file_path) so a slow trickle names its file.
 extern const char *kl_file_path(void *f);
+extern void kl_bank_note_io(const char *op, void *f, long long a, long long b, long long res);
+extern int  kl_bank_is_open(void *f);              // kl_libc.c — gate, false for every other file
 static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
     FILE *hf = kl_host_file(f);
+    // The archive trace: WHERE libzip is reading (the offset it starts from) and
+    // whether it got what it asked for. Silent unless this is an open archive.
+    long long at = kl_bank_is_open(hf) ? (long long)ftello(hf) : -1;
     size_t r = fread(p, a, b, hf);
+    if (at >= 0) kl_bank_note_io("fread", hf, at, (long long)(a * b), (long long)(r * a));
     static int on = -1;
     if (on < 0) on = kl_env_on("KL_TRACE_IO", 0);
     if (on) {
@@ -226,17 +254,37 @@ static size_t kl_fread(void *p, size_t a, size_t b, void *f) {
     }
     return r;
 }
-static int kl_fclose(void *f)                      { return fclose(kl_host_file(f)); }
+extern void kl_bank_note_close(void *f);           // kl_libc.c — the bank probe
+static int kl_fclose(void *f)                      { kl_bank_note_close(f);
+                                                     return fclose(kl_host_file(f)); }
 static int kl_fflush(void *f)                      { return fflush(f ? kl_host_file(f) : NULL); }
 static char *kl_fgets(char *s, int n, void *f)     { return fgets(s, n, kl_host_file(f)); }
+// bionic's fgets_unlocked (API 28): Darwin has no such name. The locked fgets
+// is a correct stand-in — the guest only promised it needs no lock. UE4 reads
+// /proc/meminfo with it at start.
+static char *kl_fgets_unlocked(char *s, int n, void *f) { return fgets(s, n, kl_host_file(f)); }
 static int kl_getc_(void *f)                       { return getc(kl_host_file(f)); }
 static int kl_feof(void *f)                        { return feof(kl_host_file(f)); }
 static int kl_ferror(void *f)                      { return ferror(kl_host_file(f)); }
 static void kl_clearerr(void *f)                   { clearerr(kl_host_file(f)); }
-static int kl_fseek(void *f, long o, int w)        { return fseek(kl_host_file(f), o, w); }
-static int kl_fseeko(void *f, off_t o, int w)      { return fseeko(kl_host_file(f), o, w); }
+// The offsets ARE the evidence for the bank probe (a 3.4 GB archive whose
+// central directory and Init.bnk both sit above 2^31), so each of these reports
+// the offset it was handed and the offset the host ended up at.
+static int kl_fseek(void *f, long o, int w)        { FILE *hf = kl_host_file(f); int r = fseek(hf, o, w);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("fseek", hf, (long long)o, w,
+                                                                         r ? -1 : (long long)ftello(hf));
+                                                     return r; }
+static int kl_fseeko(void *f, off_t o, int w)      { FILE *hf = kl_host_file(f); int r = fseeko(hf, o, w);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("fseeko", hf, (long long)o, w,
+                                                                         r ? -1 : (long long)ftello(hf));
+                                                     return r; }
 static long kl_ftell(void *f)                      { return ftell(kl_host_file(f)); }
-static off_t kl_ftello(void *f)                    { return ftello(kl_host_file(f)); }
+static off_t kl_ftello(void *f)                    { FILE *hf = kl_host_file(f); off_t r = ftello(hf);
+                                                     if (kl_bank_is_open(hf))
+                                                         kl_bank_note_io("ftello", hf, 0, 0, (long long)r);
+                                                     return r; }
 static int kl_setvbuf(void *f, char *b, int m, size_t n) { return setvbuf(kl_host_file(f), b, m, n); }
 
 // ---------- sockets: bionic -> Darwin option constants ----------
@@ -472,9 +520,56 @@ static void kl_hexdump(const char *tag, const void *buf, ssize_t n) {
     for (ssize_t i = 0; i < n; i++) fputc(p[i] >= 0x20 && p[i] < 0x7f ? p[i] : '.', stderr);
     fprintf(stderr, "|\n");
 }
+// Meta's own hosts, for a guest that would otherwise present the synthetic
+// offline user to them.
+//
+// Beat Saber from 1.45 on gets that user because its start waits for one
+// (klplat_user_default), and with a user it does what it does on a Quest: it
+// asks graph.oculus.com for an analytics id, sends analytics batches, fetches
+// feature flags and leaderboards — every request carrying the offline token
+// klplat_User_GetAccessToken handed it. Meta refuses each one ("Failed to
+// decrypt", OAuthException 190; several dozen in a seven-minute session on
+// device, 2026-10-12) and the game falls back to its defaults, so nothing was
+// gained by sending them, and a made-up credential went to somebody else's
+// server each time. Its owner asked for them to stop.
+//
+// So for that guest these names do not resolve — the answer a headset without
+// a network gives, for these hosts only; everything else resolves as before.
+// By name, at the one door every request shares: the game's REST client and
+// Unity's own both come through getaddrinfo (seen with KL_TRACE_NET on a Mac
+// host). KL_NET_NO_META overrides in either direction, for any guest.
+static int kl_net_meta_host(const char *node) {
+    static const char *const dom[] = { "oculus.com", "oculuscdn.com", "facebook.com",
+                                       "facebook.net", "fbcdn.net", "meta.com" };
+    if (!node) return 0;
+    size_t n = strlen(node);
+    for (size_t i = 0; i < sizeof dom / sizeof dom[0]; i++) {
+        size_t l = strlen(dom[i]);
+        if (n >= l && strcasecmp(node + n - l, dom[i]) == 0 && (n == l || node[n - l - 1] == '.'))
+            return 1;
+    }
+    return 0;
+}
+static int kl_net_no_meta(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern int kl_guest_beatsaber_openxr(void);
+        on = kl_env_on("KL_NET_NO_META", kl_guest_beatsaber_openxr());
+    }
+    return on;
+}
 static void kl_sa_to_guest(struct sockaddr *sa, socklen_t *len);
 static int kl_getaddrinfo(const char *node, const char *serv,
                           const void *hints, void *res) {
+    if (kl_net_meta_host(node) && kl_net_no_meta()) {
+        static int said;
+        if (said < 4 || kl_net_trace()) {
+            said++;
+            fprintf(stderr, "  [net] getaddrinfo(\"%s\") -> EAI_NONAME — Meta's hosts are not asked "
+                            "with the offline user (KL_NET_NO_META=0 lets it through)\n", node);
+        }
+        return EAI_NONAME;
+    }
     if (kl_net_offline()) {
         if (kl_net_trace())
             fprintf(stderr, "  [net] getaddrinfo(\"%s\") -> EAI_NONAME (offline)\n",
@@ -486,6 +581,15 @@ static int kl_getaddrinfo(const char *node, const char *serv,
     if (kl_net_trace())
         fprintf(stderr, "  [net] getaddrinfo(\"%s\",\"%s\") -> %d\n",
                 node ? node : "(null)", serv ? serv : "", r);
+    // A Xash3D guest whose master servers no longer exist never asks for servers at all; with a stand-in
+    // address it does, and the player's own servers answer (runtime/guest/kl_xashservers.c).
+    extern const char *kl_xash_servers_master_standin(const char *);
+    const char *standin = r != 0 ? kl_xash_servers_master_standin(node) : NULL;
+    if (standin) {
+        r = getaddrinfo(standin, serv, hints, &hres);
+        if (kl_net_trace())
+            fprintf(stderr, "  [net] getaddrinfo(\"%s\") stands in for it -> %d\n", standin, r);
+    }
     // bionic and Darwin share the addrinfo layout (canonname before addr —
     // proven by the Ping callsite, which reads ai_addr at +0x20); only the
     // sockaddr inside differs (Darwin's sa_len). Convert each in place and
@@ -669,6 +773,23 @@ static void kl_grow_sock_buffers(int fd) {
     }
 }
 
+// inet_pton/inet_ntop take the family as an argument, so they carry the same
+// 10 -> 30 divergence as socket() below and cannot be direct forwards. Darwin
+// answers an unknown family with -1/EAFNOSUPPORT, and -1 is TRUE to curl's
+// Curl_host_is_ipnum — `inet_pton(AF_INET, h) || inet_pton(AF_INET6, h)` — so
+// every hostname read as an IP literal and curl sent no SNI. Steam's CDN
+// answers a ClientHello without SNI with a fatal internal_error alert (15 03 03
+// 00 02 02 50), which Steam Link logs as "CURL error SSL connect error (35)"
+// on every api.steampowered.com request, and the shell sits at "Connecting…".
+static int kl_inet_pton(int af, const char *src, void *dst) {
+    if (af == 10) af = AF_INET6;
+    return inet_pton(af, src, dst);
+}
+static const char *kl_inet_ntop(int af, const void *src, char *dst, socklen_t size) {
+    if (af == 10) af = AF_INET6;
+    return inet_ntop(af, src, dst, size);
+}
+
 static int kl_socket(int domain, int type, int protocol) {
     // bionic AF_INET6=10 -> Darwin 30; SOCK_* types agree.
     if (domain == 10) domain = AF_INET6;
@@ -695,8 +816,36 @@ static int kl_socket(int domain, int type, int protocol) {
                             "(interface scan uses getifaddrs, not this socket)\n", fd);
         return fd;
     }
+    // Linux lets the type carry two flags Darwin has no bits for: SOCK_NONBLOCK
+    // (04000) and SOCK_CLOEXEC (02000000). Passed on as they are, Darwin reads
+    // them as part of the type and refuses the socket ("Protocol wrong type for
+    // socket") — which is every connection of a guest whose HTTP stack opens its
+    // sockets this way. Unity 6's does (Demeo, 2026-10-13: `socket(dom=2
+    // type=2049 proto=6) -> -1` for each request, "Cannot connect to
+    // destination host" in the game, and a start that waited on its servers for
+    // ever). Taken off the type and set on the descriptor instead.
+    int lx_nonblock = type & 0x800, lx_cloexec = type & 0x80000;
+    type &= ~(0x800 | 0x80000);
     int fd = socket(domain, type, protocol);
+    if (fd >= 0 && lx_nonblock) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    if (fd >= 0 && lx_cloexec) fcntl(fd, F_SETFD, FD_CLOEXEC);
     if (fd >= 0) kl_grow_sock_buffers(fd);
+    // A failed send on a non-stream socket must come back as an error, never as
+    // SIGPIPE. Linux never raises SIGPIPE for datagram sockets; Darwin does
+    // whenever a send fails with EPIPE, unless SO_NOSIGPIPE is set. Beat Saber
+    // 1.40 (Unity 2022.3) dies this way seconds into boot: Unity's Ping sends on
+    // its ICMP datagram socket, gets "Broken pipe", and the SIGPIPE lands in
+    // Unity's own handler (13 is not refused by klb_fatal_signal), which reads
+    // the Darwin ucontext as Linux, dumps garbage registers and faults at 0x0 in
+    // libunity. SO_NOSIGPIPE here restores the Linux behaviour: the engine gets
+    // the EPIPE it already logs and carries on. Stream sockets are untouched
+    // (Linux does raise SIGPIPE there without MSG_NOSIGNAL, handled per call in
+    // kl_msg_flags). KL_NET_DGRAM_NOSIGPIPE=0 reverts.
+    if (fd >= 0 && (type & 0xf) != SOCK_STREAM) {
+        static int nosig = -1;
+        if (nosig < 0) nosig = kl_env_on("KL_NET_DGRAM_NOSIGPIPE", 1);
+        if (nosig) kl_no_sigpipe(fd);
+    }
     // Darwin traffic-class marking for the guest's UDP sockets. Steam Link's
     // AV stream is plain UDP; stamped NET_SERVICE_TYPE_RV ("responsive
     // multimedia - interactive media such as screen sharing", Apple's own
@@ -718,8 +867,9 @@ static int kl_socket(int domain, int type, int protocol) {
     }
 #endif
     if (kl_net_trace())
-        fprintf(stderr, "  [net] socket(dom=%d type=%d proto=%d) -> fd %d%s\n",
-                domain, type, protocol, fd, fd < 0 ? strerror(errno) : "");
+        fprintf(stderr, "  [net] socket(dom=%d type=%d%s%s proto=%d) -> fd %d%s\n",
+                domain, type, lx_nonblock ? "|NONBLOCK" : "", lx_cloexec ? "|CLOEXEC" : "",
+                protocol, fd, fd < 0 ? strerror(errno) : "");
     return fd;
 }
 
@@ -787,6 +937,29 @@ static int klb_getifaddrs(struct ifaddrs **out) {
 }
 static void klb_freeifaddrs(struct ifaddrs *ifa) { freeifaddrs(ifa); }
 
+// A failed socket call publishes its errno through kl_errno_set, so the guest
+// reads the failure and not a value it stored itself before the call.
+//
+// klb_errno (kl_libc.c) keeps a guest's own errno write unless Darwin's errno
+// moved since the slot was last filled. A non-blocking reader repeats the same
+// failure — recv -> EAGAIN, again and again — so Darwin's errno does NOT move,
+// and a guest that cleared errno in between (`errno = 0; recv(...)`) reads 0
+// back. curl takes -1 with errno 0 as a broken connection: "Curl error 56:
+// Recv failure: Undefined error: 0". Walkabout Mini Golf's PlayFab sign-in
+// died on it, and the game sat out its offline wait in the loading screen
+// (on the headset, 2026-10-16: 563.2 and 567 slow, 371 signed in at once).
+// The same rule broke Flight Unlimited's Cesium tiles at random: curl reset
+// an HTTP/2 stream on a repeated EAGAIN it read as 0 (headset 2026-10-16).
+// A shim knows its host call failed, so it says so; `e` is errno as the host
+// call left it, taken before any trace output can change it. Every socket and
+// fd call below goes through here: send, recv and their to/from/msg forms,
+// connect, accept, read, write, readv and writev.
+void kl_errno_set(int darwin_errno);    // kl_libc.c
+static ssize_t kl_net_ret(ssize_t r, int e) {
+    if (r < 0) kl_errno_set(e);
+    return r;
+}
+
 // JNI_GetCreatedJavaVMs(vmBuf, bufLen, nVMs) — the JNI invocation API's "hand me
 // the JavaVM already running in this process". Meta's MR Utility Kit
 // (libmrutilitykitshared, pulled in by olar/UE5) calls it to reach the VM;
@@ -802,7 +975,7 @@ static int klb_JNI_GetCreatedJavaVMs(void **vmBuf, int bufLen, int *nVMs) {
 static int kl_connect(int fd, const struct sockaddr *sa, socklen_t len) {
     if (kl_net_offline()) {
         if (kl_net_trace()) fprintf(stderr, "  [net] connect() -> ENETUNREACH (offline)\n");
-        errno = ENETUNREACH;
+        kl_errno_set(ENETUNREACH);
         return -1;
     }
     char host[80] = "?";
@@ -820,32 +993,14 @@ static int kl_connect(int fd, const struct sockaddr *sa, socklen_t len) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     int r = connect(fd, sa, len);
-    int saved_errno = errno;
+    int e = errno;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (kl_net_trace())
         fprintf(stderr, "  [net] connect(%s) -> %d (%s) in %.2fs [fam=%d len=%d]\n", host, r,
-                r ? strerror(saved_errno) : "ok",
+                r ? strerror(errno) : "ok",
                 (double)(t1.tv_sec - t0.tv_sec) + 1e-9 * (double)(t1.tv_nsec - t0.tv_nsec),
                 sa ? ((const struct sockaddr_storage *)sa)->ss_family : -1, (int)len);
-    // A refused connect earns a line even without KL_TRACE_NET. The guest's own
-    // log says "Cannot connect to destination host" and names neither the peer
-    // nor the errno — and EPERM, ENETUNREACH and ECONNREFUSED are three
-    // different diagnoses (a policy denial, no network, nobody listening).
-    // Ancient Dungeon's Unity Authentication sign-in failed that way with only
-    // the Rust side's "Operation not permitted" to go on. The first few only; a
-    // retry storm would otherwise flood the log. EINPROGRESS is a non-blocking
-    // connect proceeding normally, not a failure.
-    else if (r != 0 && saved_errno != EINPROGRESS) {
-        static int said;
-        if (said < 8) {
-            said++;
-            fprintf(stderr, "  [net] connect(%s) -> %s [fam=%d]%s\n", host, strerror(saved_errno),
-                    sa ? ((const struct sockaddr_storage *)sa)->ss_family : -1,
-                    said == 8 ? " (further failures only with KL_TRACE_NET=1)" : "");
-        }
-    }
-    errno = saved_errno;
-    return r;
+    return (int)kl_net_ret(r, e);
 }
 // A guest binding a fixed port is normally alone on the device. Here it is not:
 // developing against a Steam host on the SAME Mac puts Steam's own UDP *:27036
@@ -1295,7 +1450,16 @@ static ssize_t kl_sendto(int fd, const void *buf, size_t n, int flags,
     }
     int nosig = 0, dflags = kl_msg_flags(flags, &nosig);
     if (nosig) kl_no_sigpipe(fd);
-    ssize_t r = sendto(fd, buf, n, dflags, sa, len);
+    // A Xash3D guest's rcon request to one of the player's own servers leaves with that server's admin
+    // password in place of the guest's placeholder (runtime/guest/kl_xashservers.c). Nothing else is touched.
+    extern size_t kl_xash_rcon_rewrite(const void *, size_t, const struct sockaddr *, char *, size_t);
+    char rcon[1400];
+    size_t rn = sa ? kl_xash_rcon_rewrite(buf, n, sa, rcon, sizeof rcon) : 0;
+    ssize_t r = sendto(fd, rn ? (const void *)rcon : buf, rn ? rn : n, dflags, sa, len);
+    if (rn && r == (ssize_t)rn) r = (ssize_t)n;      // the guest sent its n bytes
+    // ...and its query for servers also asks the player's own (same file).
+    extern void kl_xash_servers_on_query(int, const void *, size_t, const struct sockaddr *, socklen_t);
+    if (sa && !rn) { int e = errno; kl_xash_servers_on_query(fd, buf, n, sa, len); errno = e; }
     if (r < 0 && errno == EISCONN && sa)
         r = kl_sendto_connected(fd, buf, n, dflags, sa);
     // ...and again, one host at a time, where the platform may have dropped it.
@@ -1306,11 +1470,12 @@ static ssize_t kl_sendto(int fd, const void *buf, size_t n, int flags,
         errno = e;
         if (r < 0) r = (ssize_t)n;              // the datagram did go out
     }
+    int e = errno;
     if (kl_net_trace())
         fprintf(stderr, "  [net] sendto(fd=%d, %zu B, flags=0x%x->0x%x, %s) -> %zd%s\n",
-                fd, n, flags, dflags, host, r, r < 0 ? strerror(errno) : "");
+                fd, n, flags, dflags, host, r, r < 0 ? strerror(e) : "");
     kl_hexdump("->", buf, r);
-    return r;
+    return kl_net_ret(r, e);
 }
 // send/recv carry the same flag word and were forwarded raw. curl's every
 // write is send(..., MSG_NOSIGNAL) on Linux, which arrived here as Darwin's
@@ -1319,11 +1484,12 @@ static ssize_t kl_send(int fd, const void *buf, size_t n, int flags) {
     int nosig = 0, dflags = kl_msg_flags(flags, &nosig);
     if (nosig) kl_no_sigpipe(fd);
     ssize_t r = send(fd, buf, n, dflags);
+    int e = errno;
     if (kl_net_trace())
         fprintf(stderr, "  [net] send(fd=%d, %zu B, flags=0x%x->0x%x) -> %zd%s\n",
-                fd, n, flags, dflags, r, r < 0 ? strerror(errno) : "");
+                fd, n, flags, dflags, r, r < 0 ? strerror(e) : "");
     kl_hexdump("->", buf, r);
-    return r;
+    return kl_net_ret(r, e);
 }
 // ---------- KL_NET_RATE=<seconds>: what is actually arriving ----------
 // A streaming client cannot tell you from inside itself whether the picture is
@@ -1423,23 +1589,26 @@ static void kl_net_rx_boost(ssize_t r) {
 static ssize_t kl_recv(int fd, void *buf, size_t n, int flags) {
     int dflags = kl_msg_flags(flags, NULL);
     ssize_t r = recv(fd, buf, n, dflags);
+    int e = errno;
     kl_net_rate_note(fd, r);
     kl_net_rx_boost(r);
     if (kl_net_trace())
         fprintf(stderr, "  [net] recv(fd=%d, %zu B, flags=0x%x->0x%x) -> %zd%s\n",
-                fd, n, flags, dflags, r, r < 0 ? strerror(errno) : "");
+                fd, n, flags, dflags, r, r < 0 ? strerror(e) : "");
     kl_hexdump("<-", buf, r);
-    return r;
+    return kl_net_ret(r, e);
 }
 static int kl_accept(int fd, struct sockaddr *sa, socklen_t *len) {
     int r = accept(fd, sa, len);
+    int e = errno;
     if (r >= 0) kl_sa_to_guest(sa, len);
-    return r;
+    return (int)kl_net_ret(r, e);   // a non-blocking listener's EAGAIN
 }
 static ssize_t kl_recvfrom(int fd, void *buf, size_t n, int flags,
                            struct sockaddr *sa, socklen_t *len) {
     int dflags = kl_msg_flags(flags, NULL);
     ssize_t r = recvfrom(fd, buf, n, dflags, sa, len);
+    int e = errno;
     kl_net_rate_note(fd, r);
     kl_net_rx_boost(r);
     char host[80] = "-";
@@ -1449,9 +1618,9 @@ static ssize_t kl_recvfrom(int fd, void *buf, size_t n, int flags,
     }
     if (kl_net_trace())
         fprintf(stderr, "  [net] recvfrom(fd=%d, %zu B, flags=0x%x->0x%x) -> %zd from %s%s\n",
-                fd, n, flags, dflags, r, host, r < 0 ? strerror(errno) : "");
+                fd, n, flags, dflags, r, host, r < 0 ? strerror(e) : "");
     kl_hexdump("<-", buf, r);
-    return r;
+    return kl_net_ret(r, e);
 }
 
 // FORTIFY's recvfrom: __recvfrom_chk(fd, buf, len, __bos(buf), flags, sa, len).
@@ -1602,11 +1771,12 @@ static ssize_t kl_sendmsg(int fd, const void *gmsg, int flags) {
             for (int i = 0; i < (int)h.msg_iovlen; i++) r += (ssize_t)h.msg_iov[i].iov_len;
         }
     }
+    int e = errno;
     if (kl_net_trace())
         fprintf(stderr, "  [net] sendmsg(fd=%d, %d iov, %u B ctl, flags=0x%x->0x%x, %s) -> %zd%s\n",
                 fd, (int)h.msg_iovlen, (unsigned)h.msg_controllen, flags, dflags,
-                host, r, r < 0 ? strerror(errno) : "");
-    return r;
+                host, r, r < 0 ? strerror(e) : "");
+    return kl_net_ret(r, e);
 }
 static ssize_t kl_recvmsg(int fd, void *gmsg, int flags) {
     kl_lx_msghdr *g = gmsg;
@@ -1624,6 +1794,7 @@ static ssize_t kl_recvmsg(int fd, void *gmsg, int flags) {
                                        ? g->msg_controllen : sizeof cbuf);
     }
     ssize_t r = recvmsg(fd, &h, kl_msg_flags(flags, NULL));
+    int e = errno;
     kl_net_rate_note(fd, r);
     kl_net_rx_boost(r);
     char host[80] = "-";
@@ -1662,8 +1833,8 @@ static ssize_t kl_recvmsg(int fd, void *gmsg, int flags) {
     }
     if (kl_net_trace())
         fprintf(stderr, "  [net] recvmsg(fd=%d, flags=0x%x) -> %zd from %s%s\n",
-                fd, flags, r, host, r < 0 ? strerror(errno) : "");
-    return r;
+                fd, flags, r, host, r < 0 ? strerror(e) : "");
+    return kl_net_ret(r, e);
 }
 static int kl_getpeername(int fd, struct sockaddr *sa, socklen_t *len) {
     int r = getpeername(fd, sa, len);
@@ -1692,11 +1863,28 @@ static int kl_fd_is_regular(int fd) {
     return fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+// write, writev and readv: Darwin's own calls, with the failure published as for
+// read below — a full non-blocking pipe or socket fails EAGAIN again and again,
+// and a closed peer EPIPE.
+static ssize_t kl_shim_write(int fd, const void *buf, size_t n) {
+    ssize_t r = write(fd, buf, n);
+    return r < 0 ? kl_net_ret(r, errno) : r;
+}
+static ssize_t kl_shim_writev(int fd, const struct iovec *iov, int cnt) {
+    ssize_t r = writev(fd, iov, cnt);
+    return r < 0 ? kl_net_ret(r, errno) : r;
+}
+static ssize_t kl_shim_readv(int fd, const struct iovec *iov, int cnt) {
+    ssize_t r = readv(fd, iov, cnt);
+    return r < 0 ? kl_net_ret(r, errno) : r;
+}
+
 ssize_t kl_shim_read(int fd, void *buf, size_t n) {
     int handled; ssize_t vr = kl_obbmap_read(fd, buf, n, &handled);
     if (handled) return vr;   // OBB read-through fd — served from the archive
     ssize_t r = read(fd, buf, n);
-    if (r >= 0 && (size_t)r < n && r != 0 && kl_fd_is_regular(fd)) {
+    if (r < 0) return kl_net_ret(r, errno);  // a non-blocking pipe's EAGAIN, as for recv
+    if ((size_t)r < n && r != 0 && kl_fd_is_regular(fd)) {
         size_t done = (size_t)r;
         while (done < n) {
             ssize_t k = read(fd, (char *)buf + done, n - done);
@@ -1807,6 +1995,17 @@ static char *kl_strchr_chk(char *s, int ch, size_t dl) {
     kl_strlen_chk(s, dl);                  // proves the object is dl bytes
     return strchr(s, ch);
 }
+// bionic: __strlcat_chk(dst, src, supplied_size, compiler_size). strlcat itself
+// is on Darwin, so this is only the bounds half of the contract. Same shape for
+// strlcpy.
+static size_t kl_strlcat_chk(char *d, const char *s, size_t n, size_t dl) {
+    if (n > dl) die("__strlcat_chk overflow");
+    return strlcat(d, s, n);
+}
+static size_t kl_strlcpy_chk(char *d, const char *s, size_t n, size_t dl) {
+    if (n > dl) die("__strlcpy_chk overflow");
+    return strlcpy(d, s, n);
+}
 // bionic: __vsnprintf_chk(dest, supplied_size, flags, compiler_size, fmt, va).
 static int kl_vsnprintf_chk(char *d, size_t n, int flags, size_t dl,
                             const char *fmt, void *gva) {
@@ -1817,6 +2016,15 @@ static int kl_vsnprintf_chk(char *d, size_t n, int flags, size_t dl,
     return vsnprintf(d, n, fmt, (va_list)m);
 }
 static size_t kl_malloc_usable_size(const void *p) { return malloc_size(p); }
+// custom-types' GC crash diagnostics request Android allocator XML. Darwin's
+// allocator has no equivalent schema; fail explicitly without inventing a dump
+// or dereferencing the guest FILE. This does not disable the GC diagnostics.
+static int kl_malloc_info(int options, void *stream) {
+    (void)stream;
+    int error = options ? EINVAL : ENOTSUP;
+    errno = error; kl_errno_set(error);
+    return -1;
+}
 
 // jemalloc's extended allocation API. Android's system allocator IS jemalloc, so
 // guest libraries link these directly (Meta's MR Utility Kit — libmrutilitykit
@@ -1874,6 +2082,30 @@ static int kl_execv(const char *p, char *const argv[]) {
     errno = ENOSYS;
     return -1;
 }
+// bionic's `timezone` is a long VARIABLE (seconds west of UTC, standard
+// time). Darwin has only the BSD timezone() FUNCTION under that name, so the
+// variable is ours, filled once at load from the host's idea of standard
+// time (January: no DST). tzset is forwarded rather than wrapped, so a guest
+// that calls it and re-reads the variable still sees this value.
+static long kl_timezone_var;
+// `daylight` is its partner (HITMAN 3 VR: Reloaded imports it): nonzero when the
+// zone has summer time at all, read here as "July's offset differs from
+// January's" — the same question tzset answers on Linux.
+static int kl_daylight_var;
+__attribute__((constructor)) static void kl_init_timezone(void) {
+    tzset();
+    struct tm jan = {0};
+    jan.tm_year = 120; jan.tm_mon = 0; jan.tm_mday = 15;
+    time_t t = mktime(&jan);
+    struct tm lt;
+    if (t != (time_t)-1 && localtime_r(&t, &lt)) kl_timezone_var = -lt.tm_gmtoff;
+    struct tm jul = {0};
+    jul.tm_year = 120; jul.tm_mon = 6; jul.tm_mday = 15; jul.tm_isdst = -1;
+    time_t u = mktime(&jul);
+    struct tm lu;
+    if (t != (time_t)-1 && u != (time_t)-1 && localtime_r(&u, &lu))
+        kl_daylight_var = lu.tm_gmtoff != -kl_timezone_var;
+}
 
 // ---------- small bionic-isms ----------
 static void kl_set_abort_message(const char *m) { fprintf(stderr, "[guest abort] %s\n", m ? m : ""); }
@@ -1884,6 +2116,16 @@ static void kl_openlog(const char *a, int b, int c) { (void)a; (void)b; (void)c;
 static void kl_closelog(void) {}
 static int  kl_cxa_atexit(void (*f)(void *), void *a, void *d) { (void)f;(void)a;(void)d; return 0; }
 static void kl_cxa_finalize(void *d) { (void)d; }
+// liblog's "would this line be written?" (API 30). Every line the guest logs is
+// written here, so: yes, for anything at or above the level the caller names
+// as its default (ANDROID_LOG_DEFAULT = 1 falls back to INFO = 4, as liblog
+// does). Oboe 1.7.0 inside Mission: ISS's Meta XR Audio for Wwise asks before
+// its first stream warning; unresolved, that stopped the game.
+static int kl_android_log_is_loggable(int prio, const char *tag, int default_prio) {
+    (void)tag;
+    if (default_prio <= 1) default_prio = 4;
+    return prio >= default_prio;
+}
 static void kl_android_log_write(int p, const char *t, const char *m) {
     fprintf(stderr, "[%d/%s] %s\n", p, t ? t : "", m ? m : ""); }
 
@@ -1892,16 +2134,28 @@ static void kl_android_log_write(int p, const char *t, const char *m) {
 X(klv_printf) X(klv_fprintf) X(klv_sprintf) X(klv_snprintf) X(klv_asprintf)
 X(klv_dprintf) X(klv_syslog) X(klv_warnx) X(klv_android_log_print) X(klv_sscanf) X(klv_fscanf)
 X(klv_open) X(klv_fcntl) X(klv_ioctl) X(klv_strtold) X(klv_wcstold) X(klv_strtold_l)
-X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_read)
+X(klv_roundl) X(klb_pthread_gettid_np) X(klb_faccessat)
+X(klb_mincore) X(klb_mkdtemp) X(klb_mallopt)
+X(klb_pthread_barrier_init) X(klb_pthread_barrier_wait) X(klb_pthread_barrier_destroy)
+X(klb_fstatat) X(klb_rmdir) X(klb_remove) X(klb_chmod) X(klb_chown) X(klb_lchown)
+X(klb_truncate) X(klb_mkfifo) X(klb_readlink) X(klb_symlink) X(klb_link) X(klb_utimes)
+X(klb_utime) X(klb_unlinkat) X(klb_mkdirat) X(klb_fchmodat) X(klb_fchownat)
+X(klb_readlinkat) X(klb_renameat) X(klb_symlinkat) X(klb_utimensat) X(klb_freopen)
+X(klb_kill) X(klb_raise) X(klb_signal) X(klb_sigwait) X(klb_sigsuspend) X(klb_sigpending)
+X(klb_tgkill) X(klb_tkill)
+X(klb___fpclassifyd) X(klb_popen) X(klb_pclose)
+X(klb_statfs64) X(klb_execlp)
+X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_read) X(klb_sysprop_read_callback)
 X(klb_prctl) X(klb_sched_getaffinity) X(klb_sched_setaffinity)
 X(klb___sched_cpucount) X(klb___libc_current_sigrtmin) X(klb___libc_current_sigrtmax)
 X(klb_stat) X(klb_lstat) X(klb_fstat) X(klb_statfs) X(klb_uname) X(klb_sigaction)
-X(klb_opendir) X(klb_readdir) X(klb_closedir) X(klb_scandir) X(klb_alphasort)
+X(klb_opendir) X(klb_readdir) X(klb_closedir) X(klb_scandir) X(klb_alphasort) X(klb_nftw) X(klb_gethostbyname_r)
 X(klb_FD_ISSET_chk) X(klb_FD_SET_chk) X(klb_ctype_mb_cur_max) X(klb_lseek64)
 X(klb_close) X(klb_lseek) X(klb_pread)
-X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename)
+X(klb_sysconf) X(klb_fopen) X(klb_access) X(klb_mkdir) X(klb_unlink) X(klb_rename) X(klb_link)
 X(klh_android_log_print)
 X(klb_getpwuid) X(klb_getpwuid_r) X(klb_execl) X(klb_system) X(klb_syscall) X(klb_swprintf)
+X(klb_process_vm_readv)
 X(klb_vprintf) X(klb_vsscanf) X(klb_memrchr) X(klb_memalign)
 X(klb_getrandom) X(klb_isnan)
 X(klb_isnanf) X(klb_isinf) X(klb_isinff) X(klb_isfinite) X(klb_isfinitef)
@@ -1914,8 +2168,13 @@ X(klb_pthread_cond_broadcast) X(klb_pthread_cond_wait) X(klb_pthread_cond_timedw
 X(klb_pthread_condattr_init) X(klb_pthread_condattr_destroy) X(klb_pthread_condattr_setclock)
 X(klb_pthread_rwlock_init) X(klb_pthread_rwlock_destroy) X(klb_pthread_rwlock_rdlock)
 X(klb_pthread_rwlock_wrlock) X(klb_pthread_rwlock_unlock)
-X(klb_pthread_attr_init) X(klb_pthread_attr_destroy) X(klb_pthread_attr_setstacksize)
+X(klb_pthread_attr_init) X(klb_pthread_attr_destroy) X(klb_pthread_attr_setstacksize) X(klb_pthread_attr_getstacksize)
 X(klb_pthread_attr_setdetachstate) X(klb_pthread_attr_getstack) X(klb_pthread_getattr_np)
+X(klb_pthread_attr_setstack)
+X(klb_pthread_attr_setschedpolicy) X(klb_pthread_attr_setschedparam)
+X(klb_pthread_attr_getdetachstate) X(klb_pthread_attr_getinheritsched) X(klb_pthread_attr_getschedpolicy)
+X(klb_pthread_attr_getschedparam) X(klb_pthread_attr_getguardsize) X(klb_pthread_setschedprio)
+X(klb_pthread_rwlockattr_init) X(klb_pthread_rwlockattr_destroy)
 X(klb_pthread_key_create) X(klb_pthread_key_delete) X(klb_pthread_getspecific)
 X(klb_pthread_setspecific) X(klb_pthread_once)
 X(klb_pthread_create) X(klb_pthread_join) X(klb_pthread_detach) X(klb_pthread_exit)
@@ -1927,7 +2186,9 @@ X(klb_sem_timedwait) X(klb_sem_getvalue) X(klb_sem_trywait)
 X(klb_sem_open) X(klb_sem_close)
 X(klb_pthread_getschedparam) X(klb_pthread_setschedparam)
 X(klb_dlopen) X(klb_dlsym) X(klb_dlclose) X(klb_dlerror) X(klb_dladdr)
+X(klb_android_dlopen_ext)
 X(klb_clock_gettime) X(klb_clock_getres) X(klb_gettimeofday)
+X(klb_clock_nanosleep) X(klb___poll_chk)
 // kl_libc_slink.c — the surface Steam Link reaches for and Beat Saber does not.
 X(klb_getauxval)
 X(klb_fegetenv) X(klb_fesetenv) X(klb_feholdexcept) X(klb_feupdateenv)
@@ -1936,10 +2197,10 @@ X(klb_epoll_create) X(klb_epoll_create1) X(klb_epoll_ctl) X(klb_epoll_wait)
 X(klb_openat) X(klb___open_2)
 X(klb___memmove_chk) X(klb___strncpy_chk) X(klb___strncpy_chk2) X(klb___strcat_chk)
 X(klb___read_chk) X(klb___vsprintf_chk)
-X(klv___sprintf_chk) X(klv___snprintf_chk)
+X(klv___sprintf_chk) X(klv___snprintf_chk) X(klv_swprintf) X(kl_vswprintf_g)
 X(klb___pread64_chk) X(klb___pwrite64_chk) X(klb___strrchr_chk) X(klb_pread64) X(klb_pwrite64)
 X(klb___strncat_chk) X(klb_ftruncate64) X(klb___fwrite_chk)
-X(klb_fopen64) X(klb_fseeko64) X(klb_ftello64) X(klb_exit) X(klb__exit) X(klb_chdir) X(klb_getcwd) X(klb_realpath)
+X(klb_fopen64) X(klb_fseeko64) X(klb_ftello64) X(klb_exit) X(klb__exit) X(klb_creat) X(klb_chdir) X(klb_getcwd) X(klb_realpath)
 X(klb_sincosf) X(klb_sincos) X(klb_putchar) X(klb_getchar) X(klb_fdatasync)
 X(klb___cmsg_nxthdr) X(klb___cxa_thread_atexit_impl)
 X(klb_fileno) X(klb_fgetc) X(klb_ungetc) X(klb_getwc) X(klb_fgetwc)
@@ -1947,7 +2208,7 @@ X(klb_ungetwc) X(klb_fputwc) X(klb_putwc) X(klb_fwide)
 X(klb_pthread_rwlock_tryrdlock) X(klb_pthread_rwlock_trywrlock)
 X(klb___register_atfork) X(klb___gnu_strerror_r) X(klb___write_chk)
 // ...and what the 2D frontend (libshell + Qt6) adds on top of it.
-X(klb_eventfd) X(klb_eventfd_read) X(klb_eventfd_write) X(klb_ppoll)
+X(klb_eventfd) X(klb_eventfd_read) X(klb_eventfd_write) X(klb_ppoll) X(klb_timerfd_create) X(klb_timerfd_settime)
 X(klb_accept4) X(klb_pipe2) X(klb_dup2) X(klb_dup3) X(klb_memfd_create) X(klb_clone)
 X(klb_inotify_init) X(klb_inotify_init1)
 X(klb_inotify_add_watch) X(klb_inotify_rm_watch)
@@ -1982,18 +2243,213 @@ static int klb_timer_getoverrun(void *t) { (void)t; return 0; }
 // host's, it only checks its own prologue value against its own epilogue value.
 uintptr_t klb_stack_chk_guard = (uintptr_t)0x00000aff0a0000ULL;  // NUL/newline bytes trap overruns
 
+// ---------- free(), with Android's tolerance ----------
+//
+// A guest's free() is the host's free(), and the host's allocator is stricter
+// than the one the guest was written against. bionic's scudo keeps a freed
+// block in a QUARANTINE before reusing it, so a write that lands just after the
+// free — one thread still walking a buffer another thread has replaced — hits
+// memory nobody owns yet and nothing ever notices. Darwin's allocator checks a
+// free block when it hands it out again and stops the process:
+// "BUG IN CLIENT OF LIBMALLOC: memory corruption of free block", raised in
+// whichever host code allocates next (ANGLE, the Swift compositor, UIKit), which
+// is why the crash never names the guest.
+//
+// Doom3Quest does exactly this. Its renderer runs a front end and a back end on
+// two threads sharing idList<idImage*> queues: idImageManager::AddAllocList
+// appends under a critical section (and Append reallocates — new[], copy,
+// delete[] old), while GetNextAllocImage / GetNextPurgeImage remove WITHOUT it,
+// shifting elements down in a buffer the other thread may just have freed
+// (neo/renderer/Image_init.cpp, RenderSystem.cpp in the port's public source).
+// On device, 2026-10-06 and 2026-10-08: fourteen crash reports with that
+// message, all at the first frames of a level, each preceded by the back end's
+// "CAN NOT LOAD IMAGE FROM BIND" (its own AddAllocList calls).
+//
+// So a guest that asks for it gets the quarantine it was tested with: free()
+// parks the block and really frees the oldest ones once the park is over its
+// budget. The race is still the guest's — an entry can be lost exactly as on a
+// Quest — but the write lands in memory that is still allocated.
+//
+// KL_FREE_QUARANTINE_MB sets the budget (0 = plain free). OFF BY DEFAULT, for
+// every target, and for Doom3Quest in particular: it does stop that crash, and
+// on device it also broke the game's collision — invisible walls, a player who
+// could jump through ceilings, normal only while crouched (owner, 2026-10-08:
+// broken with the park, normal with KL_FREE_QUARANTINE_MB=0 on the same build,
+// still broken with the parked blocks zeroed). Why delaying reuse does that is
+// not known. What the default does instead for that guest is take the second
+// thread away (kl_gles3jni.c, r_multithread). The knob stays as an instrument.
+// Not a default to widen blindly either way: an IL2CPP guest stops its threads
+// by signal, and a thread stopped inside the lock below would hang the collector
+// (see kl_env.c for the same hazard).
+// Blocks over KLQ_MAX_BLOCK are freed at once: the park is for the small
+// buffers threads race over, not for a level's worth of image data.
+//
+// A parked block is zeroed, as Darwin's free() clears a small block it frees:
+// the park is meant to change WHEN a block becomes reusable and nothing else.
+#include <os/lock.h>
+extern const char *kl_driver_target_name(void);
+#define KLQ_SLOTS     (1u << 16)
+#define KLQ_MAX_BLOCK ((size_t)256 << 10)
+static void           *g_klq_ptr[KLQ_SLOTS];
+static uint32_t        g_klq_size[KLQ_SLOTS];
+static unsigned        g_klq_head, g_klq_n;
+static size_t          g_klq_bytes, g_klq_budget;
+static os_unfair_lock  g_klq_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic int     g_klq_on = -1;
+static uint64_t        g_klq_parked, g_klq_passed;
+
+static int klq_init(void) {
+    const char *t = kl_driver_target_name();
+    (void)t;
+    int mb = kl_env_int("KL_FREE_QUARANTINE_MB", 0);
+    if (mb < 0) mb = 0;
+    if (mb > 1024) mb = 1024;
+    g_klq_budget = (size_t)mb << 20;
+    if (mb)
+        fprintf(stderr, "  [libc] free() quarantine: %d MiB, blocks up to %zu KiB "
+                        "(KL_FREE_QUARANTINE_MB=0 for plain free)\n", mb, KLQ_MAX_BLOCK >> 10);
+    atomic_store(&g_klq_on, mb ? 1 : 0);
+    return mb ? 1 : 0;
+}
+
+static void klb_free(void *p) {
+    if (!p) return;
+    int on = atomic_load(&g_klq_on);
+    if (on < 0) on = klq_init();
+    size_t sz = on ? malloc_size(p) : 0;
+    if (!on || sz == 0 || sz > KLQ_MAX_BLOCK) {
+        if (on) g_klq_passed++;
+        free(p);
+        return;
+    }
+    memset(p, 0, sz);       // what free() would have done to it — see above
+    for (;;) {
+        void *out[16];
+        int nout = 0, parked = 0;
+        os_unfair_lock_lock(&g_klq_lock);
+        if (p && g_klq_n < KLQ_SLOTS) {
+            unsigned at = (g_klq_head + g_klq_n) % KLQ_SLOTS;
+            g_klq_ptr[at] = p;
+            g_klq_size[at] = (uint32_t)sz;
+            g_klq_n++;
+            g_klq_bytes += sz;
+            g_klq_parked++;
+            parked = 1;
+        }
+        while (nout < 16 && g_klq_n &&
+               (g_klq_bytes > g_klq_budget || g_klq_n == KLQ_SLOTS)) {
+            out[nout++] = g_klq_ptr[g_klq_head];
+            g_klq_bytes -= g_klq_size[g_klq_head];
+            g_klq_head = (g_klq_head + 1) % KLQ_SLOTS;
+            g_klq_n--;
+        }
+        int more = g_klq_n && g_klq_bytes > g_klq_budget;
+        os_unfair_lock_unlock(&g_klq_lock);
+        if (parked) p = NULL;
+        // Outside the lock: the host's free takes locks of its own.
+        for (int i = 0; i < nout; i++) free(out[i]);
+        if (!p && !more) return;
+    }
+}
+
+void kl_libc_free_report(FILE *f) {
+    if (atomic_load(&g_klq_on) <= 0) return;
+    fprintf(f, "  free() quarantine: %llu block(s) parked, %llu passed straight through; "
+               "holding %u block(s), %zu KiB\n",
+            (unsigned long long)g_klq_parked, (unsigned long long)g_klq_passed,
+            g_klq_n, g_klq_bytes >> 10);
+}
+
 // ---------- table ----------
 typedef struct { const char *name; void *fn; } kl_entry;
+// bionic's FORTIFY fread: the caller's buffer size rides along, and a read that
+// could overrun it is a fatal check, as in bionic, rather than a quiet overflow.
+static size_t kl_fread_chk(void *p, size_t cap, size_t a, size_t b, void *f) {
+    if (a && b > cap / a) {
+        fprintf(stderr, "[klepton] fatal: __fread_chk: %zu x %zu bytes into a %zu-byte buffer\n", a, b, cap);
+        abort();
+    }
+    return kl_fread(p, a, b, f);
+}
 #define E(n, f)   { n, (void *)(f) }
 #define KL_FWD(n) { #n, (void *)(n) },
 
+// sched_setscheduler: bionic has it, Darwin does not (sched_setaffinity, the
+// sibling libvrlink_scene also calls, is already stubbed in kl_libc.c). Steam
+// Link asks for real-time scheduling on its streaming threads; visionOS owns
+// scheduling and exposes no equivalent, so this is advisory and reports success
+// without applying anything — the same shape as the perf-settings no-op. Was an
+// unresolved-import abort in the stream-setup phase.
+static int klb_sched_setscheduler(int pid, int policy, const void *param) {
+    (void)param;
+    // SCHED_FIFO(1)/SCHED_RR(2) is a real-time request; SCHED_OTHER(0) and the
+    // rest are "normal" and need nothing. visionOS has no RT policy, but it has
+    // QoS: map an RT request to USER_INTERACTIVE for that thread, through the
+    // same door the XR thread hint and Process.setThreadPriority(AUDIO) use.
+    // Steam Link's UDP-receive / decode / submit and audio threads flag
+    // THEMSELVES here; left a pure no-op their default QoS is coalesced behind
+    // the compositor, which reads to the sender as jitter (shaky view, pose and
+    // input timing) and drops audio buffers. pid 0 or our own tid is the self
+    // case; another tid goes through the live-thread registry.
+    if (policy == 1 || policy == 2) {
+        uint64_t self_tid = 0; pthread_threadid_np(NULL, &self_tid);
+        kl_pthread_boost_qos((pid == 0 || pid == (int)self_tid) ? self_tid
+                                                                : (uint32_t)pid);
+    }
+    return 0;
+}
+
+// pthread_attr_setinheritsched: whether a new thread takes its scheduling from
+// the attr or from the thread that creates it. Marvel's Deadpool VR (UE4) sets it
+// on every thread it starts, and with no answer the game aborted in
+// GameActivity.onCreate — "called unresolved import" — before its first frame
+// (2026-10-09). The policy and priority in a guest attr are not applied here at
+// all: thread creation reads the stack size and the detach state out of it and
+// visionOS owns scheduling, so both values lead to the same thread. Accepted for
+// bionic's two values (0 explicit, 1 inherit), EINVAL otherwise, as bionic does.
+static int klb_pthread_attr_setinheritsched(void *attr, int inherit) {
+    (void)attr;
+    return (inherit == 0 || inherit == 1) ? 0 : EINVAL;
+}
+
+// sched_getscheduler: the getter of the pair above. No thread here is ever given
+// a real-time policy (a request for one becomes a QoS boost, see
+// klb_sched_setscheduler), so SCHED_OTHER (0) is what every thread has.
+static int klb_sched_getscheduler(int pid) { (void)pid; return 0; }
+// sched_getparam: bionic's struct sched_param is ONE int; Darwin's carries
+// four more opaque bytes, so forwarding would write past the guest's struct.
+// Same answer as the getter above: priority 0 under SCHED_OTHER.
+static int klb_sched_getparam(int pid, int *param) { (void)pid; if (param) *param = 0; return 0; }
+// sched_getcpu: no Darwin equivalent; CPU 0 is a valid answer for "where am I".
+static int klb_sched_getcpu(void) { return 0; }
+
+// putenv: same contract on bionic and Darwin — the "NAME=value" string itself
+// becomes part of the environment, no copy — and the guest's `environ` is the
+// process's own (E("environ") below), so this is the forward the generated
+// table would hold beside getenv/setenv/unsetenv. It is here by hand because no
+// tree that table was generated from imports it. Wooorld's
+// libVuplexWebViewAndroid does, on the first frame after Unity loads its
+// plugins, and with no answer the game stopped there: "called unresolved
+// import 'putenv'" (2026-10-11). The first few are logged, because a guest
+// that sets TZ or a locale this way changes what the rest of the process reads.
+static int klb_putenv(char *s) {
+    static atomic_int said;
+    if (atomic_fetch_add(&said, 1) < 4)
+        fprintf(stderr, "  [klepton] guest putenv(\"%.80s\")\n", s ? s : "(null)");
+    return putenv(s);
+}
+
 static const kl_entry g_shim[] = {
 #include "kl_libc_table.h"
+
+    // Released ZIP support also needs zlib's C error-string function.
+    E("zError", zError),
 
     // stdio needing guest-FILE translation
     E("__sF", g_sF),
     E("fputc", kl_fputc), E("fputs", kl_fputs), E("fwrite", kl_fwrite), E("fread", kl_fread),
     E("fclose", kl_fclose), E("fflush", kl_fflush), E("fgets", kl_fgets), E("getc", kl_getc_),
+    E("fgets_unlocked", kl_fgets_unlocked),
     E("feof", kl_feof), E("ferror", kl_ferror), E("clearerr", kl_clearerr),
     E("fseek", kl_fseek), E("fseeko", kl_fseeko), E("ftell", kl_ftell), E("ftello", kl_ftello),
     E("setvbuf", kl_setvbuf),
@@ -2010,9 +2466,11 @@ static const kl_entry g_shim[] = {
     E("open", klv_open), E("fcntl", klv_fcntl), E("ioctl", klv_ioctl),
     E("setsockopt", kl_setsockopt), E("getsockopt", kl_getsockopt),
     E("read", kl_shim_read), E("usleep", kl_usleep),
+    E("write", kl_shim_write), E("writev", kl_shim_writev), E("readv", kl_shim_readv),
     E("close", klb_close), E("lseek", klb_lseek), E("pread", klb_pread),
     E("getaddrinfo", kl_getaddrinfo), E("connect", kl_connect),
     E("socket", kl_socket),
+    E("inet_pton", kl_inet_pton), E("inet_ntop", kl_inet_ntop),
     E("bind", kl_bind), E("sendto", kl_sendto), E("accept", kl_accept),
     E("getifaddrs", klb_getifaddrs), E("freeifaddrs", klb_freeifaddrs),
     E("recvfrom", kl_recvfrom), E("__recvfrom_chk", kl___recvfrom_chk),
@@ -2021,8 +2479,9 @@ static const kl_entry g_shim[] = {
     E("send", kl_send), E("recv", kl_recv),
     E("getsockname", kl_getsockname),
     E("strtold", klv_strtold), E("wcstold", klv_wcstold), E("strtold_l", klv_strtold_l),
-    E("swprintf", klb_swprintf), E("execl", klb_execl), E("system", klb_system),
+    E("swprintf", klv_swprintf), E("vswprintf", kl_vswprintf_g), E("execl", klb_execl), E("system", klb_system),
     E("syscall", klb_syscall),
+    E("process_vm_readv", klb_process_vm_readv),
 
     // guest va_list consumers
     E("vfprintf", kl_vfprintf), E("vsnprintf", kl_vsnprintf), E("vasprintf", kl_vasprintf),
@@ -2051,18 +2510,24 @@ static const kl_entry g_shim[] = {
     E("sysconf", klb_sysconf),
     E("fopen", klb_fopen), E("access", klb_access),
     E("mkdir", klb_mkdir), E("unlink", klb_unlink), E("rename", klb_rename),
+    E("link", klb_link),
     E("opendir", klb_opendir), E("readdir", klb_readdir), E("closedir", klb_closedir),
-    E("scandir", klb_scandir), E("alphasort", klb_alphasort),
+    E("scandir", klb_scandir), E("alphasort", klb_alphasort), E("nftw", klb_nftw), E("gethostbyname_r", klb_gethostbyname_r),
     E("lseek64", klb_lseek64), E("__ctype_get_mb_cur_max", klb_ctype_mb_cur_max),
     E("getpwuid", klb_getpwuid), E("getpwuid_r", klb_getpwuid_r),
     E("prctl", klb_prctl),
     E("memrchr", klb_memrchr), E("memalign", klb_memalign),
+    // Not a plain forward: see klb_free.
+    E("free", klb_free),
     // Beat Saber 1.40: getrandom is Linux-only and getentropy is NOT a drop-in
     // (no flags, 256-byte cap, 0/-1 rather than a count); isnan is a macro on
     // Darwin, so there is no symbol to forward. Both in kl_libc.c.
     E("getrandom", klb_getrandom), E("isnan", klb_isnan),
     E("__isnan", klb_isnan), E("__isnanf", klb_isnanf), E("__isinf", klb_isinf),
     E("__isinff", klb_isinff), E("__isfinite", klb_isfinite), E("__isfinitef", klb_isfinitef),
+    // Android arm64 off_t is already 64-bit. Space Atlas VR's avatar SDK
+    // imports mmap64; keep Linux flag translation and the executable-map guard.
+    E("mmap64", klb_mmap),
     E("mmap", klb_mmap), E("mprotect", klb_mprotect), E("madvise", klb_madvise),
     E("sbrk", klb_sbrk),
     // Linux-only, and the third door onto the memory budget — UE4 asks here
@@ -2073,6 +2538,7 @@ static const kl_entry g_shim[] = {
     E("__system_property_find", klb_sysprop_find),
     E("__system_property_get", klb_sysprop_get),
     E("__system_property_read", klb_sysprop_read),
+    E("__system_property_read_callback", klb_sysprop_read_callback),
 
     // The clocks are hand-written (kl_libc.c) and must stay that way: the
     // Choreographer, System.nanoTime and the engine's frame delta all have to
@@ -2122,6 +2588,10 @@ static const kl_entry g_shim[] = {
     // called, because a guest that exits during startup leaves a log with
     // nothing in it and a driver that can only report "no signal".
     E("exit", klb_exit), E("_exit", klb__exit),
+    // CSVR 1.0.5 (Counter-Strike VR): what its SDL2 and its server library import
+    // beyond the above. Wide strings are 32-bit on both sides, so they forward.
+    E("_Exit", klb__exit), E("creat", klb_creat),
+    E("wcslcat", wcslcat), E("wcslcpy", wcslcpy), E("wcsncasecmp", wcsncasecmp), E("wcsstr", wcsstr),
     // ...and the fifth path door, which decides where an id Tech 3 guest
     // thinks its whole installation is.
     E("chdir", klb_chdir),
@@ -2149,6 +2619,7 @@ static const kl_entry g_shim[] = {
     // fallback for. None is a silent success.
     E("eventfd", klb_eventfd),
     E("eventfd_read", klb_eventfd_read), E("eventfd_write", klb_eventfd_write),
+    E("timerfd_create", klb_timerfd_create), E("timerfd_settime", klb_timerfd_settime),
     E("ppoll", klb_ppoll),
     E("accept4", klb_accept4), E("pipe2", klb_pipe2), E("dup3", klb_dup3),
     E("dup2", klb_dup2),
@@ -2207,9 +2678,14 @@ static const kl_entry g_shim[] = {
     E("pthread_rwlock_unlock", klb_pthread_rwlock_unlock),
     E("pthread_attr_init", klb_pthread_attr_init),
     E("pthread_attr_destroy", klb_pthread_attr_destroy),
+    E("pthread_attr_setschedpolicy", klb_pthread_attr_setschedpolicy),
+    E("pthread_attr_setschedparam", klb_pthread_attr_setschedparam),
     E("pthread_attr_setstacksize", klb_pthread_attr_setstacksize),
+    E("pthread_attr_getstacksize", klb_pthread_attr_getstacksize),
     E("pthread_attr_setdetachstate", klb_pthread_attr_setdetachstate),
+    E("pthread_attr_setinheritsched", klb_pthread_attr_setinheritsched),
     E("pthread_attr_getstack", klb_pthread_attr_getstack),
+    E("pthread_attr_setstack", klb_pthread_attr_setstack),
     E("pthread_getattr_np", klb_pthread_getattr_np),
     E("pthread_key_create", klb_pthread_key_create),
     E("pthread_key_delete", klb_pthread_key_delete),
@@ -2222,6 +2698,17 @@ static const kl_entry g_shim[] = {
     E("pthread_kill", klb_pthread_kill), E("pthread_sigmask", klb_pthread_sigmask),
     E("sigprocmask", klb_sigprocmask),
     E("pthread_setname_np", klb_pthread_setname_np), E("pthread_atfork", klb_pthread_atfork),
+    // pthread_getname_np: same (pthread_t, char*, size_t) on Darwin and bionic
+    // (unlike the SETTER above), so a direct forward. sched_* below are stubs:
+    // Darwin lacks them and visionOS owns scheduling.
+    E("pthread_getname_np", pthread_getname_np),
+    E("sched_setscheduler", klb_sched_setscheduler),
+    E("sched_getscheduler", klb_sched_getscheduler),
+    // Deadpool VR's other imports with a plain answer. fesetround: the rounding
+    // modes are FPCR bits and have the same values on both sides, so a direct
+    // forward. mkdtemp: forwarded like mkstemp next to it in the table.
+    E("clock_nanosleep", klb_clock_nanosleep), E("__poll_chk", klb___poll_chk),
+    E("fesetround", fesetround),   // mkdtemp: with the path family below
     E("sem_init", klb_sem_init), E("sem_destroy", klb_sem_destroy),
     E("sem_post", klb_sem_post), E("sem_wait", klb_sem_wait),
     E("sem_timedwait", klb_sem_timedwait), E("sem_getvalue", klb_sem_getvalue),
@@ -2233,10 +2720,12 @@ static const kl_entry g_shim[] = {
     // dl
     E("dlopen", klb_dlopen), E("dlsym", klb_dlsym), E("dlclose", klb_dlclose),
     E("dlerror", klb_dlerror), E("dladdr", klb_dladdr),
+    E("android_dlopen_ext", klb_android_dlopen_ext),
     E("dl_iterate_phdr", kl_dl_iterate_phdr),
 
     // logging / misc
     E("__android_log_write", kl_android_log_write),
+    E("__android_log_is_loggable", kl_android_log_is_loggable),
     // __android_log_vprint(prio, tag, fmt, va_list) — NOT vfprintf's shape. It
     // was bound to kl_vfprintf once, which put `prio` in the FILE* slot and
     // segfaulted in flockfile the first time Unity logged through it. The
@@ -2248,15 +2737,85 @@ static const kl_entry g_shim[] = {
     E("openlog", kl_openlog), E("closelog", kl_closelog),
     E("__cxa_atexit", kl_cxa_atexit), E("__cxa_finalize", kl_cxa_finalize),
 
+    // Tea For God (x6323807174332876): wide-string helpers it imports. wchar_t
+    // is 32-bit on both sides, so these forward unchanged.
+    E("wcscasecmp", wcscasecmp), E("wctomb", wctomb),
+    E("sched_getparam", klb_sched_getparam), E("sched_getcpu", klb_sched_getcpu),
+    E("putenv", klb_putenv),
+    // asctime_r: the Epic Online Services SDK that Roboquest VR ships imports it
+    // (x3151760, 2026-10-22; the same library in x9269393463181825). struct tm
+    // is laid out the same on both sides — localtime_r and ctime_r are direct
+    // forwards here — so this is one too.
+    E("asctime_r", asctime_r),
+    // zlib's one-shot compress(): Robo Recall: Unplugged (x1906871599408213,
+    // UE 4.21) imports it beside compress2 and compressBound, which the
+    // generated table already forwards — it was in no tree that table was
+    // generated from. Same zlib on both sides, so a plain forward (2026-10-14).
+    E("compress", compress),
+    E("quick_exit", klb__exit),
+
     // Steam Link (SDL3) additions — plain forwards plus the small wrappers above
     E("getentropy", getentropy), E("tzset", tzset), E("strncasecmp", strncasecmp),
-    E("malloc_usable_size", kl_malloc_usable_size), E("execv", kl_execv),
+    E("malloc_usable_size", kl_malloc_usable_size), E("malloc_info", kl_malloc_info), E("execv", kl_execv),
     E("mallocx", kl_mallocx),
     E("rallocx", kl_rallocx), E("sallocx", kl_sallocx), E("dallocx", kl_dallocx),
     E("sdallocx", kl_sdallocx), E("nallocx", kl_nallocx), E("xallocx", kl_xallocx),
     E("mallctl", kl_mallctl), E("mallctlnametomib", kl_mallctlnametomib),
     E("mallctlbymib", kl_mallctlbymib),
     E("MallocExtension_Internal_GetNumericProperty", kl_MallocExtension_GetNumericProperty),
+
+    // ---- libc and pthread surface that cannot ride the generated table ----
+    // Barriers are a real implementation (kl_pthread.c): Darwin has no
+    // pthread_barrier_t to forward to. QuakeQuest parks renderer workers on one.
+    E("pthread_barrier_init", klb_pthread_barrier_init),
+    E("pthread_barrier_wait", klb_pthread_barrier_wait),
+    E("pthread_barrier_destroy", klb_pthread_barrier_destroy),
+    E("pthread_gettid_np", klb_pthread_gettid_np),
+    // The rest of the path family: translated through kl_guest_path, the Linux
+    // AT_* numbering mapped, and failures published to the guest errno slot
+    // (kl_libc.c, "the rest of the path family"). fstatat also translates the
+    // struct it writes, which a forward wrote in Darwin's layout.
+    E("fstatat", klb_fstatat), E("fstatat64", klb_fstatat),
+    E("faccessat", klb_faccessat), E("mkdtemp", klb_mkdtemp),
+    E("rmdir", klb_rmdir), E("remove", klb_remove),
+    E("chmod", klb_chmod), E("chown", klb_chown), E("lchown", klb_lchown),
+    E("truncate", klb_truncate), E("mkfifo", klb_mkfifo),
+    E("readlink", klb_readlink), E("symlink", klb_symlink),   // link: with the first batch above
+    E("utimes", klb_utimes), E("utime", klb_utime),
+    E("unlinkat", klb_unlinkat), E("mkdirat", klb_mkdirat),
+    E("fchmodat", klb_fchmodat), E("fchownat", klb_fchownat),
+    E("readlinkat", klb_readlinkat), E("renameat", klb_renameat),
+    E("symlinkat", klb_symlinkat), E("utimensat", klb_utimensat),
+    E("freopen", klb_freopen),
+    // Signal numbers: the SIGUSR2/SIGSYS swap — see kl_sig_to_darwin.
+    E("kill", klb_kill), E("raise", klb_raise), E("signal", klb_signal),
+    E("tgkill", klb_tgkill), E("tkill", klb_tkill),
+    E("sigwait", klb_sigwait), E("sigsuspend", klb_sigsuspend),
+    E("sigpending", klb_sigpending),
+    // Layout or numbering mismatches the compiler cannot see: bionic's FP_*
+    // numbering, popen("getprop ...") answered
+    // without a subprocess, statfs64 (= statfs on LP64), execlp (refused).
+    E("__fpclassifyd", klb___fpclassifyd),
+    E("popen", klb_popen), E("pclose", klb_pclose),
+    E("statfs64", klb_statfs64), E("execlp", klb_execlp),
+    E("mincore", klb_mincore), E("mallopt", klb_mallopt),
+    E("roundl", klv_roundl),
+    // FORTIFY forms and a DATA symbol.
+    E("__strlcat_chk", kl_strlcat_chk), E("__strlcpy_chk", kl_strlcpy_chk),
+    E("timezone", &kl_timezone_var), E("daylight", &kl_daylight_var),
+    // HITMAN 3 VR: Reloaded (2026-10-20): the attr getters and setschedprio
+    // (kl_pthread.c), the FORTIFY fread, and two host functions whose ABI is
+    // the same on both sides.
+    E("pthread_attr_getdetachstate", klb_pthread_attr_getdetachstate),
+    E("pthread_attr_getinheritsched", klb_pthread_attr_getinheritsched),
+    E("pthread_attr_getschedpolicy", klb_pthread_attr_getschedpolicy),
+    E("pthread_attr_getschedparam", klb_pthread_attr_getschedparam),
+    E("pthread_attr_getguardsize", klb_pthread_attr_getguardsize),
+    E("pthread_setschedprio", klb_pthread_setschedprio),
+    E("pthread_rwlockattr_init", klb_pthread_rwlockattr_init),
+    E("pthread_rwlockattr_destroy", klb_pthread_rwlockattr_destroy),
+    E("__fread_chk", kl_fread_chk),
+    E("nextafterf", nextafterf), E("inflateValidate", inflateValidate),
 
     E("__klepton_unresolved", kl_unresolved),
 };
@@ -2276,6 +2835,15 @@ void kl_shim_set_guest_gl(kl_image *img) { g_guest_gl = img; }
 
 void *kl_shim_lookup(const char *name) {
     if (kl_shim_override) { void *o = kl_shim_override(name); if (o) return o; }
+    // Added for the Beat Saber mod port. Without the mods these stay
+    // unresolved, as before, until they are tested across the library.
+    if (!kl_extension_active() &&
+        (!strcmp(name, "process_vm_readv") || !strcmp(name, "malloc_info") ||
+         !strcmp(name, "zError") || !strncmp(name, "AChoreographer_", 15)))
+        return NULL;
+    // The optional extension owns its small, explicit guest export surface.
+    void *extension = kl_extension_symbol(name);
+    if (extension) return extension;
     for (size_t i = 0; i < sizeof g_shim / sizeof g_shim[0]; i++)
         if (strcmp(g_shim[i].name, name) == 0) return g_shim[i].fn;
     // Tier 4: the NDK surface lives in its own table — it is a different
@@ -2407,8 +2975,45 @@ void *kl_shim_lookup(const char *name) {
     //
     // `ovrp_` is OVRPlugin's prefix and a different library (kl_ovrp), so the
     // fourth character is checked: `ovr_` and `ovrID` are the platform's, and
-    // `ovrp_` must not be claimed here.
-    if (!strncmp(name, "ovr_", 4) || !strncmp(name, "ovrID", 5))
+    // `ovrp_` is not claimed by this tier.
+    // ...and so are the SDK's enum helpers, which are spelled without the
+    // underscore (ovrMessageType_ToString, ovrLeaderboardFilterType_FromString):
+    // `ovr` followed by a capital – which covers `ovrID` as well. Maestro calls
+    // the first to log a failed request, and as an unresolved import that was
+    // the end of the run.
+    if (!strncmp(name, "ovr_", 4) ||
+        (!strncmp(name, "ovr", 3) && name[3] >= 'A' && name[3] <= 'Z'))
         return kl_ovrplat_sym(name);
+
+    // Tier 12: OVRPlugin as an ELF import. Newer Unreal dlopens libOVRPlugin.so
+    // and dlsyms it (kl_dl.c -> kl_ovrp_sym), but older Unreal (the gnustl era:
+    // Tales from the Galaxy's Edge, fix 16, 2026-10-11) has libOVRPlugin in
+    // libUE4's DT_NEEDED and binds its ovrp_* calls at RELOCATION time, so
+    // without this tier they were all unresolved and the first one
+    // (ovrp_PreInitialize3) aborted. Same answers dlsym gives.
+    //
+    // For Unreal guests only. kl_ovrp_sym answers a name it does not know with
+    // a stub that stops the run when CALLED, and this lookup also serves weak
+    // imports and dlsym(RTLD_DEFAULT): a guest that probes for an ovrp_ entry
+    // and would have taken "not there" for an answer gets that stub instead.
+    // Unity guests reach OVRPlugin by dlsym and were brought up without this.
+    if (!strncmp(name, "ovrp_", 5)) {
+        extern kl_guest_kind kl_driver_kind(void);
+        if (kl_driver_kind() == KL_GUEST_UE4) return kl_ovrp_sym(name);
+    }
+
+    // Tier 13: the Steamworks API as an ELF import. Steam's Android build of an
+    // Unreal game (Moss from depot 846472, for Steam Frame) has libsteam_api.so
+    // in libUE4's DT_NEEDED and imports fourteen Steam* functions; the library
+    // is replaced like the ones above (kl_steamapi.h), so without this tier the
+    // first one called, SteamAPI_RestartAppIfNecessary, ended the run as an
+    // unresolved import. Unity reaches the same stand-in by dlsym.
+    //
+    // For Unreal guests only, and only the names kl_steamapi_lookup lists: one
+    // it does not know stays unresolved and stops by name when called.
+    if (!strncmp(name, "Steam", 5)) {
+        extern kl_guest_kind kl_driver_kind(void);
+        if (kl_driver_kind() == KL_GUEST_UE4) return kl_steamapi_lookup(name);
+    }
     return NULL;
 }

@@ -1,0 +1,48 @@
+if (NOT DEFINED CMAKE_ANDROID_NDK)
+	if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ndkpath.txt")
+		file (STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/ndkpath.txt" CMAKE_ANDROID_NDK)
+	else()
+		if(EXISTS $ENV{ANDROID_NDK_HOME})
+			set(CMAKE_ANDROID_NDK $ENV{ANDROID_NDK_HOME})
+		elseif(EXISTS $ENV{ANDROID_NDK_LATEST_HOME})
+			set(CMAKE_ANDROID_NDK $ENV{ANDROID_NDK_LATEST_HOME})
+		endif()
+	endif()
+endif()
+if (NOT DEFINED CMAKE_ANDROID_NDK)
+	message(Big time error buddy, no NDK)
+endif()
+
+string(REPLACE "\\" "/" CMAKE_ANDROID_NDK ${CMAKE_ANDROID_NDK})
+message(STATUS "Using NDK ${CMAKE_ANDROID_NDK}")
+
+set(ANDROID_PLATFORM 24)
+set(ANDROID_ABI arm64-v8a)
+set(ANDROID_STL c++_static)
+set(ANDROID_USE_LEGACY_TOOLCHAIN_FILE OFF)
+
+set(CMAKE_TOOLCHAIN_FILE ${CMAKE_ANDROID_NDK}/build/cmake/android.toolchain.cmake)
+
+# read in information about the mod from qpm.json
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/qpm.shared.json PACKAGE_JSON)
+
+string(JSON PACKAGE_CONFIG GET ${PACKAGE_JSON} config)
+string(JSON PACKAGE_INFO GET ${PACKAGE_CONFIG} info)
+
+string(JSON PACKAGE_NAME GET ${PACKAGE_INFO} name)
+string(JSON PACKAGE_ID GET ${PACKAGE_INFO} id)
+string(JSON PACKAGE_VERSION GET ${PACKAGE_INFO} version)
+
+message(STATUS "PACKAGE NAME: ${PACKAGE_NAME}")
+message(STATUS "PACKAGE VERSION: ${PACKAGE_VERSION}")
+
+string(JSON EXTERN_DIR_NAME GET ${PACKAGE_CONFIG} dependenciesDir)
+string(JSON SHARED_DIR_NAME GET ${PACKAGE_CONFIG} sharedDir)
+
+set(EXTERN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/${EXTERN_DIR_NAME})
+set(SHARED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/${SHARED_DIR_NAME})
+
+macro(find_qpm_package NAME)
+    set(${NAME}_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/cmake")
+    find_package(${NAME} REQUIRED)
+endmacro()

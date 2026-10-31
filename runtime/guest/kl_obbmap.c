@@ -30,6 +30,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include "kl_obbmap.h"
+#include "kl_extension.h"
 #include <zlib.h>
 #include "kl_env.h"
 
@@ -60,7 +61,28 @@ static unsigned   g_n, g_cap;
 // The banks live in the OBB (zix: assets/Audio/GeneratedSoundBanks/Android/*.bnk
 // + Media/*.wem; vampire: Content/.../FMOD/Banks/Mobile/*.bank), all STORED, so
 // they serve through the same virtual-fd window as the loose paks.
-typedef struct { char base[128]; char obb[1024]; uint64_t lhdr, size; uint16_t method; } obb_bank;
+//
+// By basename — and, where several archives carry a file of the same name, by
+// the FOLDER it sits in. Batman: Arkham Shadow ships its voice-over as one
+// archive per language, each with the same bank names under a folder named
+// after the language (assets/Android/de-DE/VO_GameOver.bnk, …/en-US/…), and
+// Wwise asks for a localised bank under that folder name. Served by basename
+// alone, every such request got the file of whichever archive had been read
+// first: with German chosen in the game and both packs on the device, the
+// English banks came back, and with them the English lines (seen in a device
+// log, 2026-10-11: the 19.9 MB English VO_GameOver.bnk where the German one is
+// 21.9 MB). `dir` is that folder's name.
+//
+// One folder name is not always enough. Mission: ISS ships every Wwise media
+// file twice in ONE archive: .../Android/<id>.wem from an older export and
+// .../Android/Media/<id>.wem, which the game's Wwise 2024 asks for (it carries
+// the `hash` chunk; the old copy has `JUNK` there). For the voice lines both
+// copies sit in a folder named English(US) (Android/English(US) and
+// Android/Media/English(US)), so the one-name match served the old copy, and
+// Mission Control never spoke — music, asked for under "Media", was right.
+// `dir2` is the last two folder names; a request whose two match one file's
+// gets that file before a one-name match is considered.
+typedef struct { char base[128]; char dir[48]; char dir2[96]; char obb[1024]; uint64_t lhdr, size; uint16_t method; } obb_bank;
 static obb_bank *g_bank;
 static unsigned  g_bankn, g_bankcap;
 
@@ -73,6 +95,33 @@ static int name_is_bank(const char *base) {
     }
     return 0;
 }
+// The name of the folder a file sits in: "de-DE" for ".../Android/de-DE/x.bnk",
+// "" for a bare name.
+static void parent_name(const char *path, const char *base, char *out, size_t cap) {
+    out[0] = 0;
+    if (base <= path) return;
+    const char *end = base - 1;                       // the '/' before the basename
+    const char *start = end;
+    while (start > path && start[-1] != '/') start--;
+    size_t n = (size_t)(end - start);
+    if (n == 0 || n >= cap) return;
+    memcpy(out, start, n); out[n] = 0;
+}
+// The last two folder names: "Media/English(US)" for
+// ".../Android/Media/English(US)/x.wem", "" when there are fewer than two.
+static void parent2_name(const char *path, const char *base, char *out, size_t cap) {
+    out[0] = 0;
+    if (base <= path) return;
+    const char *end = base - 1;                       // the '/' before the basename
+    const char *start = end;
+    while (start > path && start[-1] != '/') start--; // start of the parent
+    if (start <= path + 1) return;
+    start--;                                          // the '/' before the parent
+    while (start > path && start[-1] != '/') start--; // start of the grandparent
+    size_t n = (size_t)(end - start);
+    if (n == 0 || n >= cap || *start == '/') return;
+    memcpy(out, start, n); out[n] = 0;
+}
 static void bank_add(const char *rel, const char *obbpath, uint16_t method,
                      uint64_t size, uint64_t lhdr) {
     const char *base = strrchr(rel, '/'); base = base ? base + 1 : rel;
@@ -84,15 +133,60 @@ static void bank_add(const char *rel, const char *obbpath, uint16_t method,
     }
     obb_bank *b = &g_bank[g_bankn++];
     snprintf(b->base, sizeof b->base, "%s", base);
+    parent_name(rel, base, b->dir, sizeof b->dir);
+    parent2_name(rel, base, b->dir2, sizeof b->dir2);
     snprintf(b->obb, sizeof b->obb, "%s", obbpath);
     b->method = method; b->size = size; b->lhdr = lhdr;
 }
 static obb_bank *bank_find(const char *loose) {
     const char *base = strrchr(loose, '/'); base = base ? base + 1 : loose;
     if (!name_is_bank(base)) return NULL;
-    for (unsigned i = 0; i < g_bankn; i++)
-        if (strcmp(g_bank[i].base, base) == 0) return &g_bank[i];
-    return NULL;
+    char dir[48], dir2[96];
+    parent_name(loose, base, dir, sizeof dir);
+    parent2_name(loose, base, dir2, sizeof dir2);
+    // The file of that name in the folder asked for, if there is one; otherwise
+    // the first of that name, as it always was. KL_OBB_BANK_DIR=0 restores the
+    // plain first match.
+    static int by_dir = -1;
+    if (by_dir < 0) by_dir = kl_env_on("KL_OBB_BANK_DIR", 1);
+    obb_bank *first = NULL;
+    unsigned same = 0;
+    if (by_dir && dir2[0])
+        for (unsigned i = 0; i < g_bankn; i++)
+            if (strcmp(g_bank[i].base, base) == 0 && strcmp(g_bank[i].dir2, dir2) == 0) {
+                static int said;
+                if (said < 3) { said++;
+                    fprintf(stderr, "  [obb] %s asked for under '%s' -> the file in that "
+                                    "folder (%llu bytes)\n", base, dir2,
+                            (unsigned long long)g_bank[i].size); }
+                return &g_bank[i];
+            }
+    for (unsigned i = 0; i < g_bankn; i++) {
+        if (strcmp(g_bank[i].base, base) != 0) continue;
+        if (by_dir && dir[0] && strcmp(g_bank[i].dir, dir) == 0) {
+            if (first && first != &g_bank[i]) {
+                static int said;
+                if (said < 6) { said++;
+                    const char *a = strrchr(g_bank[i].obb, '/');
+                    fprintf(stderr, "  [obb] %s is in more than one archive; asked for under "
+                                    "'%s' -> served from %s\n", base, dir, a ? a + 1 : g_bank[i].obb); }
+            }
+            return &g_bank[i];
+        }
+        if (!first) first = &g_bank[i];
+        same++;
+    }
+    if (first && same > 1) {
+        // Several of that name and none in the folder asked for: said, because the
+        // choice is then the order the archives were read in and nothing better.
+        static int said;
+        if (said < 6) { said++;
+            const char *a = strrchr(first->obb, '/');
+            fprintf(stderr, "  [obb] %s is in %u archives and none has it under '%s' "
+                            "-> the first one, %s (folder '%s')\n",
+                    base, same, dir, a ? a + 1 : first->obb, first->dir); }
+    }
+    return first;
 }
 static char       g_base[1024];
 static size_t     g_base_len;
@@ -108,10 +202,16 @@ typedef struct { int fd; uint64_t base, len; off_t pos; int inuse;
 // table filled during mount and the LAST paks to be processed — pakchunk0/1/2,
 // which hold the global shader library and engine content — silently failed to
 // open as windows, so UE4 never mounted them and died with "Missing global
-// shader … make sure cooking was successful". 256 covers 80 paks + optional/split
+// shader … make sure cooking was successful". 256 covered 80 paks + optional/split
 // variants with headroom; the table-full path now shouts instead of failing mute.
-#define KL_OBB_MAX_VFD 256
+// Medal of Honor: Above and Beyond (x3647259232032222) mounts more than 400 paks
+// from its OBBs and content bundles: at 256 the last 169 — pakchunk0 among them —
+// did not mount, the game asked to quit and faulted at start (2026-10-18). 2048
+// slots, and the lookups only walk up to the highest slot ever taken
+// (g_vfd_hi), so a title with few paks pays what it paid before.
+#define KL_OBB_MAX_VFD 2048
 static obb_vfd  g_vfd[KL_OBB_MAX_VFD];
+static unsigned g_vfd_hi;   // slots [0, g_vfd_hi) have been used; under g_vfd_lock
 // KL_TRACE_PAKREAD: log the first reads the guest makes through each .pak window
 // fd. This is the ONE path we cannot otherwise see — the guest parses a pak's own
 // index and reads files (e.g. the global shader library) straight from the window,
@@ -333,7 +433,14 @@ void kl_obbmap_init(const char *obbdir, const char *ue4game_base) {
     unsigned files = 0;
     while ((e = readdir(d)) != NULL) {
         size_t L = strlen(e->d_name);
-        if (L < 4 || strcmp(e->d_name + L - 4, ".obb") != 0) continue;
+        // ...and the store's language packs, `<tag>.lang`: the same ZIP as an
+        // OBB under another name (Asgard's Wrath 2's de.lang is 73 stored FMOD
+        // banks, Wrath2/Content/FMOD/Desktop/VO_*_DE.bank). Unreal's own OBB
+        // visitor mounts them beside the .obb files; left out here, the banks
+        // of a pack that was on the device were not there for the sound engine.
+        int is_obb  = L >= 4 && strcmp(e->d_name + L - 4, ".obb") == 0;
+        int is_lang = L >= 5 && strcmp(e->d_name + L - 5, ".lang") == 0;
+        if (!is_obb && !is_lang) continue;
         char p[1024];
         snprintf(p, sizeof p, "%s/%s", obbdir, e->d_name);
         index_one(p);
@@ -813,6 +920,21 @@ fail:
     return out;
 }
 
+int kl_obbmap_locate(const char *loose, char *host, size_t cap, long long *base, long long *size) {
+    obb_entry *e = find(loose);
+    if (!e || e->is_zpak || (!e->is_loose && !e->is_abs && e->method != 0)) return 0;
+    FILE *probe = fopen(e->obb, "rb");
+    if (!probe) return 0;
+    uint64_t at = 0;
+    int ok = data_offset(probe, e, &at);
+    fclose(probe);
+    if (!ok) return 0;
+    if (host) snprintf(host, cap, "%s", e->obb);
+    if (base) *base = (long long)at;
+    if (size) *size = (long long)e->size;
+    return 1;
+}
+
 int kl_obbmap_open(const char *loose, int flags) {
     if (is_uproject(loose) && (flags & O_ACCMODE) == O_RDONLY) {
         int fd = open(g_uproject, O_RDONLY);
@@ -864,6 +986,7 @@ int kl_obbmap_open(const char *loose, int flags) {
     for (unsigned i = 0; i < sizeof g_vfd / sizeof g_vfd[0]; i++) {
         if (g_vfd[i].inuse) continue;
         g_vfd[i] = (obb_vfd){ .fd = fd, .base = base, .len = e->size, .pos = 0, .inuse = 1 };
+        if (i >= g_vfd_hi) g_vfd_hi = i + 1;
         { const char *bn = strrchr(loose, '/'); bn = bn ? bn + 1 : loose;
           snprintf(g_vfd[i].name, sizeof g_vfd[i].name, "%s", bn); }
         pthread_mutex_unlock(&g_vfd_lock);
@@ -911,7 +1034,7 @@ int kl_obbmap_open(const char *loose, int flags) {
 }
 
 static obb_vfd *vfd_find(int fd) {
-    for (unsigned i = 0; i < sizeof g_vfd / sizeof g_vfd[0]; i++)
+    for (unsigned i = 0; i < g_vfd_hi; i++)
         if (g_vfd[i].inuse && g_vfd[i].fd == fd) return &g_vfd[i];
     return NULL;
 }
@@ -1026,7 +1149,10 @@ static void dir_add_name(obb_dir *d, const char *name, char type) {
 }
 
 void *kl_obbmap_opendir(const char *dirpathin) {
-    if (!g_n || !dirpathin) return NULL;
+    // Unity indexes OBB audio banks with no Unreal loose-file base. An empty
+    // prefix must not claim real Unity directories as synthetic UE4 handles.
+    // Only with the mods for now; other games keep the old answer.
+    if (!g_n || (!g_base_len && kl_extension_active()) || !dirpathin) return NULL;
     // UE4 lists its pak folder with a trailing slash ("<Project>/Content/Paks/");
     // matching children as "<dir>/<child>" then compares against the slash that
     // is already part of <dir>, and every entry is rejected — the synthesis

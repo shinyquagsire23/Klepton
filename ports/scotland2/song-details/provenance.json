@@ -1,0 +1,9 @@
+{
+  "name": "song-details",
+  "repository": "bsq-ports/SongDetails",
+  "tag": "v1.0.4",
+  "commit": "b13aa5d5cc07200a4873f7c0554a99ba0ba6d79f",
+  "archive": "song-details-b13aa5d.tar.gz",
+  "sha256": "48616107076617dfc3aa957dadb2d72ed58f8212b64683eacf6f331f32803cc6",
+  "scope": "Exact original released source downloaded for port work; not built or tested."
+}

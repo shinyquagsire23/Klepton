@@ -1,0 +1,64 @@
+﻿<vertical preferred-width='120' anchor-pos-x="2" xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<horizontal id='filterContainer' preferred-height='10' child-control-width='false' child-expand-width='false' pad-left='1'>
+		<button on-click='SelectRandom' text='Random' preferred-height='8' pref-width="14"/>
+		<button on-click='ShowMoreModal' text='More' preferred-height='8' pref-width="14"/>
+		<vertical id='searchBoxContainer' preferred-width='44' pad-left='2'/>
+		<loading id="searchInProgress" preserve-aspect="true" ignore-layout='true' size-delta-x='6' anchor-min-x='0.33' anchor-max-x='0.33'/>
+
+		<vertical preferred-width='44' pad-left='1'>
+			<dropdown-list-setting id='sortDropdown' text='Sort' value="selectedSortMode" apply-on-change="true" choices='sortModeSelections' on-change='UpdateDataAndFilters'/>
+		</vertical>
+	</horizontal>
+	<horizontal preferred-height='75' pad-top='3' pad-bottom='2' preferred-width='80'>
+		<vertical preferred-width='72'>
+			<list id='songList' select-cell='SelectSong' show-scrollbar='true' />
+		</vertical>
+		<vertical preferred-width='6' id='scrollBarContainer' vertical-fit='Unconstrained'/>
+		<vertical preferred-width='40' bg='round-rect-panel' pad='2' child-expand-height='false'>
+			<!-- <macro.as-host host='selectedSongView'> -->
+				<horizontal preferred-height='6'>
+					<text id="selectedSongAuthor" align='Center' font-size='3.2' overflow-mode='Ellipsis' word-wrapping='false' color='#CCC' text='Loading...' rich-text='false'/>
+				</horizontal> 
+				<horizontal preferred-height='4'>
+					<text id="selectedSongName" align='Center' font-size='2.7' overflow-mode='Ellipsis' word-wrapping='false' text='Please wait' rich-text='false'/>
+				</horizontal>
+				<horizontal child-align='MiddleCenter' vertical-fit="PreferredSize" preferred-height="28">
+					<image id="coverImage" preserve-aspect="true"/>
+					<loading id="coverLoading" preserve-aspect="true" ignore-layout="true"/>
+				</horizontal>
+				<horizontal horizontal-fit="Unconstrained" pad-top="2">
+					<text id="selectedSongDiffInfo" align='Center' font-size='2.5' word-wrapping='false' color='#CCC' text=''/>
+				</horizontal>
+				<vertical vertical-fit="PreferredSize" active="true" id="detailActions">
+					<primary-button id="downloadButton" on-click='Download' text='Download' horizontal-fit='Unconstrained' font-size='3.5' active='false'/>
+					<primary-button id="playButton" on-click='Play' text='Play' horizontal-fit='Unconstrained' font-size='3.5' active='false'/>
+					<button id="infoButton" on-click='ShowSongDetails' text='Upload Details' horizontal-fit='Unconstrained' font-size='3.5'/>
+					<button on-click='FilterByUploader' text='Filter by Uploader' horizontal-fit='Unconstrained' font-size='3.2'/>
+				</vertical>
+			<!-- </macro.as-host> -->
+		</vertical>
+	</horizontal>
+	
+	<modal id="moreModal" clickerino-offerino-closerino='true' move-to-center='false' size-delta-x='50' size-delta-y='25' anchor-pos-x='-18' anchor-pos-y='14'>
+		<vertical horizontal-fit='Unconstrained' pad='2' pad-bottom='-2'>
+			<!-- on-click='HideMoreModal'  -->
+			<primary-button text='Batch Download' on-click='ShowBatchDownload'  horizontal-fit='Unconstrained'/>
+			<!-- <primary-button text='Create / Update Playlist' on-click='ShowPlaylistCreation' horizontal-fit='Unconstrained'/> -->
+			<primary-button text='BetterSongSearch Settings' on-click='ShowSettings' horizontal-fit='Unconstrained'/>
+		</vertical>
+	</modal>
+	
+	<modal id="downloadCancelConfirmModal" clickerino-offerino-closerino='true' size-delta-x='80' size-delta-y='40'>
+		<vertical horizontal-fit='Unconstrained' pad='4' pad-top='9'>
+			<horizontal bg='panel-top-gradient' ignore-layout='true' anchor-max-x='.97' anchor-min-x='.03' anchor-min-y='1' anchor-pos-y='-5'>
+				<text text='BetterSongSearch - Pending Downloads' align='Center'/>
+			</horizontal>
+			<text text='You still have pending downloads which would be stopped by closing Better Song Search. Continue?' word-wrapping='true' align='Capline'/>
+			<horizontal pad-top='4'>
+				<!-- click-event='CloseDownloadCancelConfirm -->
+				<primary-button text='Yes' on-click='ForcedUIClose'/>
+				<button text='Cancel' on-click='ForcedUICloseCancel'/>
+			</horizontal>
+		</vertical>
+	</modal>
+</vertical>

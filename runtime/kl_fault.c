@@ -361,7 +361,7 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
     // object, not its first word.
     int want = kl_env_int("KL_FAULT_PEEK", 16);
     if (want < 16) want = 16;
-    if (want > 512) want = 512;
+    if (want > 2048) want = 2048;
     if (uc) {
         const uint64_t *x = (const uint64_t *)uc->uc_mcontext->__ss.__x;
         for (int i = 0; i < 29; i++) {

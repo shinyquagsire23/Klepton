@@ -62,6 +62,11 @@ def out_param_regs(so, addr, span=0x60):
         ["objdump", "-d", f"--start-address={addr}", f"--stop-address={addr + span}", so],
         capture_output=True, text=True).stdout
     body = d.split(">:", 1)[-1] if ">:" in d else d
+    # The span is a guess, and a short function ends inside it: Beat Saber
+    # 1.6.0's ovrp_Shutdown2 is 0x3c bytes, so the window ran on into
+    # ovrp_GetVersion2 and charged its NULL check to Shutdown2. Stop at the
+    # next symbol.
+    body = re.split(r"\n[0-9a-f]+ <[^>]+>:", body, maxsplit=1)[0]
     regs = set()
     for m in re.finditer(r"cbz\s+x(\d+),\s+0x([0-9a-f]+)", body):
         reg, target = int(m.group(1)), m.group(2)
