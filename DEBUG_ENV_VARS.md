@@ -59,6 +59,11 @@ answers GL and kl_glfb never initializes.
 - `KL_GLFB=1` — enable the one-eye reference renderer on ANGLE/Metal.
   Host-only; it exists to produce the known-good frame a real backend gets
   diffed against.
+- `KL_GLFB_MIRROR_DRAW=0|1` — (`kl_glfb_mirror_layer`) copy an overlay layer
+  whose guest texture is COMPRESSED (ETC2/ASTC) with a sampling draw instead
+  of `glBlitFramebuffer`, which cannot read it (an incomplete read
+  framebuffer, error 0x506, and a pink panel: Arizona Sunshine's loading
+  screen). Default 1; 0 goes back to the blit.
 - `KL_EGL_EXTENSIONS=<space-separated list>` — override what
   `eglQueryString(EGL_EXTENSIONS)` answers. The default names the three we
   actually implement (`EGL_KHR_image_base`,

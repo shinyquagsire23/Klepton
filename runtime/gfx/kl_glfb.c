@@ -1957,6 +1957,7 @@ static void (*g_real_FramebufferTextureLayer)(uint32_t, uint32_t, uint32_t, int3
                                               int32_t);
 
 static int klfb_tex_info(uint32_t name, uint32_t *fmt, int32_t *w, int32_t *h);
+static int klfb_block_geom(uint32_t fmt, int *bw, int *bh, int *bytes);
 
 // Every FBO's current colour-0 attachment, for the draw census below. This is a
 // different table from g_fbo_stage, which deliberately keeps its sixteen slots
@@ -3661,12 +3662,18 @@ static uint32_t klfb_blit_subrect(uint32_t src_tex, int src_layer, uint32_t dst_
 // that stays fully opaque before the fade begins (0..1). Returns 0 on success;
 // nonzero means the caller should fall back to the plain blit. All GL state it
 // touches is saved and restored — it runs inside the guest's own frame.
+//
+// `copy` drops the feather and the blend: the source's own RGBA is written as
+// sampled. That is how a texture glBlitFramebuffer cannot read gets copied —
+// a compressed one (ETC2/ASTC) is not colour-renderable, so it cannot be a
+// read framebuffer's attachment, but it can always be sampled (see
+// kl_glfb_mirror_layer).
 static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
                              uint32_t src_tex, int dx0, int dy0, int dx1, int dy1,
-                             float inner) {
+                             float inner, int copy) {
     static int tried, ok_program;
     static uint32_t prog, vao, vbo;
-    static int loc_tex, loc_inner, loc_pos, loc_uv;
+    static int loc_tex, loc_inner, loc_copy, loc_pos, loc_uv;
     static uint32_t (*r_CreateShader)(uint32_t);
     static void (*r_ShaderSource)(uint32_t, int32_t, const char *const *, const int32_t *);
     static void (*r_CompileShader)(uint32_t);
@@ -3753,8 +3760,10 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
                 "#version 300 es\n"
                 "precision highp float;\n"
                 "in vec2 vUV; uniform sampler2D uTex; uniform float uInner;\n"
+                "uniform int uCopy;\n"
                 "out vec4 o;\n"
                 "void main(){\n"
+                "  if (uCopy != 0) { o = texture(uTex, vUV); return; }\n"
                 "  vec3 c = texture(uTex, vUV).rgb;\n"
                 "  vec2 d = (vUV - 0.5) * 2.0;\n"
                 "  float r = length(d);\n"
@@ -3777,6 +3786,7 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
             if (okv && okf && okl) {
                 loc_tex   = r_GetUniformLocation(prog, "uTex");
                 loc_inner = r_GetUniformLocation(prog, "uInner");
+                loc_copy  = r_GetUniformLocation(prog, "uCopy");
                 loc_pos   = r_GetAttribLocation(prog, "aPos");
                 loc_uv    = r_GetAttribLocation(prog, "aUV");
                 r_GenVertexArrays(1, &vao);
@@ -3822,8 +3832,18 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
     if (depth_was && r_Disable) r_Disable(0x0B71);
     if (cull_was  && r_Disable) r_Disable(0x0B44);
     if (sciss_was && r_Disable) r_Disable(0x0C11);
-    if (r_Enable) r_Enable(0x0BE2 /* BLEND */);
-    if (r_BlendFunc) r_BlendFunc(0x0302 /* SRC_ALPHA */, 0x0303 /* ONE_MINUS_SRC_ALPHA */);
+    if (copy) {
+        if (blend_was && r_Disable) r_Disable(0x0BE2 /* BLEND */);
+    } else {
+        if (r_Enable) r_Enable(0x0BE2 /* BLEND */);
+        if (r_BlendFunc) r_BlendFunc(0x0302 /* SRC_ALPHA */, 0x0303 /* ONE_MINUS_SRC_ALPHA */);
+    }
+    // An sRGB source is decoded when sampled, so an sRGB destination has to
+    // encode on write for this to be a copy. Only a guest that has turned the
+    // encode off (EXT_sRGB_write_control, g_srgb_write_off) can have it off.
+    int srgb_off = copy && g_srgb_write_off && r_IsEnabled &&
+                   !r_IsEnabled(KLFB_GL_FRAMEBUFFER_SRGB);
+    if (srgb_off && r_Enable) r_Enable(KLFB_GL_FRAMEBUFFER_SRGB);
     r_Viewport(0, 0, dstw, dsth);
 
     float nx0 = 2.0f * dx0 / dstw - 1.0f, nx1 = 2.0f * dx1 / dstw - 1.0f;
@@ -3866,6 +3886,7 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
     }
     if (loc_tex >= 0)   r_Uniform1i(loc_tex, 0);
     if (loc_inner >= 0) r_Uniform1f(loc_inner, inner);
+    if (loc_copy >= 0)  r_Uniform1i(loc_copy, copy);
     r_DrawArrays(0x0005 /* TRIANGLE_STRIP */, 0, 4);
 
     // Restore the guest's texture parameters while its texture is still bound.
@@ -3889,7 +3910,9 @@ static int klfb_feather_blit(uint32_t dst_tex, int dstw, int dsth,
     if (r_BlendFuncSeparate)
         r_BlendFuncSeparate((uint32_t)s_bsr, (uint32_t)s_bdr,
                             (uint32_t)s_bsa, (uint32_t)s_bda);
+    if (blend_was && r_Enable) r_Enable(0x0BE2);
     if (!blend_was && r_Disable) r_Disable(0x0BE2);
+    if (srgb_off && r_Disable) r_Disable(KLFB_GL_FRAMEBUFFER_SRGB);
     if (depth_was && r_Enable) r_Enable(0x0B71);
     if (cull_was  && r_Enable) r_Enable(0x0B44);
     if (sciss_was && r_Enable) r_Enable(0x0C11);
@@ -4066,6 +4089,30 @@ int kl_glfb_mirror_layer(int layer, int stage, uint32_t src_tex, int src_layer,
         fprintf(stderr, "  [glfb] mirror layer=%d stage=%d: %dx%d fmt 0x%x <- guest "
                         "tex %u (one blit a frame; the guest's own storage is left "
                         "alone)\n", layer, stage, w, h, internal_fmt, src_tex);
+    }
+
+    // A COMPRESSED source cannot be blitted: it is not colour-renderable, so
+    // the read framebuffer is incomplete (0x8CD6), the blit raises 0x506 and
+    // the panel keeps its fresh, never-written storage — which composites as a
+    // pink square. Arizona Sunshine (x2190353671014400) puts its loading
+    // screen up that way: a static OVROverlay naming its own 2048x2048
+    // SRGB8_ALPHA8_ETC2_EAC texture in every submit (2026-10-30). Sampling it
+    // in a draw is the copy GL does allow. KL_GLFB_MIRROR_DRAW=0 goes back to
+    // the blit.
+    static int draw_compressed = -1;
+    if (draw_compressed < 0) draw_compressed = kl_env_on("KL_GLFB_MIRROR_DRAW", 1);
+    uint32_t sfmt = 0;
+    int bw, bh, bb;
+    if (draw_compressed && src_layer < 0 && klfb_tex_info(src_tex, &sfmt, NULL, NULL) &&
+        klfb_block_geom(sfmt, &bw, &bh, &bb)) {
+        int failed = klfb_feather_blit(m->tex, w, h, src_tex, 0, 0, w, h, 1.0f, 1);
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [glfb] mirror layer=%d stage=%d: guest tex %u is "
+                            "compressed (fmt 0x%x) — %s\n", layer, stage, src_tex,
+                    sfmt, failed ? "the copy shader is unavailable, NOT composited"
+                                 : "copied by a draw, not a blit");
+        return !failed;
     }
 
     uint32_t e = klfb_mirror_blit(src_tex, src_layer, m->tex, w, h);
@@ -4592,7 +4639,7 @@ void kl_glfb_overlay_eye_inset(int eye, int stage, uint32_t tex, int layer,
     uint32_t e = 0;
     if (feather && layer < 0 &&
         klfb_feather_blit(m->tex, m->w, m->h, tex, dx0, dy0, dx1, dy1,
-                          inner_x100 / 100.0f) == 0) {
+                          inner_x100 / 100.0f, 0) == 0) {
         how = "feather";
     } else {
         e = klfb_blit_subrect(tex, layer, m->tex, iw, ih, dx0, dy0, dx1, dy1);
