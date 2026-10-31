@@ -421,7 +421,21 @@ void klb_sysprop_read_callback(const void *p,
     klb_sysprop_get(prop, v);
     cb(cookie, prop, v, 0);
 }
-int  klb_prctl(int op, ...)                  { (void)op; return 0; }
+// prctl: PR_SET_NAME (15) names the calling thread, as on Linux, so the names
+// Unity gives its threads (its loader, job workers, render thread) reach the
+// host and every stuck-thread account and crash report; until now they were
+// all blank. Everything else stays the no-op success it was. The arguments are
+// taken as the registers they arrive in (the guest's variadic call puts them
+// in x1-x4, where Darwin's va_arg would look on the stack — see klb_syscall).
+int  klb_prctl(int op, unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5) {
+    (void)a3; (void)a4; (void)a5;
+    if (op == 15 && a2) {
+        char n[16];                          // Linux keeps 15 characters
+        snprintf(n, sizeof n, "%s", (const char *)a2);
+        pthread_setname_np(n);
+    }
+    return 0;
+}
 // Every CPU the guest is told it has (kl_cpu_count — the same number
 // sysconf(_SC_NPROCESSORS_*) and /proc/cpuinfo give), and NO others. It used to
 // set every bit of the caller's buffer, which describes 8*sz CPUs — a machine
@@ -1791,6 +1805,34 @@ static int kl_fs_jar_file(void) {
     return v;
 }
 
+// KL_FS_SDCARD_OBB: read "/sdcard/Android/obb/<package>/…" — Android's OBB
+// directory spelled by literal path — from the directory getObbDirs() answers
+// (kl_jni_obb_dir). On a device they are one directory; here a Unity target's
+// OBB is staged at <files>/obb, so the literal spelling named an empty
+// <files>/Android/obb/<package>. Arizona Sunshine (x2190353671014400) asks
+// Java for the OBB and loads it, then its AssetBundleGameSystem opens the same
+// file again by the literal path ("Unable to open archive file:
+// /sdcard/Android/obb/com.vertigogames.azsq/main.21876…obb"), and everything
+// after it — FMOD's banks, the scene — fails, leaving the headset black once
+// the loading logo is gone (2026-10-30). Tied to that target like
+// KL_FS_REL_SDCARD; a UE4 target's OBB already lives at that path. Returns
+// the length of "/Android/obb/<package>" in `rest` (the path past the storage
+// prefix), or 0.
+static size_t kl_fs_sdcard_obb(const char *rest) {
+    static int v = -1;
+    if (v < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_FS_SDCARD_OBB", t && strcmp(t, "x2190353671014400") == 0);
+    }
+    if (!v || strncmp(rest, "/Android/obb/", 13) != 0) return 0;
+    const char *pkg = kl_jni_guest_package();
+    size_t pl = pkg ? strlen(pkg) : 0;
+    if (!pl || strncmp(rest + 13, pkg, pl) != 0) return 0;
+    if (rest[13 + pl] != '/' && rest[13 + pl] != '\0') return 0;
+    return 13 + pl;
+}
+
 static const char *kl_guest_path_inner(const char *path, char *buf, size_t cap) {
     if (!path) return path;
     // Windows-heritage guests (reVC / GTA Vice City) build paths with '\'
@@ -1873,6 +1915,15 @@ static const char *kl_guest_path_inner(const char *path, char *buf, size_t cap) 
             // A prefix match is not a path match: /sdcardiskette is neither
             // /sdcard nor under it.
             if (path[n] != '/' && path[n] != '\0') continue;
+            // Android's own OBB directory, named literally, is the one
+            // getObbDirs() answers (KL_FS_SDCARD_OBB).
+            size_t on = kl_fs_sdcard_obb(path + n);
+            if (on) {
+                const char *obb = kl_jni_obb_dir();
+                snprintf(buf, cap, "%s%s", obb, path + n + on);
+                kl_casefix(buf, strlen(obb));
+                return buf;
+            }
             snprintf(buf, cap, "%s%s", g_ext_target, path + n);
             // iOS is case-sensitive; the guest mixes case (DATA vs data). Rewrite
             // the suffix to the on-disk spelling, past the known-good target prefix.
@@ -3259,6 +3310,25 @@ static int futex_op_cmp(int cmp, int32_t oldval, int32_t cmparg) {
     return 0;
 }
 
+// KL_FUTEX_SPURIOUS_MS=<ms>: no futex wait sleeps longer than this before
+// coming back as woken. The futex contract allows a wakeup with no wake (every
+// caller re-checks its word and sleeps again), so this changes nothing for
+// correct code and turns a wake that went missing into a pause of that length.
+// Arizona Sunshine (x2190353671014400) froze at its logo in about half of its
+// starts: the game thread waiting for a job it had just scheduled, every one
+// of Unity's job workers asleep in a futex, nothing running (2026-10-31).
+// Default 50 for that target, else 0 (off).
+static long kl_futex_spurious_ns(void) {
+    static long ns = -1;
+    if (ns < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        ns = (long)kl_env_int("KL_FUTEX_SPURIOUS_MS", t && strcmp(t, "x2190353671014400") == 0 ? 50 : 0) * 1000000L;
+        if (ns < 0) ns = 0;
+    }
+    return ns;
+}
+
 static long kl_futex_legacy(int32_t *uaddr, int op, uint32_t val, const struct timespec *ts,
                             int32_t *uaddr2, uint32_t val3) {
     int      base = op & ~(KL_FUTEX_PRIVATE_FLAG | KL_FUTEX_CLOCK_REALTIME);
@@ -3274,7 +3344,18 @@ static long kl_futex_legacy(int32_t *uaddr, int op, uint32_t val, const struct t
             return -1;
         }
         int r;
-        if (!ts) {
+        long cap = kl_futex_spurious_ns();
+        struct timespec capped;
+        int capped_on = 0;
+        if (cap) {
+            clock_gettime(CLOCK_REALTIME, &capped);
+            capped.tv_nsec += cap;
+            ts_normalise(&capped);
+        }
+        if (!ts && cap) {
+            r = pthread_cond_timedwait(&g_futex[b].c, &g_futex[b].m, &capped);
+            if (r == ETIMEDOUT) r = 0;                     // woken, as far as the caller knows
+        } else if (!ts) {
             r = pthread_cond_wait(&g_futex[b].c, &g_futex[b].m);
         } else {
             // FUTEX_WAIT's timeout is relative; FUTEX_WAIT_BITSET's is an
@@ -3295,7 +3376,13 @@ static long kl_futex_legacy(int32_t *uaddr, int op, uint32_t val, const struct t
                 abs.tv_nsec = now.tv_nsec + (ts->tv_nsec - mono.tv_nsec);
             }
             ts_normalise(&abs);
+            if (cap && (capped.tv_sec < abs.tv_sec ||
+                        (capped.tv_sec == abs.tv_sec && capped.tv_nsec < abs.tv_nsec))) {
+                abs = capped;
+                capped_on = 1;
+            }
             r = pthread_cond_timedwait(&g_futex[b].c, &g_futex[b].m, &abs);
+            if (r == ETIMEDOUT && capped_on) r = 0;        // our cap, not the caller's deadline
         }
         pthread_mutex_unlock(&g_futex[b].m);
         if (r == ETIMEDOUT) { errno = ETIMEDOUT; return -1; }

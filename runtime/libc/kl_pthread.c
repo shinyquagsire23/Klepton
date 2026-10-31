@@ -601,6 +601,7 @@ static void mtx_wait_leave(void) {
 // this is the last place a stalled producer can hide. Populated for the duration
 // of every blocking sem wait; the watchdog dumps whoever is still parked.
 static struct { _Atomic(void *) tid, guest, ra; } g_sem_waiters[64];
+static void sem_describe(int *s, char *out, size_t cap);   // with the table, below
 static void sem_wait_enter(void *guest, void *ra) {
     void *self = (void *)pthread_self();
     for (int i = 0; i < 64; i++) {
@@ -692,9 +693,11 @@ static void *cnd_watchdog(void *arg) {
         for (int i = 0; i < 64; i++) {
             void *tid = atomic_load(&g_sem_waiters[i].tid);
             if (!tid) continue;
-            fprintf(stderr, "  [sem] tid=%p BLOCKED in sem_wait on %p (ra=%p)\n",
+            char d[320];
+            sem_describe(atomic_load(&g_sem_waiters[i].guest), d, sizeof d);
+            fprintf(stderr, "  [sem] tid=%p BLOCKED in sem_wait on %p (ra=%p) %s\n",
                     tid, atomic_load(&g_sem_waiters[i].guest),
-                    atomic_load(&g_sem_waiters[i].ra));
+                    atomic_load(&g_sem_waiters[i].ra), d);
         }
     }
     return NULL;
@@ -1723,6 +1726,9 @@ typedef struct {
     _Atomic int          count;
     int                  initial;   // what it was created with, for the release
                                     // rule in klb_sem_destroy
+    _Atomic unsigned     posts;     // for the stuck-thread account (sem_describe)
+    _Atomic uint64_t     last_post_ns;
+    void                *init_ra[4];  // who made it (KL_SEM_ORIGIN)
 } kl_sem;
 static kl_sem g_sems[KL_MAX_SEMS];
 static _Atomic int g_nsems = 1;                 // index 0 means "uninitialised"
@@ -1761,6 +1767,36 @@ int klb_sem_init(int *s, int pshared, unsigned value) {
     // waiter on another thread then got EINVAL from a semaphore that had, as far
     // as its owner was concerned, been initialised.
     atomic_store(&g_sems[i].count, (int)value);
+    atomic_store(&g_sems[i].posts, 0);
+    atomic_store(&g_sems[i].last_post_ns, 0);
+    // KL_SEM_ORIGIN=0|1: keep the guest's call chain into sem_init, four frames,
+    // for the stuck-thread account (sem_describe). Arizona Sunshine froze at
+    // its logo in about half of its starts with its game thread on a semaphore
+    // nobody ever posted; from the build that records this on, it froze in
+    // about one start in four or five. Why is not known — the record makes every sem_init a little
+    // slower, which may be what moves a race out of the way — so it is on for
+    // that target only, and is a lead for whoever finds the race (2026-10-31).
+    static int origin = -1;
+    if (origin < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        origin = kl_env_on("KL_SEM_ORIGIN", t && strcmp(t, "x2190353671014400") == 0);
+    }
+    for (int d = 0; d < 4; d++) g_sems[i].init_ra[d] = NULL;
+    if (origin) {
+        // Read with vm_read_overwrite: a guest frame chain can end in anything,
+        // and a plain load from it faulted inside sem_init.
+        uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
+        for (int d = 0; d < 4; d++) {
+            uintptr_t f[2];
+            vm_size_t got = 0;
+            if (!fp || (fp & 7) ||
+                vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof f, (vm_address_t)f, &got) != KERN_SUCCESS ||
+                got != sizeof f) { fp = 0; continue; }
+            g_sems[i].init_ra[d] = (void *)f[1];
+            fp = f[0];
+        }
+    }
     g_sems[i].initial = (int)value;
     g_sems[i].d = dispatch_semaphore_create(value);
     atomic_thread_fence(memory_order_release);
@@ -1830,25 +1866,62 @@ int klb_sem_post(int *s) {
                     *s, atomic_load(&k->count) + 1);
     }
     atomic_fetch_add(&k->count, 1);
+    atomic_fetch_add(&k->posts, 1);
+    atomic_store(&k->last_post_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     dispatch_semaphore_signal(k->d);
     return 0;
 }
 
+// One semaphore as the stuck-thread account shows it: its slot, its count and
+// how many posts it has had, and how long since the last. A waiter on a slot
+// whose posts keep climbing has lost a wakeup; one whose posts are frozen is
+// waiting for a post nobody makes.
+static void sem_describe(int *s, char *out, size_t cap) {
+    int i = s ? *s : 0;
+    if (i <= 0 || i >= KL_MAX_SEMS || !g_sems[i].d) { snprintf(out, cap, "(slot %d: none)", i); return; }
+    uint64_t lp = atomic_load(&g_sems[i].last_post_ns);
+    double age = lp ? (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - lp) / 1e9 : -1.0;
+    extern const char *kl_addr_image(const void *addr, size_t *off);
+    int n = snprintf(out, cap, "slot %d count=%d posts=%u last_post=%.1fs made at", i,
+                     atomic_load(&g_sems[i].count), atomic_load(&g_sems[i].posts), age);
+    for (int d = 0; d < 4 && n > 0 && (size_t)n < cap; d++) {
+        size_t off = 0;
+        const char *img = g_sems[i].init_ra[d] ? kl_addr_image(g_sems[i].init_ra[d], &off) : NULL;
+        n += snprintf(out + n, cap - (size_t)n, " %s+0x%zx", img ? img : "?", img ? off : (size_t)0);
+    }
+}
+
+// The count is taken BEFORE the thread blocks, as Linux takes it: a waiter is
+// a count below zero, and sem_getvalue (which reports 0 then) never shows a
+// token that has already been claimed. Taken after the wait returned — as it
+// was — there was a window, between dispatch_semaphore_wait handing the token
+// over and the decrement, in which the value still read 1. A producer that
+// posts only when it reads 0 (wake the consumer unless a wake is pending) then
+// skipped its post while the consumer, already awake and finding its queue
+// empty, went back to sleep: a wake lost for good. Found chasing Arizona
+// Sunshine's intermittent start freeze (UnityMain waiting on a load queued for
+// Loading.PreloadManager, 2026-10-31); closing it did not end that freeze on
+// its own.
 int klb_sem_wait(int *s) {
     kl_sem *k = sem_of(s);
     if (!k) { errno = EINVAL; return -1; }
     sem_wait_enter(s, __builtin_return_address(0));
+    atomic_fetch_sub(&k->count, 1);
     dispatch_semaphore_wait(k->d, DISPATCH_TIME_FOREVER);
     sem_wait_leave();
-    atomic_fetch_sub(&k->count, 1);
     return 0;
 }
 
+// A token is claimed only if one is there; claimed, it is ours — the post that
+// made it may still be on its way to dispatch_semaphore_signal, so the wait for
+// it is unbounded, and short.
 int klb_sem_trywait(int *s) {
     kl_sem *k = sem_of(s);
     if (!k) { errno = EINVAL; return -1; }
-    if (dispatch_semaphore_wait(k->d, DISPATCH_TIME_NOW) != 0) { errno = EAGAIN; return -1; }
-    atomic_fetch_sub(&k->count, 1);
+    int c = atomic_load(&k->count);
+    while (c > 0 && !atomic_compare_exchange_weak(&k->count, &c, c - 1)) {}
+    if (c <= 0) { errno = EAGAIN; return -1; }
+    dispatch_semaphore_wait(k->d, DISPATCH_TIME_FOREVER);
     return 0;
 }
 
@@ -1899,8 +1972,15 @@ int klb_sem_timedwait(int *s, const struct timespec *ts) {
     kl_sem *k = sem_of(s);
     if (!k) { errno = EINVAL; return -1; }
     dispatch_time_t when = dispatch_walltime(ts, 0);
-    if (dispatch_semaphore_wait(k->d, when) != 0) { errno = ETIMEDOUT; return -1; }
-    atomic_fetch_sub(&k->count, 1);
+    atomic_fetch_sub(&k->count, 1);              // claimed before blocking, as in klb_sem_wait
+    if (dispatch_semaphore_wait(k->d, when) != 0) {
+        // Given back. A post that lands meanwhile leaves its signal in the
+        // dispatch semaphore, matched by the count it raised: the next waiter
+        // takes both.
+        atomic_fetch_add(&k->count, 1);
+        errno = ETIMEDOUT;
+        return -1;
+    }
     return 0;
 }
 
