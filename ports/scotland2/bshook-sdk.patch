@@ -1,0 +1,58 @@
+--- a/shared/utils/capstone-utils.hpp
++++ b/shared/utils/capstone-utils.hpp
+@@ -6,6 +6,9 @@
+ #include <tuple>
+ #include <optional>
+ 
++#ifdef SC2_AOT_HOOKS
++extern "C" void *sc2_aot_original(const void *);
++#endif
+ namespace cs {
+ csh getHandle();
+ 
+@@ -26,6 +29,10 @@
+ };
+ 
+ auto find_through_hooks(void const* hook, uint32_t initialSearchSize, auto&& func) {
++#ifdef SC2_AOT_HOOKS
++    if (sc2_aot_original(hook))
++        return func(cs::AddrSearchPair(reinterpret_cast<uint32_t const*>(hook), initialSearchSize));
++#endif
+     // First, check to see if we are hooked.
+     auto const& logger = il2cpp_utils::Logger;
+     logger.debug("Finding through potential hook: {} and size: {}", fmt::ptr(hook), initialSearchSize);
+--- a/shared/utils/hooking.hpp
++++ b/shared/utils/hooking.hpp
+@@ -614,6 +614,9 @@
+     if constexpr (track) {
+         HookInfo info(T::name(), addr, (void*) T::hook());
+         A64HookFunction(addr, (void*) T::hook(), (void**) T::trampoline());
++#ifdef SC2_AOT_HOOKS
++        if (!*T::trampoline()) SAFE_ABORT_MSG("Prepared hook installation failed for {}", T::name());
++#endif
+         info.orig = (void*) *T::trampoline();
+         HookTracker::AddHook(info);
+     } else {
+@@ -659,6 +662,12 @@
+     }
+     auto addr = (void*) info->methodPointer;
+     auto* origAddr = const_cast<void*>(HookTracker::GetOrig(addr));
++#ifdef SC2_AOT_HOOKS
++    // Install into a prepared original entry, then publish the new deepest
++    // original in HookTracker. The old ordering stored an uninitialized pointer.
++    __InstallHook<T, L, false>(logger, origAddr);
++    if (!*T::trampoline()) SAFE_ABORT_MSG("Prepared original-entry hook failed for {}", T::name());
++#endif
+     if (origAddr != addr) { \
+         auto* hooks = const_cast<std::unordered_map<const void*, std::list<HookInfo>>*>(HookTracker::GetHooks());
+         auto itr = hooks->find(addr);
+@@ -666,7 +675,9 @@
+             itr->second.front().orig = (void*) *T::trampoline();
+         }
+     }
++#ifndef SC2_AOT_HOOKS
+     __InstallHook<T, L, false>(logger, origAddr);
++#endif
+ }
+ template<typename T, typename L>
+ requires (is_hook<T> && is_logger<L>)

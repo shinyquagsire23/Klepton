@@ -1,0 +1,14 @@
+[
+  {
+    "repository": "Tencent/rapidjson",
+    "commit": "5ec44fb9206695e5293f610b0a46d21851d0c966",
+    "url": "https://codeload.github.com/Tencent/rapidjson/tar.gz/5ec44fb9206695e5293f610b0a46d21851d0c966",
+    "sha256": "bc23236d26360ab2eccea85619068e757517269ce626c5bbc97c6881b921763a"
+  },
+  {
+    "repository": "nemtrif/utfcpp",
+    "commit": "6be08bbea14ffa0a5c594257fb6285a054395cd7",
+    "url": "https://codeload.github.com/nemtrif/utfcpp/tar.gz/6be08bbea14ffa0a5c594257fb6285a054395cd7",
+    "sha256": "30e85e1e6430335d911c6a882a2e475fbd17748cf870f94b3ee70cb35074fb48"
+  }
+]

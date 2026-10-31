@@ -10,6 +10,7 @@
 #include "klepton.h"
 #include "kl_driver.h"
 #include "kl_obbmap.h"
+#include "kl_tuned.h"
 #include "kl_egl.h"
 #include "kl_env.h"
 #include "kl_guestpoke.h"
@@ -18,12 +19,16 @@
 #include "kl_sdl2.h"
 #include "kl_gles3jni.h"
 #include "kl_jni.h"
+#include "kl_linuxproc.h"
 #include "kl_mediandk.h"
 #include "kl_opensl.h"
 #include "kl_openxr.h"
 #include "kl_ovrp.h"
 #include "kl_ovrplat.h"
+#include "kl_steamapi.h"
 #include "kl_mprobe.h"
+#include "kl_songs.h"
+#include "kl_extension.h"
 #include "kl_sample.h"
 #include "kl_slink.h"
 #include "kl_ue4.h"
@@ -72,6 +77,25 @@ static void P(FILE *out, const char *fmt, ...) {
 // already default-on for hl2 via their own target check, so they are not repeated.
 static void kl_driver_env_defaults(const kl_target *t) {
     if (!t || !t->name) return;
+    if (!strcmp(t->name, "x8016534201745429")) {
+        // Space Atlas VR resizes its GLES eyes during startup; the owner sees
+        // the scene confined to the lower-left corner with guest foveation.
+        // Diagnostic A/B: use ordinary full-eye rendering for this title.
+        setenv("KL_VRR", "0", 0);
+        // The tracked right hand can click, but its cursor is invisible.
+        // ES 3.2 produces sampler units 179..188 (invalid); test the ES 3.0
+        // rendering path before changing the hand pose or gesture mapping.
+        setenv("KL_GLES_VERSION", "3.0", 0);
+        // The startup shaders use read-only StructuredBuffers despite ES 3.0.
+        // On device: 1536 failed compiles (std430/readonly), stale images up
+        // to hundreds of milliseconds. Use the existing lossless read path.
+        setenv("KL_GLFB_SSBO_TEX", "1", 0);
+        // The optional Meta audio plugin is refused on this host. Repeated
+        // managed calls throw each frame (1753 in the round-trip test).
+        // Use the existing no-effect implementation; Wwise still owns playback.
+        setenv("KL_METAXR_AUDIO_STUB", "1", 0);
+        fprintf(stderr, "  [klepton] Space Atlas VR: guest foveation disabled for image-placement test\n");
+    }
     if (!strcmp(t->name, "hl2")) {
         // Validated Half-Life 2 VR configuration (2026-08-31): direct-array multiview
         // + forced eye-RT allocation, single-threaded material queue (threaded wedges
@@ -113,6 +137,143 @@ static void kl_driver_env_defaults(const kl_target *t) {
         setenv("KL_XASH_CVARS",
                "vr_smoothturn 1; vr_turn_angle 5; vr_height_adjust -1.5", 0);
     }
+    else if (!strcmp(t->name, "cs1")) {
+        // Counter-Strike VR (CSVR) with PlayStation VR2 Sense controllers: the
+        // game puts duck on A and jump on B, which on a Sense pair is cross for
+        // duck and circle for jump — the wrong way round for anyone used to a
+        // PlayStation pad, and what its first player here asked to have swapped.
+        // Written to userconfig.cfg at each start (see hl1 above), so the two
+        // buttons cannot be remapped in the game's own controls page while this
+        // is in force; KL_XASH_CVARS="" in the environment switches it off.
+        //
+        // vr_motion_activation 0: "use" follows the weapon. The game's default (3) makes the
+        // moment "use" is held – or the left arm is stretched – a hand pointer: the direction
+        // sent to the server is no longer the gun's but the line from the head through the
+        // left hand, and letting the arm come back sends "-use" even with the trigger held.
+        // Defusing needs "use" to keep hitting the bomb for seconds; reported from the
+        // headset as starting and breaking off at once, which is the first half second
+        // (still the gun's direction) followed by a hand that points elsewhere. With 0 the
+        // player aims the gun at the bomb, the door or the hostage and holds the trigger.
+        setenv("KL_XASH_CVARS", "vr_button_a \"+jump\"; vr_button_b \"+duck\"; vr_motion_activation 0", 0);
+    }
+    else if (!strcmp(t->name, "alyx")) {
+        // Half-Life: Alyx. The eye texture the display is offered at decides how
+        // large the engine's render targets are ALLOCATED — it rounds the offer
+        // up by ~1.18 and its automatic fidelity level then renders into a part
+        // of that, so the offer is a memory ceiling rather than a picture size.
+        // At the default cap of 3072 the first level sat at a 6.9 GB footprint
+        // with 1.3 GB left and the system reporting critical memory pressure
+        // (Vision Pro M5, 2026-10-06), while the fidelity level it settled on
+        // was drawing 2304x1920 of the 3648x2880 it had allocated. 2800 leaves
+        // room above what it draws and came to ~0.5 GB less.
+        setenv("KL_OVRP_EYE_MAX", "2800", 0);
+        // The display rate the engine is told is its FRAME BUDGET: its fidelity
+        // controller picks the largest picture whose measured frame time fits one
+        // refresh (the measurement is xrizer's, patched to be real —
+        // guestbuild/xrizer-frame-timing.py). Told the panel's own 100 Hz it has
+        // 10 ms, cannot make it at any size, and sits at its smallest picture.
+        // Frames reach the compositor on a 10 ms grid and are reprojected from
+        // there, so the engine is given a budget it can meet instead: at 60 it
+        // settles where a frame takes ~15 ms and lands every other refresh, a
+        // steady 50 a second. Lower buys resolution with frame rate, and the
+        // other way round; Documents/lx/env.txt changes it without a build.
+        setenv("KL_DISPLAY_HZ", "60", 0);
+        // Two things MoltenVK does to the engine's multisampled scene pass that
+        // cost it every sample of that pass, written to memory and read back,
+        // each frame — and that the Vulkan side can prevent (kl_vulkan.c has
+        // both stories): the pass is split in two at a barrier the engine
+        // records inside it, and it is loaded and stored instead of cleared and
+        // discarded because its render area is a few percent smaller than its
+        // attachments. Mac, first level, 2x: 17.1 -> 14.9 ms of GPU a frame.
+        setenv("KL_VK_PASS_BARRIERS", "0", 0);
+        setenv("KL_VK_WIDEN_AREA", "1", 0);
+        // MoltenVK without MTLHeaps. With them the engine's pooled device memory
+        // is one large heap per allocation whether or not it is filled, and the
+        // textures MoltenVK cannot place in a heap (every depth target) are
+        // paid for a second time beside it. The session with heaps off was the
+        // first to stay well under the app's memory limit: 2.5 GB of Metal
+        // allocations instead of ~4.5, 5.96 GB footprint, 13-14 ms of GPU a
+        // frame in a level (Vision Pro M5, 2026-10-06; not a controlled A/B).
+        setenv("MVK_CONFIG_USE_MTLHEAP", "0", 0);
+        // "It hangs for a moment now and then" — say what each such moment was
+        // (kl_stall.c). A quarter of a second is what a player notices.
+        setenv("KL_STALL_MS", "250", 0);
+        // The engine compiles each pipeline at the draw that first needs it, and
+        // the frame waits: 300-600 ms the first time a shader is seen on a
+        // device, the stalls a player meets on entering a new place. Compiled
+        // behind the frame instead (kl_vulkan.c, KL_VK_ASYNC_PIPES).
+        setenv("KL_VK_ASYNC_PIPES", "1", 0);
+        // The frame is published when the GPU has finished it rather than the
+        // guest waiting for that at xrEndFrame (kl_openxr.c, klxr_defer_*): the
+        // engine builds its next frame while this one is drawn.
+        setenv("KL_VK_FRAME_ASYNC", "1", 0);
+        // Better than behind the frame: compiled before the game starts. The
+        // system's Metal cache keeps what it has compiled, so every pipeline in
+        // a list that came with the game (Documents/klfz/*.foz, built on the
+        // Mac from the player's own shader files — tools/alyx_pipelines.py) is
+        // compiled while the start window is still up (kl_fossilize.cpp, and
+        // prepare_graphics in the app), and the game then finds it there in a
+        // few milliseconds. What the game asks for beyond the list is recorded
+        // beside it and is in the next start's. Only where the app has named
+        // the folder: a run on the host has no such place.
+        if (getenv("KL_VK_FOZ_DIR")) {
+            setenv("KL_VK_FOZ_REPLAY", "auto", 0);
+            setenv("KL_VK_FOZ_REPLAY_BLOCK", "1", 0);
+            setenv("KL_VK_FOZ_THREADS", "6", 0);
+            setenv("KL_VK_FOZ_RECORD", "auto", 0);
+            setenv("KL_VK_DEVICE_INFO", "auto", 0);
+            // The game's device, not the one xrizer opens its session with.
+            setenv("KL_VK_FOZ_APP", "Source2", 0);
+        }
+    }
+    else if (!strcmp(t->name, "x9269393463181825")) {
+        // Roboquest VR, Meta Store build (UE 5.6 mobile renderer, OpenXR on
+        // Vulkan). Its RHI thread calls xrEndFrame, and xrEndFrame waited there
+        // for the GPU to finish the frame (kl_vulkan_frame_done) before the RHI
+        // thread could start on the next one. With its multisampled scene in
+        // real memory (KL_VK_NO_TRANSIENT) that came to 40 of 90 frames a
+        // second with the GPU about a third busy and no CPU thread above 18%
+        // (on device, 2026-10-23): frames missed while nothing was at its
+        // limit. Its other build (x3151760) measured the same in the hub.
+        // Published by a worker once the GPU is done instead, as for Alyx above
+        // (kl_openxr.c, klxr_defer_*): the next frame is built while this one
+        // is drawn. KL_VK_FRAME_ASYNC=0 is the old way.
+        setenv("KL_VK_FRAME_ASYNC", "1", 0);
+    }
+    else if (!strcmp(t->name, "x9531494193591052")) {
+        // Ghost Town, from community PR #41 (sibest). Its Options buttons and
+        // the right-hand hold to recenter (KleptonControllers.swift), the
+        // TLSDESC relocations its Unity build carries, one audio output, the
+        // per-layer colour its fades are made of, the panels it submits apart
+        // from its eye-only EndFrame list, and panels it destroys taken down
+        // at once (klovrp_enq_retire).
+        setenv("KL_GHOSTTOWN_INPUT", "1", 0);
+        setenv("KL_ELF_TLSDESC", "1", 0);
+        setenv("KL_AUDIO_ONE_OUTPUT", "1", 0);
+        setenv("KL_GHOSTTOWN_OVERLAY_COLOR", "1", 0);
+        setenv("KL_OVRP_ENQ_OWNS_OVERLAYS", "1", 0);
+    }
+    else if (!strcmp(t->name, "vampire")) {
+        // Vampire: The Masquerade - Justice (UE 4.27, Vulkan). Ended by the
+        // system on entering the sanctuary for the first time: the footprint
+        // went 2.5 -> 8 GB in six seconds with no error in the log
+        // (2026-10-29). KL_TRACE_MMAP named one site in libUE4 mapping 1654
+        // blocks of 4 MB — a 1280x720 RGBA video sample each — as two
+        // discipline movies started: the engine copied the same decoded frame
+        // again on every tick (kl_jni_ue4.c, KL_MP14_NEW_FRAMES_ONLY).
+        setenv("KL_MP14_NEW_FRAMES_ONLY", "1", 0);
+    }
+    else if (!strcmp(t->name, "x5812519008825194")) {
+        // AC Nexus: ShaderWarmupManager.PopulatePSOCache is one frame that
+        // compiles every pipeline in MoltenVK and then waits for the GPU to
+        // work through them. The game got in after ~90 s three times; once the
+        // first level was finished the same frame took longer than the app's
+        // 120 s watchdog (60 s compiling, then 60+ s at the frame-end wait
+        // with the GPU still submitting), and the watchdog's SIGALRM ended
+        // every start from then on (2026-10-29). A watchdog is for a frame
+        // that never returns, not for a slow one.
+        setenv("KL_ALARM", "600", 0);
+    }
     else if (!strcmp(t->name, "wrath2")) {
         // wrath2's world never appears because the GAME thread grinds through FMOD
         // Studio bank loading (UEngine::LoadMap -> LoadBanksForMap -> loadBankFile),
@@ -124,6 +285,199 @@ static void kl_driver_env_defaults(const kl_target *t) {
         setenv("KL_USLEEP_CAP", "250", 0);   // microseconds; the FMOD poll slept 5-33 ms/call
         setenv("KL_GUEST_QOS",  "1",   0);   // USER_INITIATED instead of default
     }
+    else if (!strcmp(t->name, "walkabout") || !strcmp(t->name, "x3634830803298285")) {
+        // Demeo (x3634830803298285) is here for the same complaint, word for
+        // word a session later ("es ruckelt alle 5-10 Sekunden einmal für ca
+        // 500 ms", 2026-10-13): its first long session compiled 240 pipelines
+        // at about 300 ms each as they were first drawn, which accounts for
+        // most of the stalls in its log — and not for all of them: its owner
+        // sees them standing still in a room as well, and some were the
+        // compositor's own presents arriving late, with the app at 7.5 to 7.7
+        // of its 8.2 GB. So the watch below is on for it too.
+        //
+        // "It lags every few seconds" (a Vision Pro, 2026-10-11): the display
+        // keeps its 100 Hz, and the GAME's frames arrive 100-300 ms late now
+        // and then. Say what each such moment was — the stall watch names the
+        // threads that were busy.
+        //
+        // What the watch found in two sessions: the long ones (0.3-0.6 s) are
+        // MoltenVK compiling a shader the first time a pipeline needs it (this
+        // is a Vulkan guest). A frame that arrives one refresh late about once
+        // a second is there as well, and was there still with the managed
+        // probe gated (kl_mprobe.c) — not explained yet.
+        setenv("KL_STALL_MS", "100", 0);
+        // ...and how long its frames take against the display's period, every
+        // ten seconds (the app's frame loop), while this is being looked into.
+        setenv("KL_GUEST_FRAME_STATS", "10", 0);
+        // So its pipelines are compiled before the game starts, as Alyx's are:
+        // what a session compiled is recorded in the app's klfz folder, and
+        // the next start compiles that list while the start window is still
+        // up (kl_fossilize.cpp, prepare_graphics in the app). The first start
+        // after installing has no list and is as before. Only where the app
+        // has named the folder.
+        if (getenv("KL_VK_FOZ_DIR")) {
+            setenv("KL_VK_FOZ_REPLAY", "auto", 0);
+            setenv("KL_VK_FOZ_REPLAY_BLOCK", "1", 0);
+            setenv("KL_VK_FOZ_THREADS", "6", 0);
+            setenv("KL_VK_FOZ_RECORD", "auto", 0);
+            setenv("KL_VK_DEVICE_INFO", "auto", 0);
+        }
+    }
+    else if (!strcmp(t->name, "batman")) {
+        // "Small hitches while playing, the game stands still for a moment"
+        // (2026-10-17). Its log of twelve minutes in the story: the picture
+        // stood for 0.5 to 1.6 s eight times, and each time but two the
+        // render thread was in vkCreateGraphicsPipelines — 400 pipelines,
+        // 15 s in the compiler, the slowest 1.1 s, as new places and enemies
+        // came into view. Metal keeps what it compiled, so a place seen once
+        // is smooth the next time; a story game is mostly places seen once.
+        // The other two were enemies coming in with a dozen sound banks
+        // loaded at once. The sound itself ran without a gap.
+        //
+        // As for Walkabout and Demeo: the stall watch names what each gap
+        // was, the frame statistics say how the frames went, and a session's
+        // pipelines are recorded and compiled before the next start (after a
+        // system update has emptied Metal's cache, too). Compiling behind the
+        // frame (KL_VK_ASYNC_PIPES with KL_VK_ASYNC_RP) is a test switch, on
+        // from the start for this game (targets.py "test_on"): with it the
+        // owner's next session had no such freeze left (2026-10-17).
+        setenv("KL_STALL_MS", "100", 0);
+        setenv("KL_GUEST_FRAME_STATS", "10", 0);
+        if (getenv("KL_VK_FOZ_DIR")) {
+            setenv("KL_VK_FOZ_REPLAY", "auto", 0);
+            setenv("KL_VK_FOZ_REPLAY_BLOCK", "1", 0);
+            setenv("KL_VK_FOZ_THREADS", "6", 0);
+            setenv("KL_VK_FOZ_RECORD", "auto", 0);
+            setenv("KL_VK_DEVICE_INFO", "auto", 0);
+        }
+    }
+    else if (!strcmp(t->name, "moss") || !strcmp(t->name, "x4395292760584049")) {
+        // "Some shader stutters, in the Steam and in the Meta version"
+        // (2026-10-17). The first session of a fresh Steam copy compiled 162
+        // pipelines in four minutes, 0.3-0.7 s each, at the draw that first
+        // needed them; the second start compiled none (Metal's cache), so it
+        // is the places not seen yet on this installation. As for Arkham
+        // Shadow: what each gap was, how the frames went, and a session's
+        // pipelines recorded and compiled before the next start. Compiling
+        // behind the frame (KL_VK_ASYNC_PIPES with KL_VK_ASYNC_RP) is a test
+        // switch, on from the start for this game (targets.py "test_on"):
+        // with it the owner's next session had no compile freeze left.
+        setenv("KL_STALL_MS", "100", 0);
+        setenv("KL_GUEST_FRAME_STATS", "10", 0);
+        if (getenv("KL_VK_FOZ_DIR")) {
+            setenv("KL_VK_FOZ_REPLAY", "auto", 0);
+            setenv("KL_VK_FOZ_REPLAY_BLOCK", "1", 0);
+            setenv("KL_VK_FOZ_THREADS", "6", 0);
+            setenv("KL_VK_FOZ_RECORD", "auto", 0);
+            setenv("KL_VK_DEVICE_INFO", "auto", 0);
+        }
+    }
+    else if (!strcmp(t->name, "x5269080709783454")) {
+        // Max Mustard (Unity 2022.3 + FMOD Studio over OpenSL). FMOD produced
+        // sound in only a small fraction of its buffers — heard as near-silence
+        // with the odd quiet stutter — while the banks loaded fine. wrath2's fix
+        // class: at default QoS visionOS coalesces the mixer's short timed waits
+        // to ~33 ms, longer than one 512-frame block at 48 kHz (10.7 ms), so the
+        // output starves between blocks.
+        setenv("KL_USLEEP_CAP", "250", 0);
+        setenv("KL_GUEST_QOS",  "1",   0);
+    }
+    else if (!strcmp(t->name, "x9386827918099701")) {
+        // BattleGroupVR2 0.251 (Unity 6.2, Vulkan; fix 38, 2026-10-13). The
+        // app was ended at its per-process memory limit while the game was
+        // still starting. Three settings are the sender's answer, each seen by
+        // the sender on a Vision Pro and by nobody here; a fourth, the 2x cap
+        // on multisampling, is beside its siblings in klvk_sample_mask.
+        //
+        // MoltenVK without MTLHeaps, as for Alyx above and for the same two
+        // reasons: a pool is one heap of its full size whether or not it is
+        // filled, and every depth target is paid for a second time beside it.
+        setenv("MVK_CONFIG_USE_MTLHEAP", "0", 0);
+        // The game is told memory is short while 1.5 GiB are still free
+        // instead of 384 MiB (kl_mem_pressure_poll): what it asks for at its
+        // start came in steps larger than the smaller reserve, so the warning
+        // arrived after the allocation that ended the app. It reaches the game
+        // through Unity 6.2's own callback (kl_jni_low_memory).
+        setenv("KL_LOWMEM_FREE_MB", "1536", 0);
+    }
+    else if (!strcmp(t->name, "x8387152738076399")) {
+        // Banners & Bastions 1.0.5 (com.dropout.island; Unity 6000.3, Vulkan,
+        // Unity's OpenXR plugin with Meta's MetaXRFeature, the Interaction SDK
+        // and MR Utility Kit): a mixed-reality tabletop game. First run here
+        // (2026-10-17): it started, but the picture stayed glued to the head,
+        // no controllers showed, the room was black, and it stuttered. The
+        // same stack as DreamSpace (x9449316705178989), and the same answers.
+        //
+        // OVRPlugin's version. Told 1.60.0, MetaXRFeature never reached the
+        // native OnInstanceCreate ("[MetaXRFeature] OnInstanceCreate returned
+        // an error") and the Meta half of the SDK stayed off: its camera rig,
+        // its controllers, its passthrough (kl_ovrp.c, klovrp_version_str). It
+        // is told the version its own libOVRPlugin.so carries.
+        setenv("KL_OVRP_VERSION", "1.201.0", 0);
+        // ...and, as for every title told a plugin version this far above the
+        // 1.60.0 these answers were collected against, an entry point with no
+        // answer says UNSUPPORTED and is named once instead of ending the game
+        // (kl_ovrp.c, KL_OVRP_UNANSWERED). Its first was
+        // ovrp_SetControllerDrivenHandPoses, right after the session began:
+        // hands drawn from controllers are not something this runtime does.
+        setenv("KL_OVRP_UNANSWERED", "unsupported", 0);
+        // The room around the board: passthrough is offered, as to the other
+        // mixed-reality titles (kl_ovrp.c, klovrp_pt_on), and the app keeps the
+        // mixed space for it (KleptonTuning.swift, targetIsMixedReality).
+        setenv("KL_OVRP_PASSTHROUGH", "1", 0);
+        // Meta's MR Utility Kit (libmrutilitykitshared) carries TLSDESC
+        // relocations; refused, a NullReferenceException followed at start
+        // (kl_image.c). Loaded, it asks for a room, which is the emulated one
+        // DreamSpace gets (KL_OVRP_SCENE_ROOM, kl_ovrp.c and kl_openxr.c), and
+        // LOCAL_FLOOR is answered as for DreamSpace (kl_openxr.c), which on
+        // this stack asks for it once the Meta half is up.
+        setenv("KL_ELF_TLSDESC", "1", 0);
+        setenv("KL_OVRP_SCENE_ROOM", "1", 0);
+        setenv("KL_XR_LOCAL_FLOOR", "1", 0);
+        // The stutter: 145 pipelines compiled at the draw that first needed
+        // each, about 300 ms apiece, in a 20-second first session. Recorded,
+        // and compiled while the start window is up from the next start on,
+        // as for Demeo above. Only where the app has named the folder.
+        if (getenv("KL_VK_FOZ_DIR")) {
+            setenv("KL_VK_FOZ_REPLAY", "auto", 0);
+            setenv("KL_VK_FOZ_REPLAY_BLOCK", "1", 0);
+            setenv("KL_VK_FOZ_THREADS", "6", 0);
+            setenv("KL_VK_FOZ_RECORD", "auto", 0);
+            setenv("KL_VK_DEVICE_INFO", "auto", 0);
+        }
+    }
+    if (!strcmp(t->name, "x3231001163584154")) {
+        // Warhammer 40,000: Battle Sister: its lightmaps are HDR ASTC (Unity's
+        // GraphicsFormat 145), which Unity takes as supported only when the
+        // extension string names GL_KHR_texture_compression_astc_hdr — named
+        // here only if ANGLE names it (kl_egl.c, the backend candidates).
+        setenv("KL_GL_BACKEND_EXT", "1", 0);
+        // Its BLAST shaders are rewritten at glShaderSource (kl_glfb.c,
+        // KL_GLFB_PROBE_CUBE_ARRAY, KL_GLFB_NO_GRADING_LUT); a program Unity
+        // cached as a binary skips that, and keeps whatever an earlier
+        // toolchain made of it. Always from source, so a change reaches them.
+        setenv("KL_GLFB_PROGRAM_BINARY", "0", 0);
+    }
+    // Every Unity title under the profile for untested games gets what
+    // Walkabout, Demeo, Arkham Shadow and Moss were given for their hitches:
+    // the stall watch names what each gap was, the frame statistics say how
+    // the frames went, and a session's pipelines are recorded and compiled
+    // before the next start. LEGO Bricktales: "the picture stops for a moment
+    // now and then" (2026-10-18). The KL_VK_* lines only act on a Vulkan guest.
+    {
+        extern int kl_untested_profile(void);
+        if (t->kind == KL_GUEST_UNITY && kl_untested_profile()) {
+            setenv("KL_STALL_MS", "100", 0);
+            setenv("KL_GUEST_FRAME_STATS", "10", 0);
+            if (getenv("KL_VK_FOZ_DIR")) {
+                setenv("KL_VK_FOZ_REPLAY", "auto", 0);
+                setenv("KL_VK_FOZ_REPLAY_BLOCK", "1", 0);
+                setenv("KL_VK_FOZ_THREADS", "6", 0);
+                setenv("KL_VK_FOZ_RECORD", "auto", 0);
+                setenv("KL_VK_DEVICE_INFO", "auto", 0);
+            }
+        }
+    }
 }
 
 void kl_driver_init(const kl_target *t, const char *libdir, kl_slink_door door) {
@@ -132,6 +486,53 @@ void kl_driver_init(const kl_target *t, const char *libdir, kl_slink_door door) 
     g_error[0] = 0;
     snprintf(g_libdir, sizeof g_libdir, "%s", libdir ? libdir : "");
     kl_driver_env_defaults(t);
+    if (t && !strcmp(t->name, "x2249318828413747")) {
+        // Device log: ANGLE supplies ES 3.0, while claiming 3.2 makes Unity
+        // select compute skinning. Compute shader creation then fails and
+        // kernels remain invalid. Describe the backend this title actually
+        // has so Unity can select its supported skinning/rendering path.
+        kl_egl_set_gles_version(3, 0);
+        fprintf(stderr, "  [gl] Space Channel: GLES 3.0 capability profile (ANGLE backend)\n");
+    }
+    if (t && !strcmp(t->name, "x9449316705178989")) {
+        // DreamSpace: the same story. Told 3.2, Unity skinned on the GPU, every
+        // Internal-Skinning kernel was invalid (~160k log lines a session) and a
+        // vertex shader reading a storage buffer failed to compile on ES 3.0 — a
+        // theme's tree showed its leaves and no trunk (2026-10-16). Told 3.0,
+        // Unity takes the paths this backend has.
+        kl_egl_set_gles_version(3, 0);
+        fprintf(stderr, "  [gl] DreamSpace: GLES 3.0 capability profile (ANGLE backend)\n");
+    }
+    if (t && !strcmp(t->name, "x3882524545155280")) {
+        // Catan VR (Unity 2018.4, which has no disable-gpu-skinning boot
+        // switch): told 3.2, it skinned the player's hands with a compute
+        // shader, glCreateShader(COMPUTE) was refused (shader 0, "GLSL
+        // compilation failed, no infolog provided" x12) and only the wrist
+        // cuffs were drawn (2026-10-17).
+        kl_egl_set_gles_version(3, 0);
+        fprintf(stderr, "  [gl] Catan VR: GLES 3.0 capability profile (ANGLE backend)\n");
+    }
+    if (t && !strcmp(t->name, "x3919415921458774")) {
+        // Gods of Gravity (Unity 2021.3.45f2): told 3.2, its wand models came
+        // out as large flat surfaces of a different colour each run, from the
+        // right hand out across the scene (headset, 2026-10-19/20; not the
+        // pins, VFX Graph, base-vertex draws, CPU skinning or non-finite
+        // positions, each switched off on its own). Told 3.0, the Mac run draws
+        // the wands that were missing there under 3.2.
+        kl_egl_set_gles_version(3, 0);
+        fprintf(stderr, "  [gl] Gods of Gravity: GLES 3.0 capability profile (ANGLE backend)\n");
+    }
+    // KL_GLES_VERSION=<major>.<minor> — the GLES level described to any guest,
+    // for trying a title on the 3.0 profile above without a build.
+    {
+        const char *v = getenv("KL_GLES_VERSION");
+        int ma = 0, mi = 0;
+        if (v && sscanf(v, "%d.%d", &ma, &mi) == 2 && ma >= 2 && ma <= 3 && mi >= 0 && mi <= 2) {
+            kl_egl_set_gles_version(ma, mi);
+            fprintf(stderr, "  [gl] KL_GLES_VERSION: GLES %d.%d described\n", ma, mi);
+        }
+    }
+
 }
 
 kl_guest_kind kl_driver_kind(void) {
@@ -140,6 +541,67 @@ kl_guest_kind kl_driver_kind(void) {
 
 const char      *kl_driver_error(void)  { return g_error; }
 const char      *kl_driver_target_name(void) { return g_target ? g_target->name : NULL; }
+// Moss and Moss: Book II (x4395292760584049): one studio, one engine (UE 4.27.2,
+// Polyarc), the same device profiles and the same picture. The settings Moss was
+// tuned to on the headset hold for both; the Steam build's own ones stay Moss's.
+int kl_driver_target_is_moss(void) {
+    const char *t = g_target ? g_target->name : NULL;
+    return t && (!strcmp(t, "moss") || !strcmp(t, "x4395292760584049"));
+}
+
+// ---- The profile for untested games --------------------------------------
+//
+// A store title nobody here has looked at runs as a generic target: it gets
+// its engine's defaults and none of the per-title answers, and everything the
+// runtime does not know ends the run by name. That is right while a title is
+// being brought up, and it is why most untested titles stop at start. Of the
+// first 52 fixes users sent in, about twenty were a Java method with no answer,
+// about fifteen an OVRPlugin entry point or import with none, nine a missing
+// logged-in user, six an OVRPlugin version too old for the game's own C#, six
+// Unity samplers on the wrong texture units, and several GPU skinning or a
+// TLSDESC relocation.
+//
+// So a store title (x<app id>) that is not in kl_tuned.h gets better defaults:
+// unknown OVRPlugin entry points answer UNSUPPORTED (klovrp_soft_unanswered),
+// unknown Java methods and fields answer zero (klj_soft_unknown), OVRPlugin
+// reports the version the game ships (KL_OVRP_GUEST_VERSION, read from its
+// libOVRPlugin.so when the app is built), an offline player and an empty
+// purchase list (kl_ovrplat.c), TLSDESC relocations (kl_image.c), and for a
+// Unity guest on GLES its uniform pins bound at link (KL_GLFB_BIND_PINS) and
+// skinning on the CPU (klj_boot_config_extra). Each of those keeps its own
+// switch, which still wins. KL_UNTESTED=0 turns the profile off, =1 on for any
+// target. A title in kl_tuned.h keeps exactly what it was tested with.
+static int kl_target_is_store_id(const char *t) {
+    if (!t || t[0] != 'x' || !t[1]) return 0;
+    for (const char *p = t + 1; *p; p++) if (*p < '0' || *p > '9') return 0;
+    return 1;
+}
+static int kl_tuned_cmp(const void *key, const void *el) {
+    return strcmp((const char *)key, *(const char *const *)el);
+}
+int kl_target_tuned(const char *t) {
+    return t && bsearch(t, kl_tuned_targets, sizeof kl_tuned_targets / sizeof kl_tuned_targets[0],
+                        sizeof kl_tuned_targets[0], kl_tuned_cmp) != NULL;
+}
+// The same answer for a named target, for the start window, which asks before
+// the driver has one.
+int kl_untested_target(const char *t) {
+    return kl_env_on("KL_UNTESTED", kl_target_is_store_id(t) && !kl_target_tuned(t));
+}
+int kl_untested_profile(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+    const char *t = kl_driver_target_name();
+    if (!t && !getenv("KL_UNTESTED")) return 0;   // asked before the target is known: not cached
+    v = kl_untested_target(t);
+    if (v)
+        fprintf(stderr, "  [klepton] %s: no title here has been tested — the profile for untested "
+                        "games is on (KL_UNTESTED): soft answers for unknown OVRPlugin and Java "
+                        "calls, the game's own OVRPlugin version, an offline player, TLSDESC, and "
+                        "for Unity on GLES its uniform pins and skinning on the CPU\n",
+                t ? t : "?");
+    return v;
+}
 int              kl_driver_gap_only(void) { return g_gap_only; }
 unsigned         kl_driver_frames(void) { return g_frames; }
 void             kl_driver_note_frame(void) { g_frames++; }
@@ -153,6 +615,7 @@ int kl_driver_owns_frame_loop(void) {
     case KL_GUEST_JKXR:
     case KL_GUEST_NATIVE:
     case KL_GUEST_SDL2:
+    case KL_GUEST_LINUX:
     case KL_GUEST_GLES3JNI: return 1;
     default:            return 0;
     }
@@ -244,7 +707,10 @@ static int boot_unity(FILE *out) {
     phase("initJni");
     P(out, "\n=== UnityPlayer.initJni%s -> %s-arg call ===\n",
       ijsig ? ijsig : "<sig unrecorded>", initJni3 ? "3" : initJni2 ? "2" : "1");
-    void *thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+    // The shared singleton for the same reason the Context is one: this is the
+    // object UnityPlayerActivity keeps in mUnityPlayer, and the guest reads it
+    // back through that field. See kl_jni.h.
+    void *thiz = kl_jni_unity_player();
     kl_jni_local_frame_push();
     if (initJni3)
         ((void (*)(void *, void *, void *, int, void *))initJni)(
@@ -403,7 +869,22 @@ static int boot_gles3jni(FILE *out) {
     return 0;
 }
 
+// The Linux process door. "Boot" is where its world is put together — mounts,
+// links, environment — and stops short of starting it, like every other door's.
+// KL_LX_ROOT is the staged tree and KL_LX_DYLIBS where the translations are; the
+// app sets both from its own bundle and container.
+static int boot_linux(FILE *out) {
+    phase("linux configure");
+    if (kl_linuxproc_configure(kl_env_str("KL_LX_ROOT", NULL), kl_env_str("KL_LX_DYLIBS", NULL),
+                               out) != 0)
+        return fail(kl_linuxproc_error());
+    if (g_gap_only) return 0;
+    P(out, "\n=== EXIT CRITERION MET: the Linux process is described and its tree is staged ===\n");
+    return 0;
+}
+
 int kl_driver_boot(FILE *out) {
+    if (kl_extension_start() != 0) return fail(kl_extension_error());
     if (!g_target) return fail("kl_driver_init was not called");
     g_gap_only = kl_env_on("KL_GAP_ONLY", 0);
     int rc;
@@ -413,6 +894,7 @@ int kl_driver_boot(FILE *out) {
     case KL_GUEST_JKXR:      rc = boot_jkxr(out);      break;
     case KL_GUEST_NATIVE:    rc = boot_native(out);    break;
     case KL_GUEST_SDL2:      rc = boot_sdl2(out);      break;
+    case KL_GUEST_LINUX:     rc = boot_linux(out);     break;
     case KL_GUEST_GLES3JNI:  rc = boot_gles3jni(out);  break;
     default:                 rc = boot_unity(out);     break;
     }
@@ -466,7 +948,8 @@ static void sample_start_if_asked(void) {
 }
 
 static int begin_unity(FILE *out) {
-    g_thiz = kl_jni_new_object("com/unity3d/player/UnityPlayer");
+    // The SAME player initJni ran on, not a second instance — see kl_jni.h.
+    g_thiz = kl_jni_unity_player();
     if (!g_thiz) return fail("kl_driver_boot must run first");
 
     // Index the OBB's audio banks by basename (NULL base = no UE4 loose-path
@@ -617,6 +1100,15 @@ static int begin_native(FILE *out) {
     return 0;
 }
 
+static int begin_linux(FILE *out) {
+    phase("linux exec");
+    P(out, "\n=== starting the Linux process ===\n");
+    if (kl_linuxproc_begin(out) != 0) return fail(kl_linuxproc_error());
+    sample_start_if_asked();
+    phase("linux process");
+    return 0;
+}
+
 int kl_driver_lifecycle_begin(FILE *out) {
     if (!g_target) return fail("kl_driver_init was not called");
     switch (kl_driver_kind()) {
@@ -625,9 +1117,48 @@ int kl_driver_lifecycle_begin(FILE *out) {
     case KL_GUEST_JKXR:      return begin_jkxr(out);
     case KL_GUEST_NATIVE:    return begin_native(out);
     case KL_GUEST_SDL2:      return begin_sdl2(out);
+    case KL_GUEST_LINUX:     return begin_linux(out);
     case KL_GUEST_GLES3JNI:  return begin_gles3jni(out);
     default:                 return begin_unity(out);
     }
+}
+
+// KL_UNITY_QUIT_TEARDOWN: when nativeRender first answers false (the game's
+// own quit), give Unity the end Android would: the game's preferences saved,
+// then nativePause, then nativeDone, on the thread that just ran nativeRender.
+// nativeRender is dropped after it, so the engine that was torn down is never
+// called again whatever the frame loop does next.
+//
+// Gun Club VR (x2285803881494677, build 410) is the one title it was run with,
+// on its sender's headset (fix 44, 2026-10-15; not run here): its in-game Exit
+// left its settings at their old values, since pause and teardown alone wrote
+// nothing, and with TBMPrefs.Save in front of them they were kept across a
+// restart. Default on for that title only, alongside KL_UNITY_QUIT_EXITS.
+static int unity_quit_teardown(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_UNITY_QUIT_TEARDOWN", t && strcmp(t, "x2285803881494677") == 0);
+    }
+    return v;
+}
+
+static void unity_lifecycle_call(const char *name) {
+    void *fn = unity_lifecycle_native(name);
+    if (!fn) { fprintf(stderr, "[guest] quit: %s not registered\n", name); return; }
+    kl_jni_local_frame_push();
+    ((void (*)(void *, void *))fn)(kl_jni_env(), g_thiz);
+    kl_jni_local_frame_pop();
+    fprintf(stderr, "[guest] quit: %s returned\n", name);
+}
+
+static void unity_quit_teardown_run(void) {
+    fprintf(stderr, "[guest] nativeRender returned false: saving and tearing down "
+                    "(KL_UNITY_QUIT_TEARDOWN)\n");
+    kl_mprobe_gunclub_save_preferences();
+    unity_lifecycle_call("nativePause");
+    unity_lifecycle_call("nativeDone");
+    g_render = NULL;
 }
 
 int kl_driver_frame(void) {
@@ -649,6 +1180,14 @@ int kl_driver_frame(void) {
     int r = ((int8_t (*)(void *, void *))g_render)(kl_jni_env(), g_thiz);
     kl_jni_local_frame_pop();
     kl_jni_drain_ui_tasks();
+    kl_jni_audioinaec_pump();
+    if (r == 0 && unity_quit_teardown()) {
+        // Nothing else runs against the engine this frame: no probes, no songs.
+        unity_quit_teardown_run();
+        if (g_alarm) alarm(0);
+        g_frames++;
+        return r;
+    }
     // Android's low-memory notification: one task_info call, and the guest drops
     // its caches when the footprint crosses the reported budget.
     kl_mem_pressure_poll();
@@ -657,6 +1196,11 @@ int kl_driver_frame(void) {
     // pump). Between frames on the thread that just ran one, which is where
     // managed calls are safe.
     kl_mprobe_tick(g_frames);
+    // AC Nexus's own half-rate spin, taken out (self-gated on the target).
+    kl_mprobe_nexus_frame_budget(g_frames);
+    // Custom levels, from the same seat and for the same reason. Self-gated on a
+    // CustomLevels directory existing, so every other guest pays one stat().
+    kl_songs_tick(g_frames);
     if (g_alarm) alarm(0);
     g_frames++;
     return r;
@@ -671,6 +1215,7 @@ double kl_driver_pump(double seconds, const volatile int *quit) {
     case KL_GUEST_JKXR: return kl_jkxr_pump(seconds, quit);
     case KL_GUEST_NATIVE: return kl_native_pump(seconds, quit);
     case KL_GUEST_SDL2: return kl_sdl2_pump(seconds, quit);
+    case KL_GUEST_LINUX: return kl_linuxproc_pump(seconds, quit);
     case KL_GUEST_GLES3JNI: return kl_gles3jni_pump(seconds, quit);
     default:            return 0.0;
     }
@@ -691,6 +1236,10 @@ double kl_driver_pump_default(void) {
     case KL_GUEST_SDL2:
     case KL_GUEST_GLES3JNI:  return kl_env_str("KL_NATIVE_WAIT", NULL)
                                   ? strtod(getenv("KL_NATIVE_WAIT"), NULL) : 5.0;
+    // A minute: long enough for a small program to finish and for an engine to
+    // say how far it gets without a compositor.
+    case KL_GUEST_LINUX:     return kl_env_str("KL_LX_WAIT", NULL)
+                                  ? strtod(getenv("KL_LX_WAIT"), NULL) : 60.0;
     default:                 return 0.0;
     }
 }
@@ -721,6 +1270,10 @@ void kl_driver_report(FILE *out) {
         fprintf(out, "\n=== the SDL2 run ===\n");
         kl_sdl2_report(out);
         return;
+    case KL_GUEST_LINUX:
+        fprintf(out, "\n=== the Linux process run ===\n");
+        kl_linuxproc_report(out);
+        return;
     case KL_GUEST_GLES3JNI:
         fprintf(out, "\n=== the GLES3JNILib run ===\n");
         kl_gles3jni_report(out);
@@ -736,6 +1289,7 @@ void kl_driver_report(FILE *out) {
     kl_mediandk_report(out);
     kl_ovrp_report(out);
     kl_ovrplat_report(out);
+    kl_steamapi_report(out);
     kl_openxr_report(out);
     kl_madv_report();
     kl_mem_report();

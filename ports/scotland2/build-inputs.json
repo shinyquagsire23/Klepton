@@ -1,0 +1,253 @@
+{
+  "schema": 1,
+  "sources": [
+    {
+      "file": "flamingo-461993fea629.zip",
+      "url": "https://codeload.github.com/sc2ad/Flamingo/zip/461993fea629790bf499f41e807b00db25b0a148",
+      "sha256": "e2e192eeba8dd5b5ab0e333d8bbda7ae23bd465c6e4e0ca5ecd0325770a4524c",
+      "destination": "flamingo",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "bshook-dd9f4cf0565f.zip",
+      "url": "https://codeload.github.com/QuestPackageManager/beatsaber-hook/zip/dd9f4cf0565ff46f9c2844a1512bc1786a7f2446",
+      "sha256": "35d6ce2ae65540338f4fc05c33e8cfeb3e86b9fbd8f8356199a5fe66c3ac2599",
+      "destination": "bshook",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "paperlog-65c4b3c9d19c.zip",
+      "url": "https://codeload.github.com/Fernthedev/paperlog/zip/65c4b3c9d19c7bcd833629933b23d21099852c0d",
+      "sha256": "1d9fe494cee350a318859e64d94c87c533c85d20d1ce5b5aa282d43456991cba",
+      "destination": "paperlog",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "fmt-11.0.2.zip",
+      "url": "https://codeload.github.com/fmtlib/fmt/zip/refs/tags/11.0.2",
+      "sha256": "7aa4b58e361de10b8e5d7b6c18aebd98be1886ab3efe43e368527a75cd504ae4",
+      "destination": "fmt",
+      "stripComponents": 1,
+      "patch": "ports/scotland2/fmt-apple.patch"
+    },
+    {
+      "file": "rapidjson-5ec44fb.tar.gz",
+      "url": "https://codeload.github.com/Tencent/rapidjson/tar.gz/5ec44fb9206695e5293f610b0a46d21851d0c966",
+      "sha256": "bc23236d26360ab2eccea85619068e757517269ce626c5bbc97c6881b921763a",
+      "destination": "rapidjson",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "utfcpp-6be08bb.tar.gz",
+      "url": "https://codeload.github.com/nemtrif/utfcpp/tar.gz/6be08bbea14ffa0a5c594257fb6285a054395cd7",
+      "sha256": "30e85e1e6430335d911c6a882a2e475fbd17748cf870f94b3ee70cb35074fb48",
+      "destination": "utfcpp",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "bs-cordl-3b1bf58.tar.gz",
+      "url": "https://codeload.github.com/QuestPackageManager/bs-cordl/tar.gz/3b1bf58a4cb633bc7ec36913a298397e8541885a",
+      "sha256": "afcdf1b6baf6176b95b28b0062993cfe1b5307889ec329f61093fe44812ad477",
+      "destination": "bs-cordl",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "sombrero-2be4750.tar.gz",
+      "url": "https://codeload.github.com/Fernthedev/Sombrero-quest/tar.gz/2be47500c6ef70d501c7a95ecbcbf08fc56ac6c7",
+      "sha256": "b7f212608ca75490e0f910a6b85752c70a078b690937a6ead2d05d74acd2ba5f",
+      "destination": "sombrero",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "kaleb-01e34ea.tar.gz",
+      "url": "https://codeload.github.com/RedBrumbler/Kaleb/tar.gz/01e34eab1a1bf34c899485a9d334aa2c772623bc",
+      "sha256": "b89e641db2992aa9954d264bf0d36b76b6774dce8fd28bf1575ccfbb7ef35b1d",
+      "destination": "kaleb",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "gif-lib-019805d.tar.gz",
+      "url": "https://codeload.github.com/RedBrumbler/gif-lib-QPM/tar.gz/019805d88c61f150f74655a98a9f50f240d54b35",
+      "sha256": "47ca916dad37a7d8b659d3e242ee1197b70afffa718cbb3ed92764b553888727",
+      "destination": "gif-lib",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "tinyxml2-3a9698d.tar.gz",
+      "url": "https://codeload.github.com/MillzyDev/NDK-tinyxml2/tar.gz/3a9698dedab1e1e77e2a4b91ff55483ca6498399",
+      "sha256": "f4e0b20914c686bceff24f140ef62310fa8ae53ed38215be14e3b2531c640681",
+      "destination": "tinyxml2",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "EasyGifReader-5203c99.tar.gz",
+      "url": "https://codeload.github.com/Chlumsky/EasyGifReader/tar.gz/5203c993636353d8d817f5facd62ac71338aaa29",
+      "sha256": "6ad43ad52dd49c016461d5656442f6435e48b06dc50b3255ede2700a38c12161",
+      "destination": "EasyGifReader",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "cppcodec-8019b8b.tar.gz",
+      "url": "https://codeload.github.com/tplgy/cppcodec/tar.gz/8019b8b580f8573c33c50372baec7039dfe5a8ce",
+      "sha256": "2547d492dfc32bdd3e12674114d52f054efa0b6acbf3bbff679f94ef1cbcf844",
+      "destination": "cppcodec",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "css-color-parser-cpp-9d28a41.tar.gz",
+      "url": "https://codeload.github.com/RedBrumbler/css-color-parser-cpp/tar.gz/9d28a41027e919930c706b3e59f75c6bfc521638",
+      "sha256": "43c41acb3b00fe6ba153a6b89a43e84a84ed5173b2c3a4468bb010a8d434e785",
+      "destination": "css-color-parser-cpp",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "config-utils-bbc37cb.tar.gz",
+      "url": "https://codeload.github.com/darknight1050/config-utils/tar.gz/bbc37cb19eaf34d07650704aaca2bd5664338dea",
+      "sha256": "21b90b068b22801ed5717999d8ec0dc8bbe278f9514ddc6044f8c5971011f77a",
+      "destination": "config-utils",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "rapidjson-macros-27cd571.tar.gz",
+      "url": "https://codeload.github.com/Metalit/RapidjsonMacros/tar.gz/27cd571767065192387145912fa216b7abe87915",
+      "sha256": "4a9c654ac6a78110f8a8ca26059fbf194d86818d943fa891f06b19360ba93ddf",
+      "destination": "rapidjson-macros",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "zip-songdownloader-f72dce2.tar.gz",
+      "url": "https://codeload.github.com/kuba--/zip/tar.gz/f72dce22bd25d10f8575ec54cf51bf5a5fdcb5ba",
+      "sha256": "e40a6392280dacf2b0ded4045db79f15ad71a705a015df441c49aa8bbbeac210",
+      "destination": "zip-songdownloader",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "autohooks-a3c6b4d.tar.gz",
+      "url": "https://codeload.github.com/DanTheMan827-BeatSaber/QPM.AutoHooks/tar.gz/a3c6b4d88876d0a29545d499b4c7abf35feb5175",
+      "sha256": "34d56389ee360bd3934d11efc190f5bb5d780069a7b9526f103b9c85d7e85db0",
+      "destination": "autohooks",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "libil2cpp_0.4.0.zip",
+      "url": "https://cdn.frozenalex.com/libil2cpp_0.4.0.zip",
+      "sha256": "504709328fea8dc9af183c4d4ad1cd78585c307c80440416f0e7cb169918671c",
+      "destination": "libil2cpp",
+      "stripComponents": 0,
+      "patch": null
+    },
+    {
+      "file": "libcryptopp-99c8f2a.tar.gz",
+      "url": "https://codeload.github.com/darknight1050/cryptopp-qpm/tar.gz/99c8f2aeb72234dd1b7989b0e8da0089d88711a0",
+      "sha256": "2a66ee2e1beb7934efc2fb93dac9ea6e3cd3b408287f0f16401c49fc167c9679",
+      "destination": "libcryptopp",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "libcryptopp-8.5.0.a",
+      "url": "https://github.com/darknight1050/cryptopp-qpm/releases/download/v8.5.0/libcryptopp.a",
+      "sha256": "1d7e2537909328ec78060072d50f1344f50a6cfd68e0729a621c673b3b1905f5",
+      "destination": null,
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "libcurl-a079bdc.tar.gz",
+      "url": "https://codeload.github.com/darknight1050/openssl-curl-android/tar.gz/a079bdcdf8b4ecd4a44baa32fbd7efa96a5e6641",
+      "sha256": "d42a5950b241de26d9bdeaa27562c1dc29097425ec1db37ab432d02aa61db514",
+      "destination": "libcurl-7.78.0",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "libcurl-7.78.0.a",
+      "url": "https://github.com/darknight1050/openssl-curl-android/releases/download/v7.78.0/libcurl.a",
+      "sha256": "4c19c42982f5c512337ddb9f2e035fee256b9de3e5f0269877a0e1ef1ae24102",
+      "destination": null,
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "libcurl-345e207.tar.gz",
+      "url": "https://codeload.github.com/darknight1050/openssl-curl-android/tar.gz/345e2073b1bb503c1f4ca0ae71853a53c2bbef56",
+      "sha256": "652a87dd374154dc90b91fd405d6c323df72bac19fdc4ab01fa82ab5baebb667",
+      "destination": "libcurl-8.5.0",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "libcurl-8.5.0.a",
+      "url": "https://github.com/darknight1050/openssl-curl-android/releases/download/v8.5.0/libcurl.a",
+      "sha256": "79f931c1eabdf5cdfa4be6c55110dff3048aaef004539a040f4c22a1309f9b17",
+      "destination": null,
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "capstone-qpm-source.zip",
+      "url": "https://codeload.github.com/sc2ad/capstone-qpm/zip/914496e27746bd307c712f5a979d71cea69ead2f",
+      "sha256": "3112f1c33d3c1b0b6966e4c58735b2d4a12b13eff3c0d0d2d601704aa7ef781c",
+      "destination": "capstone-qpm/source",
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "capstone-qpm/libcapstone.a",
+      "url": "https://github.com/sc2ad/capstone-qpm/releases/download/v0.1.0/libcapstone.a",
+      "sha256": "00c760cf5e6c8ee9159d42dfa3891e01889d17794fcbe3e0e2332a40e5f764aa",
+      "destination": null,
+      "stripComponents": 1,
+      "patch": null
+    },
+    {
+      "file": "protobuf-f0dc78d.tar.gz",
+      "url": "https://codeload.github.com/protocolbuffers/protobuf/tar.gz/f0dc78d7e6e331b8c6bb2d5283e06aa26883ca7c",
+      "sha256": "d594b561fb41bf243233d8f411c7f2b7d913e5c9c1be4ca439baf7e48384c893",
+      "destination": "protobuf",
+      "stripComponents": 1,
+      "patch": null,
+      "version": "3.21.12",
+      "commit": "f0dc78d7e6e331b8c6bb2d5283e06aa26883ca7c",
+      "reason": "Exact version from SongDetails 1.0.4 vcpkg.json; source rebuilding required to fix TLS"
+    },
+    {
+      "file": "brotli-ed738e8.tar.gz",
+      "url": "https://codeload.github.com/google/brotli/tar.gz/ed738e842d2fbdf2d6459e39267a633c4a9b2f5d",
+      "sha256": "aaa739962a45b508b2e783b915e6b2b57ed3b12bd4b0feac73acfb144dffa54f",
+      "destination": "brotli",
+      "stripComponents": 1,
+      "patch": null,
+      "version": "1.1.0",
+      "commit": "ed738e842d2fbdf2d6459e39267a633c4a9b2f5d",
+      "reason": "Exact version from SongDetails 1.0.4 vcpkg.json; source rebuilding required to fix TLS"
+    }
+  ],
+  "ndk": {
+    "version": "27.2.12479018",
+    "release": "r27c",
+    "url": "https://dl.google.com/android/repository/android-ndk-r27c-darwin.zip",
+    "manifest": "https://dl.google.com/android/repository/repository2-3.xml",
+    "sha1": "0217c10ffbec496bb9fbfbb3c6fc2477c6b77297",
+    "sha256": "8c5685457c58a88527367d46d3f14e8c727d962c39f85344cff0c0768a73c3b7",
+    "size": 836128272,
+    "purpose": "Android C++ ABI bridge; supplied beatsaber-hook binary contains r27c identifier."
+  }
+}

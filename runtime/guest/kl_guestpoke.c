@@ -16,6 +16,7 @@
 // and BOTH drivers call it.
 #include "kl_guestpoke.h"
 #include "klepton.h"
+#include "kl_guestpatch.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -39,9 +40,11 @@
 // Matches 20NN.N[N].N[N]<a|b|f|p>N... at b+i, and returns the length of the
 // match, or 0. `want_rev` additionally requires the '_<revision>' suffix that
 // makes a stamp the build's own rather than a version merely mentioned.
+// Unity 6 counts differently — "6000.3.22f1_1c726e1fb402" — and is matched as
+// well; read as "20NN" only, such a build reported the decoy "2018.3.0a1".
 static size_t unity_version_at(const char *b, size_t n, size_t i, int want_rev) {
     if (i + 10 >= n) return 0;
-    if (b[i] != '2' || b[i + 1] != '0') return 0;
+    if ((b[i] != '2' && b[i] != '6') || b[i + 1] != '0') return 0;
     size_t j = i + 2;
     if (!isdigit((unsigned char)b[j]) || !isdigit((unsigned char)b[j + 1])) return 0;
     j += 2;
@@ -98,6 +101,32 @@ static size_t unity_version_at(const char *b, size_t n, size_t i, int want_rev) 
 // carries a revision is one this binary was built from rather than one it merely
 // mentions. The bare-string scan stays as the fallback, so a guest whose libunity
 // has no stamped revision behaves exactly as it did before.
+// Does the LOADED libunity carry unity-texunit-mask (kl_guestpatch.c)? Asked
+// of the image as it is mapped, not of a flag: on the headset the patch was
+// written offline by klepton-ld and nothing at run time remembers that, and on
+// the host the loader may have been told KL_GUEST_PATCH=0. kl_glfb masks
+// sampler units only when this says yes, because the two halves have to agree
+// — a shader sampling unit 3 while Unity bound the texture to 35 is the same
+// black surface the patch exists to fix.
+struct tu_ctx { const uint8_t *base; size_t span; };
+static uint32_t *tu_at(void *c_, uint64_t va) {
+    struct tu_ctx *c = c_;
+    if (va + 4 > c->span) return NULL;
+    return (uint32_t *)(uintptr_t)(c->base + va);
+}
+int kl_texunit_mask_active(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+    kl_image *u = kl_find_image("libunity.so");
+    if (!u) return 0;                              // asked too early: do not cache
+    struct tu_ctx c = { (const uint8_t *)kl_base(u), kl_span(u) };
+    v = kl_gp_texunit_state(tu_at, &c) == 2;
+    fprintf(stderr, "  [poke] texture units: %s\n", v
+            ? "libunity masks them & 31 at the bind; sampler uniforms are masked to match"
+            : "libunity is not masked (unity-texunit-mask not applied); sampler units pass through");
+    return v;
+}
+
 static const char *unity_version(void) {
     static char ver[32];
     static int done;
@@ -187,8 +216,66 @@ static int addr_mapped(const void *p, size_t len) {
 // dispatches through. The process then dies in an unrelated subsystem thousands
 // of frames later, on device and in the viewer alike, branching through a slot
 // holding whatever the page held. Stale unit-0 textures are the lesser fault.
-struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; int use; };
+//
+// `target`, when set, narrows `use` to that one target: the offsets belong to
+// the Unity build, but whether raising the cap is safe was shown per title
+// (Beat Saber 1.40 is a 2022.3 build that dies when it is raised).
+struct poke_cap_row { const char *ver; uint32_t singleton; uint32_t field; int use;
+                      const char *target; };
 static const struct poke_cap_row k_poke_caps[] = {
+    // Unity 2021.3.45f2 — Shave & Stuff 1.12.3.2
+    // (x7532973430077887, 2026-10-15). The base game runs after CPU skinning,
+    // but dynamic hair colours and parts of the salon menu sample stale unit-0
+    // textures while the engine reports "Invalid texture unit!" continuously.
+    // Measured from this title's own libunity by the recipe above:
+    //   0x1487c52  "OpenGL Error: Invalid texture unit!"
+    //   0xb8fc34   bl 0x4b0fc4            ; the singleton getter
+    //   0xb8fc38   ldr w8, [x0, #0xec]    ; the cap
+    //   0xb8fc3c   cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x4b0fc4   adrp x8, 0x18f4000 / ldr x0, [x8, #0xf40]
+    // 0x18f4f40 is in the final RW LOAD's BSS (file-backed end 0x1892c78,
+    // memory end 0x1982250). The 12-byte unit cache starts at 0x28 and its
+    // active-unit field is at 0x330, leaving exactly 64 safe entries.
+    { "2021.3.45f2", 0x18f4f40, 0xec, 1, "x7532973430077887" },
+
+    // Space Channel 5 VR 1.0.5 / Unity 2021.3.24f1, measured from its ELF:
+    // 7c06c0 queries MAX_COMBINED_TEXTURE_IMAGE_UNITS, then 7c06dc clamps
+    // to 32 and 7c06e0 writes field ec. SetTexture at 7a3a14 rejects against
+    // that field; getter 2932ec loads the singleton at 1393240.
+    // Its 12-byte texture cache starts at 28 and ends before active-unit field
+    // 330: 64 slots. Use the existing conservative 64 default, not all 96
+    // ANGLE combined units. Additional instruction/count guards below keep
+    // this store confined to this measured binary and the expected field.
+    { "2021.3.24f1", 0x1393240, 0xec, 1, "x2249318828413747" },
+
+    // Unity 2019.4.36f1 — Eye of the Temple 1.528 (2026-10-10). 1.28 million
+    // "Invalid texture unit!" in 45 seconds at the cap of 32, and every texture
+    // in the game black. Measured by the recipe above against this build's
+    // libunity:
+    //   0xdad5f4   "OpenGL Error: Invalid texture unit!"
+    //   0x404730   bl 0x2e1bac            ; the singleton getter
+    //   0x404734   ldr w8, [x0, #0xe8]    ; the cap
+    //   0x404738   cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x2e1bac   adrp x8, 0x112b000 / ldr x0, [x8, #0xec0]
+    // 0x112bec0 lands in the RW LOAD's BSS (va 0x10729c0, filesz 0x5c568 <
+    // memsz 0x15a6f0), a singleton pointer filled at runtime. Field 0xe8 as on
+    // the other 2019 builds. BEFORE the "2019.4" row because the match is a
+    // prefix test and takes the first hit; that row is Beat Saber's build.
+    { "2019.4.36f1", 0x112bec0, 0xe8, 1, "x5361030930653377" },
+    // Unity 2019.4.18f1 — Sniper Elite VR 1.03 (x2544573735586536, 2026-10-11).
+    // ~640k "Invalid texture unit!" in a short session at the cap of 32: the
+    // menu drew, but every level surface came out black and unlit (its
+    // TexArray/MegaMaterial world shaders sample above unit 31). Measured by
+    // the recipe above against this build's libunity:
+    //   0x1231fe4  "OpenGL Error: Invalid texture unit!"
+    //   0x6e5788   bl 0x53b558            ; the singleton getter
+    //   0x6e578c   ldr w8, [x0, #0xe8]    ; the cap
+    //   0x6e5790   cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x53b558   adrp x8, 0x1684000 / ldr x0, [x8, #0xf40]
+    // 0x1684f40 lands in the RW LOAD's BSS (va 0x15a8908, filesz 0x6f778 <
+    // memsz 0x16cfe0), a singleton pointer filled at runtime. BEFORE the
+    // "2019.4" row for the same prefix reason as the row above.
+    { "2019.4.18f1", 0x1684f40, 0xe8, 1, "x2544573735586536" },
     // Unity 2019.4 — Beat Saber 1.28/1.6.0, the long-standing reference build.
     // Getter 0x313710 serves *(base + 0x122e340); cap at +0xe8.
     { "2019.4", 0x122e340, 0xe8, 0 },
@@ -232,6 +319,37 @@ static const struct poke_cap_row k_poke_caps[] = {
     // a singleton pointer filled at runtime. Field 0xe8 is the same slot 2019.4
     // uses; the singleton address is this build's own.
     { "2019.1.10f1", 0x149e280, 0xe8, 1 },
+    // Unity 2022.3.62f3 — Keep Talking and Nobody Explodes 1.10.15 (2026-10-10).
+    // ~21k "Invalid texture unit!" in one short session at the cap of 32; none
+    // at boot once raised. Measured by the recipe above against the __klelf
+    // ELF inside this build's libunity framework:
+    //   0x120002   "OpenGL Error: Invalid texture unit!"
+    //   0xa20418   bl 0x50e4b4            ; the singleton getter
+    //   0xa2041c   ldr w8, [x0, #0xec]    ; the cap
+    //   0xa20420   cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x50e4b4   adrp x8, 0x10cd000 / ldr x0, [x8, #0x2c0]
+    // 0x10cd2c0 lands in the last RW LOAD's BSS (va 0x104ef20, filesz 0x19180 <
+    // memsz 0x103c60), a singleton pointer filled at runtime. Used on this
+    // title only; another title on the same build is told it was declined.
+    { "2022.3.62f3", 0x10cd2c0, 0xec, 1, "x2010043642376517" },
+    // Unity 6000.3.22f1 — Premium Bowling 1.32.3 (x2773034772778845, 2026-10-12).
+    // ~105k "Invalid texture unit!" in 26 seconds at the cap of 32, and every
+    // glyph of its menus a filled box. Measured by the recipe above against
+    // this build's libunity:
+    //   0x169307   "OpenGL Error: Invalid texture unit!"
+    //   0xea54c0   bl 0x71c184            ; the singleton getter
+    //   0xea54c4   ldr w8, [x0, #0xec]    ; the cap
+    //   0xea54c8   cmp w8, w22 / b.ls     ; reject units >= cap
+    //   0x71c184   adrp x8, 0x1796000 / ldr x0, [x8, #0xe40]
+    // 0x1796e40 lands in .bss (va 0x1734d40, size 0x158f80), a singleton
+    // pointer filled at runtime. Measured and NOT used: raised to 64, the run
+    // faults within two frames, branching to 0 out of the bind at 0xec6df4.
+    // This build's GL layer keeps its per-unit caches for 32 units (bound
+    // texture at +0xffc, its target 0x80 further on, the bind dispatch table
+    // right behind at +0x1178), and the cap is min(MAX_COMBINED, 32) at
+    // 0xec1ee4 — 32 on a Quest as well. The units above 31 came from the
+    // location answers instead; see KL_GLFB_BIND_PINS in kl_glfb.c.
+    { "6000.3.22f1", 0x1796e40, 0xec, 0, "x2773034772778845" },
 };
 #define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])
 
@@ -270,7 +388,13 @@ void kl_guest_poke_texture_unit_cap(void) {
         }
     // A row that exists and is not used declines by name, so the absence of a
     // raise on a build the offsets ARE known for never reads as an unlisted one.
-    if (row && !row->use && !pv) {
+    int use = row && row->use;
+    if (use && row->target) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        use = t && strcmp(t, row->target) == 0;
+    }
+    if (row && !use && !pv) {
         if (first) fprintf(stderr, "  [poke] texture-unit cap: not raised on Unity %s — the "
                         "engine's own 32-unit check is what keeps an out-of-range unit out "
                         "of its GL state cache, and raising it trades stale unit-0 textures "
@@ -298,6 +422,33 @@ void kl_guest_poke_texture_unit_cap(void) {
     kl_image *u = kl_find_image("libunity.so");
     if (!u) return;
     uint8_t *ub = (uint8_t *)kl_base(u);
+    if (row->target && !strcmp(row->target, "x2249318828413747")) {
+        static const uint32_t getter[] = {0x90008808, 0xf9412100, 0xd65f03c0};
+        static const uint32_t limit[] = {0xb940ec08, 0x6b16011f, 0x54000629};
+        if (kl_span(u) < 0x7a3a20 ||
+            memcmp(ub + 0x2932ec, getter, sizeof getter) ||
+            memcmp(ub + 0x7a3a14, limit, sizeof limit)) {
+            if (first) fprintf(stderr, "  [poke] Space Channel texture cap: SKIPPED (binary guard mismatch)\n");
+            return;
+        }
+        if (!pv) poke_n = 64;
+        if (poke_n > 64) poke_n = 64; // the measured engine cache has 64 slots
+    }
+    // Shave & Stuff: the same two guards, from the instructions in its row's
+    // comment (getter 0x4b0fc4, the cap check 0xb8fc38), and the same 64-slot
+    // ceiling, which KL_POKE_CAP may lower but not raise.
+    if (row->target && !strcmp(row->target, "x7532973430077887")) {
+        static const uint32_t getter[] = {0x9000a228, 0xf947a100};
+        static const uint32_t limit[] = {0xb940ec08, 0x6b16011f};
+        if (kl_span(u) < 0xb8fc40 ||
+            memcmp(ub + 0x4b0fc4, getter, sizeof getter) ||
+            memcmp(ub + 0xb8fc38, limit, sizeof limit)) {
+            if (first) fprintf(stderr, "  [poke] Shave & Stuff texture cap: SKIPPED (binary guard mismatch)\n");
+            return;
+        }
+        if (poke_n > 64) poke_n = 64;
+    }
+
     if ((size_t)POKE_SINGLETON + sizeof(void *) > kl_span(u)) {
         if (first) fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — libunity is %zu bytes, "
                         "shorter than the %#x offset.\n", kl_span(u), POKE_SINGLETON);
@@ -315,6 +466,11 @@ void kl_guest_poke_texture_unit_cap(void) {
         return;
     }
     int32_t cur = *(int32_t *)(singleton + POKE_FIELD);
+    if (row->target && !strcmp(row->target, "x2249318828413747") && cur != 32 && cur != 64) {
+        if (first) fprintf(stderr, "  [poke] Space Channel texture cap: SKIPPED (unexpected count %d)\n", cur);
+        return;
+    }
+
     if (cur <= 0 || cur > 4096) {
         if (first) fprintf(stderr, "  [poke] texture-unit cap: SKIPPED — +%#x reads %d, which is "
                         "not a texture-unit count.\n", POKE_FIELD, cur);

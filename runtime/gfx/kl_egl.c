@@ -28,6 +28,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <zlib.h>
+#include "guest/kl_driver.h"   // target name, for the per-target GL identity
 #include "klepton.h"
 #include "kl_env.h"
 #include "kl_egl.h"
@@ -316,6 +317,16 @@ static const char *const g_gl_extensions[] = {
     // ASTC / Supported: ETC2" and then dies uploading the assets it does have).
     "GL_KHR_texture_compression_astc_ldr",
     "GL_OES_texture_compression_astc",
+    // Vertex array objects: CORE in ES 3.0, so at the 3.2 we claim in
+    // GL_VERSION naming it states nothing new, and ANGLE carries the OES entry
+    // points (aliases of the core ones).
+    //
+    // Leaving it out is a NULL function pointer inside the guest, and it is a
+    // glad-loader hazard rather than a title quirk: glad fills
+    // `glad_glBindVertexArrayOES` only when this string names the extension,
+    // and a renderer that calls it with no null test (the Simpsons Hit & Run VR
+    // port's Pure3D layer does) branches to address zero on its first draw.
+    "GL_OES_vertex_array_object",
     // Framebuffer blit + multisample. These are CORE in GLES 3 (glBlitFramebuffer,
     // glRenderbufferStorageMultisample) and fully backed by ANGLE, but Source's
     // togl is a desktop-GL translator that gates its scene->eye RESOLVE on the old
@@ -340,9 +351,25 @@ static const char *const g_gl_extensions[] = {
     // ("no usable vertex shader variant") and render black. A different engine that
     // isn't built for it is better left on its own per-eye path. klgl_want_multiview()
     // gates BOTH doors (this list and GL_MAX_VIEWS_OVR); klgl_ext_count() drops these
-    // entries when it returns 0, so THESE TWO MULTIVIEW ENTRIES MUST STAY LAST.
+    // entries when it returns 0, so THESE MULTIVIEW ENTRIES (and the one after them) MUST STAY LAST.
     "GL_OVR_multiview",
     "GL_OVR_multiview2",
+    // The multisampled form, for one kind of guest only (klgl_want_multiview_ms):
+    // Unreal's Android GL layer switches mobile multiview on only when all THREE
+    // names are in the string and both entry points resolve. The entry point it
+    // gets for this one is ours and attaches without multisampling — see
+    // klgl_FramebufferTextureMultisampleMultiviewOVR.
+    "GL_OVR_multiview_multisampled_render_to_texture",
+    // Texture buffers, for the same one kind of guest (klgl_want_multiview_ms).
+    // Unreal decides whether buffer resource views exist from THIS NAME, not
+    // from the ES level it is told: without it RHICreateShaderResourceView
+    // makes no texture at all, while the cooked shaders still read their bone
+    // matrices out of a samplerBuffer — nothing is bound there, every bone is
+    // zero, and every skinned mesh collapses to a point. Maestro: no musicians
+    // and no score book, their instruments hanging in the air (glTexBuffer was
+    // never called once in a whole run). What answers it is kl_glfb's 2D
+    // stand-in (klfb_TexBuffer), which does not need the real extension.
+    "GL_EXT_texture_buffer",
 };
 
 // Which targets actually render with GLES single-pass multiview. Advertise the
@@ -354,33 +381,333 @@ static const char *const g_gl_extensions[] = {
 // so even a mistaken advertisement can't fault a per-eye draw — this door is about
 // steering each engine to the path it actually supports.)
 extern const char *kl_driver_target_name(void);
+// A Unity 6 title on Unity's OpenXR plugin: Beat Saber from 1.45 on
+// (kl_guest_beatsaber_openxr in kl_jni_android.c; 1.40 and older use the Oculus
+// XR plugin and draw an eye at a time). It renders SinglePassInstanced into an array swapchain, and with 4x
+// anti-aliasing its camera target is a multisampled ARRAY. What Unity makes of
+// that depends on three names together:
+//   - without GL_OVR_multiview it has no layered attachment at all and binds
+//     GL_TEXTURE_2D_MULTISAMPLE_ARRAY, which an ES 3.0 ANGLE refuses — the eye
+//     framebuffer is incomplete on every frame and the picture stays black;
+//   - with multiview and GL_OVR_multiview_multisampled_render_to_texture but
+//     WITHOUT GL_EXT_multisampled_render_to_texture it treats the target as
+//     explicitly resolved, finds no resolve surface ("RenderPass: Missing
+//     resolve surface for attachment 0") and never begins a render pass;
+//   - with all three the target resolves implicitly, and both attach calls are
+//     ours: single-sample (klgl_FramebufferTextureMultisampleMultiviewOVR here,
+//     klfb_FramebufferTexture2DMultisampleEXT in kl_glfb).
+// KL_GL_MSRTT overrides in either direction.
+// DreamSpace (x9449316705178989) is the same case on Unity 6 + OpenXR with Meta's
+// XR SDK: told none of the three names, every frame logged "GL_INVALID_FRAMEBUFFER_
+// OPERATION: Framebuffer is not complete" and nothing reached its array swapchain —
+// a black eye picture, or only the room behind its passthrough (2026-10-16).
+// Fluid (x6946182742093178, Unity 6000.3 + OpenXR) is the same again: ~1450
+// incomplete-framebuffer errors a run and a black picture (2026-10-21).
+// Sweet Surrender (x4723352327707414, Unity 6000.1 + OpenXR, SinglePassMultiview
+// with 4x anti-aliasing) is the same again: ~2000 incomplete-framebuffer errors in
+// 25 s, a black picture with its music playing (2026-10-23).
+// iB Cricket (x5437449896288644, Unity 6000.0 + the Oculus XR plugin, 4x
+// anti-aliasing) too: its eye framebuffers are a colour texture beside a
+// 4-sample depth renderbuffer, every glClear on them raised 0x506 (status
+// 0x8cd6), nothing was ever drawn into the eye textures and the player saw
+// only the untouched eye storage — a plain pink screen.
+// Spatial Zombies (x24151641901194680, Unity 6000.6 + OpenXR, SinglePassInstanced):
+// told none of the three names, Unity asked for STEREO_INSTANCING_ON variants its
+// shaders were never built with (~38000 "variant not found" a run) (2026-10-28).
+static int klgl_want_msrtt(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern int kl_guest_beatsaber_openxr(void);
+        const char *t = kl_driver_target_name();
+        v = kl_env_on("KL_GL_MSRTT", kl_guest_beatsaber_openxr() ||
+                                     (t && (strcmp(t, "x9449316705178989") == 0 ||
+                                            strcmp(t, "x6946182742093178") == 0 ||
+                                            strcmp(t, "x4723352327707414") == 0 ||
+                                            strcmp(t, "x5437449896288644") == 0 ||
+                                            strcmp(t, "x24151641901194680") == 0)));
+    }
+    return v;
+}
 static int klgl_want_multiview(void) {
     const char *t = kl_driver_target_name();
     if (!t) return 0;
+    if (klgl_want_msrtt()) return 1;
     // ieytd/ieytd2/ieytd-<n> (Unity), and the HL2Q3VR Source-VR family (hl2, portal
     // — both liblauncher) whose single-pass stereo is baked around GL_OVR_multiview.
+    // doom3quest (id Tech 4 / d3es): its GLSL is written for multiview outright —
+    // every program opens with `layout(num_views=2) in;` and the VR framebuffer is
+    // attached with glFramebufferTextureMultiviewOVR, with no per-eye fallback.
+    // ...and whoever is served the Array eye layout on GL through OVRPlugin
+    // (kl_ovrp_gl_array — Maestro, a UE4 project cooked for mobile multiview).
+    extern int kl_ovrp_gl_array(void);
     return strncmp(t, "ieytd", 5) == 0 ||
            strcmp(t, "hl2") == 0 ||
-           strcmp(t, "portal") == 0;
+           strcmp(t, "portal") == 0 ||
+           strcmp(t, "doom3quest") == 0 ||
+           kl_ovrp_gl_array();
+}
+
+// The same answer for kl_ue4.c, which may only write Unreal's multiview flags
+// to 0 for a guest this gateway does NOT name the extensions to.
+int kl_gl_cap_names_multiview(void) { return klgl_want_multiview(); }
+
+// Who is also shown GL_OVR_multiview_multisampled_render_to_texture: a guest
+// served the Array eye layout on GL through OVRPlugin (kl_ovrp_gl_array). That is
+// Unreal on GLES, and FAndroidOpenGL::ProcessExtensions sets its multiview flag
+// from `multiview && multiview2 && multiview_multisampled` plus both function
+// pointers. Shown only two of the three, Maestro still asked OVRPlugin for an
+// Array eye texture (the project is cooked that way), compiled every shader with
+// `#define gl_ViewID_OVR 0`, allocated no scene colour for the layered target,
+// and read a NULL texture in FMobileSceneRenderer::RenderForward.
+static int klgl_want_multiview_ms(void) {
+    extern int kl_ovrp_gl_array(void);
+    return kl_ovrp_gl_array() || klgl_want_msrtt();
+}
+
+// ...and a SECOND list, admitted by a different door: not "core at the level
+// we claim", but "the backend in this process told us, this run, that it has
+// it". Nothing here is named unless ANGLE's own glGetString(GL_EXTENSIONS)
+// named it first (kl_gl_cap_adopt_backend_extensions, called from kl_glfb once
+// the real context exists), so a promise made here is one ANGLE has already
+// made to us.
+//
+//   * The DXT/BC family. Source-engine ports ship DXT1/DXT5 texture packs, and
+//     libtogl, finding no compression extension in the string, takes the
+//     engine's CPU-decompress path and uploads RGBA8888 — 4-8x the bytes, which
+//     on a large pack is the difference between fitting in the memory budget
+//     and not. ANGLE-on-Metal spells the capability per format (_dxt1 and the
+//     two GL_ANGLE_ names) and not as the umbrella _s3tc, so all four are
+//     candidates.
+//   * GL_EXT_texture_filter_anisotropic: a sampler parameter, free in memory,
+//     and without it a floor at a grazing angle samples from the mip chosen for
+//     its worst axis.
+//   * GL_EXT_texture_format_BGRA8888, which is not core at any GLES level. A
+//     glad-bound renderer can build its upload pair from two places — the
+//     internalformat from a table that says GL_BGRA_EXT unconditionally, the
+//     format from a flag glad sets from this name — so an unnamed extension
+//     selects a MIXED pair (GL_BGRA_EXT with GL_RGBA), invalid in every GLES
+//     profile: every texture upload fails GL_INVALID_OPERATION and samples
+//     black (the Simpsons Hit & Run VR port). Quest drivers tolerate the pair.
+//   * GL_KHR_texture_compression_astc_hdr: the same ASTC formats, with HDR
+//     blocks allowed in them. Unity reads its HDR ASTC GraphicsFormats from
+//     this name alone; Warhammer 40,000: Battle Sister ships its lightmaps that
+//     way, and without it "Texture creation failed. '145' is not supported"
+//     ended the level load on its loading screen (2026-10-28).
+static const char *const g_gl_ext_candidates[] = {
+    "GL_EXT_texture_compression_s3tc",
+    "GL_EXT_texture_compression_dxt1",
+    "GL_ANGLE_texture_compression_dxt3",
+    "GL_ANGLE_texture_compression_dxt5",
+    "GL_EXT_texture_filter_anisotropic",
+    "GL_EXT_texture_format_BGRA8888",
+    "GL_KHR_texture_compression_astc_hdr",
+};
+#define KL_GL_EXT_CANDIDATES \
+    ((int)(sizeof g_gl_ext_candidates / sizeof g_gl_ext_candidates[0]))
+
+static const char *g_gl_ext_adopted[KL_GL_EXT_CANDIDATES];
+static int g_gl_ext_adopted_n = 0;
+
+// Called once, from kl_glfb, with whatever the real driver answers. A name the
+// driver does not carry is simply not adopted — there is no override, because
+// the failure this guards against (a guest uploading blocks to a driver that
+// cannot decode them) is a black world, not a slow one.
+void kl_gl_cap_adopt_backend_extensions(const char *backend_ext) {
+    g_gl_ext_adopted_n = 0;
+    if (!backend_ext) backend_ext = "";
+    // Off unless asked for (KL_GL_BACKEND_EXT=1). Where this list came from it
+    // is on by default with KL_GL_NO_BACKEND_EXT as the way back; here every
+    // verified game was verified against the core-only description, and a
+    // Unity guest that is shown anisotropic filtering starts using it. A
+    // target that needs one of these names turns the list on by its default.
+    if (!kl_env_on("KL_GL_BACKEND_EXT", 0)) return;
+    for (int i = 0; i < KL_GL_EXT_CANDIDATES; i++) {
+        const char *name = g_gl_ext_candidates[i];
+        size_t len = strlen(name);
+        // Whole-token match: "..._s3tc" is a prefix of "..._s3tc_srgb" in some
+        // drivers, and strstr alone would adopt the shorter name off the longer.
+        const char *q = backend_ext;
+        int have = 0;
+        while ((q = strstr(q, name)) != NULL) {
+            char after = q[len];
+            char before = (q == backend_ext) ? ' ' : q[-1];
+            if ((after == 0 || after == ' ') && before == ' ') { have = 1; break; }
+            q += len;
+        }
+        if (have) g_gl_ext_adopted[g_gl_ext_adopted_n++] = name;
+    }
+}
+
+int kl_gl_cap_backend_has_dxt(void) {
+    for (int i = 0; i < g_gl_ext_adopted_n; i++)
+        if (strstr(g_gl_ext_adopted[i], "texture_compression_"))
+            return 1;
+    return 0;
+}
+
+int kl_gl_cap_adopted_extension_count(void) { return g_gl_ext_adopted_n; }
+const char *kl_gl_cap_adopted_extension(int i) {
+    return (i >= 0 && i < g_gl_ext_adopted_n) ? g_gl_ext_adopted[i] : NULL;
 }
 
 // ...and none of it is offered below ES 3. Steam Link is told GLES 2.0
 // (kl_egl_set_gles_version) and has always run against an empty list; the
 // argument above is an ES 3.2 argument and does not carry over, so that target
 // stays exactly as it was rather than being changed by a fix it did not need.
-static int klgl_ext_count(void) {
+static int klgl_base_count(void) {
     if (g_es_major < 3) return 0;
     int n = (int)(sizeof g_gl_extensions / sizeof g_gl_extensions[0]);
-    // Hide the two trailing OVR_multiview entries from targets that don't use it.
-    if (!klgl_want_multiview()) n -= 2;
+    // Hide the trailing OVR_multiview entries from targets that don't use them:
+    // all three, or just the multisampled one.
+    // ...and the texture-buffer name behind them goes with the multisampled one.
+    if (!klgl_want_multiview()) n -= 4;
+    else if (!klgl_want_multiview_ms()) n -= 2;
+    else {
+        // The texture-buffer name is Unreal's; a klgl_want_msrtt guest is not shown it.
+        extern int kl_ovrp_gl_array(void);
+        if (!kl_ovrp_gl_array()) n -= 1;
+    }
     return n;
 }
 
+// One more name, for Counter-Strike VR. Textures of any size are core in ES 3,
+// so GL_OES_texture_npot states nothing the level does not — but Xash's renderer
+// decides from the NAME (gl_opengl.c: GL_ARB_texture_non_power_of_two, else
+// GL_OES_texture_npot), and without it rescales every image to powers of two.
+// Its menu buttons are rows cut out of one tall strip, and after the rescale
+// each row carried a sliver of the next one under it; seen on the device and,
+// with the whole panel in view, in a host capture. A Quest names the extension.
+// Per target rather than for everyone: the list above is what every verified
+// game was verified against.
+//
+// GL_EXT_texture_buffer is the second such name (fix 16, sent in by a user,
+// 2026-10-11). Texture buffers are core in the ES 3.2 this runtime claims and
+// kl_glfb emulates glTexBuffer under all its names, so naming it states
+// nothing new — but older Unreal's FAndroidOpenGL::ProcessExtensions loads
+// glTexBufferEXT ONLY when the string is there, while its ES 3.1 RHI binds
+// SRVs as GL_TEXTURE_BUFFER regardless: without the name the pointer stays
+// NULL and the first SRV jumps to address 0, which is where Tales from the
+// Galaxy's Edge (x3484270071659289) died. Star Wars Pinball VR
+// (x3180994211970184, UE 4.25 on GLES) dies the same way: its render thread
+// calls glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, buf) through the NULL pointer
+// right after the first textures are made.
+static const char *klgl_ext_extra(void) {
+    const char *t = kl_driver_target_name();
+    if (!t) return NULL;
+    if (strcmp(t, "cs1") == 0) return "GL_OES_texture_npot";
+    if (g_es_major >= 3 && (strcmp(t, "x3484270071659289") == 0 ||
+                            strcmp(t, "x3180994211970184") == 0))
+        return "GL_EXT_texture_buffer";
+    // Vader Immortal: Episode I (UE 4.19.2) is cooked for GLSL_ES3_1_ANDROID
+    // only, and its PlatformInitOpenGL takes the ES 3.1 path only when
+    // FAndroidGPUInfo found this name in the string (byte +0x22, next to the
+    // half-float render-target flag). Without it the engine settles on ES2,
+    // asks for GlobalShaderCache-GLSL_ES2.bin, which the game never shipped,
+    // and quits through LowLevelFatalError before its first frame.
+    // Episodes II (x2223615721048141) and III (x2426206484098337) ship the same
+    // engine build: the same "es2" APK, OVRPlugin 1.30.0, ES 3.1 cook.
+    if (g_es_major >= 3 && (strcmp(t, "x2108775495884888") == 0 || strcmp(t, "x2223615721048141") == 0 ||
+                            strcmp(t, "x2426206484098337") == 0)) return "GL_EXT_shader_io_blocks";
+    // The third of the three names klgl_want_msrtt is about.
+    if (g_es_major >= 3 && klgl_want_msrtt()) return "GL_EXT_multisampled_render_to_texture";
+    return NULL;
+}
+// The list a guest is shown, in order: the base list, the one per-target name
+// if there is one, then whatever was adopted from the backend.
+static int klgl_ext_count(void) {
+    int n = klgl_base_count();
+    if (n <= 0) return n;
+    return n + (klgl_ext_extra() ? 1 : 0) + g_gl_ext_adopted_n;
+}
+static const char *klgl_ext_at(int i) {
+    int base = klgl_base_count();
+    if (i < base) return g_gl_extensions[i];
+    i -= base;
+    if (klgl_ext_extra()) { if (i == 0) return klgl_ext_extra(); i--; }
+    return (i >= 0 && i < g_gl_ext_adopted_n) ? g_gl_ext_adopted[i] : NULL;
+}
+
+// ANGLE's Metal backend exports glFramebufferTextureMultisampleMultiviewOVR and
+// refuses it (no implicit-resolve layered pass). For a guest that was told the
+// extension exists, the attachment is made WITHOUT multisampling instead: the
+// same two-view attachment, one sample. The picture loses its anti-aliasing and
+// nothing else; refusing would leave the eye framebuffer incomplete.
+static void klgl_FramebufferTextureMultisampleMultiviewOVR(uint32_t target, uint32_t attachment,
+                                                           uint32_t texture, int32_t level,
+                                                           int32_t samples, int32_t base_view,
+                                                           int32_t num_views) {
+    static void (*plain)(uint32_t, uint32_t, uint32_t, int32_t, int32_t, int32_t);
+    if (!plain) plain = kl_egl_sym("glFramebufferTextureMultiviewOVR");
+    // With KL_GL_MSAA_MV and an ANGLE that has the layered multisampled pass,
+    // the attachment is the real thing.
+    if (kl_glfb_multiview_ms(target, attachment, texture, level, samples, base_view, num_views))
+        return;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [gl] glFramebufferTextureMultisampleMultiviewOVR(samples=%d) is "
+                        "attached as plain multiview — this backend has no multisampled "
+                        "layered pass (said once)\n", samples);
+    if (plain) plain(target, attachment, texture, level, base_view, num_views);
+}
+
+// The GL identity, per target. An Unreal guest creates a throwaway GLES context
+// before it has chosen an RHI, purely to read GL_RENDERER, and matches its
+// DEVICE PROFILE on the answer — and the profile is what turns Vulkan on. Moss
+// (UE 4.27) ships exactly two profiles that clear r.Android.DisableVulkanSupport,
+// both gated on `SRC_GpuFamily` matching "Adreno \(TM\) 6[0-9][0-9]" (plus the
+// make, an Android version >= 9 and Vulkan being available); anything else
+// falls to the base Android profile, Vulkan stays disabled, and a title packaged
+// without ES 3.1 stops at "This device does not support Vulkan". So for that
+// target the renderer is the Quest 2's, to go with the Quest 2 that
+// android.os.Build already describes. Read out of the game's own
+// DefaultDeviceProfiles.ini / BaseDeviceProfiles.ini, not guessed.
+static const char *klgl_identity(int renderer) {
+    const char *t = kl_driver_target_name();
+    // Saints & Sinners (x2897337400373711, UE 4.26) likewise: as "Klepton GLES"
+    // its weapons did not draw at all; as the Quest 2's GPU they do. Its
+    // sequel, Chapter 2: Retribution (x5190288877703616, UE 4.27.2, the same
+    // studio's engine line), ran as "Klepton GLES" with every texture at a
+    // visibly low resolution and is given the same identity; with it the
+    // textures looked only a little sharper, but the build confirmed working
+    // on device runs with it (2026-10-17).
+    // Moss: Book II (x4395292760584049) has the same rule in its own
+    // DefaultDeviceProfiles.ini: only Oculus_Adreno6xx_Vulkan clears
+    // DisableVulkanSupport (make "Oculus", "Adreno \(TM\) 6[0-9][0-9]",
+    // Android >= 9, Vulkan available). As "Klepton GLES" it took the base
+    // Android profile and stopped at "This device does not support Vulkan"
+    // (headset log 2026-10-18); as the Quest 2's GPU it opens a Vulkan device
+    // (Mac host, the same day).
+    // Propagation: Paradise Hotel (x8826022237415280, UE 4.27.2 PICO branch)
+    // the same: every profile in its BaseDeviceProfiles.ini that clears
+    // DisableVulkanSupport is gated on SRC_GpuFamily matching Adreno, Mali or
+    // PowerVR, the package has no ES 3.1, and as "Klepton GLES" it stopped at
+    // "This device does not support Vulkan" (headset log 2026-10-19).
+    if (kl_driver_target_is_moss() || (t && (strcmp(t, "x2897337400373711") == 0 ||
+              strcmp(t, "x5190288877703616") == 0 ||
+              strcmp(t, "x8826022237415280") == 0)))
+        return renderer ? "Adreno (TM) 650" : "Qualcomm";
+    // Vampire: The Masquerade - Justice asks the same string which headset it
+    // is on: UJukeboxBlueprintLibrary::ResolveHMD sets Quest 1, 2 or 3 from
+    // FAndroidMisc::GetGPUFamily() containing "adreno" and "540", "650" or
+    // "740" (read out of its libUE4), and nothing else on Android. As
+    // "Klepton GLES" it resolved to none of them, its button hints fell through
+    // to the last platform in its list, and the game showed the markup itself
+    // (`<img id="WMR.RStick"/>`) because the Quest package holds no such icons.
+    if (t && strcmp(t, "vampire") == 0)
+        return renderer ? "Adreno (TM) 650" : "Qualcomm";
+    return renderer ? "Klepton GLES" : "Klepton";
+}
+
 static const char *klgl_GetString(uint32_t name) {
-    static char ver[64], glsl[64], exts[256];
+    // `exts` holds the whole list: at 256 bytes the three multiview names did not
+    // fit behind the rest and the last was cut in half — a guest reading the
+    // string (Unreal on Android does) never saw it.
+    static char ver[64], glsl[64], exts[1024];
     switch (name) {
-    case GL_VENDOR:     return "Klepton";
-    case GL_RENDERER:   return "Klepton GLES";
+    // Who the GPU says it is. Honest by default; KL_GL_VENDOR / KL_GL_RENDERER
+    // override, and one target needs a different default — see klgl_identity.
+    case GL_VENDOR:     return kl_env_str("KL_GL_VENDOR", klgl_identity(0));
+    case GL_RENDERER:   return kl_env_str("KL_GL_RENDERER", klgl_identity(1));
     // Unity parses this to decide the GLES level it drives, so the shape matters
     // as much as the number: it expects "OpenGL ES <major>.<minor> <vendor>".
     case GL_VERSION:
@@ -397,7 +724,7 @@ static const char *klgl_GetString(uint32_t name) {
         exts[0] = 0;
         for (int i = 0; i < n; i++) {
             if (i) strlcat(exts, " ", sizeof exts);
-            strlcat(exts, g_gl_extensions[i], sizeof exts);
+            strlcat(exts, klgl_ext_at(i), sizeof exts);
         }
         return exts;
     }
@@ -408,7 +735,7 @@ static const char *klgl_GetString(uint32_t name) {
 
 static const char *klgl_GetStringi(uint32_t name, uint32_t index) {
     if (name == GL_EXTENSIONS && (int)index < klgl_ext_count())
-        return g_gl_extensions[index];
+        return klgl_ext_at((int)index);
     return "";           // consistent with GL_NUM_EXTENSIONS
 }
 
@@ -513,6 +840,64 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
     // glGetStringi will hand out makes the guest read past the end or stop
     // short, and either one is silent.
     if (pname == GL_NUM_EXTENSIONS) { params[0] = klgl_ext_count(); return 1; }
+    // The compressed-format pair is described as EMPTY in the table below, which
+    // is only true while no compression extension is named. Once one is adopted
+    // from the backend, "s3tc, and zero compressed formats" is two different
+    // answers; hand both questions to ANGLE, which owns the real one.
+    if ((pname == 0x86A2 /* NUM_COMPRESSED_TEXTURE_FORMATS */ ||
+         pname == 0x86A3 /* COMPRESSED_TEXTURE_FORMATS     */) &&
+        g_gl_ext_adopted_n > 0)
+        return 0;
+    // The ES 3.1 storage limits, for a title that is refused on their absence.
+    // Unity derives "random write" support from these, and every shader built at
+    // `#pragma target 4.5` (requirement mask: compute, randomwrite, msaatex...)
+    // is marked unsupported when they read 0 — which is what the generic answer
+    // below gives — and drawn with the magenta error shader instead. Sniper Elite
+    // VR (x2544573735586536) builds its whole menu UI (SEVRQuest/DefaultUI) that
+    // way, so its menu panel was one magenta quad. A UI shader stores nothing; the
+    // values are the ES 3.1 spec minimums, the least that keeps the 3.2 claim in
+    // GL_VERSION consistent, and they are per target because every other title
+    // here was verified against the zeros. Synth Riders 3.6.6a1
+    // (x2436558143118760, Unity 6000; fix 39, sent in by a user) likewise: it
+    // played with magenta assets until it got these, confirmed on the sender's
+    // Vision Pro. iB Cricket (x5437449896288644, Unity 6000.0) asks for the
+    // same limits at startup; it got them alongside KL_GL_MSRTT (which is what
+    // ended its pink screen) and runs with both, but whether it needs these on
+    // their own was not tested.
+    {
+        const char *t = kl_driver_target_name();
+        // KL_GL_ES31_LIMITS=1: the same answer for any target, as an experiment
+        // (Beat Saber 1.45's FillMeshData kernel is refused on the zeros; this
+        // shows what Unity sends to GL once it is not). Off by default.
+        static int es31_any = -1;
+        if (es31_any < 0) es31_any = getenv("KL_GL_ES31_LIMITS") != NULL;
+        // ...and for a target whose compute kernels kl_glfb runs as transform
+        // feedback (Beat Saber 1.45's FillMeshData): refused on the zeros, the
+        // kernel never reaches the GL layer that would serve it.
+        // ...and for one whose read-only storage buffers kl_glfb reads through
+        // textures (Garden of the Sea).
+        if (es31_any || kl_glfb_compute_tf() || kl_glfb_ssbo_tex() || (t && (strcmp(t, "x2544573735586536") == 0
+                                                       || strcmp(t, "x2436558143118760") == 0
+                                                       || strcmp(t, "x3922378427824210") == 0
+                                                       || strcmp(t, "x3984056454948095") == 0
+                                                       || strcmp(t, "x5437449896288644") == 0))) {
+            static const struct { uint32_t pname; int32_t value; } es31[] = {
+                {0x8F38 /* MAX_IMAGE_UNITS                     */, 4},
+                {0x90D6 /* MAX_VERTEX_SHADER_STORAGE_BLOCKS    */, 4},
+                {0x90DA /* MAX_FRAGMENT_SHADER_STORAGE_BLOCKS  */, 4},
+                {0x90DB /* MAX_COMPUTE_SHADER_STORAGE_BLOCKS   */, 4},
+                {0x90DC /* MAX_COMBINED_SHADER_STORAGE_BLOCKS  */, 8},
+                {0x90DD /* MAX_SHADER_STORAGE_BUFFER_BINDINGS  */, 8},
+                {0x92DC /* MAX_ATOMIC_COUNTER_BUFFER_BINDINGS  */, 1},
+                {0x90EB /* MAX_COMPUTE_WORK_GROUP_INVOCATIONS  */, 128},
+                {0x90D7 /* MAX_COMPUTE_UNIFORM_BLOCKS          */, 14},
+                {0x90D8 /* MAX_COMPUTE_TEXTURE_IMAGE_UNITS     */, 16},
+                {0x90D9 /* MAX_COMPUTE_IMAGE_UNIFORMS          */, 4},
+            };
+            for (size_t i = 0; i < sizeof es31 / sizeof es31[0]; i++)
+                if (es31[i].pname == pname) { params[0] = es31[i].value; return 1; }
+        }
+    }
     for (size_t i = 0; i < sizeof g_gl_int / sizeof g_gl_int[0]; i++)
         if (g_gl_int[i].pname == pname) {
             params[0] = g_gl_int[i].value;
@@ -524,6 +909,25 @@ int kl_gl_cap_integerv(uint32_t pname, int32_t *params) {
                         pname, params[0]);
             return 1;
         }
+    // GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT (ES 3.2 / EXT_texture_buffer, which the
+    // texel-buffer emulation in kl_glfb stands in for). ANGLE's ES 3.0 context
+    // does not know the name, so it went unanswered and the guest read 0. The
+    // Walking Dead: Saints & Sinners - Chapter 2: Retribution (x5190288877703616)
+    // aligns each allocation in its pooled read buffer to it, and Align(x, 0) is
+    // 0: every Niagara effect's particle data was written to byte 0 of the one
+    // buffer, each over the last, and every texel-buffer window was opened at
+    // byte 0 too. Each effect then drew from whichever effect had been written
+    // last — its sparks as streaks of the wrong colours, flickering as the set
+    // of effects in view changed (seen on device and traced event by event,
+    // 2026-10-17). 16 covers the widest texel (RGBA32F); the emulation reads a
+    // window at any byte offset. Per target, as the limits above are;
+    // KL_GL_TB_ALIGN=<n> answers n for any target, 0 leaves it unanswered.
+    if (pname == 0x919F) {
+        const char *t = kl_driver_target_name();
+        int a = kl_env_int("KL_GL_TB_ALIGN", t && strcmp(t, "x5190288877703616") == 0 ? 16 : 0);
+        if (a > 0) { params[0] = a; return 1; }
+        return 0;
+    }
     if (pname == 0x0D3A) {                       // MAX_VIEWPORT_DIMS: two values
         params[0] = 16384; params[1] = 16384; return 1;
     }
@@ -1233,8 +1637,8 @@ static unsigned klegl_Terminate(EGLDisplay dpy) {
     (void)dpy; g_display.initialised = 0; return EGL_TRUE;
 }
 
-// EGL_EXTENSIONS names exactly the three extensions this runtime implements
-// entry points for, and nothing else. Every name here is a promise, and Unity
+// EGL_EXTENSIONS names exactly the extensions this runtime implements entry
+// points (or, for the last, the attributes) for, and nothing else. Every name here is a promise, and Unity
 // branches hard on this string — advertising one we do not serve buys a failure
 // much further from its cause, which is why the list is the implemented set
 // rather than a plausible one:
@@ -1243,6 +1647,23 @@ static unsigned klegl_Terminate(EGLDisplay dpy) {
 //   EGL_ANDROID_image_native_buffer       ...and EGL_NATIVE_BUFFER_ANDROID, the
 //                                         only image target we accept
 //   EGL_ANDROID_get_native_client_buffer  eglGetNativeClientBufferANDROID
+//   EGL_KHR_create_context                no new entry point — it is the
+//                                         eglCreateContext ATTRIBUTE set, and
+//                                         the one that matters
+//                                         (EGL_CONTEXT_MAJOR_VERSION_KHR) is
+//                                         token 0x3098, the same number as
+//                                         EGL_CONTEXT_CLIENT_VERSION, which
+//                                         klegl_CreateContext already reads.
+//
+// EGL_KHR_create_context is not optional for an SDL2 guest. SDL_EGL_
+// CreateContext will not ask for a GLES 3 context on a display that does not
+// advertise it: it refuses BEFORE calling eglCreateContext ("Could not create
+// EGL context (context attributes are not supported)"). The guest then runs on
+// with no context at all — our GL entry points answer glGetString without one,
+// so its renderer banner looks healthy — creates its XR session against context
+// 0, and submits stereo layers from swapchain textures nothing ever drew into:
+// an all-black immersive space with no crash and no complaint. (A GLES 2 SDL
+// guest never hits it; that is the branch SDL takes without the extension.)
 //
 // The empty string is NOT the safe answer, legal as it is: AVPro Video's
 // OpenGLESPlayerRenderer::setupEglContext strdup()s this string and walks it
@@ -1254,12 +1675,32 @@ static unsigned klegl_Terminate(EGLDisplay dpy) {
 //
 // The empty string is one env-var away, to A/B against a guest that branches on
 // a name here.
+// EGL_KHR_create_context is named only where KL_EGL_CREATE_CONTEXT_EXT=1 asks
+// for it (upstream of this fork it is in the default list). It is not neutral
+// for a game that never needed it — seen in headless Mac runs, 2026-10-13:
+//
+//   Asgard's Wrath 2 (Unreal, a Vulkan title) creates its three EGL contexts as
+//     GLES 2 without the name and as GLES 3.2 with it;
+//   Beat Saber 1.40 and 1.45 (Unity) ask for GLES 3.2 and 3.0 where they asked
+//     for plain GLES 3 twice.
+//
+// Nothing was seen to go wrong in those runs, but both are a changed start of
+// a verified game, so the name waits for a headset run. A switch in the start
+// window's test group; a target for an SDL2 guest, which cannot start without
+// it, sets it by default.
 static const char *klegl_extensions(void) {
     static const char *s;
-    if (!s) s = kl_env_str("KL_EGL_EXTENSIONS",
-                           "EGL_KHR_image_base "
+    static char with_khr[160];
+    if (!s) {
+        const char *base = "EGL_KHR_image_base "
                            "EGL_ANDROID_image_native_buffer "
-                           "EGL_ANDROID_get_native_client_buffer");
+                           "EGL_ANDROID_get_native_client_buffer";
+        if (kl_env_on("KL_EGL_CREATE_CONTEXT_EXT", 0)) {
+            snprintf(with_khr, sizeof with_khr, "%s EGL_KHR_create_context", base);
+            base = with_khr;
+        }
+        s = kl_env_str("KL_EGL_EXTENSIONS", base);
+    }
     return s;
 }
 
@@ -1481,10 +1922,19 @@ static EGLContext klegl_CreateContext(EGLDisplay dpy, EGLConfig cfg,
     // the EGLConfig for XrGraphicsBindingOpenGLESAndroidKHR; without a real id it
     // finds no config and refuses the session.
     c->config_id = cfg ? ((const typeof(g_configs[0]) *)cfg)->id : g_configs[0].id;
-    for (const int32_t *a = attribs; a && *a != EGL_NONE; a += 2)
-        if (a[0] == 0x3098 /* EGL_CONTEXT_CLIENT_VERSION */) c->client_version = a[1];
-    fprintf(stderr, "  [egl] context %u = %p, GLES %d (created on t%llu)\n",
-            g_nctx - 1, (void *)c, c->client_version, klegl_tid());
+    // 0x3098 is EGL_CONTEXT_CLIENT_VERSION and EGL_CONTEXT_MAJOR_VERSION_KHR —
+    // one token under two names. The minor version is read for the log line
+    // only: ANGLE hands kl_glfb whatever ES 3.x context it has. The rest of the
+    // KHR list (flags, profile mask, robustness) is ignored on purpose.
+    int minor = 0;
+    for (const int32_t *a = attribs; a && *a != EGL_NONE; a += 2) {
+        if (a[0] == 0x3098 /* EGL_CONTEXT_CLIENT_VERSION / MAJOR_VERSION_KHR */)
+            c->client_version = a[1];
+        else if (a[0] == 0x30FB /* EGL_CONTEXT_MINOR_VERSION_KHR */)
+            minor = a[1];
+    }
+    fprintf(stderr, "  [egl] context %u = %p, GLES %d.%d (created on t%llu)\n",
+            g_nctx - 1, (void *)c, c->client_version, minor, klegl_tid());
     return (EGLContext)c;
 }
 
@@ -1775,6 +2225,14 @@ static int32_t klegl_GetError(void) {
 // The gateway. Never fails, never aborts — see the header comment.
 void *kl_egl_sym(const char *name) {
     if (!name) return NULL;
+    // OVR_multiview_multisampled_render_to_texture is NOT offered (ANGLE's Metal
+    // backend has no implicit-resolve layered pass), and for an absent extension
+    // eglGetProcAddress answers NULL. That is what a guest tests: Doom3Quest takes
+    // glFramebufferTextureMultiviewOVR when this one is missing, where ANGLE's
+    // exported-but-disabled entry point would raise INVALID_OPERATION and leave
+    // its eye framebuffer incomplete.
+    if (strcmp(name, "glFramebufferTextureMultisampleMultiviewOVR") == 0)
+        return klgl_want_multiview_ms() ? (void *)klgl_FramebufferTextureMultisampleMultiviewOVR : NULL;
     void *own = kl_egl_lookup(name);              // eglXxx resolved through here too
     if (own) return own;
     // With KL_GLFB=1 the host's real GL answers everything except the capability
@@ -1868,6 +2326,7 @@ void kl_egl_report(FILE *f) {
     // swap: the last census before the abort is the one that names the class.
     kl_glfb_gl_census(f);
     kl_glfb_draw_census(f);
+    kl_glfb_program_binary_census(f);
     unsigned called = 0;
     for (unsigned i = 0; i < g_ngl; i++) if (g_gl[i].calls) called++;
     // `calls` counts the NULL driver's own stubs. Under KL_GLFB=1 the guest gets

@@ -32,6 +32,17 @@ for n in libEGL libGLESv2; do
   # install_name must be @rpath-relative to the framework, so the app's
   # embedded copy is what gets found rather than a build-tree absolute path.
   install_name_tool -id "@rpath/$n.framework/$n" "$DST/$n.framework/$n"
+  # No debug map in what ships. ANGLE's link leaves one N_OSO entry per object
+  # file in the symbol table — some 940 absolute paths of the machine it was
+  # built on (/Users/<name>/.../vendor/out/ios/obj/...), which then travel in
+  # every toolchain package. `strip -S` removes exactly those: code, data and
+  # the exported symbols are unchanged (compared section by section), and the
+  # library is two megabytes smaller. The unstripped build stays in $SRC for
+  # anyone who needs to symbolise.
+  xcrun strip -S "$DST/$n.framework/$n" 2> /dev/null
+  if LC_ALL=C grep -a -q '/Users/' "$DST/$n.framework/$n"; then
+    echo "  !! $DST/$n.framework/$n still names a build path under /Users/"; exit 1
+  fi
   cat > "$DST/$n.framework/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

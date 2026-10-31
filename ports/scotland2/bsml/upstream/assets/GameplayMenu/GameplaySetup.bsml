@@ -1,0 +1,27 @@
+﻿<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+    <tab-selector id='tabSelector' tab-tag='new-tab' anchor-pos-y='0' size-delta-y='6' size-delta-x='-20' child-expand-width='true' child-control-width='true'/>
+    <tab id='vanillaTab' tags='new-tab' tab-name='Vanilla' anchor-pos-y='-8'>
+        <macro.reparent transforms='vanillaItems'/>
+    </tab>
+    <tab id='modsTab' tags='new-tab' tab-name='Mods'>
+        <horizontal child-expand-width='false' pref-height='6' anchor-pos-y='28' size-delta-x='-16'>
+            <page-button direction='Left' pref-width='6' pref-height='6' tags='left-button'/>
+            <tab-selector tab-tag='mod-tab' child-expand-width='true' child-control-width='true' page-count='3' left-button-tag='left-button' right-button-tag='right-button'/>
+            <page-button direction='Right' pref-width='6' pref-height='6' tags='right-button'/>
+        </horizontal>
+    <stack pref-width='6' pref-height='6' horizontal-fit='PreferredSize' vertical-fit='PreferredSize' anchor-pos-x='57' anchor-pos-y='28'>
+        <clickable-image src='BSML_visibility' hover-hint='Show/Hide Tabs' on-click='ShowModal' preserve-aspect='true' pref-width='6' pref-height='6'/>
+    </stack>
+        <macro.for-each items='menus' pass-back-tags='true'>
+            <tab id='tab' tags='mod-tab' tab-name='~name' anchor-max-y='0.75'/>
+        </macro.for-each>
+    <modal id='listModal' clickerino-offerino-closerino='true' size-delta-x='65' size-delta-y='35'>
+        <stack child-align='MiddleCenter'>
+            <loading-indicator id='loading' preserve-aspect='true' pref-width='20' pref-height='20'/>
+            <horizontal anchor-pos-x='-2' horizontal-fit='PreferredSize' vertical-fit='PreferredSize' pref-width='55' pref-height='32'>
+                <list id='modsList' show-scrollbar='true' stick-scrolling='true' pref-width='55' pref-height='32' visible-cells='4'/>
+            </horizontal>
+        </stack>
+    </modal>
+    </tab>
+</bg>

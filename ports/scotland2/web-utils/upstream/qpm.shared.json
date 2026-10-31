@@ -1,0 +1,81 @@
+{
+  "$schema": "https://raw.githubusercontent.com/QuestPackageManager/QPM.Package/refs/heads/main/qpm.shared.schema.json",
+  "config": {
+    "version": "0.3.0",
+    "sharedDir": "shared",
+    "dependenciesDir": "extern",
+    "info": {
+      "name": "WebUtils",
+      "id": "web-utils",
+      "version": "0.1.0",
+      "url": "https://github.com/bsq-ports/WebUtils",
+      "additionalData": {
+        "overrideSoName": "libweb-utils.so",
+        "cmake": false
+      }
+    },
+    "workspace": {
+      "scripts": {
+        "qmod": [
+          "pwsh ./scripts/build.ps1",
+          "qpm qmod build",
+          "pwsh ./scripts/createqmod.ps1"
+        ]
+      },
+      "ndk": "^27.3.13750724",
+      "qmodIncludeDirs": [],
+      "qmodIncludeFiles": [],
+      "qmodOutput": null
+    },
+    "dependencies": [
+      {
+        "id": "libcurl",
+        "versionRange": "^8.5.0",
+        "additionalData": {
+          "private": true
+        }
+      },
+      {
+        "id": "fmt",
+        "versionRange": "^10.0.0",
+        "additionalData": {
+          "private": true
+        }
+      }
+    ]
+  },
+  "restoredDependencies": [
+    {
+      "dependency": {
+        "id": "fmt",
+        "versionRange": "=10.0.0",
+        "additionalData": {
+          "headersOnly": true,
+          "branchName": "version/v10_0_0",
+          "compileOptions": {
+            "systemIncludes": [
+              "fmt/include/"
+            ],
+            "cppFlags": [
+              "-DFMT_HEADER_ONLY"
+            ]
+          }
+        }
+      },
+      "version": "10.0.0"
+    },
+    {
+      "dependency": {
+        "id": "libcurl",
+        "versionRange": "=8.5.0",
+        "additionalData": {
+          "staticLinking": true,
+          "soLink": "https://github.com/darknight1050/openssl-curl-android/releases/download/v8.5.0/libcurl.a",
+          "overrideSoName": "libcurl.a",
+          "branchName": "version-v8.5.0"
+        }
+      },
+      "version": "8.5.0"
+    }
+  ]
+}

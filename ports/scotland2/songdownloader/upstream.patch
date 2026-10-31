@@ -1,0 +1,1240 @@
+--- a/include/CustomTypes/DownloadSongsSearchViewController.hpp
++++ b/include/CustomTypes/DownloadSongsSearchViewController.hpp
+@@ -25,6 +25,7 @@
+ #include "bsml/shared/BSML/MainThreadScheduler.hpp"
+ 
+ #include <vector>
++#include <atomic>
+ 
+ #define MAX_SPRITES 150
+ 
+@@ -94,7 +95,7 @@
+     void GoToSong(SongDownloader::SearchEntry entry);
+     void EnterSolo(GlobalNamespace::BeatmapLevel* level);
+ 
+-    static int searchIndex;
++    static std::atomic_int searchIndex;
+ 
+     static int searchPage;
+ 
+--- a/shared/BeatSaverAPI.hpp
++++ b/shared/BeatSaverAPI.hpp
+@@ -117,5 +117,7 @@
+ 
+     SONGDOWNLOADER_EXPORT void DownloadMissingSongsFromPlaylist(PlaylistCore::Playlist* playlist, std::function<void()> finished, std::function<void(int, int)> progressUpdate = nullptr);
+ 
++    // Legacy ABI; internal callers use the synchronized snapshot below.
+     SONGDOWNLOADER_EXPORT extern std::string exception;
++    SONGDOWNLOADER_EXPORT std::string GetException();
+ }
+--- a/shared/ScoreSaberAPI.hpp
++++ b/shared/ScoreSaberAPI.hpp
+@@ -194,5 +194,7 @@
+     /// <summary>
+     /// String containing any exceptions that were encountered during the request, empty otherwise
+     /// </summary>
++    // Legacy ABI; internal callers use the synchronized snapshot below.
+     SONGDOWNLOADER_EXPORT extern std::string exception;
++    SONGDOWNLOADER_EXPORT std::string GetException();
+ }
+--- a/src/BeatSaverAPI.cpp
++++ b/src/BeatSaverAPI.cpp
+@@ -1,6 +1,8 @@
+ #include "BeatSaverAPI.hpp"
+ 
+ #include "CustomLogger.hpp"
++#include <mutex>
++#include <memory>
+ 
+ #include "Utils/WebUtils.hpp"
+ #include "Utils/FileUtils.hpp"
+@@ -23,9 +25,18 @@
+ namespace BeatSaver::API {
+ 
+     std::string exception;
++    static std::mutex exceptionMutex;
++    static void SetException(std::string value) {
++        std::lock_guard<std::mutex> lock(exceptionMutex);
++        exception = std::move(value);
++    }
++    std::string GetException() {
++        std::lock_guard<std::mutex> lock(exceptionMutex);
++        return exception;
++    }
+ 
+     std::optional<BeatSaver::Beatmap> GetBeatmapByKey(std::string key) {
+-        exception.clear();
++        SetException({});
+         auto json = WebUtils::GetJSON(fmt::format(API_URL "/maps/id/{}", key));
+         if (!json.has_value())
+             return std::nullopt;
+@@ -36,13 +47,13 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     std::optional<BeatSaver::Beatmap> GetBeatmapByHash(std::string hash) {
+-        exception.clear();
++        SetException({});
+         auto json = WebUtils::GetJSON(fmt::format(API_URL "/maps/hash/{}", hash));
+         if (!json.has_value())
+             return std::nullopt;
+@@ -53,13 +64,13 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     std::optional<BeatSaver::UserDetail> GetUserById(int id) {
+-        exception.clear();
++        SetException({});
+         auto json = WebUtils::GetJSON(fmt::format(API_URL "/users/id/{}", id));
+         if (!json.has_value())
+             return std::nullopt;
+@@ -70,13 +81,13 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     std::optional<BeatSaver::UserDetail> GetUserByName(std::string username) {
+-        exception.clear();
++        SetException({});
+         auto json = WebUtils::GetJSON(fmt::format(API_URL "/users/name/{}", username));
+         if (!json.has_value())
+             return std::nullopt;
+@@ -87,13 +98,13 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     std::optional<BeatSaver::Page> SearchPaged(std::string query, int pageIndex, std::string sortOrder, std::string automapper, std::string ME, std::string NE, std::string Chroma) {
+-        exception.clear();
++        SetException({});
+         std::stringstream searchStream;
+         searchStream << API_URL "/search/text/" << pageIndex;
+         searchStream << "?sortOrder=" << sortOrder;
+@@ -113,13 +124,13 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     std::optional<BeatSaver::Page> LatestPaged(bool automapper, std::string after) {
+-        exception.clear();
++        SetException({});
+         std::optional<rapidjson::Document> json;
+         if (after.empty()) {
+             json = WebUtils::GetJSON(fmt::format(API_URL "/maps/latest?automapper={}", automapper));
+@@ -136,13 +147,13 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     std::optional<BeatSaver::Page> PlaysPaged(int pageIndex) {
+-        exception.clear();
++        SetException({});
+         auto json = WebUtils::GetJSON(fmt::format(API_URL "/maps/plays/{}", pageIndex));
+         if (!json.has_value())
+             return std::nullopt;
+@@ -153,17 +164,18 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     bool DownloadBeatmap(const BeatSaver::Beatmap& beatmap) {
++        if (beatmap.GetVersions().empty()) { return false; }
+         auto levelsPath = SongCore::API::Loading::GetPreferredCustomLevelPath();
+-        auto targetFolderName = fmt::format("{} ()[]{{}}%&.:,;=!-_ ({} - {})", beatmap.GetId(), beatmap.GetMetadata().GetSongName(), beatmap.GetMetadata().GetLevelAuthorName());
++        auto targetFolderName = FileUtils::FixIlegalName(fmt::format("{} ({} - {})", beatmap.GetId(), beatmap.GetMetadata().GetSongName(), beatmap.GetMetadata().GetLevelAuthorName()));
+         auto targetFolder = levelsPath / targetFolderName;
+         std::string data;
+-        WebUtils::Get(beatmap.GetVersions().front().GetDownloadURL(), FILE_DOWNLOAD_TIMEOUT, data);
++        if (beatmap.GetVersions().empty() || WebUtils::Get(beatmap.GetVersions().front().GetDownloadURL(), FILE_DOWNLOAD_TIMEOUT, data)!=200 || data.empty()) return true;
+         int args = 2;
+         int statusCode = zip_stream_extract(data.data(), data.length(), targetFolder.c_str(), +[](const char* name, void* arg) -> int {
+             return 0;
+@@ -172,6 +184,7 @@
+     }
+ 
+     std::vector<uint8_t> GetPreview(const BeatSaver::Beatmap& beatmap) {
++        if (beatmap.GetVersions().empty()) { return {}; }
+         std::string data;
+         WebUtils::Get(beatmap.GetVersions().front().GetPreviewURL(), FILE_DOWNLOAD_TIMEOUT, data);
+         std::vector<uint8_t> bytes(data.begin(), data.end());
+@@ -179,6 +192,7 @@
+     }
+ 
+     std::vector<uint8_t> GetCoverImage(const BeatSaver::Beatmap& beatmap) {
++        if (beatmap.GetVersions().empty()) { return {}; }
+         std::string data;
+         WebUtils::Get(beatmap.GetVersions().front().GetCoverURL(), FILE_DOWNLOAD_TIMEOUT, data);
+         std::vector<uint8_t> bytes(data.begin(), data.end());
+@@ -196,7 +210,7 @@
+     }
+ 
+     void GetBeatmapByKeyAsync(std::string key, std::function<void(std::optional<BeatSaver::Beatmap>)> finished) {
+-        exception.clear();
++        SetException({});
+         WebUtils::GetJSONAsync(fmt::format(API_URL "/maps/id/{}", key),
+             [finished](long httpCode, bool error, rapidjson::Document& document) {
+                 if (error || ++document.MemberBegin() == document.MemberEnd()) {
+@@ -210,7 +224,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                         //// Convert the document into a string and log/write to file for debug purposes
+                         //rapidjson::StringBuffer buffer;
+@@ -224,7 +238,7 @@
+     }
+ 
+     void GetBeatmapByHashAsync(std::string hash, std::function<void(std::optional<BeatSaver::Beatmap>)> finished) {
+-        exception.clear();
++        SetException({});
+         WebUtils::GetJSONAsync(fmt::format(API_URL "/maps/hash/{}", hash),
+             [finished](long httpCode, bool error, rapidjson::Document& document) {
+                 if (error || ++document.MemberBegin() == document.MemberEnd()) {
+@@ -238,7 +252,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                         //// Convert the document into a string and log/write to file for debug purposes
+                         //rapidjson::StringBuffer buffer;
+@@ -252,7 +266,7 @@
+     }
+ 
+     void GetBeatmapByUserIdAsync(int userID, int page, std::function<void(std::optional<BeatSaver::Page>)> finished) {
+-        exception.clear();
++        SetException({});
+         std::string searchPath = fmt::format(API_URL "/maps/uploader/{}/{}", userID, page);
+         LOG_DEBUG("GetBeatmapByUserIdAsync: {}", searchPath);
+         WebUtils::GetJSONAsync(searchPath,
+@@ -273,7 +287,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                     }
+                 }
+@@ -282,7 +296,7 @@
+     }
+ 
+     void GetUserByNameAsync(std::string username, std::function<void(std::optional<BeatSaver::UserDetail>)> finished) {
+-        exception.clear();
++        SetException({});
+         std::string searchPath = fmt::format(API_URL "/users/name/{}", username);
+         LOG_DEBUG("GetUserByNameAsync: {}", searchPath);
+         WebUtils::GetJSONAsync(searchPath,
+@@ -303,7 +317,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                     }
+                 }
+@@ -313,7 +327,7 @@
+ 
+ 
+     void GetUserByIdAsync(int id, std::function<void(std::optional<BeatSaver::UserDetail>)> finished) {
+-        exception.clear();
++        SetException({});
+         auto searchPath = fmt::format(API_URL "/users/id/{}", id);
+         LOG_DEBUG("GetUserByIdAsync: {}", searchPath);
+         WebUtils::GetJSONAsync(searchPath,
+@@ -329,7 +343,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                         //// Convert the document into a string and log/write to file for debug purposes
+                         //rapidjson::StringBuffer buffer;
+@@ -343,7 +357,7 @@
+     }
+ 
+     void SearchPagedAsync(std::string query, int pageIndex, std::function<void(std::optional<BeatSaver::Page>)> finished, std::string sortOrder, std::string automapper, std::string ranked, std::string ME, std::string NE, std::string Chroma) {
+-        exception.clear();
++        SetException({});
+         std::stringstream searchStream;
+         searchStream << API_URL "/search/text/" << pageIndex;
+         searchStream << "?sortOrder=" << sortOrder;
+@@ -374,7 +388,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                     }
+                 }
+@@ -383,8 +397,10 @@
+     }
+ 
+     void DownloadBeatmapAsync(const BeatSaver::Beatmap& beatmap, std::function<void(bool)> finished, std::function<void(float)> progressUpdate) {
++        if (beatmap.GetVersions().empty()) { if (finished) finished(true); return; }
+         WebUtils::GetAsync(beatmap.GetVersions().front().GetDownloadURL(), FILE_DOWNLOAD_TIMEOUT,
+             [beatmap, finished](long httpCode, std::string data) {
++                if (httpCode!=200 || data.empty()) { if(finished) finished(true); return; }
+                 auto levelsPath = SongCore::API::Loading::GetPreferredCustomLevelPath();
+                 auto targetFolderName = FileUtils::FixIlegalName(fmt::format("{} ({} - {})", beatmap.GetId(), beatmap.GetMetadata().GetSongName(), beatmap.GetMetadata().GetLevelAuthorName()));
+                 auto targetFolder = levelsPath / targetFolderName;
+@@ -400,6 +416,7 @@
+     void DownloadBeatmapAsync(const BeatSaver::Beatmap& beatmap, const BeatSaver::BeatmapVersion& beatmapVer, std::function<void(bool)> finished, std::function<void(float)> progressUpdate) {
+         WebUtils::GetAsync(beatmapVer.GetDownloadURL(), FILE_DOWNLOAD_TIMEOUT,
+             [beatmap, finished](long httpCode, std::string data) {
++                if (httpCode!=200 || data.empty()) { if(finished) finished(true); return; }
+                 auto levelsPath = SongCore::API::Loading::GetPreferredCustomLevelPath();
+                 auto targetFolderName = FileUtils::FixIlegalName(fmt::format("{} ({} - {})", beatmap.GetId(), beatmap.GetMetadata().GetSongName(), beatmap.GetMetadata().GetLevelAuthorName()));
+                 auto targetFolder = levelsPath / targetFolderName;
+@@ -419,6 +436,7 @@
+         std::transform(hash.begin(), hash.end(), hash.begin(), tolower);
+         WebUtils::GetAsync(fmt::format(CDN_URL "{}.zip", hash), FILE_DOWNLOAD_TIMEOUT,
+             [song, finished](long httpCode, std::string data) {
++                if(httpCode!=200 || data.empty()){if(finished)finished(true);return;}
+                 auto levelsPath = SongCore::API::Loading::GetPreferredCustomLevelPath();
+                 auto targetFolderName = FileUtils::FixIlegalName(fmt::format("{} ({} - {})", song.GetUid(), song.GetName(), song.GetLevelAuthorName()));
+                 auto targetFolder = levelsPath / targetFolderName;
+@@ -438,7 +456,7 @@
+             if (beatmap.has_value())
+                 DownloadBeatmapAsync(beatmap.value(), finished, progressUpdate);
+             else
+-                finished(false);
++                if (finished) finished(true);
+             }
+         );
+ 
+@@ -458,8 +476,10 @@
+     }
+ 
+     void GetCoverImageAsync(const BeatSaver::Beatmap& beatmap, std::function<void(std::vector<uint8_t>)> finished, std::function<void(float)> progressUpdate) {
++        if (beatmap.GetVersions().empty()) { if (finished) finished({}); return; }
+         WebUtils::GetAsync(beatmap.GetVersions().front().GetCoverURL(), FILE_DOWNLOAD_TIMEOUT,
+             [beatmap, finished](long httpCode, std::string data) {
++                if (httpCode!=200 || data.empty()) { if(finished) finished({}); return; }
+                 std::vector<uint8_t> bytes(data.begin(), data.end());
+                 finished(bytes);
+             }, progressUpdate
+@@ -469,6 +489,7 @@
+     void GetCoverImageAsync(const BeatSaver::BeatmapVersion& beatmap, std::function<void(std::vector<uint8_t>)> finished, std::function<void(float)> progressUpdate) {
+         WebUtils::GetAsync(beatmap.GetCoverURL(), FILE_DOWNLOAD_TIMEOUT,
+             [beatmap, finished](long httpCode, std::string data) {
++                if (httpCode!=200 || data.empty()) { if(finished) finished({}); return; }
+                 std::vector<uint8_t> bytes(data.begin(), data.end());
+                 finished(bytes);
+             }, progressUpdate
+@@ -489,8 +510,10 @@
+     }
+ 
+     void GetPreviewAsync(const BeatSaver::Beatmap& beatmap, std::function<void(std::vector<uint8_t>)> finished, std::function<void(float)> progressUpdate) {
++        if (beatmap.GetVersions().empty()) { if (finished) finished({}); return; }
+         WebUtils::GetAsync(beatmap.GetVersions().front().GetPreviewURL(), FILE_DOWNLOAD_TIMEOUT,
+             [beatmap, finished](long httpCode, std::string data) {
++                if (httpCode!=200 || data.empty()) { if(finished) finished({}); return; }
+                 std::vector<uint8_t> bytes(data.begin(), data.end());
+                 finished(bytes);
+             }, progressUpdate
+@@ -498,19 +521,9 @@
+     }
+ 
+     void DownloadMissingSongsFromPlaylist(PlaylistCore::Playlist* playlist, std::function<void()> finished, std::function<void(int, int)> progressUpdate) {
+-        // find number of songs that need to be in the queue before downloading
+-        int quantity = PlaylistCore::PlaylistHasMissingSongs(playlist);
+-        if(quantity == 0) {
+-            if(finished)
+-                finished();
+-            return;
+-        }
+-        if(progressUpdate)
+-            progressUpdate(0, quantity);
+-        // queue songs
++        if (!playlist || !playlist->playlistCS) { if (finished) finished(); return; }
+         auto songQueue = std::vector<std::string>{};
+-        // track actual downloads
+-        auto downloads = new std::atomic_int(0);
++        auto downloads = std::make_shared<std::atomic_int>(0);
+         // add all nonpresent song hashes to queue
+         for(auto& song : playlist->playlistJSON.Songs) {
+             bool hasSong = false;
+@@ -530,12 +543,16 @@
+             if(!hasSong && song.Hash)
+                 songQueue.emplace_back(song.Hash.value());
+         }
++        const int quantity = static_cast<int>(songQueue.size());
++        if (!quantity) { if (finished) finished(); return; }
++        if (progressUpdate) progressUpdate(0, quantity);
+         // recursive (because threads) callback for each time a beatmap is recieved from beatsaver
+-        static void(*onBeatmap)(std::vector<std::string>, std::optional<Beatmap>, std::function<void()>, std::function<void(int, int)>, int, std::atomic_int*)
+-                = *[](std::vector<std::string> songQueue, std::optional<Beatmap> beatmap, std::function<void()> finished, std::function<void(int, int)> progressUpdate, int quantity, std::atomic_int* downloads) mutable {
++        static void(*onBeatmap)(std::vector<std::string>, std::optional<Beatmap>, std::function<void()>, std::function<void(int, int)>, int, std::shared_ptr<std::atomic_int>)
++                = *[](std::vector<std::string> songQueue, std::optional<Beatmap> beatmap, std::function<void()> finished, std::function<void(int, int)> progressUpdate, int quantity, std::shared_ptr<std::atomic_int> downloads) mutable {
+             // start next beatmap
+             if(!songQueue.empty()) {
+-                GetBeatmapByHashAsync(songQueue.back(), [songQueue = std::move(songQueue), finished, progressUpdate, quantity, downloads](std::optional<Beatmap> beatmap) mutable {
++                auto nextHash = songQueue.back();
++                GetBeatmapByHashAsync(nextHash, [songQueue = std::move(songQueue), finished, progressUpdate, quantity, downloads](std::optional<Beatmap> beatmap) mutable {
+                     songQueue.pop_back();
+                     onBeatmap(std::move(songQueue), std::move(beatmap), finished, progressUpdate, quantity, downloads);
+                 });
+@@ -543,26 +560,27 @@
+             // download if beatmap is found, but update downloads and potentially run finish either way
+             if(beatmap.has_value()) {
+                 DownloadBeatmapAsync(beatmap.value(), [finished, progressUpdate, quantity, downloads](bool _) {
+-                    bool complete = (*downloads)++ == quantity - 1;
++                    const int completed = downloads->fetch_add(1) + 1;
++                    bool complete = completed == quantity;
+                     if(progressUpdate)
+-                        progressUpdate(*downloads, quantity);
++                        progressUpdate(completed, quantity);
+                     if(complete && finished) {
+                         finished();
+-                        delete downloads;
+                     }
+                 });
+             } else {
+                 LOG_INFO("Beatmap not found on beatsaver");
+-                bool complete = (*downloads)++ == quantity - 1;
++                const int completed = downloads->fetch_add(1) + 1;
++                    bool complete = completed == quantity;
+                 if(progressUpdate)
+-                    progressUpdate(*downloads, quantity);
++                    progressUpdate(completed, quantity);
+                 if(complete && finished) {
+                     finished();
+-                    delete downloads;
+                 }
+             }
+         };
+-        GetBeatmapByHashAsync(songQueue.back(), [songQueue = std::move(songQueue), finished, progressUpdate, quantity, downloads](std::optional<Beatmap> beatmap) mutable {
++        auto nextHash = songQueue.back();
++                GetBeatmapByHashAsync(nextHash, [songQueue = std::move(songQueue), finished, progressUpdate, quantity, downloads](std::optional<Beatmap> beatmap) mutable {
+             songQueue.pop_back();
+             onBeatmap(std::move(songQueue), std::move(beatmap), finished, progressUpdate, quantity, downloads);
+         });
+--- a/src/CustomTypes/DownloadSongsSearchViewController.cpp
++++ b/src/CustomTypes/DownloadSongsSearchViewController.cpp
+@@ -49,7 +49,7 @@
+ 
+ DEFINE_TYPE(SongDownloader, DownloadSongsSearchViewController);
+ 
+-int DownloadSongsSearchViewController::searchIndex = 0;
++std::atomic_int DownloadSongsSearchViewController::searchIndex{0};
+ 
+ int DownloadSongsSearchViewController::searchPage = 0;
+ 
+@@ -119,67 +119,57 @@
+                     this->GoToSong(entry);
+                     return;
+                 }
+-                if (entry.MapType == SearchEntry::MapType::BeatSaver) {
+-                    auto hash = entry.GetBeatmap().GetVersions().front().GetHash();
+-                    entry.status = SearchEntry::DownloadStatus::Downloading;
+-                    BeatSaver::API::DownloadBeatmapAsync(entry.GetBeatmap(),
+-                        [this, hash, &entry](bool error) {
+-                            if (!error) {
+-                                if (auto playlist = DownloadSongsPlaylistViewController::GetSelectedPlaylist()) {
+-                                    auto& json = playlist->playlistJSON;
+-                                    json.Songs.emplace_back().Hash = hash;
+-                                    playlist->Save();
+-                                    PlaylistCore::MarkPlaylistForReload(playlist);
+-                                }
+-                                entry.status = SearchEntry::DownloadStatus::Downloaded;
+-                                // Update download progress to 100% in GUI
+-                                entry.UpdateDownloadProgress(false);
+-                                SongCore::API::Loading::RefreshSongs(false).wait();
+-                                // Trigger checking for if the song is loaded
+-                                entry.UpdateDownloadProgress(true);
+-                                   
+-                            } else {
+-                                entry.status = SearchEntry::DownloadStatus::Failed;
+-                            }
+-                        },
+-                        [&entry, hash](float percentage) {
+-                            if (entry.GetBeatmap().GetVersions().front().GetHash() == hash) {
+-                                entry.downloadProgress = percentage;
+-                                entry.UpdateDownloadProgress(false);
+-                            }
+-                        }
+-                    );
+-                }
+-                else {
+-                    auto hash = entry.GetSongScoreSaber().GetSongHash();
+-                    entry.status = SearchEntry::DownloadStatus::Downloading;
+-                    BeatSaver::API::DownloadBeatmapAsync(entry.GetSongScoreSaber(),
+-                        [this, hash, &entry](bool error) {
+-                            if (!error) {
+-                                if (auto playlist = DownloadSongsPlaylistViewController::GetSelectedPlaylist()) {
+-                                    auto& json = playlist->playlistJSON;
+-                                    json.Songs.emplace_back().Hash = hash;
+-                                    playlist->Save();
+-                                    PlaylistCore::MarkPlaylistForReload(playlist);
+-                                }
+-                                
+-                                entry.status = SearchEntry::DownloadStatus::Downloaded;
+-                                entry.UpdateDownloadProgress(false);
+-                                SongCore::API::Loading::RefreshSongs(false).wait();
+-                                entry.status = SearchEntry::DownloadStatus::Loaded;
+-                                entry.UpdateDownloadProgress(true);
+-                            } else {
+-                                entry.status = SearchEntry::DownloadStatus::Failed;
+-                            }
+-                        },
+-                        [&entry, hash](float percentage) {
+-                            if (entry.GetSongScoreSaber().GetSongHash() == hash) {
+-                                entry.downloadProgress = percentage;
+-                                entry.UpdateDownloadProgress(false);
++                if (entry.MapType == SearchEntry::MapType::BeatSaver && entry.GetBeatmap().GetVersions().empty()) return;
++                const auto hash = entry.GetSongHash();
++                const int generation = searchIndex.load();
++                SafePtrUnity<DownloadSongsSearchViewController> owner(this);
++                const auto row = &entry - searchEntries;
++                auto isCurrent = [owner, row, hash, generation]() {
++                    return owner && generation == searchIndex.load() && owner->searchEntries[row].GetSongHash() == hash;
++                };
++                entry.status = SearchEntry::DownloadStatus::Downloading;
++                entry.UpdateDownloadProgress(false);
++                auto finished = [owner, row, hash, generation, isCurrent](bool error) {
++                    // Refresh stays on the download worker; Unity and playlist state stay on the main thread.
++                    BSML::MainThreadScheduler::Schedule([owner, row, error, isCurrent] {
++                        if (!isCurrent()) return;
++                        auto& current = owner->searchEntries[row];
++                        current.status = error ? SearchEntry::DownloadStatus::Failed : SearchEntry::DownloadStatus::Downloaded;
++                        current.UpdateDownloadProgress(false);
++                    });
++                    if (error) return;
++                    bool refreshed = true;
++                    try { SongCore::API::Loading::RefreshSongs(false).wait(); }
++                    catch (...) { refreshed = false; }
++                    BSML::MainThreadScheduler::Schedule([owner, row, hash, generation, isCurrent, refreshed] {
++                        // Playlist access is main-thread-only, even when a search page has changed.
++                        if (!owner || generation != searchIndex.load()) return;
++                        if (auto playlist = DownloadSongsPlaylistViewController::GetSelectedPlaylist()) {
++                            auto& songs = playlist->playlistJSON.Songs;
++                            if (std::none_of(songs.begin(), songs.end(), [&hash](const auto& song) { return song.Hash == hash; })) {
++                                songs.emplace_back().Hash = hash;
++                                playlist->Save();
++                                PlaylistCore::MarkPlaylistForReload(playlist);
+                             }
+                         }
+-                    );
+-                }
++                        if (!isCurrent()) return;
++                        auto& current = owner->searchEntries[row];
++                        if (!refreshed) current.status = SearchEntry::DownloadStatus::Failed;
++                        current.UpdateDownloadProgress(refreshed);
++                    });
++                };
++                auto progress = [owner, row, isCurrent](float percentage) {
++                    BSML::MainThreadScheduler::Schedule([owner, row, percentage, isCurrent] {
++                        if (!isCurrent()) return;
++                        auto& current = owner->searchEntries[row];
++                        current.downloadProgress = percentage;
++                        current.UpdateDownloadProgress(false);
++                    });
++                };
++                if (entry.MapType == SearchEntry::MapType::BeatSaver)
++                    BeatSaver::API::DownloadBeatmapAsync(entry.GetBeatmap(), finished, progress);
++                else
++                    BeatSaver::API::DownloadBeatmapAsync(entry.GetSongScoreSaber(), finished, progress);
+             }
+         ));
+     }
+@@ -196,11 +186,11 @@
+ void DownloadSongsSearchViewController::SearchKey(int currentSearchIndex) {
+     if (!DownloadSongsSearchViewController::SearchQuery.empty()) {
+         BeatSaver::API::GetBeatmapByKeyAsync(DownloadSongsSearchViewController::SearchQuery,
+-            [this, currentSearchIndex](std::optional<BeatSaver::Beatmap> beatmap) {
++            [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(this)](std::optional<BeatSaver::Beatmap> beatmap) {
+                 if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                     BSML::MainThreadScheduler::Schedule(
+-                        [this, currentSearchIndex, beatmap] {
+-                            if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
++                        [this, currentSearchIndex, beatmap, owner] {
++                            if (owner && currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                                 if (beatmap.has_value()) {
+                                     loadingControl->Hide();
+                                     searchEntries[0].SetBeatmap(beatmap.value());
+@@ -209,7 +199,7 @@
+                                     }
+                                 }
+                                 else {
+-                                    if (!BeatSaver::API::exception.empty()) loadingControl->ShowText(BeatSaver::API::exception, true);
++                                    if (!BeatSaver::API::GetException().empty()) loadingControl->ShowText(BeatSaver::API::GetException(), true);
+                                     else loadingControl->ShowText("No Song Found for Key!", true);
+                                 }
+                             }
+@@ -224,11 +214,11 @@
+ 
+ void DownloadSongsSearchViewController::SearchSongs(int currentSearchIndex) {
+     BeatSaver::API::SearchPagedAsync(DownloadSongsSearchViewController::SearchQuery, DownloadSongsSearchViewController::searchPage,
+-        [this, currentSearchIndex](std::optional<BeatSaver::Page> page) {
++        [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(this)](std::optional<BeatSaver::Page> page) {
+             if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                 BSML::MainThreadScheduler::Schedule(
+-                    [this, currentSearchIndex, page] {
+-                        if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
++                    [this, currentSearchIndex, page, owner] {
++                        if (owner && currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                             if (page.has_value() && !page.value().GetDocs().empty()) {
+                                 auto maps = page.value().GetDocs();
+                                 auto mapsSize = maps.size();
+@@ -247,7 +237,7 @@
+                                 }
+                             }
+                             else {
+-                                if (!BeatSaver::API::exception.empty()) loadingControl->ShowText(BeatSaver::API::exception, true);
++                                if (!BeatSaver::API::GetException().empty()) loadingControl->ShowText(BeatSaver::API::GetException(), true);
+                                 else if (DownloadSongsSearchViewController::SearchQuery.empty()) loadingControl->ShowText("No Results,\nis your Internet working?", true);
+                                 else loadingControl->ShowText("No Songs Found!", true);
+                             }
+@@ -267,15 +257,16 @@
+ void DownloadSongsSearchViewController::SearchUser(int currentSearchIndex) {
+     if (!DownloadSongsSearchViewController::SearchQuery.empty()) {
+         BeatSaver::API::GetUserByNameAsync(DownloadSongsSearchViewController::SearchQuery,
+-            [this, currentSearchIndex](std::optional<BeatSaver::UserDetail> User) {
++            [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(this)](std::optional<BeatSaver::UserDetail> User) {
+                 BSML::MainThreadScheduler::Schedule(
+-                    [this, currentSearchIndex, User]() {
++                    [this, currentSearchIndex, User, owner]() {
++                        if (!owner || currentSearchIndex != searchIndex.load()) return;
+                         if (User.has_value()) {
+                             BeatSaver::API::GetBeatmapByUserIdAsync(User.value().GetId(), DownloadSongsSearchViewController::searchPage,
+-                                [this, currentSearchIndex](std::optional<BeatSaver::Page> page) {
++                                [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(this)](std::optional<BeatSaver::Page> page) {
+                                     BSML::MainThreadScheduler::Schedule(
+-                                        [this, currentSearchIndex, page]() {
+-                                            if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
++                                        [this, currentSearchIndex, page, owner]() {
++                                            if (owner && currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                                                 if (page.has_value() && !page.value().GetDocs().empty()) {
+                                                     auto maps = page.value().GetDocs();
+                                                     auto mapsSize = maps.size();
+@@ -293,7 +284,7 @@
+                                                         mapIndex++;
+                                                     }
+                                                 } else {
+-                                                    if (!BeatSaver::API::exception.empty() && BeatSaver::API::exception != "Not Found") loadingControl->ShowText(BeatSaver::API::exception, true);
++                                                    if (!BeatSaver::API::GetException().empty() && BeatSaver::API::GetException() != "Not Found") loadingControl->ShowText(BeatSaver::API::GetException(), true);
+                                                     else loadingControl->ShowText("No Songs Found for given User!", true);
+                                                 }
+                                             }
+@@ -302,7 +293,7 @@
+                                 }
+                             );
+                         } else {
+-                            if (!BeatSaver::API::exception.empty() && BeatSaver::API::exception != "Not Found") loadingControl->ShowText(BeatSaver::API::exception, true);
++                            if (!BeatSaver::API::GetException().empty() && BeatSaver::API::GetException() != "Not Found") loadingControl->ShowText(BeatSaver::API::GetException(), true);
+                             else loadingControl->ShowText("No User Found!", true);
+                         }
+                     }
+@@ -316,11 +307,11 @@
+ void DownloadSongsSearchViewController::GetTrending(int currentSearchIndex) {
+     ScoreSaber::API::SearchAsync(DownloadSongsSearchViewController::SearchQuery, ScoreSaber::API::ListCategory::TopRanked,
+     //ScoreSaber::API::GetTrendingAsync(
+-        [this, currentSearchIndex](std::optional<ScoreSaber::Leaderboards> page) {
++        [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(this)](std::optional<ScoreSaber::Leaderboards> page) {
+             if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                 BSML::MainThreadScheduler::Schedule(
+-                    [this, currentSearchIndex, page] {
+-                        if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
++                    [this, currentSearchIndex, page, owner] {
++                        if (owner && currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                             if (page.has_value() && !page.value().GetLeaderboards().empty()) {
+                                 auto songs = page.value().GetLeaderboards();
+                                 auto songsSize = songs.size();
+@@ -339,7 +330,7 @@
+                                 }
+                             }
+                             else {
+-                                if (!ScoreSaber::API::exception.empty()) loadingControl->ShowText(ScoreSaber::API::exception, true);
++                                if (!ScoreSaber::API::GetException().empty()) loadingControl->ShowText(ScoreSaber::API::GetException(), true);
+                                 else if (DownloadSongsSearchViewController::SearchQuery.empty()) loadingControl->ShowText("No Results,\nis your Internet working?", true);
+                                 else loadingControl->ShowText("No Songs Found!", true);
+                             }
+@@ -354,11 +345,11 @@
+ void DownloadSongsSearchViewController::GetLatestRanked(int currentSearchIndex) {
+     ScoreSaber::API::SearchAsync(DownloadSongsSearchViewController::SearchQuery, ScoreSaber::API::ListCategory::LatestRanked,
+     //ScoreSaber::API::SearchSSAsync(DownloadSongsSearchViewController::SearchQuery, ScoreSaber::API::SearchType::LatestRanked,
+-        [this, currentSearchIndex](std::optional<ScoreSaber::Leaderboards> page) {
++        [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(this)](std::optional<ScoreSaber::Leaderboards> page) {
+             if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                 BSML::MainThreadScheduler::Schedule(
+-                    [this, currentSearchIndex, page] {
+-                        if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
++                    [this, currentSearchIndex, page, owner] {
++                        if (owner && currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                             if (page.has_value() && !page.value().GetLeaderboards().empty()) {
+                                 auto songs = page.value().GetLeaderboards();
+                                 auto songsSize = songs.size();
+@@ -377,7 +368,7 @@
+                                 }
+                             }
+                             else {
+-                                if (!ScoreSaber::API::exception.empty()) loadingControl->ShowText(ScoreSaber::API::exception, true);
++                                if (!ScoreSaber::API::GetException().empty()) loadingControl->ShowText(ScoreSaber::API::GetException(), true);
+                                 else if (DownloadSongsSearchViewController::SearchQuery.empty()) loadingControl->ShowText("No Results,\nis your Internet working?", true);
+                                 else loadingControl->ShowText("No Songs Found!", true);
+                             }
+@@ -392,11 +383,11 @@
+ void DownloadSongsSearchViewController::GetTopPlayed(int currentSearchIndex) {
+     ScoreSaber::API::GetListAsync(ScoreSaber::API::ListCategory::TopPlayed, /*)
+     ScoreSaber::API::SearchSSAsync(DownloadSongsSearchViewController::SearchQuery, ScoreSaber::API::SearchType::TopPlayed,*/
+-        [this, currentSearchIndex](std::optional<ScoreSaber::Leaderboards> page) {
++        [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(this)](std::optional<ScoreSaber::Leaderboards> page) {
+             if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                 BSML::MainThreadScheduler::Schedule(
+-                    [this, currentSearchIndex, page] {
+-                        if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
++                    [this, currentSearchIndex, page, owner] {
++                        if (owner && currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                             if (page.has_value() && !page.value().GetLeaderboards().empty()) {
+                                 auto songs = page.value().GetLeaderboards();
+                                 auto songsSize = songs.size();
+@@ -415,7 +406,7 @@
+                                 }
+                             }
+                             else {
+-                                if (!ScoreSaber::API::exception.empty()) loadingControl->ShowText(ScoreSaber::API::exception, true);
++                                if (!ScoreSaber::API::GetException().empty()) loadingControl->ShowText(ScoreSaber::API::GetException(), true);
+                                 else if (DownloadSongsSearchViewController::SearchQuery.empty()) loadingControl->ShowText("No Results,\nis your Internet working?", true);
+                                 else loadingControl->ShowText("No Songs Found!", true);
+                             }
+@@ -430,11 +421,11 @@
+ void DownloadSongsSearchViewController::GetTopRanked(int currentSearchIndex) {
+     ScoreSaber::API::SearchAsync(DownloadSongsSearchViewController::SearchQuery, ScoreSaber::API::ListCategory::TopRanked,
+     //ScoreSaber::API::SearchSSAsync(DownloadSongsSearchViewController::SearchQuery, ScoreSaber::API::SearchType::TopRanked,
+-        [this, currentSearchIndex](std::optional<ScoreSaber::Leaderboards> page) {
++        [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(this)](std::optional<ScoreSaber::Leaderboards> page) {
+             if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                 BSML::MainThreadScheduler::Schedule(
+-                    [this, currentSearchIndex, page] {
+-                        if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
++                    [this, currentSearchIndex, page, owner] {
++                        if (owner && currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                             if (page.has_value() && !page.value().GetLeaderboards().empty()) {
+                                 auto songs = page.value().GetLeaderboards();
+                                 auto songsSize = songs.size();
+@@ -453,7 +444,7 @@
+                                 }
+                             }
+                             else {
+-                                if (!ScoreSaber::API::exception.empty()) loadingControl->ShowText(ScoreSaber::API::exception, true);
++                                if (!ScoreSaber::API::GetException().empty()) loadingControl->ShowText(ScoreSaber::API::GetException(), true);
+                                 else if (DownloadSongsSearchViewController::SearchQuery.empty()) loadingControl->ShowText("No Results,\nis your Internet working?", true);
+                                 else loadingControl->ShowText("No Songs Found!", true);
+                             }
+@@ -519,6 +510,7 @@
+ 
+ void DownloadSongsSearchViewController::DidActivate(bool firstActivation, bool addedToHierarchy, bool screenSystemEnabling) {
+     if (firstActivation) {
++        ++searchIndex;
+         searchViewController = this;
+         get_gameObject()->AddComponent<Touchable*>();
+ 
+--- a/src/CustomTypes/SearchEntry.cpp
++++ b/src/CustomTypes/SearchEntry.cpp
+@@ -28,6 +28,7 @@
+ #pragma region SetBeatmap
+ 
+ void SearchEntry::SetBeatmap(const BeatSaver::Beatmap& _map) {
++    if (_map.GetVersions().empty()) { Disable(); return; }
+     map = _map;
+     gameObject->SetActive(true);
+     MapType = SearchEntry::MapType::BeatSaver;
+@@ -66,10 +67,10 @@
+     int currentSearchIndex = DownloadSongsSearchViewController::searchIndex;
+ 
+     coverImageView->set_enabled(false);
+-    BeatSaver::API::GetCoverImageAsync(map, [this, currentSearchIndex](std::vector<uint8_t> bytes) {
++    BeatSaver::API::GetCoverImageAsync(map, [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(searchViewController)](std::vector<uint8_t> bytes) {
+         if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+-            BSML::MainThreadScheduler::Schedule([this, currentSearchIndex, bytes] {
+-                if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
++            BSML::MainThreadScheduler::Schedule([this, currentSearchIndex, bytes, owner] {
++                if (owner && !bytes.empty() && currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                     std::vector<uint8_t> data = bytes;
+ 
+                     ArrayW<uint8_t> spriteArray(data);
+@@ -102,10 +103,10 @@
+ //    int currentSearchIndex = DownloadSongsSearchViewController::searchIndex;
+ //
+ //    coverImageView->set_enabled(false);
+-//    ScoreSaber::API::GetCoverImageAsync(SSsong, [this, currentSearchIndex](std::vector<uint8_t> bytes) {
++//    ScoreSaber::API::GetCoverImageAsync(SSsong, [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(searchViewController)](std::vector<uint8_t> bytes) {
+ //        if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+-//            MainThreadScheduler::Schedule([this, currentSearchIndex, bytes] {
+-//                if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
++//            MainThreadScheduler::Schedule([this, currentSearchIndex, bytes, owner] {
++//                if (owner && !bytes.empty() && currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+ //                    std::vector<uint8_t> data = bytes;
+ //
+ //                    Array<uint8_t>* spriteArray = il2cpp_utils::vectorToArray(data);
+@@ -141,10 +142,10 @@
+     int currentSearchIndex = DownloadSongsSearchViewController::searchIndex;
+ 
+     coverImageView->set_enabled(false);
+-    ScoreSaber::API::GetCoverImageAsync(SSsong, [this, currentSearchIndex](std::vector<uint8_t> bytes) {
++    ScoreSaber::API::GetCoverImageAsync(SSsong, [this, currentSearchIndex, owner = SafePtrUnity<DownloadSongsSearchViewController>(searchViewController)](std::vector<uint8_t> bytes) {
+         if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+-            BSML::MainThreadScheduler::Schedule([this, currentSearchIndex, bytes] {
+-                if (currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
++            BSML::MainThreadScheduler::Schedule([this, currentSearchIndex, bytes, owner] {
++                if (owner && !bytes.empty() && currentSearchIndex == DownloadSongsSearchViewController::searchIndex) {
+                     std::vector<uint8_t> data = bytes;
+ 
+                     ArrayW<uint8_t> spriteArray(data);
+@@ -163,7 +164,7 @@
+ std::string SearchEntry::GetSongHash() {
+     std::string hash;
+     if (MapType == SearchEntry::MapType::BeatSaver) {
+-        hash = map.GetVersions().front().GetHash();
++        if (!map.GetVersions().empty()) hash = map.GetVersions().front().GetHash();
+     }
+     else {
+         hash = SSsong.GetSongHash();
+@@ -187,7 +188,8 @@
+     }
+     
+     BSML::MainThreadScheduler::Schedule(
+-        [this] {
++        [this, owner = SafePtrUnity<DownloadSongsSearchViewController>(searchViewController)] {
++            if (!owner) return;
+             // Update the download button text based on the current status
+             switch (status)
+             {
+--- a/src/ScoreSaberAPI.cpp
++++ b/src/ScoreSaberAPI.cpp
+@@ -1,6 +1,8 @@
+ #include "ScoreSaberAPI.hpp"
+ 
+ #include "CustomLogger.hpp"
++#include <mutex>
++#include <memory>
+ 
+ #include "Utils/WebUtils.hpp"
+ #include "Utils/FileUtils.hpp"
+@@ -22,9 +24,18 @@
+     // TODO: Add search option
+ 
+     std::string exception;
++    static std::mutex exceptionMutex;
++    static void SetException(std::string value) {
++        std::lock_guard<std::mutex> lock(exceptionMutex);
++        exception = std::move(value);
++    }
++    std::string GetException() {
++        std::lock_guard<std::mutex> lock(exceptionMutex);
++        return exception;
++    }
+ 
+     std::optional<ScoreSaber::Page> GetTrending(bool ranked, int pageIndex, int amount) {
+-        exception.clear();
++        SetException({});
+         auto json = WebUtils::GetJSON(fmt::format(API_URL_DEPRECATED "&cat=0&limit={}&page={}&ranked={}", amount, ++pageIndex, int(ranked)));
+         if (!json.has_value())
+             return std::nullopt;
+@@ -35,13 +46,13 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     std::optional<ScoreSaber::Page> GetLatestRanked(bool ranked, int pageIndex, int amount) {
+-        exception.clear();
++        SetException({});
+         auto json = WebUtils::GetJSON(fmt::format(API_URL_DEPRECATED "&cat=1&limit={}&page={}&ranke={}", amount, ++pageIndex, int(ranked)));
+         if (!json.has_value())
+             return std::nullopt;
+@@ -52,13 +63,13 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     std::optional<ScoreSaber::Page> GetTopPlayed(bool ranked, int pageIndex, int amount) {
+-        exception.clear();
++        SetException({});
+         auto json = WebUtils::GetJSON(fmt::format(API_URL_DEPRECATED "&cat=2&limit={}&page={}&ranked={}", amount, ++pageIndex, int(ranked)));
+         if (!json.has_value())
+             return std::nullopt;
+@@ -69,13 +80,13 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     std::optional<ScoreSaber::Page> GetTopRanked(bool ranked, int pageIndex, int amount) {
+-        exception.clear();
++        SetException({});
+         auto json = WebUtils::GetJSON(fmt::format(API_URL_DEPRECATED "&cat=3&limit={}&page={}&ranked={}", amount, ++pageIndex, int(ranked)));
+         if (!json.has_value())
+             return std::nullopt;
+@@ -86,13 +97,13 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+ 
+     std::optional<ScoreSaber::Leaderboards> GetList(ListCategory list, std::optional<bool> ranked, std::optional<bool> qualified, std::optional<bool> unique, int pageIndex) {
+-        exception.clear();
++        SetException({});
+         std::stringstream requeststream;
+         requeststream << API_LEADERBOARD;
+         requeststream << fmt::format("?category={}", static_cast<int>(list));
+@@ -106,7 +117,7 @@
+         if (!json.has_value())
+             return std::nullopt;
+         if (json.value().HasMember("errorMessage") && json.value()["errorMessage"].IsString()) {
+-            if (strcmp(json.value()["errorMessage"].GetString(), "Not Found") != 0) exception = json.value()["errorMessage"].GetString();
++            if (strcmp(json.value()["errorMessage"].GetString(), "Not Found") != 0) SetException(json.value()["errorMessage"].GetString());
+             return std::nullopt;
+         }
+         try {
+@@ -116,7 +127,7 @@
+         }
+         catch (const std::exception& e) {
+             LOG_ERROR("{}", e.what());
+-            exception = e.what();
++            SetException(e.what());
+             return std::nullopt;
+         }
+     }
+@@ -139,7 +150,7 @@
+     }
+ 
+     void GetTrendingAsync(std::function<void(std::optional<ScoreSaber::Page>)> finished, bool ranked, int pageIndex, int amount) {
+-        exception.clear();
++        SetException({});
+         WebUtils::GetJSONAsync(fmt::format(API_URL_DEPRECATED "&cat=0&limit={}&page={}&ranked={}", amount, ++pageIndex, int(ranked)),
+             [finished](long httpCode, bool error, rapidjson::Document& document) {
+                 if (error) {
+@@ -153,7 +164,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                         //// Convert the document into a string and log/write to file for debug purposes
+                         //rapidjson::StringBuffer buffer;
+@@ -167,7 +178,7 @@
+     }
+ 
+     void GetLatestRankedAsync(std::function<void(std::optional<ScoreSaber::Page>)> finished, bool ranked, int pageIndex, int amount) {
+-        exception.clear();
++        SetException({});
+         WebUtils::GetJSONAsync(fmt::format(API_URL_DEPRECATED "&cat=1&limit={}&page={}&ranked={}", amount, ++pageIndex, int(ranked)),
+             [finished](long httpCode, bool error, rapidjson::Document& document) {
+                 if (error) {
+@@ -181,7 +192,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                         //// Convert the document into a string and log/write to file for debug purposes
+                         //rapidjson::StringBuffer buffer;
+@@ -195,7 +206,7 @@
+     }
+ 
+     void GetTopPlayedAsync(std::function<void(std::optional<ScoreSaber::Page>)> finished, bool ranked, int pageIndex, int amount) {
+-        exception.clear();
++        SetException({});
+         WebUtils::GetJSONAsync(fmt::format(API_URL_DEPRECATED "&cat=2&limit={}&page={}&ranked={}", amount, ++pageIndex, int(ranked)),
+             [finished](long httpCode, bool error, rapidjson::Document& document) {
+                 if (error) {
+@@ -209,7 +220,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                         //// Convert the document into a string and log/write to file for debug purposes
+                         //rapidjson::StringBuffer buffer;
+@@ -223,7 +234,7 @@
+     }
+ 
+     void GetTopRankedAsync(std::function<void(std::optional<ScoreSaber::Page>)> finished, bool ranked, int pageIndex, int amount) {
+-        exception.clear();
++        SetException({});
+         WebUtils::GetJSONAsync(fmt::format(API_URL_DEPRECATED "&cat=3&limit={}&page={}&ranked={}", amount, ++pageIndex, int(ranked)),
+             [finished](long httpCode, bool error, rapidjson::Document& document) {
+                 if (error) {
+@@ -237,7 +248,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                         //// Convert the document into a string and log/write to file for debug purposes
+                         //rapidjson::StringBuffer buffer;
+@@ -251,7 +262,7 @@
+     }
+ 
+     void GetListAsync(ListCategory list, std::function<void(std::optional<ScoreSaber::Leaderboards>)> finished, std::optional<bool> ranked, std::optional<bool> qualified, std::optional<bool> unique, int pageIndex) {
+-        exception.clear();
++        SetException({});
+         std::stringstream requeststream;
+         requeststream << API_LEADERBOARD;
+         requeststream << fmt::format("?category={}", static_cast<int>(list));
+@@ -267,7 +278,7 @@
+                     finished(std::nullopt);
+                 }
+                 else if (document.IsObject() && document.HasMember("errorMessage") && document["errorMessage"].IsString()) {
+-                    if (strcmp(document["errorMessage"].GetString(), "Not Found") != 0) exception = document["errorMessage"].GetString();
++                    if (strcmp(document["errorMessage"].GetString(), "Not Found") != 0) SetException(document["errorMessage"].GetString());
+                     finished(std::nullopt);
+                 }
+                 else {
+@@ -278,7 +289,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                         //// Convert the document into a string and log/write to file for debug purposes
+                         //rapidjson::StringBuffer buffer;
+@@ -292,7 +303,7 @@
+     }
+ 
+     void SearchSSAsync(std::string query, SearchType list, std::function<void(std::optional<ScoreSaber::Page>)> finished, bool ranked, int pageIndex, int amount) {
+-        exception.clear();
++        SetException({});
+         WebUtils::GetJSONAsync(fmt::format(API_URL_DEPRECATED "&cat={}&limit={}&page={}&ranked={}&search={}", static_cast<int>(list), amount, ++pageIndex, int(ranked), query),
+             [finished](long httpCode, bool error, rapidjson::Document& document) {
+                 if (error) {
+@@ -306,7 +317,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                         //// Convert the document into a string and log/write to file for debug purposes
+                         //rapidjson::StringBuffer buffer;
+@@ -320,7 +331,7 @@
+     }
+ 
+     void SearchAsync(std::string query, ListCategory list, std::function<void(std::optional<ScoreSaber::Leaderboards>)> finished, std::optional<bool> ranked, std::optional<bool> qualified, std::optional<bool> unique, int pageIndex) {
+-        exception.clear();
++        SetException({});
+         std::stringstream requeststream;
+         requeststream << API_LEADERBOARD;
+         requeststream << fmt::format("?category={}", static_cast<int>(list));
+@@ -337,7 +348,7 @@
+                     finished(std::nullopt);
+                 }
+                 else if (document.IsObject() && document.HasMember("errorMessage") && document["errorMessage"].IsString()) {
+-                    if (strcmp(document["errorMessage"].GetString(), "Not Found") != 0) exception = document["errorMessage"].GetString();
++                    if (strcmp(document["errorMessage"].GetString(), "Not Found") != 0) SetException(document["errorMessage"].GetString());
+                     finished(std::nullopt);
+                 }
+                 else {
+@@ -348,7 +359,7 @@
+                     }
+                     catch (const std::exception& e) {
+                         LOG_ERROR("{}", e.what());
+-                        exception = e.what();
++                        SetException(e.what());
+                         finished(std::nullopt);
+                         // Convert the document into a string and log/write to file for debug purposes
+                         rapidjson::StringBuffer buffer;
+--- a/src/Utils/WebUtils.cpp
++++ b/src/Utils/WebUtils.cpp
+@@ -5,12 +5,29 @@
+ #include "libcurl/shared/curl.h"
+ #include "libcurl/shared/easy.h"
+ #include <sstream>
++#include <cstdlib>
++#include <limits>
++#include <algorithm>
++#include <cmath>
+ 
+ #define TIMEOUT 10
+ #define USER_AGENT "QuestSongDownloader/" VERSION " (+https://github.com/darknight1050/SongDownloader)"
+ 
+ namespace WebUtils {
++    [[maybe_unused]] static const auto curlInitialized=curl_global_init(CURL_GLOBAL_ALL);
++    // Standalone platform trust asset; retain the original curl request code.
++    static void ConfigureTLS(CURL* curl) {
++        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
++        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
++        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
++        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
++        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
++        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
++        if (const char* ca=std::getenv("KL_SCOTLAND2_CA_BUNDLE"); ca && *ca)
++            curl_easy_setopt(curl, CURLOPT_CAINFO, ca);
++    }
+ 
++
+     //https://stackoverflow.com/a/55660581
+     std::string query_encode(const std::string& s)
+     {
+@@ -29,7 +46,7 @@
+             {
+                 ret << ch;
+             }
+-            else if ((ch == '%') && IS_HEXDIG(s[i+0]) && IS_HEXDIG(s[i+1]))
++            else if ((ch == '%') && i + 1 < s.size() && IS_HEXDIG(s[i+0]) && IS_HEXDIG(s[i+1]))
+             {
+                 ret << s.substr(i-1, 3);
+                 i += 2;
+@@ -81,10 +98,13 @@
+ 
+     std::size_t CurlWrite_CallbackFunc_StdString(void *contents, std::size_t size, std::size_t nmemb, std::string *s)
+     {
++        constexpr std::size_t limit=512ULL*1024*1024;
++        if (!s || (size && nmemb>limit/size)) return 0;
+         std::size_t newLength = size * nmemb;
++        if (s->size()>limit || newLength>limit-s->size()) return 0;
+         try {
+             s->append((char*)contents, newLength);
+-        } catch(std::bad_alloc &e) {
++        } catch(const std::exception &e) {
+             //handle memory problem
+             LOG_CRITICAL("Failed to allocate string of size: {}", newLength);
+             return 0;
+@@ -107,8 +127,10 @@
+     }
+ 
+     long Get(std::string url, long timeout, std::string& val) {
++        val.clear();
+         // Init curl
+         auto* curl = curl_easy_init();
++        if (!curl) return 0;
+         struct curl_slist *headers = NULL;
+         headers = curl_slist_append(headers, "Accept: */*");
+         // Set headers
+@@ -129,17 +151,19 @@
+ 
+         curl_easy_setopt(curl, CURLOPT_WRITEDATA, reinterpret_cast<void*>(&val));
+         curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
+-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, false);
++        ConfigureTLS(curl);
+ 
+-        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
++        curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
+ 
+         auto res = curl_easy_perform(curl);
+         /* Check for errors */
+         if (res != CURLE_OK) {
+             LOG_CRITICAL("curl_easy_perform() failed: {}: {}", int(res), curl_easy_strerror(res));
+         }
+-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
++        if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
++        else val.clear();
+         curl_easy_cleanup(curl);
++        curl_slist_free_all(headers);
+ 
+         return httpCode;
+     }
+@@ -158,6 +182,7 @@
+                 std::string val;
+                 // Init curl
+                 auto* curl = curl_easy_init();
++                if (!curl) { if(finished) finished(0,{}); return; }
+                 struct curl_slist *headers = NULL;
+                 headers = curl_slist_append(headers, "Accept: */*");
+                 // Set headers
+@@ -182,10 +207,10 @@
+                     // Install the callback function
+                     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
+                         +[] (void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
+-                            float percentage = (float)dlnow / (float)dltotal * 100.0f;
++                            float percentage = dltotal>0 ? std::clamp((float)dlnow / (float)dltotal * 100.0f,0.0f,100.0f) : 0.0f;
+                             if(isnan(percentage))
+                                 percentage = 0.0f;
+-                            reinterpret_cast<ProgressUpdateWrapper*>(clientp)->progressUpdate(percentage);
++                            try { reinterpret_cast<ProgressUpdateWrapper*>(clientp)->progressUpdate(percentage); } catch (...) { return 1; }
+                             return 0;
+                         }
+                     );
+@@ -194,19 +219,21 @@
+                 long httpCode(0);
+                 curl_easy_setopt(curl, CURLOPT_WRITEDATA, &val);
+                 curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
+-                curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, false);
++                ConfigureTLS(curl);
+ 
+-                curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
++                curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
+ 
+                 auto res = curl_easy_perform(curl);
+                 /* Check for errors */
+                 if (res != CURLE_OK) {
+                     LOG_CRITICAL("curl_easy_perform() failed: {}: {}", int(res), curl_easy_strerror(res));
+                 }
+-                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
++                if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
++                else val.clear();
+                 curl_easy_cleanup(curl);
++                curl_slist_free_all(headers);
+                 delete wrapper;
+-                finished(httpCode, val);
++                if(finished) finished(httpCode, val);
+             }
+         );
+         t.detach();

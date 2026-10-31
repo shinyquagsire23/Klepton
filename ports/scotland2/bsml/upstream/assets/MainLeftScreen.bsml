@@ -1,0 +1,23 @@
+<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+    <vertical child-control-height='false'>
+        <horizontal bg='panel-top' pad-left='20' pad-right='20' horizontal-fit='PreferredSize'>
+            <text text='Mods' align='Center' font-size='10'></text>
+        </horizontal>
+        <macro.if value='anyButtons'>
+            <macro.print text='mods were found, showing buttons!'/>
+            <horizontal>
+                <scroll-view horizontal-fit='PreferredSize' vertical-fit='PreferredSize' pref-width='143' pref-height='59' child-control-height='true' child-control-width='false'>
+                    <grid horizontal-fit='Unconstrained' size-delta-x='124' cell-size-y='9' cell-size-x='40' spacing-x='2' spacing-y='2' align='Center'>
+                        <macro.for-each items='buttons'>
+                            <button id='menuButton' pref-width='40' pref-height='9' text='~text' hover-hint='~hoverHint' interactable='~interactable' on-click='Click' pad='0'/>
+                        </macro.for-each>
+                    </grid>
+                </scroll-view>
+            </horizontal>
+        </macro.if>
+    </vertical>
+    <macro.if value='!anyButtons'>
+        <macro.print text='No mods found! showing this to the user...' />
+        <text anchor-pos-y='6' size-delta-x='82' text='None of your currently installed mods add any buttons to this part of the menu!' font-align='Center' font-size='5' />
+    </macro.if>
+</bg>

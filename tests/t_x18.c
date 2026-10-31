@@ -43,6 +43,10 @@ typedef struct { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offse
 // instruction already names x9 the expected text collapses to x9 twice, which
 // is exactly what the rewritten word disassembles to.
 #define TEST_REG 9
+// ...except where x18 names a PAIR (CASP, KLX_HZ_PAIR): the field must stay
+// even, and the register above it comes along. check_x18.py expects x18:x19 to
+// read as this and the next one up.
+#define TEST_PAIR 10
 
 static unsigned long g_data;
 static unsigned long g_words, g_sites, g_refused, g_rd, g_wr, g_rw;
@@ -128,7 +132,8 @@ static void scan(const char *path) {
                 // rather than filtered here, so the tool reports the counts.
                 printf("%llx %08x %08x %d %u %u %d\n",
                        (unsigned long long)va, w[k],
-                       info.ok ? klx_substitute(w[k], &info, TEST_REG) : w[k],
+                       info.ok ? klx_substitute(w[k], &info, info.hazard == KLX_HZ_PAIR
+                                                             ? TEST_PAIR : TEST_REG) : w[k],
                        info.ok, info.nfields, info.roles, data);
             }
         }

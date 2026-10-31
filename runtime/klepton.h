@@ -45,6 +45,10 @@ void      *kl_sym(kl_image *img, const char *name);
 // is how an interposer calls through. Diagnostic: nothing in a shipping path
 // registers one.
 void       kl_interpose(const char *name, void *fn);
+// Repoint the slots an image bound for `name` from `from` to `to` (late ELF
+// preemption, before its initializers run). Returns the slots moved, -1 if the
+// image has no ELF header to walk.
+int        kl_rebind(kl_image *img, const char *name, void *from, void *to);
 // Run DT_INIT_ARRAY. Separate from kl_load so tests can inspect first.
 void       kl_run_init(kl_image *img);
 void       kl_unload(kl_image *img);
@@ -121,6 +125,7 @@ void *kl_trace_stub(const char *name, void *desc, void *tramp);
 
 // ---- image registry (backs guest dlopen/dlsym/dladdr) ----
 void      kl_set_library_path(const char *dir);
+const char *kl_library_path(void);
 void      kl_register_image(const char *soname, kl_image *img);
 kl_image *kl_find_image(const char *soname);
 // Load an .so plus its DT_NEEDED chain, dependencies first (kl_dl.c).
@@ -186,6 +191,8 @@ uint64_t kl_mem_available_bytes(void);
 // compares against Linux's values (see kl_libc.c).
 int kl_errno_to_linux(int e);
 int kl_errno_from_linux(int e);
+// Publish a host error to both Darwin errno and the cached bionic errno slot.
+void kl_errno_set(int darwin_errno);
 
 // KL_TRACE_FS reporting for guest file operations (see kl_libc.c).
 void kl_fs_trace_open(const char *path, int flags, int fd);
@@ -231,6 +238,18 @@ void kl_shim_set_guest_gl(kl_image *img);
 // mutex and from where it was locked. Called from t_boot's fault handler so
 // a hang names the contested mutex's owner, not just its waiters.
 void kl_pthread_report(FILE *out);
+// How many entries the mutex table has ever made (a destroyed mutex's entry is
+// taken over, not made again) — what says whether the table is holding a
+// guest's working set or every address it ever used.
+unsigned kl_pthread_mutex_entries(void);
+// kl_pthread_report as the app leaves, for the targets whose runs keep that
+// account (kl_pthread_stuck_diag); nothing for any other.
+int  kl_pthread_stuck_diag(void);
+void kl_pthread_exit_report(FILE *out);
+// Guest (Linux) signal number / sigset -> Darwin. One swapped pair,
+// SIGUSR2 <-> SIGSYS; everything else passes through. See kl_libc.c.
+int      kl_sig_to_darwin(int linux_sig);
+uint64_t kl_sigmask_to_darwin(uint64_t linux_mask);
 
 // XR_KHR_android_thread_settings (kl_pthread.c): raise a guest-flagged
 // scheduling-critical thread to USER_INTERACTIVE QoS so a streaming guest's

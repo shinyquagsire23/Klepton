@@ -1,0 +1,15 @@
+{
+  "_QPVersion": "1.0.0",
+  "name": "${mod_name}",
+  "id": "${mod_id}",
+  "author": "Sc2ad",
+  "version": "${version}",
+  "description": "General purpose Android hook library",
+  "dependencies": [],
+  "modFiles": [],
+  "libraryFiles": [
+    "libflamingo.so"
+  ],
+  "fileCopies": [],
+  "copyExtensions": []
+}

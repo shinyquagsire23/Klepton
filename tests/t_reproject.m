@@ -23,6 +23,10 @@
 #include <math.h>
 #include "kl_reproject.h"
 
+// kl_reproject.c asks for the target's name (per-title defaults); this test
+// links that file alone, without the driver, and runs as no title at all.
+const char *kl_driver_target_name(void) { return NULL; }
+
 static int g_fail;
 
 static void ok(int cond, const char *what) {
@@ -693,6 +697,131 @@ static void check_crop_pixels(void) {
                    "screen — the corner-of-the-eye bug, reproduced");
 }
 
+// A VULKAN picture with a shorter viewport — Alien: Rogue Incursion's case.
+//
+// Vulkan's first row is the picture's TOP, and the pass mirrors v after the
+// grid (`flip_y`). Unreal on Vulkan lowers its resolution by drawing into the
+// top rows of the texture and submitting {0, 0, w, h} counted from there. The
+// rect is mirrored ONCE, by kl_reproject_viewport_for_pass, and the pass must
+// show those rows, full size and right way up. Mirrored twice (what the
+// runtime's KL_OVRP_VIEWPORT_TOP did on top of the compositor's own mirror) it
+// names the texture's last rows: the lower part of the picture at the top of
+// the view and unwritten texels under it — the black band seen on the headset.
+//
+// 4x4 source, memory row 0 = picture top; the guest drew rows 0..2 (a 75 %
+// viewport), row 3 is the never-drawn marker. Rendered into a 4x3 target with
+// nearest sampling, so each output texel is exactly one source texel.
+static int vk_crop_render(id<MTLDevice> dev, id<MTLCommandQueue> q,
+                          id<MTLRenderPipelineState> ps, id<MTLTexture> src,
+                          id<MTLSamplerState> samp, float vp[4], uint8_t out[48]) {
+    kl_reproject_viewport_for_pass(vp, 4.0f, 1);
+    kl_ovrp_render_pose r = {0};
+    r.serial = 1; r.qw = 1;
+    for (int e = 0; e < 2; e++)
+        for (int i = 0; i < 4; i++) r.tangents[e][i] = 1.0f;
+    simd_float4x4 P = kl_reproject_projection(1, 1, 1, 1, 0.03f);
+    kl_reproject_uniforms u = kl_reproject_build(&r, 0, matrix_identity_float4x4,
+                                                 matrix_identity_float4x4, P, 0, 1, 0);
+    simd_float2 grid[kl_reproject_grid_entries(1, 1)];
+    kl_reproject_grid_build(grid, 1, 1, vp, 4, 4, 4, 4, NULL, NULL);
+
+    MTLTextureDescriptor *rd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:4 height:3 mipmapped:NO];
+    rd.usage = MTLTextureUsageRenderTarget;
+    rd.storageMode = MTLStorageModeShared;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:rd];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    id<MTLCommandBuffer> cmd = [q commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:ps];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentTexture:src atIndex:1];
+    [enc setFragmentSamplerState:samp atIndex:0];
+    [enc setVertexBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    [enc setVertexBytes:grid length:sizeof grid atIndex:1];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+             vertexCount:kl_reproject_grid_vertices(1, 1)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    [dst getBytes:out bytesPerRow:16 fromRegion:MTLRegionMake2D(0,0,4,3) mipmapLevel:0];
+    return 1;
+}
+
+static void check_vulkan_crop_pixels(void) {
+    printf("=== a Vulkan picture with a shorter viewport ===\n");
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    if (!dev || !q) { printf("  no Metal device — skipped\n"); return; }
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:
+                              [NSString stringWithUTF8String:kl_reproject_msl()]
+                                           options:nil error:&err];
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"kl_reproject_v"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"kl_reproject_f"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd
+                                                                       error:&err];
+    if (!ps) { ok(0, "pipeline for the Vulkan crop check"); return; }
+
+    MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+    td.textureType = MTLTextureType2DArray;
+    td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    td.width = 4; td.height = 4; td.arrayLength = 2;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> src = [dev newTextureWithDescriptor:td];
+    const uint8_t M[4] = { 255, 0, 255, 255 };          // magenta: never drawn
+    uint8_t s[4 * 4 * 4];
+    for (int i = 0; i < 4 * 4; i++) memcpy(s + i * 4, M, 4);
+    for (int y = 0; y < 3; y++)                          // rows 0..2: the picture
+        for (int x = 0; x < 4; x++) {
+            uint8_t *p = s + (y * 4 + x) * 4;
+            p[0] = (uint8_t)(40 + 50 * x); p[1] = (uint8_t)(20 + 90 * y);
+            p[2] = 0; p[3] = 255;
+        }
+    for (int sl = 0; sl < 2; sl++)
+        [src replaceRegion:MTLRegionMake2D(0,0,4,4) mipmapLevel:0 slice:sl
+                 withBytes:s bytesPerRow:16 bytesPerImage:64];
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.minFilter = MTLSamplerMinMagFilterNearest;
+    sd.magFilter = MTLSamplerMinMagFilterNearest;
+    sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    id<MTLSamplerState> samp = [dev newSamplerStateWithDescriptor:sd];
+
+    // As the guest submits it and as the frame record now carries it.
+    uint8_t out[48] = {0};
+    float vp[4] = { 0, 0, 4, 3 };
+    vk_crop_render(dev, q, ps, src, samp, vp, out);
+    // Output row 0 is the top of the target; the picture's top is source row 0.
+    int good = memcmp(out, s, 48) == 0;
+    ok(good, "the rows the guest drew, full size and right way up");
+    if (!good)
+        for (int i = 0; i < 48; i += 4)
+            printf("    texel %d got %3u,%3u,%3u want %3u,%3u,%3u\n", i / 4,
+                   out[i], out[i+1], out[i+2], s[i], s[i+1], s[i+2]);
+
+    // ...and mirrored twice, the way it reached the compositor for a store-built
+    // Unreal title on Vulkan from toolchain 478 to this fix: the marker comes
+    // back, under the picture's lower rows. If this goes quiet, the assertion
+    // above has stopped measuring anything.
+    uint8_t twice[48] = {0};
+    float vp2[4] = { 0, 4 - (0 + 3), 4, 3 };            // the old KL_OVRP_VIEWPORT_TOP
+    vk_crop_render(dev, q, ps, src, samp, vp2, twice);
+    int marker_bottom = 1, lower_row_top = memcmp(twice, s + 16, 32) == 0;
+    for (int i = 32; i < 48; i += 4)
+        if (!(twice[i] == M[0] && twice[i+1] == M[1] && twice[i+2] == M[2])) marker_bottom = 0;
+    ok(lower_row_top && marker_bottom,
+       "...mirrored twice: lower rows on top, unwritten texels below (Alien's band)");
+}
+
     // TWO EYES, TWO CROPS, ONE GRID — the symmetric-projection case.
 //
 // A guest using Oculus symmetric projection renders both eyes with one union
@@ -1026,6 +1155,26 @@ static void check_viewport(void) {
     kl_reproject_grid_build(g, 1, 1, over, W, H, W, H, NULL, NULL);
     ok(g[4].x == 1.0f && g[4].y == 1.0f,
        "a viewport past the screen is clamped, not trusted");
+
+    // ...but a rect that only OVERHANGS the screen keeps its span: Angry Birds
+    // VR's OculusXR submits eye1 at -64,0 4000 wide in a 3936-wide texture.
+    // The grid's interior must sit where that projection put it, and only the
+    // vertices past the edge are held to it. Clamping the rect squeezed 4000
+    // pixels of picture onto 3936 and moved the eye by 64 (2026-10-18).
+    {
+        const float TW = 3936, TH = 3209;
+        simd_float2 g4[kl_reproject_grid_entries(4, 1)];
+        const float hang[4] = { -64, 0, 4000, TH };
+        kl_reproject_grid_build(g4, 4, 1, hang, TW, TH, TW, TH, NULL, NULL);
+        int good = g4[1].x == 0.0f;                               // past the edge: held
+        for (int i = 1; i <= 3; i++)
+            good &= fabsf(g4[1 + i].x - (-64.0f + 1000.0f * i) / TW) < 1e-6f;
+        good &= g4[1 + 4].x == 1.0f;                              // 3936 = the edge itself
+        const float hang0[4] = { 0, 0, 4000, TH };
+        kl_reproject_grid_build(g4, 4, 1, hang0, TW, TH, TW, TH, NULL, NULL);
+        good &= fabsf(g4[1 + 2].x - 2000.0f / TW) < 1e-6f && g4[1 + 4].x == 1.0f;
+        ok(good, "a viewport overhanging the screen keeps its span; only the edge vertices are held");
+    }
 
     // Zero is the "whole texture" spelling every guest that cannot answer uses
     // — 1.28's legacy VRDevice, the null driver, an OpenXR guest. It must not
@@ -1373,6 +1522,7 @@ int main(void) {
         check_shader();
         check_pixels();
         check_crop_pixels();
+        check_vulkan_crop_pixels();
         check_split_crop_pixels();
         check_two_textures();
         check_proj_layers();

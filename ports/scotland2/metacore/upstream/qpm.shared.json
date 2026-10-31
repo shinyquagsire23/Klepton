@@ -1,0 +1,276 @@
+{
+  "$schema": "https://raw.githubusercontent.com/QuestPackageManager/QPM.Package/refs/heads/main/qpm.shared.schema.json",
+  "config": {
+    "version": "0.1.0",
+    "sharedDir": "shared",
+    "dependenciesDir": "extern",
+    "info": {
+      "name": "MetaCore",
+      "id": "metacore",
+      "version": "1.6.2",
+      "url": "https://github.com/Metalit/MetaCore",
+      "additionalData": {
+        "overrideSoName": "libmetacore.so",
+        "cmake": true
+      }
+    },
+    "workspace": {
+      "scripts": {
+        "build": [
+          "pwsh ./scripts/build.ps1 $0?"
+        ],
+        "copy": [
+          "pwsh ./scripts/copy.ps1 $0:?",
+          "pwsh ./scripts/restart-game.ps1"
+        ],
+        "log": [
+          "pwsh ./scripts/start-logging.ps1 $0:?"
+        ],
+        "qmod": [
+          "pwsh ./scripts/build.ps1 $0?",
+          "pwsh ./scripts/createqmod.ps1"
+        ],
+        "restart": [
+          "pwsh ./scripts/restart-game.ps1"
+        ],
+        "stack": [
+          "pwsh ./scripts/ndk-stack.ps1 $0:?"
+        ],
+        "tomb": [
+          "pwsh ./scripts/pull-tombstone.ps1 -analyze"
+        ]
+      },
+      "qmodIncludeDirs": [
+        "./build",
+        "./extern/libs"
+      ],
+      "qmodIncludeFiles": [],
+      "qmodOutput": "./MetaCore.qmod"
+    },
+    "dependencies": [
+      {
+        "id": "beatsaber-hook",
+        "versionRange": "^6.4.2",
+        "additionalData": {}
+      },
+      {
+        "id": "scotland2",
+        "versionRange": "^0.1.6",
+        "additionalData": {
+          "includeQmod": false
+        }
+      },
+      {
+        "id": "bs-cordl",
+        "versionRange": "^4008.0.0",
+        "additionalData": {}
+      },
+      {
+        "id": "paper2_scotland2",
+        "versionRange": "^4.6.4",
+        "additionalData": {}
+      },
+      {
+        "id": "rapidjson-macros",
+        "versionRange": "^2.1.0",
+        "additionalData": {}
+      },
+      {
+        "id": "custom-types",
+        "versionRange": "^0.18.3",
+        "additionalData": {
+          "private": true
+        }
+      },
+      {
+        "id": "song-details",
+        "versionRange": "^1.0.4",
+        "additionalData": {
+          "private": true
+        }
+      },
+      {
+        "id": "web-utils",
+        "versionRange": "^0.6.8",
+        "additionalData": {
+          "private": true
+        }
+      }
+    ]
+  },
+  "restoredDependencies": [
+    {
+      "dependency": {
+        "id": "custom-types",
+        "versionRange": "=0.18.3",
+        "additionalData": {
+          "soLink": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/libcustom-types.so",
+          "debugSoLink": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/debug_libcustom-types.so",
+          "overrideSoName": "libcustom-types.so",
+          "modLink": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod",
+          "branchName": "version/v0_18_3",
+          "compileOptions": {
+            "cppFlags": [
+              "-Wno-invalid-offsetof"
+            ]
+          },
+          "cmake": true
+        }
+      },
+      "version": "0.18.3"
+    },
+    {
+      "dependency": {
+        "id": "rapidjson-macros",
+        "versionRange": "=2.1.0",
+        "additionalData": {
+          "headersOnly": true,
+          "branchName": "version/v2_1_0",
+          "cmake": false
+        }
+      },
+      "version": "2.1.0"
+    },
+    {
+      "dependency": {
+        "id": "bs-cordl",
+        "versionRange": "=4008.0.0",
+        "additionalData": {
+          "headersOnly": true,
+          "branchName": "version/v4008_0_0",
+          "compileOptions": {
+            "includePaths": [
+              "include"
+            ],
+            "cppFeatures": [],
+            "cppFlags": [
+              "-DNEED_UNSAFE_CSHARP",
+              "-fdeclspec",
+              "-DUNITY_2021",
+              "-DHAS_CODEGEN",
+              "-Wno-invalid-offsetof"
+            ]
+          }
+        }
+      },
+      "version": "4008.0.0"
+    },
+    {
+      "dependency": {
+        "id": "paper2_scotland2",
+        "versionRange": "=4.6.4",
+        "additionalData": {
+          "soLink": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/libpaper2_scotland2.so",
+          "overrideSoName": "libpaper2_scotland2.so",
+          "modLink": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod",
+          "branchName": "version/v4_6_4",
+          "compileOptions": {
+            "systemIncludes": [
+              "shared/utfcpp/source"
+            ]
+          },
+          "cmake": false
+        }
+      },
+      "version": "4.6.4"
+    },
+    {
+      "dependency": {
+        "id": "fmt",
+        "versionRange": "=11.0.2",
+        "additionalData": {
+          "headersOnly": true,
+          "branchName": "version/v11_0_2",
+          "compileOptions": {
+            "systemIncludes": [
+              "fmt/include/"
+            ],
+            "cppFlags": [
+              "-DFMT_HEADER_ONLY"
+            ]
+          }
+        }
+      },
+      "version": "11.0.2"
+    },
+    {
+      "dependency": {
+        "id": "beatsaber-hook",
+        "versionRange": "=6.4.2",
+        "additionalData": {
+          "soLink": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/libbeatsaber-hook.so",
+          "debugSoLink": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/debug_libbeatsaber-hook.so",
+          "overrideSoName": "libbeatsaber-hook.so",
+          "modLink": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod",
+          "branchName": "version/v6_4_2",
+          "compileOptions": {
+            "cppFlags": [
+              "-Wno-extra-qualification"
+            ]
+          },
+          "cmake": true
+        }
+      },
+      "version": "6.4.2"
+    },
+    {
+      "dependency": {
+        "id": "web-utils",
+        "versionRange": "=0.6.8",
+        "additionalData": {
+          "soLink": "https://github.com/bsq-ports/WebUtils/releases/download/v0.6.8/libweb-utils.so",
+          "debugSoLink": "https://github.com/bsq-ports/WebUtils/releases/download/v0.6.8/debug_libweb-utils.so",
+          "overrideSoName": "libweb-utils.so",
+          "modLink": "https://github.com/bsq-ports/WebUtils/releases/download/v0.6.8/WebUtils.qmod",
+          "branchName": "version/v0_6_8",
+          "cmake": false
+        }
+      },
+      "version": "0.6.8"
+    },
+    {
+      "dependency": {
+        "id": "scotland2",
+        "versionRange": "=0.1.6",
+        "additionalData": {
+          "soLink": "https://github.com/sc2ad/scotland2/releases/download/v0.1.6/libsl2.so",
+          "debugSoLink": "https://github.com/sc2ad/scotland2/releases/download/v0.1.6/debug_libsl2.so",
+          "overrideSoName": "libsl2.so",
+          "branchName": "version/v0_1_6"
+        }
+      },
+      "version": "0.1.6"
+    },
+    {
+      "dependency": {
+        "id": "song-details",
+        "versionRange": "=1.0.4",
+        "additionalData": {
+          "soLink": "https://github.com/bsq-ports/SongDetails/releases/download/v1.0.4/libsongdetails.so",
+          "debugSoLink": "https://github.com/bsq-ports/SongDetails/releases/download/v1.0.4/debug_libsongdetails.so",
+          "overrideSoName": "libsongdetails.so",
+          "modLink": "https://github.com/bsq-ports/SongDetails/releases/download/v1.0.4/SongDetails.qmod",
+          "branchName": "version/v1_0_4",
+          "cmake": false
+        }
+      },
+      "version": "1.0.4"
+    },
+    {
+      "dependency": {
+        "id": "libil2cpp",
+        "versionRange": "=0.4.0",
+        "additionalData": {
+          "headersOnly": true,
+          "compileOptions": {
+            "systemIncludes": [
+              "il2cpp/external/baselib/Include",
+              "il2cpp/external/baselib/Platforms/Android/Include"
+            ]
+          }
+        }
+      },
+      "version": "0.4.0"
+    }
+  ]
+}

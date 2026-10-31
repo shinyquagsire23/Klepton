@@ -24,4 +24,10 @@ typedef uint32_t *(*kl_gp_at)(void *ctx, uint64_t va);
 // of patch GROUPS written. Names what it did, and names what it refused.
 unsigned kl_guest_patch_apply(const char *path, kl_gp_at at, void *ctx);
 
+// Does this libunity carry unity-texunit-mask? 0 = not this shape (never
+// patched), 1 = the original instruction, 2 = masked. Read-only: the GL side
+// asks it of the LOADED image, so it agrees with what klepton-ld or the loader
+// actually wrote rather than with a flag either one meant to set.
+int kl_gp_texunit_state(kl_gp_at at, void *ctx);
+
 #endif

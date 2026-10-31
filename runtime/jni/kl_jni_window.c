@@ -5,6 +5,7 @@
 // dispatch, id interning) is kl_jni.c; this file owns implementations and the
 // binding table that names them. See runtime/jni/kl_jni_int.h for the seam.
 #include <ctype.h>
+#include <math.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <pthread.h>
@@ -21,6 +22,7 @@
 #include "kl_fault.h"
 #include "kl_target.h"
 #include "kl_env.h"
+#include "guest/kl_driver.h"   // the target name, for per-target JNI defaults
 #include "kl_ovrp.h"
 #include "kl_avdec.h"
 #include "kl_egl.h"
@@ -35,6 +37,19 @@
 // here to keep a screen on or hide a navigation bar, and pretending otherwise
 // would be inventing behaviour rather than reporting it.
 static klj_val klj_Window_getDecorView(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *view;
+    return klj_singleton("android/view/View", &view);
+}
+
+// UnityPlayer.getView() — the SurfaceView the player owns. The C# reach for it
+// is the line after the mUnityPlayer read that brought that field into the
+// table above:
+//   currentActivity.Get<AndroidJavaObject>("mUnityPlayer").Call(..., "getView")
+// and it is what a plugin passes to a window/insets/touch API. A distinct View
+// from the window's decor view, because on Android they are distinct; both are
+// the same class here, so every android/view/View binding answers for either.
+static klj_val klj_UnityPlayer_getView(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *view;
     return klj_singleton("android/view/View", &view);
@@ -62,12 +77,10 @@ static klj_val klj_PowerManager_sustainedPerf(void *env, void *self, const klj_v
 // telemetry, not a control input: nothing here changes streaming behaviour, and
 // the cost of a wrong answer is a wrong number on someone's desktop.
 //
-// Answered as a headset on its battery and nearly full, which is what a Vision
-// Pro on its pack is for most of a session. Both are knobs because neither is
-// measured yet: on device the real values are available (UIDevice's battery
-// monitoring), and wiring them is the honest fix — until then a fixed answer at
-// least does not fluctuate, and a fluctuating invented number would be worse
-// than a static one.
+// The visionOS frontend publishes UIDevice's real level and charging state into
+// the seam below before the guest boots. A host run has no battery and therefore
+// keeps the stable 95% / unplugged fallback; KL_BATTERY_* can override either
+// field for a diagnostic run.
 static klj_val klj_BatteryManager_isCharging(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     // The charging flag lives in the kl_ovrp battery seam — the single source
@@ -112,6 +125,14 @@ static klj_val klj_InputDevice_getDeviceIds(void *env, void *self, const klj_val
         int32_t *v = klj_arr(ids)->data;
         v[0] = KLJ_INPUT_DEV_LTOUCH;
         v[1] = KLJ_INPUT_DEV_RTOUCH;
+        // Pinned for the same reason getDevice()'s InputDevice objects are.
+        // Unpinned, Paint the Town Red VR's boot aborts: libunity asks for the
+        // ids inside a local frame, the pop retires the array, and the next caller
+        // — Rewired, from C#, through the erased `()Ljava/lang/Object;`
+        // spelling — is handed a pointer we no longer recognise and aborts in
+        // GetObjectClass. A cached answer must outlive the frame it was built
+        // in; that is what klj_host_cache says.
+        klj_host_cache(ids);
     }
     KLJ_LOG("InputDevice.getDeviceIds() -> [%d, %d] (the two Touch controllers)",
             KLJ_INPUT_DEV_LTOUCH, KLJ_INPUT_DEV_RTOUCH);
@@ -225,11 +246,50 @@ static klj_val klj_InputDevice_getMotionRange(void *env, void *self, const klj_v
     return (klj_val){.l = NULL};   // no InputDevice-backed axis exists
 }
 
+// InputDevice.hasKeys(int... keyCodes) -> boolean[], one flag per key asked.
+//
+// Rewired asks this one, and only this one, to decide whether a device is a
+// DualShock 4 wearing a generic gamepad keymap (`IsDeviceKeyMapped`,
+// `DS4_GAMEPAD_KEYMAP_DISALLOWED_KEYS`): a real DS4 reports the disallowed
+// keys, a controller that merely looks like one does not. Our devices are the
+// two synthetic Touch controllers, which are NOT DualShocks and carry no
+// Android keymap at all — every button reaches the guest through OVRPlugin's
+// GetControllerState4, never as a key code. So the honest answer is all-false,
+// which is also the answer that keeps Rewired from mis-identifying a Touch
+// controller as a DS4 and remapping its buttons to a PlayStation layout.
+//
+// The array must be the same LENGTH as the one asked with — Rewired indexes it
+// positionally — so it is sized from the argument rather than from a constant.
+static klj_val klj_InputDevice_hasKeys(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int len = 0;
+    if (n > 0 && a[0].l) {
+        klj_array *keys = klj_arr(a[0].l);
+        if (keys) len = keys->len;
+    }
+    void *out = klj_new_array('Z', NULL, len);
+    KLJ_LOG("InputDevice.hasKeys(%d keys) -> all false (Touch carries no Android keymap)", len);
+    return (klj_val){.l = out};
+}
+
+
 static klj_val klj_InputManager_registerListener(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     // Same shape as registerDisplayListener: recorded, and nothing is owed a
     // callback because our device set never changes.
     KLJ_LOG("InputManager.registerInputDeviceListener — recorded; the device set never changes");
+    return (klj_val){.l = NULL};
+}
+
+// ...and its pair. Rewired's Android input source (Paint the Town Red ships
+// Rewired_Android.dll; `unregisterInputDeviceListener` is in its il2cpp string
+// heap next to the register call) tears the listener down on shutdown and on
+// every platform-helper reinitialise. Nothing was recorded, so nothing is
+// undone — but the call has to EXIST, or the teardown path aborts a boot that
+// otherwise worked.
+static klj_val klj_InputManager_unregisterListener(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("InputManager.unregisterInputDeviceListener — nothing was owed a callback");
     return (klj_val){.l = NULL};
 }
 
@@ -251,7 +311,6 @@ static klj_val klj_InputManager_getInputDevice(void *env, void *self, const klj_
 
 static klj_val klj_InputManager_getInputDeviceIds(void *env, void *self, const klj_val *a, int n) {
     return klj_InputDevice_getDeviceIds(env, self, a, n);
-    return (klj_val){.j = 0};
 }
 
  klj_val klj_AudioManager_getStreamVolume(void *env, void *self, const klj_val *a, int n) {
@@ -290,6 +349,52 @@ static klj_val klj_AudioManager_setStreamVolume(void *env, void *self, const klj
     return (klj_val){.j = 0};
 }
 
+// ---- audio focus (API 26+): AudioAttributes / AudioFocusRequest builders ----
+//
+// Newer Unity players ask for audio focus at startup the API-26 way:
+//   new AudioAttributes.Builder().setUsage(USAGE_GAME).setContentType(..).build()
+//   new AudioFocusRequest.Builder(AUDIOFOCUS_GAIN).setAudioAttributes(attrs)
+//       .setAcceptsDelayedFocusGain(..).setOnAudioFocusChangeListener(..).build()
+//   AudioManager.requestAudioFocus(request) == AUDIOFOCUS_REQUEST_GRANTED ?
+// Virtual Virtual Reality (1.8.48) is the first guest here to do it, and each
+// of those calls was a work item that ended the run right after the splash.
+// Nothing on the host competes for an Android audio stream, so focus is simply
+// granted; the builders only have to hand back objects of the right classes,
+// because nothing ever looks inside them. The listener is never called: focus
+// is never lost here.
+static klj_val klj_builder_self(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = self};
+}
+
+static klj_val klj_AudioAttributes_Builder_build(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object("android/media/AudioAttributes")};
+}
+
+// A constructor binding is called with the jclass and returns the new object.
+static klj_val klj_AudioFocusRequest_Builder_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    KLJ_LOG("AudioFocusRequest.Builder(focusGain %lld)", n > 0 ? (long long)(int32_t)a[0].j : -1);
+    return (klj_val){.l = kl_jni_new_object("android/media/AudioFocusRequest$Builder")};
+}
+
+static klj_val klj_AudioFocusRequest_Builder_build(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object("android/media/AudioFocusRequest")};
+}
+
+static klj_val klj_AudioManager_requestAudioFocus(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AudioManager.requestAudioFocus(request) -> AUDIOFOCUS_REQUEST_GRANTED");
+    return (klj_val){.j = 1};   // AUDIOFOCUS_REQUEST_GRANTED
+}
+
+static klj_val klj_AudioManager_abandonAudioFocusRequest(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};   // AUDIOFOCUS_REQUEST_GRANTED
+}
+
 static klj_val klj_UnityPlayer_getLaunchURL(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     // null, and that is the answer rather than a placeholder: the app was not
@@ -303,13 +408,20 @@ static klj_val klj_AudioManager_getProperty(void *env, void *self, const klj_val
     const char *k = n > 0 ? klj_str(a[0].l) : "";
     // The keys are the values of AudioManager.PROPERTY_* below; match on the
     // documented strings so the two cannot drift apart.
+    // The strings are FORMATTED from the macros rather than spelled again beside
+    // them: this door hands back text where AudioSystem below hands back an int,
+    // and a literal here is a copy that can drift from the number every other
+    // door reports. Same fact, one source.
+    char buf[24];
     if (strstr(k, "OUTPUT_SAMPLE_RATE")) {
         KLJ_LOG("AudioManager.getProperty(OUTPUT_SAMPLE_RATE) -> %d", KLJ_AUDIO_RATE);
-        return (klj_val){.l = kl_jni_new_string("48000")};
+        snprintf(buf, sizeof buf, "%d", KLJ_AUDIO_RATE);
+        return (klj_val){.l = kl_jni_new_string(buf)};
     }
     if (strstr(k, "OUTPUT_FRAMES_PER_BUFFER")) {
         KLJ_LOG("AudioManager.getProperty(OUTPUT_FRAMES_PER_BUFFER) -> %d", KLJ_AUDIO_FRAMES);
-        return (klj_val){.l = kl_jni_new_string("256")};
+        snprintf(buf, sizeof buf, "%d", KLJ_AUDIO_FRAMES);
+        return (klj_val){.l = kl_jni_new_string(buf)};
     }
     // Android returns null for an unknown property, and FMOD handles that.
     KLJ_LOG("AudioManager.getProperty(\"%s\") -> null (unknown property)", k);
@@ -335,6 +447,15 @@ static klj_val klj_AudioSystem_getPrimaryOutputFrameCount(void *env, void *self,
     KLJ_LOG("AudioSystem.getPrimaryOutputFrameCount() -> %d", KLJ_AUDIO_FRAMES);
     return (klj_val){.j = KLJ_AUDIO_FRAMES};
 }
+// AudioTrack.getNativeOutputSampleRate(streamType): a third door to the same
+// number. Vader Immortal I's Wwise asks it; answered 0 by the profile for
+// untested games, it is a mixer told the device runs at no rate at all.
+static klj_val klj_AudioTrack_getNativeOutputSampleRate(void *env, void *self,
+                                                        const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AudioTrack.getNativeOutputSampleRate() -> %d", KLJ_AUDIO_RATE);
+    return (klj_val){.j = KLJ_AUDIO_RATE};
+}
 
 // No Bluetooth audio is routed here: kl_audio opens a CoreAudio output unit on
 // whatever the host has selected, and nothing in this shim can present an A2DP
@@ -348,20 +469,7 @@ static klj_val klj_AudioManager_isBluetoothA2dpOn(void *env, void *self,
     return (klj_val){.j = 0};
 }
 
-// The other two of the game's once-a-second audio-route poll. Both answered
-// the way a headset with no Bluetooth route answers: no SCO link, and
-// isMusicActive false - the poll is asking about OTHER apps' playback, which
-// does not exist here.
-static klj_val klj_AudioManager_isBluetoothScoOn(void *env, void *self,
-                                                 const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.j = 0};
-}
-static klj_val klj_AudioManager_isMusicActive(void *env, void *self,
-                                              const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.j = 0};
-}
+// (isBluetoothScoOn / isMusicActive: answered false in kl_jni_android.c.)
 
 // ---------------------------------------------------------- window insets
 //
@@ -402,6 +510,22 @@ static klj_val klj_View_setOnApplyWindowInsetsListener(void *env, void *self,
     (void)env; (void)self; (void)a; (void)n;
     KLJ_LOG("View.setOnApplyWindowInsetsListener() — recorded; insets never change, "
             "so it is never called back");
+    return (klj_val){.l = NULL};
+}
+
+// The same for layout: the guest's view is laid out once at the size of the
+// surface and never again, so an OnLayoutChangeListener has nothing to hear.
+// Mini Motor Racing X (x2371757336252737) registers one at boot.
+static klj_val klj_View_addOnLayoutChangeListener(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("View.addOnLayoutChangeListener() — recorded; the layout never changes, "
+            "so it is never called back");
+    return (klj_val){.l = NULL};
+}
+static klj_val klj_View_removeOnLayoutChangeListener(void *env, void *self,
+                                                     const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.l = NULL};
 }
 
@@ -466,23 +590,6 @@ static klj_val klj_Context_unbindService(void *env, void *self, const klj_val *a
     return (klj_val){.l = NULL};
 }
 
-// Google VR sample PermissionHelper (Into the Radius): checkPermission(name)Z
-// and acquirePermissions([name])V. Answered from the same manifest permission
-// model as Context.checkPermission — a boolean here, granted only for what the
-// manifest declares — and acquiring is a no-op (there is no user to prompt).
-static klj_val klj_PermissionHelper_check(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
-    const char *p = n > 0 ? klj_str(a[0].l) : "", *why = "";
-    int granted = klj_permission_state(p, &why);
-    KLJ_LOG("PermissionHelper.checkPermission(\"%s\") -> %s%s", p,
-            granted ? "true" : "false", why);
-    return (klj_val){.j = (uint64_t)(granted != 0)};
-}
-static klj_val klj_PermissionHelper_acquire(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    KLJ_LOG("PermissionHelper.acquirePermissions(...) — no user to prompt; no-op");
-    return (klj_val){.l = NULL};
-}
 static klj_val klj_Context_checkPermission(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     // Answered from the SAME manifest model as checkSelfPermission below. It
@@ -764,7 +871,152 @@ static klj_val klj_Activity_requestPermissions(void *env, void *self, const klj_
     return (klj_val){.j = 0};
 }
 
+// com.google.vr.sdk.samples.permission.PermissionHelper — Google's VR sample
+// permission helper, which UE4's Android VR builds embed wholesale (Into the
+// Radius resolves both of its statics during startup, right after the engine
+// has worked out where its files are). Two methods, and they are the same
+// question and the same command Activity.checkSelfPermission /
+// requestPermissions already answer above — so they read the SAME
+// klj_permission_state rather than deciding again. A permission granted through
+// one door and denied through another is precisely the split this file's
+// permission model exists to prevent.
+//
+// checkPermission returns a `boolean` here rather than the PackageManager int
+// the Context spelling uses: true is granted. The helper's own Java is
+// `ContextCompat.checkSelfPermission(...) == PERMISSION_GRANTED`, so this is
+// that comparison, done here.
+static klj_val klj_GvrPermission_check(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *p = n > 0 ? klj_str(a[0].l) : "", *why = "";
+    int granted = klj_permission_state(p ? p : "", &why);
+    KLJ_LOG("PermissionHelper.checkPermission(\"%s\") -> %s%s", p ? p : "",
+            granted ? "true" : "false", why);
+    return (klj_val){.j = granted ? 1u : 0u};
+}
+
+// ...and the ACQUIRE half, which on Android puts up the system dialog. There is
+// nobody here to be asked and no dialog to put up; what the state actually IS
+// was already settled by the manifest model, and checkPermission is where the
+// guest reads it.
+//
+// The answer is still DELIVERED. On Android the real class hands off to a
+// PermissionFragment and the result arrives later at the guest's STATIC NATIVE
+// `onAcquirePermissions(String[] permissions, int[] grantResults)`, which UE4's
+// AndroidPermission plugin registers and which fires
+// UAndroidPermissionCallbackProxy's delegate. A Blueprint that asked and is
+// never answered waits forever — a hang, harder to diagnose than an abort. So
+// the guest's own native is called with the same values checkPermission gives
+// (PackageManager constants: GRANTED 0, DENIED -1). Looked up, never cached
+// (kl_jni_ue4.c's reason: a lookup that beat RegisterNatives would pin NULL);
+// a guest that registered no such native gets the log line and nothing else.
+// Five Nights at Freddy's: Help Wanted 2 asks from Blueprint on its loading
+// path and waits on the delegate.
+#define KLJ_PERMISSION_HELPER "com/google/vr/sdk/samples/permission/PermissionHelper"
+static klj_val klj_GvrPermission_acquire(void *env, void *self, const klj_val *a, int n) {
+    (void)self;
+    klj_array *arr = n > 0 ? klj_arr(a[0].l) : NULL;
+    int len = arr && arr->kind == 'L' ? arr->len : 0;
+    void      *results = klj_new_array('I', NULL, len);
+    klj_array *ra      = klj_arr(results);
+    for (int i = 0; i < len; i++) {
+        const char *p = klj_str(((void **)arr->data)[i]), *why = "";
+        int granted = klj_permission_state(p ? p : "", &why);
+        if (ra && ra->data) ((kl_jint *)ra->data)[i] = granted ? 0 : -1;
+        KLJ_LOG("PermissionHelper.acquirePermissions[%d] \"%s\" -> already %s%s "
+                "(no dialog: there is no user session here to ask, and the state "
+                "is the manifest's)", i, p ? p : "",
+                granted ? "GRANTED" : "DENIED", why);
+    }
+    void (*cb)(void *, void *, void *, void *) = (void (*)(void *, void *, void *, void *))
+        kl_jni_native(KLJ_PERMISSION_HELPER, "onAcquirePermissions", NULL);
+    // UE4 4.27's AndroidPermission plugin does not RegisterNatives it: it is a
+    // static export, JNI_METHOD Java_..._PermissionHelper_onAcquirePermissions,
+    // found by name as GameActivity's natives are. The Walking Dead: Saints &
+    // Sinners - Chapter 2 (x5190288877703616) asks on its loading path and
+    // waited on it for good, black, when only the registered table was read.
+    // KL_UE4_PERMISSION_EXPORT, default on for that title alone: the names
+    // reach this callback intact only with KL_JNI_DEFER_STRING_DELETE (kl_jni.c),
+    // and a guest that reads retired names back is not one to call into.
+    const char *t = kl_driver_target_name();
+    if (!cb && kl_env_on("KL_UE4_PERMISSION_EXPORT", t && strcmp(t, "x5190288877703616") == 0))
+        cb = (void (*)(void *, void *, void *, void *))kl_jni_guest_native(
+            "Java_com_google_vr_sdk_samples_permission_PermissionHelper_onAcquirePermissions");
+    KLJ_LOG("PermissionHelper.acquirePermissions(%d) -> onAcquirePermissions%s",
+            len, cb ? "" : " — SKIPPED, the guest registered no such native");
+    if (cb) cb(env ? env : kl_jni_env(), kl_jni_class(KLJ_PERMISSION_HELPER),
+               n > 0 ? a[0].l : NULL, results);
+    return (klj_val){.j = 0};
+}
+
+// Android cursor metadata: preserve custom pixels and hot spot, then retain
+// the chosen icon on the View. VR scene rendering continues to be the guest's.
+typedef struct { void *bitmap; float hotspot_x,hotspot_y; int type; } klj_pointer_icon;
+static klj_val pointer_icon_create(void *env,void *self,const klj_val *a,int n) {
+    (void)self;
+    klj_object *image=n ? klj_as_object(a[0].l) : NULL;
+    if(n!=3 || !image || strcmp(image->cls,"android/graphics/Bitmap")) {
+        klj_raise("java/lang/IllegalArgumentException","pointer bitmap required");return (klj_val){0};
+    }
+    klj_impl width=klj_own_impl("android/graphics/Bitmap","getWidth","()I");
+    klj_impl height=klj_own_impl("android/graphics/Bitmap","getHeight","()I");
+    int w=width ? width(env,a[0].l,NULL,0).j : 0;
+    int h=height ? height(env,a[0].l,NULL,0).j : 0;
+    if(klj_ExceptionCheck(env))return (klj_val){0};
+    float x=(float)a[1].d,y=(float)a[2].d;
+    if(!isfinite(x) || !isfinite(y) || x<0 || y<0 || x>=w || y>=h) {
+        klj_raise("java/lang/IllegalArgumentException","pointer hot spot outside bitmap");return (klj_val){0};
+    }
+    klj_pointer_icon *icon=calloc(1,sizeof *icon);if(!icon)return (klj_val){0};
+    icon->bitmap=a[0].l;icon->hotspot_x=x;icon->hotspot_y=y;icon->type=-1;
+    kl_jni_pin_object(icon->bitmap);
+    KLJ_LOG("PointerIcon.create: retained %dx%d bitmap, hotspot %.2f,%.2f",w,h,x,y);
+    return (klj_val){.l=klj_own(klj_new_object_data("android/view/PointerIcon",icon),free)};
+}
+static klj_val pointer_icon_system(void *env,void *self,const klj_val *a,int n) {
+    (void)env;(void)self;
+    int type=n>1 ? (int32_t)a[1].j : 1000;
+    if(type!=0 && (type<1000 || type>1021 || type==1005))type=1000;
+    static void *icons[23];int index=type ? type-999 : 0;
+    if(!icons[index]) {
+        klj_pointer_icon *icon=calloc(1,sizeof *icon);if(!icon)return (klj_val){0};icon->type=type;
+        icons[index]=klj_own(klj_new_object_data("android/view/PointerIcon",icon),free);
+        kl_jni_pin_object(icons[index]);
+    }
+    return (klj_val){.l=icons[index]};
+}
+static klj_val pointer_icon_type(void *env,void *self,const klj_val *a,int n) {
+    (void)env;(void)a;(void)n;klj_object *o=klj_as_object(self);
+    klj_pointer_icon *icon=o && !strcmp(o->cls,"android/view/PointerIcon") ? o->data : NULL;
+    return (klj_val){.j=icon ? (uint64_t)(int64_t)icon->type : 0};
+}
+static void *pointer_icon_field(void) {
+    return klj_want(klj_class_object("android/view/View"),"__kleptonPointerIcon","Landroid/view/PointerIcon;",'f');
+}
+static klj_val view_set_pointer_icon(void *env,void *self,const klj_val *a,int n) {
+    (void)env;void *icon=n ? a[0].l : NULL;klj_object *o=icon ? klj_as_object(icon) : NULL;
+    if(icon && (!o || strcmp(o->cls,"android/view/PointerIcon"))) {
+        klj_raise("java/lang/IllegalArgumentException","not a pointer icon");return (klj_val){0};
+    }
+    if(icon)kl_jni_pin_object(icon);
+    klj_field_store(self,pointer_icon_field(),(klj_val){.l=icon});
+    KLJ_LOG("View.setPointerIcon: %s",icon ? "retained icon" : "reset to default");
+    return (klj_val){0};
+}
+static klj_val view_get_pointer_icon(void *env,void *self,const klj_val *a,int n) {
+    (void)env;(void)a;(void)n;return klj_field_written(self,pointer_icon_field());
+}
+
 const klj_binding klj_bind_window[] = {
+    {"com/google/vr/sdk/samples/permission/PermissionHelper", "checkPermission",
+     "(Ljava/lang/String;)Z", klj_GvrPermission_check},
+    {"com/google/vr/sdk/samples/permission/PermissionHelper", "acquirePermissions",
+     "([Ljava/lang/String;)V", klj_GvrPermission_acquire},
+    {"android/view/PointerIcon","create","(Landroid/graphics/Bitmap;FF)Landroid/view/PointerIcon;",pointer_icon_create},
+    {"android/view/PointerIcon","getSystemIcon","(Landroid/content/Context;I)Landroid/view/PointerIcon;",pointer_icon_system},
+    {"android/view/PointerIcon","getType","()I",pointer_icon_type},
+    {"android/view/View","setPointerIcon","(Landroid/view/PointerIcon;)V",view_set_pointer_icon},
+    {"android/view/View","getPointerIcon","()Landroid/view/PointerIcon;",view_get_pointer_icon},
+
     // Reached by pressing *Start Pairing*: the shell checks a permission before
     // it opens the socket. Bound on SteamLink rather than on Context because a
     // binding is matched on the full (class, name, signature) triple and this is
@@ -798,6 +1050,7 @@ const klj_binding klj_bind_window[] = {
     {"android/os/BatteryManager", "isCharging", "()Z", klj_BatteryManager_isCharging},
     {"android/os/BatteryManager", "getIntProperty", "(I)I", klj_BatteryManager_getIntProperty},
     {"android/view/InputDevice", "getDeviceIds", "()[I", klj_InputDevice_getDeviceIds},
+    // Pinball FX's own helper over that same enumeration — see the note above it.
     {"android/view/InputDevice", "getDevice", "(I)Landroid/view/InputDevice;", klj_InputDevice_getDevice},
     {"android/view/InputDevice", "getName", "()Ljava/lang/String;", klj_InputDevice_getName},
     {"android/view/InputDevice", "getId", "()I", klj_InputDevice_getId},
@@ -815,30 +1068,46 @@ const klj_binding klj_bind_window[] = {
      klj_InputManager_getInputDeviceIds},
     {"android/hardware/input/InputManager", "getInputDevice",
      "(I)Landroid/view/InputDevice;", klj_InputManager_getInputDevice},
+    {"android/hardware/input/InputManager", "unregisterInputDeviceListener",
+     "(Landroid/hardware/input/InputManager$InputDeviceListener;)V",
+     klj_InputManager_unregisterListener},
+    {"android/view/InputDevice", "hasKeys", "([I)[Z", klj_InputDevice_hasKeys},
     {"android/media/AudioManager", "getStreamVolume", "(I)I", klj_AudioManager_getStreamVolume},
     {"android/media/AudioManager", "getStreamMinVolume", "(I)I", klj_AudioManager_getStreamMinVolume},
     {"android/media/AudioManager", "getStreamMaxVolume", "(I)I", klj_AudioManager_getStreamMaxVolume},
     {"android/media/AudioManager", "setStreamVolume", "(III)V", klj_AudioManager_setStreamVolume},
+    // Audio focus, the API-26 builder form (see klj_AudioManager_requestAudioFocus).
+    {"android/media/AudioAttributes$Builder", "setUsage", "(I)Landroid/media/AudioAttributes$Builder;", klj_builder_self},
+    {"android/media/AudioAttributes$Builder", "setContentType", "(I)Landroid/media/AudioAttributes$Builder;", klj_builder_self},
+    {"android/media/AudioAttributes$Builder", "build", "()Landroid/media/AudioAttributes;", klj_AudioAttributes_Builder_build},
+    {"android/media/AudioFocusRequest$Builder", "<init>", "(I)V", klj_AudioFocusRequest_Builder_init},
+    {"android/media/AudioFocusRequest$Builder", "setAudioAttributes",
+     "(Landroid/media/AudioAttributes;)Landroid/media/AudioFocusRequest$Builder;", klj_builder_self},
+    {"android/media/AudioFocusRequest$Builder", "setAcceptsDelayedFocusGain",
+     "(Z)Landroid/media/AudioFocusRequest$Builder;", klj_builder_self},
+    {"android/media/AudioFocusRequest$Builder", "setOnAudioFocusChangeListener",
+     "(Landroid/media/AudioManager$OnAudioFocusChangeListener;)Landroid/media/AudioFocusRequest$Builder;", klj_builder_self},
+    {"android/media/AudioFocusRequest$Builder", "build", "()Landroid/media/AudioFocusRequest;", klj_AudioFocusRequest_Builder_build},
+    {"android/media/AudioManager", "requestAudioFocus", "(Landroid/media/AudioFocusRequest;)I", klj_AudioManager_requestAudioFocus},
+    {"android/media/AudioManager", "abandonAudioFocusRequest", "(Landroid/media/AudioFocusRequest;)I", klj_AudioManager_abandonAudioFocusRequest},
     {"com/unity3d/player/UnityPlayer", "getLaunchURL", "()Ljava/lang/String;", klj_UnityPlayer_getLaunchURL},
+    {"com/unity3d/player/UnityPlayer", "getView", "()Landroid/view/View;", klj_UnityPlayer_getView},
     {"android/media/AudioManager", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", klj_AudioManager_getProperty},
     {"android/media/AudioManager", "isBluetoothA2dpOn", "()Z", klj_AudioManager_isBluetoothA2dpOn},
-    {"android/media/AudioManager", "isBluetoothScoOn", "()Z", klj_AudioManager_isBluetoothScoOn},
-    {"android/media/AudioManager", "isMusicActive", "()Z", klj_AudioManager_isMusicActive},
     // Unity 2018.4 reads the device's audio configuration off the hidden
     // AudioSystem class instead of AudioManager.getProperty(). Same numbers.
     {"android/media/AudioSystem", "getPrimaryOutputSamplingRate", "()I", klj_AudioSystem_getPrimaryOutputSamplingRate},
     {"android/media/AudioSystem", "getPrimaryOutputFrameCount", "()I", klj_AudioSystem_getPrimaryOutputFrameCount},
+    {"android/media/AudioTrack", "getNativeOutputSampleRate", "(I)I", klj_AudioTrack_getNativeOutputSampleRate},
     // ...and asks the decor view for its insets to compute a safe area.
     {"android/view/View", "getRootWindowInsets", "()Landroid/view/WindowInsets;", klj_View_getRootWindowInsets},
     {"android/view/View", "onApplyWindowInsets", "(Landroid/view/WindowInsets;)Landroid/view/WindowInsets;", klj_View_onApplyWindowInsets},
     {"android/view/View", "setOnApplyWindowInsetsListener", "(Landroid/view/View$OnApplyWindowInsetsListener;)V", klj_View_setOnApplyWindowInsetsListener},
+    {"android/view/View", "addOnLayoutChangeListener", "(Landroid/view/View$OnLayoutChangeListener;)V", klj_View_addOnLayoutChangeListener},
+    {"android/view/View", "removeOnLayoutChangeListener", "(Landroid/view/View$OnLayoutChangeListener;)V", klj_View_removeOnLayoutChangeListener},
     {"android/view/WindowInsets", "getDisplayCutout", "()Landroid/view/DisplayCutout;", klj_WindowInsets_getDisplayCutout},
     {"android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", klj_PackageManager_hasSystemFeature},
     {"android/content/Context", "checkCallingOrSelfPermission", "(Ljava/lang/String;)I", klj_Context_checkPermission},
-    {"com/google/vr/sdk/samples/permission/PermissionHelper", "checkPermission",
-     "(Ljava/lang/String;)Z", klj_PermissionHelper_check},
-    {"com/google/vr/sdk/samples/permission/PermissionHelper", "acquirePermissions",
-     "([Ljava/lang/String;)V", klj_PermissionHelper_acquire},
     {"android/content/Context", "bindService", "(Landroid/content/Intent;Landroid/content/ServiceConnection;I)Z", klj_Context_bindService},
     {"android/content/Context", "unbindService", "(Landroid/content/ServiceConnection;)V", klj_Context_unbindService},
     {0}

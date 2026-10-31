@@ -128,6 +128,18 @@ const klj_binding klj_bind_jkxr[] = {
     // (cs1's Xash calls HapticsAPI.enable/event/endFrame). Route to the same
     // handlers; the accessory devices (bHaptics/ForceTube) are not present, so these
     // record state and drive the per-hand CoreHaptics fallback like every target.
+    // Doom3Quest's Activity: the same seven methods under its own package (the
+    // smali is line-for-line the JKXR loop over bound accessory services).
+    {"com/drbeef/doom3quest/GLES3JNIActivity", "shutdown", "()V", jkxr_shutdown},
+    {"com/drbeef/doom3quest/GLES3JNIActivity", "haptic_event",
+     "(Ljava/lang/String;IIIFF)V", jkxr_haptic_event},
+    {"com/drbeef/doom3quest/GLES3JNIActivity", "haptic_updateevent",
+     "(Ljava/lang/String;IF)V", jkxr_haptic_updateevent},
+    {"com/drbeef/doom3quest/GLES3JNIActivity", "haptic_stopevent",
+     "(Ljava/lang/String;)V", jkxr_haptic_stopevent},
+    {"com/drbeef/doom3quest/GLES3JNIActivity", "haptic_endframe", "()V", jkxr_haptic_endframe},
+    {"com/drbeef/doom3quest/GLES3JNIActivity", "haptic_enable",   "()V", jkxr_haptic_enable},
+    {"com/drbeef/doom3quest/GLES3JNIActivity", "haptic_disable",  "()V", jkxr_haptic_disable},
     {"com/drbeef/externalhapticsservice/HapticsAPI", "enable",   "()V", jkxr_haptic_enable},
     {"com/drbeef/externalhapticsservice/HapticsAPI", "endframe", "()V", jkxr_haptic_endframe},
     {"com/drbeef/externalhapticsservice/HapticsAPI", "event",

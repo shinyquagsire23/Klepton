@@ -9,6 +9,14 @@
 #include <stdio.h>
 
 int  kl_glfb_enabled(void);
+// Whether compute kernels are run as transform feedback (KL_GLFB_COMPUTE_TF; on
+// for Beat Saber from 1.45). kl_egl.c answers the ES 3.1 storage limits to match:
+// without them Unity refuses a kernel before it reaches GL.
+int  kl_glfb_compute_tf(void);
+// Whether read-only storage buffers are read through textures (KL_GLFB_SSBO_TEX;
+// on for Garden of the Sea). kl_egl.c answers the ES 3.1 storage limits for it
+// too: the title's shaders read storage buffers in the vertex stage.
+int  kl_glfb_ssbo_tex(void);
 int  kl_glfb_init(void);
 void kl_glfb_set_size(int w, int h);
 
@@ -34,11 +42,19 @@ void kl_glfb_make_current(void);
 // The release half: call from eglMakeCurrent when the guest makes no context
 // current. Migration mode frees the root context for the next thread.
 void kl_glfb_release_current(void);
+// Bind a share-group context on a thread that holds none (1 if done), and undo it.
+int  kl_glfb_borrow_context(void);
+void kl_glfb_return_context(void);
 
 // Read the eye framebuffer back and write <dir>/frame_NNN.png. Returns the number
 // of frames presented so far. When a frame sink is registered the buffer goes
 // there instead (dir may then be NULL) and no PNG is written.
 unsigned kl_glfb_present(const char *dir);
+// Put a decoded picture into one of the guest's own 2D textures, on the thread
+// that is current on its context. `pixels` is w*h BGRA8 or RGBA8 (`bgra`), top
+// row first. The guest's bindings and unpack state are left as they were.
+// 1 if the upload was issued, 0 if there is no GL to issue it with.
+int kl_glfb_upload_picture(uint32_t tex, int w, int h, const void *pixels, int bgra);
 
 // The frontend seam, frame out. Registering a sink turns the per-swap capture
 // into a handoff: instead of PNG-encoding to KL_GLFB_OUT, the readback buffer
@@ -79,6 +95,11 @@ int  kl_glfb_has_gpu_fence(void);
 // Read from the compositor thread; monotonically increasing, so an unchanged
 // value means "no new guest frame since you last looked".
 uint64_t kl_glfb_gpu_fence_value(void);
+// For a guest whose eyes reach the compositor by copy and that never swaps:
+// publish a fence after the frame's copies (kl_glfb.c). kl_glfb_frame_fenced()
+// says whether one ever was, i.e. whether the fence value follows the frames.
+void kl_glfb_frame_fence(void);
+int  kl_glfb_frame_fenced(void);
 
 // Print the internalformats the guest allocated immutable texture storage with.
 // KL_GLFB_SKIP bisected the AGX abort to glTexStorage* + glTexSubImage*, which
@@ -99,6 +120,23 @@ void kl_glfb_gl_census(FILE *f);
 // black" and "the guest never drew into the eye texture" are the same symptom
 // and completely different work.
 void kl_glfb_draw_census(FILE *f);
+// glProgramBinary loads, and how many the driver refused to link. A rejected
+// binary is an unlinked program the guest will use anyway.
+void kl_glfb_program_binary_census(FILE *f);
+
+// The generation of klfb_rewrite_glsl's OUTPUT, which belongs to a guest's
+// shader cache exactly as much as the driver's build does. A guest's
+// ProgramBinaryCache stores the compiled form of the GLSL WE handed ANGLE, not
+// the GLSL the guest wrote, so a change to any rewrite rule leaves every cached
+// blob a compiled copy of the old text. It is folded into kl_app.c's
+// shader_cache_guard fingerprint beside the OS build, so bumping it drops the
+// caches once per install, on every target. BUMP IT whenever
+// klfb_rewrite_glsl emits different text.
+//
+//   1  the rewrite rules up to and including the per-stage int precision
+//   2  KL_GLFB_VS_FINITE: a guarded main appended to vertex shaders (Synth
+//      Riders by default), 2026-10-15
+#define KL_GLFB_REWRITE_GEN 2
 
 // The eye-texture seam, texture identity out. kl_ovrp's SetupEyeTexture2 calls
 // this with the GL texture name Unity handed down; the capture finds "the
@@ -127,7 +165,15 @@ void kl_glfb_set_live_eye_image(int eye, uint32_t tex, int32_t w, int32_t h, int
 // that keep an eye texture's storage alive — the EGLImage and the GL texture —
 // so the provider's own release on reallocation can actually reclaim it. A
 // no-op for a slot that was never bound; out-of-range says so and does nothing.
+// Also drops the stage attribution of that texture and the eye-FBO map slots
+// that pointed at it, so a re-created swapchain's FBOs always find room.
 void kl_glfb_release_eye_texture(int eye, int stage);
+
+// The stage-association state in one `[eyemap]` line: the registered eye
+// texture names, eye-FBO map slots in use, and how often a release gave slots
+// back, the map was full, or the colour-table fallback answered. Silent for a
+// guest that never registered a GL eye texture.
+void kl_glfb_eye_map_census(FILE *f);
 
 // Which swapchain stage the guest most recently RENDERED into, or -1 if that
 // has not been observed.
@@ -255,6 +301,22 @@ void *kl_glfb_mtl_device(void);
 int kl_glfb_bind_eye_mtl_texture(int eye, int stage, uint32_t gl_tex,
                                  int w, int h, uint32_t internal_fmt);
 
+// DoubleWide: make (eye, stage) read the same MTLTexture and slice as
+// (from_eye, stage) without re-binding any GL name. Returns 0 if from_eye has no
+// Metal storage at that stage.
+int kl_glfb_share_eye_mtl_texture(int eye, int stage, int from_eye);
+
+// The guest's eye layer is DoubleWide: both eyes side by side in one texture.
+// Foveation is then refused (kl_glfb_foveation_wanted answers 0) — the rate map
+// is ONE eye's display curve stretched over the whole width, so its sharp zone
+// lands between the eyes and the per-eye crops of the result are wrong.
+void kl_glfb_set_eye_doublewide(int on);
+
+// A non-eye layer was destroyed: its mirror and Metal-binding rows are given
+// back for a later layer id — by the thread that mirrors layers, not by the
+// caller's.
+void kl_glfb_forget_layer(int layer);
+
 // The MTLTexture currently backing (eye, stage), or NULL — what the compositor
 // pass samples, and what a test reads back to check the guest's frame arrived.
 void *kl_glfb_eye_mtl_texture(int eye, int stage, int *out_slice);
@@ -314,6 +376,21 @@ void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
 // per-swapchain value will do; 0 means "unknown" and then `image` IS the slot,
 // which is the OVRPlugin path's direct keying and what a caller with nothing to
 // give still gets.
+// How many layers a guest rate map needs (two for a mirrored multiview guest).
+int kl_glfb_rate_map_layers(void);
+// 1 when each of those layers gets its own eye's curve, 0 for the envelope.
+int kl_glfb_rate_map_per_eye(void);
+// Will a guest whose eyes are copied out of an array swapchain be foveated this
+// run (see klfb_mirror_vrr)? Answerable before the guest boots.
+int kl_glfb_mirror_foveation_wanted(void);
+// A multiview attachment with multisampling (KL_GL_MSAA_MV), made through
+// ANGLE's own entry point; 0 when it was not made and the caller attaches
+// plain multiview instead.
+int kl_glfb_multiview_ms(uint32_t target, uint32_t attachment, uint32_t texture, int32_t level,
+                         int32_t samples, int32_t base_view, int32_t num_views);
+// The physical size of the map just given to kl_glfb_set_eye_rate_map (the
+// larger of its layers'), so a foveated eye is copied as what was written.
+void kl_glfb_set_eye_rate_physical(int pw, int ph);
 int kl_glfb_mirror_eye_layer(int eye, int image, uint32_t source,
                              uint32_t src_tex, int src_layer,
                              int w, int h, uint32_t internal_fmt);
@@ -452,6 +529,7 @@ void  kl_glfb_image_destroy(void *image);
 // which is where the guest's glBindTexture(GL_TEXTURE_EXTERNAL_OES, ...) landed
 // after klfb_detarget. This is what glEGLImageTargetTexture2DOES becomes.
 int   kl_glfb_image_bind(void *image);
+int   kl_glfb_image_bind_texture(void *image, uint32_t texture);
 
 // Is this handle one of ours? Asked of pointers the guest chose, so it is a
 // registry lookup and not a magic-word peek through a foreign pointer.
@@ -516,6 +594,14 @@ void *kl_glfb_eye_rate_map(void);
 // the border (`KL_VRR_EDGE`, default 0.35); both are clamped to what a rate map
 // will accept. Either pointer may be NULL.
 int kl_glfb_foveation_wanted(int *zones, float *edge);
+// What `KL_VRR` defaults to when the environment does not say: 1 until this is
+// called. The visionOS app calls it with its stored setting before the guest
+// boots; an explicit `KL_VRR` still overrides either way.
+void kl_glfb_set_foveation_default(int on);
+// The app's "Edge smoothing" setting for a multisampled multiview guest
+// (kl_glfb_multiview_ms): 0 off, 2 or 4 samples, anything else the guest's own
+// count. Before the guest boots.
+void kl_glfb_set_msaa_default(int samples);
 
 // The rate layer's per-zone quality along one axis: 1.0 at the centre falling
 // linearly to `edge` at the border, `n` entries. Both axes get the same curve,

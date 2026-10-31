@@ -15,10 +15,13 @@ RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
-# RUNTIME_SHIP — everything that links the runtime needs them.
-LDLIBS  := -lz -framework AudioToolbox \
+# RUNTIME_SHIP — everything that links the runtime needs them. Metal likewise,
+# for kl_mtl_foveate.m, which makes descriptors of its own.
+CFLAGS += $(REPRO_FLAGS)
+LDLIBS  := -lz -framework AudioToolbox -framework CoreAudio \
            -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-           -framework CoreFoundation -framework AVFoundation -framework Foundation -framework CoreAudio
+           -framework CoreFoundation -framework AVFoundation -framework Foundation \
+           -framework Metal
 # The host/ship split is a source-list boundary, not a runtime getenv.
 #
 # RUNTIME_SHIP is everything that goes into the visionOS app bundle. It is the
@@ -42,29 +45,65 @@ RUNTIME_JNI := runtime/kl_jni.c \
            runtime/jni/kl_jni_net.c runtime/jni/kl_jni_softinput.c \
            runtime/jni/kl_jni_services.c runtime/jni/kl_jni_io.c \
            runtime/jni/kl_jni_prefs.c runtime/jni/kl_jni_sdl.c \
-           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c
+           runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c \
+           runtime/jni/kl_jni_haptics.c \
+           runtime/jni/kl_jni_firebase.c runtime/jni/kl_jni_vivox.c \
+           runtime/jni/kl_jni_vertigo.c runtime/jni/kl_jni_ghosttown.c
 
-RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
+# The Linux process runtime (runtime/linux/) and its door. Part of what ships:
+# a Linux guest in the visionOS app is the same code as build/m_linux.
+LX_SRC  := runtime/linux/kl_lx_exec.c runtime/linux/kl_lx_syscall.c runtime/linux/kl_lx_svc.S \
+           runtime/linux/kl_lx_vfs.c runtime/linux/kl_lx_mm.c runtime/linux/kl_lx_thread.c \
+           runtime/linux/kl_lx_proc.c runtime/linux/kl_lx_signal.c runtime/linux/kl_lx_event.c \
+           runtime/linux/kl_lx_hostlib.c runtime/linux/kl_lx_vulkan.c runtime/linux/kl_lx_steam.c \
+           runtime/linux/kl_lx_steam_net.c runtime/linux/kl_lx_openxr.c \
+           runtime/linux/kl_lx_diag.c runtime/linux/kl_lx_audio.c \
+           runtime/linux/kl_lx_interstitial.c
+
+RUNTIME_SHIP := $(LX_SRC) runtime/guest/kl_linuxproc.c \
+           runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runtime/libc/kl_shim.c runtime/libc/kl_va.c \
            runtime/libc/kl_va_handlers.c runtime/libc/kl_va_thunks.S \
            runtime/libc/kl_libc.c runtime/libc/kl_libc_slink.c runtime/libc/kl_pthread.c runtime/kl_dl.c \
            runtime/guest/kl_ndk.c runtime/kl_x18.c runtime/kl_target.c \
            $(RUNTIME_JNI) \
-           runtime/gfx/kl_egl.c runtime/media/kl_opensl.c runtime/media/kl_audio.c runtime/xr/kl_ovrp.c \
+           runtime/gfx/kl_egl.c runtime/media/kl_opensl.c runtime/media/kl_audio.c runtime/xr/kl_ovrp.c runtime/xr/kl_hands.c \
            runtime/xr/kl_ovrp_sret.S runtime/gfx/kl_reproject.c runtime/gfx/kl_present.c \
-           runtime/xr/kl_ovrplat.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
-           runtime/gfx/kl_vulkan.c \
+           runtime/xr/kl_ovrplat.c runtime/xr/kl_assetcfg.c runtime/xr/kl_room.c runtime/xr/kl_steamapi.c runtime/xr/kl_openxr.c runtime/media/kl_mediandk.c runtime/media/kl_vtdec.c runtime/media/kl_avdec.m \
+           runtime/gfx/kl_vulkan.c runtime/gfx/kl_vk_eyefix.c runtime/gfx/kl_mtl_foveate.m runtime/gfx/kl_mtl_busy.m \
            runtime/guest/kl_nativeactivity.c runtime/guest/kl_slink.c runtime/guest/kl_ue4.c runtime/guest/kl_obbmap.c \
-           runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_sdl2.c \
+           runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_xashservers.c runtime/guest/kl_sdl2.c \
            runtime/guest/kl_gles3jni.c runtime/guest/kl_driver.c \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c \
-           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
+           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_fove.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
            runtime/guest/kl_mono.c \
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \
            runtime/media/kl_menu_font.S \
-           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c
+           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c runtime/diag/kl_stall.c runtime/diag/kl_metrics.c \
+           runtime/guest/kl_extension.c runtime/guest/kl_aot_hooks.c \
+           runtime/guest/kl_songs.c
 RUNTIME_DIAG := runtime/diag/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
+
+# Scotland2 is an optional leaf component. Host-specific tests opt in by target.
+KLEPTON_SCOTLAND2 ?= $(if $(filter build/t_scotland2%,$(MAKECMDGOALS)),1,0)
+ifeq ($(KLEPTON_SCOTLAND2),1)
+SC2_FRAMEWORKS := -framework CoreText -framework CoreGraphics
+RUNTIME_INC += -Iports/scotland2/include
+SC2_DIAGNOSTICS := $(if $(filter release,$(SC2_BUILD_MODE)),0,1)
+SC2_DEFINES := -DKL_GUEST_EXTENSION_BUILTIN -DSC2_DIAGNOSTICS=$(SC2_DIAGNOSTICS)
+CFLAGS += -Iports/scotland2/include $(SC2_DEFINES)
+LDLIBS += $(SC2_FRAMEWORKS)
+RUNTIME_SHIP += ports/scotland2/src/host-bridge.c ports/scotland2/src/apple-unicode.m
+RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
+endif
+
+# A source-list switch must rebuild archives and host fixtures in both directions.
+.PHONY: runtime-selection-force
+build/runtime-selection: runtime-selection-force
+	@mkdir -p build
+	@printf '%s\n' 'scotland2=$(KLEPTON_SCOTLAND2) diagnostics=$(SC2_DIAGNOSTICS)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
 
 # ...and every header they include, as a PREREQUISITE (never as a compiler
 # input — a .h on the command line is compiled as a header, not included).
@@ -80,13 +119,43 @@ RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 # that measured a build nobody has.
 # kl_phonon_hrtf.S .incbins the SOFA blob, so the data file is a prerequisite
 # of everything too — same missed-FAILURE argument as the generated tables.
-RUNTIME_ALL_HDRS := $(wildcard runtime/*.h) $(wildcard runtime/*/*.h)
+RUNTIME_ALL_HDRS := $(wildcard runtime/*.h) $(wildcard runtime/*/*.h) $(wildcard ports/scotland2/include/*.h) build/runtime-selection Makefile
 RUNTIME_HDRS := $(RUNTIME_ALL_HDRS) $(wildcard tests/*.h) \
                 runtime/data/phonon_hrtf_cipic_124.sofa \
                 runtime/data/kl_menu_font.ttf
 
-.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
+.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest x18race uevk jniobj
 all: build/t_opus
+
+# Apple Scotland2 core: explicit host gate, separate from the stock runtime.
+SC2_CORE_SRC := $(wildcard ports/scotland2/src/*) $(wildcard ports/scotland2/include/*) \
+                $(wildcard ports/scotland2/upstream/src/*) \
+                $(wildcard ports/scotland2/upstream/shared/*) \
+                $(wildcard ports/scotland2/upstream/include/*) \
+                $(wildcard port-deps/sources/fmt/include/fmt/*) ports/scotland2/build.sh
+build/scotland2/macosx/libscotland2-core.a: $(SC2_CORE_SRC)
+	bash ports/scotland2/build.sh macosx
+
+build/t_scotland2: ports/scotland2/tests/klepton.c build/scotland2/macosx/libscotland2-core.a $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Iports/scotland2/include -o $@ ports/scotland2/tests/klepton.c \
+	  $(RUNTIME) build/scotland2/macosx/libscotland2-core.a $(LDLIBS) -lc++
+
+build/t_scotland2_il2cpp: ports/scotland2/tests/il2cpp.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ ports/scotland2/tests/il2cpp.c $(RUNTIME) $(LDLIBS)
+
+build/t_android_1453: tests/t_android_1453.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_android_1453.c $(RUNTIME) $(LDLIBS)
+
+build/t_scotland2_paper: ports/scotland2/tests/paper.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ ports/scotland2/tests/paper.c $(RUNTIME) $(LDLIBS)
+
+build/t_scotland2_aot: ports/scotland2/tests/aot-hooks.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ ports/scotland2/tests/aot-hooks.c $(RUNTIME) $(LDLIBS)
 
 build/t_opus: tests/t_opus.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
@@ -136,6 +205,21 @@ guestswap:
 build/t_load: tests/t_load.c $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_load.c $(RUNTIME) $(LDLIBS)
+
+# android_dlopen_ext through the guest-facing symbol table: the plain form is
+# dlopen, and every extension flag is refused with a dlerror that names it. No
+# guest library is loaded; milliseconds, in `make check`.
+build/t_futex: tests/t_futex.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_futex.c $(RUNTIME) $(LDLIBS)
+
+build/t_dl_ext: tests/t_dl_ext.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_dl_ext.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: dl-ext
+dl-ext: build/t_dl_ext
+	./build/t_dl_ext
 
 # Which guest the host gates run against. `make check TARGET=superhot` points
 # every one of them at another title's tree — the libraries, the assets and the
@@ -347,6 +431,120 @@ build/t_xrspace: tests/t_xrspace.c $(RUNTIME) $(RUNTIME_HDRS)
 xrspace: build/t_xrspace
 	./build/t_xrspace
 
+# The Oculus Platform completion queue (runtime/xr/kl_ovrplat.c): more requests
+# outstanding than a pool block, held handles across new requests, FreeMessage
+# misuse, and the queue and the call-surface table under threads. Before it, a
+# 17th outstanding request got an id and no completion, and two threads
+# resolving names could tear a slot. No guest; seconds; in `make check`.
+build/t_ovrplat: tests/t_ovrplat.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_ovrplat.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: ovrplat
+ovrplat: build/t_ovrplat
+	./build/t_ovrplat
+
+# The pose-boundary gate for one pose per guest frame (from rebelancap's fork)
+# — one head pose per guest frame cycle, and the anchor filed for reprojection
+# equal to it. Unity's render and sim threads number the same frame differently
+# in gameplay, so a boundary keyed on that number froze two head poses inside
+# one frame (his `poses/frame` 1.70 instead of 1.00). A process per case,
+# because the boundary is read once: the default; the index boundary, which
+# must be SEEN to split; and the two kinds of guest that never call
+# ovrp_WaitToBeginFrame (OpenXR frames, with and without an ovrp_Update2 in
+# mid-frame), where one-pose must do nothing. Milliseconds; in `make check`.
+build/t_posebound: tests/t_posebound.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_posebound.c $(RUNTIME) $(LDLIBS)
+
+posebound: build/t_posebound
+	./build/t_posebound
+
+# Enqueued panels under KL_OVRP_ENQ_RETIRE (Ghost Town): a destroyed or expired
+# panel is taken down and stays down. Milliseconds; in `make check`.
+build/t_ovrplayers: tests/t_ovrplayers.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_ovrplayers.c $(RUNTIME) $(LDLIBS)
+
+ovrplayers: build/t_ovrplayers
+	./build/t_ovrplayers
+
+# Tracker nodes 5..8 as a Quest answers them (KL_OVRP_NO_TRACKERS, Angry Birds VR). In `make check`.
+build/t_trackers: tests/t_trackers.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_trackers.c $(RUNTIME) $(LDLIBS)
+
+trackers: build/t_trackers
+	./build/t_trackers
+
+# The profile for untested games (kl_untested_profile): which titles, the
+# OVRPlugin version read from a game's own library, and unknown Java methods
+# answered with zero. Milliseconds; in `make check`.
+build/t_untested: tests/t_untested.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_untested.c $(RUNTIME) $(LDLIBS)
+
+untested: build/t_untested
+	./build/t_untested
+
+# The audio sink's gates (rebelancap's tests/t_audio.c and tests/t_aaudio.c,
+# taken over with his sink). The first: a guest's sample format, per encoding,
+# and the OpenSL surface driven with PCM and PCM_EX sources — a float32 guest
+# played as int16 is half-speed static in one ear, and the [sl] line it
+# produced read the same as a correct player's. Milliseconds; in `make check`.
+build/t_audio: tests/t_audio.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_audio.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: audio-formats
+audio-formats: build/t_audio
+	@./build/t_audio
+
+# The second: the block-seam harness. It models a guest's mixer — a copy
+# callback in front of an asynchronous producer — so the AAudio path can be
+# measured on the host. Real time (20 s by default) and it opens the real
+# output device, at +-1 LSB, so it is NOT in `check`.
+build/t_aaudio: tests/t_aaudio.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_aaudio.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: aaudio-seam
+aaudio-seam: build/t_aaudio
+	@./build/t_aaudio
+
+# Writers against a device that is reopened at changing formats, closed,
+# flushed and restarted under them, mixed and with one owner: no crash and no
+# deadlock (a deadline per case). The lock order it holds to is described at
+# the top of runtime/media/kl_audio.c. Opens the real output device for a few
+# seconds (SKIPs without one); in `make check`. audio-race-asan is the same
+# under AddressSanitizer.
+build/t_audiorace: tests/t_audiorace.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_audiorace.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: audio-race audio-race-asan
+audio-race: build/t_audiorace
+	@./build/t_audiorace
+
+build/t_audiorace_asan: tests/t_audiorace.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fsanitize=address -fno-omit-frame-pointer -o $@ tests/t_audiorace.c $(RUNTIME) $(LDLIBS)
+
+audio-race-asan: build/t_audiorace_asan
+	@./build/t_audiorace_asan
+
+# The third: two streams MIXED (KL_AUDIO_MIX_SOURCES, Steam Link's shape — a
+# float stream and an int16 stream at once). Each must deliver real time with
+# no resyncs, and what reaches the device must be both. Opens the real output
+# device for a few seconds, so it is NOT in `check` either.
+build/t_audiomix: tests/t_audiomix.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_audiomix.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: audio-mix
+audio-mix: build/t_audiomix
+	@./build/t_audiomix
+
 # The OpenXR action-surface gate — the same argument as xrspace above,
 # one API family across. A binding decoded to the wrong bit, two hands combined
 # the wrong way, a stale press surviving a controller being put down, an action
@@ -375,12 +573,132 @@ build/t_softinput: tests/t_softinput.c $(RUNTIME) $(RUNTIME_HDRS)
 softinput: build/t_softinput
 	./build/t_softinput
 
+# UE's GameActivity virtual keyboard — the same gate for the other engine's
+# keyboard. A missing AndroidThunkJava_ShowVirtualKeyboardInput aborts, and the
+# obvious fix (a no-op) trades the abort for an editor the engine holds open
+# forever, which produces no crash and no log line. No guest, no window, no
+# headset; milliseconds, in `make check`.
+build/t_uevk: tests/t_uevk.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_uevk.c $(RUNTIME) $(LDLIBS)
+
+uevk: build/t_uevk
+	./build/t_uevk
+
 build/t_variadic: tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(RUNTIME_HDRS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_variadic.c tests/t_variadic_call.S $(RUNTIME) $(LDLIBS)
 
 vatest: build/t_variadic
 	./build/t_variadic
+
+# The JNI object model: a jobject a host-side static caches must outlive the
+# local frame it was built in, and every erased spelling Unity's C# produces for
+# a call must resolve to the same binding and the same object. Both failures
+# abort a boot hundreds of lines from the binding at fault (see kl_jni.c's
+# kl_jni_object_lifetime_selftest). No guest, no window, no headset;
+# milliseconds, in `make check`.
+build/t_jniobj: tests/t_jniobj.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jniobj.c $(RUNTIME) $(LDLIBS)
+
+jniobj: build/t_jniobj
+	./build/t_jniobj
+
+# java.io.FileOutputStream and File.delete/setWritable/setReadOnly through the
+# guest-facing JNI slots, A and V calls both, against a temporary directory
+# under build/: what is written, what a failed open or write throws, which
+# permission bits move, and that deleting a link leaves its target. No guest;
+# in `make check`.
+build/t_jni_io: tests/t_jni_io.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jni_io.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: jni-io
+jni-io: build/t_jni_io
+	./build/t_jni_io
+
+# Which web pages the DreamSpace web window may show (kl_mono_web_url, also
+# asked by its navigation delegate) and what an intent names
+# (kl_jni_intent_web): https only, http upgraded, listed hosts only, plain DNS
+# names only. Pure string checks; in `make check`.
+build/t_jni_url: tests/t_jni_url.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jni_url.c $(RUNTIME) $(LDLIBS)
+
+# BattleGroupVR2's own answers (fix 38), each with the proof that no other
+# title gets them: the Firebase and Vivox starts that throw instead of
+# stopping the process, and the Unity 6.2 memory callback with the title's
+# memory defaults. Made-up SDK calls; no game, no network; in `make check`.
+build/t_jni_firebase: tests/t_jni_firebase.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jni_firebase.c $(RUNTIME) $(LDLIBS)
+
+build/t_jni_vivox: tests/t_jni_vivox.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jni_vivox.c $(RUNTIME) $(LDLIBS)
+
+# A UE 4.21 guest's boot surface (Robo Recall: Unplugged): the AConfiguration
+# getters native_app_glue prints, zlib's compress(), MediaPlayer14(ZZ)V.
+build/t_ue421: tests/t_ue421.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_ue421.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: ue421
+ue421: build/t_ue421
+	./build/t_ue421
+
+build/t_jni_memory: tests/t_jni_memory.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jni_memory.c $(RUNTIME) $(LDLIBS)
+
+# Arizona Sunshine 2's own answers (Vertigo's logcat read, the Sentry Java SDK
+# dropped), and that every other title still stops on those names.
+build/t_jni_azs2: tests/t_jni_azs2.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_jni_azs2.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: jni-firebase jni-vivox jni-memory jni-azs2
+jni-firebase: build/t_jni_firebase
+	./build/t_jni_firebase
+jni-vivox: build/t_jni_vivox
+	./build/t_jni_vivox
+jni-memory: build/t_jni_memory
+	./build/t_jni_memory
+jni-azs2: build/t_jni_azs2
+	./build/t_jni_azs2
+
+# Gun Club VR's quit teardown and preference-file trace, and that every other
+# title keeps its frame loop and its silent file ops.
+build/t_gunclub: tests/t_gunclub.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_gunclub.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: gunclub
+gunclub: build/t_gunclub
+	./build/t_gunclub
+
+# "Max resolution per eye": the launch line's KL_OVRP_EYE_MAX over the player's
+# choice over the title's cap over 3072, and Native uncapped.
+build/t_maxeye: tests/t_maxeye.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_maxeye.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: maxeye
+maxeye: build/t_maxeye
+	./build/t_maxeye
+
+# The installation's asset-file list (runtime/xr/kl_assetcfg.c): which lines
+# are entries, which are refused (traversal, paths out of the OBB directory,
+# malformed numbers), and installed only at exactly the listed size. Built from
+# that one file — it depends on nothing else in the runtime.
+build/t_assetcfg: tests/t_assetcfg.c runtime/xr/kl_assetcfg.c runtime/xr/kl_assetcfg.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_assetcfg.c runtime/xr/kl_assetcfg.c
+
+.PHONY: assetcfg
+assetcfg: build/t_assetcfg
+	./build/t_assetcfg
 
 # kl_view.c is the KL_VIEW=1 interactive viewer (SDL3); only m_boot links it,
 # so only this rule carries the pkg-config flags. kl_view.c compiles to a stub
@@ -435,8 +753,26 @@ build/t_x18: tests/t_x18.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/t_x18.c runtime/kl_x18.c runtime/kl_env.c
 
+# klepton-ld's SPLIT veneer placement (two pools, per-slice choice, halving that
+# keeps odd-word tails instruction-aligned) on a synthetic sparse library wider
+# than two `b` windows — no host tree carries one (Deadpool VR's libUE4 is the
+# real case). Also run by `make check`.
+.PHONY: ldsplit
+ldsplit: build/klepton-ld
+	python3 tests/t_ld_split.py build/klepton-ld build/ldsplit
+
 x18: build/t_x18
 	python3 tools/check_x18.py build/t_x18 $(foreach f,$(GUEST_LIBS),$(LIBS)/$(f).so)
+
+# The `br x18` veneer's race windows, manufactured and executed so the fix can
+# be checked somewhere other than a headset. Seeds the TSD slot through
+# kl_thread_init, so it links the runtime.
+build/t_x18race: tests/t_x18race.c $(RUNTIME) runtime/kl_x18.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_x18race.c $(RUNTIME) $(LDLIBS)
+
+x18race: build/t_x18race
+	./build/t_x18race
 
 # The CTR_EL0 veneer, EXECUTED. Same shape as t_x18: linked against
 # the decoder alone, so a veneer bug cannot hide behind a working loader. It
@@ -449,6 +785,106 @@ build/t_ctr: tests/t_ctr.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 ctr: build/t_ctr
 	./build/t_ctr
 
+# The guest-mutex table under create/destroy churn (kl_pthread.c). The failure
+# it guards is a game that stops in a loading screen with every thread waiting,
+# on a headset, now and then; here it is a sequence of six calls.
+build/t_mtxtable: tests/t_mtxtable.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_mtxtable.c $(RUNTIME) $(LDLIBS)
+
+mtxtable: build/t_mtxtable
+	./build/t_mtxtable
+
+# The Linux ABI's veneers (thread pointer and svc), EXECUTED, on the same terms.
+build/t_lx: tests/t_lx.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_lx.c runtime/kl_x18.c runtime/kl_env.c
+
+.PHONY: lx
+lx: build/t_lx
+	./build/t_lx
+
+# The data window's two-entry literal-pool rule and its scope (one target),
+# on real PhysX and BoringSSL words. Decoder only, like t_x18. In `make check`.
+build/t_x18pool: tests/t_x18pool.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_x18pool.c runtime/kl_x18.c runtime/kl_env.c
+
+.PHONY: x18pool
+x18pool: build/t_x18pool
+	./build/t_x18pool
+
+# CASP with x18:x19 as one of its register pairs, EXECUTED (KLX_HZ_PAIR).
+build/t_casp: tests/t_casp.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_casp.c runtime/kl_x18.c runtime/kl_env.c
+
+.PHONY: casp
+casp: build/t_casp
+	./build/t_casp
+
+# ---- the Linux process runtime (runtime/linux/) ----
+# A glibc guest's own loader and libc, translated and run. LX_RT is the sysroot
+# they come from — Valve's Steam Linux Runtime, unpacked beside this checkout.
+LX_RT   ?= ../steamrt/root/files/lib/aarch64-linux-gnu
+# The guest's root: the runtime tarball's `files` is its /usr, and /lib, /bin and
+# /etc are the usual merged-usr aliases of it.
+LX_ROOT ?= ../steamrt/root/files
+LX_RUN   = ./build/m_linux --mount /usr=$(LX_ROOT) --mount /lib=$(LX_ROOT)/lib \
+           --mount /bin=$(LX_ROOT)/bin --mount /etc=$(LX_ROOT)/etc --dylibs build/lx
+
+build/m_linux: mains/m_linux.c runtime/linux/kl_lx.h $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ mains/m_linux.c $(RUNTIME) $(LDLIBS)
+
+# Valve's Fossilize (vendor-fossilize/, MIT) and the recorder/replayer built on
+# it, runtime/gfx/kl_fossilize.cpp (KL_VK_FOZ_RECORD / KL_VK_FOZ_REPLAY): the
+# only C++ in the runtime, compiled into the same archives. Whatever links an
+# archive takes the C++ library with it (-lc++); the host mains, which are one
+# cc command over the C sources, link without it and kl_vulkan.c finds the
+# recorder absent (a weak reference).
+FZ_DIR := vendor-fossilize
+FZ_SRC := $(FZ_DIR)/fossilize.cpp $(FZ_DIR)/fossilize_db.cpp $(FZ_DIR)/varint.cpp $(FZ_DIR)/path.cpp \
+          $(FZ_DIR)/fossilize_application_filter.cpp runtime/gfx/kl_fossilize.cpp
+FZ_DEPS := $(FZ_SRC) $(FZ_DIR)/miniz/miniz.c $(wildcard $(FZ_DIR)/*.hpp) runtime/gfx/kl_vk_pipe_hooks.h
+FZ_INC := -I$(FZ_DIR) -I$(FZ_DIR)/rapidjson/include -I$(FZ_DIR)/khronos -I$(FZ_DIR)/miniz -Iruntime/gfx
+FZ_CXX := clang++ -std=c++17 -g -O2 -arch arm64 -fno-exceptions -Wno-unused-parameter -Wno-deprecated-declarations $(FZ_INC)
+# $(1) = platform directory, $(2) = its target flags
+define FZ_COMPILE
+	@for s in $(FZ_SRC); do \
+	  $(FZ_CXX) $(2) -c $$s -o build/$(1)/fz_$$(basename $$s .cpp).o || exit 1; done
+	@clang -g -O2 -arch arm64 $(2) -c $(FZ_DIR)/miniz/miniz.c -o build/$(1)/fz_miniz.o
+endef
+
+# The pipeline replay on this Mac, with no guest (tests/t_foz.c). The one host
+# binary with the C++ recorder in it.
+build/t_foz: tests/t_foz.c $(RUNTIME) $(RUNTIME_HDRS) $(FZ_DEPS)
+	@mkdir -p build/fzhost
+	@for s in $(FZ_SRC); do \
+	  $(FZ_CXX) -c $$s -o build/fzhost/fz_$$(basename $$s .cpp).o || exit 1; done
+	@clang -g -O2 -arch arm64 -c $(FZ_DIR)/miniz/miniz.c -o build/fzhost/fz_miniz.o
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tests/t_foz.c $(RUNTIME) build/fzhost/*.o $(LDLIBS) -lc++
+
+# m_boot with the recorder in it — to collect a guest's pipelines on this Mac
+# (KL_VK_FOZ_DIR + a guest that can be walked through its content without a
+# person: KL_PROBE_CALL). The objects are t_foz's.
+build/m_boot_fz: build/m_boot build/t_foz
+	$(CC) $(CFLAGS) -fobjc-arc $(shell pkg-config --cflags sdl3) -o $@ \
+	  mains/m_boot.c tests/t_mtl_provider.m $(RUNTIME) runtime/gfx/kl_view.c \
+	  runtime/gfx/kl_view_mtl.m build/fzhost/*.o \
+	  $(LDLIBS) -lc++ -framework Metal -framework QuartzCore -framework Foundation \
+	  $(shell pkg-config --libs sdl3)
+
+# The whole sysroot, ad-hoc signed — Apple silicon maps no unsigned code even on
+# the host. A few hundred libraries; tools/lx_translate.sh runs them in parallel.
+.PHONY: lx-rt lx-boot
+lx-rt: build/klepton-ld
+	@tools/lx_translate.sh build/lx $(LX_RT)
+
+# The first rung: glibc's own dynamic loader, run as a program.
+lx-boot: build/m_linux lx-rt
+	$(LX_RUN) /lib/ld-linux-aarch64.so.1 --version
+
 # The broadcast fan-out, driven through the shim's own sendto and aimed
 # at loopback, so it exercises the discovery path without putting 254 datagrams
 # on anyone's network. The path is otherwise reachable only from a live Qt
@@ -459,6 +895,15 @@ build/t_bcast: tests/t_bcast.c $(RUNTIME) $(RUNTIME_HDRS)
 
 bcast: build/t_bcast
 	./build/t_bcast
+
+# What the guest reads in errno after a failed send/recv (see the test's header):
+# the shim's own recv, send and __errno, on local sockets.
+build/t_neterrno: tests/t_neterrno.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_neterrno.c $(RUNTIME) $(LDLIBS)
+
+neterrno: build/t_neterrno
+	./build/t_neterrno
 
 # ...and the preemptive version of the same question: what OTHER system
 # registers do these guests touch, and which of them may EL0 not execute?
@@ -535,29 +980,323 @@ build/t_il2cpp: tests/t_il2cpp.c $(RUNTIME) $(RUNTIME_HDRS)
 il2cpp: build/t_il2cpp
 	./build/t_il2cpp
 
+# The foveation tests (kl_fove.m, docs/FOVEATION.md): profile maths and tables,
+# plus GPU self-tests that skip themselves without a Metal device.
+build/t_fove: tests/t_fove.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_fove.c $(RUNTIME) $(LDLIBS)
+
+# The metrics panel's GPU numbers (kl_mtl_busy.m): every committed command
+# buffer counted, overlapping spans once. Skips itself without a Metal device.
+build/t_mtlbusy: tests/t_mtlbusy.m runtime/gfx/kl_mtl_busy.m runtime/gfx/kl_mtl_busy.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tests/t_mtlbusy.m runtime/gfx/kl_mtl_busy.m -framework Metal -framework Foundation
+
+# ...and the sample they are part of (kl_metrics.c): rates, the busiest thread, memory.
+build/t_metrics: tests/t_metrics.c runtime/diag/kl_metrics.c runtime/diag/kl_metrics.h runtime/gfx/kl_mtl_busy.m runtime/gfx/kl_mtl_busy.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tests/t_metrics.c runtime/diag/kl_metrics.c runtime/gfx/kl_mtl_busy.m -framework Metal -framework Foundation
+
+# The metrics panel for the macOS viewer (KL_STATS_CARD with --view): the same drawing as a dylib that
+# kl_view_mtl.m loads from beside m_boot only when the panel is asked for. Not in `check`; m_boot does
+# not depend on it.
+build/libklvm_panel.dylib: tools/viewer_panel/panel.swift visionos/Sources/KleptonMetrics.swift runtime/diag/kl_metrics.h
+	@mkdir -p build
+	swiftc -O -emit-library -o $@ -import-objc-header runtime/diag/kl_metrics.h \
+	  visionos/Sources/KleptonMetrics.swift tools/viewer_panel/panel.swift
+
+.PHONY: viewer-panel
+viewer-panel: build/libklvm_panel.dylib
+
+# The panel itself as a picture, from a made-up minute: the drawing runs on the
+# Mac, so its layout can be looked at without a headset.
+build/metrics_preview: tools/metrics_preview/main.swift visionos/Sources/KleptonMetrics.swift
+	@mkdir -p build
+	swiftc -O -o $@ visionos/Sources/KleptonMetrics.swift tools/metrics_preview/main.swift
+
+# The room on the floor (kl_room.c): scan map, suggested play area, drawn areas,
+# distance to the edge, finding a room measured before — on a made-up room.
+build/t_room: tests/t_room.c runtime/xr/kl_room.c runtime/xr/kl_room.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_room.c runtime/xr/kl_room.c
+
+.PHONY: room
+room: build/t_room
+	./build/t_room
+
+# Hand tracking for OVRPlugin guests (kl_hands.c): synthetic ARKit hands in,
+# OVR's 24-bone hand skeleton out — bind pose, mirror relation, finger bend,
+# pinch, finding ARKit's joint axes.
+# BRINK Traveler: its depth through the real reprojection shader, a pinch as a tap or a swipe, and
+# ARKit's joints as OpenXR's. No guest and no headset.
+build/t_brink_depth: tests/t_brink_depth.m tests/t_reproject.m runtime/gfx/kl_reproject.c \
+                     runtime/gfx/kl_reproject.h runtime/kl_env.c runtime/xr/kl_ovrp.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $< runtime/gfx/kl_reproject.c \
+	  runtime/kl_env.c -framework Metal -framework Foundation
+
+build/t_brink_selection: visionos/Sources/KleptonBrinkSelection.swift tests/brink-selection/main.swift
+	@mkdir -p build
+	swiftc -o $@ $^
+
+build/t_brink_hands: visionos/Sources/KleptonBrinkSelection.swift tests/brink-hands/main.swift
+	@mkdir -p build
+	swiftc -o $@ $^
+
+.PHONY: brink
+brink: build/t_brink_depth build/t_brink_selection build/t_brink_hands
+	./build/t_brink_depth
+	./build/t_brink_selection
+	./build/t_brink_hands
+
+build/t_hands: tests/t_hands.c runtime/xr/kl_hands.c runtime/xr/kl_hands.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_hands.c runtime/xr/kl_hands.c
+
+.PHONY: hands
+hands: build/t_hands
+	./build/t_hands
+
+# The discrete hand pinch (KleptonPinch.swift, KL_PINCH_DISCRETE): the filter
+# the app compiles, run on the Mac against timed sequences of fingertip values
+# and system pinch events at 60, 90 and 100 Hz. No ARKit; in `make check`.
+build/t_pinch: tests/t_pinch.swift visionos/Sources/KleptonPinch.swift
+	@mkdir -p build
+	swiftc -o $@ visionos/Sources/KleptonPinch.swift tests/t_pinch.swift
+
+# Hardware-independent tests for the actual shipped Surreal decoder, mapper and fusion.
+SURREAL_CORE := visionos/Sources/KleptonControllerInput.swift visionos/Sources/KleptonControllerMode.swift visionos/Sources/KleptonSurrealInput.swift visionos/Sources/KleptonSurrealAim.swift
+build/t_surreal: $(SURREAL_CORE) tests/t_surreal.swift
+	@mkdir -p build
+	swiftc -o $@ $(SURREAL_CORE) tests/t_surreal.swift
+
+.PHONY: surreal
+surreal: build/t_surreal
+	./build/t_surreal
+	python3 tests/t_surreal_project.py
+
+.PHONY: pinch
+pinch: build/t_pinch
+	./build/t_pinch
+
+# The MetalFX switch and the resolution (KleptonMetalFXPreset.swift): on at
+# 100 % sets 75 %, off gives 100 % back only if the switch lowered it and the
+# slider was not moved since; the mark survives a new start. In `make check`.
+build/t_mfxpreset: tests/t_mfxpreset.swift visionos/Sources/KleptonMetalFXPreset.swift
+	@mkdir -p build
+	swiftc -o $@ visionos/Sources/KleptonMetalFXPreset.swift tests/t_mfxpreset.swift
+
+.PHONY: mfxpreset
+mfxpreset: build/t_mfxpreset
+	./build/t_mfxpreset
+
+# MetalFX in mixed reality (KleptonMetalFXAlpha.swift): the real spatial scaler
+# on the Mac's GPU, then the alpha pass, for every format the compositor
+# upscales — transparent stays transparent, opaque stays opaque, one clean edge.
+# In `make check`; says SKIP on a Mac without the scaler.
+build/t_mfxalpha: tests/t_mfxalpha.swift visionos/Sources/KleptonMetalFXAlpha.swift
+	@mkdir -p build
+	swiftc -o $@ visionos/Sources/KleptonMetalFXAlpha.swift tests/t_mfxalpha.swift
+
+.PHONY: mfxalpha
+mfxalpha: build/t_mfxalpha
+	./build/t_mfxalpha
+
+# The metrics panel over the guest's quad layers (KleptonOverlayDepth.swift): the composite's quad pass
+# on the Mac's GPU with the real overlay shader and panel — a quad nearer than the panel (Alien's levels)
+# must not hide it. Writes {menu,level}-{before,after}.png to $$T_STATSCARD_SHOTS or build/.
+build/t_statscard: tests/t_statscard.swift tests/t_statscard.h visionos/Sources/KleptonOverlayDepth.swift \
+                   visionos/Sources/KleptonMetrics.swift runtime/gfx/kl_reproject.c runtime/gfx/kl_reproject.h \
+                   runtime/kl_env.c runtime/xr/kl_ovrp.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -c -o build/t_statscard_reproject.o runtime/gfx/kl_reproject.c
+	$(CC) $(CFLAGS) -c -o build/t_statscard_env.o runtime/kl_env.c
+	swiftc -o $@ -import-objc-header tests/t_statscard.h $(RUNTIME_INC) \
+	  visionos/Sources/KleptonOverlayDepth.swift visionos/Sources/KleptonMetrics.swift tests/t_statscard.swift \
+	  build/t_statscard_reproject.o build/t_statscard_env.o
+
+.PHONY: statscard
+statscard: build/t_statscard
+	./build/t_statscard
+
+# Half-Life: Alyx's loading screen, from the game's own models (KleptonHologram.swift), on the Mac's GPU.
+# Needs T_ALYX_HLVR, the game's hlvr folder; without it the test says so and passes.
+build/t_hologram: tests/t_hologram.swift visionos/Sources/KleptonHologram.swift
+	@mkdir -p build
+	swiftc -O -o $@ visionos/Sources/KleptonHologram.swift tests/t_hologram.swift
+
+.PHONY: hologram
+hologram: build/t_hologram
+	./build/t_hologram
+
+# "Max resolution per eye" in the start window (KleptonEyeMax.swift): the
+# options, the stored choice per game, and the old Test switch taken over once.
+build/t_maxeye_swift: tests/t_maxeye.swift visionos/Sources/KleptonEyeMax.swift
+	@mkdir -p build
+	swiftc -o $@ visionos/Sources/KleptonEyeMax.swift tests/t_maxeye.swift
+
+.PHONY: maxeyeswift
+maxeyeswift: build/t_maxeye_swift
+	./build/t_maxeye_swift
+# Walkabout's "unlock all putters and balls" (KleptonWalkaboutSave.swift) on a
+# COPY of a real save: android-files/files of the game and its
+# global-metadata.dat. Not in `make check` — it needs a player's save.
+#   make walkaboutunlock WB_FILES=<copy>/files WB_META=<tree>/assets/bin/Data/Managed/Metadata/global-metadata.dat
+build/t_walkabout_unlock: tests/t_walkabout_unlock.swift visionos/Sources/KleptonWalkaboutSave.swift
+	@mkdir -p build
+	swiftc -O -parse-as-library -o $@ visionos/Sources/KleptonWalkaboutSave.swift tests/t_walkabout_unlock.swift
+
+.PHONY: walkaboutunlock
+walkaboutunlock: build/t_walkabout_unlock
+	./build/t_walkabout_unlock "$(WB_FILES)" "$(WB_META)"
+
+# Which builds are test builds (KleptonTestBuild.swift; KLTestBuild, which
+# gen_xcodeproj.py bakes): what only a tester sees must never reach a
+# player's build.
+build/t_testbuild: tests/t_testbuild.swift visionos/Sources/KleptonTestBuild.swift
+	@mkdir -p build
+	swiftc -o $@ visionos/Sources/KleptonTestBuild.swift tests/t_testbuild.swift
+
+.PHONY: testbuild
+testbuild: build/t_testbuild
+	./build/t_testbuild
+	python3 tests/t_testbuild_gen.py
+	python3 tests/t_steam_art.py
+	python3 tests/t_steam_art.py
+
+# The compositor's array-view cache (KleptonArrayViews.swift): 25 per-eye
+# swapchain rebuilds on the Mac's Metal device; the released images must be
+# freed and the device's allocated size stay flat. In `make check`.
+build/t_arrayviews: tests/t_arrayviews.swift visionos/Sources/KleptonArrayViews.swift
+	@mkdir -p build
+	swiftc -o $@ visionos/Sources/KleptonArrayViews.swift tests/t_arrayviews.swift
+
+.PHONY: arrayviews
+arrayviews: build/t_arrayviews
+	./build/t_arrayviews
+
+.PHONY: metrics-preview
+metrics-preview: build/metrics_preview
+	@./build/metrics_preview 60 build/metrics && echo "  build/metrics-panel.png, build/metrics-line.png," \
+	  "build/metrics-panel-notap.png, build/metrics-panel-tap.png"
+
 # Full regression sweep — run this first when picking work back up.
 #
+# tgkill/tkill(tid, 0) liveness probes answered by the raw-syscall door.
+build/t_tgkill: tests/t_tgkill.c $(RUNTIME)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_tgkill.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: tgkill
+tgkill: build/t_tgkill
+	./build/t_tgkill
+
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+check: build/t_futex build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_ovrplat build/t_posebound build/t_ovrplayers build/t_trackers build/t_untested build/t_audio build/t_audiorace build/t_xrinput build/t_softinput build/t_ctr build/t_mtxtable build/t_bcast build/t_neterrno build/t_fault build/t_glcaps build/t_x18race build/t_tgkill build/klepton-ld build/t_uevk build/t_jniobj build/t_fove build/t_mtlbusy build/t_metrics build/t_dl_ext build/t_jni_io build/t_jni_url build/t_jni_firebase build/t_jni_vivox build/t_jni_memory build/t_jni_azs2 build/t_gunclub build/t_maxeye build/t_assetcfg build/t_pinch build/t_arrayviews build/t_surreal build/t_mfxpreset build/t_mfxalpha build/t_statscard build/t_hologram build/t_maxeye_swift build/t_x18pool build/t_ue421 build/t_room build/t_hands build/t_brink_depth build/t_brink_selection build/t_brink_hands
+	@# The guest steps read $(TARGET)'s own files. Without them the loader steps print nothing and pass, and the
+	@# run ends at the il2cpp step with a bare "Error 1" - a check that looked green until its last line. A
+	@# working copy without the game's tree (a fresh git worktree) is told so here, before anything runs.
+	@test -f $(LIBS)/libil2cpp.so || { echo "check needs the guest it tests: $(LIBS)/libil2cpp.so is not here."; \
+	  echo "  Unpack $(TARGET) into this working copy (see BUILDING.md), link or clone the tree from another one,"; \
+	  echo "  or name a guest that is here: make check TARGET=<name>"; exit 1; }
+	@./build/t_surreal
 	@echo "=== variadic ABI ===" && ./build/t_variadic
+	@./build/t_x18race > build/x18race.log 2>&1 || { cat build/x18race.log; exit 1; }
+	@head -1 build/x18race.log && tail -1 build/x18race.log
+	@./build/t_x18pool > build/x18pool.log 2>&1 || { cat build/x18pool.log; exit 1; }
+	@head -1 build/x18pool.log && tail -1 build/x18pool.log
+	@./build/t_tgkill > build/tgkill.log 2>&1 || { cat build/tgkill.log; exit 1; }
+	@grep -E '=== tgkill' build/tgkill.log && tail -1 build/tgkill.log
+	@python3 tests/t_ld_split.py build/klepton-ld build/ldsplit > build/ldsplit.log 2>&1 || { cat build/ldsplit.log; exit 1; }
+	@echo "=== klepton-ld SPLIT placement (synthetic 300 MB library) ===" && tail -1 build/ldsplit.log
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug
 	@./build/t_hevc > build/hevc.log 2>&1 || { cat build/hevc.log; exit 1; }
 	@grep -E '=== HEVC|30 access units' build/hevc.log && tail -1 build/hevc.log
 	@./build/t_xrspace > build/xrspace.log 2>&1 || { cat build/xrspace.log; exit 1; }
 	@head -2 build/xrspace.log && tail -1 build/xrspace.log
+	@./build/t_ovrplat > build/ovrplat.log 2>&1 || { cat build/ovrplat.log; exit 1; }
+	@head -1 build/ovrplat.log && tail -1 build/ovrplat.log
+	@./build/t_posebound > build/posebound.log 2>&1 || { cat build/posebound.log; exit 1; }
+	@head -1 build/posebound.log && grep -E '^(PASS|FAIL)' build/posebound.log
+	@./build/t_ovrplayers > build/ovrplayers.log 2>&1 || { cat build/ovrplayers.log; exit 1; }
+	@cat build/ovrplayers.log
+	@./build/t_trackers > build/trackers.log 2>&1 || { cat build/trackers.log; exit 1; }
+	@tail -1 build/trackers.log
+	@./build/t_untested > build/untested.log 2>&1 || { cat build/untested.log; exit 1; }
+	@head -1 build/untested.log && tail -1 build/untested.log
+	@./build/t_audio > build/audio.log 2>&1 || { cat build/audio.log; exit 1; }
+	@echo "=== audio sink: sample formats, OpenSL sources ===" && tail -1 build/audio.log
+	@./build/t_audiorace > build/audiorace.log 2>&1 || { cat build/audiorace.log; exit 1; }
+	@head -1 build/audiorace.log && tail -1 build/audiorace.log
 	@./build/t_xrinput > build/xrinput.log 2>&1 || { cat build/xrinput.log; exit 1; }
 	@grep -E '=== OpenXR actions' build/xrinput.log && tail -1 build/xrinput.log
 	@./build/t_softinput > build/softinput.log 2>&1 || { cat build/softinput.log; exit 1; }
 	@head -1 build/softinput.log && tail -1 build/softinput.log
+	@./build/t_jniobj > build/jniobj.log 2>&1 || { cat build/jniobj.log; exit 1; }
+	@head -1 build/jniobj.log && tail -1 build/jniobj.log
+	@./build/t_uevk > build/uevk.log 2>&1 || { cat build/uevk.log; exit 1; }
+	@head -1 build/uevk.log && tail -1 build/uevk.log
 	@./build/t_ctr > build/ctr.log 2>&1 || { cat build/ctr.log; exit 1; }
 	@head -2 build/ctr.log && tail -1 build/ctr.log
+	@./build/t_mtxtable > build/mtxtable.log 2>&1 || { cat build/mtxtable.log; exit 1; }
+	@head -1 build/mtxtable.log && tail -1 build/mtxtable.log
 	@./build/t_bcast > build/bcast.log 2>&1 || { cat build/bcast.log; exit 1; }
 	@head -1 build/bcast.log && tail -1 build/bcast.log
+	@./build/t_neterrno > build/neterrno.log 2>&1 || { cat build/neterrno.log; exit 1; }
+	@head -1 build/neterrno.log && tail -1 build/neterrno.log
 	@./build/t_haptics > build/haptics.log 2>&1 || { cat build/haptics.log; exit 1; }
 	@head -3 build/haptics.log && tail -1 build/haptics.log
+	@./build/t_fove > build/fove.log 2>&1 || { cat build/fove.log; exit 1; }
+	@head -1 build/fove.log && tail -1 build/fove.log
+	@./build/t_mtlbusy > build/mtlbusy.log 2>&1 || { cat build/mtlbusy.log; exit 1; }
+	@head -1 build/mtlbusy.log && tail -1 build/mtlbusy.log
+	@./build/t_metrics > build/metrics.log 2>&1 || { cat build/metrics.log; exit 1; }
+	@head -1 build/metrics.log && tail -1 build/metrics.log
+	@KL_FUTEX_EXACT=1 ./build/t_futex > build/futex.log 2>&1 || { cat build/futex.log; exit 1; }
+	@./build/t_dl_ext > build/dl-ext.log 2>&1 || { cat build/dl-ext.log; exit 1; }
+	@echo "=== android_dlopen_ext ===" && tail -1 build/dl-ext.log
+	@./build/t_jni_io > build/jni-io.log 2>&1 || { cat build/jni-io.log; exit 1; }
+	@echo "=== JNI file output ===" && tail -1 build/jni-io.log
+	@./build/t_jni_url > build/jni-url.log 2>&1 || { cat build/jni-url.log; exit 1; }
+	@echo "=== JNI web addresses ===" && tail -1 build/jni-url.log
+	@./build/t_jni_firebase > build/jni-firebase.log 2>&1 || { cat build/jni-firebase.log; exit 1; }
+	@./build/t_jni_vivox > build/jni-vivox.log 2>&1 || { cat build/jni-vivox.log; exit 1; }
+	@./build/t_jni_memory > build/jni-memory.log 2>&1 || { cat build/jni-memory.log; exit 1; }
+	@echo "=== BattleGroupVR2: Firebase, Vivox, memory ===" && tail -1 build/jni-firebase.log && tail -1 build/jni-vivox.log && tail -1 build/jni-memory.log
+	@./build/t_jni_azs2 > build/jni-azs2.log 2>&1 || { cat build/jni-azs2.log; exit 1; }
+	@echo "=== Arizona Sunshine 2: logcat, Sentry ===" && tail -1 build/jni-azs2.log
+	@./build/t_gunclub > build/gunclub.log 2>&1 || { cat build/gunclub.log; exit 1; }
+	@head -1 build/gunclub.log && tail -1 build/gunclub.log
+	@./build/t_maxeye > build/maxeye.log 2>&1 || { cat build/maxeye.log; exit 1; }
+	@head -1 build/maxeye.log && tail -1 build/maxeye.log
+	@./build/t_assetcfg > build/assetcfg.log 2>&1 || { cat build/assetcfg.log; exit 1; }
+	@head -1 build/assetcfg.log && tail -1 build/assetcfg.log
+	@./build/t_pinch > build/pinch.log 2>&1 || { cat build/pinch.log; exit 1; }
+	@echo "=== discrete hand pinch ===" && tail -1 build/pinch.log
+	@./build/t_room > build/room.log 2>&1 || { cat build/room.log; exit 1; }
+	@echo "=== room and play area ===" && tail -1 build/room.log
+	@./build/t_brink_depth > build/brink-depth.log 2>&1 || { cat build/brink-depth.log; exit 1; }
+	@./build/t_brink_selection > build/brink-selection.log 2>&1 || { cat build/brink-selection.log; exit 1; }
+	@./build/t_brink_hands > build/brink-hands.log 2>&1 || { cat build/brink-hands.log; exit 1; }
+	@echo "=== BRINK Traveler: depth, selection, hand frames ===" && tail -1 build/brink-hands.log
+	@./build/t_hands > build/hands.log 2>&1 || { cat build/hands.log; exit 1; }
+	@echo "=== hand tracking (OVR skeleton) ===" && tail -1 build/hands.log
+	@./build/t_arrayviews > build/arrayviews.log 2>&1 || { cat build/arrayviews.log; exit 1; }
+	@echo "=== compositor array views ===" && tail -1 build/arrayviews.log
+	@./build/t_ue421 > build/ue421.log 2>&1 || { cat build/ue421.log; exit 1; }
+	@head -1 build/ue421.log && tail -1 build/ue421.log
+	@./build/t_mfxpreset > build/mfxpreset.log 2>&1 || { cat build/mfxpreset.log; exit 1; }
+	@echo "=== MetalFX switch: resolution preset ===" && tail -1 build/mfxpreset.log
+	@./build/t_mfxalpha > build/mfxalpha.log 2>&1 || { cat build/mfxalpha.log; exit 1; }
+	@head -1 build/mfxalpha.log && tail -1 build/mfxalpha.log
+	@./build/t_statscard > build/statscard.log 2>&1 || { cat build/statscard.log; exit 1; }
+	@./build/t_hologram > build/hologram.log 2>&1 || { cat build/hologram.log; exit 1; }
+	@head -1 build/statscard.log && tail -1 build/statscard.log
+	@./build/t_maxeye_swift > build/maxeye-swift.log 2>&1 || { cat build/maxeye-swift.log; exit 1; }
+	@head -1 build/maxeye-swift.log && tail -1 build/maxeye-swift.log
 	@$(MAKE) -s ovrpabi
 # The opus roundtrip is the one gate here that RUNS guest code rather than
 # inspecting it, so it is worth keeping wherever it exists — but libunityopus.so
@@ -593,7 +1332,14 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@if [ -x "$(NDK_CC)" ]; then echo "=== guest differential ===" && \
 	   $(MAKE) -s guest | grep -E 'x18 sites|identical to the host|lost '; \
 	 else echo "=== guest differential: SKIPPED (set ANDROID_NDK_HOME) ==="; fi
-	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so $(TARGET)/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log
+# libil2cpp.so exists only on Unity IL2CPP titles. A UE4, SDL or native guest
+# has nothing to point t_il2cpp at, and failing here stopped every gate after
+# it. Skip loudly, as the opus gate does: a missing library is a property of
+# the guest, not a regression.
+	@echo "=== il2cpp runtime ===" && if [ -f $(LIBS)/libil2cpp.so ]; then \
+	  ./build/t_il2cpp $(LIBS)/libil2cpp.so $(TARGET)/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log; \
+	else echo "  SKIPPED: $(LIBS) has no libil2cpp.so (not a Unity IL2CPP title)."; \
+	     echo "  The guest-entry gate below still runs its own entry points."; fi
 	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/m_boot $(LIBS) > build/boot.log 2>/dev/null && \
 	  grep -E 'guard verified|DLC enumeration|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|EXIT CRITERION' build/boot.log
 
@@ -737,7 +1483,7 @@ XROS_LIBS  := $(foreach p,$(XROS_PLATFORMS),build/$(p)/libklepton.a)
 # fails; a Vulkan guest simply reports that the hardware does not meet its
 # requirements, on device only). Nothing links against MoltenVK either way —
 # kl_vulkan.c is VK_NO_PROTOTYPES and dlopens it — so this is headers only.
-XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
+XROS_CFLAGS := $(REPRO_FLAGS) $(SC2_DEFINES) -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 
 .PHONY: xros xros-device xros-sim swiftcheck
 xros: $(XROS_GATES) build/Klepton.xcframework swiftcheck
@@ -764,9 +1510,12 @@ xros: $(XROS_GATES) build/Klepton.xcframework swiftcheck
 # between this and the real build, which is the one thing that would make it
 # lie.
 swiftcheck:
+	@mkdir -p build/swift-module-cache
 	@xcrun -sdk xros swiftc -typecheck -target arm64-apple-xros26.0 \
+	  -module-cache-path build/swift-module-cache \
 	  -import-objc-header visionos/Sources/Klepton-Bridging-Header.h \
-	  $(RUNTIME_INC) visionos/Sources/*.swift 2>&1 | grep -E '^[^ ].*error:' && exit 1; \
+	  $(RUNTIME_INC) visionos/Sources/*.swift visionos/SteamCloudKit/Sources/SteamCloudKit/*.swift \
+	  > build/swiftcheck.log 2>&1 || { cat build/swiftcheck.log; exit 1; }; \
 	  echo "  swiftcheck: the visionOS app typechecks against runtime/*.h"
 
 # The archives are real targets with real prerequisites, not side effects of a
@@ -780,22 +1529,24 @@ swiftcheck:
 # runs the PREVIOUS constant while the source says otherwise. That is the same
 # stale-artifact trap the xcframework rule below already records; the fix there
 # stopped at the archives and left this behind it.
-build/xros/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
+build/xros/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS) $(FZ_DEPS)
 	@mkdir -p build/xros
-	@rm -f $@
+	@rm -f $@ $(@D)/*.o
 	@for s in $(RUNTIME_SHIP); do \
 	  o=build/xros/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
 	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) \
 	    -c $$s -o $$o || exit 1; done
+	$(call FZ_COMPILE,xros,-target arm64-apple-xros1.0 -isysroot $(XROS_SDK))
 	@ar rcs $@ build/xros/*.o
 
-build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
+build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS) $(FZ_DEPS)
 	@mkdir -p build/xrsim
-	@rm -f $@
+	@rm -f $@ $(@D)/*.o
 	@for s in $(RUNTIME_SHIP); do \
 	  o=build/xrsim/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
 	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) \
 	    -c $$s -o $$o || exit 1; done
+	$(call FZ_COMPILE,xrsim,-target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK))
 	@ar rcs $@ build/xrsim/*.o
 
 # The gate: link each archive into a dylib with -all_load, so a symbol that is
@@ -803,16 +1554,16 @@ build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
 # a function nothing calls yet.
 build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz -lc++ -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
+	   -framework CoreFoundation -framework AVFoundation -framework Foundation -framework Metal $(SC2_FRAMEWORKS) \
 	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
-	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
+	   -dynamiclib -o $@ -Wl,-all_load $< -lz -lc++ -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
+	   -framework CoreFoundation -framework AVFoundation -framework Foundation -framework Metal $(SC2_FRAMEWORKS) \
 	   -install_name @rpath/libklepton.dylib
 
 xros-device: build/xros/libklepton.dylib
@@ -859,12 +1610,23 @@ build/Klepton.xcframework: $(XROS_LIBS) $(RUNTIME_ALL_HDRS) build/.xcframework-s
 # LC_BUILD_VERSION afterwards. Confirmed prior art (ALVR ships a Rust dylib this
 # way). ANGLE emits ios_framework_bundle on iOS, so the output is already the
 # .framework packaging the app bundle wants.
+# Extra gn args for all three slices. The pinned toolchain's lld cannot read an
+# Xcode 27 SDK — its .tbd files name an arm64e.x1 target that this LLVM's TAPI
+# reader rejects as "unknown target", so nothing links against libSystem. There,
+# use_lld=false links with Apple's ld instead.
+#
+# Detected rather than passed by hand, because visionos/run.sh re-runs
+# `make angle-xros angle-xrsim` on every device build: a flag given once to
+# `make angle-all` is gone on the next gn gen, and the relink fails.
+ANGLE_GN_EXTRA ?= $(shell grep -qs 'arm64e\.x1' \
+                    "$$(xcrun --sdk macosx --show-sdk-path)/usr/lib/libSystem.tbd" \
+                    && echo use_lld=false)
 .PHONY: angle-ios angle-ios-sim angle-xros
 angle-ios: angle-fetch
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
 	  gn gen out/ios --args='is_debug=false target_os="ios" target_cpu="arm64" \
 	    target_environment="device" ios_enable_code_signing=false \
-	    angle_enable_vulkan=false angle_enable_swiftshader=false use_lld=false use_custom_libcxx=false use_custom_libcxx_for_host=false treat_warnings_as_errors=false' && \
+	    angle_enable_vulkan=false angle_enable_swiftshader=false use_lld=false use_custom_libcxx=false use_custom_libcxx_for_host=false treat_warnings_as_errors=false $(ANGLE_GN_EXTRA)' && \
 	  autoninja -C out/ios libEGL libGLESv2
 
 # The simulator slice. Same trick one platform over: an iOS *simulator* build
@@ -876,7 +1638,7 @@ angle-ios-sim: angle-fetch
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
 	  gn gen out/ios-sim --args='is_debug=false target_os="ios" target_cpu="arm64" \
 	    target_environment="simulator" ios_enable_code_signing=false \
-	    angle_enable_vulkan=false angle_enable_swiftshader=false use_thin_archive=false' && \
+	    angle_enable_vulkan=false angle_enable_swiftshader=false use_thin_archive=false $(ANGLE_GN_EXTRA)' && \
 	  autoninja -C out/ios-sim libEGL libGLESv2
 
 # The retarget itself is a script (tools/angle_retarget.sh) — it rewrites the
@@ -994,7 +1756,7 @@ ovrpabi:
 angle-debug: angle-fetch
 	cd vendor && if [ ! -f depot_tools/python3_bin_reldir.txt ]; then cd depot_tools && ./update_depot_tools && cd ..; fi
 	cd vendor && export PATH="$$PWD/depot_tools:$$PATH" DEPOT_TOOLS_UPDATE=0 && \
-		gn gen out/Debug --args='is_debug=true target_cpu="arm64" use_lld=false' && \
+		gn gen out/Debug --args='is_debug=true target_cpu="arm64" use_lld=false $(ANGLE_GN_EXTRA)' && \
 		autoninja -C out/Debug libEGL libGLESv2
 
 # ---- vendor/ — the ANGLE checkout, which we MODIFY ----
@@ -1126,6 +1888,14 @@ angle-status:
 #
 # vendor-moltenvk/ is gitignored exactly as vendor/ is — the tracked artifacts
 # are the two scripts and the version+sha256 pin inside mvk_fetch.sh.
+# Surreal Interactive's visionOS SDK, the pose source of a Surreal Touch build.
+# gen_xcodeproj.py fetches it by itself for every build that lacks it; this
+# is for staging it ahead of time (a toolchain that ships with it, an offline
+# build). Pinned and verified in the script; visionos/Frameworks/ is gitignored.
+.PHONY: surreal-sdk
+surreal-sdk:
+	@./tools/surreal_sdk_fetch.sh
+
 .PHONY: mvk mvk-fetch mvk-retarget mvk-check mvk-status
 mvk-fetch:
 	@./tools/mvk_fetch.sh

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "config-utils",
+    "repository": "darknight1050/config-utils",
+    "ref": "v2.0.3",
+    "commit": "bbc37cb19eaf34d07650704aaca2bd5664338dea",
+    "archive": "config-utils-bbc37cb.tar.gz",
+    "sha256": "21b90b068b22801ed5717999d8ec0dc8bbe278f9514ddc6044f8c5971011f77a"
+  },
+  {
+    "name": "rapidjson-macros",
+    "repository": "Metalit/RapidjsonMacros",
+    "ref": "version/v2_1_0",
+    "commit": "27cd571767065192387145912fa216b7abe87915",
+    "archive": "rapidjson-macros-27cd571.tar.gz",
+    "sha256": "4a9c654ac6a78110f8a8ca26059fbf194d86818d943fa891f06b19360ba93ddf"
+  },
+  {
+    "name": "zip-songdownloader",
+    "repository": "kuba--/zip",
+    "ref": "SongDownloader include/zip gitlink",
+    "commit": "f72dce22bd25d10f8575ec54cf51bf5a5fdcb5ba",
+    "archive": "zip-songdownloader-f72dce2.tar.gz",
+    "sha256": "e40a6392280dacf2b0ded4045db79f15ad71a705a015df441c49aa8bbbeac210"
+  }
+]

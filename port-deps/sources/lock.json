@@ -1,0 +1,23 @@
+[
+  {
+    "name": "flamingo",
+    "repository": "sc2ad/Flamingo",
+    "tag": "v1.1.2",
+    "commit": "461993fea629790bf499f41e807b00db25b0a148",
+    "sha256": "e2e192eeba8dd5b5ab0e333d8bbda7ae23bd465c6e4e0ca5ecd0325770a4524c"
+  },
+  {
+    "name": "bshook",
+    "repository": "QuestPackageManager/beatsaber-hook",
+    "tag": "v6.4.2",
+    "commit": "dd9f4cf0565ff46f9c2844a1512bc1786a7f2446",
+    "sha256": "35d6ce2ae65540338f4fc05c33e8cfeb3e86b9fbd8f8356199a5fe66c3ac2599"
+  },
+  {
+    "name": "customtypes",
+    "repository": "QuestPackageManager/Il2CppQuestTypePatching",
+    "tag": "v0.18.3",
+    "commit": "864211e6dd9ec9d82ddc4490668db02316672c38",
+    "sha256": "8f7d9c8abb51adf7f092cd8cd809f36f090fb33238fca9cebbf0120d7c8588a8"
+  }
+]

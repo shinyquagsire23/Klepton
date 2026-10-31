@@ -17,14 +17,18 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include "klepton.h"
 #include "kl_mediaplayer.h"
 #include "kl_jni.h"
 #include "kl_fault.h"
 #include "kl_target.h"
 #include "kl_env.h"
+#include "guest/kl_driver.h"   // the target name, for the device-language default
 #include "kl_ovrp.h"
+#include "kl_ovrplat.h"           // whether the installation lists language packs
 #include "kl_avdec.h"
+#include "kl_audio.h"
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_va.h"
@@ -218,9 +222,12 @@ static klj_val klj_UnityPlayer_getNetworkConnectivity(void *env, void *self,
 // ClassNotFoundException and the C# catches it, which is how "close Sentry if
 // the Android SDK is present" is written.
 //
-// We cannot reproduce that, and the reason is a settled design decision rather
-// than an oversight: FindClass here never fails (it interns any name) and the
-// exception state is always clear, so a guest cannot discover that a class is
+// We do not reproduce that in general, and the reason is a design decision
+// rather than an oversight: FindClass here interns any name. (It can fail
+// since 2026-10-11 — there is a pending exception per thread, and
+// klj_class_absent in kl_jni.c names the classes an APK is known not to ship,
+// one title so far — but nothing here knows an APK's class list.) So a guest
+// usually cannot discover that a class is
 // absent. That is right for the Android framework, every class of which we
 // implement — and it is exactly wrong for an application's OPTIONAL dependency,
 // where the absence IS the answer. The failure it produces is an abort on a
@@ -231,7 +238,7 @@ static klj_val klj_UnityPlayer_getNetworkConnectivity(void *env, void *self,
 // and Sentry is crash TELEMETRY — "closed, sending nothing" is the state we
 // want to be in and the one we are actually in.
 //
-// Deliberately only close(). If this guest ever calls Sentry.init or
+// Deliberately only close() (and isEnabled(), below). If this guest ever calls Sentry.init or
 // captureException it should stop by name and be decided on then, because
 // those are a translated guest phoning home about a machine it is not running
 // on, which is not ours to answer for.
@@ -242,6 +249,121 @@ static klj_val klj_Sentry_close(void *env, void *self, const klj_val *a, int n) 
         KLJ_LOG("io/sentry/Sentry.close() — this APK ships no Sentry SDK, so "
                 "there is nothing initialised to close");
     return (klj_val){0};
+}
+
+// isEnabled() is the one query a guest can make of that state, and it has a
+// true answer: the Java SDK is never initialised here (SentryBridgeJava.init
+// is a no-op, see kl_jni_ue4.c), so it is not enabled — the same answer a
+// device gives before init. Skydance's BEHEMOTH (x5767635983306831, UE5) ships
+// the SDK, never calls io.sentry.Sentry.init itself (its Unreal bridge's init
+// is the no-op named above), and asks this right after its first composited
+// frame; it aborted here (fix 21, sent in by a user, 2026-10-11).
+static klj_val klj_Sentry_isEnabled(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("io/sentry/Sentry.isEnabled() -> false (never initialised here)");
+    return (klj_val){.j = 0};
+}
+
+// ---- Virtuix Omni: a treadmill bridge with no treadmill app to bind ----
+//
+// Unity games with Virtuix Omni support (Cave Crave) ship the OmniConnectShared
+// plugin. Its Java start(activity) loads libOmniConnectShared and binds to the
+// separate "Omni Connect" app (com.virtuix.omniconnect/.SharedMemoryService),
+// which owns the treadmill's shared memory. On a Quest without that app the
+// bind simply fails and the plugin reports no Omni — the game falls back to
+// its normal locomotion. That app cannot exist here, so start() is answered as
+// that not-installed branch: nothing is bound, nothing is loaded. Without it
+// the static call aborted at boot ("no host implementation").
+static klj_val klj_Omni_start(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("OmniConnectSharedAndroid.start() — no Omni Connect service to "
+                "bind on this host; treadmill support stays off");
+    return (klj_val){0};
+}
+
+// ---- Vuplex 3D WebView: settings for a browser engine that is not here ----
+//
+// Vuplex's Android plugin is a Java wrapper (com.vuplex.webview.WebView3D)
+// around the system WebView or GeckoView. Neither exists on this host, so a web
+// view cannot be created — but a game configures the plugin long before it
+// opens one. Wooorld (x4360608937312293) does it while booting:
+// setAlternativePointerInputSystemEnabled and setAutoplayEnabled from its
+// startup scripts, resumeAll from OnApplicationPause(false). All three are
+// static, return void and only set process-wide switches for web views that
+// may be created later (resumeAll resumes the ones that exist: none). With no
+// answer the first of them stopped the game before its first frame ("no host
+// implementation", 2026-10-11). Real VR Fishing (x2582932495064035) sets two
+// more of the same kind on the way into its title scene, setDrmEnabled,
+// setRemoteDebuggingEnabled and globallySetUserAgent (fix 37, 2026-10-14;
+// setRemoteDebuggingEnabled observed on device 2026-10-20).
+//
+// Deliberately only these. WebView3D.<init> and everything that would hand the
+// game a page stays unimplemented, so a game that really opens a web view
+// stops by name there and is decided on then.
+static klj_val klj_Vuplex_setting(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("com/vuplex/webview/WebView3D: no Android WebView on this host — "
+                "the plugin's static settings are accepted and change nothing");
+    return (klj_val){0};
+}
+
+// ...and the question the plugin asks before it makes a web view: is the
+// system's WebView package installed? It is not, and false is the plugin's own
+// answer for a device without one — the game is told its browser is unavailable
+// by the plugin instead of stopping at WebView3D.<init>. Real VR Fishing asks;
+// what it leaves out without a browser (its online music, by its sender) is
+// left out.
+static klj_val klj_Vuplex_isWebViewAvailable(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("com/vuplex/webview/WebView3D.isWebViewAvailable() -> false "
+                "(no Android WebView on this host)");
+    return (klj_val){.j = 0};
+}
+
+// Real VR Fishing's native microphone helper checks Android's Bluetooth
+// adapter after the title scene loads. visionOS owns the headset's Bluetooth
+// route and exposes no Android adapter to the guest, so this is the same result
+// Android returns on a device without Bluetooth support: null. The helper then
+// continues with its non-Bluetooth audio path.
+static klj_val klj_BluetoothAdapter_getDefaultAdapter(void *env, void *self,
+                                                       const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("BluetoothAdapter.getDefaultAdapter() -> null (Bluetooth audio "
+                "routing belongs to visionOS)");
+    return (klj_val){.l = NULL};
+}
+
+// ---- Meta Voice SDK: a telemetry service that is never bound ----
+//
+// The Voice SDK reports usage to the headset's Assistant service through a
+// fragment it attaches to the activity:
+// UnityPlatformLoggerServiceFragment.createAndAttach(activity, version), then
+// getService() for the service the fragment bound. There is no Assistant
+// service to bind here, and telemetry about this machine is not ours to send,
+// so getService() answers what a fragment whose bind never completed holds:
+// null. Wooorld (x4360608937312293) asks once during boot and carries on
+// without a logger — no further call on the fragment, nothing in Unity's log
+// (measured on the host, 2026-10-11). The fragment itself is an inert object
+// (klj_View_new in the table) rather than null, because createAndAttach
+// constructs one unconditionally and the caller uses it without a check.
+// Unanswered, createAndAttach aborted before the game's first scene.
+static klj_val klj_VoiceLogger_getService(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("UnityPlatformLoggerServiceFragment.getService() -> null (no "
+                "Assistant service to bind; Voice SDK telemetry stays off)");
+    return (klj_val){.l = NULL};
 }
 
 // ---- JavaBroadcastReceiver: a subscription to a bus with no publisher ----
@@ -383,6 +505,13 @@ void kl_jni_unity_construct_helpers(void) {
     return (klj_val){.l = kl_jni_activity()};
 }
 
+// UnityPlayerActivity.mUnityPlayer — the activity's handle on the player it
+// constructed in onCreate. Same object as the `thiz` every UnityPlayer native
+// is called with, because on Android it IS that object.
+ klj_val klj_mUnityPlayer_field(void) {
+    return (klj_val){.l = kl_jni_unity_player()};
+}
+
 // Oculus's device-config client. The native half of this
 // (libdeviceconfigclient-full-aar.so) is not in the APK — the dlopen for it fails
 // early in every run — so there is no configuration service behind this on a real
@@ -458,6 +587,19 @@ static klj_val klj_OculusDeviceConfig_getError(void *env, void *self,
 static klj_val klj_UnityPlayer_addPhoneCallListener(void *env, void *self,
                                                     const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// UnityPlayer.setRunWithoutFocus(boolean) — Unity 6000.3 hands
+// Application.runInBackground to the Java player, which then decides whether a
+// lost window focus pauses the game. There is no Java player here: pause and
+// resume come from the host's own lifecycle, so the wish is recorded and
+// nothing else changes. Unanswered, it fataled at the first frame.
+static klj_val klj_UnityPlayer_setRunWithoutFocus(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("UnityPlayer.setRunWithoutFocus(%d) — recorded, pausing stays with the host lifecycle",
+            n > 0 ? (int)(a[0].j & 1) : -1);
     return (klj_val){.j = 0};
 }
 
@@ -537,6 +679,25 @@ static void klj_locale_parts(char *lang, size_t lang_sz, char *country, size_t c
     snprintf(lang, lang_sz, "en");
     snprintf(country, country_sz, "US");
     const char *env = getenv("LANG");
+    // On a headset nothing sets LANG, so every game was told en_US whatever the
+    // device is set to. The app passes the device's own language along as
+    // KL_DEVICE_LANG ("de_DE"), and it is used where a game is known to take
+    // its language from the device and nowhere else: Asgard's Wrath 2 has no
+    // language menu — FGenericPlatformMisc::GetDefaultLanguage decides text
+    // and voices — and stayed English with the German pack installed
+    // (2026-10-11). KL_LOCALE_DEVICE=1 turns it on for any game, =0 off.
+    // It is on by default, too, for a title whose installation lists its
+    // language packs (kl_ovrplat_asset_files_configured: Deadpool VR picks its
+    // voice-over pack by this language); without such a list nothing changes.
+    if (!env || !*env) {
+        static int from_device = -1;
+        if (from_device < 0) {
+            const char *t = kl_driver_target_name();
+            from_device = kl_env_on("KL_LOCALE_DEVICE", (t && strcmp(t, "wrath2") == 0) ||
+                                                        kl_ovrplat_asset_files_configured());
+        }
+        if (from_device) env = getenv("KL_DEVICE_LANG");
+    }
     if (!env || !*env || strncmp(env, "C", 2) == 0) return;
     // "en_US.UTF-8" -> "en" + "US"
     char buf[64];
@@ -559,6 +720,69 @@ static void klj_locale_parts(char *lang, size_t lang_sz, char *country, size_t c
 // AConfiguration_getLanguage out of native_app_glue.
 void kl_jni_locale_parts(char *lang, size_t lang_sz, char *country, size_t country_sz) {
     klj_locale_parts(lang, lang_sz, country, country_sz);
+    // Said once, where the platform calls are traced (KL_PLAT_TRACE): the
+    // language the guest is told, and where it came from.
+    // Once in every boot log, so the language a game was told can be read
+    // without a trace run (the start window's choice: KleptonLanguage).
+    static int told;
+    if (!told) {
+        told = 1;
+        const char *dl = getenv("KL_DEVICE_LANG"), *ld = getenv("KL_LOCALE_DEVICE");
+        fprintf(stderr, "  [jni] locale told to the guest: %s_%s (KL_LOCALE_DEVICE=%s, KL_DEVICE_LANG=%s)\n",
+                lang, country, ld ? ld : "(unset)", dl ? dl : "(unset)");
+    }
+    static int said;
+    if (!said && kl_ovrplat_trace_on()) {
+        said = 1;
+        const char *host = getenv("LANG"), *dev = getenv("KL_DEVICE_LANG");
+        fprintf(stderr, "  [plat-trace] locale -> %s_%s (LANG=%s, KL_DEVICE_LANG=%s, KL_LOCALE_DEVICE=%s)\n",
+                lang, country, host ? host : "(unset)", dev ? dev : "(unset)",
+                getenv("KL_LOCALE_DEVICE") ? getenv("KL_LOCALE_DEVICE") : "(unset)");
+    }
+}
+
+// A Locale object carries its own two parts rather than deferring to the host
+// every time. The guest can build one (`new Locale("en","US")`,
+// `Locale.forLanguageTag`) and it must then describe THAT locale, not the
+// machine's — while `getDefault()` keeps describing the machine. One payload,
+// tagged by its destructor so a jclass or any other object is never mistaken
+// for a Locale, is what lets both be true through the same accessors.
+typedef struct { char lang[16], country[16]; } klj_locale;
+
+static void klj_locale_free(void *p) { free(p); }
+
+static klj_locale *klj_locale_payload(void *self) {
+    klj_object *o = self ? klj_as_object(self) : NULL;
+    // The destructor is the tag. klj_object.data means something different for
+    // every class (a klj_class* for java/lang/Class, a char* for a String), so
+    // reading it on identity alone is how a static call through the jclass turns
+    // into a wild pointer.
+    return (o && o->destroy == klj_locale_free) ? (klj_locale *)o->data : NULL;
+}
+
+static void *klj_locale_new(const char *lang, const char *country) {
+    void *obj = kl_jni_new_object("java/util/Locale");
+    if (!obj) return NULL;
+    klj_locale *l = calloc(1, sizeof *l);
+    if (!l) return obj;
+    snprintf(l->lang,    sizeof l->lang,    "%s", lang    ? lang    : "");
+    snprintf(l->country, sizeof l->country, "%s", country ? country : "");
+    klj_as_object(obj)->data    = l;
+    klj_as_object(obj)->destroy = klj_locale_free;
+    return obj;
+}
+
+// The two parts of whichever Locale is being asked about: the receiver's own if
+// it has them, the host's otherwise. The fallback is what makes a static call
+// and a call on the default Locale agree.
+static void klj_locale_read(void *self, char *lang, size_t ls, char *country, size_t cs) {
+    const klj_locale *l = klj_locale_payload(self);
+    if (l) {
+        snprintf(lang, ls, "%s", l->lang);
+        snprintf(country, cs, "%s", l->country);
+        return;
+    }
+    klj_locale_parts(lang, ls, country, cs);
 }
 
 static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, int n) {
@@ -567,7 +791,7 @@ static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, in
     if (!locale) {
         char lang[16], country[16];
         klj_locale_parts(lang, sizeof lang, country, sizeof country);
-        locale = kl_jni_new_object("java/util/Locale");
+        locale = klj_locale_new(lang, country);
         // PINNED, because the cache outlives the read. The object is handed
         // out again on every later
         // call, but the guest is entitled to retire the reference it was given:
@@ -628,17 +852,38 @@ static klj_val klj_LocaleList_get(void *env, void *self, const klj_val *a, int n
 }
 
 static klj_val klj_Locale_getLanguage(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
+    (void)env; (void)a; (void)n;
     char lang[16], country[16];
-    klj_locale_parts(lang, sizeof lang, country, sizeof country);
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
     return (klj_val){.l = kl_jni_new_string(lang)};
 }
 
 static klj_val klj_Locale_getCountry(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
+    (void)env; (void)a; (void)n;
     char lang[16], country[16];
-    klj_locale_parts(lang, sizeof lang, country, sizeof country);
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
     return (klj_val){.l = kl_jni_new_string(country)};
+}
+
+// Locale.toString() — the UNDERSCORE form, "en_US". This is not a cosmetic
+// difference from toLanguageTag() below and the two must not be swapped: it is
+// the string Unity's mscorlib parses to build CultureInfo.CurrentCulture. The
+// IL2CPP metadata's slash-spelled `java/util/Locale` sits beside
+// `java/lang/System` and `java/lang/reflect/Field`, i.e. in the BCL's own Android
+// interop block rather than in the game's — the culture bootstrap is
+// `Locale.getDefault().toString()`, and without it the boot aborts at the first
+// thing that touches a culture-sensitive format.
+//
+// Java omits the separator entirely when there is no region, rather than leaving
+// a trailing underscore, and mscorlib's parse depends on that.
+static klj_val klj_Locale_toString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char lang[16], country[16], out[40];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    if (*country) snprintf(out, sizeof out, "%s_%s", lang, country);
+    else          snprintf(out, sizeof out, "%s", lang);
+    KLJ_LOG("Locale.toString() -> %s", out);
+    return (klj_val){.l = kl_jni_new_string(out)};
 }
 
 // BCP 47, which is what Beat Saber 1.40 asks for where 1.28 read getLanguage()
@@ -647,13 +892,157 @@ static klj_val klj_Locale_getCountry(void *env, void *self, const klj_val *a, in
 // opinion about it. Java omits the region subtag entirely when there is none,
 // rather than leaving a trailing hyphen.
 static klj_val klj_Locale_toLanguageTag(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
+    (void)env; (void)a; (void)n;
     char lang[16], country[16], tag[40];
-    klj_locale_parts(lang, sizeof lang, country, sizeof country);
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
     if (*country) snprintf(tag, sizeof tag, "%s-%s", lang, country);
     else          snprintf(tag, sizeof tag, "%s", lang);
     KLJ_LOG("Locale.toLanguageTag() -> %s", tag);
     return (klj_val){.l = kl_jni_new_string(tag)};
+}
+
+// new Locale(lang), new Locale(lang, country), new Locale(lang, country, variant).
+// The variant is accepted and dropped, because getVariant() below reports "" for
+// every Locale we hand out and the two have to agree.
+static klj_val klj_Locale_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *lang    = n > 0 ? klj_str(a[0].l) : "";
+    const char *country = n > 1 ? klj_str(a[1].l) : "";
+    return (klj_val){.l = klj_locale_new(lang, country)};
+}
+
+// Locale.forLanguageTag("en-US"). The inverse of toLanguageTag: everything after
+// the first subtag separator that looks like a region is the region, and script
+// and extension subtags are dropped for the same reason getScript() answers "".
+static klj_val klj_Locale_forLanguageTag(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *tag = n > 0 ? klj_str(a[0].l) : "";
+    char lang[16] = "", country[16] = "", buf[64];
+    snprintf(buf, sizeof buf, "%s", tag ? tag : "");
+    char *dash = strchr(buf, '-');
+    if (!dash) dash = strchr(buf, '_');
+    if (dash) { *dash = 0; snprintf(country, sizeof country, "%s", dash + 1); }
+    snprintf(lang, sizeof lang, "%s", buf);
+    // A region subtag is two letters or three digits; anything else after the
+    // language is a script or a variant, which this Locale does not carry.
+    size_t cl = strlen(country);
+    if (cl != 2 && cl != 3) country[0] = 0;
+    KLJ_LOG("Locale.forLanguageTag(\"%s\") -> %s%s%s", tag ? tag : "", lang,
+            *country ? "_" : "", country);
+    return (klj_val){.l = klj_locale_new(lang, country)};
+}
+
+// The ISO 639-2 / ISO 3166-1 alpha-3 renderings. A table rather than a
+// computation because there is no rule connecting the two-letter and
+// three-letter forms — and a SHORT table, covering the languages a store build
+// of this shape ships, with the two-letter code and a log line for anything
+// else. That is the honest failure: the caller gets a code of the wrong width
+// and the log says which one was missing, instead of a plausible invention.
+static const char *klj_iso3(const char *code, const char *const *map, const char *kind) {
+    if (!code || !*code) return "";
+    for (const char *const *m = map; m[0]; m += 2)
+        if (strcmp(code, m[0]) == 0) return m[1];
+    KLJ_LOG("Locale: no ISO3 %s for \"%s\" — answering with the 2-letter code",
+            kind, code);
+    return code;
+}
+static klj_val klj_Locale_getISO3Language(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    static const char *const map[] = {
+        "en","eng", "de","deu", "fr","fra", "es","spa", "it","ita", "pt","por",
+        "ru","rus", "pl","pol", "nl","nld", "sv","swe", "da","dan", "fi","fin",
+        "no","nor", "cs","ces", "hu","hun", "tr","tur", "el","ell", "uk","ukr",
+        "ja","jpn", "ko","kor", "zh","zho", "th","tha", "vi","vie", "id","ind",
+        "ar","ara", NULL, NULL,
+    };
+    char lang[16], country[16];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    return (klj_val){.l = kl_jni_new_string(klj_iso3(lang, map, "language"))};
+}
+static klj_val klj_Locale_getISO3Country(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    static const char *const map[] = {
+        "US","USA", "GB","GBR", "DE","DEU", "FR","FRA", "ES","ESP", "IT","ITA",
+        "PT","PRT", "BR","BRA", "NL","NLD", "SE","SWE", "DK","DNK", "FI","FIN",
+        "NO","NOR", "PL","POL", "CZ","CZE", "HU","HUN", "TR","TUR", "GR","GRC",
+        "RU","RUS", "UA","UKR", "JP","JPN", "KR","KOR", "CN","CHN", "TW","TWN",
+        "TH","THA", "VN","VNM", "ID","IDN", "CA","CAN", "AU","AUS", "MX","MEX",
+        NULL, NULL,
+    };
+    char lang[16], country[16];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    return (klj_val){.l = kl_jni_new_string(klj_iso3(country, map, "country"))};
+}
+
+// getDisplayName / getDisplayLanguage / getDisplayCountry are the LOCALIZED,
+// human-readable names — "English (United States)" where getLanguage() answers
+// "en". Serving those properly means shipping CLDR, which is a whole ICU we do
+// not have; so these answer with the code, and say so once per call in the log.
+//
+// The code is a defensible answer rather than a stub: it is what Java itself
+// falls back to when it has no display name for a locale, so callers already
+// handle seeing a bare code, and any string that reaches a menu is at least
+// correct about WHICH locale it names. A launch that shows "en" in a language
+// picker is then a known, named cost rather than a mystery.
+static klj_val klj_Locale_getDisplayLanguage(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char lang[16], country[16];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    KLJ_LOG("Locale.getDisplayLanguage() -> \"%s\" (the code; no CLDR name table here)", lang);
+    return (klj_val){.l = kl_jni_new_string(lang)};
+}
+static klj_val klj_Locale_getDisplayCountry(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char lang[16], country[16];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    KLJ_LOG("Locale.getDisplayCountry() -> \"%s\" (the code; no CLDR name table here)", country);
+    return (klj_val){.l = kl_jni_new_string(country)};
+}
+static klj_val klj_Locale_getDisplayName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char lang[16], country[16], out[48];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    if (*country) snprintf(out, sizeof out, "%s (%s)", lang, country);
+    else          snprintf(out, sizeof out, "%s", lang);
+    KLJ_LOG("Locale.getDisplayName() -> \"%s\" (codes; no CLDR name table here)", out);
+    return (klj_val){.l = kl_jni_new_string(out)};
+}
+
+// A Locale here has a language and a region and nothing else — no variant, no
+// script — so these are "" by construction rather than by omission, and
+// forLanguageTag above drops exactly the subtags that would make them non-empty.
+static klj_val klj_Locale_empty_string(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("")};
+}
+
+// equals() compares the two parts rather than the handles: getDefault() hands
+// back one pinned singleton, but a guest that built its own `new Locale("en","US")`
+// is asking whether they describe the same locale, and they do.
+static klj_val klj_Locale_equals(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    char al[16], ac[16], bl[16], bc[16];
+    klj_locale_read(self, al, sizeof al, ac, sizeof ac);
+    void *other = n > 0 ? a[0].l : NULL;
+    // A payload is required on the OTHER side, not merely tolerated: without it
+    // klj_locale_read would fall back to the host default and have this Locale
+    // report equal to any object at all that happens to be handed in.
+    const klj_locale *ol = klj_locale_payload(other);
+    if (!ol) return (klj_val){.j = 0};
+    klj_locale_read(other, bl, sizeof bl, bc, sizeof bc);
+    return (klj_val){.j = (strcmp(al, bl) == 0 && strcmp(ac, bc) == 0) ? 1u : 0u};
+}
+
+// hashCode() over the same two parts, so equal Locales hash equal — the one
+// invariant a caller putting Locales in a HashMap depends on.
+static klj_val klj_Locale_hashCode(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char lang[16], country[16], buf[40];
+    klj_locale_read(self, lang, sizeof lang, country, sizeof country);
+    snprintf(buf, sizeof buf, "%s_%s", lang, country);
+    uint32_t h = 2166136261u;
+    for (const char *p = buf; *p; p++) { h ^= (unsigned char)*p; h *= 16777619u; }
+    return (klj_val){.j = (uint64_t)(int64_t)(int32_t)h};
 }
 
 // null means "this route is not presenting to a secondary display", which is the
@@ -965,7 +1354,7 @@ static const klj_kv *klj_manifest_metadata(void) {
                     "transcribed <meta-data>, which may not be this guest's",
                     g_assets_dir);
         }
-        bundle = klj_new_object_data("android/os/Bundle", (void *)kv);
+        bundle = klj_host_cache(klj_new_object_data("android/os/Bundle", (void *)kv));
     }
     return (klj_val){.l = bundle};
 }
@@ -1144,8 +1533,37 @@ static klj_val klj_PackageInfo_getLongVersionCode(void *env, void *self,
 }
 
 // PackageInfo, like ApplicationInfo, is read field-by-field.
+// Packages other than the guest itself (such as Meta Quest system packages like
+// com.oculus.shellenv or com.oculus.vrshell) are queried by games like Warplanes: WW1
+// Fighters to check the Quest system version (GetQuestSystemVersion). When handed the
+// guest's own versionCode/versionName instead, it sees version 4 (< minRequiredQuestSystemVersion)
+// and aborts loading on a black screen.
 static klj_val klj_PM_getPackageInfo(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
+    (void)env; (void)self;
+    const char *pkg = (n > 0 && a[0].l) ? klj_str(a[0].l) : NULL;
+    if (pkg && (strcmp(pkg, "com.oculus.shellenv") == 0 ||
+                strcmp(pkg, "com.oculus.vrshell") == 0 ||
+                strcmp(pkg, "com.oculus.systemux") == 0)) {
+        static void *shell_pi;
+        if (!shell_pi) {
+            shell_pi = kl_jni_new_object("android/content/pm/PackageInfo");
+            klj_as_object(shell_pi)->pinned = 1;
+            void *cls = klj_class_object("android/content/pm/PackageInfo");
+            void *jname = kl_jni_new_string("60.0.0.0");
+            klj_as_object(jname)->pinned = 1;
+            void *jpkg = kl_jni_new_string(pkg);
+            klj_as_object(jpkg)->pinned = 1;
+            klj_field_store(shell_pi, klj_want(cls, "versionName", "Ljava/lang/String;", 'f'),
+                            (klj_val){.l = jname});
+            klj_field_store(shell_pi, klj_want(cls, "versionCode", "I", 'f'),
+                            (klj_val){.j = 600000000});
+            klj_field_store(shell_pi, klj_want(cls, "packageName", "Ljava/lang/String;", 'f'),
+                            (klj_val){.l = jpkg});
+        }
+        KLJ_LOG("PackageManager.getPackageInfo(\"%s\") -> shell PackageInfo (versionName=60.0.0.0 versionCode=600000000)", pkg);
+        return (klj_val){.l = shell_pi};
+    }
+    KLJ_LOG("PackageManager.getPackageInfo(\"%s\") -> guest PackageInfo", pkg ? pkg : "");
     static void *pi;
     return klj_singleton("android/content/pm/PackageInfo", &pi);
 }
@@ -1191,6 +1609,110 @@ static klj_val klj_File_getParent(void *env, void *self, const klj_val *a, int n
     parent[len] = '\0';
     return (klj_val){.l = kl_jni_new_string(parent)};
 }
+// new File(parent, child) / File(path) / File(parentPath, child). Java creates
+// nothing on disk here, so neither does this — unlike klj_new_file, which is for
+// the directories the platform hands out and makes them exist. A null or empty
+// parent leaves the child as given, as Java's does.
+static void *klj_File_make(const char *parent, const char *child) {
+    char path[1024];
+    if (parent && *parent && child)
+        snprintf(path, sizeof path, "%s%s%s", parent,
+                 parent[strlen(parent) - 1] == '/' ? "" : "/", child);
+    else
+        snprintf(path, sizeof path, "%s", child ? child : (parent ? parent : ""));
+    void *obj = kl_jni_new_object("java/io/File");
+    klj_as_object(obj)->data = strdup(path);
+    return klj_own(obj, free);       // a guest makes these as it goes; the path goes with the object
+}
+static klj_val klj_File_init_file_str(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    klj_object *p = n > 0 ? klj_as_object(a[0].l) : NULL;
+    return (klj_val){.l = klj_File_make(p ? p->data : NULL, n > 1 ? klj_str(a[1].l) : NULL)};
+}
+static klj_val klj_File_init_str(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    return (klj_val){.l = klj_File_make(NULL, n > 0 ? klj_str(a[0].l) : NULL)};
+}
+static klj_val klj_File_init_str_str(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    return (klj_val){.l = klj_File_make(n > 0 ? klj_str(a[0].l) : NULL,
+                                        n > 1 ? klj_str(a[1].l) : NULL)};
+}
+// The java.io.File predicates, answered from the real filesystem through the
+// same guest-path mapping every libc call uses (the payload may be the short
+// /sdcard spelling). Meta's Avatar SDK (BRINK Traveler) probes canRead during
+// its init. A File with no path answers false, as Java's does for "".
+static int klj_File_access(void *self, int mode, int want_dir) {
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data || !*(const char *)o->data) return 0;
+    char kp[1024];
+    const char *p = kl_guest_path(o->data, kp, sizeof kp);
+    if (want_dir) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }
+    return access(p, mode) == 0;
+}
+static klj_val klj_File_exists(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n; return (klj_val){.j = klj_File_access(self, F_OK, 0)};
+}
+static klj_val klj_File_canRead(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n; return (klj_val){.j = klj_File_access(self, R_OK, 0)};
+}
+static klj_val klj_File_canWrite(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n; return (klj_val){.j = klj_File_access(self, W_OK, 0)};
+}
+static klj_val klj_File_isDirectory(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n; return (klj_val){.j = klj_File_access(self, 0, 1)};
+}
+// Firebase's embedded-file cache makes an old file writable, deletes it, then
+// marks its replacement read-only before writing through an already-open fd.
+// These are real filesystem operations, including their boolean failure result.
+static klj_val klj_File_delete(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data || !*(const char *)o->data) return (klj_val){.j = 0};
+    char kp[1024];
+    // remove unlinks a symlink itself and removes only empty directories.
+    return (klj_val){.j = remove(kl_guest_path(o->data, kp, sizeof kp)) == 0};
+}
+static int klj_File_permission(void *self, mode_t mask, int enable) {
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data || !*(const char *)o->data) return 0;
+    char kp[1024];
+    const char *path = kl_guest_path(o->data, kp, sizeof kp);
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    mode_t mode = st.st_mode & 07777;
+    return chmod(path, enable ? mode | mask : mode & ~mask) == 0;
+}
+static klj_val klj_File_setWritable(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    // The one-argument overload defaults to ownerOnly=true.
+    mode_t mask = n < 2 || a[1].j ? S_IWUSR : S_IWUSR | S_IWGRP | S_IWOTH;
+    return (klj_val){.j = klj_File_permission(self, mask, n > 0 && a[0].j)};
+}
+static klj_val klj_File_setReadOnly(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = klj_File_permission(self, S_IWUSR | S_IWGRP | S_IWOTH, 0)};
+}
+// mkdirs()/mkdir(): Java's contract is "true only if this call created it" —
+// false for a directory that was already there.
+static klj_val klj_File_mkdirs(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data || !*(const char *)o->data) return (klj_val){.j = 0};
+    char kp[1024];
+    const char *p = kl_guest_path(o->data, kp, sizeof kp);
+    struct stat st;
+    if (stat(p, &st) == 0) return (klj_val){.j = 0};
+    klj_mkdir_p(p);
+    return (klj_val){.j = stat(p, &st) == 0 && S_ISDIR(st.st_mode)};
+}
+static klj_val klj_File_mkdir(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data || !*(const char *)o->data) return (klj_val){.j = 0};
+    char kp[1024];
+    return (klj_val){.j = mkdir(kl_guest_path(o->data, kp, sizeof kp), 0755) == 0};
+}
 
 // getExternalFilesDir(type): type selects a subdirectory ("music", "pictures"),
 // and null means the root — which is what Unity passes.
@@ -1202,10 +1724,42 @@ static klj_val klj_Context_getExternalFilesDir(void *env, void *self, const klj_
     // container path): /sdcard maps to files_dir via kl_guest_path, so the two
     // resolve identically, but a guest that appends "/gamedata" then a FORTIFY'd
     // strcat into a 128-byte buffer (vicecity) overflows on the long form.
-    if (type && *type) snprintf(path, sizeof path, "/sdcard/files/%s", type);
+    //
+    // LES MILLS BODYCOMBAT (x4015163475201433) gets Android's own spelling,
+    // /sdcard/Android/data/<package>/files. It finds its Addressables content
+    // by walking up from Application.persistentDataPath — which is this
+    // directory — three levels, then appending obb/<package>
+    // (AddressablesUtils.GetAddressableLoadPath): on a Quest that is
+    // /sdcard/Android/obb/<package>, where the store's asset files are and
+    // where they are staged here. From /sdcard/files the third
+    // GetDirectoryName is null, Path.Combine throws, the catalogue path stays
+    // the literal "{...addressableLoadPath}/..." and every bundle fails to
+    // open. Other games keep the short form, so their saves do not move.
+    static int android_shape = -1;
+    if (android_shape < 0) {
+        const char *t = kl_driver_target_name();
+        android_shape = t && strcmp(t, "x4015163475201433") == 0;
+    }
+    if (android_shape) {
+        if (type && *type) snprintf(path, sizeof path, "/sdcard/Android/data/%s/files/%s", klj_guest_package(), type);
+        else               snprintf(path, sizeof path, "/sdcard/Android/data/%s/files", klj_guest_package());
+        char kp[1024];
+        klj_mkdir_p(kl_guest_path(path, kp, sizeof kp));
+    } else if (type && *type) snprintf(path, sizeof path, "/sdcard/files/%s", type);
     else               snprintf(path, sizeof path, "/sdcard/files");
     KLJ_LOG("getExternalFilesDir(%s) -> %s", type ? type : "null", path);
     return (klj_val){.l = klj_new_file(path)};
+}
+// getExternalFilesDirs(type): plural form of getExternalFilesDir(type), introduced in
+// Android 4.4 for multi-volume support. On a system with one external storage volume,
+// it returns a one-element array containing getExternalFilesDir(type).
+// DeoVR (x2382576078453818) calls this to inspect storage paths; without this binding
+// the call answers null, causing a NullReferenceException ("Error get SDCard path!").
+static klj_val klj_Context_getExternalFilesDirs(void *env, void *self, const klj_val *a, int n) {
+    klj_val single = klj_Context_getExternalFilesDir(env, self, a, n);
+    void *arr = klj_new_array('L', "java/io/File", 1);
+    ((void **)klj_arr(arr)->data)[0] = single.l;
+    return (klj_val){.l = arr};
 }
 static klj_val klj_Context_getFilesDir(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -1319,6 +1873,194 @@ static klj_val klj_Environment_getExternalStorageDirectory(void *env, void *self
     return (klj_val){.l = klj_new_file("/sdcard")};   // short form; see getExternalFilesDir
 }
 
+// The guest's writable data volume is the app container on this host.
+// Return its real directory so StatFs measures available storage accurately.
+static klj_val klj_Environment_getDataDirectory(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = klj_new_file(kl_jni_files_dir())};
+}
+
+// ---- android.os.StatFs ----
+//
+// "How much room is left?", asked the way every Android app asks it. Guests
+// reach this immediately after `getObbDir()` + `File.getAbsolutePath()` — the
+// classic before-first-run-unpack free space check — and a missing constructor
+// aborts the boot there.
+//
+// It is an OBJECT with per-instance state, like ZipFile and HandlerThread: the
+// path is fixed at construction and every getter reads the snapshot taken then
+// (Android's StatFs caches a `statfs()` too, which is exactly why it has a
+// `restat()`).
+//
+// The numbers are the HOST filesystem's, read through statvfs(). Nothing here
+// is a constant: the Vision Pro genuinely has the space, the guest is entitled
+// to a true answer, and a fabricated one is wrong in both directions — too
+// small aborts the unpack, too large lets it write until the real volume fills.
+//
+// Two details that are not obvious:
+//
+//   - The path is MAPPED. The guest may hand back a container path it got from
+//     getObbDir() (already ours, so kl_guest_path passes it through) or an
+//     Android-flavoured one like /sdcard/... — the same redirect every file
+//     call in this runtime goes through, so there is one mapper and not two.
+//   - statvfs() needs the path to EXIST. Android's StatFs throws
+//     IllegalArgumentException otherwise, and we have no exception state, so
+//     instead of failing we walk up to the nearest existing ancestor — which is
+//     on the same volume and therefore gives the same answer — and say so.
+//     The alternative is a zeroed StatFs, which reads as "disk full".
+typedef struct {
+    char           path[1024];   // the mapped path, as statted
+    struct statvfs st;
+    int            ok;
+} klj_statfs;
+
+static void klj_statfs_read(klj_statfs *s) {
+    // Nearest existing ancestor: same volume, same numbers, and never zero.
+    char probe[1024];
+    snprintf(probe, sizeof probe, "%s", s->path);
+    for (;;) {
+        if (statvfs(probe, &s->st) == 0) {
+            s->ok = 1;
+            if (strcmp(probe, s->path) != 0)
+                KLJ_LOG("StatFs(\"%s\") does not exist yet — measured its nearest "
+                        "existing ancestor %s, which is the same volume", s->path, probe);
+            return;
+        }
+        char *cut = strrchr(probe, '/');
+        if (!cut || cut == probe) break;
+        *cut = '\0';
+    }
+    s->ok = 0;
+    KLJ_LOG("StatFs(\"%s\"): statvfs failed all the way up (%s) — answering zeroes, "
+            "which the guest will read as a full disk", s->path, strerror(errno));
+    memset(&s->st, 0, sizeof s->st);
+}
+
+static klj_statfs *klj_statfs_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o ? o->data : NULL;
+}
+
+// f_frsize is the FRAGMENT size, which is what f_blocks/f_bfree/f_bavail are
+// counted in; f_bsize is the preferred I/O size and is NOT the multiplier.
+// Getting these two backwards is the classic statvfs bug, and on APFS they do
+// differ, so it would be off by a large factor rather than harmlessly.
+static uint64_t klj_statfs_unit(const klj_statfs *s) {
+    uint64_t u = s->st.f_frsize ? (uint64_t)s->st.f_frsize : (uint64_t)s->st.f_bsize;
+    return u ? u : 4096;
+}
+
+static klj_val klj_StatFs_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env;
+    const char *given = n > 0 ? klj_str(a[0].l) : NULL;
+    klj_statfs *s = calloc(1, sizeof *s);
+    if (!s) return (klj_val){.l = NULL};
+    char mapped[1024];
+    const char *p = given ? kl_guest_path(given, mapped, sizeof mapped) : kl_jni_files_dir();
+    snprintf(s->path, sizeof s->path, "%s", p ? p : "/");
+    klj_statfs_read(s);
+    if (s->ok)
+        KLJ_LOG("StatFs(\"%s\") -> %s: %llu bytes available of %llu (%llu-byte blocks)",
+                given ? given : "(null)", s->path,
+                (unsigned long long)((uint64_t)s->st.f_bavail * klj_statfs_unit(s)),
+                (unsigned long long)((uint64_t)s->st.f_blocks * klj_statfs_unit(s)),
+                (unsigned long long)klj_statfs_unit(s));
+    void *obj = kl_jni_new_object(klj_class_name(clazz));
+    klj_object *o = klj_as_object(obj);
+    if (!o) { free(s); return (klj_val){.l = NULL}; }
+    o->data = s;
+    o->destroy = free;
+    return (klj_val){.l = obj};
+}
+
+// API 17's restat(String) — re-reads, and may be handed a different path.
+static klj_val klj_StatFs_restat(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_statfs *s = klj_statfs_of(self);
+    if (!s) return (klj_val){.j = 0};
+    const char *given = n > 0 ? klj_str(a[0].l) : NULL;
+    if (given) {
+        char mapped[1024];
+        const char *p = kl_guest_path(given, mapped, sizeof mapped);
+        snprintf(s->path, sizeof s->path, "%s", p ? p : s->path);
+    }
+    klj_statfs_read(s);
+    return (klj_val){.j = 0};
+}
+
+static uint64_t klj_statfs_blocks(void *self, int which) {
+    klj_statfs *s = klj_statfs_of(self);
+    if (!s) return 0;
+    switch (which) {
+        case 0:  return (uint64_t)s->st.f_blocks;   // total
+        case 1:  return (uint64_t)s->st.f_bavail;   // available to an unprivileged app
+        default: return (uint64_t)s->st.f_bfree;    // free, including the root reserve
+    }
+}
+
+static klj_val klj_StatFs_getBlockSizeLong(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_statfs *s = klj_statfs_of(self);
+    return (klj_val){.j = s ? klj_statfs_unit(s) : 0};
+}
+static klj_val klj_StatFs_getBlockCountLong(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = klj_statfs_blocks(self, 0)};
+}
+static klj_val klj_StatFs_getAvailableBlocksLong(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = klj_statfs_blocks(self, 1)};
+}
+static klj_val klj_StatFs_getFreeBlocksLong(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = klj_statfs_blocks(self, 2)};
+}
+static klj_val klj_StatFs_getTotalBytes(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_statfs *s = klj_statfs_of(self);
+    return (klj_val){.j = s ? (uint64_t)s->st.f_blocks * klj_statfs_unit(s) : 0};
+}
+static klj_val klj_StatFs_getAvailableBytes(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_statfs *s = klj_statfs_of(self);
+    return (klj_val){.j = s ? (uint64_t)s->st.f_bavail * klj_statfs_unit(s) : 0};
+}
+static klj_val klj_StatFs_getFreeBytes(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_statfs *s = klj_statfs_of(self);
+    return (klj_val){.j = s ? (uint64_t)s->st.f_bfree * klj_statfs_unit(s) : 0};
+}
+
+// The DEPRECATED int forms, which are still what a lot of shipped code calls:
+// the Long variants only arrived in API 18, and Unity-era Java keeps reaching
+// for the int ones because they work everywhere. They are carried for the same
+// reason getObbDir and getObbDirs both are — one answer asked two ways, and the
+// guest picks which. Adding them costs four lines and saves a failed run.
+//
+// Android CLAMPS rather than wrapping (`(int) Math.min(x, Integer.MAX_VALUE)`),
+// and that matters: a large volume counted in small blocks overflows an int,
+// and a wrapped NEGATIVE block count reads as "disk full" to every caller.
+static kl_jint klj_statfs_clamp(uint64_t v) {
+    return (kl_jint)(v > 0x7fffffffull ? 0x7fffffffull : v);
+}
+static klj_val klj_StatFs_getBlockSize(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_statfs *s = klj_statfs_of(self);
+    return (klj_val){.j = (uint64_t)(int64_t)klj_statfs_clamp(s ? klj_statfs_unit(s) : 0)};
+}
+static klj_val klj_StatFs_getBlockCount(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)(int64_t)klj_statfs_clamp(klj_statfs_blocks(self, 0))};
+}
+static klj_val klj_StatFs_getAvailableBlocks(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)(int64_t)klj_statfs_clamp(klj_statfs_blocks(self, 1))};
+}
+static klj_val klj_StatFs_getFreeBlocks(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)(int64_t)klj_statfs_clamp(klj_statfs_blocks(self, 2))};
+}
+
 // MANAGE_EXTERNAL_STORAGE — "does this app hold unrestricted access to shared
 // storage?" — and the answer here is yes, because there is nothing to restrict.
 // The permission exists on Android to separate one app's files in shared
@@ -1346,8 +2088,8 @@ static klj_val klj_Environment_getExternalStorageDirectory(void *env, void *self
 // without this call is for AskForManageStoragePermission() to THROW, which is
 // how the guest recognises a device with no all-files-access settings screen
 // (`m_FolderPermissionOverride = true`). Serving that arm means an
-// ActivityNotFoundException we cannot raise — our JNI has no exception state
-// (klj_ExceptionCheck is 0 forever) — plus Uri.fromParts, an
+// ActivityNotFoundException — which could be raised since klj_raise exists
+// (kl_jni.c), and was not when this was written — plus Uri.fromParts, an
 // Intent(String, Uri) constructor, addCategory and startActivity, i.e. four
 // fabricated answers about a Settings activity that does not exist here.
 // Answering the question we CAN answer truthfully forces none of them.
@@ -1458,9 +2200,22 @@ static void *klj_oculus_surface_created_native(void) {
         kl_image *img = kl_find_image("libOculusXRPlugin.so");
         if (img)
             fn = kl_sym(img, "Java_com_unity_oculus_OculusUnity_surfaceCreated");
+        // The plugin's 1.x line (Unity 2019.4 — Eye of the Temple) names the same
+        // private native initComplete(Surface): its OculusUnity.initOculus builds
+        // a SurfaceView on the UI thread and calls initComplete(holder.getSurface())
+        // from surfaceCreated. Same arguments, same job — the native turns the
+        // Surface into its window and lets the XR display start. Without it the
+        // plugin waits for a surface for good: the game runs and never submits a
+        // frame (no crash, 0 layers).
+        if (!fn && img) {
+            fn = kl_sym(img, "Java_com_unity_oculus_OculusUnity_initComplete");
+            if (fn)
+                fprintf(stderr, "  [jni] libOculusXRPlugin.so has the older initComplete(Surface) "
+                                "in place of surfaceCreated — calling that\n");
+        }
         if (!fn)
-            fprintf(stderr, "  [jni] no Java_com_unity_oculus_OculusUnity_surfaceCreated "
-                            "export in libOculusXRPlugin.so — surface setup skipped\n");
+            fprintf(stderr, "  [jni] no Java_com_unity_oculus_OculusUnity_surfaceCreated or "
+                            "_initComplete export in libOculusXRPlugin.so — surface setup skipped\n");
     }
     return fn;
 }
@@ -1542,7 +2297,7 @@ static klj_val klj_PlayAssetDelivery_missing(void *env, void *self, const klj_va
     return (klj_val){.j = 1};        // Play Core is absent — see above
 }
 
-static klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {
+klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *am;
     return klj_singleton("android/content/res/AssetManager", &am);
@@ -1612,6 +2367,43 @@ static const char *klj_stream_bytes(klj_stream *st) {
     free(st);
 }
 
+// Lines appended to the guest's boot.config as Unity reads it — the engine's
+// own switches, which on Android it takes from this file and nowhere else.
+//
+// Eye of the Temple (x5361030930653377, Unity 2019.4.36f1) and Shave & Stuff
+// (x7532973430077887) skin on the GPU
+// with a compute shader, because the ES 3.2 we describe makes Unity set its
+// compute capability from the version alone (MAX_COMPUTE_* are not consulted).
+// ANGLE's ES 3.0 context cannot compile one: "Shader Internal-Skinning.main:
+// GLSL compilation failed", and every skinned mesh is never drawn — the whip
+// works but is invisible. disable-gpu-skinning is a stock boot.config
+// parameter (registered beside gfx-enable-gfx-jobs) that selects CPU skinning.
+// LES MILLS BODYCOMBAT (x4015163475201433, Unity 2022.3) is the same case:
+// 24k "Internal-Skinning.compute: Kernel at index (15) is invalid" in one
+// session and no gloves in a level (on device, 2026-10-15).
+// Surviving Mars: Pioneer (x9863010250399155, Unity 2022.3.62f1) too:
+// "Compute shader (Internal-Skinning): Kernel (11) size exceeds device
+// limits", then "Kernel at index (11) is invalid" every frame, and only the
+// wrist gear of the player's hands drawn (on device, 2026-10-16).
+// KL_UNITY_BOOT_EXTRA="k=v;k=v" overrides the per-target default; "" for none.
+// ...and every Unity title under the profile for untested games (kl_driver.c).
+// boot.config is read before Unity picks its graphics API, so this cannot be
+// held to the GLES titles, where GPU skinning never compiles here; a Vulkan
+// title skins on the CPU too, at some CPU time, where its own would have run.
+static const char *klj_boot_config_extra(void) {
+    const char *t = kl_driver_target_name();
+    extern kl_guest_kind kl_driver_kind(void);
+    extern int kl_untested_profile(void);
+    const char *dflt = (t &&
+        (strcmp(t, "x5361030930653377") == 0 ||
+         strcmp(t, "x7532973430077887") == 0 ||
+         strcmp(t, "x4015163475201433") == 0 ||
+         strcmp(t, "x9863010250399155") == 0)) ||
+        (kl_untested_profile() && kl_driver_kind() == KL_GUEST_UNITY)
+        ? "disable-gpu-skinning=1" : "";
+    return kl_env_str("KL_UNITY_BOOT_EXTRA", dflt);
+}
+
 static klj_val klj_AssetManager_open(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     const char *rel = n > 0 ? klj_str(a[0].l) : NULL;
@@ -1623,14 +2415,25 @@ static klj_val klj_AssetManager_open(void *env, void *self, const klj_val *a, in
     KLJ_LOG("AssetManager.open(\"%s\") -> %s", rel, f ? path : "MISSING");
     if (!f) return (klj_val){.l = NULL};   // guest catches IOException
 
+    const char *extra = strcmp(rel, "bin/Data/boot.config") == 0
+        ? klj_boot_config_extra() : "";
+    size_t xlen = extra ? strlen(extra) : 0;
+
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     klj_stream *st = calloc(1, sizeof *st);
-    st->data = malloc((size_t)sz + 1);
+    st->data = malloc((size_t)sz + xlen + 2);
     st->len  = fread(st->data, 1, (size_t)sz, f);
     st->data[st->len] = '\0';
     fclose(f);
+    if (xlen) {
+        if (st->len && st->data[st->len - 1] != '\n') st->data[st->len++] = '\n';
+        for (size_t i = 0; i < xlen; i++)
+            st->data[st->len++] = extra[i] == ';' ? '\n' : extra[i];
+        st->data[st->len] = '\0';
+        KLJ_LOG("boot.config += \"%s\"", extra);
+    }
 
     void *obj = kl_jni_new_object("java/io/InputStream");
     klj_as_object(obj)->data = st;
@@ -1687,6 +2490,211 @@ static klj_val klj_SDLActivity_getAssetsList(void *env, void *self, const klj_va
 static int klj_delim_whole_input(const char *d) {
     return strcmp(d, "\\A") == 0 || strcmp(d, "\\z") == 0 || strcmp(d, "\\Z") == 0;
 }
+// (android.os.StatFs is further up, as taken over from rebelancap's 51780e0: it
+// measures the nearest existing directory and serves the int forms and restat
+// as well. Walkabout asks before it offers a course download.)
+
+// com.exitgames.photon.audioinaec.AudioInAEC — Photon Voice's Android microphone
+// (an AudioRecord with echo cancellation, in the APK's own smali). Walkabout
+// constructs one the moment a multiplayer room exists, and an unimplemented
+// GetMinBufferSize was the whole of "the room appears for a second and the game
+// crashes".
+//
+// What the Java class does, and so what this does: Start() opens the recorder
+// and remembers the DataCallback proxy; SetBuffer() hands over the short[] that
+// is one voice frame (Photon sizes it to its encoder frame, so no framing is
+// needed on its side); every time a frame is full, the samples go into that
+// array and DataCallback.OnData() is called, after which Photon copies the
+// array out (AndroidJNI.FromShortArray) and encodes it.
+//
+// The recorder is kl_audio's capture path — the same one Steam Link's voice
+// uses, VoiceProcessingIO, so Apple's echo cancellation stands in for the AEC
+// the Java class asked AcousticEchoCanceler for — and it exists only while the
+// start window's Microphone toggle is on. With it off, Start() answers false as
+// the class does on a device that will not give it a microphone: Photon logs
+// "AudioInAEC.Start returned false" and the room carries on without local voice.
+//
+// OnData is called from the frame pump on the game's own thread rather than
+// from the audio thread: a proxy call is managed code, and the frame pump is the
+// one seat where calling into the guest is known to be safe. Photon only queues
+// the frame there, so a frame arriving up to one game frame later costs latency,
+// not audio.
+static struct {
+    pthread_mutex_t lock;
+    void    *callback;          // the DataCallback proxy (pinned while running)
+    void    *buf;               // the short[] from SetBuffer (pinned)
+    int      running;
+    unsigned rate, ch;          // what Photon asked for
+    int16_t *acc;               // samples at rate/ch not yet delivered
+    size_t   acc_n, acc_cap;
+    double   pos;               // resampler phase, in input frames
+    int16_t  last[2];           // previous input frame, for the interpolation
+    unsigned long long frames_out;
+} g_aec = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static void klj_aec_pin(void *o, int on) {
+    klj_object *x = klj_as_object(o);
+    if (!x) return;
+    if (on) x->pinned++;
+    else if (x->pinned) x->pinned--;
+}
+
+static klj_val klj_AudioInAEC_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object("com/exitgames/photon/audioinaec/AudioInAEC")};
+}
+// AudioRecord.getMinBufferSize's shape: BYTES of 16-bit PCM, about 40 ms.
+static klj_val klj_AudioInAEC_GetMinBufferSize(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int rate = n > 0 ? (int)a[0].j : 48000, ch = n > 1 ? (int)a[1].j : 1;
+    if (rate <= 0) rate = 48000;
+    if (ch < 1 || ch > 2) ch = 1;
+    return (klj_val){.j = (uint64_t)(rate / 25 * ch * 2)};
+}
+// Start(Activity, DataCallback, int sampleRate, int channels, int bufferSize,
+//       boolean aec, boolean agc, boolean ns)
+static klj_val klj_AudioInAEC_Start(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    unsigned rate = n > 2 && (int)a[2].j > 0 ? (unsigned)a[2].j : 48000;
+    unsigned ch = n > 3 && (int)a[3].j == 2 ? 2u : 1u;
+    if (!kl_audio_mic_enabled()) {
+        KLJ_LOG("AudioInAEC.Start -> false (the microphone is off in the start window; "
+                "the guest continues without local voice)");
+        return (klj_val){.j = 0};
+    }
+    if (kl_audio_mic_open(rate, ch) != 0) {
+        KLJ_LOG("AudioInAEC.Start -> false (no capture device)");
+        return (klj_val){.j = 0};
+    }
+    pthread_mutex_lock(&g_aec.lock);
+    if (g_aec.callback) klj_aec_pin(g_aec.callback, 0);
+    g_aec.callback = n > 1 ? a[1].l : NULL;
+    klj_aec_pin(g_aec.callback, 1);
+    g_aec.rate = rate; g_aec.ch = ch;
+    g_aec.acc_n = 0; g_aec.pos = 0; g_aec.last[0] = g_aec.last[1] = 0;
+    g_aec.running = 1;
+    pthread_mutex_unlock(&g_aec.lock);
+    // Drop what the ring collected before Photon was listening.
+    int16_t junk[1024];
+    while (kl_audio_mic_read_i16(junk, (int)(sizeof junk / sizeof *junk / 2)) > 0) {}
+    KLJ_LOG("AudioInAEC.Start(%u Hz, %u ch, aec %d agc %d ns %d) -> true: capturing %u Hz/%u ch",
+            rate, ch, n > 5 ? (int)(a[5].j & 1) : -1, n > 6 ? (int)(a[6].j & 1) : -1,
+            n > 7 ? (int)(a[7].j & 1) : -1, kl_audio_mic_rate(), kl_audio_mic_channels());
+    return (klj_val){.j = 1};
+}
+static klj_val klj_AudioInAEC_SetBuffer(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_array *arr = n > 0 ? klj_arr(a[0].l) : NULL;
+    if (!arr || arr->kind != 'S' || arr->len <= 0) {
+        KLJ_LOG("AudioInAEC.SetBuffer: not a short[] — refused");
+        return (klj_val){.j = 0};
+    }
+    pthread_mutex_lock(&g_aec.lock);
+    if (g_aec.buf) klj_aec_pin(g_aec.buf, 0);
+    g_aec.buf = a[0].l;
+    klj_aec_pin(g_aec.buf, 1);
+    pthread_mutex_unlock(&g_aec.lock);
+    KLJ_LOG("AudioInAEC.SetBuffer: %d samples a frame", arr->len);
+    return (klj_val){.j = 1};
+}
+static klj_val klj_AudioInAEC_Stop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    pthread_mutex_lock(&g_aec.lock);
+    int was = g_aec.running;
+    g_aec.running = 0;
+    if (g_aec.callback) { klj_aec_pin(g_aec.callback, 0); g_aec.callback = NULL; }
+    if (g_aec.buf) { klj_aec_pin(g_aec.buf, 0); g_aec.buf = NULL; }
+    g_aec.acc_n = 0;
+    pthread_mutex_unlock(&g_aec.lock);
+    if (was) {
+        kl_audio_mic_close();
+        KLJ_LOG("AudioInAEC.Stop: %llu frames delivered", g_aec.frames_out);
+    }
+    return (klj_val){.j = 1};
+}
+static klj_val klj_AudioInAEC_GetSampleRate(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = g_aec.running ? g_aec.rate : 0};
+}
+static klj_val klj_AudioInAEC_false(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+// The capture unit's samples, as Photon asked for them: channels folded or
+// doubled, then linear resampling (the unit usually runs at the hardware's
+// 48 kHz, which is also what Photon asks for, and then this is a copy).
+static void klj_aec_take(const int16_t *in, int frames, unsigned in_ch, unsigned in_rate) {
+    if (frames <= 0 || !in_rate) return;
+    double step = (double)in_rate / (double)g_aec.rate;
+    size_t need = g_aec.acc_n + (size_t)((double)frames / step + 2) * g_aec.ch;
+    if (need > g_aec.acc_cap) {
+        size_t cap = need * 2;
+        int16_t *p = realloc(g_aec.acc, cap * sizeof *p);
+        if (!p) return;
+        g_aec.acc = p; g_aec.acc_cap = cap;
+    }
+    for (int f = 0; f < frames; f++) {
+        int16_t cur[2];
+        if (in_ch == 1) cur[0] = cur[1] = in[f];
+        else { cur[0] = in[f * in_ch]; cur[1] = in[f * in_ch + 1]; }
+        // Emit every output frame whose position lies between last and cur.
+        while (g_aec.pos < 1.0) {
+            double t = g_aec.pos;
+            int l = (int)(g_aec.last[0] + (cur[0] - g_aec.last[0]) * t);
+            int r = (int)(g_aec.last[1] + (cur[1] - g_aec.last[1]) * t);
+            if (g_aec.ch == 1) g_aec.acc[g_aec.acc_n++] = (int16_t)((l + r) / 2);
+            else { g_aec.acc[g_aec.acc_n++] = (int16_t)l; g_aec.acc[g_aec.acc_n++] = (int16_t)r; }
+            g_aec.pos += step;
+        }
+        g_aec.pos -= 1.0;
+        g_aec.last[0] = cur[0]; g_aec.last[1] = cur[1];
+    }
+}
+
+void kl_jni_audioinaec_pump(void) {
+    if (!g_aec.running) return;
+    unsigned in_ch = kl_audio_mic_channels(), in_rate = kl_audio_mic_rate();
+    if (!in_ch || in_ch > 8) return;
+    int16_t tmp[4096];
+    int per = (int)(sizeof tmp / sizeof *tmp / in_ch);
+    pthread_mutex_lock(&g_aec.lock);
+    for (int got; (got = kl_audio_mic_read_i16(tmp, per)) > 0; )
+        klj_aec_take(tmp, got, in_ch, in_rate);
+    klj_array *arr = g_aec.buf ? klj_arr(g_aec.buf) : NULL;
+    void *cb = g_aec.callback;
+    size_t frame = arr ? (size_t)arr->len : 0;
+    // More than half a second behind (the game was paused, or loading) is not
+    // worth sending: keep only the newest frame's worth.
+    if (frame && g_aec.acc_n > (size_t)g_aec.rate * g_aec.ch / 2) {
+        size_t keep = g_aec.acc_n % frame + frame;
+        memmove(g_aec.acc, g_aec.acc + (g_aec.acc_n - keep), keep * sizeof *g_aec.acc);
+        g_aec.acc_n = keep;
+    }
+    while (arr && cb && frame && g_aec.acc_n >= frame) {
+        memcpy(arr->data, g_aec.acc, frame * sizeof(int16_t));
+        g_aec.acc_n -= frame;
+        memmove(g_aec.acc, g_aec.acc + frame, g_aec.acc_n * sizeof *g_aec.acc);
+        g_aec.frames_out++;
+        // Unlocked around the guest: OnData may call back into this class.
+        pthread_mutex_unlock(&g_aec.lock);
+        klj_proxy_invoke_named(cb, "com/exitgames/photon/audioinaec/AudioInAEC$DataCallback",
+                               "OnData", "()V");
+        pthread_mutex_lock(&g_aec.lock);
+        if (!g_aec.running || g_aec.buf == NULL) break;
+        arr = klj_arr(g_aec.buf);
+        cb = g_aec.callback;
+    }
+    if (g_aec.frames_out == 1 || (g_aec.frames_out && g_aec.frames_out % 3000 == 0)) {
+        static unsigned long long said;
+        if (said != g_aec.frames_out) {
+            said = g_aec.frames_out;
+            KLJ_LOG("AudioInAEC: %llu voice frames handed to Photon", g_aec.frames_out);
+        }
+    }
+    pthread_mutex_unlock(&g_aec.lock);
+}
+
 typedef struct { klj_stream *st; char delim[32]; } klj_scanner;
 
 static klj_val klj_Scanner_init(void *env, void *clazz, const klj_val *a, int n) {
@@ -1741,7 +2749,72 @@ static klj_val klj_Scanner_next(void *env, void *self, const klj_val *a, int n) 
     return (klj_val){.l = s};
 }
 
+// System.identityHashCode(Object) — the identity hash, i.e. "which object is
+// this". Unity caches this method id at UnityPlayer init and uses it to key its
+// own side table of proxies, so it must be stable for the lifetime of an object
+// and distinct between live objects; the handle we issued is exactly that, since
+// every jobject the guest holds is a klj_object we allocated.
+//
+// Java's is an int, so the pointer is folded rather than truncated: the low bits
+// of consecutive allocations are the ones that repeat, and a truncation would
+// collide two neighbours that a fold separates.
+static klj_val klj_System_identityHashCode(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    uintptr_t p = n > 0 ? (uintptr_t)a[0].l : 0;
+    uint32_t h = (uint32_t)(p ^ (p >> 32));
+    // Java never returns 0 for a live object; 0 is what a caller reads as "null".
+    if (!h && p) h = 1;
+    return (klj_val){.j = (uint64_t)(int64_t)(int32_t)h};
+}
+
+// com.oculus.metrics.MetricsService — OVRPlugin's door onto OVR Monitor, the
+// Quest-side performance capture service. It binds to a service exported by
+// com.oculus.ovrmonitormetricsservice, which is a Horizon OS component and is
+// not on this host; isServiceAvailable() answering false is the transcription of
+// that, not a refusal, and it is the branch the plugin's own code takes on a
+// device without the service installed.
+//
+// The rest are bound to match: bind/unbind/shutdown record and return (there is
+// nothing to bind to), the two debug-string setters report failure the same way
+// the real ones do when the service is absent, and getLatestEventJson answers
+// with the empty JSON object rather than null so a caller that parses it gets an
+// empty document instead of an exception.
+static klj_val klj_MetricsService_unavailable(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MetricsService_void(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("MetricsService: no OVR Monitor service on this host — recorded");
+    return (klj_val){.j = 0};
+}
+static klj_val klj_MetricsService_json(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("{}")};
+}
+
 const klj_binding klj_bind_services[] = {
+    {"java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I",
+                                                    klj_System_identityHashCode},
+
+    // com.oculus.metrics.MetricsService — OVR Monitor, absent on this host.
+    {"com/oculus/metrics/MetricsService", "isServiceAvailable",
+     "(Landroid/content/Context;)Z", klj_MetricsService_unavailable},
+    {"com/oculus/metrics/MetricsService", "isServiceAvailable",
+     "(Landroid/content/Context;I)Z", klj_MetricsService_unavailable},
+    {"com/oculus/metrics/MetricsService", "bind",
+     "(Landroid/content/Context;)V", klj_MetricsService_void},
+    {"com/oculus/metrics/MetricsService", "unbind",
+     "(Landroid/content/Context;)V", klj_MetricsService_void},
+    {"com/oculus/metrics/MetricsService", "shutdown",
+     "(Landroid/content/Context;)V", klj_MetricsService_void},
+    {"com/oculus/metrics/MetricsService", "setOverlayDebugString",
+     "(Landroid/content/Context;Ljava/lang/String;)Z", klj_MetricsService_unavailable},
+    {"com/oculus/metrics/MetricsService", "appendCsvDebugString",
+     "(Landroid/content/Context;Ljava/lang/String;)Z", klj_MetricsService_unavailable},
+    {"com/oculus/metrics/MetricsService", "getLatestEventJson",
+     "(Landroid/content/Context;)Ljava/lang/String;", klj_MetricsService_json},
+
     {"org/fmod/FmodAndroidAudioManager", "getInstance",
      "()Lorg/fmod/FmodAndroidAudioManager;",        klj_fmod_audio_manager},
     {"org/fmod/FmodAndroidAudioManager", "getBluetoothInputDeviceId", "()I",
@@ -1763,6 +2836,9 @@ const klj_binding klj_bind_services[] = {
     {"com/unity3d/player/UnityPlayer", "getNetworkConnectivity", "()I",
      klj_UnityPlayer_getNetworkConnectivity},
     {"io/sentry/Sentry", "close", "()V", klj_Sentry_close},
+    {"io/sentry/Sentry", "isEnabled", "()Z", klj_Sentry_isEnabled},
+    {"com/virtuix/omniconnectshared/OmniConnectSharedAndroid", "start",
+     "(Lcom/unity3d/player/UnityPlayerActivity;)V", klj_Omni_start},
     {"com/unity3d/player/JavaBroadcastReceiver", "setReceiver",
      "(Landroid/content/Context;Lcom/unity3d/player/JavaBroadcastReceiverInterface;"
      "[Ljava/lang/String;)V", klj_JavaBroadcastReceiver_setReceiver},
@@ -1782,6 +2858,7 @@ const klj_binding klj_bind_services[] = {
     {"java/lang/System", "currentTimeMillis", "()J", klj_System_currentTimeMillis},
     {"com/unity3d/player/UnityPlayer", "getNetworkProxySettings", "(Ljava/lang/String;)Ljava/lang/String;", klj_UnityPlayer_getNetworkProxySettings},
     {"com/unity3d/player/UnityPlayer", "addPhoneCallListener", "()V", klj_UnityPlayer_addPhoneCallListener},
+    {"com/unity3d/player/UnityPlayer", "setRunWithoutFocus", "(Z)V", klj_UnityPlayer_setRunWithoutFocus},
     {"java/lang/Class",  "getName",  "()Ljava/lang/String;", klj_Class_getName},
     // Unity builds this signature from Class.getName(), so it is spelled with
     // dots where a real JNI signature would have slashes. Matched as the string
@@ -1803,6 +2880,50 @@ const klj_binding klj_bind_services[] = {
     // it), so the ctor is a no-op and setExtra returns the builder for chaining.
     {"com/oculus/os/AnalyticsEvent", "<init>", "(Ljava/lang/String;)V", klj_void_noop},
     {"com/oculus/os/AnalyticsEvent", "setExtra", "(Ljava/lang/String;Ljava/lang/Object;)Lcom/oculus/os/AnalyticsEvent;", klj_AlertBuilder_self},
+    // Meta's app-metrics service. Sniper Elite VR binds its activity to it
+    // (static, through ReflectionHelper, so the signature is spelled with dots as
+    // OculusDeviceConfig's is) when a new game starts. There is no metrics
+    // service here, and binding to nothing is the honest no-op: the call returns
+    // void and the game carries on. Unimplemented, it stopped the run.
+    // Beat Saber 1.45's receiver for debug broadcasts — see registerReceiver in
+    // kl_jni_android.c. Nothing broadcasts here, so the callback is never used.
+    // It is unregistered when its scene goes: the first time after the language
+    // screen, where the missing entry ended the run (on device, 2026-10-12).
+    {"android/content/Context", "unregisterReceiver",
+     "(Lcom.beatgames.beatsaber.terminal.TerminalBroadcastReceiver;)V", klj_void_noop},
+    {"com/beatgames/beatsaber/terminal/TerminalBroadcastReceiver", "setCallback",
+     "(Lcom.beatgames.beatsaber.terminal.TerminalBroadcastReceiver$Callback;)V", klj_void_noop},
+    {"com/oculus/metrics/MetricsService", "bind", "(Lcom.unity3d.player.UnityPlayerActivity;)V", klj_void_noop},
+    // ...and the rest of that helper, which the same game calls as play begins.
+    // The boolean ones answer false ("nothing was recorded"), which is the truth
+    // with no service to record into.
+    {"com/oculus/metrics/MetricsService", "shutdown", "(Lcom.unity3d.player.UnityPlayerActivity;)V", klj_void_noop},
+    {"com/oculus/metrics/MetricsService", "appendCsvDebugString", "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z", klj_void_noop},
+    {"com/oculus/metrics/MetricsService", "setOverlayDebugString", "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Z", klj_void_noop},
+    // Vuplex 3D WebView's process-wide switches (see klj_Vuplex_setting). Static,
+    // through ReflectionHelper. Only the three Wooorld calls on its way to its
+    // first scene and Real VR Fishing's two; a web view itself
+    // (WebView3D.<init>) is not served, and isWebViewAvailable says so.
+    {"com/vuplex/webview/WebView3D", "setAlternativePointerInputSystemEnabled", "(Z)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "setAutoplayEnabled", "(Z)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "setDrmEnabled", "(Z)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "setRemoteDebuggingEnabled", "(Z)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "globallySetUserAgent", "(Ljava/lang/String;)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "globallySetUserAgent", "(Z)V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "resumeAll", "()V", klj_Vuplex_setting},
+    {"com/vuplex/webview/WebView3D", "isWebViewAvailable", "()Z", klj_Vuplex_isWebViewAvailable},
+    {"android/bluetooth/BluetoothAdapter", "getDefaultAdapter", "()Ljava/lang/Object;", klj_BluetoothAdapter_getDefaultAdapter},
+    // Real VR Fishing's Java audio bridge caches an encoded clip before the
+    // lobby begins. The native output path is loaded separately; accepting the
+    // cache hint is equivalent to a completed asynchronous preload and avoids
+    // making the optional Android-side cache a launch requirement.
+    {"com/qck/nativeaudiobridge/NativeAudioBridge", "PreloadAudio", "(Ljava/lang/String;[BIIZ)V", klj_void_noop},
+    // The Voice SDK's telemetry connection (see klj_VoiceLogger_getService):
+    // the fragment is an inert object, the service behind it is never bound.
+    {"com/oculus/assistant/api/unity/logging/UnityPlatformLoggerServiceFragment", "createAndAttach",
+     "(Lcom.unity3d.player.UnityPlayerActivity;Ljava/lang/String;)Ljava/lang/Object;", klj_View_new},
+    {"com/oculus/assistant/api/unity/logging/UnityPlatformLoggerServiceFragment", "getService",
+     "()Ljava/lang/Object;", klj_VoiceLogger_getService},
     {"android/os/Vibrator", "hasVibrator", "()Z", klj_Vibrator_hasVibrator},
     {"android/content/pm/PackageManager", "getInstallerPackageName", "(Ljava/lang/String;)Ljava/lang/String;", klj_PackageManager_getInstallerPackageName},
     {"android/content/res/Resources", "getSystem", "()Landroid/content/res/Resources;", klj_Resources_getSystem},
@@ -1810,10 +2931,39 @@ const klj_binding klj_bind_services[] = {
     {"android/content/res/Configuration", "getLocales", "()Landroid/os/LocaleList;", klj_Configuration_getLocales},
     {"android/os/LocaleList", "get", "(I)Ljava/util/Locale;", klj_LocaleList_get},
     {"android/os/LocaleList", "size", "()I", klj_LocaleList_size},
+    // java.util.Locale, read WHOLE rather than one method per launch. The class
+    // has no state a host can get wrong — a language and a region — so the
+    // whole public surface that reduces to those two is bound at once, and the
+    // three that do not (getDisplay*) are bound to the code with a log line
+    // saying so. A guest that dies on toString() with getDefault() already
+    // bound beside it is the shape this table exists to stop.
     {"java/util/Locale", "getDefault",  "()Ljava/util/Locale;",   klj_Locale_getDefault},
+    // Locale.getDefault(Locale.Category) — Java 7's per-category default. There
+    // is one default here, so both categories are it.
+    {"java/util/Locale", "getDefault",  "(Ljava/util/Locale$Category;)Ljava/util/Locale;",
+                                                                  klj_Locale_getDefault},
     {"java/util/Locale", "getLanguage", "()Ljava/lang/String;",   klj_Locale_getLanguage},
     {"java/util/Locale", "getCountry",  "()Ljava/lang/String;",   klj_Locale_getCountry},
+    {"java/util/Locale", "toString",    "()Ljava/lang/String;",   klj_Locale_toString},
     {"java/util/Locale", "toLanguageTag", "()Ljava/lang/String;", klj_Locale_toLanguageTag},
+    {"java/util/Locale", "forLanguageTag", "(Ljava/lang/String;)Ljava/util/Locale;",
+                                                                  klj_Locale_forLanguageTag},
+    {"java/util/Locale", "<init>", "(Ljava/lang/String;)V", klj_Locale_init},
+    {"java/util/Locale", "<init>", "(Ljava/lang/String;Ljava/lang/String;)V", klj_Locale_init},
+    {"java/util/Locale", "<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                                                                  klj_Locale_init},
+    {"java/util/Locale", "getISO3Language", "()Ljava/lang/String;", klj_Locale_getISO3Language},
+    {"java/util/Locale", "getISO3Country",  "()Ljava/lang/String;", klj_Locale_getISO3Country},
+    {"java/util/Locale", "getDisplayName",     "()Ljava/lang/String;", klj_Locale_getDisplayName},
+    {"java/util/Locale", "getDisplayName",     "(Ljava/util/Locale;)Ljava/lang/String;", klj_Locale_getDisplayName},
+    {"java/util/Locale", "getDisplayLanguage", "()Ljava/lang/String;", klj_Locale_getDisplayLanguage},
+    {"java/util/Locale", "getDisplayLanguage", "(Ljava/util/Locale;)Ljava/lang/String;", klj_Locale_getDisplayLanguage},
+    {"java/util/Locale", "getDisplayCountry",  "()Ljava/lang/String;", klj_Locale_getDisplayCountry},
+    {"java/util/Locale", "getDisplayCountry",  "(Ljava/util/Locale;)Ljava/lang/String;", klj_Locale_getDisplayCountry},
+    {"java/util/Locale", "getVariant", "()Ljava/lang/String;", klj_Locale_empty_string},
+    {"java/util/Locale", "getScript",  "()Ljava/lang/String;", klj_Locale_empty_string},
+    {"java/util/Locale", "equals",   "(Ljava/lang/Object;)Z", klj_Locale_equals},
+    {"java/util/Locale", "hashCode", "()I",                   klj_Locale_hashCode},
     {"android/media/MediaRouter$RouteInfo", "getPresentationDisplay", "()Landroid/view/Display;", klj_RouteInfo_getPresentationDisplay},
 
     {"android/app/AlertDialog$Builder", "<init>", "(Landroid/content/Context;)V", klj_AlertBuilder_init},
@@ -1858,6 +3008,7 @@ const klj_binding klj_bind_services[] = {
     {"org/libsdl/app/SDLActivity", "getAssets", "(Z)Landroid/content/res/AssetManager;", klj_Context_getAssets},
     {"org/libsdl/app/SDLActivity", "getAssetsList", "(ZLjava/lang/String;)[Ljava/lang/String;", klj_SDLActivity_getAssetsList},
     {"android/content/Context", "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;", klj_Context_getExternalFilesDir},
+    {"android/content/Context", "getExternalFilesDirs", "(Ljava/lang/String;)[Ljava/io/File;", klj_Context_getExternalFilesDirs},
     {"android/content/Context", "getFilesDir", "()Ljava/io/File;", klj_Context_getFilesDir},
     {"android/content/Context", "getCacheDir", "()Ljava/io/File;", klj_Context_getCacheDir},
     {"android/content/Context", "getExternalCacheDir", "()Ljava/io/File;",
@@ -1865,6 +3016,10 @@ const klj_binding klj_bind_services[] = {
     {"android/app/ActivityThread", "currentActivityThread", "()Landroid/app/ActivityThread;",
      klj_ActivityThread_current},
     {"android/app/ActivityThread", "getApplication", "()Landroid/app/Application;",
+     klj_ActivityThread_getApplication},
+    // The static shortcut to the same Application — Meta's Avatar SDK
+    // (libovravatar2, BRINK Traveler) asks this way right after its JNI_OnLoad.
+    {"android/app/ActivityThread", "currentApplication", "()Landroid/app/Application;",
      klj_ActivityThread_getApplication},
     {"android/app/ActivityThread", "getTopResumedActivity", "()Landroid/app/Activity;",
      klj_ActivityThread_getTopResumedActivity},
@@ -1889,13 +3044,44 @@ const klj_binding klj_bind_services[] = {
     // Unreal Engine 4's GameActivity — see klj_UE4_GetFontDirectory.
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetFontDirectory",
      "()Ljava/lang/String;", klj_UE4_GetFontDirectory},
+    {"android/os/Environment", "getDataDirectory", "()Ljava/io/File;", klj_Environment_getDataDirectory},
     {"android/os/Environment", "getExternalStorageState", "()Ljava/lang/String;", klj_Environment_getExternalStorageState},
     {"android/os/Environment", "getExternalStorageDirectory", "()Ljava/io/File;", klj_Environment_getExternalStorageDirectory},
     {"android/os/Environment", "isExternalStorageManager", "()Z", klj_Environment_isExternalStorageManager},
+    // android.os.StatFs — free space, measured rather than invented. See the
+    // implementation for why f_frsize is the multiplier and why the int forms
+    // are here alongside the Long ones.
+    {"android/os/StatFs", "<init>", "(Ljava/lang/String;)V", klj_StatFs_init},
+    {"android/os/StatFs", "restat", "(Ljava/lang/String;)V", klj_StatFs_restat},
+    {"android/os/StatFs", "getAvailableBytes", "()J", klj_StatFs_getAvailableBytes},
+    {"android/os/StatFs", "getFreeBytes",      "()J", klj_StatFs_getFreeBytes},
+    {"android/os/StatFs", "getTotalBytes",     "()J", klj_StatFs_getTotalBytes},
+    {"android/os/StatFs", "getBlockSizeLong",       "()J", klj_StatFs_getBlockSizeLong},
+    {"android/os/StatFs", "getBlockCountLong",      "()J", klj_StatFs_getBlockCountLong},
+    {"android/os/StatFs", "getAvailableBlocksLong", "()J", klj_StatFs_getAvailableBlocksLong},
+    {"android/os/StatFs", "getFreeBlocksLong",      "()J", klj_StatFs_getFreeBlocksLong},
+    {"android/os/StatFs", "getBlockSize",       "()I", klj_StatFs_getBlockSize},
+    {"android/os/StatFs", "getBlockCount",      "()I", klj_StatFs_getBlockCount},
+    {"android/os/StatFs", "getAvailableBlocks", "()I", klj_StatFs_getAvailableBlocks},
+    {"android/os/StatFs", "getFreeBlocks",      "()I", klj_StatFs_getFreeBlocks},
     {"java/io/File", "getAbsolutePath", "()Ljava/lang/String;", klj_File_getPath},
     {"java/io/File", "getPath",         "()Ljava/lang/String;", klj_File_getPath},
+    {"java/io/File", "toString",        "()Ljava/lang/String;", klj_File_getPath},   // Java: == getPath()
     {"java/io/File", "getCanonicalPath","()Ljava/lang/String;", klj_File_getPath},
     {"java/io/File", "getParent",       "()Ljava/lang/String;", klj_File_getParent},
+    {"java/io/File", "<init>", "(Ljava/io/File;Ljava/lang/String;)V",   klj_File_init_file_str},
+    {"java/io/File", "<init>", "(Ljava/lang/String;)V",                 klj_File_init_str},
+    {"java/io/File", "<init>", "(Ljava/lang/String;Ljava/lang/String;)V", klj_File_init_str_str},
+    {"java/io/File", "exists",          "()Z",                  klj_File_exists},
+    {"java/io/File", "canRead",         "()Z",                  klj_File_canRead},
+    {"java/io/File", "canWrite",        "()Z",                  klj_File_canWrite},
+    {"java/io/File", "isDirectory",     "()Z",                  klj_File_isDirectory},
+    {"java/io/File", "delete",          "()Z",                  klj_File_delete},
+    {"java/io/File", "setWritable",     "(Z)Z",                 klj_File_setWritable},
+    {"java/io/File", "setWritable",     "(ZZ)Z",                klj_File_setWritable},
+    {"java/io/File", "setReadOnly",     "()Z",                  klj_File_setReadOnly},
+    {"java/io/File", "mkdirs",          "()Z",                  klj_File_mkdirs},
+    {"java/io/File", "mkdir",           "()Z",                  klj_File_mkdir},
     {"android/content/res/AssetManager", "open", "(Ljava/lang/String;)Ljava/io/InputStream;", klj_AssetManager_open},
     {"com/unity3d/player/UnityPlayer", "initializeGoogleAr", "()Z", klj_UnityPlayer_initializeGoogleAr},
     {"com/unity/oculus/OculusUnity", "getIsOnOculusHardware", "()Z",
@@ -1931,11 +3117,34 @@ const klj_binding klj_bind_services[] = {
     {"android/os/Bundle", "getInt",     "(Ljava/lang/String;I)I", klj_Bundle_getInt},
     {"android/os/Bundle", "containsKey","(Ljava/lang/String;)Z",  klj_Bundle_containsKey},
 
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "<init>", "()V", klj_AudioInAEC_init},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "GetMinBufferSize", "(II)I", klj_AudioInAEC_GetMinBufferSize},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "Start",
+     "(Landroid/app/Activity;Lcom/exitgames/photon/audioinaec/AudioInAEC$DataCallback;IIIZZZ)Z",
+     klj_AudioInAEC_Start},
+    // ...and the spelling Unity's AndroidJavaObject reflection actually asks
+    // with: the CONCRETE argument classes, dotted (see kl_jni_display.c's
+    // hasUserAuthorizedPermission). The declared one above never matched it.
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "Start",
+     "(Lcom.unity3d.player.UnityPlayerActivity;Lcom.exitgames.photon.audioinaec.AudioInAEC$DataCallback;IIIZZZ)Z",
+     klj_AudioInAEC_Start},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "Stop",           "()Z",   klj_AudioInAEC_Stop},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "SetBuffer",      "([S)Z", klj_AudioInAEC_SetBuffer},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "GetSampleRate",  "()I",   klj_AudioInAEC_GetSampleRate},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "AECIsAvailable", "()Z",   klj_AudioInAEC_false},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "AGCIsAvailable", "()Z",   klj_AudioInAEC_false},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "NSIsAvailable",  "()Z",   klj_AudioInAEC_false},
+    {"com/exitgames/photon/audioinaec/AudioInAEC", "Reset",          "()V",   klj_void_noop},
     {"java/util/Scanner", "<init>",        "(Ljava/io/InputStream;Ljava/lang/String;)V", klj_Scanner_init},
     {"java/util/Scanner", "useDelimiter",  "(Ljava/lang/String;)Ljava/util/Scanner;",    klj_Scanner_useDelimiter},
     {"java/util/Scanner", "next",          "()Ljava/lang/String;",                       klj_Scanner_next},
 
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetAssetManager",
+     "()Landroid/content/res/AssetManager;", klj_Context_getAssets},
+    // FMOD's Java helper hands its native side the AssetManager to read banks
+    // from file:///android_asset (Max Mustard). The same single manager as
+    // Context.getAssets — AAssetManager_fromJava maps any of them to one tree.
+    {"org/fmod/FMOD", "getAssetManager",
      "()Landroid/content/res/AssetManager;", klj_Context_getAssets},
 
     // android.media.MediaPlayer — GTA Vice City's intro/cutscene movie audio,

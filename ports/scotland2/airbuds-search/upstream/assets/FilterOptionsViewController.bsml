@@ -1,0 +1,25 @@
+<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+    xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+
+    <vertical pref-width="50">
+        <horizontal>
+            <dropdown-list-setting id="difficultyDropdown_" text="Difficulty" choices="dropdownOptionsDifficulties_" value="selectedDifficultyString_" bind-value="true" apply-on-change="true" on-change="onFilterChanged"/>
+        </horizontal>
+
+        <vertical pad-top="1" spacing="0.6" horizontal-fit="Unconstrained">
+            <text text="My friends" font-size="3.2" align="MidlineLeft"/>
+            <vertical horizontal-fit="Unconstrained" pad-right="4" pref-height="40">
+                <list id="friendsListView_" select-cell="onFriendSelected" show-scrollbar="true" list-width="24"/>
+            </vertical>
+            <text id="friendsStatusTextView_" font-size="2.5" color="grey" align="Center" active="false"/>
+            <button id="backToMyHistoryButton_" text="Back to my history" on-click="onBackToMyHistoryButtonClicked" pref-height="5" active="false"/>
+        </vertical>
+
+        <vertical flex-height="100">
+            <!-- Dummy -->
+        </vertical>
+    </vertical>
+
+
+
+</bg>

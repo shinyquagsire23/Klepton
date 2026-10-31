@@ -1,0 +1,6 @@
+﻿<horizontal child-expand-width='false' child-align='MiddleLeft' spacing='2'>
+	<clickable-text id='includeButton' font-size='3.5' on-click='IncludeGenre'/>
+	<horizontal child-expand-width='false'>
+		<clickable-text id='excludeButton' text='❌' font-size='3.5' align="Center" on-click='ExcludeGenre' hover-hint='Explicitly exclude any Map tagged with this Genre'/>
+	</horizontal>
+</horizontal>

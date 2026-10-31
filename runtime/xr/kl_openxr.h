@@ -46,6 +46,7 @@
 // unresolved-import report still works — see the note in kl_shim_lookup about
 // a gateway that can never say no.
 void *kl_openxr_lookup(const char *name);
+const char *kl_openxr_name(int i);      // the i-th name lookup answers for; NULL past the end
 
 // XR_KHR_android_surface_swapchain seam, reached from kl_ndk and kl_egl:
 //   - kl_xr_swapchain_for_surface: which surface-backed swapchain a
@@ -66,12 +67,21 @@ int   kl_xr_android_surface_present(void *swapchain);
 // runtime broker it needs. See the long note in kl_openxr.c.
 int   kl_openxr_claims(const char *soname);
 void *kl_openxr_dlopen(const char *soname);
+// Has the guest opened the loader by name (an Unreal guest on OpenXR does)?
+int   kl_openxr_in_use(void);
 int   kl_openxr_is_handle(const void *h);
 void *kl_openxr_sym(const char *name);
 
 // Which xr* the guest resolved and which it called — the work list, in the
 // shape kl_ovrp_report prints.
 void kl_openxr_report(FILE *f);
+
+// For OVRPlugin's ovrp_GetNativeOpenXRHandles / ovrp_GetOpenXRInstanceProcAddrFunc:
+// on Meta's OpenXR backend native plugins (the MR Utility Kit) ask OVRPlugin for
+// the guest's XrInstance, XrSession and xrGetInstanceProcAddr to make OpenXR
+// calls of their own. Handles: 0 until both exist.
+int   kl_openxr_native_handles(uint64_t *instance, uint64_t *session);
+void *kl_openxr_get_instance_proc_addr(void);
 
 // The reference-space algebra, checked with no session, no guest and no Steam
 // host. Returns non-zero if every invariant holds; `make xrspace`.
@@ -115,6 +125,11 @@ int kl_openxr_input_selftest(FILE *f);
 // should make the guest render against the last pose, not wedge it.
 void kl_openxr_set_frame_pacer(void (*wait)(void));
 
+// The dominant hand a SteamVR game set (IVRInput::SetDominantHand, through
+// xrizer): with the left, every binding that is not a pose is driven by the
+// other controller and reported as that controller's hand. Right is the start.
+void kl_openxr_set_dominant_hand(int left);
+
 // Capture the TOPMOST projection layer instead of the base one (layer 0).
 //
 // The compositor shows exactly one projection layer (kl_glfb draws one quad per
@@ -152,5 +167,24 @@ void kl_openxr_set_grip_tune(float grip_pitch_deg, float aim_pitch_deg,
                              const float pivot[3], const float pos[3]);
 void kl_openxr_grip_tune(float *grip_pitch_deg, float *aim_pitch_deg,
                          float pivot[3], float pos[3]);
+
+// Head prediction (KL_XR_PREDICT): OFF unless KL_XR_PREDICT=1. The visionOS
+// app's Advanced › Test switch "XR prediction" sets it (KleptonTestSwitches).
+//
+// It can be switched while a guest runs: a switch takes effect at the next
+// xrWaitFrame, never inside a frame — every pose entry point answers one
+// (frame, instant) with one head, and a frame half predicted and half not
+// would be the very swim the prediction cache exists to prevent. Lock-free on
+// this side (an atomic store), so any thread may call it. Only the self-test
+// does; the app no longer offers a live switch.
+void kl_openxr_set_predict(int on);
+// What the next frame will do: 1 predicts, 0 answers the latched head.
+int  kl_openxr_predict(void);
+
+// Live ARKit -> OpenXR 26-joint bridge. 8 floats per joint: xyz, xyzw, radius.
+// Valid[i] is an OpenXR XrSpaceLocationFlags value (0 or 0xF).
+// NULL/0 marks a hand temporarily untracked. Called by the visionOS render loop.
+void kl_openxr_set_hand_joints(int hand, const float *pose8,
+                              const uint32_t *valid, int count);
 
 #endif

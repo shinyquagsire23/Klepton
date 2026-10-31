@@ -45,6 +45,20 @@ int kl_ovrp_tracking_origin(void);
 void kl_ovrp_set_head_pose(float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
 
+// The room a guest's scene queries are answered with (KL_OVRP_SCENE_ROOM): the
+// planes the frontend has seen, in the same world space as the head pose.
+// kinds: 0 floor, 1 ceiling, 2 wall. m16: one column-major 4x4 per plane in the
+// scene convention (the plane in its local XY, +Z its normal). ext2: width and
+// height per plane, in metres. Each call replaces the whole set; any thread.
+void kl_ovrp_scene_planes(int count, const int *kinds, const float *m16, const float *ext2);
+// The room the start window measured (kl_room_box_planes, placed in ARKit's
+// world by the frontend), in the same form: preferred to the planes above.
+void kl_ovrp_scene_room_planes(int count, const int *kinds, const float *m16, const float *ext2);
+// Whether the frontend should run plane detection for this guest: it is given a
+// room (KL_OVRP_SCENE_ROOM) AND that room is to be measured (KL_OVRP_SCENE_PLANES,
+// off by default — the box around the head is the default room).
+int kl_ovrp_scene_wanted(void);
+
 // Date the NEXT head pose: the instant that pose IS ABOUT, on any monotonic
 // clock the frontend likes, as long as it is the same clock every time. On
 // visionOS that is the PRESENTATION TIME the device anchor was predicted to,
@@ -79,6 +93,52 @@ void kl_ovrp_get_head_pose(float *px, float *py, float *pz,
 // unsafe, only less useful: each call re-pins to the newest published pose.
 // KL_OVRP_LATCH=0 disables it and restores the live read.
 void kl_ovrp_frame_latch(void);
+
+// The pose-boundary gate for one pose per guest frame (kl_ovrp.c, "ONE POSE
+// PER GUEST FRAME"), as a host check: `make posebound`, in `make check`. It
+// drives the real entry points with the gameplay call pattern — the two
+// ovrp_Update2 steps of one frame carrying different frame indices, the
+// frontend publishing in between — and reads off it what the named case must
+// show. Returns 1 on pass.
+//
+// The boundary is read ONCE and the feature's state is per process, so a case
+// is a process: set the environment first, then call with the case it was set
+// for (a mismatch fails rather than testing something else). tests/t_posebound.c
+// does that.
+//
+//   CYCLE  the default: one head pose per ovrp_WaitToBeginFrame cycle, it is
+//          the one published when the cycle opened, the frame record carries
+//          it, and the eye transform is pinned with it.
+//   INDEX  ...with KL_OVRP_POSE_BOUNDARY=index: the same pattern SPLITS — two
+//          poses per cycle. Passing means the split was seen, i.e. that the
+//          measurement the CYCLE case passes on is able to fail.
+//   XR     a guest that never speaks OVRPlugin (kl_openxr): one-pose is not in
+//          force for a guest that never calls ovrp_WaitToBeginFrame — nothing
+//          frozen, the latch's pose and the live eye transform.
+//   MIXED  an OpenXR frame loop whose Meta SDK also calls ovrp_Update2(step 0,
+//          frameIdx 0) in mid-frame (Walkabout): the head read before and
+//          after that call is the latch's one pose, nothing frozen.
+enum {
+    KL_OVRP_POSEBOUND_CYCLE = 0,
+    KL_OVRP_POSEBOUND_INDEX,
+    KL_OVRP_POSEBOUND_XR,
+    KL_OVRP_POSEBOUND_MIXED,
+};
+int kl_ovrp_pose_boundary_selftest(FILE *f, int which);
+
+// The OVRPlugin version a game's own libOVRPlugin.so names (the profile for
+// untested games; kl_ovrp.c). 1 and the version in `out`, or 0.
+int kl_ovrp_guest_version_in(const char *path, char *out, size_t cap);
+
+// The host recentered (KleptonCompositor, after it has rebased the head and the
+// controllers): GetLocalTrackingSpaceRecenterCount moves on, for the titles
+// that read it (klovrp_recenter_count_on).
+void kl_ovrp_notify_recenter(void);
+
+// The enqueued-panel lifecycle under KL_OVRP_ENQ_RETIRE: a panel destroyed or no
+// longer submitted is taken down and cannot come back. 1 = passed. Host test
+// tests/t_ovrplayers.c; it needs KL_OVRP_ENQ_RETIRE=1 in the environment.
+int kl_ovrp_layer_lifecycle_selftest(void);
 
 // The frame clock, for a guest that owns its own frame loop — kl_openxr's
 // pacer, on the OVRPlugin side of the same question.
@@ -154,6 +214,28 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float qx, float qy, float qz, float qw,
                              float vx, float vy, float vz,
                              float avx, float avy, float avz);
+// Hand tracking for an OVRPlugin guest (kl_ovrp.c, kl_hands.c). Is it on for
+// this guest (KL_OVRP_HANDS, default per title)? 0 until the guest is known.
+int kl_ovrp_hand_tracking_on(void);
+// Space Atlas hand guide: 27 measured joints (81 floats) and pinch.
+// Frontend space; read-only snapshot, no UI hit test or input modification.
+// palm_up: left palm normal dotted with world up (right value is unused).
+int kl_ovrp_hand_guide(int hand, float *joints, float *pinch, float *palm_up);
+
+// One hand's 27 ARKit joints for this frame, in the order of kl_hands.h's
+// KLH_* (HandSkeleton.JointName order), each 7 floats: position x y z, then
+// orientation x y z w — the same world as kl_ovrp_set_hand_motion, predicted to
+// the frame's presentation time. `tracked` has bit i set for each joint ARKit
+// tracks. state: 0 the hand is not seen, 1 tracked (xf required), 2 the hand
+// holds a controller (Touch is the input until it is put down). Call before
+// kl_ovrp_set_hand_motion for the same hand: while the joints are tracked the
+// hand node is their wrist and the grip pose is ignored.
+void kl_ovrp_set_hand_joints(int hand, int state, const float *xf, uint32_t tracked);
+
+// Has a frontend ever published a head pose / this hand's pose (sticky)?
+int kl_ovrp_head_pose_published(void);
+int kl_ovrp_hand_pose_published(int hand);
+
 void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
                                   float index_trigger, float hand_trigger,
                                   float stick_x, float stick_y);
@@ -225,6 +307,11 @@ int kl_ovrp_haptics_pull(int hand, float *amplitude, float *seconds);
 // stage the guest is still drawing into.
 
 typedef struct {
+    int layer_plus_one, stage, slice, reserved;
+    float near_z, far_z, min_depth, max_depth;
+} kl_ovrp_depth_image;
+
+typedef struct {
     float    px, py, pz;          // head position, in the current tracking space
     float    qx, qy, qz, qw;      // head orientation
     // The frustum the guest was told to render this frame with, per eye:
@@ -290,6 +377,9 @@ typedef struct {
     // thread, and the two describe different frames whenever the guest is
     // decoupled, which is the design.
     int      viewport_of[2];
+    // Optional OpenXR depth, published after the same GPU fence as color.
+    // layer_plus_one == 0 means absent. Registry owns the native images.
+    kl_ovrp_depth_image depth[2];
     uint64_t serial;              // guest frame serial, 1-based; 0 = nothing recorded
     int      stage;               // the swapchain stage this frame drew into
     int      complete;            // has ovrp_EndFrame been seen for this serial?
@@ -308,6 +398,13 @@ int kl_ovrp_stage_render_pose(int stage, kl_ovrp_render_pose *out);
 // This is the stage a compositor should be sampling, and the only stage index
 // a caller has any business passing to the call above.
 int kl_ovrp_last_complete_stage(void);
+// KL_VK_FRAME_ASYNC: wait up to max_ms for a frame the GPU is still finishing
+// (1 filed, 0 none in flight, -1 gave up). For the compositor, just before it
+// takes the newest finished stage.
+int kl_ovrp_wait_inflight(double max_ms);
+// The budget KL_CP_LATE_WAIT_MS defaults to for this title (0 = no late wait):
+// the titles that have KL_VK_FRAME_ASYNC on by default.
+double kl_ovrp_late_wait_default_ms(void);
 
 // ---------------------------------------------------------------------------
 // The OTHER layers — what a compositor has to draw ON TOP of the eye picture
@@ -338,6 +435,12 @@ typedef struct {
     int   viewport[2][4];// per-eye {x, y, w, h} within that texture
     float pose[7];       // orientation xyzw then position xyz, tracking space
     float size[2];       // Quad: width and height in METRES
+    // Cylinder: the arc's LENGTH along the surface, the height and the radius,
+    // all in metres — ovrpLayerSubmitCylinder's ArcWidth, Height, Radius. The
+    // pose is the cylinder's centre (a point on its axis); the picture is on
+    // the part of the surface that faces -Z from there. All zero for any
+    // other shape, and for a cylinder whose submit could not be read.
+    float cyl[3];
     int   flags;         // ovrpLayerSubmitFlags, as submitted
     int   head_locked;   // the flag above, decoded — see kl_ovrp.c
     // Which eyes see this layer: 0 both, 1 left only, 2 right only. OpenXR's
@@ -356,6 +459,13 @@ typedef struct {
     // here, not into the swapchain image we handed out via GetLayerTexture2 — so
     // the compositor resolves THIS to an MTLTexture, or every panel is empty.
     unsigned long long tex;
+    // Equirect only: how much of the full turn the picture's width spans, as
+    // 2*pi over that angle (1 = the whole 360 degrees). 0 leaves it to the
+    // compositor's own default, which is what every layer filed before this
+    // field existed gets.
+    float eq_hscale;
+    int color_override;
+    float color_scale[4], color_offset[4];
 } kl_ovrp_overlay;
 
 // How many non-eye layers the guest submitted with its most recent frame, and
@@ -367,12 +477,34 @@ typedef struct {
 int kl_ovrp_overlay_count(void);
 int kl_ovrp_overlay_get(int i, kl_ovrp_overlay *out);
 
+// The loading screen of a guest that SAYS what it should show rather than
+// drawing it (Half-Life: Alyx; runtime/linux/kl_lx_interstitial.c has the
+// story). For a compositor to draw while the guest submits no eye picture.
+typedef struct {
+    int      phase;             // 0 nothing to show, 1 loading
+    unsigned generation;        // changes whenever anything below does
+    char     loading[64];       // "LOADING", in the game's language
+    char     chapter[128], map[128];
+    char     tip[512], description[512];
+    char     message[128];      // "Press Trigger To Start", once the level is ready
+} kl_interstitial;
+// Fills *out and returns the generation.
+int kl_interstitial_get(kl_interstitial *out);
+// The guest submitted an eye picture: a loading screen that is not asking for
+// the trigger is over (kl_lx_interstitial.c has the rest).
+void kl_interstitial_done(void);
+
 // 1 while the guest has a live Equirect loading layer (AC Nexus's video
 // skybox). The compositor plays the loading mp4 onto the equirect while this is
 // set, and shows the guest's eye picture once it clears. See kl_ovrp.c.
 int kl_loadingvideo_active(void);
 // The guest's LoadingScreen.stopUpdatingLoadingScreen() hook - hide the skybox.
 void kl_loadingvideo_stop(void);
+// The video the guest asked to play onto that layer (an Unreal title's
+// GameActivity.playVideo), as a host path; NULL or "" clears it. The getter
+// copies it out and returns a generation that changes with every set.
+void kl_loadingvideo_set_source(const char *host_path);
+unsigned kl_loadingvideo_source(char *out, int cap);
 
 // ...and the two calls that FILE those records for a guest that does not speak
 // OVRPlugin at all.
@@ -414,6 +546,11 @@ void kl_loadingvideo_stop(void);
 // knob.
 void kl_ovrp_frame_begin_external(void);
 void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8);
+// ...and its two halves (see kl_ovrp.c): close the record now, file it later.
+// `prepare` answers 1 when there is a record to file.
+int  kl_ovrp_frame_end_prepare(int stage, const float *pose7, const float *tan8,
+                               kl_ovrp_render_pose *out);
+void kl_ovrp_frame_end_commit(const kl_ovrp_render_pose *rec);
 
 // ...and the same for the OTHER layers, which for an OpenXR guest is the whole
 // of `xrEndFrame`'s list that is not a projection layer.
@@ -471,6 +608,36 @@ typedef struct {
     // 1 when row 0 of the picture is its TOP — Vulkan and Metal — and 0 for one
     // GL drew. Same meaning and polarity as kl_ovrp_overlay.origin_top_left.
     int   origin_top_left;
+    // Which part of the texture IS the picture, per eye: {x0, y0, x1, y1} as
+    // fractions of the texture, measured from the picture's row 0 (the top for
+    // origin_top_left, the bottom otherwise). All zero means the whole texture,
+    // which is what every guest before Half-Life: Alyx submitted.
+    //
+    // OpenXR states it as subImage.imageRect and a guest is free to change it
+    // every frame. Source 2 does: its dynamic resolution renders into a corner
+    // of a fixed-size texture and names that corner (2688x2208 of 3648x2880 on
+    // a loaded frame), so a composite that reads the whole texture shows the
+    // picture squeezed into that corner with stale frames around it. A fraction
+    // rather than pixels for kl_ovrp_render_pose.viewport_of's reason.
+    float rect[2][4];
+    // The layer's XrCompositionLayerFlags as submitted. 0x2 (BLEND_TEXTURE_SOURCE_ALPHA)
+    // asks for it to be blended over the layers before it by its alpha, 0x4
+    // (UNPREMULTIPLIED_ALPHA) says that colour is not premultiplied. HITMAN 3 VR:
+    // Reloaded's second layer is its interface: transparent but for the menus,
+    // and composited opaque it covered the whole world with black (2026-10-20).
+    int   xr_flags;
+    // XR_FB_space_warp (moonshot s3-framegen): the motion vectors and depth the
+    // game drew for this layer's views, per eye — MTLTextures
+    // (kl_vulkan_xr_image_mtl), NULL where a view carries none — with the array
+    // slice of each and the part of the texture that holds them ({x0,y0,x1,y1}
+    // fractions, as `rect`; all zero = all of it). sw_planes = minDepth,
+    // maxDepth, nearZ, farZ as submitted; sw_delta = how the app space moved
+    // since the previous frame, {px,py,pz,qx,qy,qz,qw}.
+    void *sw_mv[2], *sw_depth[2];
+    int   sw_mv_slice[2], sw_depth_slice[2];
+    float sw_mv_rect[2][4];
+    float sw_planes[4];
+    float sw_delta[7];
 } kl_ovrp_proj_layer;
 
 // How many projection layers the guest's most recent frame submitted, and what
@@ -509,6 +676,44 @@ void kl_ovrp_proj_layers_external(const kl_ovrp_proj_layer *v, int n);
 // every OpenXR guest that submits a projection layer every frame) is unchanged.
 void kl_ovrp_eye_layer_external(int submitted);
 int  kl_ovrp_eye_layer_live(void);
+// Black behind the quads of a frame that has no eye picture (kl_ovrp.c).
+void kl_ovrp_set_eyeless_black(int on);
+int  kl_ovrp_eyeless_black(void);
+// 1 while the guest's frames carry a passthrough layer (kl_ovrp.c, "Insight
+// Passthrough"): the room is meant to show wherever the frame has no picture,
+// so no black goes behind it — neither the one above nor the mixed space's.
+int  kl_ovrp_passthrough_live(void);
+// The play area the start window's room measuring is using, its extent across
+// the floor in metres (KleptonBoundary, when it takes a room or the stationary
+// circle). From then on the Guardian answers report it (kl_ovrp.c,
+// KL_OVRP_BOUNDARY) instead of the fixed default.
+void kl_ovrp_set_play_area(float width, float depth);
+
+// The same bookkeeping for a guest on Meta's OpenXR backend, which files its
+// passthrough layer through ovrp_EnqueueSubmitLayer2 but ends its frames with
+// xrEndFrame rather than ovrp_EndFrame4. Called by kl_openxr once per frame.
+void kl_ovrp_openxr_frame_end(void);
+
+// Hands one OpenXR event (an XrEventDataBuffer) to every handler the guest
+// registered through ovrp_RegisterOpenXREventHandler. Called by kl_openxr's
+// xrPollEvent for each event it delivers.
+void kl_ovrp_dispatch_openxr_event(void *event);
+
+// The emulated room (KL_OVRP_SCENE_ROOM), for kl_openxr's scene entry points.
+// Index 0 the room, 1 floor, 2 ceiling, 3.. walls; components are
+// XrSpaceComponentTypeFB numbers. kl_ovrp_room_prepare builds the room (anew
+// when asked to, as a discovery of rooms does) and returns how many anchors.
+int  kl_ovrp_room_on(void);
+int  kl_ovrp_room_prepare(int rebuild);
+int  kl_ovrp_room_count(void);
+void kl_ovrp_room_uuid(int i, unsigned char out[16]);
+int  kl_ovrp_room_index_of_uuid(const unsigned char u[16]);
+int  kl_ovrp_room_has(int i, int comp);
+const char *kl_ovrp_room_label(int i);
+void kl_ovrp_room_extent(int i, float *x, float *y);
+int  kl_ovrp_room_locatable(int i);
+void kl_ovrp_room_set_locatable(int i, int on);
+void kl_ovrp_room_pose(int i, float q[4], float p[3]);
 
 // How many swapchain stages we tell the guest it has (KL_OVRP_STAGES). The
 // answer to ovrp_GetEyeTextureStageCount, so it bounds every (eye, stage) key
@@ -585,8 +790,8 @@ void kl_ovrp_set_display_frequency(float hz);
 void kl_ovrp_set_forced_hz_hint(float hz);
 
 // Battery telemetry, as one source of truth. The defaults are the Quest-2
-// fiction (95% / not charging) — on the host there is no battery. A visionOS
-// frontend that reads the real level off UIDevice pushes it through
+// fiction (95% / not charging) — on the host there is no battery. The visionOS
+// frontend reads the real level off UIDevice and pushes it through
 // kl_ovrp_set_battery_level, the same seam shape as
 // kl_ovrp_set_display_frequency, and BOTH the OVRPlugin query
 // (ovrp_GetSystemBatteryLevel2) and the Java BatteryManager answer
@@ -597,6 +802,18 @@ void kl_ovrp_set_battery_level(int level);     // 0..100, clamped
 int  kl_ovrp_battery_level(void);
 void kl_ovrp_set_battery_charging(int charging);
 int  kl_ovrp_battery_charging(void);
+// Per-hand controller batteries. `level == -1` means the platform/controller
+// did not provide a reading. `state` uses the small common vocabulary below so
+// the visionOS frontend does not leak a GameController enum into the runtime.
+enum {
+    KL_CONTROLLER_BATTERY_UNKNOWN = -1,
+    KL_CONTROLLER_BATTERY_DISCHARGING = 0,
+    KL_CONTROLLER_BATTERY_CHARGING = 1,
+    KL_CONTROLLER_BATTERY_FULL = 2,
+};
+void kl_ovrp_set_controller_battery(int hand, int level, int state);
+int  kl_ovrp_controller_battery_level(int hand);  // -1 or 0..100
+int  kl_ovrp_controller_battery_state(int hand);
 // ...and the third field of the same telemetry, in whole degrees Celsius. There
 // is no sensor here, so it is a nominal — but it is read through a getter for
 // the reason above: UE4's BatteryReceiver dispatches status, level and
@@ -645,7 +862,47 @@ float kl_ovrp_display_frequency(void);
 // it is one fewer rebuild, and each one used to leak a whole generation
 //.
 void kl_ovrp_set_eye_texture_size(int w, int h);
+// The cap on the longer axis a title is tuned for: 3072, or its own row in
+// kl_ovrp.c (4000 for Gun Club VR, ...); 0 is no cap (Forest - Oniri tech demo).
+// NULL asks for the running target.
+int kl_ovrp_title_eye_cap(const char *target);
+// "Max resolution per eye" from the start window: 0 is the title's cap, a
+// number of pixels replaces it, KL_OVRP_EYE_NATIVE takes the display's whole
+// request. Call before kl_ovrp_set_eye_texture_size; KL_OVRP_EYE_MAX wins.
+#define KL_OVRP_EYE_NATIVE (-1)
+// The eye layer's final size for the guest's own scale (ovrp_CalculateEyeLayerDesc*),
+// after KL_OVRP_EYE_DESC_CAP: what the swapchain really is.
+void kl_ovrp_eye_desc_size(float texture_scale, int *w, int *h);
+void kl_ovrp_set_eye_max_choice(int px);
+// The fraction of that size the guest is actually told, 0.4..1.0, applied after
+// the cap. Call before kl_ovrp_set_eye_texture_size; KL_OVRP_RENDER_SCALE
+// overrides it.
+void kl_ovrp_set_render_scale_default(float s);
 void kl_ovrp_eye_texture_size(int *w, int *h);
+// The render scale the CURRENT eye size carries (1.0 until
+// kl_ovrp_set_eye_texture_size has applied one) and the size it was taken
+// from — after the cap, before the scale and KL_OVRP_EYE_ALIGN. What the
+// compositor's MetalFX upscale restores to: the stored "Render resolution"
+// can be moved in the game at any time, but the guest keeps rendering at the
+// scale it was started with, so the setting is not the answer and this is.
+void kl_ovrp_eye_texture_scale(float *rs, int *full_w, int *full_h);
+// The same size reshaped for the cone the guest is actually TOLD. They differ
+// only under KL_OVRP_UNIFY_FRUSTUM, where both eyes get the union of the two
+// cones: that cone is wider than the one the display sized its texture for
+// (120 degrees against 105 on a Vision Pro), and the same width spread over it
+// is a picture ~27% coarser across than down. The area is kept — it is the
+// memory and the fill cost — and the shape follows the cone, so the pixels come
+// out square again. Identical to kl_ovrp_eye_texture_size when nothing is
+// unified.
+void kl_ovrp_eye_texture_size_for_cone(int *w, int *h);
+// The cone the DISPLAY has for this eye — left, right, top, bottom tangents, all
+// positive — as against the one the guest is told (kl_ovrp_eye_view), which is
+// wider under KL_OVRP_UNIFY_FRUSTUM. The difference is the part of the guest's
+// picture nobody can see: XR_KHR_visibility_mask is built from it.
+void kl_ovrp_eye_display_tangents(int eye, float tan[4]);
+// ...and the cone the GUEST is told for it, after KL_OVRP_UNIFY_FRUSTUM and
+// KL_OVRP_EYE_TAN_MAX — what its picture is rendered with. Same order.
+void kl_ovrp_eye_told_tangents(int eye, float tan[4]);
 
 // Do we tell the guest the two eyes may be ARRAY LAYERS of one texture rendered
 // in a single pass — Unity's Single Pass Instanced / Multiview? This is the one
@@ -659,6 +916,11 @@ void kl_ovrp_eye_texture_size(int *w, int *h);
 // Vulkan path it follows KL_OVRP_MULTIVIEW, because MoltenVK implements
 // VK_KHR_multiview and kl_vulkan.c can allocate the two-layer image.
 int kl_ovrp_multiview(void);
+// Whether this target is served the Array eye layout on GL (see kl_ovrp.c).
+int kl_ovrp_gl_array(void);
+// The same answer for a target named by the caller, uncached: kl_app.c's
+// shader-cache fingerprint asks before the driver knows its target.
+int kl_ovrp_gl_array_for(const char *target);
 
 // ---------------------------------------------------------------------------
 // The eye view, for a guest that is not OVRPlugin's
@@ -682,6 +944,18 @@ int kl_ovrp_multiview(void);
 void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz,
                       float *qx, float *qy, float *qz, float *qw,
                       float tangents[4]);
+
+// The frustum the guest is told for eye `eye` (0 = left, 1 = right): the same
+// tangents kl_ovrp_eye_view hands out, read without touching the pose latch.
+// out = left, right, top, bottom, all positive.
+void kl_ovrp_eye_tangents(int eye, float out[4]);
+
+// The frustum the guest's live eye layer DESCRIBES for eye `eye` (its
+// ovrpLayerDesc_EyeFov.Fov, l/r/t/b tangents, positive). Under symmetric
+// projection that is the union cone the eye was actually rendered with, which
+// is where its straight-ahead point sits in the (widened) eye image.
+// 0 when no eye layer carries one (OpenXR guests, before SetupLayer).
+int kl_ovrp_eye_layer_fov(int eye, float out[4]);
 
 // The head pose as the GUEST sees it — pinned for the duration of its frame by
 // kl_ovrp_frame_latch, and therefore NOT the same thing as

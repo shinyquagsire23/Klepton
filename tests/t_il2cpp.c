@@ -31,17 +31,18 @@ int main(int argc, char **argv) {
 
     void (*set_data_dir)(const char *)   = kl_sym(img, "il2cpp_set_data_dir");
     void (*set_config_dir)(const char *) = kl_sym(img, "il2cpp_set_config_dir");
-    void *(*il2cpp_init)(const char *)   = kl_sym(img, "il2cpp_init");
+    void (*il2cpp_init)(const char *)    = kl_sym(img, "il2cpp_init");
     void *(*domain_get)(void)            = kl_sym(img, "il2cpp_domain_get");
     void *(*get_assemblies)(void *, size_t *) = kl_sym(img, "il2cpp_domain_get_assemblies");
 
-    if (!il2cpp_init) { printf("  !! il2cpp_init not exported\n"); return 1; }
+    if (!il2cpp_init || !domain_get) { printf("  !! il2cpp_init/domain_get not exported\n"); return 1; }
     if (set_data_dir)   { printf("  il2cpp_set_data_dir(\"%s\")\n", data); set_data_dir(data); }
     if (set_config_dir) set_config_dir(data);
 
     printf("\n  calling il2cpp_init(\"klepton\")…\n"); fflush(stdout);
-    void *domain = il2cpp_init("klepton");
-    printf("  il2cpp_init returned %p\n", domain);
+    il2cpp_init("klepton");
+    void *domain = domain_get();
+    printf("  il2cpp_domain_get returned %p\n", domain);
     if (!domain) { printf("  !! il2cpp_init failed\n"); return 1; }
 
     if (domain_get) printf("  il2cpp_domain_get() = %p\n", domain_get());

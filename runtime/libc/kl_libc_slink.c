@@ -38,6 +38,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <math.h>
+#include <malloc/malloc.h>
 #include <pthread.h>
 #include <wchar.h>
 #include "klepton.h"
@@ -48,6 +49,7 @@ int   kl_open_flags(int linux_flags);       // kl_libc.c
 ssize_t kl_shim_read(int fd, void *buf, size_t n);  // kl_shim.c
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
 void  kl_fatal_prepare(void);
+void  kl_errno_set(int darwin_errno);    // kl_libc.c
 
 #include "../guest/kl_obbmap.h"
 #define GUEST_PATH(p) char _kp[1024]; const char *_p = kl_guest_path((p), _kp, sizeof _kp)
@@ -545,7 +547,9 @@ static ssize_t klb_pread_full(int fd, void *buf, size_t n, off_t off) {
         if (r > 0) { done += (size_t)r; continue; }
         if (r == 0) break;                       // EOF: a short read is the truth
         if (errno == EINTR) continue;
-        return done ? (ssize_t)done : -1;        // report the bytes that did move
+        if (done) return (ssize_t)done;          // report the bytes that did move
+        kl_errno_set(errno);                     // ...or the failure, as read does
+        return -1;
     }
     return (ssize_t)done;
 }
@@ -750,7 +754,9 @@ __attribute__((constructor)) static void kl_build_ctype(void) {
 // FORTIFY's write, the counterpart to __read_chk above.
 ssize_t klb___write_chk(int fd, const void *buf, size_t n, size_t cap) {
     if (n > cap) chk_fail("__write_chk", n, cap);
-    return write(fd, buf, n);
+    ssize_t r = write(fd, buf, n);
+    if (r < 0) kl_errno_set(errno);   // as the bare write (kl_shim_write)
+    return r;
 }
 
 // bionic's atfork registration, which libc++ and the pthread shims funnel
@@ -812,20 +818,28 @@ int   klb_fwide(void *f, int mode)         { return fwide(kl_host_file(f), mode)
 //
 // What is NOT reproduced is the 64-bit counter: eventfd accumulates, this
 // queues datagrams. eventfd_read below drains everything pending and sums it,
-// which matches for every use Qt makes of it. A guest using eventfd as a
-// SEMAPHORE (EFD_SEMAPHORE) would see different behaviour — none does, and the
-// flag is refused below rather than ignored.
+// which matches for every use Qt makes of it.
+//
+// EFD_SEMAPHORE (Valve's tier0: CThreadMultiWaitSemaphore, eventfd(0,
+// EFD_SEMAPHORE|EFD_CLOEXEC|EFD_NONBLOCK), fatal if refused) is where the
+// datagram queue is actually the RIGHT shape: a semaphore eventfd's read takes
+// ONE unit and answers 1, and a queue of datagrams each carrying 1 — what
+// Release() writes, 8 bytes of value 1 — hands out exactly one per read() and
+// stays readable while any are left. What it cannot do is split one write of
+// N>1 into N units; tier0 never writes anything but 1. The socket's buffers are
+// raised so a burst of releases does not fill Darwin's small datagram queue.
 #define LX_EFD_SEMAPHORE 1
 #define LX_EFD_CLOEXEC   0x80000
 #define LX_EFD_NONBLOCK  0x800
 
 int klb_eventfd(unsigned int initval, int flags) {
-    if (flags & LX_EFD_SEMAPHORE) {   // see above: we do not implement counting
-        errno = EINVAL;
-        return -1;
-    }
     int s = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (s < 0) return -1;
+    if (flags & LX_EFD_SEMAPHORE) {   // see above: one datagram per unit
+        int sz = 256 * 1024;
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
+    }
 
     // A name is needed only long enough to bind and connect; the connection
     // outlives the unlink, so nothing is left in the filesystem.
@@ -870,6 +884,80 @@ int klb_eventfd_read(int fd, uint64_t *value) {
 int klb_eventfd_write(int fd, uint64_t value) {
     ssize_t w = send(fd, &value, sizeof value, 0);
     return w == (ssize_t)sizeof value ? 0 : -1;
+}
+
+// timerfd_create / timerfd_settime — HITMAN 3 VR: Reloaded's HTTP manager
+// (ZHttpManagerQuest::InitAsyncIO) puts one beside its curl sockets in an epoll
+// set as curl's timeout clock, and the game aborted on the unresolved import
+// before its first frame (Mac run 2026-10-20). Darwin has no timerfd, so it is
+// the eventfd above — a self-connected datagram socket epoll (kqueue) sees as
+// readable — fed by a dispatch timer that sends one 8-byte count per expiry.
+// What is not reproduced: the accumulated counter (each expiry is its own
+// datagram, a read returns 1) and the clock choice (relative times on the
+// monotonic clock, TFD_TIMER_ABSTIME converted from CLOCK_MONOTONIC). The timer
+// writes through its own dup of the fd, so a guest close never makes it write
+// into a reused descriptor number; that dup and the timer stay until the
+// process ends — one per timerfd, and the one game that uses it makes one.
+#include <dispatch/dispatch.h>
+#include <time.h>
+#define LX_TFD_TIMER_ABSTIME 1
+typedef struct { struct timespec it_interval, it_value; } lx_itimerspec;   // same 32 bytes on both sides
+static struct { int fd, out; dispatch_source_t src; int resumed; lx_itimerspec cur; } g_tfd[16];
+static pthread_mutex_t g_tfd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void kl_tfd_fire(void *ctx) {
+    int i = (int)(intptr_t)ctx;
+    uint64_t one = 1;
+    send(g_tfd[i].out, &one, sizeof one, MSG_DONTWAIT);
+}
+
+int klb_timerfd_create(int clockid, int flags) {
+    (void)clockid;
+    // TFD_CLOEXEC and TFD_NONBLOCK are O_CLOEXEC and O_NONBLOCK, the eventfd flags' values.
+    int fd = klb_eventfd(0, flags & (LX_EFD_CLOEXEC | LX_EFD_NONBLOCK));
+    if (fd < 0) return -1;
+    pthread_mutex_lock(&g_tfd_lock);
+    int i;
+    for (i = 0; i < 16 && g_tfd[i].src; i++) {}
+    if (i < 16) { g_tfd[i].fd = fd; g_tfd[i].out = dup(fd); g_tfd[i].resumed = 0;
+                  memset(&g_tfd[i].cur, 0, sizeof g_tfd[i].cur);
+                  g_tfd[i].src = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                     dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+                  if (g_tfd[i].src) { dispatch_set_context(g_tfd[i].src, (void *)(intptr_t)i);
+                                      dispatch_source_set_event_handler_f(g_tfd[i].src, kl_tfd_fire); } }
+    pthread_mutex_unlock(&g_tfd_lock);
+    if (i == 16 || !g_tfd[i].src) { close(fd); errno = EMFILE; return -1; }
+    fprintf(stderr, "  [libc] timerfd_create -> fd %d (a datagram socket fed by a dispatch timer)\n", fd);
+    return fd;
+}
+
+int klb_timerfd_settime(int fd, int flags, const lx_itimerspec *nv, lx_itimerspec *old) {
+    if (!nv) { errno = EFAULT; return -1; }
+    pthread_mutex_lock(&g_tfd_lock);
+    int i;
+    for (i = 0; i < 16 && !(g_tfd[i].src && g_tfd[i].fd == fd); i++) {}
+    if (i == 16) { pthread_mutex_unlock(&g_tfd_lock); errno = EINVAL; return -1; }
+    if (old) *old = g_tfd[i].cur;
+    g_tfd[i].cur = *nv;
+    int64_t value = (int64_t)nv->it_value.tv_sec * 1000000000 + nv->it_value.tv_nsec;
+    int64_t every = (int64_t)nv->it_interval.tv_sec * 1000000000 + nv->it_interval.tv_nsec;
+    if (value > 0 && (flags & LX_TFD_TIMER_ABSTIME)) {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        value -= (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+        if (value < 1) value = 1;
+    }
+    // An interval of DISPATCH_TIME_FOREVER is libdispatch's one-shot; a start
+    // of FOREVER is a timer that never fires, i.e. disarmed. Re-arming is only
+    // set_timer again, so the source is resumed exactly once (a second resume
+    // is fatal in libdispatch).
+    if (value <= 0)
+        dispatch_source_set_timer(g_tfd[i].src, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+    else
+        dispatch_source_set_timer(g_tfd[i].src, dispatch_time(DISPATCH_TIME_NOW, value),
+                                  every > 0 ? (uint64_t)every : DISPATCH_TIME_FOREVER, 1000000);
+    if (!g_tfd[i].resumed) { g_tfd[i].resumed = 1; dispatch_resume(g_tfd[i].src); }
+    pthread_mutex_unlock(&g_tfd_lock);
+    return 0;
 }
 
 // ---- ppoll ----
@@ -918,7 +1006,9 @@ static int apply_linux_fd_flags(int fd, int flags) {
 }
 
 int klb_accept4(int s, struct sockaddr *addr, socklen_t *alen, int flags) {
-    return apply_linux_fd_flags(accept(s, addr, alen), flags);
+    int fd = accept(s, addr, alen);
+    if (fd < 0) { kl_errno_set(errno); return -1; }   // a non-blocking listener's EAGAIN
+    return apply_linux_fd_flags(fd, flags);
 }
 
 int klb_pipe2(int fds[2], int flags) {
@@ -1099,4 +1189,107 @@ void klb___pthread_cleanup_pop(void *c, int execute) {
     if (!rec) return;
     g_cleanups = rec->prev;
     if (execute && rec->routine) rec->routine(rec->arg);
+}
+
+// ------------------------------------------------ more libc surface
+//
+// Each one is either a same-meaning rebuild out of what Darwin has or an
+// honest refusal with the errno the caller already handles; none invents an
+// answer. Half-Life: Alyx's Android launcher is the guest that reached for
+// most of them.
+
+// The kernel tid of ANOTHER thread. A guest pthread_t here is Darwin's
+// pthread_t (klb_pthread_self), and the id is the one klb_gettid reports for
+// the same thread, so the two doors agree about who a thread is.
+int klb_pthread_gettid_np(pthread_t t) {
+    uint64_t tid = 0;
+    if (pthread_threadid_np(t, &tid) != 0) return -1;
+    return (int)tid;
+}
+
+// AT_FDCWD is -100 on Linux and -2 on Darwin, and the two flag bits move:
+// AT_SYMLINK_NOFOLLOW 0x100 -> 0x20, AT_EACCESS 0x200 -> 0x10. A cwd-relative
+// or absolute path goes through the same guest-path mapping access() uses.
+int klb_faccessat(int dirfd, const char *path, int mode, int flags) {
+    if (flags & ~0x300) { errno = EINVAL; return -1; }
+    int df = 0;
+    if (flags & 0x100) df |= AT_SYMLINK_NOFOLLOW;
+    if (flags & 0x200) df |= AT_EACCESS;
+    if (dirfd == -100) dirfd = AT_FDCWD;
+    GUEST_PATH(path);
+    int r = faccessat(dirfd, _p, mode, df);
+    // Into the slot a cached __errno() pointer reads, too (kl_errno_set): the
+    // Half-Life: Alyx launcher's faccessat self-test holds that pointer across the call and
+    // read back the EOPNOTSUPP it had written itself instead of ENOENT.
+    if (r) kl_errno_set(errno);
+    return r;
+}
+
+// mkdtemp was a raw forward, so a template spelled the guest's way (/sdcard,
+// /data/...) went to Darwin as written and failed; and a failure left the
+// errno slot a cached __errno() pointer reads untouched. Like mkstemp's
+// callers, the template is rewritten in place: the host path is made and the
+// XXXXXX the kernel chose is copied back into the guest's own buffer.
+char *klb_mkdtemp(char *tmpl) {
+    if (!tmpl) { kl_errno_set(EINVAL); return NULL; }
+    char kp[1024];
+    const char *hp = kl_guest_path(tmpl, kp, sizeof kp);
+    char host[1024];
+    snprintf(host, sizeof host, "%s", hp);
+    if (!mkdtemp(host)) {
+        int e = errno;
+        fprintf(stderr, "  [klepton] mkdtemp(\"%s\") -> %s\n", tmpl, strerror(e));
+        kl_errno_set(e);
+        return NULL;
+    }
+    size_t tl = strlen(tmpl), hl = strlen(host);
+    if (hl >= 6 && tl >= 6) memcpy(tmpl + tl - 6, host + hl - 6, 6);
+    return tmpl;
+}
+
+// Same bit-0 meaning on both ("page is resident"); Darwin also sets
+// referenced/modified bits Linux leaves reserved, so they are cleared rather
+// than handed to a caller that may test the whole byte. The vector is in
+// Darwin pages, which is the size sysconf(_SC_PAGESIZE) already reports.
+int klb_mincore(void *addr, size_t len, unsigned char *vec) {
+    if (mincore(addr, len, (char *)vec) != 0) return -1;
+    size_t pg = (size_t)getpagesize(), n = (len + pg - 1) / pg;
+    for (size_t i = 0; i < n; i++) vec[i] &= 1;
+    return 0;
+}
+
+// bionic answers 1 for a parameter it applied and 0 for one it did not.
+//
+// Two of bionic's parameters describe behaviour Darwin's allocator already has
+// or can perform, and those are answered for what they are:
+//   M_DECAY_TIME (-100) = 1: "return freed pages to the system over time" —
+//     Darwin's zones do exactly that on their own schedule (madvise of free
+//     spans), so decay is on; = 0 ("never decay") cannot be had, and says so.
+//   M_PURGE (-101): "release free pages now" — malloc_zone_pressure_relief on
+//     every zone is that operation.
+// Every other parameter (arena counts, cache sizes, tagging levels) has no
+// Darwin counterpart and gets 0, which every caller treats as "not supported".
+// Half-Life: Alyx's launcher requires the decay answer: a 0 there is its fatal
+// "guest-memory-native-decay-install failed" (guard exit 125).
+int klb_mallopt(int param, int value) {
+    if (param == -100) return value != 0;
+    if (param == -101) { malloc_zone_pressure_relief(NULL, 0); return 1; }
+    return 0;
+}
+
+// roundl on IEEE binary128 bits (Linux/aarch64 long double; see
+// kl_f64_to_f128). The thunk klv_roundl moves q0 into x0:x1 and back. Round half
+// away from zero on the magnitude: add half an ulp of the integer position and
+// truncate the fraction bits; a carry into the exponent is exactly right.
+__uint128_t kl_f128_roundl(__uint128_t x) {
+    const __uint128_t sign = (__uint128_t)1 << 127;
+    __uint128_t mag = x & ~sign;
+    int e = (int)((uint64_t)(mag >> 112) & 0x7fff) - 16383;
+    if (e >= 112) return x;                              // integral, inf or nan
+    if (e < -1) return x & sign;                         // |x| < 0.5 -> +-0
+    if (e == -1) return (x & sign) | ((__uint128_t)16383 << 112);   // -> +-1
+    int frac = 112 - e;
+    mag += (__uint128_t)1 << (frac - 1);
+    mag &= ~(((__uint128_t)1 << frac) - 1);
+    return (x & sign) | mag;
 }

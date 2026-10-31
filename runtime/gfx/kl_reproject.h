@@ -152,7 +152,31 @@ typedef struct {
     // having a hard jagged edge.
     float         chroma_min, chroma_max;
     float         chroma_key[3];
+    // The guest's colour scale and offset for the eye picture (kl_ovrp.c,
+    // ovrp_SetColorScaleAndOffset): colour * (1 - fade) + offset. Kept as what
+    // is TAKEN AWAY rather than as the scale itself, so that uniforms nobody
+    // filled in — all zeroes — are the picture as it is and not a black one.
+    float         color_fade[4];
+    float         color_offset[4];
+    // What the eye picture's own alpha means (KL_EYE_ALPHA_*). 0, which is
+    // what every guest had until one asked for passthrough, is "nothing": the
+    // picture is opaque, as kl_eye_sample says it must be. The other two are
+    // for a guest that submits a passthrough layer under its eye layer and
+    // leaves the room's place in the picture transparent (kl_ovrp.c).
+    uint32_t      eye_alpha;
 } kl_reproject_uniforms;
+// The eye picture's alpha, for every kl_reproject_build from now on. Colour is
+// taken as premultiplied in both readings, which is how a headset composites an
+// eye layer over the layers under it.
+enum {
+    KL_EYE_ALPHA_OPAQUE   = 0,   // ignore it — the picture covers everything
+    KL_EYE_ALPHA_COVERAGE = 1,   // 1 = the game's picture, 0 = the room
+    KL_EYE_ALPHA_INVERSE  = 2,   // 0 = the game's picture, 1 = the room
+};
+void kl_reproject_set_eye_alpha(int mode);
+// The values every kl_reproject_build puts there from now on. Scale 1, offset
+// 0 is the picture unchanged.
+void kl_reproject_set_eye_color(const float scale[4], const float offset[4]);
 
 // The blit's uniforms — buffer(0) of its FRAGMENT stage. It carried a bare
 // `uint slice` until the flip existed; a second scalar could have gone in
@@ -208,7 +232,23 @@ typedef struct {
     // already happening and is at least honest.
     uint32_t      visible;
     uint32_t      opaque;    // KL_OVERLAY_OPAQUE: force sampled alpha to 1
+    // A CYLINDER, when cyl_segments is not 0: the strip is then
+    // (cyl_segments + 1) * 2 vertices along the arc instead of the quad's
+    // four, on a surface of this radius around the pose, from -cyl_half_angle
+    // to +cyl_half_angle about the direction the pose faces (-Z). half_size.y
+    // is half its height; half_size.x is not used. kl_overlay_strip_vertices
+    // says how many vertices to draw.
+    uint32_t      cyl_segments;
+    float         cyl_radius;      // metres
+    float         cyl_half_angle;  // radians
+    vector_float4 color_scale;
+    vector_float4 color_offset;
 } kl_overlay_uniforms;
+
+// How many vertices the overlay strip has for these uniforms: 4 for a quad.
+static inline int kl_overlay_strip_vertices(const kl_overlay_uniforms *u) {
+    return (u && u->cyl_segments) ? (int)(u->cyl_segments + 1u) * 2 : 4;
+}
 
 // The overlay shader — `kl_ov_v` / `kl_ov_f`, a 4-vertex triangle strip with no
 // vertex buffer, buffer(0) an array indexed by [[amplification_id]] exactly as
@@ -274,12 +314,23 @@ const char *kl_reproject_msl(void);
 // PRE-UNWARPED texture coordinate, so the rasterizer's interpolation does the
 // rest and the fragment shader still just samples at `in.uv`.
 //
-// Exact, not an approximation. A Metal rate map is piecewise linear with its
-// breakpoints at the layer descriptor's zone boundaries, so a grid whose
-// vertices land on those boundaries reproduces the map exactly. Build it at the
-// map's zone count, or a multiple, and there is no error to trade off. The
-// coordinates are static for a given map, so this is built when the map is
-// made, not per frame.
+// A sampling of the map, and how fine it is matters. This used to say "exact":
+// that a Metal rate map is piecewise linear with its breakpoints at the layer
+// descriptor's zone boundaries, so a cell per zone reproduces it. It is not.
+// Metal interpolates the rate BETWEEN the sample points, so screen -> physical
+// is curved inside a zone, most where the rate changes fastest — the edge of
+// the dense region. Measured on a Mac (2026-10-12) with the display's own
+// 64-zone curve at 6890x5526, against -[MTLRasterizationRateMap
+// mapScreenToPhysicalCoordinates:]: a cell per zone is up to 3.3 physical
+// pixels off inside a cell at that edge (2.4 vertically), two cells a zone 1.2,
+// four 0.7, eight 0.3. On the headset the cell-per-zone grid read as a slight
+// wave where foveation begins — round menu buttons no longer quite round as the
+// eyes pass over the lower edge (owner, Beat Saber and other games).
+//
+// So the grid is built at KL_REPROJECT_GRID_REFINE cells a zone, up to
+// KL_REPROJECT_GRID_CELLS_MAX. The coordinates are static for a given map, so
+// this is built when the map is made, not per frame; what the finer grid costs
+// is vertices in the composite pass (256x256 cells are 393,216 an eye).
 //
 // Buffer layout, bound at buffer(1) of the VERTEX stage:
 //
@@ -308,6 +359,10 @@ const char *kl_reproject_msl(void);
 // worth knowing before hunting a soft periphery in a title that scales its
 // resolution.
 #define KL_REPROJECT_GRID_MAX 64
+// ...which is the most ZONES a map is sampled into (the display's own has 64).
+// The grid's cells are finer than the zones — see the note above.
+#define KL_REPROJECT_GRID_REFINE 4
+#define KL_REPROJECT_GRID_CELLS_MAX 256
 
 // Entries (each a simd_float2) a grid buffer needs, header included.
 static inline uint32_t kl_reproject_grid_entries(uint32_t nx, uint32_t ny) {
@@ -382,6 +437,15 @@ void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
                              float tex_w, float tex_h,
                              kl_reproject_s2p fn, void *ctx);
 
+// A render viewport, {x, y, w, h} counted from the picture's first row as the
+// guest submits it, turned into the rect the grid above wants when the picture's
+// first row is its TOP (`flip_y`, every Vulkan guest): the shader mirrors v after
+// the grid, over the whole texture, so a rect shorter than the texture is
+// mirrored here first or the pass reads the rows the guest did not write. A
+// full-height rect, or top_left 0, comes back as it went in. Shared by the
+// visionOS compositor and the Mac viewer, so the two cannot disagree.
+void kl_reproject_viewport_for_pass(float vp[4], float tex_h, int top_left);
+
 // The plain blit the viewer used before any of this existed: a full-screen
 // triangle, no uniforms but the slice. Kept because it is the A/B — if the
 // reprojected picture is wrong, this is the one known to be right.
@@ -441,6 +505,15 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
 // `visible` is 0 for an eye this layer does not name (slot < 0), which is how a
 // one-view layer is expressed — the quad collapses instead of the caller having
 // to skip a draw.
+// The unwarp grid a projection layer is drawn with — bind it at vertex buffer
+// index 1 in place of the identity grid. KL_PROJ_LAYER_GRID_ENTRIES coordinates:
+// the header and one 1x1 block per eye, each block the corners of that eye's
+// part of the texture (kl_ovrp_proj_layer.rect). kl_proj_layer_build's uniforms
+// select the block, so the two go together: its result drawn against any other
+// grid reads eye 1 from past the end of it.
+#define KL_PROJ_LAYER_GRID_ENTRIES 9
+void kl_proj_layer_grid(const kl_ovrp_proj_layer *pl, simd_float2 *out);
+
 kl_reproject_uniforms kl_proj_layer_build(const kl_ovrp_proj_layer *pl, int eye,
                                           simd_float4x4 origin_from_device,
                                           simd_float4x4 device_from_view,

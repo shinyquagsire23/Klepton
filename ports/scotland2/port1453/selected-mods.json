@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "name": "beatsaber1453-core-and-search",
+  "game": {
+    "version": "1.45.3_30054",
+    "versionCode": 3237,
+    "unity": "6.3",
+    "metadataVersion": 39,
+    "files": {
+      "libil2cpp.so": "bb560407d856fdd8f00ac3026967b5b10c3af4dbcfa3650ac3fa41d58a3744eb",
+      "libunity.so": "4bd2583ea13fa77b13a5ff22ddc4508347f54a087c62995efe19ff8d944cef43",
+      "global-metadata.dat": "34859f9dbfeb2dcd5f6ebe3ce64d682c836bcf40c97b2055f414a151dba9c5b8"
+    }
+  },
+  "selectedMods": [
+    "custom-types",
+    "lapiz",
+    "bsml",
+    "songcore",
+    "playlistcore",
+    "paper2_scotland2",
+    "songdownloader",
+    "unicode",
+    "datakeeper",
+    "metacore",
+    "metacore-bs",
+    "BetterSongSearch",
+    "airbuds-search"
+  ],
+  "excludedMods": [
+    "FakeId"
+  ],
+  "metadata": [
+    "libs/libbeatsaverplusplus.so",
+    "libs/libzip.so",
+    "early_mods/libmetacore.so",
+    "libs/libtinyxml2.so",
+    "libs/libweb-utils.so",
+    "libs/libsongdetails.so",
+    "libs/libcustom-types.so",
+    "libs/libpaper2_scotland2.so",
+    "libs/libreflectcpp.so",
+    "libs/libbeatsaber-hook.so",
+    "early_mods/libbsml.so",
+    "mods/libsongcore.so",
+    "early_mods/liblapiz.so",
+    "mods/libplaylistcore.so",
+    "mods/libsongdownloader.so",
+    "mods/libunicode.so",
+    "early_mods/libdatakeeper.so",
+    "early_mods/libmetacore-bs.so",
+    "mods/libBetterSongSearch.so",
+    "mods/libairbuds-search.so",
+    "shims/libsl2_abi.so",
+    "shims/libflamingo.so",
+    "shims/libsc2_scene.so"
+  ],
+  "hookCatalogs": [
+    "lapiz",
+    "bsml",
+    "songcore",
+    "metacore-bs",
+    "playlistcore",
+    "datakeeper",
+    "unicode",
+    "bettersongsearch",
+    "airbuds-search"
+  ],
+  "runtimeProfile": "1.45.3",
+  "flamingoLibrary": "libflamingo.so",
+  "sourceAdaptedBoundaries": [
+    "beatsaber-hook mkpath",
+    "BeatSaverPlusPlus extraction",
+    "SongDownloader extraction"
+  ],
+  "scope": "Explicit candidate composition; availability in AVP Play requires completed build/package validation."
+}

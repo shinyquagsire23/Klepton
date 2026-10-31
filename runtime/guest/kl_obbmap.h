@@ -12,6 +12,12 @@ void kl_obbmap_init(const char *obbdir, const char *ue4game_base);
 
 // access()/stat(): 1 (+ size) if loose is an indexed entry, else 0.
 int kl_obbmap_stat(const char *loose, long long *size);
+// Where an indexed entry's bytes really are: the host file and the offset of
+// its first byte in it. For a reader that is handed a path and a byte range
+// and opens the file ITSELF, past the guest's open() — a media player given
+// "(this pak, offset, length)" when the pak is an entry inside the OBB. 1 on
+// success; 0 when the path is not an entry that is stored as plain bytes.
+int kl_obbmap_locate(const char *loose, char *host, size_t cap, long long *base, long long *size);
 
 // 1 if loose is UE4's Content/Internationalization directory (or under it) and
 // the OBB map is live — the ICU data is in a mounted pak whose path-hash index

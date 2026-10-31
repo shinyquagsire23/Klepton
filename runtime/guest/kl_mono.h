@@ -101,6 +101,28 @@ int  kl_mono_keycode_for_char(int ch);
 void kl_mono_set_text_input(int on);
 int  kl_mono_text_input_wanted(void);
 
+// A web page the guest asked to open — an Android intent turned into an https
+// URL (kl_jni_android's startActivity). Shared through here for the same reason
+// as the text-input flag: the frontend polls it and opens the page in a web
+// window of its own (KL_JNI_OPEN_URL). take copies the pending URL into `out`
+// and clears it; it returns 1 when there was one.
+void kl_mono_request_open_url(const char *url);
+int  kl_mono_take_open_url(char *out, int cap);
+
+// Which web pages that window may show: the one rule for the page an intent
+// asks for (kl_jni_android's startActivity) and for every navigation inside the
+// window afterwards, redirects included (the app's navigation delegate). https
+// only (http is upgraded); the host must be spotify.com, youtube.com, youtu.be,
+// meta.com, oculus.com or under one of them, or exactly facebook.com or
+// accounts.google.com (where a YouTube sign-in goes); it must
+// be a plain DNS name (labels of letters, digits and inner dashes, 1-63
+// characters, 253 in all), no user part, no address literal. `navigation`
+// also lets about:blank and about:srcdoc through (frames a page makes for
+// itself). Returns 1 with the address to load in `out` (cap bytes), or 0 with
+// the reason in `*why` (`why` may be NULL).
+int  kl_mono_web_url(const char *in, char *out, unsigned long cap, int navigation,
+                     const char **why);
+
 // Deliver typed characters from the system keyboard to the guest as
 // SDL_TEXTINPUT (SDLInputConnection.nativeCommitText). Use this for text — not
 // kl_mono_key, whose key events do not fill an SDL text field. UTF-8; the

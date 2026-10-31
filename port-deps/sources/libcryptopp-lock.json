@@ -1,0 +1,9 @@
+{
+  "repository": "darknight1050/cryptopp-qpm",
+  "commit": "99c8f2aeb72234dd1b7989b0e8da0089d88711a0",
+  "version": "8.5.0",
+  "headerArchiveSha256": "2a66ee2e1beb7934efc2fb93dac9ea6e3cd3b408287f0f16401c49fc167c9679",
+  "binaryUrl": "https://github.com/darknight1050/cryptopp-qpm/releases/download/v8.5.0/libcryptopp.a",
+  "binarySha256": "1d7e2537909328ec78060072d50f1344f50a6cfd68e0729a621c673b3b1905f5",
+  "binarySize": 93006504
+}

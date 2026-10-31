@@ -18,6 +18,7 @@
 #include "kl_egl.h"
 #include "kl_openxr.h"
 #include "kl_opensl.h"
+#include "kl_xashservers.h"
 
 static char      g_libdir[1200];
 static char      g_engine_lib[256];   // e.g. "libmiamivr.so"
@@ -370,6 +371,10 @@ void kl_engine_setenv(const char *libdir, const char *entry_lib, FILE *out) {
         setenv("XASH3D_GAMEDIR",    gamedir, 1);
         setenv("XASH3D_ENGLIBDIR",  libdir, 1);
         setenv("XASH3D_GAMELIBDIR", libdir, 1);
+        // The player's own servers (favourites, admin access, the menus that use it) – before the
+        // userconfig is written, because the admin access adds a setting to it. See kl_xashservers.c.
+        extern const char *kl_jni_assets_dir(void);
+        kl_xash_servers_prepare(base, gamedir, kl_jni_assets_dir(), out);
         // Env-tunable cvars → userconfig.cfg, so knobs like vr_height_adjust can be
         // retuned between launches with no restage (see kl_xash_write_userconfig).
         kl_xash_write_userconfig(base, out);
@@ -479,6 +484,25 @@ int kl_native_load(FILE *out) {
     // exactly that gap; kl_load_recursive walks DT_NEEDED (skipping shim-served
     // names like libopenxr_loader/libandroid/libc, which bind through the shims)
     // and register+inits each, deps first, then the target.
+    //
+    // Tea For God (x6323807174332876) lists libfmod/libfmodstudio in its
+    // DT_NEEDED BEFORE libc++_shared, and libfmodstudio's static initializers
+    // call __cxa_guard_acquire — which Android's libstdc++.so would serve, but
+    // which here only libc++_shared exports. Walking DT_NEEDED in order binds
+    // FMOD first and its init aborts in kl_unresolved_named. Pull libc++_shared
+    // in up front, the way UE4_CHAIN does, so FMOD binds against it.
+    {
+        extern const char *kl_driver_target_name(void);
+        const char *tn = kl_driver_target_name();
+        if (tn && strcmp(tn, "x6323807174332876") == 0) {
+            char cxx[1400];
+            snprintf(cxx, sizeof cxx, "%s/libc++_shared.so", g_libdir);
+            if (kl_can_load(cxx) && !kl_load_recursive(cxx) && out) {
+                fprintf(out, "  libc++_shared.so preload failed: %s\n", kl_error());
+                fflush(out);
+            }
+        }
+    }
     kl_image *img = kl_load_recursive(path);
     if (!img) { snprintf(g_err, sizeof g_err, "%s: %s", g_engine_lib, kl_error()); return 1; }
     g_img = img;

@@ -1,0 +1,348 @@
+{
+  "schema": 1,
+  "name": "beatsaber140-ten-mods",
+  "game": {
+    "version": "1.40.8_7379",
+    "files": {
+      "libil2cpp": "edae5059bd5a85ba354eb679e1cdcc3816116d2e2b29b3a16a70c05b56dd07cb",
+      "libunity": "8203664e3b9203e9731251ea958ca2b1d9f0fc1e3b10032c34a61e5ee8068891"
+    },
+    "metadata": {
+      "path": "assets/bin/Data/Managed/Metadata/global-metadata.dat",
+      "sha256": "1814358a82213ff8ab48b088eae65c4039801f2ca0e9ec48157e74d84f329c17"
+    }
+  },
+  "selectedMods": [
+    "custom-types",
+    "lapiz",
+    "bsml",
+    "songcore",
+    "playlistcore",
+    "paper2_scotland2",
+    "songdownloader",
+    "unicode",
+    "datakeeper",
+    "metacore"
+  ],
+  "excludedMods": [
+    "FakeId"
+  ],
+  "packages": [
+    {
+      "id": "custom-types",
+      "version": "0.18.3",
+      "selectedMod": true,
+      "archive": "archives/custom-types-9e5afffb45f5.qmod",
+      "url": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod",
+      "sha256": "9b665017d47b4074c56265f4e7cd7104d83b44c137bdc2c73ae29b7a3724b1c7",
+      "dependencies": [
+        "beatsaber-hook",
+        "paper2_scotland2"
+      ],
+      "sourceProvenance": "ports/scotland2/customtypes/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": "ports/scotland2/customtypes/upstream/LICENSE",
+      "phase": "libs"
+    },
+    {
+      "id": "lapiz",
+      "version": "0.2.23",
+      "selectedMod": true,
+      "archive": "archives/lapiz-132e86064be9.qmod",
+      "url": "https://github.com/raineaeternal/Lapiz/releases/download/v0.2.23/Lapiz.qmod",
+      "sha256": "ae1b688cf61c7620ea006f071e02a6ba8fd77fb6084f3b8fe66de017685b15c8",
+      "dependencies": [
+        "beatsaber-hook",
+        "custom-types",
+        "paper2_scotland2"
+      ],
+      "sourceProvenance": "ports/scotland2/lapiz/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": "ports/scotland2/lapiz/upstream/LICENSE",
+      "phase": "early_mods"
+    },
+    {
+      "id": "bsml",
+      "version": "0.4.55",
+      "selectedMod": true,
+      "archive": "archives/bsml-87d6be904fcc.qmod",
+      "url": "https://github.com/bsq-ports/Quest-BSML/releases/download/v0.4.55/BSML.qmod",
+      "sha256": "04d7cf8aaaae485f605b3719e98daf2031a603d5be997c5dc17392f925820764",
+      "dependencies": [
+        "beatsaber-hook",
+        "custom-types",
+        "paper2_scotland2",
+        "tinyxml2"
+      ],
+      "sourceProvenance": "ports/scotland2/bsml/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": null,
+      "phase": "early_mods"
+    },
+    {
+      "id": "songcore",
+      "version": "1.1.24",
+      "selectedMod": true,
+      "archive": "archives/songcore-da5f4505dafd.qmod",
+      "url": "https://github.com/raineaeternal/Quest-SongCore/releases/download/v1.1.24/SongCore.qmod",
+      "sha256": "9572f6cb1e540aaa0bf0318afb46acd0957b0d71b9575550c83bc12c58a37d26",
+      "dependencies": [
+        "beatsaber-hook",
+        "paper2_scotland2",
+        "bsml",
+        "lapiz",
+        "custom-types"
+      ],
+      "sourceProvenance": "ports/scotland2/songcore/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": "ports/scotland2/songcore/upstream/LICENSE",
+      "phase": "mods"
+    },
+    {
+      "id": "playlistcore",
+      "version": "1.5.5",
+      "selectedMod": true,
+      "archive": "archives/playlistcore-9769522b724d.qmod",
+      "url": "https://github.com/Metalit/PlaylistCore/releases/download/v1.5.5/PlaylistCore.qmod",
+      "sha256": "967be7b0b753858d9d2848141ce943e6f42b4adbb5e9b65c656324c4895e03f7",
+      "dependencies": [
+        "beatsaber-hook",
+        "bsml",
+        "custom-types",
+        "songcore",
+        "web-utils",
+        "beatsaverplusplus",
+        "paper2_scotland2",
+        "metacore"
+      ],
+      "sourceProvenance": "ports/scotland2/playlistcore/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": "ports/scotland2/playlistcore/upstream/LICENSE",
+      "phase": "mods"
+    },
+    {
+      "id": "paper2_scotland2",
+      "version": "4.6.4",
+      "selectedMod": true,
+      "archive": "archives/paper2_scotland2-5ce6552419ba.qmod",
+      "url": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod",
+      "sha256": "d14d7aef777e4487dd20df1247e7926b1f6901d24397a6a19040b8a4d69bc92d",
+      "dependencies": [],
+      "sourceProvenance": null,
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": null,
+      "phase": "libs"
+    },
+    {
+      "id": "songdownloader",
+      "version": "0.8.8",
+      "selectedMod": true,
+      "archive": "archives/songdownloader-d838232fb11d.qmod",
+      "url": "https://github.com/darknight1050/SongDownloader/releases/download/v0.8.8/SongDownloader.qmod",
+      "sha256": "9782942f4e22abaf0d9475a789e0296582d3fe925ea0e98f214cc4f0080c463c",
+      "dependencies": [
+        "beatsaber-hook",
+        "bsml",
+        "custom-types",
+        "paper2_scotland2",
+        "playlistcore",
+        "songcore"
+      ],
+      "sourceProvenance": "ports/scotland2/songdownloader/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": "ports/scotland2/songdownloader/upstream/LICENSE",
+      "phase": "mods"
+    },
+    {
+      "id": "unicode",
+      "version": "0.1.7",
+      "selectedMod": true,
+      "archive": "archives/unicode-a417cdeb7890.qmod",
+      "url": "https://github.com/Metalit/UnicodeQuest/releases/download/v0.1.7/Unicode.qmod",
+      "sha256": "8bc1995fdcc892b8a3f4195bcb9584787208785fd0d559aee4df1f38a138e140",
+      "dependencies": [
+        "beatsaber-hook",
+        "paper2_scotland2",
+        "metacore"
+      ],
+      "sourceProvenance": "ports/scotland2/unicode/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": null,
+      "phase": "mods"
+    },
+    {
+      "id": "datakeeper",
+      "version": "0.2.5",
+      "selectedMod": true,
+      "archive": "archives/datakeeper-d3ff01ee63fd.qmod",
+      "url": "https://github.com/Metalit/PlayerDataKeeper/releases/download/v0.2.5/PlayerDataKeeper.qmod",
+      "sha256": "a87cc49c23e51b56467ef3050b4f2c5328e015e0422133ab690a003f24e03f08",
+      "dependencies": [
+        "beatsaber-hook",
+        "paper2_scotland2",
+        "custom-types"
+      ],
+      "sourceProvenance": "ports/scotland2/datakeeper/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": null,
+      "phase": "early_mods"
+    },
+    {
+      "id": "metacore",
+      "version": "1.6.2",
+      "selectedMod": true,
+      "archive": "archives/metacore-a0637caf4208.qmod",
+      "url": "https://github.com/Metalit/MetaCore/releases/download/v1.6.2/MetaCore.qmod",
+      "sha256": "76432b89821cf26ab3288e36ab4b956076472ffc81e68cfceeefe08853224388",
+      "dependencies": [
+        "beatsaber-hook",
+        "paper2_scotland2",
+        "custom-types",
+        "song-details",
+        "web-utils"
+      ],
+      "sourceProvenance": "ports/scotland2/metacore/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": null,
+      "phase": "early_mods"
+    },
+    {
+      "id": "beatsaber-hook",
+      "version": "6.4.2",
+      "selectedMod": false,
+      "archive": "archives/beatsaber-hook-e9801ed65fff.qmod",
+      "url": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod",
+      "sha256": "eb96c66aa15aa3ef0a1e7c6c00791193ae8545a98470889b441bf593383641d7",
+      "dependencies": [
+        "paper2_scotland2"
+      ],
+      "sourceProvenance": null,
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": null,
+      "phase": "libs"
+    },
+    {
+      "id": "tinyxml2",
+      "version": "10.0.0",
+      "selectedMod": false,
+      "archive": "archives/tinyxml2-a6a17c3b5ae5.qmod",
+      "url": "https://github.com/MillzyDev/NDK-tinyxml2/releases/download/v10.0.0/tinyxml2.qmod",
+      "sha256": "dd4af8b43a251a7f96fc86a2e2e0801a1405d452497b30cbeab438142e56797a",
+      "dependencies": [],
+      "sourceProvenance": null,
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": null,
+      "phase": "libs"
+    },
+    {
+      "id": "web-utils",
+      "version": "0.6.8",
+      "selectedMod": false,
+      "archive": "archives/web-utils-bc3941328eb0.qmod",
+      "url": "https://github.com/bsq-ports/WebUtils/releases/download/v0.6.8/WebUtils.qmod",
+      "sha256": "fd9fca2e067290c88f9d5a48e68bb255a22be03949353359d6ce17048616ee8b",
+      "dependencies": [],
+      "sourceProvenance": "ports/scotland2/web-utils/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": null,
+      "phase": "libs"
+    },
+    {
+      "id": "beatsaverplusplus",
+      "version": "0.2.1",
+      "selectedMod": false,
+      "archive": "archives/beatsaverplusplus-33938e7a67fd.qmod",
+      "url": "https://github.com/bsq-ports/BeatSaverPlusPlus/releases/download/v0.2.1/BeatSaverPlusPlus.qmod",
+      "sha256": "0dc46ea94e4b673597b91c44c2e60be57902e1f0ee9f951d4a78ae84052fc145",
+      "dependencies": [
+        "paper2_scotland2",
+        "web-utils",
+        "beatsaber-hook"
+      ],
+      "sourceProvenance": "ports/scotland2/beatsaverplusplus/provenance.json",
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": "ports/scotland2/beatsaverplusplus/upstream/LICENSE",
+      "phase": "libs"
+    },
+    {
+      "id": "song-details",
+      "version": "1.0.4",
+      "selectedMod": false,
+      "archive": "archives/song-details-5f278068c614.qmod",
+      "url": "https://github.com/bsq-ports/SongDetails/releases/download/v1.0.4/SongDetails.qmod",
+      "sha256": "8602c954e6eb92297fea382b260f7ac3c531ad0bdaa4911e7a5cec215d5538bd",
+      "dependencies": [
+        "paper2_scotland2"
+      ],
+      "sourceProvenance": null,
+      "platform": "Android arm64 translated to signed visionOS arm64",
+      "licenseFile": null,
+      "phase": "libs"
+    }
+  ],
+  "hookCatalogs": [
+    "lapiz",
+    "bsml",
+    "songcore",
+    "metacore",
+    "playlistcore",
+    "datakeeper",
+    "unicode"
+  ],
+  "metadata": [
+    "early_mods/libbsml.so",
+    "early_mods/libdatakeeper.so",
+    "early_mods/liblapiz.so",
+    "early_mods/libmetacore.so",
+    "libs/libbeatsaber-hook.so",
+    "libs/libbeatsaverplusplus.so",
+    "libs/libcustom-types.so",
+    "libs/libpaper2_scotland2.so",
+    "libs/libsongdetails.so",
+    "libs/libtinyxml2.so",
+    "libs/libweb-utils.so",
+    "libs/libzip.so",
+    "mods/libplaylistcore.so",
+    "mods/libsongcore.so",
+    "mods/libsongdownloader.so",
+    "mods/libunicode.so",
+    "shims/libsc2_flamingo.so",
+    "shims/libsc2_scene.so",
+    "shims/libsl2_abi.so"
+  ],
+  "extraFrameworks": [
+    "Scotland2Core",
+    "libcxx_shared"
+  ],
+  "mode": "release",
+  "scope": "Standalone local builder; exact game hashes only; no generic QMOD support",
+  "diagnosticMetadata": [
+    "early_mods/libbsml.so",
+    "early_mods/libdatakeeper.so",
+    "early_mods/liblapiz.so",
+    "early_mods/libmetacore.so",
+    "libs/libbeatsaber-hook.so",
+    "libs/libbeatsaverplusplus.so",
+    "libs/libcustom-types.so",
+    "libs/libpaper2_scotland2.so",
+    "libs/libsongdetails.so",
+    "libs/libtinyxml2.so",
+    "libs/libweb-utils.so",
+    "libs/libzip.so",
+    "mods/libplaylistcore.so",
+    "mods/libsongcore.so",
+    "mods/libsongdownloader.so",
+    "mods/libunicode.so",
+    "shims/libsc2_bsml_probe.so",
+    "shims/libsc2_customtypes_probe.so",
+    "shims/libsc2_flamingo.so",
+    "shims/libsc2_flamingo_probe.so",
+    "shims/libsc2_metacore_probe.so",
+    "shims/libsc2_songcore_probe.so",
+    "shims/libsl2_abi.so"
+  ],
+  "dependencyAdaptations": {
+    "beatsaverplusplus": "Original released binary and complete export surface retained. Only the original ExtractAll entry uses a prepared signed hook to the shared bounded extraction adapter; the original declared libzip dependency remains.",
+    "song-details": "Original public API and protobuf/Brotli formats preserved; exact original protobuf 3.21.12 and Brotli 1.1.0 rebuilt to enable TLS validation and bound remote data."
+  }
+}

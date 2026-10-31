@@ -1,0 +1,14 @@
+<horizontal xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+            xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'
+            id="root_" bg='round-rect-panel' pad='1' spacing="1" child-align="MiddleLeft" vertical-fit="Unconstrained">
+
+    <vertical horizontal-fit="Unconstrained" vertical-fit="PreferredSize" spacing="-0.5">
+        <horizontal flex-width="100">
+            <text id='friendNameTextView_' font-align="Left" overflow-mode='Ellipsis' font-size="2.7"
+                  word-wrapping='false' rich-text='false'/>
+        </horizontal>
+        <text id='friendHandleTextView_' font-align='Left' overflow-mode='Ellipsis' font-size="2.2" word-wrapping='false'
+              color='#AAA' rich-text='false'/>
+    </vertical>
+
+</horizontal>

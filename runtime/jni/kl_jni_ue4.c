@@ -23,10 +23,13 @@
 #include "kl_env.h"
 #include "kl_ovrp.h"
 #include "kl_avdec.h"
+#include "kl_obbmap.h"
 #include "kl_egl.h"
 #include "kl_ndk.h"
 #include "kl_va.h"
 #include "kl_jni_int.h"
+#include "kl_driver.h"
+#include "kl_ue4.h"
 
 // ---- UE4's MessageBox01 ----
 // `FPlatformMisc::MessageBoxExt` on Android: the engine news up one of these,
@@ -56,6 +59,41 @@ static char g_ue4_msg_buttons[512];
 // Routing the synthetic ones at the same Display handlers Unity reads is the
 // display-panel group answer again — two engines asking one device the same
 // question must not get two numbers.
+//
+// Unreal 5 renamed the synthetic keys along with everything else: `ue4.display`,
+// `ue4.display.getRefreshRate` and `ue4.displaymetrics.dpi` are spelled
+// `unreal.*` in 5.3 (Pinball FX VR), and the Java behind them is the same
+// method with the same sparse-switch. So they are ALIASED here rather than
+// duplicated below, the same choice kl_jni.c's class fold makes.
+//
+// Only the display family, and that limit is the point: `unreal.GameActivity.*`
+// keys are GENUINE manifest entries in a UE5 APK (CookedFlavors,
+// bValidateTextureFormats) and must reach the Bundle read untouched. A blanket
+// `unreal.` -> `ue4.` prefix swap would send them looking for a key the manifest
+// does not have.
+//
+// What this cost when it was missing: `unreal.displaymetrics.dpi` fell through
+// to the manifest, answered "", and FAndroidDeviceProfileSelector split "" on
+// "," and indexed element 0 of the empty array — SIGSEGV at address 0x8, on a
+// guest worker thread, eight instructions later, naming nothing.
+static const char *klj_ue5_meta_alias(const char *k) {
+    static const struct { const char *ue5, *ue4; } alias[] = {
+        {"unreal.displaymetrics.dpi",     "ue4.displaymetrics.dpi"},
+        {"unreal.displaymetrics.metrics", "ue4.displaymetrics.metrics"},
+        {"unreal.display",                "ue4.display"},
+        {"unreal.display.getRefreshRate", "ue4.display.getRefreshRate"},
+        {"unreal.display.PresentationDeadlineNanos",
+         "ue4.display.PresentationDeadlineNanos"},
+        {"unreal.display.AppVsyncOffsetNanos",
+         "ue4.display.AppVsyncOffsetNanos"},
+        {0, 0}
+    };
+    if (!k) return "";
+    for (int i = 0; alias[i].ue5; i++)
+        if (strcmp(k, alias[i].ue5) == 0) return alias[i].ue4;
+    return k;
+}
+
 static klj_val klj_GA_hasMetaDataKey(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
     const char *k = n > 0 ? klj_str(a[0].l) : NULL;
@@ -69,7 +107,7 @@ static klj_val klj_GA_getMetaDataBoolean(void *env, void *self, const klj_val *a
 }
 static klj_val klj_GA_getMetaDataInt(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
-    const char *k = n > 0 ? klj_str(a[0].l) : "";
+    const char *k = klj_ue5_meta_alias(n > 0 ? klj_str(a[0].l) : "");
     // The graphics API decision, and it is made HERE rather than by the RHI:
     // UE4 offers Vulkan only when the platform reports the vulkan.version
     // feature, and the activity reads that out of
@@ -112,9 +150,21 @@ static klj_val klj_GA_getMetaDataInt(void *env, void *self, const klj_val *a, in
     if (strcmp(k, "android.hardware.vulkan.version") == 0
         || strcmp(k, "android.hardware.vulkan.level") == 0) {
         int level = strcmp(k, "android.hardware.vulkan.level") == 0;
+        // KL_UE4_VULKAN: 0 withholds the feature entirely (the A/B that
+        // restores the pre-Vulkan refusal); 1 or unset keeps the default,
+        // VK_MAKE_VERSION(1,1,0); anything larger is used AS the version word,
+        // so a guest that wants a different number can be given one without a
+        // rebuild. Unreal decides from the NUMBER, not from a probe: Pinball FX
+        // VR (UE5.3) given 1.0.3 dlopens libvulkan.so, calls nothing through
+        // it, and puts up "This device does not support Vulkan but the app was
+        // not packaged with ES 3.1 support"; given 1.1 it reaches
+        // vkCreateInstance and vkCreateDevice.
         const char *env_v = getenv("KL_UE4_VULKAN");
-        int on = env_v ? (int)strtol(env_v, NULL, 0) != 0 : 1;
-        int v = !on ? 0 : level ? 1 : ((1 << 22) | (1 << 12));  /* VK_MAKE_VERSION(1,1,0) — UE5 minimum */
+        long want = env_v ? strtol(env_v, NULL, 0) : 1;
+        int on = want != 0;
+        int v = !on ? 0 : level ? 1
+              : want > 1 ? (int)want
+              : ((1 << 22) | (1 << 12));   /* VK_MAKE_VERSION(1,1,0) — UE5 minimum */
         KLJ_LOG("GetMetaDataInt(\"%s\") -> 0x%x%s", k, v,
                 on ? "" : " (no Vulkan feature presented — KL_UE4_VULKAN=0)");
         return (klj_val){.j = (uint64_t)(int64_t)v};
@@ -124,7 +174,7 @@ static klj_val klj_GA_getMetaDataInt(void *env, void *self, const klj_val *a, in
 }
 
 static klj_val klj_GA_getMetaDataLong(void *env, void *self, const klj_val *a, int n) {
-    const char *k = n > 0 ? klj_str(a[0].l) : "";
+    const char *k = klj_ue5_meta_alias(n > 0 ? klj_str(a[0].l) : "");
     if (strcmp(k, "ue4.display.PresentationDeadlineNanos") == 0)
         return klj_Display_getPresentationDeadlineNanos(env, self, a, n);
     if (strcmp(k, "ue4.display.AppVsyncOffsetNanos") == 0)
@@ -133,7 +183,7 @@ static klj_val klj_GA_getMetaDataLong(void *env, void *self, const klj_val *a, i
     return (klj_val){.j = (uint64_t)(v ? strtoll(v, NULL, 10) : 0)};
 }
 static klj_val klj_GA_getMetaDataFloat(void *env, void *self, const klj_val *a, int n) {
-    const char *k = n > 0 ? klj_str(a[0].l) : "";
+    const char *k = klj_ue5_meta_alias(n > 0 ? klj_str(a[0].l) : "");
     if (strcmp(k, "ue4.display.getRefreshRate") == 0)
         return klj_Display_getRefreshRate(env, self, a, n);
     const char *v = kl_jni_manifest_meta(k);
@@ -141,7 +191,7 @@ static klj_val klj_GA_getMetaDataFloat(void *env, void *self, const klj_val *a, 
 }
 static klj_val klj_GA_getMetaDataString(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self;
-    const char *k = n > 0 ? klj_str(a[0].l) : "";
+    const char *k = klj_ue5_meta_alias(n > 0 ? klj_str(a[0].l) : "");
     // `getprop:<name>` is a system property read wearing a meta-data key's
     // clothes, and the properties are the ones kl_libc's sysprop table already
     // answers — so this goes through that rather than growing a second table.
@@ -178,10 +228,38 @@ static klj_val klj_GA_getMetaDataString(void *env, void *self, const klj_val *a,
     return (klj_val){.l = kl_jni_new_string(v ? v : "")};
 }
 
+
+// `AndroidThunkJava_GetAndroidId()` — UE's GameActivity wrapping the one line
+// `Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID)`.
+// Pinball FX VR (UE5.3) asks for it the instant the player finishes its two
+// AGREE-to-terms screens, which is the first thing past the lobby that wants to
+// know WHICH device accepted; unbound, it is klj_call_common's abort() — a
+// SIGABRT on the GameThread.
+//
+// It is a device-identity question: it answers "this installation, on this
+// device", which is what an analytics or terms-acceptance record keys on, and
+// asserts nothing about what the player owns.
+//
+// The answer is KLJ_ANDROID_ID — the SAME string Settings.Secure.getString
+// hands a Unity guest (kl_jni_net.c), shared through kl_jni_int.h so one device
+// cannot claim to be two. Non-null and 16 hex digits both matter: UE stores the
+// result straight into an FString, and a null is a crash inside the guest's own
+// string handling rather than a blank.
+static klj_val klj_GA_getAndroidId(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AndroidThunkJava_GetAndroidId() -> \"%s\" (synthetic and constant, "
+            "the same id Settings.Secure.getString answers)", KLJ_ANDROID_ID);
+    return (klj_val){.l = kl_jni_new_string(KLJ_ANDROID_ID)};
+}
+
+
 // How the JNI surface reaches back into the guest. See kl_jni.h.
 static void *(*g_guest_native)(const char *symbol);
 void kl_jni_set_guest_native_resolver(void *(*resolve)(const char *symbol)) {
     g_guest_native = resolve;
+}
+void *kl_jni_guest_native(const char *symbol) {
+    return g_guest_native && symbol ? g_guest_native(symbol) : NULL;
 }
 
 // `AndroidThunkJava_InitHMDs` — the activity posts a Runnable to the UI thread
@@ -194,6 +272,21 @@ void kl_jni_set_guest_native_resolver(void *(*resolve)(const char *symbol)) {
 // back later, and here it runs on the caller. The engine's own code is what
 // runs either way, and running it late is the failure that has no symptom — the
 // module list is consumed by the very next thing the game thread does.
+// ---- UE4's GetIntentExtras* family ----
+// The extras of the Intent the activity was started with: getIntent().getExtras()
+// and then a typed read, each with a null check around it. A launcher starts a
+// game with no extras, and so do we, so these are the answers Android itself
+// computes for an absent key — false, false, 0 and null — not a refusal.
+// Marvel's Deadpool VR asks for a string extra in its main init, without first
+// asking whether the key exists, and with no answer it stopped in
+// GameActivity.onResume (2026-10-09). UE turns the null into an empty FString.
+static klj_val klj_GA_intentExtraAbsent(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *k = n > 0 ? klj_str(a[0].l) : NULL;
+    KLJ_LOG("intent extra \"%s\": the activity was started without extras", k ? k : "");
+    return (klj_val){.j = 0};
+}
+
 static klj_val klj_GA_initHMDs(void *env, void *self, const klj_val *a, int n) {
     (void)a; (void)n;
     // UE5 renamed the package and the exported-native prefix in the same release
@@ -218,6 +311,606 @@ static klj_val klj_GA_initHMDs(void *env, void *self, const klj_val *a, int n) {
     KLJ_LOG("AndroidThunkJava_InitHMDs -> nativeInitHMDs()");
     fn(env, self);
     return (klj_val){.j = 0};
+}
+
+// ---- UE's virtual keyboard -------------------------------------------------
+//
+// The one UI element a guest cannot draw for itself. Unity hands the job to
+// UnityPlayer.showSoftInput (kl_jni_softinput.c); UE hands it to its own
+// GameActivity, and the two surfaces share nothing but the shape of the
+// problem — four Java methods go out and four natives come back.
+//
+// **Pinball FX VR died here.** The post-game score screen offers name entry,
+// the player pinched Edit, and the log's last live line was
+//
+//   [jni] no host implementation for com/epicgames/ue4/GameActivity.
+//         AndroidThunkJava_ShowVirtualKeyboardInput(ILjava/lang/String;Ljava/lang/String;)V
+//
+// which is klj_call_common's abort() — a SIGABRT on the GameThread.
+//
+// Everything below is transcribed from Pinball FX VR's GameActivity.smali rather
+// than from the engine's source, because the two paths differ in what they
+// report and the difference is the whole of the close sequence:
+//
+//   AndroidThunkJava_ShowVirtualKeyboardInput(type, label, contents)
+//        the NEW keyboard. Stores contents/type, posts GameActivity$t after
+//        200 ms, which runs processLastVirtualKeyboardCommand: it sets the
+//        y0 EditText's text and inputType, shows the IME, and calls
+//        nativeVirtualKeyboardVisible(true) (GameActivity.smali:19297).
+//        Live text comes back through the o0 TextWatcher as
+//        nativeVirtualKeyboardChanged(s), and **there is no
+//        nativeVirtualKeyboardResult on this path at all** — grep the whole
+//        smali tree: the only two callers of it are the DIALOG's listeners.
+//        The engine commits on the keys instead, and the dismissal is y0's
+//        onKeyPreIme: KEYCODE_BACK (4) -> AndroidThunkJava_HideVirtualKeyboardInput()
+//        and then nativeVirtualKeyboardSendKey(4).
+//   AndroidThunkJava_HideVirtualKeyboardInput()
+//        the same handler's other arm: hide the IME, visible(false)
+//        (GameActivity.smali:19150).
+//   AndroidThunkJava_ShowVirtualKeyboardInputDialog(type, label, contents)
+//        the OLD AlertDialog, chosen by the engine's `Android.NewKeyboard`
+//        cvar. This one does have a result, and its two listeners fix the
+//        shapes exactly:
+//          q0 (OK)     -> nativeVirtualKeyboardResult(true, editText.getText())
+//          p0 (Cancel) -> nativeVirtualKeyboardChanged(<original contents>)
+//                         then nativeVirtualKeyboardResult(false, " ")
+//        Note p0 restores the original text BEFORE reporting the refusal, and
+//        that the refusal's string is a single SPACE and not empty — both are
+//        that method's, not choices made here.
+//   AndroidThunkJava_HideVirtualKeyboardInputDialog()
+//        dismiss, nothing native.
+//
+// The natives are static exports of libUnreal (`Java_com_epicgames_ue4_…`,
+// folded onto `…_unreal_…` by ue4_native_symbol in kl_ue4.c), not
+// RegisterNatives bindings, so they are reached through g_guest_native — and
+// resolved per event rather than cached, for kl_jni_softinput.c's reason: a
+// lookup that ran before the guest published its symbols would pin a NULL and
+// leave the keyboard silently dead for the run.
+//
+// **What a host without a keyboard does, and why it is not a no-op.** There is
+// no IME here. A no-op leaves the engine believing a keyboard is up and the
+// player staring at a text field that can never close — worse than the abort,
+// because it has no log line. So a show is followed immediately by a close,
+// delivered as soon as the report queue drains.
+//
+// **Which native actually ends the entry, read off libUnreal.** Replaying the
+// Java's own BACK dismissal — visible(false) then sendKey(4) — leaves a field
+// that stays open with a blinking caret and eats every controller button for
+// the rest of the session. On a real device the *IME going away* is what ends
+// the edit, and the Java only has to tidy up after it; there is no IME here, so
+// nothing would end it. The four natives, disassembled from Pinball FX VR's
+// libUnreal:
+//
+//   nativeVirtualKeyboardVisible(b)   0x4000fc4
+//        stores b at the "keyboard is up" global (+0x8ac). On FALSE it also
+//        clears the two-word weak pointer at +0x950/+0x958 and releases it —
+//        i.e. `VirtualKeyboardWidget.Reset()`. The WIDGET is never told.
+//   nativeVirtualKeyboardResult(1, s) 0x4001e24
+//        the only one that reaches the widget: it converts s to an FString and
+//        dispatches a GameThread task over the live weak pointer — the engine's
+//        `SetTextFromVirtualKeyboard(s, TextEntryAccepted)`, which is what
+//        broadcasts OnTextCommitted and lets the game's own entry screen close
+//        and give input back. Then it Resets.
+//   nativeVirtualKeyboardResult(0, s) 0x4001ecc (the b.ne arm)
+//        Reset and nothing else — the same do-nothing as visible(false). A
+//        "cancel" cannot close a widget that has taken focus.
+//   nativeVirtualKeyboardSendKey(k)   0x4002250
+//        pushes {0, k} onto the deferred-message queue. A key event. It does
+//        not touch the weak pointer and cannot end an entry.
+//
+// So the close is `result(true, …)` on BOTH paths, and it must come BEFORE any
+// visible(false) — the Reset is what makes a later commit a no-op. What differs
+// is only the text: a commit reports the edited text, and a cancel reports the
+// SEED, which is the truthful "nothing changed" available on a host with no
+// IME. The BACK key is not sent any more: it closed nothing, and injecting a
+// back-navigation nobody asked for is a real risk once the field really shuts.
+//
+// `KL_UE_KEYBOARD=1` holds the field open instead and lets a frontend type into
+// it through the kl_jni_soft_input_* calls in kl_jni.h — which is what the SDL
+// viewer already implements, and what a visionOS text-entry UI would implement
+// when there is one. `KL_UE_KEYBOARD_TEXT=<s>` is the version that works with
+// no frontend at all: the auto-close commits `<s>` instead of the seed, so the
+// initials on a score screen are the player's and not the guest's default.
+#define KLJ_VK_TEXT_MAX 1024
+#define KLJ_VK_QUEUE    16
+
+enum {
+    KLJ_VK_VISIBLE = 1,   // nativeVirtualKeyboardVisible(Z)
+    KLJ_VK_CHANGED,       // nativeVirtualKeyboardChanged(Ljava/lang/String;)
+    KLJ_VK_RESULT,        // nativeVirtualKeyboardResult(ZLjava/lang/String;)
+    KLJ_VK_SENDKEY,       // nativeVirtualKeyboardSendKey(I)
+};
+
+typedef struct {
+    int  kind, a;
+    char s[KLJ_VK_TEXT_MAX];
+} klj_vk_ev;
+
+static struct {
+    pthread_mutex_t mu;
+    void       *activity;        // the GameActivity the guest called us on
+    int         open;            // a show was seen, no close reported yet
+    int         dialog;          // the old AlertDialog path, not the new one
+    int         type;            // Android inputType bits
+    char        text[KLJ_VK_TEXT_MAX];
+    char        seed[KLJ_VK_TEXT_MAX];   // what the guest opened it with
+    char        label[256];
+    klj_vk_ev   q[KLJ_VK_QUEUE];
+    int         qh, qn;
+    unsigned    dropped, opens;
+} g_vk = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+// Caller holds g_vk.mu. A full queue drops the OLDEST, and says so once: these
+// are ordered reports and a silent drop is an editor that never closes.
+static void klj_vk_push(int kind, int a, const char *s) {
+    if (g_vk.qn == KLJ_VK_QUEUE) {
+        g_vk.qh = (g_vk.qh + 1) % KLJ_VK_QUEUE;
+        g_vk.qn--;
+        if (!g_vk.dropped++)
+            KLJ_LOG("virtual keyboard: report queue full — dropping the oldest. "
+                    "Nothing is draining it; is the pump running?");
+    }
+    klj_vk_ev *e = &g_vk.q[(g_vk.qh + g_vk.qn) % KLJ_VK_QUEUE];
+    e->kind = kind; e->a = a;
+    e->s[0] = '\0';
+    if (s) { strncpy(e->s, s, sizeof e->s - 1); e->s[sizeof e->s - 1] = '\0'; }
+    g_vk.qn++;
+}
+
+// The close, in the guest's own two shapes. Caller holds g_vk.mu and has
+// already decided the field is open.
+static void klj_vk_push_close_locked(int canceled) {
+    // What the widget is told, on either path. A cancel reports the SEED: the
+    // engine has exactly one end-of-entry native and it is an ACCEPT, so the
+    // honest refusal is accepting the text the field already had.
+    const char *final = canceled ? g_vk.seed : g_vk.text;
+    if (g_vk.dialog) {
+        // The AlertDialog listeners, transcribed. Cancel restores the original
+        // text first and its refusal string is a single space (p0); OK reports
+        // the edited text (q0). Neither touches visibility — the dialog's own
+        // dismiss does that, and there is no nativeVirtualKeyboardVisible on
+        // either listener.
+        //
+        // The dialog's cancel is left exactly as its Java writes it, refusal
+        // string and all, because on THIS path the engine really does get a
+        // result either way and the Reset in the `update == false` arm is the
+        // dialog's own choice, not a hole we are patching.
+        if (canceled) {
+            klj_vk_push(KLJ_VK_CHANGED, 0, g_vk.seed);
+            klj_vk_push(KLJ_VK_RESULT, 0, " ");
+        } else {
+            klj_vk_push(KLJ_VK_RESULT, 1, g_vk.text);
+        }
+    } else {
+        // The new keyboard. `result(true, …)` is the only native that reaches
+        // the entry widget (0x4001e24 — see the block above), and it must run
+        // before anything Resets the weak pointer it dispatches over, so
+        // visible(false) comes LAST and only clears the engine's "a keyboard is
+        // up" flag. The live-text report goes first, the way the o0 TextWatcher
+        // would have delivered it.
+        klj_vk_push(KLJ_VK_CHANGED, 0, final);
+        klj_vk_push(KLJ_VK_RESULT, 1, final);
+        klj_vk_push(KLJ_VK_VISIBLE, 0, NULL);
+    }
+    g_vk.open = 0;
+}
+
+// Run the queue. Called from klj_drain_soft_input, i.e. on the thread that
+// pumps the looper — which is the UI thread by the only definition that
+// matters, and the thread GameActivity's own handlers run these natives on.
+// The lock is DROPPED before the guest runs: nativeVirtualKeyboardChanged
+// reaches engine code that is allowed to call straight back at us.
+unsigned klj_ue_vk_drain(void) {
+    unsigned ran = 0;
+    for (;;) {
+        klj_vk_ev e;
+        pthread_mutex_lock(&g_vk.mu);
+        if (!g_vk.qn) { pthread_mutex_unlock(&g_vk.mu); break; }
+        e = g_vk.q[g_vk.qh];
+        g_vk.qh = (g_vk.qh + 1) % KLJ_VK_QUEUE;
+        g_vk.qn--;
+        void *self = g_vk.activity;
+        pthread_mutex_unlock(&g_vk.mu);
+
+        static const char *const syms[] = {
+            [KLJ_VK_VISIBLE] = "Java_com_epicgames_ue4_GameActivity_nativeVirtualKeyboardVisible",
+            [KLJ_VK_CHANGED] = "Java_com_epicgames_ue4_GameActivity_nativeVirtualKeyboardChanged",
+            [KLJ_VK_RESULT]  = "Java_com_epicgames_ue4_GameActivity_nativeVirtualKeyboardResult",
+            [KLJ_VK_SENDKEY] = "Java_com_epicgames_ue4_GameActivity_nativeVirtualKeyboardSendKey",
+        };
+        void *f = (e.kind >= KLJ_VK_VISIBLE && e.kind <= KLJ_VK_SENDKEY && g_guest_native)
+                ? g_guest_native(syms[e.kind]) : NULL;
+        if (!f) {
+            KLJ_LOG("virtual keyboard: report %d has no guest native — dropped", e.kind);
+            continue;
+        }
+        void *env = kl_jni_env();
+        kl_jni_local_frame_push();
+        switch (e.kind) {
+        case KLJ_VK_VISIBLE:
+            // jboolean is a BYTE. An int would leave the high bits to chance.
+            ((void (*)(void *, void *, uint8_t))f)(env, self, (uint8_t)(e.a != 0));
+            break;
+        case KLJ_VK_CHANGED:
+            ((void (*)(void *, void *, void *))f)(env, self, kl_jni_new_string(e.s));
+            break;
+        case KLJ_VK_RESULT:
+            ((void (*)(void *, void *, uint8_t, void *))f)
+                (env, self, (uint8_t)(e.a != 0), kl_jni_new_string(e.s));
+            break;
+        default:
+            ((void (*)(void *, void *, int32_t))f)(env, self, (int32_t)e.a);
+            break;
+        }
+        kl_jni_local_frame_pop();
+        ran++;
+    }
+    return ran;
+}
+
+static klj_val klj_GA_showVirtualKeyboard(void *env, void *self,
+                                          const klj_val *a, int n, int dialog) {
+    (void)env;
+    int   type     = n > 0 ? (int)(int32_t)a[0].j : 0;
+    const char *lbl = n > 1 ? klj_str(a[1].l) : NULL;
+    const char *con = n > 2 ? klj_str(a[2].l) : NULL;
+    // The guest's own inputType bits, named rather than reinterpreted: the
+    // only one with a consequence outside the guest is the password variation,
+    // because a frontend must not echo or log a secure field.
+    int secure = (type & 0x80) != 0;
+    int hold   = kl_env_int("KL_UE_KEYBOARD", 0);
+    // The text an auto-close commits. Unset means "commit the seed", i.e. leave
+    // the guest's own contents alone; set means a person told us their initials
+    // once and wants them every time the game asks. Never for a secure field —
+    // a baked password is not a thing we will type on someone's behalf.
+    const char *baked = secure ? NULL : kl_env_str("KL_UE_KEYBOARD_TEXT", NULL);
+    if (baked && !*baked) baked = NULL;
+
+    pthread_mutex_lock(&g_vk.mu);
+    if (self) g_vk.activity = self;
+    g_vk.open   = 1;
+    g_vk.dialog = dialog;
+    g_vk.type   = type;
+    g_vk.text[0] = g_vk.seed[0] = g_vk.label[0] = '\0';
+    if (con) {
+        strncpy(g_vk.text, con, sizeof g_vk.text - 1);
+        g_vk.text[sizeof g_vk.text - 1] = '\0';
+        memcpy(g_vk.seed, g_vk.text, sizeof g_vk.seed);
+    }
+    if (lbl) { strncpy(g_vk.label, lbl, sizeof g_vk.label - 1);
+               g_vk.label[sizeof g_vk.label - 1] = '\0'; }
+    g_vk.opens++;
+    // processLastVirtualKeyboardCommand's show arm reports exactly one native,
+    // and only on the new path — the dialog's own show() reports nothing.
+    if (!dialog) klj_vk_push(KLJ_VK_VISIBLE, 1, NULL);
+    if (!hold) {
+        if (baked) {
+            strncpy(g_vk.text, baked, sizeof g_vk.text - 1);
+            g_vk.text[sizeof g_vk.text - 1] = '\0';
+        }
+        klj_vk_push_close_locked(baked ? 0 : 1);
+    }
+    pthread_mutex_unlock(&g_vk.mu);
+
+    KLJ_LOG("AndroidThunkJava_ShowVirtualKeyboardInput%s(type=0x%x%s label=\"%s\") "
+            "— %s", dialog ? "Dialog" : "", type, secure ? " secure" : "",
+            lbl ? lbl : "",
+            hold ? "held open; a frontend can type into it now"
+                 : baked ? "there is no keyboard on this host, so it is committed "
+                           "immediately with KL_UE_KEYBOARD_TEXT and the entry ends"
+                 : "there is no keyboard on this host, so the entry is ended "
+                   "immediately with the text the guest opened it with "
+                   "(KL_UE_KEYBOARD_TEXT=<s> commits <s> instead; "
+                   "KL_UE_KEYBOARD=1 holds it open for a frontend)");
+    return (klj_val){.j = 0};
+}
+
+static klj_val klj_GA_showVirtualKeyboardInput(void *env, void *self,
+                                               const klj_val *a, int n) {
+    return klj_GA_showVirtualKeyboard(env, self, a, n, 0);
+}
+static klj_val klj_GA_showVirtualKeyboardInputDialog(void *env, void *self,
+                                                     const klj_val *a, int n) {
+    return klj_GA_showVirtualKeyboard(env, self, a, n, 1);
+}
+
+static klj_val klj_GA_hideVirtualKeyboard(void *env, void *self,
+                                          const klj_val *a, int n, int dialog) {
+    (void)env; (void)a; (void)n;
+    pthread_mutex_lock(&g_vk.mu);
+    if (self) g_vk.activity = self;
+    int was = g_vk.open;
+    g_vk.open = 0;
+    // The hide arm of processLastVirtualKeyboardCommand is one native and only
+    // on the new path (GameActivity.smali:19150); the dialog's hide is a
+    // dismiss() and reports nothing at all.
+    if (!dialog) klj_vk_push(KLJ_VK_VISIBLE, 0, NULL);
+    pthread_mutex_unlock(&g_vk.mu);
+    KLJ_LOG("AndroidThunkJava_HideVirtualKeyboardInput%s()%s",
+            dialog ? "Dialog" : "", was ? "" : " — none was open");
+    return (klj_val){.j = 0};
+}
+
+static klj_val klj_GA_hideVirtualKeyboardInput(void *env, void *self,
+                                               const klj_val *a, int n) {
+    return klj_GA_hideVirtualKeyboard(env, self, a, n, 0);
+}
+static klj_val klj_GA_hideVirtualKeyboardInputDialog(void *env, void *self,
+                                                     const klj_val *a, int n) {
+    return klj_GA_hideVirtualKeyboard(env, self, a, n, 1);
+}
+
+// ---- the frontend side, shared with Unity's ---------------------------------
+//
+// kl_jni.h's four kl_jni_soft_input_* calls are the whole frontend contract and
+// there is exactly one of them, so a frontend does not have to know which
+// engine the guest is: kl_jni_softinput.c asks these first and answers for
+// Unity only when no UE field is open. A guest cannot have both — it has one
+// engine.
+int klj_ue_vk_active(void) {
+    pthread_mutex_lock(&g_vk.mu);
+    int open = g_vk.open;
+    pthread_mutex_unlock(&g_vk.mu);
+    return open;
+}
+
+int klj_ue_vk_get(char *buf, size_t cap, int *secure) {
+    pthread_mutex_lock(&g_vk.mu);
+    int open = g_vk.open;
+    if (buf && cap) {
+        strncpy(buf, open ? g_vk.text : "", cap - 1);
+        buf[cap - 1] = '\0';
+    }
+    if (secure) *secure = open ? ((g_vk.type & 0x80) != 0) : 0;
+    pthread_mutex_unlock(&g_vk.mu);
+    return open;
+}
+
+void klj_ue_vk_set(const char *utf8) {
+    if (!utf8) return;
+    pthread_mutex_lock(&g_vk.mu);
+    if (!g_vk.open) { pthread_mutex_unlock(&g_vk.mu); return; }
+    strncpy(g_vk.text, utf8, sizeof g_vk.text - 1);
+    g_vk.text[sizeof g_vk.text - 1] = '\0';
+    // The o0 TextWatcher's afterTextChanged, which is what a keystroke IS on
+    // this path: the engine's entry widget follows the field live and there is
+    // no other channel for it.
+    klj_vk_push(KLJ_VK_CHANGED, 0, g_vk.text);
+    pthread_mutex_unlock(&g_vk.mu);
+}
+
+void klj_ue_vk_close(int canceled) {
+    pthread_mutex_lock(&g_vk.mu);
+    if (!g_vk.open) { pthread_mutex_unlock(&g_vk.mu); return; }
+    int secure = (g_vk.type & 0x80) != 0;
+    klj_vk_push_close_locked(canceled);
+    pthread_mutex_unlock(&g_vk.mu);
+    KLJ_LOG("virtual keyboard %s", canceled ? "canceled"
+                                 : secure ? "committed (secure — text not logged)"
+                                          : "committed");
+}
+
+// ---- ...and the gate for it -------------------------------------------------
+//
+// `make uevk`, in `make check`. It exists for kl_jni_softinput.c's reason and
+// one more of its own: **the failure this seam had was an abort, and the
+// failure it can have NEXT is silence.** A show that reports nothing leaves the
+// engine holding an editor open forever, which produces no log line, no crash
+// and no .ips — the only other instrument would be a person pinching Edit in a
+// headset, which costs a build, an install and a launch.
+//
+// It drives the REAL bindings (they are static in this file, which is why the
+// check is here rather than in tests/) against natives it publishes through the
+// REAL guest-native resolver seam, so what it measures is the path the guest
+// takes.
+static struct {
+    int  n;
+    char log[32][256];
+} g_vk_seen;
+
+static void klj_vk_seen(const char *fmt, ...) {
+    if (g_vk_seen.n >= (int)(sizeof g_vk_seen.log / sizeof g_vk_seen.log[0])) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_vk_seen.log[g_vk_seen.n++], sizeof g_vk_seen.log[0], fmt, ap);
+    va_end(ap);
+}
+
+static void klj_vk_t_visible(void *env, void *self, uint8_t v) {
+    (void)env; (void)self; klj_vk_seen("visible %d", v);
+}
+static void klj_vk_t_changed(void *env, void *self, void *s) {
+    (void)env; (void)self;
+    klj_vk_seen("changed \"%s\"", klj_str(s) ? klj_str(s) : "(null)");
+}
+static void klj_vk_t_result(void *env, void *self, uint8_t ok, void *s) {
+    (void)env; (void)self;
+    klj_vk_seen("result %d \"%s\"", ok, klj_str(s) ? klj_str(s) : "(null)");
+}
+static void klj_vk_t_sendkey(void *env, void *self, int32_t k) {
+    (void)env; (void)self; klj_vk_seen("key %d", k);
+}
+
+static void *klj_vk_t_resolve(const char *sym) {
+    if (!sym) return NULL;
+    static const struct { const char *tail; void *fn; } t[] = {
+        {"nativeVirtualKeyboardVisible", (void *)klj_vk_t_visible},
+        {"nativeVirtualKeyboardChanged", (void *)klj_vk_t_changed},
+        {"nativeVirtualKeyboardResult",  (void *)klj_vk_t_result},
+        {"nativeVirtualKeyboardSendKey", (void *)klj_vk_t_sendkey},
+    };
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++)
+        if (strstr(sym, t[i].tail)) return t[i].fn;
+    return NULL;
+}
+
+// The whole report queue as one string, so a failure prints what actually
+// happened rather than "expected 3, got 2".
+static const char *klj_vk_trace(char *buf, size_t cap) {
+    buf[0] = '\0';
+    for (int i = 0; i < g_vk_seen.n; i++) {
+        strncat(buf, i ? " | " : "", cap - strlen(buf) - 1);
+        strncat(buf, g_vk_seen.log[i], cap - strlen(buf) - 1);
+    }
+    return buf;
+}
+
+int kl_jni_ue_keyboard_selftest(FILE *out) {
+    int fails = 0, checks = 0;
+    char tr[1024];
+#define VK_CHECK(cond, ...) do { \
+        checks++; \
+        if (!(cond)) { fprintf(out, "  FAIL: " __VA_ARGS__); fprintf(out, "\n"); fails++; } \
+    } while (0)
+#define VK_TRACE(want) do { \
+        checks++; \
+        if (strcmp(klj_vk_trace(tr, sizeof tr), (want)) != 0) { \
+            fprintf(out, "  FAIL: reported [%s]\n         expected [%s]\n", tr, (want)); \
+            fails++; \
+        } \
+    } while (0)
+
+    void *(*saved)(const char *) = g_guest_native;
+    kl_jni_set_guest_native_resolver(klj_vk_t_resolve);
+    void *act = (void *)&g_vk;          // the GameActivity handle, passed through
+    klj_val a[3];
+
+    // ---- 1. the host with no keyboard, which is every host we have ----
+    // The default. A show must not simply return: the engine has already put
+    // its editor up, and a report that never comes is a field that never
+    // closes — a close that reports only visible(false) and a key leaves the
+    // field open with a caret in it for the rest of the session, because
+    // neither native reaches the widget. `result 1` is the one
+    // that does, and it must land before the visible(false) that Resets the
+    // pointer it dispatches over. That ORDER is the whole assertion here.
+    unsetenv("KL_UE_KEYBOARD");
+    unsetenv("KL_UE_KEYBOARD_TEXT");
+    g_vk_seen.n = 0;
+    a[0].j = 0x21;                       // TYPE_CLASS_TEXT | CAP_SENTENCES
+    a[1].l = kl_jni_new_string("Enter name");
+    a[2].l = kl_jni_new_string("Player");
+    klj_GA_showVirtualKeyboardInput(kl_jni_env(), act, a, 3);
+    VK_CHECK(g_vk_seen.n == 0,
+             "the show dispatched %d native(s) before the drain — the queue is "
+             "what defers them onto the pump thread", g_vk_seen.n);
+    klj_drain_soft_input();
+    VK_TRACE("visible 1 | changed \"Player\" | result 1 \"Player\" | visible 0");
+    VK_CHECK(!klj_ue_vk_active(),
+             "the field is still open after the dismissal — the engine is "
+             "holding an editor nothing can close");
+
+    // ---- 1b. KL_UE_KEYBOARD_TEXT: the same auto-close, someone's initials ----
+    // The only text-entry a headset with no frontend can perform. It rides the
+    // commit arm, so what it proves is that the arm carries an arbitrary string
+    // to `result 1` and not just the seed.
+    setenv("KL_UE_KEYBOARD_TEXT", "ACE", 1);
+    g_vk_seen.n = 0;
+    a[2].l = kl_jni_new_string("Player");
+    klj_GA_showVirtualKeyboardInput(kl_jni_env(), act, a, 3);
+    klj_drain_soft_input();
+    VK_TRACE("visible 1 | changed \"ACE\" | result 1 \"ACE\" | visible 0");
+
+    // ...and never into a password field, whatever the env says.
+    g_vk_seen.n = 0;
+    a[0].j = 0x21 | 0x80;                // TYPE_TEXT_VARIATION_PASSWORD
+    a[2].l = kl_jni_new_string("hunter2");
+    klj_GA_showVirtualKeyboardInput(kl_jni_env(), act, a, 3);
+    klj_drain_soft_input();
+    VK_TRACE("visible 1 | changed \"hunter2\" | result 1 \"hunter2\" | visible 0");
+    a[0].j = 0x21;
+    unsetenv("KL_UE_KEYBOARD_TEXT");
+
+    // ---- 2. held open for a frontend ----
+    setenv("KL_UE_KEYBOARD", "1", 1);
+    g_vk_seen.n = 0;
+    a[2].l = kl_jni_new_string("Player");
+    klj_GA_showVirtualKeyboardInput(kl_jni_env(), act, a, 3);
+    klj_drain_soft_input();
+    VK_TRACE("visible 1");
+    VK_CHECK(klj_ue_vk_active(), "KL_UE_KEYBOARD=1 did not hold the field open");
+
+    // The frontend contract is kl_jni.h's, NOT this file's: a frontend has no
+    // way to know which engine it is typing into, so the shared four calls must
+    // reach here. This is the check that fails if the routing in
+    // kl_jni_softinput.c is dropped.
+    char text[256]; int secure = 1;
+    VK_CHECK(kl_jni_soft_input_active() == 1,
+             "kl_jni_soft_input_active() does not see a UE field — a frontend "
+             "would never offer a keyboard for it");
+    VK_CHECK(kl_jni_soft_input_get(text, sizeof text, &secure) == 1
+             && strcmp(text, "Player") == 0,
+             "the field's initial text reads \"%s\", not the guest's \"Player\"", text);
+    VK_CHECK(secure == 0, "a plain text field reported itself secure");
+
+    g_vk_seen.n = 0;
+    kl_jni_soft_input_set("ACE");
+    klj_drain_soft_input();
+    VK_TRACE("changed \"ACE\"");
+
+    // Commit. The Java on this path never calls the result native (grep the
+    // smali: p0 and q0 are the only callers and both are the dialog's) — but
+    // the NATIVE is the engine's only end-of-entry, so the commit is it.
+    g_vk_seen.n = 0;
+    kl_jni_soft_input_close(0);
+    klj_drain_soft_input();
+    VK_TRACE("changed \"ACE\" | result 1 \"ACE\" | visible 0");
+    VK_CHECK(!klj_ue_vk_active(), "the field stayed open after a commit");
+
+    // A cancellation must NOT report the edited text — committing a refused
+    // field is worse than dropping a committed one. It reports the SEED,
+    // because an accept of the original contents is the only refusal the
+    // engine's natives can express and still let go of the widget.
+    g_vk_seen.n = 0;
+    klj_GA_showVirtualKeyboardInput(kl_jni_env(), act, a, 3);
+    kl_jni_soft_input_set("ZZZ");
+    klj_drain_soft_input();
+    g_vk_seen.n = 0;
+    kl_jni_soft_input_close(1);
+    klj_drain_soft_input();
+    VK_TRACE("changed \"Player\" | result 1 \"Player\" | visible 0");
+
+    // ---- 3. the old AlertDialog path ----
+    // Different natives, different order, and the two constants that are the
+    // dialog's own rather than ours: cancel restores the ORIGINAL contents
+    // before refusing, and its refusal string is a single space.
+    g_vk_seen.n = 0;
+    a[2].l = kl_jni_new_string("Player");
+    klj_GA_showVirtualKeyboardInputDialog(kl_jni_env(), act, a, 3);
+    klj_drain_soft_input();
+    VK_TRACE("");
+    kl_jni_soft_input_set("ACE");
+    g_vk_seen.n = 0;
+    kl_jni_soft_input_close(0);
+    klj_drain_soft_input();
+    VK_TRACE("changed \"ACE\" | result 1 \"ACE\"");
+
+    g_vk_seen.n = 0;
+    a[2].l = kl_jni_new_string("Player");
+    klj_GA_showVirtualKeyboardInputDialog(kl_jni_env(), act, a, 3);
+    kl_jni_soft_input_set("ZZZ");
+    klj_drain_soft_input();
+    g_vk_seen.n = 0;
+    kl_jni_soft_input_close(1);
+    klj_drain_soft_input();
+    VK_TRACE("changed \"Player\" | result 0 \" \"");
+
+    // ---- 4. the guest closing it itself ----
+    g_vk_seen.n = 0;
+    klj_GA_showVirtualKeyboardInput(kl_jni_env(), act, a, 3);
+    klj_drain_soft_input();
+    g_vk_seen.n = 0;
+    klj_GA_hideVirtualKeyboardInput(kl_jni_env(), act, NULL, 0);
+    klj_drain_soft_input();
+    VK_TRACE("visible 0");
+    VK_CHECK(!klj_ue_vk_active(), "the guest hid the keyboard and the frontend "
+                                  "still thinks a field is open");
+
+    unsetenv("KL_UE_KEYBOARD");
+    kl_jni_set_guest_native_resolver(saved);
+    fprintf(out, "  %d check(s), %d failure(s)\n", checks, fails);
+    return fails == 0;
+#undef VK_CHECK
+#undef VK_TRACE
 }
 
 // ---- UE4's three BroadcastReceivers ----
@@ -340,6 +1033,46 @@ static klj_val klj_ue4_receiver_stop(void *env, void *self, const klj_val *a, in
     return (klj_val){.j = 0};
 }
 
+// ---- io.sentry.unreal.SentryBridgeJava ----
+//
+// Sentry's UE4 plugin, met first on Into the Radius (`io.sentry.sdk.name =
+// sentry.java.android.unreal` in its manifest). The engine calls
+// `SentryBridgeJava.init(activity, dsn, release, environment, dist)` during
+// startup and then talks to it in one direction only: breadcrumbs, tags,
+// contexts and a level. It is CRASH TELEMETRY — a network client aimed at the
+// publisher's servers — so declining it is the answer on the merits and not
+// merely a shortcut: there is no Sentry service here to be a client of, this
+// runtime has no business reporting a translated guest's stack to CM Games,
+// and every one of these calls is something the guest tells Sentry rather than
+// something it reads back.
+//
+// So they are ANSWERED as no-ops rather than refused, because the engine calls
+// them on paths it does not guard (init is unconditional in the plugin's
+// module startup) and an abort there is an abort in the middle of a healthy
+// boot — which is exactly how Into the Radius's first long host run ended.
+//
+// Deliberately NOT here: `captureEventWithScope` and `captureMessageWithScope`.
+// Both RETURN a SentryId, both are reached only when the guest is actually
+// reporting a crash or a message, and both would need an object invented to
+// answer at all. Leaving them out keeps the runtime's habit — a family whose
+// answer would have to be fabricated stays unimplemented and aborts by name —
+// and if one ever fires, that abort is the news, not the bug.
+static klj_val klj_Sentry_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("SentryBridgeJava.init() — declined: crash telemetry, and there is "
+            "no Sentry service here to be a client of. The bridge answers as a "
+            "no-op so the engine's unconditional init does not abort the boot.");
+    return (klj_val){.j = 0};
+}
+
+// The write-only half of the same bridge: addBreadcrumb, setTag, removeTag,
+// setContext, setLevel, configureScope. One handler, because they differ only
+// in what they would have sent.
+static klj_val klj_Sentry_sink(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
 // The engine's request for a render surface size. On Android the activity only
 // acts on it when the SurfaceView sizing workaround is on (a device quirk we do
 // not have); everything else about it is a record. Worth printing rather than
@@ -352,7 +1085,7 @@ static klj_val klj_GA_forceQuit(void *env, void *self, const klj_val *a, int n) 
     // but if this fires, something upstream went wrong and the log above it says
     // what. (With vkGetPhysicalDeviceMemoryProperties2 implemented, the Vulkan
     // path no longer triggers it.)
-    KLJ_LOG("AndroidThunkJava_ForceQuit() — the guest asked to quit; ignored "
+    KLJ_LOG("AndroidThunkJava_ForceQuit() — the guest asked to quit "
             "(see the log just above for why it wanted to)");
     // Shipping UE builds strip their runtime log, so the "why" often is NOT
     // above — nothing reaches stdout or logcat. Dump the GUEST call stack of
@@ -361,6 +1094,51 @@ static klj_val klj_GA_forceQuit(void *env, void *self, const klj_val *a, int n) 
     // pak-mount / module path), which is the only handle on a logless quit.
     fprintf(stderr, "  [ue4] ForceQuit caller stack (symbolise against the guest "
                     "libUE4/libUnreal with tools/symof.py):\n");
+    kl_fault_print_frames(stderr, __builtin_frame_address(0));
+    // ...and the reason itself, when the engine kept it. A Shipping build drops
+    // the log line but FDebug::AssertFailed and the fatal-error path still
+    // format their message into GErrorHist (TCHAR, 4 bytes a character on
+    // Android), and UE4 exports it. Vader Immortal I quit here with nothing
+    // printed; this buffer names the missing global shader cache file.
+    const uint32_t *hist = kl_guest_sym_global("GErrorHist");
+    if (hist && hist[0]) {
+        char msg[1024];
+        size_t k = 0;
+        for (size_t i = 0; hist[i] && k + 1 < sizeof msg; i++)
+            msg[k++] = (hist[i] >= 0x20 && hist[i] < 0x7f) || hist[i] == '\n'
+                     ? (char)hist[i] : '?';
+        msg[k] = 0;
+        fprintf(stderr, "  [ue4] ForceQuit reason (GErrorHist): %s\n", msg);
+    }
+    // KL_UE4_FORCE_QUIT=1: obey it, as the Quest does. The pump ends and the
+    // app leaves as for a game's own quit. On by default for Medal of Honor,
+    // whose Quit button reaches ForceQuit once FEngineLoop::Exit is through
+    // (moh-exit-no-rhi-teardown, kl_guestpatch.c); off for every other title,
+    // where ForceQuit is still a bail worth staying alive for.
+    const char *t = kl_driver_target_name();
+    if (kl_env_on("KL_UE4_FORCE_QUIT", t && strcmp(t, "x3647259232032222") == 0)) {
+        fprintf(stderr, "  [ue4] ForceQuit obeyed (KL_UE4_FORCE_QUIT): the game quit — ending the run\n");
+        fflush(stderr);
+        kl_ue4_note_force_quit();
+    } else {
+        fprintf(stderr, "  [ue4] ForceQuit ignored: the run goes on (KL_UE4_FORCE_QUIT=1 obeys it)\n");
+    }
+    return (klj_val){0};
+}
+// AndroidThunkJava_RestartApplication(String) — on Android the activity schedules
+// its own relaunch through AlarmManager and exits. UE4 asks for it once its
+// first-run OpenGL program binary cache is complete (the relaunch only frees the
+// memory the precompile used), so a fresh install of The Walking Dead: Saints &
+// Sinners called it right after its logo and died on the missing method. There
+// is no relaunching an app from inside itself here, and the programs it just
+// compiled are already live in this process, so carry on instead: the same
+// "ignored, keep running" answer ForceQuit gets.
+static klj_val klj_GA_restartApplication(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("AndroidThunkJava_RestartApplication() — the guest asked to relaunch "
+            "itself; ignored, the process keeps running");
+    fprintf(stderr, "  [ue4] RestartApplication caller stack (symbolise against the "
+                    "guest libUE4/libUnreal with tools/symof.py):\n");
     kl_fault_print_frames(stderr, __builtin_frame_address(0));
     return (klj_val){0};
 }
@@ -390,6 +1168,23 @@ static klj_val klj_GA_getDeviceOrientation(void *env, void *self, const klj_val 
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 3};   // EDeviceScreenOrientation::LandscapeLeft
 }
+// AndroidThunkJava_GetDeviceRotation()I — UE5's GameActivity answers it from
+// getCurrentDeviceRotationDegree(): Display.getRotation() turned into degrees
+// (0, 90, 180, 270) away from the panel's natural orientation. A headset's
+// display is never rotated, so a Quest answers 0, and so do we. Alien: Rogue
+// Incursion (UE 5.3) calls it while the RHI comes up, and with no row here that
+// was a fatal "no host implementation" before the first frame.
+static klj_val klj_GA_getDeviceRotation(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};   // Surface.ROTATION_0 — 0 degrees
+}
+// AndroidThunkJava_GetConfigurationOrientation()I is the same question asked of
+// Configuration.orientation (1 portrait, 2 landscape) and is resolved alongside
+// it; answered to agree with klj_GA_getDeviceOrientation's fixed landscape.
+static klj_val klj_GA_getConfigurationOrientation(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 2};   // Configuration.ORIENTATION_LANDSCAPE
+}
 static klj_val klj_GA_setNativeDisplayRefreshRate(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 1};   // jboolean true — accepted
@@ -415,12 +1210,125 @@ static klj_val klj_GA_getFontDirectory(void *env, void *self, const klj_val *a, 
     return (klj_val){.l = kl_jni_new_string("/system/fonts/")};
 }
 
+// GameActivity.getAppPackageName(): the Java returns getPackageName(), i.e. the
+// guest's own package from its manifest — the same answer Context.getPackageName
+// gives in kl_jni_android.c. Tales from the Galaxy's Edge (x3484270071659289)
+// asks for it right after its first frame and stopped there without it.
+static klj_val klj_GA_getAppPackageName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    const char *pkg = kl_jni_guest_package();
+    return (klj_val){.l = kl_jni_new_string(pkg ? pkg : "")};
+}
+
+
+
+// Pinball FX (UE5.3) asks the same question under 5.x's names, and both are
+// one-liners in that APK's own GameActivity.smali:
+//
+//   GetDeviceRotation()           -> getWindowManager().getDefaultDisplay().getRotation()
+//   GetConfigurationOrientation() -> getResources().getConfiguration().orientation
+//
+// Answered from the same constants the Display family answers from, so a guest
+// that reads the rotation both ways sees one screen. Orientation is
+// ORIENTATION_LANDSCAPE (2), NOT derived from KLJ_DISPLAY_W/H (taller than
+// wide, which would compute PORTRAIT): the activity declares
+// `android:screenOrientation="landscape"`, as every UE Android VR build does,
+// and a guest told PORTRAIT transposes its viewport.
+#define KLJ_ORIENTATION_LANDSCAPE 2
+
+
+
+// `AndroidThunkJava_ForceQuit()V` — the engine asking the activity to end the
+// process. In a UE4.27 GameActivity.smali the whole body is
+// `System.exit(0)`: not finish(), not a lifecycle transition — an immediate,
+// unconditional process exit, called from two sites in the same class.
+//
+// It is OBSERVED rather than obeyed, and that is a deliberate default for a
+// bring-up: exiting here takes the host process down mid-run, which loses the
+// boot log's tail and every end-of-run report (the JNI surface, the OVRPlugin
+// surface, the platform surface) — i.e. exactly the evidence that would say WHY
+// the guest wanted to quit. A quit has to be VISIBLE, not hidden: a silent
+// one reads as a stall.
+//
+// So it is logged every single time — never once-only — and the fact is
+// counted. `KL_UE4_FORCE_QUIT=1` obeys it and really exits, which is what a
+// device build wants once a port is past bring-up.
+
+
+
 // UE4's own VR gate, and the same question Unity's is: GameActivity.onCreate
 // sets `PackagedForOculusMobile` from `queryIntentActivities()` for its own
 // package under `com.oculus.intent.category.VR`, OR the presence of the Samsung
 // VR mode <meta-data> key. Answered by asking those two, not by a constant —
 // the manifest declares the category, so a match is the truth (see "Settled
 // decisions"), and a guest told otherwise disables the whole path under test.
+// GameActivity.playVideo(String path, Surface) — an Unreal title's own Java
+// video player (ExoPlayer) run into the Surface of an Equirect layer
+// (kl_ovrp.c, GetLayerAndroidSurfaceObject). Medal of Honor: Above and Beyond
+// plays its 360 gallery films this way. There is no ExoPlayer here; the path
+// is resolved to a host file and handed to the compositor's loading skybox,
+// which plays it on that layer (kl_loadingvideo_set_source). The Java side
+// takes "file://…", a bare path, or "jar:file:<container>!/<entry>" for a
+// video inside the APK or an OBB; the last is served when the entry is stored
+// plainly in the OBB the read-through knows, and is copied out once.
+static void klj_GA_video_resolve(const char *what, char *out, size_t cap) {
+    out[0] = 0;
+    if (!what || !*what) return;
+    const char *p = what;
+    if (strncmp(p, "file://", 7) == 0) p += 7;
+    char kp[1024], host[1024];
+    if (strncmp(p, "jar:file:", 9) == 0) {
+        const char *bang = strstr(p, "!/");
+        if (!bang) return;
+        p = bang + 2;          // the entry; the read-through indexes it by name
+    }
+    const char *gp = kl_guest_path(p, kp, sizeof kp);
+    if (access(gp, R_OK) == 0) { snprintf(out, cap, "%s", gp); return; }
+    long long base = 0, size = 0;
+    if (!kl_obbmap_locate(gp, host, sizeof host, &base, &size) || size <= 0) return;
+    const char *tmp = getenv("TMPDIR");
+    const char *bn = strrchr(gp, '/');
+    char dst[1024];
+    snprintf(dst, sizeof dst, "%s/klepton-video-%s", tmp && *tmp ? tmp : "/tmp", bn ? bn + 1 : gp);
+    struct stat st;
+    if (stat(dst, &st) != 0 || st.st_size != size) {
+        FILE *in = fopen(host, "rb"), *o = in ? fopen(dst, "wb") : NULL;
+        int ok = in && o && fseeko(in, base, SEEK_SET) == 0;
+        char buf[1 << 16];
+        for (long long left = size; ok && left > 0;) {
+            size_t want = left > (long long)sizeof buf ? sizeof buf : (size_t)left;
+            size_t got = fread(buf, 1, want, in);
+            ok = got == want && fwrite(buf, 1, got, o) == got;
+            left -= (long long)got;
+        }
+        if (in) fclose(in);
+        if (o) fclose(o);
+        if (!ok) { unlink(dst); return; }
+    }
+    snprintf(out, cap, "%s", dst);
+}
+static klj_val klj_GA_playVideo(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *what = n > 0 ? klj_str(a[0].l) : NULL;
+    char host[1024];
+    klj_GA_video_resolve(what, host, sizeof host);
+    KLJ_LOG("GameActivity.playVideo(\"%s\") -> %s", what ? what : "",
+            host[0] ? host : "not found; nothing is played");
+    kl_loadingvideo_set_source(host[0] ? host : NULL);
+    return (klj_val){.j = 0};
+}
+// initVideoPlayer() only builds the Java player; nothing to build here.
+// dispose() releases it: the video stops.
+static klj_val klj_GA_initVideoPlayer(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_GA_disposeVideo(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    kl_loadingvideo_set_source(NULL);
+    return (klj_val){.j = 0};
+}
+
 static klj_val klj_GA_isOculusMobile(void *env, void *self, const klj_val *a, int n) {
     void *list = klj_PM_queryIntentActivities(env, self, a, n).l;
     int vr = list && klj_List_size(env, list, NULL, 0).j > 0;
@@ -466,6 +1374,17 @@ static klj_val klj_MsgBox_show(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.j = 0};
 }
 
+// AndroidThunkJava_GetNetworkConnectionType() -> ENetworkConnectionType, as
+// UE4's GameActivity numbers it: 0 none, 1 airplane mode, 2 cell, 3 WiFi,
+// 4 WiMAX, 5 Bluetooth, 6 Ethernet. A Vision Pro reaches the network over
+// WiFi and nothing else, and this runtime has no notion of the link being
+// down, so the answer is WiFi — which is also what a Quest gives. Tales from
+// the Galaxy's Edge asks once its content has been found (2026-10-11).
+static klj_val klj_GA_networkConnectionType(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 3};
+}
+
 // ---- Unreal Engine 4: com.epicgames.ue4.MediaPlayer14 ----------------------
 //
 // UE4's Java media player, and the thing standing between RE4 and its opening
@@ -498,11 +1417,61 @@ typedef struct {
     float      volume;
     int        looping;
     int        started;          // start() seen; distinct from the decoder running
-    void      *buffer;           // the java.nio.Buffer handed out, cached
     unsigned long long buf_serial;
     int        last_w, last_h;   // for didResolutionChange
     int        res_changed;
+    unsigned long long tex_serial;   // the frame last put into the guest's texture
+    unsigned   tex_uploads;
+    unsigned   tex_asks;             // getVideoLastFrame calls, new frame or not
+    uint32_t   tex_seen[64];         // the distinct textures it was asked to fill
+    unsigned   tex_nseen;
 } klj_media;
+
+// Where playback is, in milliseconds, as the guest is told it.
+//
+// A Vulkan guest (RE4) is told the time of the frame it was last handed.
+//
+// A GLES guest is told ZERO, and that is measured rather than chosen. UE4's
+// player has two GLES routes. The one every Android device takes hands frames
+// over as an external texture; this runtime has no external textures, so the
+// engine takes its fallback, which stamps a sample with this value on the
+// render thread and fetches it on the game thread against the engine's own
+// playback time. On that route the engine's time never moves: traced on Tales
+// from the Galaxy's Edge (KL_MP14_TRACE), the game thread asks isPlaying,
+// didComplete and didResolutionChange every tick and never the position. So a
+// sample stamped with any time but zero is "not due yet" for ever — none is
+// fetched, each keeps a texture of its own, and the title grew by one movie
+// frame per frame until a Vision Pro jettisoned it at 8 GB (2026-10-11).
+// Tried and all the same: the frame's own time, a running clock, a clock held
+// to less than a frame per reading, a constant 500, +1 per call, a time
+// running backwards. With zero the engine cycles through five textures and
+// the movie is on screen. Its end comes from didComplete, not from here.
+static long long klj_media_position(klj_media *m) {
+    if (!m || !m->dec) return 0;
+    return m->vulkan ? kl_avdec_position_ms(m->dec) : 0;
+}
+
+// KL_MP14_TRACE=1 — name every call the guest makes on a player, with the
+// thread it came from, for the first few hundred. The order of an engine's
+// calls on its player IS its playback logic, and it is not written anywhere
+// else that can be read from here.
+// A call that repeats the one before it (the position, asked every frame) is
+// said only every 120th time, so the budget lasts for the whole of a movie
+// rather than its first half second.
+static void klj_media_trace(const char *what, long long value) {
+    static int on = -1;
+    static unsigned said, repeats;
+    static const char *last;
+    if (on < 0) on = kl_env_on("KL_MP14_TRACE", 0);
+    if (!on || said >= 600) return;
+    if (what == last && (++repeats % 120) != 0) return;
+    if (what != last) repeats = 0;
+    last = what;
+    said++;
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    fprintf(stderr, "[mp14] t%llu %s -> %lld\n", (unsigned long long)tid, what, value);
+}
 
 static klj_media *klj_media_of(void *self) {
     klj_object *o = klj_as_object(self);
@@ -526,7 +1495,24 @@ static void klj_media_open(klj_media *m, const char *what, long long off,
     // depending on which MediaSource built the URL.
     const char *p = m->source;
     if (strncmp(p, "file://", 7) == 0) p += 7;
-    m->dec = kl_avdec_open(p, off, len);
+    // The guest names the container by ITS path. Where that is a file of its
+    // own the translation is all there is to it; where the container is itself
+    // an entry of the OBB — Tales from the Galaxy's Edge keeps its movies in
+    // Taco-Android_ASTC.pak, which is stored inside main.*.obb and reaches the
+    // guest through the OBB read-through — the range is into that entry, so it
+    // is rebased onto the OBB. Without this the open failed, setDataSource
+    // answered false, and the title sat in front of a movie that never ran.
+    char kp[1024], host[1024];
+    const char *gp = kl_guest_path(p, kp, sizeof kp);
+    long long base = 0, whole = 0;
+    if (access(gp, R_OK) != 0 && kl_obbmap_locate(gp, host, sizeof host, &base, &whole)) {
+        if (len <= 0) len = whole - off;
+        KLJ_LOG("MediaPlayer14: %s is an entry of the OBB — reading %lld bytes at "
+                "%lld + %lld of it", p, len, base, off);
+        gp = host;
+        off += base;
+    }
+    m->dec = kl_avdec_open(gp, off, len);
     if (!m->dec)
         KLJ_LOG("MediaPlayer14: could not open %s (offset %lld, %lld bytes) — "
                 "setDataSource answers false and the guest's own no-media path "
@@ -603,12 +1589,14 @@ static klj_val klj_MP14_start(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
     if (m) { m->started = 1; kl_avdec_play(m->dec, 1); }
+    klj_media_trace("start", (long long)(0));
     return (klj_val){.j = 0};
 }
 static klj_val klj_MP14_pause(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
     if (m) kl_avdec_play(m->dec, 0);
+    klj_media_trace("pause", (long long)(0));
     return (klj_val){.j = 0};
 }
 static klj_val klj_MP14_stop(void *env, void *self, const klj_val *a, int n) {
@@ -621,6 +1609,7 @@ static klj_val klj_MP14_reset(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
     if (m && m->dec) { kl_avdec_close(m->dec); m->dec = NULL; m->started = 0; }
+    if (m) m->tex_serial = 0;
     return (klj_val){.j = 0};
 }
 static klj_val klj_MP14_release(void *env, void *self, const klj_val *a, int n) {
@@ -630,22 +1619,26 @@ static klj_val klj_MP14_seekTo(void *env, void *self, const klj_val *a, int n) {
     (void)env;
     klj_media *m = klj_media_of(self);
     if (m) kl_avdec_seek(m->dec, n > 0 ? (int32_t)a[0].j : 0);
+    klj_media_trace("seekTo", (long long)(n > 0 ? (int32_t)a[0].j : 0));
     return (klj_val){.j = 0};
 }
 static klj_val klj_MP14_setLooping(void *env, void *self, const klj_val *a, int n) {
     (void)env;
     klj_media *m = klj_media_of(self);
     if (m) { m->looping = n > 0 && a[0].j != 0; kl_avdec_set_looping(m->dec, m->looping); }
+    klj_media_trace("setLooping", (long long)(n > 0 && a[0].j != 0));
     return (klj_val){.j = 0};
 }
 static klj_val klj_MP14_isLooping(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
+    klj_media_trace("isLooping", (long long)(m && m->looping));
     return (klj_val){.j = m && m->looping};
 }
 static klj_val klj_MP14_isPlaying(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
+    klj_media_trace("isPlaying", (long long)(m && kl_avdec_playing(m->dec)));
     return (klj_val){.j = m && kl_avdec_playing(m->dec)};
 }
 // "Prepared" is "a decoder is open on real media", which is the same condition
@@ -659,17 +1652,21 @@ static klj_val klj_MP14_isPrepared(void *env, void *self, const klj_val *a, int 
 static klj_val klj_MP14_didComplete(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
+    klj_media_trace("didComplete", (long long)(m && kl_avdec_complete(m->dec)));
     return (klj_val){.j = m && kl_avdec_complete(m->dec)};
 }
 static klj_val klj_MP14_getDuration(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
+    klj_media_trace("getDuration", (long long)(m ? kl_avdec_duration_ms(m->dec) : 0));
     return (klj_val){.j = (uint64_t)(uint32_t)(m ? kl_avdec_duration_ms(m->dec) : 0)};
 }
 static klj_val klj_MP14_getCurrentPosition(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_media *m = klj_media_of(self);
-    return (klj_val){.j = (uint64_t)(uint32_t)(m ? kl_avdec_position_ms(m->dec) : 0)};
+    long long pos = klj_media_position(m);
+    klj_media_trace("getCurrentPosition", pos);
+    return (klj_val){.j = (uint64_t)(uint32_t)pos};
 }
 static klj_val klj_MP14_getVideoWidth(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
@@ -711,11 +1708,14 @@ static klj_val klj_MP14_setAudioVolume(void *env, void *self, const klj_val *a, 
 
 // The frame, as a direct ByteBuffer over the decoder's own storage.
 //
-// The buffer object is cached per player: UE4 calls this every frame it wants a
-// picture, and a fresh jobject per call is garbage the guest's local frame has
-// to retire. The ADDRESS behind it is stable for the life of the decoder — the
-// frame buffer is reallocated only when the dimensions change, which is why the
-// cache is dropped when they do.
+// A new buffer object on every call, over the same storage: the engine treats
+// the answer as a local reference and DeleteLocalRefs it once it has read the
+// pixels, which retires the object here. A cached one was dead from the second
+// call on — GetDirectBufferAddress answered NULL and -1 — so the engine got the
+// first frame of a movie and nothing after it, and Medal of Honor's intro never
+// made a texture at all (2026-10-18). The ADDRESS behind it is stable for the
+// life of the decoder; the frame buffer is reallocated only when the dimensions
+// change.
 static klj_val klj_MP14_getVideoLastFrameData(void *env, void *self,
                                               const klj_val *a, int n) {
     (void)a; (void)n;
@@ -725,28 +1725,92 @@ static klj_val klj_MP14_getVideoLastFrameData(void *env, void *self,
     size_t bytes = 0;
     unsigned long long serial = 0;
     const void *px = kl_avdec_frame(m->dec, &w, &h, &bytes, &serial);
+    klj_media_trace("getVideoLastFrameData(serial)", px && bytes ? (long long)serial : -1);
     if (!px || !bytes) return (klj_val){.l = NULL};
+    // KL_MP14_NEW_FRAMES_ONLY: answer null for a frame already handed over,
+    // as Android's player does when nothing new was decoded. Vampire's UE 4.27
+    // copies every non-null answer into a new 4 MB sample, and two 30 fps
+    // movies asked every tick piled up ~6 GB in seconds in the sanctuary
+    // until the system ended the app (2026-10-29). Default 1 for `vampire`.
+    static int new_only = -1;
+    if (new_only < 0) new_only = kl_env_on("KL_MP14_NEW_FRAMES_ONLY", 0);
+    if (new_only && serial == m->buf_serial) return (klj_val){.l = NULL};
     if (w != m->last_w || h != m->last_h) {
         m->res_changed = 1;
         m->last_w = w; m->last_h = h;
-        m->buffer = NULL;
     }
-    if (!m->buffer)
-        m->buffer = klj_own(klj_NewDirectByteBuffer(env, (void *)px, (int64_t)bytes),
-                            NULL);
     m->buf_serial = serial;
-    return (klj_val){.l = m->buffer};
+    return (klj_val){.l = klj_NewDirectByteBuffer(env, (void *)px, (int64_t)bytes)};
 }
 
-// (int) -> Z: "is there a frame at all". The int is the external texture the
-// GLES path would have rendered into and is not one here.
+// (int destTexture) -> Z: "is there a frame", and on GLES also "put it there".
+//
+// On Android the Java player draws its SurfaceTexture into the 2D texture the
+// engine names — this is how a GLES guest without the external-texture route
+// gets its movie (FAndroidMediaPlayer's render-thread GetVideoLastFrame, with
+// the native name of the sample's own texture). Here the frame is plain
+// pixels, so it is uploaded into that texture, once per new frame. A Vulkan
+// guest (RE4) passes no texture and reads getVideoLastFrameData instead; for
+// it this stays the question it was.
+//
+// Tales from the Galaxy's Edge is the GLES guest this was written for: its two
+// opening movies, and a picture that stayed black behind them (2026-10-11).
+static klj_val klj_MP14_getVideoLastFrame_locked(klj_media *m, uint32_t tex);
 static klj_val klj_MP14_getVideoLastFrame(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)a; (void)n;
+    (void)env;
     klj_media *m = klj_media_of(self);
+    klj_media_trace("getVideoLastFrame(texture)", n > 0 ? (long long)(int32_t)a[0].j : -1);
     if (!m || !m->dec) return (klj_val){.j = 0};
+    // Held until the upload below is done: kl_avdec_frame hands back the
+    // decoder's own buffer, and its decode thread writes the next frame into
+    // it whenever one is ready — mid-copy, without this, which puts a later
+    // frame (or half of one) into the texture early. Read off the code, not
+    // seen on a UE4 title, and the decode thread waits on the upload while it
+    // is held, so KL_UE4_MEDIA_FRAME_LOCK=0|1 is off by default.
+    static int frame_lock = -1;
+    if (frame_lock < 0) frame_lock = kl_env_on("KL_UE4_MEDIA_FRAME_LOCK", 0);
+    if (frame_lock) kl_avdec_frame_lock(m->dec);
+    klj_val r = klj_MP14_getVideoLastFrame_locked(m, n > 0 ? (uint32_t)a[0].j : 0);
+    if (frame_lock) kl_avdec_frame_unlock(m->dec);
+    return r;
+}
+static klj_val klj_MP14_getVideoLastFrame_locked(klj_media *m, uint32_t tex) {
     unsigned long long serial = 0;
-    const void *px = kl_avdec_frame(m->dec, NULL, NULL, NULL, &serial);
-    return (klj_val){.j = px != NULL && serial != 0};
+    int w = 0, h = 0;
+    const void *px = kl_avdec_frame(m->dec, &w, &h, NULL, &serial);
+    if (!px || !serial) return (klj_val){.j = 0};
+    if (w != m->last_w || h != m->last_h) {
+        m->res_changed = 1;
+        m->last_w = w; m->last_h = h;
+    }
+    klj_media_trace("getVideoLastFrame", (long long)tex);
+    // How the guest uses this, said every few hundred calls: how often it
+    // asks, how many of those were new frames, and into how many DIFFERENT
+    // textures — a guest that takes a fresh texture for every frame and keeps
+    // them is a gigabyte in seconds at these sizes.
+    if (!m->vulkan && tex) {
+        unsigned k = 0;
+        while (k < m->tex_nseen && m->tex_seen[k] != tex) k++;
+        if (k == m->tex_nseen && m->tex_nseen < 64) m->tex_seen[m->tex_nseen++] = tex;
+        if (++m->tex_asks % 900 == 0) {
+            extern int kl_glfb_is_texture(uint32_t);
+            unsigned alive = 0;
+            for (unsigned q = 0; q < m->tex_nseen; q++) alive += kl_glfb_is_texture(m->tex_seen[q]) ? 1u : 0u;
+            KLJ_LOG("MediaPlayer14: %u frame requests, %u new frames uploaded, %u distinct "
+                    "textures named%s, %u of them still exist", m->tex_asks, m->tex_uploads, m->tex_nseen,
+                    m->tex_nseen >= 64 ? " (or more)" : "", alive);
+        }
+    }
+    if (!m->vulkan && tex && serial != m->tex_serial) {
+        extern int kl_glfb_upload_picture(uint32_t, int, int, const void *, int);
+        if (kl_glfb_upload_picture(tex, w, h, px, !m->swizzle)) {
+            m->tex_serial = serial;
+            if (m->tex_uploads++ == 0)
+                KLJ_LOG("MediaPlayer14: first frame %dx%d into the guest's texture %u "
+                        "(GLES path)", w, h, tex);
+        }
+    }
+    return (klj_val){.j = 1};
 }
 
 // Latched and cleared by the read, which is what "did it change" means — a
@@ -757,6 +1821,7 @@ static klj_val klj_MP14_didResolutionChange(void *env, void *self, const klj_val
     if (!m) return (klj_val){.j = 0};
     int c = m->res_changed;
     m->res_changed = 0;
+    klj_media_trace("didResolutionChange", (long long)(c));
     return (klj_val){.j = c != 0};
 }
 
@@ -798,10 +1863,54 @@ static klj_val klj_MP14_tracks_caption(void *env, void *self, const klj_val *a, 
     return (klj_val){.l = klj_new_array('L',
         "com/epicgames/ue4/MediaPlayer14$CaptionTrackInfo", 0)};
 }
+// The video track: one, when a decoder is open — it decodes exactly one.
+//
+// An empty list here was "no selectable tracks", and for a guest that asks
+// (needTrackInfo, the ctor's third bool) that is not a neutral answer: UE4's
+// FAndroidMediaPlayer selects video track 0 only if the list has one, and
+// fetches frames only for a selected track. With none the movie opened,
+// "played" and ended without one frame being asked for (Tales from the
+// Galaxy's Edge, 2026-10-11). A guest that does not ask is given a made-up
+// track by the engine itself, which is why RE4 never needed this.
+//
+// The fields are the eight FJavaAndroidMediaPlayer reads off each element:
+// Index, MimeType, DisplayName, Language, BitRate, Width, Height, FrameRate.
+// Width and Height are the decoder's; the frame rate is not something kl_avdec
+// reports, and 30 is what the engine itself assumes when it has no track info.
+#define KLJ_MP14_VTRACK "com/epicgames/ue4/MediaPlayer14$VideoTrackInfo"
+typedef struct { int w, h; } klj_media_vtrack;
+
+int klj_ue4_media_track_field(void *obj, const char *cls, const char *name,
+                              const char *sig, klj_val *out) {
+    if (strcmp(cls, KLJ_MP14_VTRACK) != 0) return 0;
+    klj_object *o = klj_as_object(obj);
+    const klj_media_vtrack *t = (o && strcmp(o->cls, KLJ_MP14_VTRACK) == 0) ? o->data : NULL;
+    *out = (klj_val){0};
+    if (!t) return 1;
+    if      (strcmp(name, "Width") == 0)       out->j = (uint64_t)(uint32_t)t->w;
+    else if (strcmp(name, "Height") == 0)      out->j = (uint64_t)(uint32_t)t->h;
+    else if (strcmp(name, "FrameRate") == 0) { if (sig[0] == 'F') out->d = 30.0; else out->j = 30; }
+    else if (strcmp(name, "MimeType") == 0)    out->l = kl_jni_new_string("video/avc");
+    else if (strcmp(name, "DisplayName") == 0) out->l = kl_jni_new_string("Video Track 0 (Stream 0)");
+    else if (strcmp(name, "Language") == 0)    out->l = kl_jni_new_string("und");
+    // Index and BitRate: 0 — the first track, and a rate nobody measured.
+    return 1;
+}
+
 static klj_val klj_MP14_tracks_video(void *env, void *self, const klj_val *a, int n) {
-    (void)self; (void)a; (void)n;
-    return (klj_val){.l = klj_new_array('L',
-        "com/epicgames/ue4/MediaPlayer14$VideoTrackInfo", 0)};
+    (void)env; (void)a; (void)n;
+    klj_media *m = klj_media_of(self);
+    int have = m && m->dec && kl_avdec_width(m->dec) > 0 && kl_avdec_height(m->dec) > 0;
+    void *list = klj_new_array('L', KLJ_MP14_VTRACK, have ? 1 : 0);
+    klj_array *arr = klj_arr(list);
+    if (have && arr) {
+        klj_media_vtrack *t = calloc(1, sizeof *t);
+        if (t) {
+            t->w = kl_avdec_width(m->dec); t->h = kl_avdec_height(m->dec);
+            ((void **)arr->data)[0] = klj_new_object_data(KLJ_MP14_VTRACK, t);
+        }
+    }
+    return (klj_val){.l = list};
 }
 static klj_val klj_MP14_selectTrack(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
@@ -820,13 +1929,16 @@ static klj_val klj_GA_getSharedPreferenceString(void *env, void *self, const klj
     return (klj_val){.l = kl_jni_new_string(def ? def : "")};
 }
 
-// io/sentry/unreal/SentryBridgeJava.init(...) — the Sentry crash-reporting SDK's
-// Java bridge. We have no Sentry backend and want none; a no-op init lets the
-// guest (Into the Radius) proceed. It only ever reports on a crash we would see
-// ourselves, so swallowing it loses nothing.
-static klj_val klj_Sentry_init(void *env, void *self, const klj_val *a, int n) {
+
+// The bridge's void scope setters (breadcrumbs, level, tags) after a no-op
+// init: they annotate reports that will never be sent. Breadcrumbs can arrive
+// every frame, so this logs once. The bridge's capture*/isCrashedLastRun
+// return values and are deliberately not answered here.
+static klj_val klj_Sentry_scope_noop(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    KLJ_LOG("SentryBridgeJava.init() — no-op (no Sentry backend)");
+    static int said;
+    if (!said++)
+        KLJ_LOG("SentryBridgeJava scope setter — no-op (no Sentry backend; logged once)");
     return (klj_val){.l = NULL};
 }
 
@@ -839,10 +1951,225 @@ static klj_val klj_GA_void_noop(void *env, void *self, const klj_val *a, int n) 
     return (klj_val){.l = NULL};
 }
 
+// The bHaptics plugin's thunks (haptic vests and sleeves, reached through the
+// bHaptics Player app on a Quest). There is no such device or app here, so the
+// family answers as a headset with none paired: nothing registered, nothing
+// playing, every submit and ping dropped. The two that return objects get
+// well-formed empties rather than NULL, since the plugin reads them: the device
+// list as an empty JSON array, a position's status as its 20 motors all at 0.
+// In Death: Unchained stopped at Initialize the first time its pointer touched
+// a button (the hover pulse is the first haptic it plays).
+static klj_val klj_GA_bhapticsDeviceList(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("[]")};
+}
+static klj_val klj_GA_bhapticsPositionStatus(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = klj_new_array('B', NULL, 20)};
+}
+
 // The Electra H264 decoder (com/epicgames/unreal/ElectraVideoDecoderH264) that
 // wanderer drives for its intro video is a whole family of its own — see
 // runtime/jni/kl_jni_electra.c, which wires it to kl_vtdec. It used to be a
 // single GetDecoderInformation stub returning NULL here to skip the video.
+
+// ---- Pinball FX VR's BluetoothHelper: no Android Bluetooth stack here ----
+//
+// Pinball FX VR (x7255396864545733) ships its own Java helper,
+// com/zenstudios/PinballFX_VR/BluetoothHelper, and asks it right after its
+// first textures load which Bluetooth input devices are connected, as an
+// array of names. There is no Android Bluetooth stack on this host, so the
+// answer is the one a device with nothing connected would give: an empty
+// String[] (not NULL, which a caller iterating .length would trip over).
+// Without this row the static call aborted at boot ("no host implementation")
+// just after the permission prompts — the crash the user saw.
+// The class is the game's own, so this row cannot affect any other title.
+static klj_val klj_PFXVR_getConnectedInputDevices(void *env, void *self,
+                                                  const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("PinballFX_VR BluetoothHelper.getConnectedInputDevices() -> [] "
+                "(no Android Bluetooth stack on this host)");
+    return (klj_val){.l = klj_new_array('L', KLJ_CLASS_STRING, 0)};
+}
+
+// ---------------------------------------------------------------------------
+// UE4.27's post-init GameActivity surface
+// ---------------------------------------------------------------------------
+// The 28 GameActivity thunks above are the ones an Unreal guest reaches on the
+// way to `FEngineLoop::Init()`. A title that gets past it (Five Nights at
+// Freddy's: Help Wanted 2 logs `Engine is initialized` and loads its splash
+// map) opens JNI doors nothing here had bound.
+//
+// Rather than bind one name per failed run, the whole reachable set was
+// enumerated statically: every `AndroidThunkJava_*` that APK's GameActivity.smali declares,
+// intersected with the name strings actually present in libUE4.so (a thunk the
+// engine never looks up cannot abort), minus what is already bound above. What
+// is left is implemented here, by family.
+//
+// **The Ads family is bound too, and the reason is a property of THIS runtime
+// rather than of the guest.** Those eight thunks (ShowAdBanner,
+// LoadInterstitialAd, GetAdvertisingId and siblings) are in libUE4 but have NO
+// Java counterpart in this APK's GameActivity — the smali has zero occurrences.
+// On a real device UE4's FJavaWrapper::FindMethod would get NULL back and the
+// engine's `if (Method)` guard would skip the whole path. Here, method lookups
+// NEVER fail by design (kl_jni.h: only a CALL proves something is needed), so
+// the guest is handed eight valid-looking jmethodIDs and the guard cannot fire. What is a dead branch on Android
+// is a live abort here. Binding them is not gold-plating; it is repairing a
+// hole this runtime's own lookup policy opens.
+//
+// The smali-only names (GetCommandLine, CookieManager_*, ResizeKeyboard) are
+// genuinely unreachable in the other direction — no native code looks them up —
+// and are left alone.
+
+// --- Force feedback ------------------------------------------------------
+// FAndroidInputInterface::SetForceFeedbackChannelValues calls this the first
+// time any force-feedback effect plays, which for a VR title is the first menu
+// interaction. There is no device vibrator on this host — Vision Pro has none,
+// and CONTROLLER haptics are a different seam entirely (ovrp_SetControllerHaptics,
+// which is implemented and drives the real thing). So this is the Android
+// phone-body vibrator being asked for, and doing nothing is the truthful answer.
+static klj_val klj_GA_vibrate(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    static int said;
+    if (!said++)
+        KLJ_LOG("AndroidThunkJava_Vibrate(%d ms) -> no device vibrator on this "
+                "host (controller haptics go through ovrp_SetControllerHaptics)",
+                n > 0 ? (int)(int64_t)a[0].j : 0);
+    return (klj_val){.j = 0};
+}
+
+// --- Input device enumeration --------------------------------------------
+// FAndroidInputInterface asks about any device id it has not seen before, and
+// uses the name/descriptor to look the device up in the engine's controller
+// mapping. The returned object's FIELDS are read immediately afterwards, so the
+// entries in g_fields (kl_jni.c) are half of this answer — returning the object
+// without them just moves the abort one line down to "no host value for field".
+//
+// The values describe what this runtime actually presents: Touch controllers,
+// which is what ovrp_GetConnectedControllers2 reports and what
+// fill_controller_state populates. A vendor/product of 0 is what the real
+// GameActivity returns for a device whose InputDevice lookup fails, and it is
+// what we are — there is no Android InputDevice behind this.
+static klj_val klj_GA_getInputDeviceInfo(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    static int said;
+    if (!said++)
+        KLJ_LOG("AndroidThunkJava_GetInputDeviceInfo(%d) -> the synthetic Touch "
+                "pair (see g_fields for the field values)",
+                n > 0 ? (int)(int64_t)a[0].j : 0);
+    return (klj_val){.l = kl_jni_new_object("com/epicgames/ue4/GameActivity$InputDeviceInfo")};
+}
+
+// --- Local notifications --------------------------------------------------
+// libUE4 carries UPlatformGameInstance's PlatformReceivedLocalNotification
+// delegate, so the game instance polls the launch notification right after
+// engine init — exactly the window this launch enters.
+//
+// The object is returned rather than NULL because UE4.27's
+// AndroidThunkCpp_GetLaunchNotification does NOT null-check before reading the
+// three fields off it. `used` is false: this app was launched from the Home
+// View, not from a notification, which is both true and the answer that keeps
+// the game out of a notification-handling path with nothing behind it.
+static klj_val klj_GA_getLaunchNotification(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("AndroidThunkJava_LocalNotificationGetLaunchNotification() -> "
+                "used=false (this app was launched from the Home View)");
+    return (klj_val){.l = kl_jni_new_object("com/epicgames/ue4/GameActivity$LaunchNotification")};
+}
+// Scheduling one returns the notification's id; 0 is "not scheduled". There is
+// no Android AlarmManager here and no notification shade to post into, so the
+// whole family agrees that nothing is ever scheduled and nothing exists.
+static klj_val klj_GA_notifySchedule(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a;
+    static int said;
+    if (!said++)
+        KLJ_LOG("AndroidThunkJava_LocalNotificationScheduleAtTime(%d args) -> 0 "
+                "(no notification service on this host)", n);
+    return (klj_val){.j = 0};
+}
+
+// --- The virtual keyboard -------------------------------------------------
+// Answered further up (klj_GA_showVirtualKeyboardInput & co.: the host's
+// soft-input seam, the result delivered through nativeVirtualKeyboardResult).
+
+// Whether a click at (x, y) should be swallowed by the keyboard's own view.
+// There is no keyboard view, so nothing is ever swallowed — a "yes" here eats
+// the guest's pointer input.
+static klj_val klj_GA_virtualInputIgnoreClick(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+
+
+// --- Orientation ----------------------------------------------------------
+// A head-mounted display has no rotatable panel. SetOrientation is a request we
+// cannot honour and must not pretend to. GetDeviceOrientation is answered
+// further up (the panel rotation, routed at the handler Unity reads).
+static klj_val klj_GA_setOrientation(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    static int said;
+    if (!said++)
+        KLJ_LOG("AndroidThunkJava_SetOrientation(%d) -> recorded, not applied "
+                "(an HMD has no rotatable panel)", n > 0 ? (int)(int64_t)a[0].j : 0);
+    return (klj_val){.j = 0};
+}
+
+// --- The clipboard --------------------------------------------------------
+// A real host clipboard exists on visionOS but is the USER's, shared with every
+// other app; a guest that copies into it and a guest that reads it are two
+// different risks, and neither is on any path this port needs. Copy is dropped
+// and Paste answers the empty string — never NULL, because UE4 wraps the result
+// in an FString without checking.
+static klj_val klj_GA_clipboardCopy(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("AndroidThunkJava_ClipboardCopy -> dropped (the host clipboard is "
+                "the user's, not the guest's)");
+    return (klj_val){.j = 0};
+}
+static klj_val klj_GA_clipboardPaste(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("")};
+}
+
+// The empty string, for the String-returning thunks whose answer is "there is
+// nothing here". Never NULL: UE4 wraps these results in an FString without
+// checking, and a null jstring reaches FJavaHelper as a dereference.
+static klj_val klj_GA_empty_string(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("")};
+}
+
+// --- Things this process will not do to itself ----------------------------
+// Minimize, restart, launch another package, open a URL, share, broadcast. On
+// visionOS the app does not control its own window lifecycle and there is no
+// package manager to ask, so every one of these is accepted and dropped, and the
+// predicates answer no. Notably Minimize: KL_EXIT_ON_BACKGROUND=0 is baked for
+// UE4 targets precisely so that backgrounding does NOT kill a nine-gigabyte
+// load, and a guest minimising itself would defeat that from the inside.
+// (klj_GA_void_noop, defined above, is the accept-and-drop answer.)
+static klj_val klj_GA_false(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+// Screen capture: nothing here records the display, so "not disabled" is true
+// and the setter has nothing to set. The pair must agree — a guest that disables
+// capture and then reads back "enabled" concludes the call failed.
+static int g_ue4_screen_capture_disabled;
+static klj_val klj_GA_disableScreenCapture(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    g_ue4_screen_capture_disabled = (n > 0 && a[0].j) ? 1 : 0;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_GA_isScreenCaptureDisabled(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)g_ue4_screen_capture_disabled};
+}
 
 const klj_binding klj_bind_ue4[] = {
     {"android/view/Display", "getRefreshRate", "()F", klj_Display_getRefreshRate},
@@ -864,6 +2191,13 @@ const klj_binding klj_bind_ue4[] = {
     // signatures are FJavaAndroidMediaPlayer's own GetClassMethod calls, in the
     // order that constructor resolves them.
     {"com/epicgames/ue4/MediaPlayer14", "<init>", "(ZZZ)V", klj_MP14_ctor},
+    // UE 4.21's player takes two: (swizzlePixels, vulkanRenderer) — needTrackInfo
+    // came later. Robo Recall: Unplugged (x1906871599408213) builds one for its
+    // intro movie as the first thing after its GL contexts, and with no row for
+    // this shape the run stopped there (2026-10-14). Same handler: it reads the
+    // third flag only when it is passed. The methods that engine resolves next
+    // are the ones below.
+    {"com/epicgames/ue4/MediaPlayer14", "<init>", "(ZZ)V", klj_MP14_ctor},
     {"com/epicgames/ue4/MediaPlayer14", "getDuration", "()I", klj_MP14_getDuration},
     {"com/epicgames/ue4/MediaPlayer14", "reset", "()V", klj_MP14_reset},
     {"com/epicgames/ue4/MediaPlayer14", "stop", "()V", klj_MP14_stop},
@@ -911,8 +2245,20 @@ const klj_binding klj_bind_ue4[] = {
     {"com/epicgames/ue4/MediaPlayer14", "updateVideoFrame",
      "(I)Lcom/epicgames/ue4/MediaPlayer14$FrameUpdateInfo;", klj_MP14_updateVideoFrame},
     {"com/epicgames/ue4/MediaPlayer14", "selectTrack", "(I)V", klj_MP14_selectTrack},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetNetworkConnectionType", "()I",
+                                                klj_GA_networkConnectionType},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsOculusMobileApplication",
      "()Z", klj_GA_isOculusMobile},
+    // UE 4.19's name for the same question (its Java answers it from the same
+    // vr_only meta-data). Vader Immortal I asks it from FAndroidGPUInfo and
+    // OculusHMD's PreInit; answered 0, the game ran as a flat window app and
+    // never called OVRPlugin.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsGearVRApplication",
+     "()Z", klj_GA_isOculusMobile},
+    {"com/epicgames/ue4/GameActivity", "playVideo",
+     "(Ljava/lang/String;Landroid/view/Surface;)V", klj_GA_playVideo},
+    {"com/epicgames/ue4/GameActivity", "initVideoPlayer", "()V", klj_GA_initVideoPlayer},
+    {"com/epicgames/ue4/GameActivity", "dispose", "()V", klj_GA_disposeVideo},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_HasMetaDataKey",
      "(Ljava/lang/String;)Z", klj_GA_hasMetaDataKey},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetMetaDataBoolean",
@@ -925,28 +2271,100 @@ const klj_binding klj_bind_ue4[] = {
      "(Ljava/lang/String;)F", klj_GA_getMetaDataFloat},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetMetaDataString",
      "(Ljava/lang/String;)Ljava/lang/String;", klj_GA_getMetaDataString},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_HasIntentExtrasKey",
+     "(Ljava/lang/String;)Z", klj_GA_intentExtraAbsent},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetIntentExtrasBoolean",
+     "(Ljava/lang/String;)Z", klj_GA_intentExtraAbsent},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetIntentExtrasInt",
+     "(Ljava/lang/String;)I", klj_GA_intentExtraAbsent},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetIntentExtrasString",
+     "(Ljava/lang/String;)Ljava/lang/String;", klj_GA_intentExtraAbsent},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_InitHMDs", "()V", klj_GA_initHMDs},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ForceQuit", "()V", klj_GA_forceQuit},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_RestartApplication",
+     "(Ljava/lang/String;)V", klj_GA_restartApplication},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetDesiredViewSize", "(II)V",
      klj_GA_setDesiredViewSize},
+    // UE5.3's addition (Pinball FX VR) — asked once the terms screens are accepted.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetAndroidId",
+     "()Ljava/lang/String;", klj_GA_getAndroidId},
+    // The virtual keyboard, both paths. See the section above: the engine picks
+    // between them with `Android.NewKeyboard`, so a guest that has one has the
+    // other one frame later, and implementing only the one this title happened
+    // to call is a second abort waiting for the cvar to change.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ShowVirtualKeyboardInput",
+     "(ILjava/lang/String;Ljava/lang/String;)V", klj_GA_showVirtualKeyboardInput},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_HideVirtualKeyboardInput",
+     "()V", klj_GA_hideVirtualKeyboardInput},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ShowVirtualKeyboardInputDialog",
+     "(ILjava/lang/String;Ljava/lang/String;)V", klj_GA_showVirtualKeyboardInputDialog},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_HideVirtualKeyboardInputDialog",
+     "()V", klj_GA_hideVirtualKeyboardInputDialog},
+    // The refresh rate, the orientation and ForceQuit keep this fork's answers
+    // (the rate the start window chose, and a ForceQuit that is logged with its
+    // caller and not obeyed); the versions of rebelancap's 4fb9fb0 are not bound.
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetNativeDisplayRefreshRate",
      "()I", klj_GA_getNativeDisplayRefreshRate},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetDeviceOrientation",
      "()I", klj_GA_getDeviceOrientation},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetDeviceRotation",
+     "()I", klj_GA_getDeviceRotation},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetConfigurationOrientation",
+     "()I", klj_GA_getConfigurationOrientation},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetNativeDisplayRefreshRate",
      "(I)Z", klj_GA_setNativeDisplayRefreshRate},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetSupportedNativeDisplayRefreshRates",
      "()[I", klj_GA_getSupportedRefreshRates},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetFontDirectory",
      "()Ljava/lang/String;", klj_GA_getFontDirectory},
+    {"com/epicgames/ue4/GameActivity", "getAppPackageName",
+     "()Ljava/lang/String;", klj_GA_getAppPackageName},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_AddNetworkListener",
      "()V", klj_GA_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_InitializeWithPermission",
      "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V", klj_GA_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsBhapticsAvailable",
      "()Z", klj_GA_void_noop},
+    // The rest of the bHaptics family (see klj_GA_bhapticsDeviceList).
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_Initialize",
+     "(Ljava/lang/String;)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_getDeviceList",
+     "()Ljava/lang/String;", klj_GA_bhapticsDeviceList},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetPositionStatus",
+     "(Ljava/lang/String;)[B", klj_GA_bhapticsPositionStatus},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsRegistered",
+     "(Ljava/lang/String;)Z", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsPlaying",
+     "(Ljava/lang/String;)Z", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsAnythingPlaying",
+     "()Z", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_Register",
+     "(Ljava/lang/String;Ljava/lang/String;)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_RegisterReflected",
+     "(Ljava/lang/String;Ljava/lang/String;)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SubmitRegistered",
+     "(Ljava/lang/String;Ljava/lang/String;FFFF)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_TurnOff",
+     "(Ljava/lang/String;)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_TurnOffAll",
+     "()V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ChangePosition",
+     "(Ljava/lang/String;Ljava/lang/String;)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_TogglePosition",
+     "(Ljava/lang/String;)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_Ping",
+     "(Ljava/lang/String;)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_PingAll",
+     "()V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_PingPosition",
+     "(Ljava/lang/String;)V", klj_GA_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_EnableMotion",
      "(Z)V", klj_GA_void_noop},
+    // The Backtrace crash reporter's Unreal plugin: the activity is handed the
+    // attributes and attachment paths to start its Java client with. There is
+    // no such client here to start, and nothing is reported back to the engine.
+    {"com/epicgames/ue4/GameActivity", "initializeBacktraceClient",
+     "(Ljava/util/Map;Ljava/util/List;)V", klj_GA_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetSharedPreferenceString",
      "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
      klj_GA_getSharedPreferenceString},
@@ -954,9 +2372,20 @@ const klj_binding klj_bind_ue4[] = {
      "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
      klj_Sentry_init},
     {"io/sentry/unreal/SentryBridgeJava", "setContext",
-     "(Ljava/lang/String;Ljava/util/HashMap;)V", klj_Sentry_init},
+     "(Ljava/lang/String;Ljava/util/HashMap;)V", klj_Sentry_sink},
     {"io/sentry/unreal/SentryBridgeJava", "setTag",
      "(Ljava/lang/String;Ljava/lang/String;)V", klj_Sentry_init},
+    // The newer sentry-unreal bridge (UE5; Skydance's BEHEMOTH, x5767635983306831)
+    // takes the options as a string plus a native handle for its callbacks.
+    {"io/sentry/unreal/SentryBridgeJava", "init",
+     "(Landroid/app/Activity;Ljava/lang/String;J)V", klj_Sentry_init},
+    {"io/sentry/unreal/SentryBridgeJava", "addBreadcrumb",
+     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/util/HashMap;Lio/sentry/SentryLevel;)V",
+     klj_Sentry_scope_noop},
+    {"io/sentry/unreal/SentryBridgeJava", "setLevel",
+     "(Lio/sentry/SentryLevel;)V", klj_Sentry_scope_noop},
+    {"io/sentry/unreal/SentryBridgeJava", "removeTag",
+     "(Ljava/lang/String;)V", klj_Sentry_scope_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_PushSensorEvents", "()V",
      klj_GA_pushSensorEvents},
     // UE4's three BroadcastReceivers. `startReceiver` is where the state is
@@ -973,11 +2402,128 @@ const klj_binding klj_bind_ue4[] = {
      klj_HeadsetReceiver_start},
     {"com/epicgames/ue4/HeadsetReceiver", "stopReceiver", "(Landroid/app/Activity;)V",
      klj_ue4_receiver_stop},
+    // Sentry's UE4 bridge — see klj_Sentry_init for why these are answered and
+    // why the two capture* entry points are not here.
+    {"io/sentry/unreal/SentryBridgeJava", "configureScope", "(J)V", klj_Sentry_sink},
+    // ---- The post-FEngineLoop::Init surface. See the block above. ----
+    // Input and force feedback.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_Vibrate", "(I)V", klj_GA_vibrate},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetInputDeviceInfo",
+     "(I)Lcom/epicgames/ue4/GameActivity$InputDeviceInfo;", klj_GA_getInputDeviceInfo},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_VirtualInputIgnoreClick",
+     "(II)Z", klj_GA_virtualInputIgnoreClick},
+    // Local notifications — the whole family, because GetLaunchNotification is
+    // polled right after engine init and the rest follow from whatever it says.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_LocalNotificationGetLaunchNotification",
+     "()Lcom/epicgames/ue4/GameActivity$LaunchNotification;", klj_GA_getLaunchNotification},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_LocalNotificationScheduleAtTime",
+     "(Ljava/lang/String;ZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+     klj_GA_notifySchedule},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_LocalNotificationExists",
+     "(I)Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_LocalNotificationDestroyIfExists",
+     "(I)Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_LocalNotificationClearAll",
+     "()V", klj_GA_void_noop},
+    // Remote notifications: there is no push service behind this app.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsAllowedRemoteNotifications",
+     "()Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_RegisterForRemoteNotifications",
+     "()V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_UnregisterForRemoteNotifications",
+     "()V", klj_GA_void_noop},
+    // Identity and connectivity.
+    // Orientation — an HMD has no rotatable panel.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetOrientation",
+     "(I)V", klj_GA_setOrientation},
+    // Clipboard.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ClipboardCopy",
+     "(Ljava/lang/String;)V", klj_GA_clipboardCopy},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ClipboardPaste",
+     "()Ljava/lang/String;", klj_GA_clipboardPaste},
+    // Screen capture — a recorded setter/getter pair, so the two agree.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_DisableScreenCapture",
+     "(Z)V", klj_GA_disableScreenCapture},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsScreenCaptureDisabled",
+     "()Z", klj_GA_isScreenCaptureDisabled},
+    // The launch intent's remaining accessors. The String form is bound above
+    // and answers null; these two must agree that there are no extras at all.
+    // Things this process will not do to itself or to the system.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_Minimize", "()V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_LaunchURL",
+     "(Ljava/lang/String;)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ShareURL",
+     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;II)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SendBroadcast",
+     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsPackageInstalled",
+     "(Ljava/lang/String;)Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_LaunchPackage",
+     "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ShowConsoleWindow",
+     "(Ljava/lang/String;)V", klj_GA_void_noop},
+    // The OBB downloader's progress dialog. The OBBs are staged and mounted, so
+    // nothing reaches the downloader — but ShowProgressDialog is also what a
+    // GooglePAD asset-pack fetch would raise, and that path exists in this build.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ShowProgressDialog",
+     "(ZLjava/lang/String;ZI)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_UpdateProgressDialog",
+     "(I)V", klj_GA_void_noop},
+    // Play Asset Delivery. libplaycore is DT_NEEDED and the GooglePAD module is
+    // linked in, but every asset these titles need is in their OBBs — so "not
+    // available" is true and keeps the engine on the OBB path it already used.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GooglePAD_Available",
+     "()Z", klj_GA_false},
+    // Store and accounts. The online subsystem on a Quest build is typically
+    // GooglePlay falling back to NULL, so none of this is reachable through the
+    // OSS — but a Blueprint can call the IAP nodes directly, and "purchases are
+    // not allowed here" is both true and the answer that stops the sequence
+    // rather than starting one nothing can finish.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IapSetupService",
+     "(Ljava/lang/String;)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IapIsAllowedToMakePurchases",
+     "()Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IapBeginPurchase",
+     "(Ljava/lang/String;Ljava/lang/String;)Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IapConsumePurchase",
+     "(Ljava/lang/String;)Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IapQueryExistingPurchases",
+     "()Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IapQueryInAppPurchases",
+     "([Ljava/lang/String;)Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IapRestorePurchases",
+     "([Ljava/lang/String;[Z)Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GoogleClientConnect",
+     "()V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GoogleClientDisconnect",
+     "()V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ResetAchievements",
+     "()V", klj_GA_void_noop},
+    // The Ads module. Signatures are the ones the guest actually interns, read
+    // off a boot log rather than from the engine source. Every
+    // predicate says no, so nothing proceeds to a show; the advertising id is
+    // the empty string, never NULL, because UE4 wraps it in an FString unchecked.
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ShowAdBanner",
+     "(Ljava/lang/String;Z)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_HideAdBanner", "()V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_CloseAdBanner", "()V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_LoadInterstitialAd",
+     "(Ljava/lang/String;)V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsInterstitialAdAvailable",
+     "()Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsInterstitialAdRequested",
+     "()Z", klj_GA_false},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_ShowInterstitialAd",
+     "()V", klj_GA_void_noop},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetAdvertisingId",
+     "()Ljava/lang/String;", klj_GA_empty_string},
     {"com/epicgames/ue4/MessageBox01", "<init>",     "()V", klj_MsgBox_new},
     {"com/epicgames/ue4/MessageBox01", "setCaption", "(Ljava/lang/String;)V", klj_MsgBox_setCaption},
     {"com/epicgames/ue4/MessageBox01", "setText",    "(Ljava/lang/String;)V", klj_MsgBox_setText},
     {"com/epicgames/ue4/MessageBox01", "addButton",  "(Ljava/lang/String;)V", klj_MsgBox_addButton},
     {"com/epicgames/ue4/MessageBox01", "clear",      "()V", klj_MsgBox_clear},
     {"com/epicgames/ue4/MessageBox01", "show",       "()I", klj_MsgBox_show},
+    {"com/zenstudios/PinballFX_VR/BluetoothHelper", "getConnectedInputDevices",
+     "()[Ljava/lang/String;", klj_PFXVR_getConnectedInputDevices},
     {0}
 };

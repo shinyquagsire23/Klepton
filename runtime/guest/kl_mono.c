@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <time.h>
 
 #include "kl_mono.h"
@@ -52,6 +54,99 @@ int kl_mono_input_available(void) {
 static int g_text_input_wanted;
 void kl_mono_set_text_input(int on)  { g_text_input_wanted = on ? 1 : 0; }
 int  kl_mono_text_input_wanted(void) { return g_text_input_wanted; }
+
+static pthread_mutex_t g_open_url_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_open_url[2048];
+void kl_mono_request_open_url(const char *url) {
+    if (!url || !*url) return;
+    pthread_mutex_lock(&g_open_url_mu);
+    snprintf(g_open_url, sizeof g_open_url, "%s", url);
+    pthread_mutex_unlock(&g_open_url_mu);
+}
+// kl_mono_web_url's list. A host under one of the first (or equal to it) is
+// allowed; facebook.com and accounts.google.com only as themselves. The services
+// DreamSpace's buttons lead to (Spotify, YouTube), Meta's own sites, and Google's
+// sign-in page, which a YouTube sign-in redirects to.
+static const struct { const char *domain; int subdomains; } g_web_hosts[] = {
+    { "spotify.com", 1 }, { "youtube.com", 1 }, { "youtu.be", 1 },
+    { "meta.com", 1 },    { "oculus.com", 1 },  { "facebook.com", 0 },
+    { "accounts.google.com", 0 },
+};
+int kl_mono_web_url(const char *in, char *out, unsigned long cap, int navigation,
+                    const char **why) {
+    const char *dummy;
+    if (!why) why = &dummy;
+    *why = NULL;
+    if (!in || !out || cap == 0) { *why = "no address"; return 0; }
+    if (navigation && (!strcmp(in, "about:blank") || !strcmp(in, "about:srcdoc"))) {
+        if (strlen(in) >= cap) { *why = "address too long"; return 0; }
+        strcpy(out, in);
+        return 1;
+    }
+    const char *rest;
+    if (!strncasecmp(in, "https://", 8))     rest = in + 8;
+    else if (!strncasecmp(in, "http://", 7)) rest = in + 7;     // upgraded below
+    else { *why = "not an http(s) address"; return 0; }
+    // The host: up to the path, query, fragment or port. A user part
+    // ("spotify.com@elsewhere") makes the host something other than it reads.
+    size_t auth = strcspn(rest, "/?#");
+    if (memchr(rest, '@', auth)) { *why = "address carries a user part"; return 0; }
+    size_t hl = strcspn(rest, "/?#:");
+    if (hl > auth) hl = auth;
+    if (hl == 0) { *why = "no host"; return 0; }
+    if (hl > 254) { *why = "host too long"; return 0; }
+    char host[256];
+    for (size_t i = 0; i < hl; i++) {
+        host[i] = (char)tolower((unsigned char)rest[i]);
+        // A plain name only: no escapes, backslashes, brackets (IPv6) or
+        // non-ASCII (IDN, which arrives here un-encoded or as xn-- labels).
+        if (!isalnum((unsigned char)host[i]) && host[i] != '.' && host[i] != '-') {
+            *why = "host is not a plain name"; return 0;
+        }
+    }
+    host[hl] = 0;
+    if (host[hl - 1] == '.') host[--hl] = 0;                  // "youtube.com."
+    if (hl == 0 || hl > 253) { *why = "host too long or empty"; return 0; }
+    // Labels: 1-63 characters, no dash at either end; and not all digits in
+    // the last one, which is what an IPv4 literal (or a bare number) is.
+    int all_digits = 1;
+    for (size_t i = 0, start = 0; i <= hl; i++) {
+        if (i < hl && host[i] != '.') {
+            if (!isdigit((unsigned char)host[i])) all_digits = 0;
+            continue;
+        }
+        size_t len = i - start;
+        if (len == 0) { *why = "empty label in host"; return 0; }
+        if (len > 63) { *why = "label longer than 63 characters"; return 0; }
+        if (host[start] == '-' || host[i - 1] == '-') { *why = "label starts or ends with a dash"; return 0; }
+        if (i < hl) { all_digits = 1; start = i + 1; }
+    }
+    if (all_digits) { *why = "host is an address literal"; return 0; }
+    int ok = 0;
+    for (size_t k = 0; k < sizeof g_web_hosts / sizeof g_web_hosts[0] && !ok; k++) {
+        const char *d = g_web_hosts[k].domain;
+        size_t dl = strlen(d);
+        ok = (hl == dl && !strcmp(host, d)) ||
+             (g_web_hosts[k].subdomains && hl > dl && host[hl - dl - 1] == '.' &&
+              !strcmp(host + hl - dl, d));
+    }
+    if (!ok) { *why = "host not on the list"; return 0; }
+    int w = snprintf(out, cap, "https://%s", rest);
+    if (w < 0 || (unsigned long)w >= cap) { *why = "address too long"; return 0; }
+    return 1;
+}
+
+int kl_mono_take_open_url(char *out, int cap) {
+    int have = 0;
+    pthread_mutex_lock(&g_open_url_mu);
+    if (g_open_url[0] && out && cap > 0) {
+        snprintf(out, (size_t)cap, "%s", g_open_url);
+        g_open_url[0] = 0;
+        have = 1;
+    }
+    pthread_mutex_unlock(&g_open_url_mu);
+    return have;
+}
 
 // Committed text from the system keyboard. onNativeKeyDown/Up (kl_mono_key) is
 // the game-control path and does NOT produce SDL_TEXTINPUT — SDL's Android

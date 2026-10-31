@@ -21,4 +21,15 @@
 // KL_PROBE_EVERY frames (default 120). No-op unless KL_PROBE_INPUT=1.
 void kl_mprobe_tick(unsigned frame);
 
+// AC Nexus VR only, self-gated on the target: take out the fixed frame length
+// the game spins itself out to for SpaceWarp. See kl_mprobe.c.
+void kl_mprobe_nexus_frame_budget(unsigned frame);
+
+// Gun Club VR only, self-gated on the target: the game's own TBMPrefs.Save,
+// before Unity's teardown on quit. See kl_mprobe.c.
+void kl_mprobe_gunclub_save_preferences(void);
+
 #endif
+
+// User-initiated visionOS selection ray, in Unity-handed head-local metres.
+void kl_brink_selection_push(float ox,float oy,float oz,float dx,float dy,float dz,int hand,int kind,float mx,float my);

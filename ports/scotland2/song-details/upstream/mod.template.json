@@ -1,0 +1,16 @@
+{
+    "_QPVersion": "1.1.0",
+    "name": "${mod_name}",
+    "id": "${mod_id}",
+    "author": "RedBrumbler",
+    "version": "${version}",
+    "packageId": "com.beatgames.beatsaber",
+    "description": "Library that provides details about songs from BeatSaver",
+    "isLibrary": true,
+    "dependencies": [],
+    "modFiles": [],
+    "libraryFiles": [
+        "${binary}"
+    ],
+    "fileCopies": []
+}

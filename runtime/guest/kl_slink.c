@@ -18,6 +18,7 @@
 #include "kl_mediandk.h"
 #include "kl_aaudio.h"
 #include "kl_openxr.h"
+#include "kl_ovrp.h"
 #include "kl_env.h"
 
 // ---------------------------------------------------------------- the chains --
@@ -103,6 +104,53 @@ static const char *const CHAIN_VR[] = {
 static kl_slink_door g_door;
 static char g_libdir[1024];
 static char g_error[512];
+
+// Steam Link 2.0.0's controller power query. This APK predates
+// XR_EXT_interaction_profile_battery_state_display and never asks OpenXR for
+// battery state; instead its own QSVLXRInput virtual method fills this private
+// six-property record before it is sent to the host as VTE_PROPS_POWER_L/R.
+//
+// The layout is measured from the APK's PackVTEProps(SVLPowerProps,...): five
+// byte-sized booleans at +0..+4 and a float at +8. Its stock implementation
+// writes {0,1,0,1,1,0.0}, where the leading zero tells SteamVR that controller
+// battery status is unavailable. QSVLDeviceHmd::GetPowerProps writes the same
+// record with byte 0 set, charging at byte 2, and a normalized battery at +8.
+// Mirror that proven HMD shape for each controller, using Klepton's real
+// per-hand seam. Unknown stays the APK's original unavailable answer.
+#define SL_CONTROLLER_POWER_FN \
+    "_ZN11QSVLXRInput13GetPowerPropsE18QSVLControllerHandR13SVLPowerProps"
+
+static int slink_controller_power(void *self, int hand, void *out) {
+    (void)self;
+    if (!out) return 0;
+    unsigned char *p = out;
+    memset(p, 0, 12);
+    p[1] = p[3] = p[4] = 1;            // stock controller property defaults
+
+    int level = kl_ovrp_controller_battery_level(hand);
+    int state = kl_ovrp_controller_battery_state(hand);
+    if (level >= 0) {
+        p[0] = 1;                       // provides battery status
+        p[2] = state == KL_CONTROLLER_BATTERY_CHARGING;
+        float normalized = (float)level / 100.0f;
+        memcpy(p + 8, &normalized, sizeof normalized);
+    }
+
+    static int last_level[2] = { -2, -2 };
+    static int last_state[2] = { -2, -2 };
+    if (hand >= 0 && hand < 2 &&
+        (last_level[hand] != level || last_state[hand] != state)) {
+        fprintf(stderr, "  [slink] %s controller power: %s",
+                hand ? "right" : "left", level >= 0 ? "available" : "unavailable");
+        if (level >= 0) fprintf(stderr, " %d%% %s", level,
+                                state == KL_CONTROLLER_BATTERY_CHARGING ? "charging" :
+                                state == KL_CONTROLLER_BATTERY_FULL ? "full" : "discharging");
+        fputc('\n', stderr);
+        last_level[hand] = level;
+        last_state[hand] = state;
+    }
+    return 1;
+}
 
 const char *kl_slink_error(void)  { return g_error; }
 const char *kl_slink_libdir(void) { return g_libdir; }
@@ -425,6 +473,8 @@ int kl_slink_load_chain(FILE *out) {
     size_t nchain;
     const char *const *chain = kl_slink_chain(&nchain);
     int trace_svl = kl_env_int("KL_SVL_TRACE", 0);
+    if (g_door == KL_SLINK_VR)
+        kl_interpose(SL_CONTROLLER_POWER_FN, (void *)slink_controller_power);
     if (trace_svl) {
         kl_interpose(SVL_SETVALUE, (void *)svl_setvalue_trace);
         kl_interpose(SHELL_CAPS_BYTESIZE, (void *)caps_bytesize_trace);

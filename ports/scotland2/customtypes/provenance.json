@@ -1,0 +1,17 @@
+{
+  "name": "customtypes",
+  "repository": "QuestPackageManager/Il2CppQuestTypePatching",
+  "tag": "v0.18.3",
+  "commit": "864211e6dd9ec9d82ddc4490668db02316672c38",
+  "sha256": "8f7d9c8abb51adf7f092cd8cd809f36f090fb33238fca9cebbf0120d7c8588a8",
+  "modifiedFiles": [
+    "src/register.cpp"
+  ],
+  "scope": "Original custom-types implementation; Unity signature lookup bound to original ELF profile because offline TLS translation changes its signature. Requires prepared signed target. Actual registration under test.",
+  "files": {
+    "ports/scotland2/customtypes/upstream.patch": "647053bc2fa97ba0c269b92bf1e35b4fb7403d27bfdb9ba8c380220b6f130d93",
+    "ports/scotland2/bshook-sdk.patch": "c341dfeb5461883cee34c6fa033d34fb94daf8426d7d2fb6aca4eea95d3994c0",
+    "ports/scotland2/src/android-customtypes-target.cpp": "45287b5bb833c64324c583dbec4e6aa51f708053a8242e5d9ed4d971a5d5f779",
+    "ports/scotland2/src/android-mod-sdk-prelude.hpp": "52ccba9480f5a9b18d0969db67b426b67fb80983f1ff67049ca41a3777a3a97a"
+  }
+}

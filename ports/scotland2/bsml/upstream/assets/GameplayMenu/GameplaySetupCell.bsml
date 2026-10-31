@@ -1,0 +1,3 @@
+﻿<horizontal vertical-fit='PreferredSize' pref-height='8' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<checkbox-setting id='toggle' value='visible' apply-on-change='true'/>
+</horizontal>

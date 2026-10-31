@@ -7,10 +7,13 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <wchar.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include "kl_va.h"
 #include "klepton.h"
+#include <errno.h>
+#include "../guest/kl_obbmap.h"
 
 // Darwin arm64's va_list is a bare char*, so a marshalled buffer *is* a va_list.
 #define KL_MARSHAL(fmt, va, mode)                                        \
@@ -181,6 +184,29 @@ int klh_warnx(const char *fmt, kl_va *va) {
     fputc('\n', stderr);
     return n;
 }
+// Wide printf. The marshaller reads a narrow format; the conversion specs it
+// needs are ASCII, so a byte-per-wchar copy of the format describes the same
+// argument list (%s / %ls are both one pointer). Darwin's vswprintf then does
+// the formatting. Tea For God (x6323807174332876) builds its strings this way;
+// the old stub returned "" for every one of them.
+static int kl_wfmt_narrow(const wchar_t *f, char *out, size_t cap) {
+    size_t i = 0;
+    for (; f && f[i]; i++) {
+        if (i + 1 >= cap) return -1;
+        out[i] = (f[i] > 0 && f[i] < 0x80) ? (char)f[i] : '?';
+    }
+    out[i] = 0;
+    return 0;
+}
+int kl_vswprintf_g(wchar_t *s, size_t n, const wchar_t *f, kl_va *va) {
+    char nf[1024];
+    if (!f || kl_wfmt_narrow(f, nf, sizeof nf) != 0) { if (s && n) s[0] = 0; return -1; }
+    KL_MARSHAL(nf, va, KL_VA_PRINTF);
+    return vswprintf(s, n, f, _ap);
+}
+int klh_swprintf(wchar_t *s, size_t n, const wchar_t *f, kl_va *va) {
+    return kl_vswprintf_g(s, n, f, va);
+}
 int klh_sscanf(const char *s, const char *fmt, kl_va *va) {
     KL_MARSHAL(fmt, va, KL_VA_SCANF);
     return vsscanf(s, fmt, _ap);
@@ -218,7 +244,19 @@ int klh_open(const char *path, int flags, kl_va *va) {
             }
         }
     }
-    int fd = open(kl_guest_path(path, kp, sizeof kp), kl_open_flags(flags), (int)kl_va_gp(va));
+    const char *gp = kl_guest_path(path, kp, sizeof kp);
+    int fd = open(gp, kl_open_flags(flags), (int)kl_va_gp(va));
+    // The OBB read-through (paks, the synthetic .uproject) was reachable only
+    // through __open_2 / openat — the doors FORTIFY-built UE4 uses. Older UE4
+    // (gnustl era, e.g. Tales from the Galaxy's Edge) calls plain open(), so
+    // stat() said Taco.uproject and the paks existed while open() said ENOENT
+    // and the engine stopped at "Failed to open descriptor file". Consulted
+    // only when the real file is absent, so every open that worked before is
+    // unchanged; kl_obbmap_open is a no-op for paths it does not index.
+    if (fd < 0 && errno == ENOENT) {
+        int vfd = kl_obbmap_open(gp, kl_open_flags(flags));
+        if (vfd >= 0) fd = vfd; else errno = ENOENT;
+    }
     kl_fs_trace_open(path, flags, fd);
     return fd;
 }

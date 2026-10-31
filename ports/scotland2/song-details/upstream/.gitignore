@@ -1,0 +1,16 @@
+build/
+extern/
+extern.cmake
+qpm_defines.cmake
+tombstone_*
+*.log
+mod.json
+*.qmod
+*.psd
+*.~cpp
+*.~hpp
+vcpkg_installed/
+cmake-build-debug/
+.idea/
+ndkpath.txt
+.cache/

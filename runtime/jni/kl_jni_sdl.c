@@ -189,6 +189,12 @@ static klj_val klj_SL_canDisplay4K(void *env, void *self, const klj_val *a, int 
     return (klj_val){.j = 0};
 }
 
+// hidapi's write/read failure return. See the HIDDeviceManager block below.
+static klj_val klj_HID_ioerror(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)(int64_t)(int32_t)-1};
+}
+
 // "This facility is not available." Distinct from klj_SDLA_false only in that
 // the caller wants an object back, not a boolean.
 static klj_val klj_SDLA_null(void *env, void *self, const klj_val *a, int n) {
@@ -280,6 +286,18 @@ static klj_val klj_SDLA_setWindowStyle(void *env, void *self, const klj_val *a, 
     return (klj_val){.j = 0};
 }
 
+// SDLActivity.setBackButtonTrapEnabled(boolean): whether SDL swallows the
+// Android hardware BACK key instead of letting it finish the activity. Steam
+// Link's shell sets it during startup. There is no hardware back button on
+// visionOS, so nothing is trapped and nothing escapes — a recorded no-op, the
+// same shape as setWindowStyle.
+static klj_val klj_SDLA_setBackButtonTrapEnabled(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("setBackButtonTrapEnabled(%d) recorded, not applied (no hardware back button here)",
+            n > 0 ? (int)(int64_t)a[0].j : 0);
+    return (klj_val){.j = 0};
+}
+
 // No haptic devices are presented, so a poll finds no changes — the same answer
 // the real one gives with nothing connected. (The guest already logged "no
 // rumble capable system haptic device found" off the back of this.)
@@ -322,7 +340,41 @@ static klj_val klj_SL_getWifiInfo(void *env, void *self, const klj_val *a, int n
     return (klj_val){.l = obj};
 }
 
+// ------------------------------------------------- HIDDeviceManager -------
+//
+// SDL2's Android HID backend, and the whole family answers "there are no HID
+// devices here", which is TRUE rather than convenient: this runtime presents no
+// USB host and no Bluetooth HID, and the VR controllers a guest on this
+// platform sees arrive through OpenXR, not through hidapi.
+//
+// The family is here because it is not optional. SDLActivity.onCreate
+// constructs the manager, and its constructor's native half is what hands
+// libSDL2's hidapi backend the JavaVM — without it SDL_hid_init dereferences a
+// NULL g_JVM inside SDL_Init(SDL_INIT_JOYSTICK), which is where Simpsons Hit &
+// Run's first host run died with the engine nowhere on the stack. Once the
+// object exists, SDL calls back into it, and these six are what it calls:
+//
+//   initialize(usb, bluetooth) -> Z  "did either transport start". FALSE, and
+//       SDL's own code path for it is the ordinary "no HID devices" one — it
+//       logs and carries on, exactly as on a phone with USB host disabled.
+//   openDevice(id) -> Z              cannot happen: nothing was enumerated, so
+//   sendOutputReport / sendFeatureReport / getFeatureReport / closeDevice
+//       are unreachable in a run where initialize answered false. They are
+//       bound anyway because an UNBOUND method is a fatal abort at the moment
+//       the guest asks for its id — which SDL does up front, in
+//       HIDDeviceRegisterCallback, for all six at once, long before it would
+//       call any of them.
+#define KLJ_HIDMGR "org/libsdl/app/HIDDeviceManager"
+
 const klj_binding klj_bind_sdl[] = {
+    {KLJ_HIDMGR, "initialize", "(ZZ)Z", klj_SDLA_false},
+    {KLJ_HIDMGR, "openDevice", "(I)Z", klj_SDLA_false},
+    // -1 is hidapi's "write failed", not 0 ("wrote nothing"): a caller that
+    // reaches here has a device id we never handed out.
+    {KLJ_HIDMGR, "sendOutputReport", "(I[B)I", klj_HID_ioerror},
+    {KLJ_HIDMGR, "sendFeatureReport", "(I[B)I", klj_HID_ioerror},
+    {KLJ_HIDMGR, "getFeatureReport", "(I[B)Z", klj_SDLA_false},
+    {KLJ_HIDMGR, "closeDevice", "(I)V", klj_SDLCM_pollInputDevices},
     {KLJ_SDLA, "getContext", "()Landroid/app/Activity;", klj_SDLA_getContext},
     {KLJ_SDLA, "getManifestEnvironmentVariables", "()Z", klj_SDLA_getManifestEnv},
     {KLJ_SDLA, "getPreferredLocales", "()Ljava/lang/String;", klj_SDLA_getPreferredLocales},
@@ -337,6 +389,7 @@ const klj_binding klj_bind_sdl[] = {
     {"org/libsdl/app/SDL", "getContext", "()Landroid/app/Activity;", klj_SDLA_getContext},
     {KLJ_SDLA, "setActivityTitle", "(Ljava/lang/String;)Z", klj_SDLA_setActivityTitle},
     {KLJ_SDLA, "setWindowStyle", "(Z)V", klj_SDLA_setWindowStyle},
+    {KLJ_SDLA, "setBackButtonTrapEnabled", "(Z)V", klj_SDLA_setBackButtonTrapEnabled},
     {KLJ_SDLA, "getDeviceFormFactor", "()Ljava/lang/String;", klj_SDLA_formFactor},
     {KLJ_SDLA, "isChromebook", "()Z", klj_SDLA_false},
     {KLJ_SDLA, "isDeXMode", "()Z", klj_SDLA_false},
@@ -416,5 +469,19 @@ const klj_binding klj_bind_sdl[] = {
     // the visibility this waits on is a second view we do not have.
     {"com/valvesoftware/steamlink/SteamLink", "showOverlaySurface", "()V", klj_SDLA_null},
     {"com/valvesoftware/steamlink/SteamLink", "hideOverlaySurface", "()V", klj_SDLA_null},
+    // Device-environment setup the shell does at startup, none of which exists
+    // on visionOS: there is no USB networking, no Android Wi-Fi lock to hold,
+    // and no system Wi-Fi settings screen to open. All inert (void), the same
+    // recorded-no-op shape as the overlay pair above. trySetupUsbNetwork was
+    // the call the Steam Link shell aborted on after setBackButtonTrapEnabled.
+    {"com/valvesoftware/steamlink/SteamLink", "trySetupUsbNetwork", "()V", klj_SDLA_null},
+    {"com/valvesoftware/steamlink/SteamLink", "enableWiFiLock",     "()V", klj_SDLA_null},
+    {"com/valvesoftware/steamlink/SteamLink", "disableWiFiLock",    "()V", klj_SDLA_null},
+    {"com/valvesoftware/steamlink/SteamLink", "openWifiSettings",   "()V", klj_SDLA_null},
+    {"com/valvesoftware/steamlink/SteamLink", "setLowLatencyAudio", "(Z)V", klj_SDLA_null},
+    // The audio path here is CoreAudio at a fixed low-latency config, so the
+    // guest's own low-latency toggles have nothing to switch; false keeps it
+    // on the plain path rather than claiming a capability we do not expose.
+    {"com/valvesoftware/steamlink/SteamLink", "shouldEnableLowLatencyOptions", "()Z", klj_SDLA_false},
     {0}
 };

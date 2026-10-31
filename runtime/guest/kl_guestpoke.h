@@ -19,4 +19,10 @@
 // and forces it; KL_POKE_CAP_OFF=1 leaves the guest alone.
 void kl_guest_poke_texture_unit_cap(void);
 
+// 1 when the loaded libunity carries unity-texunit-mask (kl_guestpatch.c), so
+// texture units are taken & 31 at Unity's bind; kl_glfb then masks sampler
+// uniforms the same way. 0 before libunity is loaded, and for any build the
+// patch did not recognise.
+int kl_texunit_mask_active(void);
+
 #endif

@@ -1,0 +1,41 @@
+--- a/include/hooks.hpp
++++ b/include/hooks.hpp
+@@ -41,6 +41,7 @@
+         using cast_t = ::i2c::detail::method_check<cast_test, func_t>::type;                                                     \
+         static_assert(cast_test.operator()<cast_t>(), "Hook method signature does not match!");                                  \
+         static_assert(::i2c::detail::match_hookable<static_cast<cast_t>(method)>, "Method cannot be hooked!");                   \
++        SC2_RECORD_MATCH_1453(name_, method, cast_t) \
+         __INTERNAL_HOOK_STRUCT(name_, ::i2c::metadata_getter<static_cast<cast_t>(method)>::method_info(), ret_type, __VA_ARGS__) \
+     };                                                                                                                           \
+     AUTO_INSTALL(name_)                                                                                                          \
+@@ -53,6 +54,7 @@
+         using cast_t = ::i2c::detail::method_check<cast_test, func_t>::type;                                                     \
+         static_assert(cast_test.operator()<cast_t>(), "Hook method signature does not match!");                                  \
+         static_assert(::i2c::detail::match_hookable<static_cast<cast_t>(method)>, "Method cannot be hooked!");                   \
++        SC2_RECORD_MATCH_1453(name_, method, cast_t) \
+         __INTERNAL_HOOK_STRUCT(name_, ::i2c::metadata_getter<static_cast<cast_t>(method)>::method_info(), ret_type, __VA_ARGS__) \
+     };                                                                                                                           \
+     AUTO_INSTALL_ORIG(name_)                                                                                                     \
+--- a/src/hooks.cpp
++++ b/src/hooks.cpp
+@@ -38,6 +38,7 @@
+ 
+ // hook unity object destruction (OnDestroy and dtors need to be debugged in CT)
+ MAKE_HOOK(delete_object_internal_step1, (nullptr), void, char* object) {
++    if (!object) { delete_object_internal_step1(object); return; }
+     int instanceId = *(int*) (object + 8);
+     auto destroy = ObjectSignal::onDestroys.find(instanceId);
+     if (destroy != ObjectSignal::onDestroys.end() && destroy->second) {
+@@ -48,7 +49,12 @@
+ }
+ 
+ AUTO_HOOK_FUNCTION(delete_object_internal_step1) {
++#ifdef SC2_AOT_HOOKS
++    // Required measured profile is validated against the original Unity ELF by the builder.
++    uintptr_t addr = i2c::binary::base_addr("libunity.so") + SC2_METACORE_DELETE_OFFSET;
++#else
+     // TODO: fix addr (or just remove hook)
+     uintptr_t addr = i2c::binary::base_addr("libunity.so") + 0x8d2898;
++#endif
+     INSTALL_HOOK(logger, delete_object_internal_step1, (void*) addr);
+ }

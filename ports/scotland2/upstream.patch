@@ -1,0 +1,164 @@
+--- a/include/log.h
++++ b/include/log.h
+@@ -8,7 +8,23 @@
+ #define MOD_VERSION "0.1.0"
+ #endif
+ 
+-#ifdef ANDROID
++#ifdef SL2_KLEPTON
++#include <fmt/format.h>
++#include <cstdio>
++#define SL2_APPLE_LOG(lvl, str, ...) \
++  fmt::print(stderr, "[scotland2:{}] " str "\n", lvl __VA_OPT__(, __VA_ARGS__))
++#if !defined(SC2_DIAGNOSTICS) || SC2_DIAGNOSTICS
++#define LOG_VERBOSE(...) SL2_APPLE_LOG("verbose", __VA_ARGS__)
++#define LOG_DEBUG(...) SL2_APPLE_LOG("debug", __VA_ARGS__)
++#else
++#define LOG_VERBOSE(...) do { if (false) SL2_APPLE_LOG("verbose", __VA_ARGS__); } while (false)
++#define LOG_DEBUG(...) do { if (false) SL2_APPLE_LOG("debug", __VA_ARGS__); } while (false)
++#endif
++#define LOG_INFO(...) SL2_APPLE_LOG("info", __VA_ARGS__)
++#define LOG_WARN(...) SL2_APPLE_LOG("warn", __VA_ARGS__)
++#define LOG_ERROR(...) SL2_APPLE_LOG("error", __VA_ARGS__)
++#define LOG_FATAL(...) SL2_APPLE_LOG("fatal", __VA_ARGS__)
++#elif defined(ANDROID)
+ #include <android/log.h>
+ #include <fmt/compile.h>
+ #include <fmt/core.h>
+--- a/shared/loader.hpp
++++ b/shared/loader.hpp
+@@ -371,7 +371,7 @@
+   }
+ 
+   template <typename FormatContext>
+-  auto format(modloader::ModInfo const& info, FormatContext& ctx) {
++  auto format(modloader::ModInfo const& info, FormatContext& ctx) const {
+     return fmt::format_to(ctx.out(), "id: {} version: {} version tag: {}", info.id, info.version, info.versionLong);
+   }
+ };
+--- a/shared/modloader.h
++++ b/shared/modloader.h
+@@ -2,7 +2,12 @@
+ #pragma once
+ 
+ // Exposed API functions
++#ifdef SL2_KLEPTON
++// The platform entry receives an opaque VM; no Android/JNI calls in this core.
++typedef struct JavaVM_ JavaVM;
++#else
+ #include <jni.h>
++#endif
+ #include <stdint.h>
+ #include "_config.h"
+ 
+@@ -149,4 +154,4 @@
+ // - CAPI will need more effort here, we need to copy over
+ // TODO: Add void** param to setup call, store as userdata in a given mod structure
+ 
+-/*NOLINTEND(modernize-use-using)*/
+\ No newline at end of file
++/*NOLINTEND(modernize-use-using)*/
+--- a/src/loader.cpp
++++ b/src/loader.cpp
+@@ -6,7 +6,9 @@
+ #include "modloader.h"
+ 
+ #include <dlfcn.h>
++#ifndef SL2_KLEPTON
+ #include <elf.h>
++#endif
+ #include <fcntl.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+@@ -25,6 +27,17 @@
+ #include <utility>
+ #include <vector>
+ 
++#ifdef SL2_KLEPTON
++#include "apple-platform.hpp"
++#define open64 open
++#define fstat64 fstat
++#define stat64 stat
++#define dlopen sc2_apple::open
++#define dlsym sc2_apple::symbol
++#define dlerror sc2_apple::error
++#define dlclose sc2_apple::close
++#endif
++
+ namespace modloader {
+ 
+ using namespace elf_utils;
+@@ -70,6 +83,21 @@
+     return depIt->second;
+   }
+ 
++#ifdef SL2_KLEPTON
++  auto& dependencies = loadedDependencies.emplace(path.c_str(), std::vector<DependencyResult>{}).first->second;
++  for (auto const& name : sc2_apple::dependencies(path)) {
++    auto found = findSharedObject(dependencyDir, phase, name);
++    if (!found) continue;
++    auto [object, object_phase] = std::move(*found);
++    if (object_phase == LoadPhase::None) {
++      dependencies.emplace_back(std::in_place_type_t<MissingDependency>{}, std::move(object));
++    } else {
++      auto children = object.getToLoad(dependencyDir, object_phase, loadedDependencies);
++      dependencies.emplace_back(std::in_place_type_t<Dependency>{}, std::move(object), std::move(children));
++    }
++  }
++  return dependencies;
++#else
+   // TODO: RAII-ify this
+   int fd = open64(path.c_str(), O_RDONLY | O_CLOEXEC);
+   if (fd == -1) {
+@@ -191,6 +219,7 @@
+   LOG_DEBUG("Found a total of: {} dependencies successfully for: {}", dependencies.size(), path.c_str());
+ 
+   return dependencies;
++#endif
+ }
+ 
+ std::optional<std::string> LoadedMod::close() const noexcept {
+@@ -365,6 +394,14 @@
+ 
+   LOG_DEBUG("Got function from handle {} with name: {}, addr: {}", handle, name.data(), fmt::ptr(ptr));
+ 
++#ifdef SL2_KLEPTON
++  // Klepton's handle is an image-registry handle, and the symbol may live in
++  // an embedded framework. Darwin dladdr cannot validate its guest ELF path.
++  if (!sc2_apple::owns(handle, reinterpret_cast<void*>(ptr), path.c_str())) {
++    LOG_WARN("Symbol {} did not belong to requested object {}", name, path.c_str());
++    return std::nullopt;
++  }
++#else
+   Dl_info info;
+   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+   if (dladdr(reinterpret_cast<void* const>(ptr), &info)) {
+@@ -383,6 +420,7 @@
+     return std::nullopt;
+   }
+ 
++#endif
+   return ptr;
+ }
+ 
+--- a/src/modloader.cpp
++++ b/src/modloader.cpp
+@@ -5,7 +5,9 @@
+ #include <variant>
+ #include <vector>
+ #ifndef LINUX_TEST
++#ifndef SL2_KLEPTON
+ #include <jni.h>
++#endif
+ #include <sys/stat.h>
+ #include <filesystem>
+ #include <system_error>
+@@ -85,7 +87,7 @@
+   }
+ }
+ #else
+-void statdump([[maybe_unused]] fs::path const& path) {}
++void statdump([[maybe_unused]] std::filesystem::path const& path) {}
+ #endif
+ 
+ void ensure_dir_exists(std::filesystem::path const& dir) {

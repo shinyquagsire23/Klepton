@@ -1,0 +1,165 @@
+{
+  "config": {
+    "version": "0.3.0",
+    "sharedDir": "shared",
+    "dependenciesDir": "extern",
+    "info": {
+      "name": "BeatSaverPlusPlus",
+      "id": "beatsaverplusplus",
+      "version": "0.1.0",
+      "url": "https://github.com/bsq-ports/BeatSaverPlusPlus",
+      "additionalData": {
+        "overrideSoName": "libbeatsaverplusplus.so",
+        "cmake": false
+      }
+    },
+    "workspace": {
+      "scripts": {
+        "qmod": [
+          "pwsh ./scripts/build.ps1",
+          "qpm qmod manifest",
+          "pwsh ./scripts/createqmod.ps1 BeatSaverPlusPlus"
+        ]
+      },
+      "qmodIncludeDirs": [],
+      "qmodIncludeFiles": [],
+      "qmodOutput": null
+    },
+    "dependencies": [
+      {
+        "id": "paper2_scotland2",
+        "versionRange": "^4.0.0",
+        "additionalData": {}
+      },
+      {
+        "id": "zip",
+        "versionRange": "^1.7.4",
+        "additionalData": {
+          "private": true
+        }
+      },
+      {
+        "id": "web-utils",
+        "versionRange": "^0.6.0",
+        "additionalData": {}
+      },
+      {
+        "id": "beatsaber-hook",
+        "versionRange": "*",
+        "additionalData": {}
+      }
+    ]
+  },
+  "restoredDependencies": [
+    {
+      "dependency": {
+        "id": "web-utils",
+        "versionRange": "=0.6.7",
+        "additionalData": {
+          "soLink": "https://github.com/RedBrumbler/WebUtils/releases/download/v0.6.7/libweb-utils.so",
+          "debugSoLink": "https://github.com/RedBrumbler/WebUtils/releases/download/v0.6.7/debug_libweb-utils.so",
+          "overrideSoName": "libweb-utils.so",
+          "modLink": "https://github.com/RedBrumbler/WebUtils/releases/download/v0.6.7/WebUtils.qmod",
+          "branchName": "version/v0_6_7",
+          "cmake": false
+        }
+      },
+      "version": "0.6.7"
+    },
+    {
+      "dependency": {
+        "id": "paper2_scotland2",
+        "versionRange": "=4.4.2",
+        "additionalData": {
+          "soLink": "https://github.com/Fernthedev/paperlog/releases/download/v4.4.2/libpaper2_scotland2.so",
+          "overrideSoName": "libpaper2_scotland2.so",
+          "modLink": "https://github.com/Fernthedev/paperlog/releases/download/v4.4.2/paper2_scotland2.qmod",
+          "branchName": "version/v4_4_2",
+          "compileOptions": {
+            "systemIncludes": [
+              "shared/utfcpp/source"
+            ]
+          },
+          "cmake": false
+        }
+      },
+      "version": "4.4.2"
+    },
+    {
+      "dependency": {
+        "id": "zip",
+        "versionRange": "=1.7.4",
+        "additionalData": {
+          "soLink": "https://github.com/RedBrumbler/quest-zip/releases/download/v1.7.4/libzip.so.so",
+          "debugSoLink": "https://github.com/RedBrumbler/quest-zip/releases/download/v1.7.4/debug_libzip.so",
+          "overrideSoName": "libzip.so",
+          "branchName": "version-v1.7.4"
+        }
+      },
+      "version": "1.7.4"
+    },
+    {
+      "dependency": {
+        "id": "libil2cpp",
+        "versionRange": "=0.4.0",
+        "additionalData": {
+          "headersOnly": true,
+          "compileOptions": {
+            "systemIncludes": [
+              "il2cpp/external/baselib/Include",
+              "il2cpp/external/baselib/Platforms/Android/Include"
+            ]
+          }
+        }
+      },
+      "version": "0.4.0"
+    },
+    {
+      "dependency": {
+        "id": "beatsaber-hook",
+        "versionRange": "=6.4.0",
+        "additionalData": {
+          "soLink": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.0/libbeatsaber-hook.so",
+          "debugSoLink": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.0/debug_libbeatsaber-hook.so",
+          "overrideSoName": "libbeatsaber-hook.so",
+          "modLink": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.0/beatsaber-hook.qmod",
+          "branchName": "version/v6_4_0",
+          "cmake": true
+        }
+      },
+      "version": "6.4.0"
+    },
+    {
+      "dependency": {
+        "id": "fmt",
+        "versionRange": "=11.0.2",
+        "additionalData": {
+          "headersOnly": true,
+          "branchName": "version/v11_0_2",
+          "compileOptions": {
+            "systemIncludes": [
+              "fmt/include/"
+            ],
+            "cppFlags": [
+              "-DFMT_HEADER_ONLY"
+            ]
+          }
+        }
+      },
+      "version": "11.0.2"
+    },
+    {
+      "dependency": {
+        "id": "scotland2",
+        "versionRange": "=0.1.6",
+        "additionalData": {
+          "soLink": "https://github.com/sc2ad/scotland2/releases/download/v0.1.6/libsl2.so",
+          "debugSoLink": "https://github.com/sc2ad/scotland2/releases/download/v0.1.6/debug_libsl2.so",
+          "overrideSoName": "libsl2.so",
+          "branchName": "version/v0_1_6"
+        }
+      },
+      "version": "0.1.6"
+    }
+  ]
+}

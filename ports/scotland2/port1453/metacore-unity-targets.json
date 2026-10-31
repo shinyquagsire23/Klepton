@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "unitySha256": "4bd2583ea13fa77b13a5ff22ddc4508347f54a087c62995efe19ff8d944cef43",
+  "target": {
+    "name": "delete_object_internal_step1",
+    "vaddr": "0x62b924",
+    "expect": "0xd10083ff"
+  },
+  "entryWords": [
+    "0xd10083ff",
+    "0xa9014ffe",
+    "0x900088e8",
+    "0xaa0003f3",
+    "0xf9440908",
+    "0xf90007e0"
+  ],
+  "callsites": [
+    {
+      "vaddr": "0x62b290",
+      "expect": "0x940001a5"
+    },
+    {
+      "vaddr": "0x72e11c",
+      "expect": "0x97fbf602"
+    }
+  ],
+  "bodyWords": [
+    {
+      "vaddr": "0x62b94c",
+      "expect": "0xf9400a68"
+    },
+    {
+      "vaddr": "0x62b974",
+      "expect": "0xf9000a7f"
+    },
+    {
+      "vaddr": "0x62b980",
+      "expect": "0xb9400a68"
+    },
+    {
+      "vaddr": "0x62b9d4",
+      "expect": "0xf94007e0"
+    },
+    {
+      "vaddr": "0x62b9dc",
+      "expect": "0xf9400908"
+    },
+    {
+      "vaddr": "0x62b9e0",
+      "expect": "0xd63f0100"
+    },
+    {
+      "vaddr": "0x62b9e8",
+      "expect": "0xb900091f"
+    },
+    {
+      "vaddr": "0x62ba18",
+      "expect": "0xd65f03c0"
+    }
+  ],
+  "lookup": "Unity 6.3 native common object cleanup: immediate DestroyObjectHighLevel at 0x7379b8 reaches 0x737708 then 0x62b1cc and 0x62b280, which calls this entry at 0x62b290. A second batch deletion path calls directly at 0x72e11c. Body clears scripting data at +16, reads instance ID at +8, calls virtual destructor +16, then clears instance ID at +8. Preliminary 0x62b1cc is bypassed by batch cleanup.",
+  "status": "Structurally verified against the owned 1.45.3 Unity ELF; no runtime callback test performed."
+}

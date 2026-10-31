@@ -1,0 +1,85 @@
+syntax="proto3";
+
+package SongDetailsCache.Structs;
+
+message SongDetailsV3 {
+	uint32 formatVersion = 1;
+	uint32 scrapeEndedUnix = 2;
+	bytes songHashes = 3;
+	repeated SongV3 songs = 4;
+	repeated string tagList = 5;
+}
+
+enum RankedStatusBitflags {
+	Unranked = 0;
+	RankedSS = 1;
+	RankedBL = 2;
+	QualifiedSS = 4;
+	QualifiedBL = 8;
+}
+
+enum UploadFlags {
+	None = 0;
+	CuratedMap = 1;
+	VerifiedUploader = 2;
+	HasV3Environment = 4;
+}
+
+message SongV3 {
+	float bpm = 1;
+	optional uint32 upvotes = 2;
+	optional uint32 downvotes = 3;
+
+	uint32 uploadTimeUnix = 4;
+
+	uint32 mapId = 5;
+
+	optional uint32 songDurationSeconds = 6;
+
+	string songName = 7;
+	string songAuthorName = 8;
+	string levelAuthorName = 9;
+	optional string uploaderName = 10;
+
+	repeated SongDifficulty difficulties = 11;
+
+	optional uint32 rankedChangeUnix = 12;
+	optional RankedStatusBitflags rankedStateBitflags = 13;
+	optional uint64 tags = 14;
+	optional UploadFlags uploadFlags = 15;
+}
+
+message SongDifficulty {
+	enum MapCharacteristic {
+		Custom = 0;
+		Standard = 1;
+		OneSaber = 2;
+		NoArrows = 3;
+		NinetyDegree = 4;
+		ThreeSixtyDegree = 5;
+		Lightshow = 6;
+		Lawless = 7;
+	}
+
+	enum MapDifficulty {
+		Easy = 0;
+		Normal = 1;
+		Hard = 2;
+		Expert = 3;
+		ExpertPlus = 4;
+	}
+
+	optional MapCharacteristic characteristic = 1;
+	optional MapDifficulty difficulty = 2;
+
+	optional uint32 starsT100 = 4;
+	optional uint32 starsT100BL = 5;
+
+	uint32 njsT100 = 6;
+
+	optional uint32 bombs = 7;
+	optional uint32 notes = 8;
+	optional uint32 obstacles = 9;
+
+	optional uint32 mods = 10;
+}

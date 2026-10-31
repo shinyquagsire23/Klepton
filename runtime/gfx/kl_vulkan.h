@@ -73,12 +73,30 @@ int   kl_vulkan_available(void);
 // chose GLES would answer false here, correctly.
 int kl_vulkan_guest_active(void);
 
+// Edge smoothing for a Vulkan guest (KL_VK_FORCE_SAMPLES in kl_vulkan.c). The
+// first is how many samples the guest itself asked for on its eye-sized
+// multisampled targets in this run, 0 if it made none; the second is the
+// start window's setting — 4 to raise them to four, 0 to leave them — and has
+// to be given before the guest makes its first Vulkan call.
+int  kl_vulkan_guest_samples(void);
+void kl_vulkan_set_force_samples_default(int samples);
+
 // The 8-byte LUID of the GPU the guest's Vulkan instance sees, for ovrp_GetDisplay
 // AdapterId2 to hand back so Unity's OculusXR device match picks the right (only)
 // VkPhysicalDevice instead of a NULL one. Fills out[8] and returns 1 when a Vulkan
 // instance exists and reports a valid LUID; returns 0 (out untouched) otherwise —
 // a GLES guest, where the adapter id must stay empty.
 int kl_vulkan_display_luid(uint8_t out[8]);
+// The GPU's Vulkan vendor and device ids, from a throwaway instance (usable
+// before the guest makes its own, but not before kl_driver_init has put the
+// MoltenVK settings into the environment): 1 and both filled, or 0 without
+// MoltenVK. For Half-Life: Alyx's video settings file (kl_app.c).
+int kl_vulkan_gpu_ids(unsigned *vendor, unsigned *device);
+
+// The same GPU as the VkPhysicalDevice the guest's most recent instance
+// enumerates, or NULL when there has been no Vulkan instance. For the OVRPlugin
+// generation that hands the handle itself back from ovrp_GetDisplayAdapterId2.
+void *kl_vulkan_display_phys(void);
 
 // Create (or return) the eye image for a swapchain stage and eye. The returned
 // value is the VkImage handle widened to 64 bits, which is exactly what
@@ -107,9 +125,29 @@ unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, un
 // Only the eye layer is published into kl_glfb's eye table, because that table
 // is what every compositor samples. A size that differs from the cached one
 // re-allocates rather than answering with storage of the wrong shape.
+//
+// `fmt` is the storage: KLVK_LAYER_UNORM / KLVK_LAYER_SRGB (RGBA8, the old
+// 0/1 sRGB flag), or KLVK_LAYER_FP16 (RGBA16F) for a non-eye layer whose desc
+// asks for ovrpTextureFormat_R16G16B16A16_FP. The eye layer is RGBA8 always.
 #define KLVK_EYE_LAYER (-1)
+#define KLVK_LAYER_UNORM 0
+#define KLVK_LAYER_SRGB  1
+#define KLVK_LAYER_FP16  2
 unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
-                                         unsigned w, unsigned h, int srgb, int layers);
+                                         unsigned w, unsigned h, int fmt, int layers);
+
+// The two extra images an eye layer carries when the guest asked for
+// Application SpaceWarp: motion vectors (RGBA16F) and their depth. A provider
+// that asked for them treats their absence as "the eye textures could not be
+// created" and stops its display, so they have to EXIST; the compositor's frame
+// generation reads the motion vectors (kl_vulkan_spacewarp_mtl). One pair
+// per stage, re-allocated when the shape asked for changes. 0 on failure.
+unsigned long long kl_vulkan_spacewarp_image(int depth, int stage,
+                                             unsigned w, unsigned h, int layers);
+// ...and the MTLTexture behind the one of `stage` (depth != 0: its depth), with
+// its size and array layers, for the compositor's frame generation; NULL while
+// the guest has asked for none.
+void *kl_vulkan_spacewarp_mtl(int depth, int stage, int *w, int *h, int *layers);
 
 // ...and the MTLTexture behind one of those, for a compositor that has to draw
 // the layer. The eye layer is deliberately NOT reachable here: its textures go
@@ -151,6 +189,13 @@ void kl_vulkan_capture_layers(void);
 // path (where the wait is on the GPU instead). See the implementation for why
 // this one is a CPU stall and what would remove it.
 void kl_vulkan_frame_done(int stage);
+// The same in three steps, so the wait can happen off the guest's thread (see
+// kl_vulkan.c, KL_VK_FRAME_ASYNC): mark the guest's queue (guest thread; 1 on
+// success), wait for the GPU to reach the mark (any thread; 1 when it has),
+// then advance the serial a compositor reads.
+int  kl_vulkan_frame_mark(void);
+int  kl_vulkan_frame_wait(unsigned ms);
+void kl_vulkan_frame_publish(void);
 unsigned long long kl_vulkan_frame_serial(void);
 
 // How many frames have been presented, and how many were written out. The
@@ -225,5 +270,26 @@ unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned layers,
 // ...and the MTLTexture behind one, for the compositor seam. NULL when it cannot
 // be exported.
 void *kl_vulkan_xr_image_mtl(unsigned long long image);
+// This image from kl_vulkan_xr_image belongs to a flat (quad) layer, not to an
+// eye: foveation leaves it, and what it registered through it, alone.
+void kl_vulkan_xr_image_not_eye(unsigned long long image);
+// KL_VK_OUT: write one array layer of an image from kl_vulkan_xr_image to
+// <dir>/xr_f<frame>_layer<n>_eye<e>.png, every KL_VK_OUT_EVERY-th frame. A no-op
+// without KL_VK_OUT.
+void kl_vulkan_xr_image_capture(unsigned long long image, unsigned w, unsigned h,
+                                long long vk_format, unsigned array_layer,
+                                unsigned frame, int eye, int layer);
+// ...and one array layer of such an image as raw texels (`bpp` bytes each; depth
+// != 0 copies the depth aspect of a depth/stencil image) to `path`. For images
+// a PNG cannot hold: the XR_FB_space_warp motion vectors and depth.
+void kl_vulkan_xr_image_capture_raw(unsigned long long image, unsigned w, unsigned h,
+                                    unsigned bpp, int depth, unsigned array_layer,
+                                    const char *path);
+
+// t_fove: the foveated-intermediate refusal when an indirect draw recorded in a
+// SECONDARY command buffer is played inside its multiview pass (MoltenVK splits
+// such a pass). Fake handles, no device needed. Returns failed checks, -1 when
+// foveation is off or there are no MoltenVK headers.
+int kl_vulkan_fove_indirect_selftest(void);
 
 #endif

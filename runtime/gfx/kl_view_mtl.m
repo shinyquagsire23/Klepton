@@ -16,11 +16,15 @@
 // as head motion is corrected on device.
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <dlfcn.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "kl_glfb.h"
+#include "kl_metrics.h"
 #include "kl_ovrp.h"
 #include "kl_reproject.h"
 #include "kl_view_mtl.h"
@@ -55,6 +59,23 @@ static unsigned long             g_lit;   // atomics below: written on a Metal c
 static id<MTLTexture>             g_flat_tex;
 static int                        g_flat_w, g_flat_h;
 
+// The metrics panel (KL_STATS_CARD), composited as the visionOS compositor composites it — see
+// klvm_card_start. Off unless asked for, and then the composite pass also gets the device's depth: a
+// depth buffer, the eye picture nearer-wins, the guest's quads as KleptonCompositor draws them, and the
+// panel last with KleptonOverlayDepth.statsCard.
+static int                        g_card;            // the panel is on
+static int                        g_card_nearer;     // KL_VIEW_CARD_DEPTH=nearer: the panel as through toolchain 563
+static int                        g_card_in_order;   // the guest's quads in submit order (KL_OVERLAY_SUBMIT_ORDER)
+static MTLPixelFormat             g_depth_fmt = MTLPixelFormatInvalid;   // what klvm_pipeline_blend builds for
+static id<MTLRenderPipelineState> g_pipe_main;       // the blit, in the composite pass (with its depth)
+static id<MTLTexture>             g_depth;
+static id<MTLDepthStencilState>   g_ds_nearer, g_ds_in_order, g_ds_card;
+static id<MTLTexture>             g_card_tex;
+static unsigned                   g_card_seq;
+static int                        g_card_w, g_card_h, g_card_levels;
+static float                      g_card_size[2];
+static int (*g_card_draw)(uint8_t *, int32_t, int32_t, const kl_metrics *);
+
 // Build one pipeline from one of kl_reproject.c's two shaders. Both are shared
 // with the visionOS compositor; the only thing this file decides is which one
 // runs and what it draws into.
@@ -79,6 +100,7 @@ static id<MTLRenderPipelineState> klvm_pipeline_blend(const char *msl, const cha
     // per channel per pixel — 15 million calls a frame at 2198x2304, which is
     // why it needed a 64K-entry LUT to be affordable at all.
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+    pd.depthAttachmentPixelFormat = g_depth_fmt;     // Invalid unless the metrics panel is on
     // Only the OVERLAY pass blends. The eye passes force alpha to 1.0 and must
     // — a guest leaves the eye texture's alpha at 0 because the layer is
     // composited opaque, so a blending eye pass hands the window server a
@@ -206,8 +228,11 @@ static id<MTLBuffer> klvm_grid_buffer(id<MTLTexture> src, const float *vp,
             }
             if (nx < 1) nx = 1;
             if (ny < 1) ny = 1;
-            if (nx > KL_REPROJECT_GRID_MAX) nx = KL_REPROJECT_GRID_MAX;
-            if (ny > KL_REPROJECT_GRID_MAX) ny = KL_REPROJECT_GRID_MAX;
+            // Finer than the zones: the map is curved inside one (kl_reproject.h).
+            nx *= KL_REPROJECT_GRID_REFINE;
+            ny *= KL_REPROJECT_GRID_REFINE;
+            if (nx > KL_REPROJECT_GRID_CELLS_MAX) nx = KL_REPROJECT_GRID_CELLS_MAX;
+            if (ny > KL_REPROJECT_GRID_CELLS_MAX) ny = KL_REPROJECT_GRID_CELLS_MAX;
             uint32_t n = kl_reproject_grid_entries(nx, ny);
             simd_float2 *tmp = calloc(n, sizeof *tmp);
             kl_reproject_grid_build(tmp, nx, ny, cropped ? want_vp : NULL,
@@ -333,8 +358,6 @@ static int klvm_draw_proj_layers(id<MTLRenderCommandEncoder> enc, int eye,
     float px, py, pz, qx, qy, qz, qw;
     kl_ovrp_get_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw);
     simd_float4x4 device = simd_matrix4x4(simd_quaternion(qx, qy, qz, qw));
-    id<MTLBuffer> gbuf = klvm_identity_grid();
-    uint32_t gverts = kl_reproject_grid_vertices(1, 1);
     int drawn = 0;
     for (int i = 0; i < n; i++) {
         kl_ovrp_proj_layer pl = list[i];
@@ -365,11 +388,16 @@ static int klvm_draw_proj_layers(id<MTLRenderCommandEncoder> enc, int eye,
         [enc setRenderPipelineState:g_pipe_rp];
         [enc setVertexBytes:&u length:sizeof u atIndex:0];
         [enc setFragmentBytes:&u length:sizeof u atIndex:0];
-        [enc setVertexBuffer:gbuf offset:0 atIndex:1];
+        // The layer's own grid, not the identity: the picture may be only part
+        // of the texture (kl_ovrp_proj_layer.rect).
+        simd_float2 lgrid[KL_PROJ_LAYER_GRID_ENTRIES];
+        kl_proj_layer_grid(&pl, lgrid);
+        [enc setVertexBytes:lgrid length:sizeof lgrid atIndex:1];
         [enc setFragmentTexture:t atIndex:0];
         [enc setFragmentTexture:t atIndex:1];
         [enc setFragmentSamplerState:g_samp atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
+                vertexCount:kl_reproject_grid_vertices(1, 1)];
         drawn++;
     }
     return drawn;
@@ -564,6 +592,124 @@ static void *klvm_first_layer_texture(void) {
     return NULL;
 }
 
+// The metrics panel in this window, KL_STATS_CARD=1 — so the panel can be looked at in a game running on
+// the Mac, and in the composition the headset gives it rather than this viewer's own. The drawing is
+// KleptonMetrics.swift's, from build/libklvm_panel.dylib (`make viewer-panel`, beside m_boot, or
+// KL_VIEW_PANEL_LIB); without it the panel is not shown and the viewer says so once.
+//
+// What makes it the headset's composition is the depth (KleptonCompositor.encodeComposite): the eye
+// picture writes its distance and nearer wins; the guest's quads keep that state, or are drawn in submit
+// order with their distance written where KL_OVERLAY_SUBMIT_ORDER is on (Alien: Rogue Incursion and AC
+// Nexus by default); the panel comes last, over everything (KleptonOverlayDepth.statsCard).
+// KL_VIEW_CARD_DEPTH=nearer draws it nearer-wins instead, which is how the headset drew it through
+// toolchain 563: hidden by any quad of the game's nearer than its 1.2 m.
+static void klvm_card_start(void) {
+    const char *sc = getenv("KL_STATS_CARD");
+    if (!kl_env_on("KL_STATS_CARD", 0) || (sc && !strcasecmp(sc, "line"))) return;
+    char path[PATH_MAX];
+    const char *lib = getenv("KL_VIEW_PANEL_LIB");
+    if (!lib || !*lib) {
+        uint32_t n = sizeof path;
+        if (_NSGetExecutablePath(path, &n) != 0) path[0] = 0;
+        char *slash = strrchr(path, '/');
+        if (slash) snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "libklvm_panel.dylib");
+        lib = path;
+    }
+    void *h = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
+    void (*geom)(int32_t *, int32_t *, int32_t *, float *) = h ? dlsym(h, "klvm_panel_geometry") : NULL;
+    g_card_draw = h ? dlsym(h, "klvm_panel_draw") : NULL;
+    if (!geom || !g_card_draw) {
+        fprintf(stderr, "  [vmtl] metrics panel: %s not loadable (%s) — `make viewer-panel` builds it; "
+                        "not shown\n", lib, dlerror() ?: "no klvm_panel_draw");
+        g_card_draw = NULL;
+        return;
+    }
+    int32_t w = 0, hh = 0, lv = 0;
+    geom(&w, &hh, &lv, g_card_size);
+    g_card_w = w; g_card_h = hh; g_card_levels = lv > 0 ? lv : 1;
+    g_card = 1;
+    g_card_nearer = getenv("KL_VIEW_CARD_DEPTH") && !strcmp(getenv("KL_VIEW_CARD_DEPTH"), "nearer");
+    // As KleptonCompositor.overlaysInSubmitOrder decides it.
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    g_card_in_order = kl_env_on("KL_OVERLAY_SUBMIT_ORDER",
+                                t && (!strcmp(t, "x24882487241367228") || !strcmp(t, "x5812519008825194")));
+    g_depth_fmt = MTLPixelFormatDepth32Float;
+    kl_metrics_begin();
+    kl_metrics_set_visible(1);
+    fprintf(stderr, "  [vmtl] metrics panel in the window (KL_STATS_CARD), with the headset's depth: "
+                    "guest quads %s, panel %s\n",
+            g_card_in_order ? "in submit order" : "nearer-wins",
+            g_card_nearer ? "NEARER-WINS (KL_VIEW_CARD_DEPTH=nearer, as through toolchain 563)"
+                          : "over everything (KleptonOverlayDepth.statsCard)");
+}
+
+static void klvm_card_states(void) {
+    // KleptonOverlayDepth.nearerWins / .inOrder / .statsCard, in Objective-C.
+    MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
+    d.depthCompareFunction = MTLCompareFunctionGreater;
+    d.depthWriteEnabled = YES;
+    g_ds_nearer = [g_dev newDepthStencilStateWithDescriptor:d];
+    d.depthCompareFunction = MTLCompareFunctionAlways;
+    g_ds_in_order = [g_dev newDepthStencilStateWithDescriptor:d];
+    g_ds_card = g_card_nearer ? g_ds_nearer : g_ds_in_order;
+}
+
+// The panel's picture, redrawn when there is a new sample (once a second).
+static void klvm_card_refresh(void) {
+    kl_metrics m;
+    unsigned seq = kl_metrics_latest(&m);
+    if (g_card_tex && seq == g_card_seq) return;
+    if (!g_card_tex) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                         width:(NSUInteger)g_card_w height:(NSUInteger)g_card_h
+                                     mipmapped:NO];
+        td.mipmapLevelCount = (NSUInteger)g_card_levels;
+        td.usage = MTLTextureUsageShaderRead;
+        g_card_tex = [g_dev newTextureWithDescriptor:td];
+        if (!g_card_tex) { g_card = 0; return; }
+    }
+    g_card_seq = seq;
+    for (int l = 0; l < g_card_levels; l++) {
+        int w = g_card_w >> l, h = g_card_h >> l;
+        uint8_t *px = malloc((size_t)w * (size_t)h * 4);
+        if (!px) return;
+        if (g_card_draw(px, w, h, &m))
+            [g_card_tex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)w, (NSUInteger)h)
+                          mipmapLevel:(NSUInteger)l withBytes:px bytesPerRow:(NSUInteger)w * 4];
+        free(px);
+    }
+}
+
+static kl_overlay_uniforms klvm_overlay_uniforms(const kl_ovrp_overlay *ov, int eye);
+
+// encodeStatsCard: head-locked, 1.2 m ahead, just left of the middle and a little above it.
+static void klvm_draw_card(id<MTLRenderCommandEncoder> enc, int eye) {
+    if (!g_card || !g_pipe_ov) return;
+    klvm_card_refresh();
+    if (!g_card_tex) return;
+    kl_ovrp_overlay ov;
+    memset(&ov, 0, sizeof ov);
+    ov.shape = 0;
+    ov.head_locked = 1;
+    ov.tex_w = g_card_w; ov.tex_h = g_card_h;
+    for (int e = 0; e < 2; e++) { ov.viewport[e][2] = g_card_w; ov.viewport[e][3] = g_card_h; }
+    const float pose[7] = { 0, 0, 0, 1, -0.05f, 0.101f, -1.2f };
+    memcpy(ov.pose, pose, sizeof pose);
+    ov.size[0] = g_card_size[0]; ov.size[1] = g_card_size[1];
+    ov.origin_top_left = 1;
+    kl_overlay_uniforms u = klvm_overlay_uniforms(&ov, eye);
+    if (!u.visible) return;
+    [enc setDepthStencilState:g_ds_card];
+    [enc setRenderPipelineState:g_pipe_ov];
+    [enc setVertexBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentTexture:g_card_tex atIndex:0];
+    [enc setFragmentSamplerState:g_samp atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+}
+
 int kl_viewmtl_start(void *metal_layer) {
     if (g_started) return 1;
     if (!metal_layer) return 0;
@@ -644,8 +790,15 @@ int kl_viewmtl_start(void *metal_layer) {
 
     // The blit drives the liveness downsample, whose geometry is irrelevant to
     // counting lit pixels, and stands in if the reprojection shader fails.
+    g_depth_fmt = MTLPixelFormatInvalid;
     g_pipe = klvm_pipeline(kl_reproject_blit_msl(), "kl_blit_v", "kl_blit_f", "blit");
     if (!g_pipe) return 0;
+    // From here on the composite pass's pipelines; the liveness pass keeps g_pipe, with no depth.
+    klvm_card_start();
+    g_pipe_main = g_card ? klvm_pipeline(kl_reproject_blit_msl(), "kl_blit_v", "kl_blit_f", "blit")
+                         : g_pipe;
+    if (!g_pipe_main) return 0;
+    if (g_card) klvm_card_states();
 
     // The GUEST's non-eye layers.
     g_pipe_ov = klvm_pipeline_blend(kl_reproject_overlay_msl(), "kl_ov_v", "kl_ov_f",
@@ -963,8 +1116,30 @@ int kl_viewmtl_present(int win_w, int win_h) {
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    if (g_card) {
+        // Reverse-Z, cleared to 0 (nothing anywhere), as the headset's pass is.
+        if (!g_depth || g_depth.width != (NSUInteger)win_w || g_depth.height != (NSUInteger)win_h) {
+            MTLTextureDescriptor *dd = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                             width:(NSUInteger)win_w height:(NSUInteger)win_h
+                                         mipmapped:NO];
+            dd.usage = MTLTextureUsageRenderTarget;
+            dd.storageMode = MTLStorageModePrivate;
+            g_depth = [g_dev newTextureWithDescriptor:dd];
+        }
+        pass.depthAttachment.texture = g_depth;
+        pass.depthAttachment.loadAction = MTLLoadActionClear;
+        pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+        pass.depthAttachment.clearDepth = 0.0;
+    }
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
     enc.label = @"klepton viewer composite";
+    if (g_card) {
+        [enc setDepthStencilState:g_ds_nearer];
+        kl_metrics_note_shown(1, 0);
+        if (src) kl_metrics_note_eye((int)src.width, (int)src.height);
+        kl_metrics_tick();
+    }
     [enc setViewport:(MTLViewport){ (win_w - dw) * 0.5, (win_h - dh) * 0.5,
                                     dw, dh, 0.0, 1.0 }];
     // Slot 1 is the SECOND eye's texture, for a guest whose two eyes are two
@@ -990,6 +1165,8 @@ int kl_viewmtl_present(int win_w, int win_h) {
         float et[4] = { 1, 1, 1, 1 };
         kl_ovrp_eye_view(eye, NULL, NULL, NULL, NULL, NULL, NULL, NULL, et);
         simd_float4x4 pproj = kl_reproject_projection(et[0], et[1], et[2], et[3], 0.03f);
+        // Coplanar at KL_REPROJECT_DEPTH, so in submission order (encodeProjLayers).
+        if (g_card) [enc setDepthStencilState:g_ds_in_order];
         int drew = klvm_draw_proj_layers(enc, eye, g_list, nproj, pproj);
         if (!drew && kl_ovrp_overlay_count() == 0) {
             // Nothing composed, and no panel to compose either. The drawable is
@@ -1066,16 +1243,21 @@ int kl_viewmtl_present(int win_w, int win_h) {
                               "the [ovrp] render viewport line" : "");
             }
         }
+        // A Vulkan picture's first row is its top and the shader mirrors v after
+        // the grid: the rect is mirrored first, as KleptonCompositor does.
+        if (src) kl_reproject_viewport_for_pass(vp, (float)src.height, flip);
         id<MTLBuffer> gbuf = klvm_grid_buffer(src, vp[2] > 0 ? vp : NULL, &gverts);
         [enc setVertexBuffer:gbuf offset:0 atIndex:1];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:gverts];
         klvm_note_delta(stage);
     } else {
-        [enc setRenderPipelineState:g_pipe];
+        [enc setRenderPipelineState:g_pipe_main];
         [enc setFragmentBytes:&bu length:sizeof bu atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
+    if (g_card) [enc setDepthStencilState:g_card_in_order ? g_ds_in_order : g_ds_nearer];
     klvm_draw_overlays(enc, eye, stage);
+    klvm_draw_card(enc, eye);
     [enc endEncoding];
 
     // The liveness downsample, same source, same shader, 64x64. It is a second
@@ -1136,6 +1318,8 @@ void kl_viewmtl_stop(void) {
     kl_glfb_set_gpu_fence(NULL);
     g_started = 0;
     g_pipe = nil; g_samp = nil; g_stat = nil; g_queue = nil;
+    g_pipe_main = nil; g_depth = nil; g_card_tex = nil;
+    g_ds_nearer = g_ds_in_order = g_ds_card = nil;
     g_event = nil; g_layer = nil; g_dev = nil; g_flat_tex = nil;
     // The array views hold their source textures alive, and a restart would
     // otherwise match a stale key against a texture from the previous device.

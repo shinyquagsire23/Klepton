@@ -1,0 +1,6 @@
+If:
+  # Note: This is a regexp, notice '.*' at the end of PathMatch string.
+  PathMatch: ./extern/.*
+Index:
+  # Disable slow background indexing of these files.
+  Background: Skip

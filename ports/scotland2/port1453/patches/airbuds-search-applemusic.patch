@@ -1,0 +1,226 @@
+diff -ruN a/include/Airbuds/AirbudsClient.hpp b/include/Airbuds/AirbudsClient.hpp
+--- a/include/Airbuds/AirbudsClient.hpp
++++ b/include/Airbuds/AirbudsClient.hpp
+@@ -69,6 +69,7 @@
+     rapidjson::Document apiGetFriends(const AirbudsCredentials& credentials);
+ 
+     std::vector<PlaylistTrack> getRecentlyPlayedTracks();
++    std::vector<Playlist> withAppleMusicLists(std::vector<Playlist> playlists);
+     std::vector<PlaylistTrack> getRecentlyPlayedTracksForUser(
+         const std::string& userId,
+         std::vector<PlaylistTrack>* cachedTracks,
+diff -ruN a/include/Configuration.hpp b/include/Configuration.hpp
+--- a/include/Configuration.hpp
++++ b/include/Configuration.hpp
+@@ -19,6 +19,11 @@
+ std::filesystem::path getDataDirectory();
+ 
+ bool hasAirbudsRefreshToken();
++
++// Klepton (Apple Vision Pro): the Apple Music listening history, written by the host app
++// with MusicKit in the history cache format. When it is there, it replaces Airbuds.
++std::filesystem::path getAppleMusicHistoryPath();
++bool hasAppleMusicHistory();
+ std::string getAirbudsRefreshToken();
+ void setAirbudsRefreshToken(std::string_view token);
+ void clearAirbudsRefreshToken();
+diff -ruN a/src/Airbuds/AirbudsClient.cpp b/src/Airbuds/AirbudsClient.cpp
+--- a/src/Airbuds/AirbudsClient.cpp
++++ b/src/Airbuds/AirbudsClient.cpp
+@@ -259,6 +259,36 @@
+     std::chrono::milliseconds oldestTimestamp{0};
+ };
+ 
++// The host app writes why its Apple Music list is empty or stale (no permission, no MusicKit service).
++std::string readAppleMusicMessage(const std::filesystem::path& path) {
++    std::ifstream file(path, std::ios::binary);
++    if (!file.is_open()) {
++        return "";
++    }
++    std::string data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    rapidjson::Document document;
++    document.Parse(data.c_str());
++    if (!document.IsObject() || !document.HasMember("status") || !document["status"].IsString()
++        || std::string(document["status"].GetString()) == "ok") {
++        return "";
++    }
++    if (document.HasMember("message") && document["message"].IsString()) {
++        return document["message"].GetString();
++    }
++    return "Apple Music history is not available.";
++}
++
++// Two more lists from the host app beside the history: Apple's favourites and the most played songs.
++struct AppleMusicList {
++    const char* id;
++    const char* name;
++    const char* file;
++};
++constexpr AppleMusicList APPLE_MUSIC_LISTS[] = {
++    {"applemusic-favorites", "Favorites", "applemusic_favorites.json"},
++    {"applemusic-most-played", "Most Played", "applemusic_most_played.json"},
++};
++
+ std::filesystem::path getRecentlyPlayedCachePath() {
+     return AirbudsSearch::getDataDirectory() / "recently_played_cache.json";
+ }
+@@ -764,6 +794,9 @@
+ std::vector<Friend> Client::getFriends() {
+     std::vector<Friend> friends;
+     const auto credentials = getAirbudsCredentials();
++    if (!credentials && AirbudsSearch::hasAppleMusicHistory()) {
++        return friends;  // Apple Music has no friends' history
++    }
+     if (!credentials) {
+         throw std::runtime_error("Airbuds refresh token is missing.");
+     }
+@@ -837,6 +870,10 @@
+ }
+ 
+ std::vector<PlaylistTrack> Client::getRecentlyPlayedCachedOnly() {
++    if (AirbudsSearch::hasAppleMusicHistory()) {
++        cachedRecentlyPlayedTracks_ = loadRecentlyPlayedCache(AirbudsSearch::getAppleMusicHistoryPath()).tracks;
++        return cachedRecentlyPlayedTracks_;
++    }
+     if (!cachedRecentlyPlayedTracks_.empty()) {
+         return cachedRecentlyPlayedTracks_;
+     }
+@@ -867,6 +904,11 @@
+ }
+ 
+ std::vector<PlaylistTrack> Client::getPlaylistTracks(const std::string_view playlistId) {
++    for (const auto& list : APPLE_MUSIC_LISTS) {
++        if (playlistId == list.id) {
++            return loadRecentlyPlayedCache(AirbudsSearch::getDataDirectory() / list.file).tracks;
++        }
++    }
+     std::vector<PlaylistTrack> tracks = getRecentlyPlayedCachedOnly();
+     if (tracks.empty()) {
+         return tracks;
+@@ -927,7 +969,7 @@
+ Playlist Client::getRecentlyPlayedPlaylist() {
+     Playlist playlist;
+     playlist.id = "airbuds-recent";
+-    playlist.name = "Airbuds History";
++    playlist.name = AirbudsSearch::hasAppleMusicHistory() ? "Apple Music History" : "Airbuds History";
+ 
+     const std::vector<PlaylistTrack> tracks = getRecentlyPlayedCachedOnly();
+     playlist.totalItemCount = tracks.size();
+@@ -939,14 +981,36 @@
+ 
+ std::vector<Playlist> Client::getPlaylists() {
+     const std::vector<PlaylistTrack> tracks = getRecentlyPlayedTracks();
+-    return buildPlaylistsFromTracks(tracks);
++    return withAppleMusicLists(buildPlaylistsFromTracks(tracks));
+ }
+ 
+ std::vector<Playlist> Client::getPlaylistsCachedOnly() {
+     const std::vector<PlaylistTrack> tracks = getRecentlyPlayedCachedOnly();
+-    return buildPlaylistsFromTracks(tracks);
++    return withAppleMusicLists(buildPlaylistsFromTracks(tracks));
+ }
+ 
++// The host app's favourites and most played, first and only where they hold songs.
++std::vector<Playlist> Client::withAppleMusicLists(std::vector<Playlist> playlists) {
++    if (!AirbudsSearch::hasAppleMusicHistory()) {
++        return playlists;
++    }
++    std::vector<Playlist> lists;
++    for (const auto& list : APPLE_MUSIC_LISTS) {
++        const std::vector<PlaylistTrack> tracks = loadRecentlyPlayedCache(AirbudsSearch::getDataDirectory() / list.file).tracks;
++        if (tracks.empty()) {
++            continue;
++        }
++        Playlist playlist;
++        playlist.id = list.id;
++        playlist.name = list.name;
++        playlist.totalItemCount = tracks.size();
++        playlist.imageUrl = tracks.front().album.url;
++        lists.push_back(playlist);
++    }
++    lists.insert(lists.end(), playlists.begin(), playlists.end());
++    return lists;
++}
++
+ std::vector<Playlist> Client::getPlaylistsForUser(const std::string& userId) {
+     if (userId.empty()) {
+         return getPlaylists();
+@@ -1067,6 +1131,19 @@
+     std::vector<PlaylistTrack>* cachedTracks,
+     const std::filesystem::path& cachePath) {
+     lastRecentlyPlayedWarning_.clear();
++    if (userId.empty() && AirbudsSearch::hasAppleMusicHistory()) {
++        const std::filesystem::path path = AirbudsSearch::getAppleMusicHistoryPath();
++        RecentlyPlayedCache history = loadRecentlyPlayedCache(path);
++        const std::string message = readAppleMusicMessage(path);
++        if (history.tracks.empty() && !message.empty()) {
++            throw std::runtime_error(message);
++        }
++        lastRecentlyPlayedWarning_ = message;
++        if (cachedTracks) {
++            *cachedTracks = history.tracks;
++        }
++        return history.tracks;
++    }
+     RecentlyPlayedCache cache = loadRecentlyPlayedCache(cachePath);
+     std::unordered_set<std::string> cachedKeys;
+     if (!cache.tracks.empty()) {
+diff -ruN a/src/Configuration.cpp b/src/Configuration.cpp
+--- a/src/Configuration.cpp
++++ b/src/Configuration.cpp
+@@ -19,6 +19,15 @@
+     return dataDirectory;
+ }
+ 
++std::filesystem::path getAppleMusicHistoryPath() {
++    return getDataDirectory() / "applemusic_recently_played.json";
++}
++
++bool hasAppleMusicHistory() {
++    std::error_code error;
++    return std::filesystem::exists(getAppleMusicHistoryPath(), error);
++}
++
+ bool hasAirbudsRefreshToken() {
+     return !getAirbudsRefreshToken().empty();
+ }
+diff -ruN a/src/UI/FlowCoordinators/AirbudsSearchFlowCoordinator.cpp b/src/UI/FlowCoordinators/AirbudsSearchFlowCoordinator.cpp
+--- a/src/UI/FlowCoordinators/AirbudsSearchFlowCoordinator.cpp
++++ b/src/UI/FlowCoordinators/AirbudsSearchFlowCoordinator.cpp
+@@ -20,13 +20,13 @@
+     }
+ 
+     // Set title
+-    SetTitle("Airbuds Search", HMUI::ViewController::AnimationType::In);
++    SetTitle("Apple Music Search", HMUI::ViewController::AnimationType::In);
+ 
+     // Make sure the back button is visible
+     showBackButton = true;
+ 
+     // Show view controllers
+-    if (!AirbudsSearch::hasAirbudsRefreshToken()) {
++    if (!AirbudsSearch::hasAirbudsRefreshToken() && !AirbudsSearch::hasAppleMusicHistory()) {
+         settingsViewController_ = BSML::Helpers::CreateViewController<ViewControllers::SettingsViewController*>();
+         ProvideInitialViewControllers(settingsViewController_, nullptr, nullptr, nullptr, nullptr);
+         return;
+diff -ruN a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -132,7 +132,7 @@
+     custom_types::Register::AutoRegister();
+ 
+     // Register main menu button
+-    BSML::Register::RegisterMenuButton("Airbuds Search", "Search your Airbuds history", []() {
++    BSML::Register::RegisterMenuButton("Apple Music Search", "Find maps for the songs you played in Apple Music", []() {
+         AirbudsSearch::Log.info("Menu button clicked");
+         AirbudsSearch::openAirbudsSearchFlowCoordinator();
+     });
+@@ -141,7 +141,7 @@
+     AirbudsSearch::UI::GameplaySetupTab::Register();
+ 
+     // Register settings page
+-    BSML::Register::RegisterSettingsMenu<AirbudsSearch::UI::ViewControllers::SettingsViewController*>("Airbuds Search", false);
++    BSML::Register::RegisterSettingsMenu<AirbudsSearch::UI::ViewControllers::SettingsViewController*>("Apple Music Search", false);
+ 
+     // Install hooks
+     INSTALL_HOOK(AirbudsSearch::Log, onDismissFlowCoordinator);

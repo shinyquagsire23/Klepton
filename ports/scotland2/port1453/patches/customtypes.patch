@@ -1,0 +1,47 @@
+--- a/src/register.cpp
++++ b/src/register.cpp
+@@ -96,7 +96,7 @@
+         if (idx < (int) custom_types::Register::classes.size() && idx >= 0) {
+             // This is a custom class. Skip it.
+ #ifndef NO_VERBOSE_LOGS
+-            logger.debug("custom idx: {}", idx);
++            custom_types::logger.debug("custom idx: {}", idx);
+ #endif
+ #ifdef UNITY_6
+             return;
+@@ -321,7 +321,16 @@
+                 i2c::install_hook<Hook_FromIl2CppTypeMain<Il2CppType*, bool>>(logger, (void*) i2c::functions::Class_FromIl2CppType);
+             }
+ #endif
++#ifdef SC2_AOT_HOOKS
++            auto previous_handle = i2c::functions::GlobalMetadata_GetTypeInfoFromHandle;
++            if (!previous_handle || i2c::functions::MetadataCache_GetTypeInfoFromHandle != previous_handle)
++                SAFE_ABORT("Unexpected Unity 6.3 metadata compatibility aliases");
++            hook_GlobalMetadata_GetTypeInfoFromHandle::GlobalMetadata_GetTypeInfoFromHandle = previous_handle;
++            i2c::functions::GlobalMetadata_GetTypeInfoFromHandle = hook_GlobalMetadata_GetTypeInfoFromHandle::hook();
++            i2c::functions::MetadataCache_GetTypeInfoFromHandle = hook_GlobalMetadata_GetTypeInfoFromHandle::hook();
++#else
+             INSTALL_HOOK(logger, GlobalMetadata_GetTypeInfoFromHandle, (void*) i2c::functions::GlobalMetadata_GetTypeInfoFromHandle);
++#endif
+             INSTALL_HOOK(
+                 logger, GlobalMetadata_GetTypeInfoFromTypeDefinitionIndex, (void*) i2c::functions::GlobalMetadata_GetTypeInfoFromTypeDefinitionIndex
+             );
+@@ -331,11 +340,18 @@
+             INSTALL_HOOK(logger, Class_Init, (void*) i2c::functions::Class_Init);
+ #endif
+ 
++#ifdef SC2_AOT_HOOKS
++            extern int sc2_check_customtypes_unity_target(uintptr_t);
++            uintptr_t GetScriptingClassAddr = i2c::binary::base_addr("libunity.so") + SC2_CUSTOMTYPES_SCRIPTING_CLASS_OFFSET;
++            if (!sc2_check_customtypes_unity_target(GetScriptingClassAddr))
++                SAFE_ABORT("Prepared Unity 6.3 GetScriptingClass target mismatch");
++#else
+             bool multiple;
+             uintptr_t GetScriptingClassAddr = i2c::binary::libunity_unique_pattern(
+                 multiple,
+                 "ff 43 02 d1 fe 23 00 f9 fa 67 05 a9 f8 5f 06 a9 f6 57 07 a9 f4 4f 08 a9 57 d0 3b d5 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 21 ?? ?? 91 e0 03 16 aa"
+             );
++#endif
+             INSTALL_HOOK(logger, GetScriptingClass, reinterpret_cast<void*>(GetScriptingClassAddr));
+ 
+             // get the location of Type::GetClassOrElementClass

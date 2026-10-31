@@ -1,0 +1,8 @@
+<settings-container xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+    <horizontal preferred-width="90">
+        <text align="Center"
+              italics="true"
+              word-wrapping="true"
+              text="Welcome to Mod Settings! If you're wondering what this new menu is, it's a separate settings menu that mods can add to. This menu is separated from the base game's settings in order to make it less likely to break. Basically, if you're not a mod developer, then don't worry about it."/>
+    </horizontal>
+</settings-container>

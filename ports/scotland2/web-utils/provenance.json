@@ -1,0 +1,9 @@
+{
+  "name": "web-utils",
+  "repository": "bsq-ports/WebUtils",
+  "tag": "v0.6.8",
+  "commit": "d0ae1ef7f1557aa4055072a8326745ce303cf14c",
+  "archive": "web-utils-d0ae1ef.tar.gz",
+  "sha256": "443c43682d68f8e6d67aed63c51671a7f877eeef384e39a04826506667b5767d",
+  "scope": "Exact original released source downloaded for port work; not built or tested."
+}
