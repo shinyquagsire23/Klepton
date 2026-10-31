@@ -286,7 +286,26 @@ C `getenv` checks) turns the knob on, the default is off, and the reader is the
   `glCreateShader(GL_COMPUTE_SHADER)` fails on the ES 3.0 ANGLE (Beat Saber 1.45
   then throws `IndexOutOfRangeException: Invalid kernelIndex (0)`, which is
   worse than its kernel being refused). `KL_GLFB_COMPUTE_TF` answers the same
-  limits and serves the kernel.
+  limits and serves the kernel. Arizona Sunshine (`x2190353671014400`) gets
+  them through `KL_GLFB_SSBO_TEX`: without them much of its world was drawn
+  with Unity's magenta error shader, and with them alone its shaders use
+  read-only storage buffers the ES 3.0 backend cannot compile.
+- `KL_GLFB_SSBO_TEX=0|1` — (`runtime/gfx/kl_glfb.c`, `kl_glfb_ssbo_tex`) read a
+  shader's read-only storage buffers through textures, so shaders built for
+  ES 3.1 compile on the ES 3.0 backend; also answers the ES 3.1 storage limits.
+  Default 1 for `x3684804704932159` (Garden of the Sea) and
+  `x2190353671014400` (Arizona Sunshine), else 0.
+- `KL_FUTEX_SPURIOUS_MS=<ms>` — (`runtime/libc/kl_libc.c`, the default futex)
+  no futex wait sleeps longer than this before coming back as woken, which the
+  futex contract allows; a wake that went missing becomes a pause of that
+  length. Default 50 for `x2190353671014400` (Arizona Sunshine, which froze at
+  its logo in about half of its starts), else 0 (off).
+- `KL_SEM_ORIGIN=0|1` — (`runtime/libc/kl_pthread.c`) record four frames of
+  the guest's call into `sem_init`, shown with each semaphore a thread is stuck
+  on in the `KL_TRACE_CONDDUMP` account (with its post count and the age of its
+  last post). Default 1 for `x2190353671014400`: its logo freeze became
+  rarer from the build that records this (about one start in four or five
+  froze, against one in two), for reasons not yet known; it is not gone.
 
 ## ANGLE reference renderer (`runtime/gfx/kl_glfb.c`)
 
@@ -523,6 +542,12 @@ answers GL and kl_glfb never initializes.
   rewritten. `=0` is the state before: the kernel is refused, Unity logs
   "requires features ... 'randomWrite' 'uav'" every frame and the lights are
   missing from the bloom pre-pass.
+  Also on for Arizona Sunshine (`x2190353671014400`), whose kernels are Unity's
+  Internal-Skinning: several read-only buffers read at any element and one
+  written at the invocation's own. With `KL_GLFB_SSBO_TEX` on, a kernel of that
+  shape is rewritten by `klfb_cs_rewrite_sb` — the reads become texture reads,
+  the written element one captured `uint` varying per word — and dispatched
+  with no vertex attributes. Without it its hands and zombies were never drawn.
 - `KL_GLFB_COMPUTE_TF_LOG=1` — a `compute-tf: dispatch` line every 300th
   dispatch as well, with the invocation count (the number of lights, rounded
   up to work groups).
@@ -640,7 +665,11 @@ answers GL and kl_glfb never initializes.
   limit a texel buffer's 2D stand-in keeps its first contents, and what is
   drawn from it (skinned meshes, particles) goes wrong. Default 1 for
   `x5190288877703616` (Saints & Sinners - Chapter 2, which passes 1024 while
-  loading), else 0.
+  loading) and `x2190353671014400` (Arizona Sunshine, whose storage buffers read
+  as textures are texel-buffer stand-ins too), else 0. Separately, the table of
+  those storage-buffer textures holds 2048 (it held 64, and Arizona Sunshine's
+  skinned meshes past the 64th read zeros: a zombie's head or a gun there in one
+  run and gone in the next).
 - `KL_GL_TB_ALIGN=<bytes>` — (`runtime/gfx/kl_egl.c`) the answer to
   `glGetIntegerv(GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT)`, which ANGLE's ES 3.0
   context does not know. Unanswered, the guest reads 0, and Unreal aligns
@@ -923,6 +952,28 @@ The guest's own memory management, and the three seams that used to disable it.
   controller bundle that way. Default 1 for `x5812519008825194`,
   `x2773034772778845` (Premium Bowling: every hall's scene bundle) and
   `x3231001163584154` (Battle Sister: its five store bundles), else 0.
+- `KL_FS_SDCARD_OBB=0|1` — serve `/sdcard/Android/obb/<package>/…` (or
+  another spelling of external storage) from the directory `getObbDirs()`
+  answers, as on a device where they are one directory. Arizona Sunshine opens
+  its OBB a second time by that literal path. Default 1 for
+  `x2190353671014400`, else 0.
+- `KL_OVRP_GL_ARRAY=0|1` on the legacy path — (`runtime/xr/kl_ovrp.c`,
+  `klovrp_setup_eye_array`) also on for Arizona Sunshine (`x2190353671014400`):
+  Unity's old Oculus VRDevice is told multiview and texture arrays are
+  supported, takes the "texture array" eye layout, and each
+  `ovrp_SetupEyeTexture2` name gets two-layer array storage, copied a layer per
+  eye into the compositor at `ovrp_EndFrame`. Without it a Scriptable Render
+  Pipeline drops stereo and draws a flat picture nobody composites.
+- `KL_OVRP_IMPLICIT_BEGIN=0|1` — (`runtime/xr/kl_ovrp.c`, `klovrp_EndFrame`)
+  for a guest that calls `ovrp_EndFrame` and never `ovrp_BeginFrame`, open the
+  next frame's record at each EndFrame, so the compositor has a frame to show.
+  Arizona Sunshine (OVRPlugin 1.49) does that. Default 1 for
+  `x2190353671014400`, else 0.
+- `KL_GLFB_MIRROR_DRAW=0|1` — (`runtime/gfx/kl_glfb.c`, `kl_glfb_mirror_layer`)
+  copy an overlay layer whose guest texture is COMPRESSED (ETC2/ASTC) with a
+  sampling draw instead of `glBlitFramebuffer`, which cannot read it (an
+  incomplete read framebuffer, error 0x506, and a pink panel: Arizona
+  Sunshine's loading screen). Default 1; 0 goes back to the blit.
 - `KL_GLFB_PROBE_CUBE_ARRAY=0|1` — (`runtime/gfx/kl_glfb.c`) rewrite the
   reflection-probe part of PixelToys' BLAST shaders, a `samplerCubeArray` and
   a read-only storage buffer (ES 3.2 / 3.1, refused by the ES 3.0 backend), as
