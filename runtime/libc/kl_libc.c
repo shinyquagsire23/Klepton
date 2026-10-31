@@ -351,7 +351,22 @@ void klb_sysprop_read(const void *p, char *n, char *v) {
     if (n) { if (prop) snprintf(n, 32, "%s", prop); else n[0] = 0; }
     if (v) klb_sysprop_get(prop, v);
 }
-int  klb_prctl(int op, ...)                  { (void)op; return 0; }
+// prctl: PR_SET_NAME (15) names the calling thread, as on Linux, so the names
+// a guest gives its threads (Unity's loader, job workers, render thread) reach
+// the host and every stuck-thread account and crash report; until now they
+// were all blank. Everything else stays the no-op success it was. The
+// arguments are taken as the registers they arrive in (the guest's variadic
+// call puts them in x1-x4, where Darwin's va_arg would look on the stack —
+// see klb_syscall).
+int  klb_prctl(int op, unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5) {
+    (void)a3; (void)a4; (void)a5;
+    if (op == 15 && a2) {
+        char n[16];                          // Linux keeps 15 characters
+        snprintf(n, sizeof n, "%s", (const char *)a2);
+        pthread_setname_np(n);
+    }
+    return 0;
+}
 int  klb_sched_getaffinity(int p, size_t sz, void *m) {
     (void)p; if (m && sz) memset(m, 0xFF, sz);       // pretend every CPU is available
     return 0;
