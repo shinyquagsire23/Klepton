@@ -1065,7 +1065,12 @@ int kl_ovrp_gl_array_for(const char *t) {
                                                    strcmp(t, "x3386618894743567") == 0 ||
                                                    strcmp(t, "x2108775495884888") == 0 ||
                                                    strcmp(t, "x2223615721048141") == 0 ||
-                                                   strcmp(t, "x2426206484098337") == 0));
+                                                   strcmp(t, "x2426206484098337") == 0 ||
+                                                   // Arizona Sunshine: Unity's legacy VRDevice
+                                                   // with a Scriptable Render Pipeline, which
+                                                   // renders stereo single-pass or not at all
+                                                   // (klovrp_setup_eye_array, below).
+                                                   strcmp(t, "x2190353671014400") == 0));
     }
 }
 
@@ -4427,8 +4432,11 @@ static void klovrp_record_late_sample(const klovrp_pose *h) {
 // because the work-list report counts by the name a call actually hit — a
 // single shared pointer would label every ovrp_BeginFrame4 as the un-numbered
 // form. The work is identical either way and neither carries an out-param.
+// Whether the guest has ever opened a frame itself — see klovrp_EndFrame.
+static volatile int g_guest_began;
 static uint64_t klovrp_BeginFrame(int guest_frame_index) {
     ovrp_hit("ovrp_BeginFrame");
+    g_guest_began = 1;
     return klovrp_begin_frame_impl(guest_frame_index);
 }
 
@@ -4440,6 +4448,7 @@ static uint64_t klovrp_BeginFrame(int guest_frame_index) {
 // caller reads.
 static uint64_t klovrp_BeginFrame4(int guest_frame_index, uint64_t extra) {
     ovrp_hit("ovrp_BeginFrame4");
+    g_guest_began = 1;
     (void)extra;
     { static unsigned n; g_trace_frame = n; if (n < 48 || n % 300 == 0 || klovrp_pose_trace(n)) {
         uint64_t tid=0; pthread_threadid_np(NULL,&tid);
@@ -4933,6 +4942,8 @@ static uint64_t klovrp_end_frame_impl(int guest_frame_index, const int *viewport
     // The two named entry points over the body above, for the same reason
 // BeginFrame/BeginFrame4 are separate: the work list counts by the name the call
 // actually hit.
+static int klovrp_legacy_array(void);                   // with ovrp_SetupEyeTexture2
+static int klovrp_mirror_legacy_array(int guest_frame_index);
 static uint64_t klovrp_EndFrame(int guest_frame_index) {
     ovrp_hit("ovrp_EndFrame");
     klovrp_enq_age();
@@ -4940,7 +4951,33 @@ static uint64_t klovrp_EndFrame(int guest_frame_index) {
 // No layer list on this path — 1.28's legacy VRDevice hands its eye
     // textures down through ovrp_SetupEyeTexture2 and never describes a layer,
     // so it can only ever have rendered into the whole thing.
-    return klovrp_end_frame_impl(guest_frame_index, NULL, NULL, -1);
+    int named = klovrp_legacy_array() ? klovrp_mirror_legacy_array(guest_frame_index) : -1;
+    uint64_t rv = klovrp_end_frame_impl(guest_frame_index, NULL, NULL, named);
+    // KL_OVRP_IMPLICIT_BEGIN: a guest that ends frames and never begins one.
+    // Arizona Sunshine (x2190353671014400, OVRPlugin 1.49, legacy VRDevice)
+    // calls ovrp_Update2 and ovrp_EndFrame but not ovrp_BeginFrame, so no
+    // frame record was ever opened: the compositor saw "serial 0" on every
+    // stage, the observation window was never reset ("drew into 3 stages"),
+    // and the eye pass drew nothing — black with the game and its sound
+    // running behind it (2026-10-31). For such a guest each EndFrame opens the
+    // next frame, which is the same moment from the other side; its before-
+    // render Update2 sample then replaces the pose as for any guest
+    // (g_sample_after_begin). The first EndFrame files nothing, as before.
+    static int implicit = -1;
+    if (implicit < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        implicit = kl_env_on("KL_OVRP_IMPLICIT_BEGIN", t && strcmp(t, "x2190353671014400") == 0);
+    }
+    if (implicit && !g_guest_began) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [ovrp] EndFrame(%d) with no BeginFrame ever seen — "
+                            "each EndFrame opens the next frame "
+                            "(KL_OVRP_IMPLICIT_BEGIN)\n", guest_frame_index);
+        klovrp_begin_frame_impl(guest_frame_index + 1);
+    }
+    return rv;
 }
 
     // ovrp_EndFrame4(frameIndex, layerSubmits, layerSubmitCount, sync) — the 1.40
@@ -7827,6 +7864,99 @@ static uint64_t klovrp_GetNativeXrApiType(int *out) {
 // float->unorm blit INVALID_OPERATION — the eye texture must be float to
 // match. This is what the guest's fmt=2 means in practice.
 #define KL_OVRP_TEXFMT_EYE  0x881A
+
+// The Array eye layout on the LEGACY path (kl_ovrp_gl_array, on GL). Unity's
+// old Oculus VRDevice picks its eye layout from ovrp_GetSystemMultiViewSupported
+// and ovrp_GetEyeTextureArraySupported: told no, it makes "separate" textures
+// and renders multi-pass — and a Scriptable Render Pipeline then refuses stereo
+// altogether ("Scriptable Render Pipeline stereo support requires single-pass
+// stereo") and draws one flat picture to the default framebuffer, which nothing
+// composites. Arizona Sunshine (x2190353671014400, OVRPlugin 1.49, LWRP) did
+// exactly that: its eye FBOs were never bound again after the first frames and
+// the headset stayed black with the game running (2026-10-31).
+//
+// Told yes, Unity takes the "texture array" layout and renders both eyes in one
+// pass through GL_OVR_multiview. The texture name it hands down still needs
+// storage from the plugin, as on the 2D path, so it gets a two-layer
+// GL_TEXTURE_2D_ARRAY, h wide and w tall for the same reason as the 2D path. An
+// array cannot be re-pointed at the compositor's MTLTexture, so each layer is
+// copied into the compositor's eye texture of that stage at ovrp_EndFrame
+// (klovrp_mirror_legacy_array) — the route the EndFrame4 Array layout takes.
+static struct { uint32_t tex; int w, h; } g_legacy_arr[KLOVRP_MAX_STAGES][2];
+
+static int klovrp_legacy_array(void) {
+    return !kl_vulkan_guest_active() && kl_ovrp_gl_array();
+}
+
+static uint64_t klovrp_setup_eye_array(int eye, int stage, uint32_t handle, int w, int h) {
+    if ((unsigned)eye > 1 || (unsigned)stage >= KLOVRP_MAX_STAGES) return 0;
+    // Both eyes may be handed the same array: its storage is made once.
+    int other = g_legacy_arr[stage][!eye].tex == handle;
+    g_legacy_arr[stage][eye].tex = handle;
+    g_legacy_arr[stage][eye].w = w;
+    g_legacy_arr[stage][eye].h = h;
+    if (other) return 1;
+    static void (*gl_BindTexture)(uint32_t, uint32_t);
+    static void (*gl_TexStorage3D)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t);
+    static void (*gl_TexParameteri)(uint32_t, uint32_t, int32_t);
+    static void (*gl_GetIntegerv)(uint32_t, int32_t *);
+    static uint32_t (*gl_GetError)(void);
+    if (!gl_BindTexture) {
+        gl_BindTexture   = kl_egl_sym("glBindTexture");
+        gl_TexStorage3D  = kl_egl_sym("glTexStorage3D");
+        gl_TexParameteri = kl_egl_sym("glTexParameteri");
+        gl_GetIntegerv   = kl_egl_sym("glGetIntegerv");
+        gl_GetError      = kl_egl_sym("glGetError");
+    }
+    if (!gl_BindTexture || !gl_TexStorage3D) return 0;
+    int32_t prev = 0;
+    if (gl_GetIntegerv) gl_GetIntegerv(0x8C1D /* TEXTURE_BINDING_2D_ARRAY */, &prev);
+    if (gl_GetError) while (gl_GetError()) {}
+    gl_BindTexture(0x8C1A /* TEXTURE_2D_ARRAY */, handle);
+    gl_TexStorage3D(0x8C1A, 1, KL_OVRP_TEXFMT_EYE, w, h, 2);
+    uint32_t e = gl_GetError ? gl_GetError() : 0;
+    if (gl_TexParameteri) {
+        gl_TexParameteri(0x8C1A, 0x2801 /* MIN_FILTER */, 0x2601 /* LINEAR */);
+        gl_TexParameteri(0x8C1A, 0x2800 /* MAG_FILTER */, 0x2601);
+        gl_TexParameteri(0x8C1A, 0x2802 /* WRAP_S */, 0x812F /* CLAMP_TO_EDGE */);
+        gl_TexParameteri(0x8C1A, 0x2803 /* WRAP_T */, 0x812F);
+    }
+    gl_BindTexture(0x8C1A, (uint32_t)prev);
+    fprintf(stderr, "  [ovrp] SetupEyeTexture2(eye=%d stage=%d): GL %u is a two-layer "
+                    "array, %dx%d (the Array layout on the legacy path)%s\n",
+            eye, stage, handle, w, h, e ? " — glTexStorage3D raised an error" : "");
+    if (e) fprintf(stderr, "  [ovrp]   GL error 0x%x\n", e);
+    return 1;
+}
+
+// At ovrp_EndFrame: both layers of the stage the guest just drew into the
+// compositor's eye textures of that stage. The stage is the guest's frame
+// counter modulo the stage count, which is how the legacy VRDevice picks it.
+// Returns the stage, or -1 if it has no array.
+static int klovrp_mirror_legacy_array(int guest_frame_index) {
+    int stages = kl_ovrp_stage_count();
+    if (stages <= 0 || stages > KLOVRP_MAX_STAGES) return -1;
+    int stage = ((guest_frame_index % stages) + stages) % stages;
+    uint32_t t0 = g_legacy_arr[stage][0].tex;
+    if (!t0) return -1;
+    int w = g_legacy_arr[stage][0].w, h = g_legacy_arr[stage][0].h;
+    for (int eye = 0; eye < 2; eye++) {
+        uint32_t src = g_legacy_arr[stage][eye].tex ? g_legacy_arr[stage][eye].tex : t0;
+        int layer = (eye == 1 && src == t0) ? 1 : 0;
+        int slot = kl_glfb_mirror_eye_layer(eye, stage, 0, src, layer, w, h, KL_OVRP_TEXFMT_EYE);
+        static int said[2];
+        if (slot < 0 && !said[0]++)
+            fprintf(stderr, "  [ovrp] legacy array eye %d stage %d could not be copied to "
+                            "the compositor\n", eye, stage);
+        else if (slot >= 0 && !said[1]++)
+            fprintf(stderr, "  [ovrp] legacy array eyes: frame %d, stage %d, GL %u layer %d "
+                            "-> compositor slot %d (%dx%d)\n",
+                    guest_frame_index, stage, src, layer, slot, w, h);
+    }
+    kl_glfb_frame_fence();
+    return stage;
+}
+
 static uint64_t klovrp_SetupEyeTexture2(int eye, int stage, uintptr_t handle,
                                         int w, int h, int depth, int fmt, void *ctx) {
     ovrp_hit("ovrp_SetupEyeTexture2");
@@ -7839,6 +7969,8 @@ static uint64_t klovrp_SetupEyeTexture2(int eye, int stage, uintptr_t handle,
     }
     fprintf(stderr, "  [ovrp] SetupEyeTexture2(eye=%d stage=%d) -> tex=%zu %dx%d\n",
             eye, stage, (size_t)handle, w, h);
+    if (klovrp_legacy_array())
+        return klovrp_setup_eye_array(eye, stage, (uint32_t)handle, h, w);
 // The capture reads the frame back from the FBO this texture is attached
     // to — tell kl_glfb which names are eyes (it is a no-op consumer when the
     // null driver is doing the "rendering").
@@ -11834,6 +11966,8 @@ static uint64_t klovrp_CalculateEyePreviewRect(const ovrp_layer_desc_eyefov *des
 static uint64_t klovrp_DestroyEyeTexture(int eye, int stage) {
     ovrp_hit("ovrp_DestroyEyeTexture");
     fprintf(stderr, "  [ovrp] DestroyEyeTexture(eye=%d stage=%d)\n", eye, stage);
+    if ((unsigned)eye <= 1 && (unsigned)stage < KLOVRP_MAX_STAGES)
+        g_legacy_arr[stage][eye].tex = 0;
     kl_glfb_release_eye_texture(eye, stage);
     return OVRP_SUCCESS;
 }
