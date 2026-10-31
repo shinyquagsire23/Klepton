@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>io.avpplay.surreal-diagnostics</string>
+<key>CFBundleExecutable</key><string>SurrealHarness</string>
+<key>CFBundleName</key><string>Surreal Diagnostics</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>1.0</string>
+<key>MinimumOSVersion</key><string>26.0</string>
+<key>UIDeviceFamily</key><array><integer>7</integer></array>
+<key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><true/></dict>
+<key>NSBluetoothAlwaysUsageDescription</key><string>Connect Surreal Touch controllers for input diagnostics.</string>
+<key>NSHandsTrackingUsageDescription</key><string>Match your grip to the calibration references.</string>
+<key>NSWorldSensingUsageDescription</key><string>Place the controller calibration references in front of you.</string>
+</dict></plist>

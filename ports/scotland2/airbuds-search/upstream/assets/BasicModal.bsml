@@ -1,0 +1,11 @@
+<modal xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+       xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'
+       id="modal_">
+    <vertical vertical-fit="PreferredSize" background="round-rect-panel" pad="2" pref-width="70">
+        <text id="textView_" font-size="3.5" word-wrapping="true"/>
+        <horizontal>
+            <button id="secondaryButton_" on-click="onDismissModalButtonClicked" text="Cancel"/>
+            <primary-button id="primaryButton_" on-click="onContinueModalButtonClicked" text="Continue"/>
+        </horizontal>
+    </vertical>
+</modal>

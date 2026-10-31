@@ -1,0 +1,18 @@
+--- a/include/utilities/hooking.hpp
++++ b/include/utilities/hooking.hpp
+@@ -38,6 +38,7 @@
+         using cast_t = ::i2c::detail::method_check<cast_test, func_t>::type;                                                     \
+         static_assert(cast_test.operator()<cast_t>(), "Hook method signature does not match!");                                  \
+         static_assert(::i2c::detail::match_hookable<static_cast<cast_t>(method)>, "Method cannot be hooked!");                   \
++        SC2_RECORD_MATCH_1453(name_, method, cast_t) \
+         __INTERNAL_HOOK_STRUCT(name_, ::i2c::metadata_getter<static_cast<cast_t>(method)>::method_info(), ret_type, __VA_ARGS__) \
+     };                                                                                                                           \
+     AUTO_INSTALL(name_)                                                                                                          \
+@@ -50,6 +51,7 @@
+         using cast_t = ::i2c::detail::method_check<cast_test, func_t>::type;                                                     \
+         static_assert(cast_test.operator()<cast_t>(), "Hook method signature does not match!");                                  \
+         static_assert(::i2c::detail::match_hookable<static_cast<cast_t>(method)>, "Method cannot be hooked!");                   \
++        SC2_RECORD_MATCH_1453(name_, method, cast_t) \
+         __INTERNAL_HOOK_STRUCT(name_, ::i2c::metadata_getter<static_cast<cast_t>(method)>::method_info(), ret_type, __VA_ARGS__) \
+     };                                                                                                                           \
+     AUTO_INSTALL_ORIG(name_)                                                                                                     \

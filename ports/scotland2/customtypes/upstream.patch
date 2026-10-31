@@ -1,0 +1,19 @@
+--- a/src/register.cpp
++++ b/src/register.cpp
+@@ -595,7 +595,16 @@
+         INSTALL_HOOK_DIRECT(logger, GlobalMetadata_GetTypeInfoFromHandle, (void*)il2cpp_functions::il2cpp_GlobalMetadata_GetTypeInfoFromHandle);
+         INSTALL_HOOK_DIRECT(logger, GlobalMetadata_GetTypeInfoFromTypeDefinitionIndex, (void*)il2cpp_functions::il2cpp_GlobalMetadata_GetTypeInfoFromTypeDefinitionIndex);
+         INSTALL_HOOK_DIRECT(logger, Class_Init, (void*)il2cpp_functions::il2cpp_Class_Init);
++        #ifdef SC2_AOT_HOOKS
++        // The source signature includes a TLS instruction transformed offline.
++        // Use its independently verified original-ELF target and require a
++        // matching prepared signed entry before installing the real hook.
++        extern int sc2_check_customtypes_unity_target(uintptr_t);
++        uintptr_t GetScriptingClassAddr = baseAddr("libunity.so") + SC2_CUSTOMTYPES_SCRIPTING_CLASS_OFFSET;
++        if (!sc2_check_customtypes_unity_target(GetScriptingClassAddr)) SAFE_ABORT_MSG("Prepared GetScriptingClass target mismatch");
++#else
+         uintptr_t GetScriptingClassAddr = findPattern(baseAddr("libunity.so"), "ff 43 02 d1 fe 23 00 f9 fa 67 05 a9 f8 5f 06 a9 f6 57 07 a9 f4 4f 08 a9 57 d0 3b d5 e8 16 40 f9 f6 03 01 aa");
++#endif
+         INSTALL_HOOK_DIRECT(logger, GetScriptingClass, reinterpret_cast<void*>(GetScriptingClassAddr));
+ 
+         // get the location of Type::GetClassOrElementClass

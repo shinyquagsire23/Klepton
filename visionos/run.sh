@@ -10,6 +10,7 @@
 #   KLEPTON_TEAM=<teamid>   override signing team
 #   KLEPTON_BUNDLE_ID=...   override bundle id
 #   KL_SKIP_STAGE=1         never stage, even on a target that has never had it
+#   KL_SKIP_LAUNCH=1        device: build, install and stage, but do not launch
 #   KL_STAGE=1              always stage, whatever the stamp says
 #
 # Everything downstream of the target — the product name, and with it the
@@ -19,6 +20,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 eval "$(python3 targets.py "${KLEPTON_TARGET:-}")"
 export KLEPTON_TARGET="$KLT_NAME"
+
+# The runtime's copy of the target table follows targets.py. For the targets in
+# the table that is the file as checked in, and nothing is written. An
+# experimental target (KLEPTON_GENERIC_TARGET) is not in the checked-in file:
+# its row is added for this build, and the next build of anything else writes
+# the table back. Written only when it differs, so an unchanged table does not
+# make every build recompile what includes it.
+python3 targets.py --c-table > ../runtime/kl_target_table.h.new
+if cmp -s ../runtime/kl_target_table.h.new ../runtime/kl_target_table.h; then
+  rm -f ../runtime/kl_target_table.h.new
+else
+  mv ../runtime/kl_target_table.h.new ../runtime/kl_target_table.h
+  echo "  target table: rewritten for $KLT_NAME"
+fi
 # Forward target-requested knobs into the runtime environment. Some targets
 # can request host-side behaviour (for example a guest that needs to JIT).
 # The target table emits KLT_ keys; export the corresponding KL_ env var so
@@ -29,6 +44,17 @@ fi
 BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
 PRODUCT="$KLT_PRODUCT"
 MODE="${1:-sim}"
+
+# Beat Saber with its mods (AVP Play: "Mods" on the game's page). They come
+# prebuilt with the toolchain, for one game version each; stage_avp_mods.py
+# picks them by the game's version code below and stops with the reason for any
+# other. Exported before the runtime is built: the archive links the bridge only
+# then. Without KLEPTON_SCOTLAND2=1 nothing of this runs.
+if [ "${KLEPTON_SCOTLAND2:-0}" = 1 ]; then
+  export KLEPTON_SCOTLAND2 SC2_BUILD_MODE=release SC2_TEST_SET=coremods
+else
+  unset KLEPTON_SCOTLAND2 SC2_BUILD_MODE SC2_TEST_SET SC2_GAME_PROFILE
+fi
 
 # Give the custom-launcher build its OWN derived data. Xcode's incremental Swift
 # build does not reliably invalidate on a SWIFT_ACTIVE_COMPILATION_CONDITIONS change,
@@ -127,7 +153,7 @@ stage_if_needed() {
 # it, the app never did, and the run took the window path while looking like the
 # compositor had failed to come up. A knob that is set and not delivered is worse
 # than one that does not exist, so the default is now "forward it".
-FORWARD_SKIP="KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
+FORWARD_SKIP="KL_LX_PHASE KL_LX_SYSROOT KL_LX_GAME KL_LX_XRIZER KL_LX_MIRROR KL_ANGLE_DIR KL_SKIP_STAGE KL_STAGE KL_SKIP_INSTALL KL_SKIP_LAUNCH KL_LOG_OUT KL_WATCH KL_QUIET KL_KEEP_LONGEST"
 FORWARD=""
 for K in $(env | sed -n -e 's/^\(KL_[A-Za-z0-9_]*\)=.*/\1/p' \
                         -e 's/^\(MTL_[A-Za-z0-9_]*\)=.*/\1/p' \
@@ -148,6 +174,14 @@ echo "[1/5] runtime + guest translations ($KLT_NAME)…"
 # mkangle.sh below stops and names the bootstrap command instead.
 if [ -d ../vendor/.git ]; then (cd .. && make -s angle-xros angle-xrsim); fi
 ./mkguest.sh | tail -1
+if [ "${KLEPTON_SCOTLAND2:-0}" = 1 ]; then
+  # After mkguest.sh: it writes the game's own frameworks, and the mods replace
+  # libil2cpp and libunity with copies whose hook gates are prepared before signing.
+  SC2_OUT=$(python3 ../ports/scotland2/tools/stage_avp_mods.py --target "$KLT_NAME" --tree "../$KLT_TREE")
+  printf '%s\n' "$SC2_OUT" | grep -v '^SC2_GAME_PROFILE='
+  export SC2_GAME_PROFILE="$(printf '%s\n' "$SC2_OUT" | sed -n 's/^SC2_GAME_PROFILE=//p')"
+  [ -n "$SC2_GAME_PROFILE" ] || { echo "!! mods: no profile for this game version"; exit 1; }
+fi
 ./mkangle.sh | tail -1
 # ...and the Vulkan renderer, for a guest whose graphics API is not GLES. Unlike
 # ANGLE this needs no source checkout and no build — `make mvk` is a 180 MB
@@ -185,20 +219,46 @@ print(phys[0]["identifier"])
 
   echo "[3/5] building for device ${DEVID}…"
   # generic/platform, not id= : the build must not depend on the device being awake
+  BUILD_LOG="$(mktemp)"
   set +e
   xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" -configuration Debug \
     -destination 'generic/platform=visionOS' -derivedDataPath "build/dd-device-$KLT_NAME$DD_SUFFIX" \
-    -allowProvisioningUpdates build 2>&1 | grep -E 'error:|Signing Identity|\*\* BUILD'
+    -allowProvisioningUpdates build 2>&1 | grep -E 'error:|Signing Identity|\*\* BUILD' | tee "$BUILD_LOG"
   # xcodebuild's status, through the pipe. Testing for the .app is NOT enough: a
   # failed *incremental* build leaves the previous, complete and perfectly valid
   # bundle in place, so the install and launch below both succeed and run the OLD
   # binary — and the log then reads as "the change had no effect", which is the
   # most expensive possible way to be told about a compile error.
   BUILD_RC=${PIPESTATUS[0]}
+  # A developer team that has never had a device cannot be given a profile at
+  # all ("Your team has no devices from which to generate a provisioning
+  # profile"), and a generic destination registers none — so a first-time
+  # owner's very first build stops here, before the install step below that
+  # knows how to register a headset is ever reached. Build once more FOR this
+  # device: that is the one form in which Xcode may register it with the team.
+  # It needs the headset awake and reachable, which the generic build does not.
+  if [ "$BUILD_RC" != 0 ] && grep -qiE 'no devices from which to generate a provisioning profile|no devices registered' "$BUILD_LOG"; then
+    echo "  the Apple team has no device registered yet — registering this headset and building again…"
+    xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" -configuration Debug \
+      -destination "id=$DEVID" -derivedDataPath "build/dd-device-$KLT_NAME$DD_SUFFIX" \
+      -allowProvisioningUpdates -allowProvisioningDeviceRegistration build 2>&1 | grep -E 'error:|Signing Identity|\*\* BUILD' | tee "$BUILD_LOG"
+    BUILD_RC=${PIPESTATUS[0]}
+    if [ "$BUILD_RC" != 0 ]; then
+      echo "!! signing: the Apple team has no registered device, and registering this Vision Pro did not work. Keep the headset on, unlocked and on the same Wi-Fi, then try again. If it still fails, add the headset by hand: its identifier is shown in Xcode › Window › Devices and Simulators, and it goes under Certificates, Identifiers & Profiles › Devices at developer.apple.com (the team's Admin or Account Holder can do that)."
+    fi
+  fi
+  rm -f "$BUILD_LOG"
   set -e
   APP="build/dd-device-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xros/$PRODUCT.app"
   [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
   [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
+  # A product without this string does not fail to build, sign or install: it
+  # launches, asks for accessory tracking, and is killed by TCC with nothing in
+  # its own log but a signal 6. Stop here instead, where the cause can be named.
+  plutil -extract NSAccessoryTrackingUsageDescription raw "$APP/Info.plist" >/dev/null 2>&1 || {
+    echo "!! $APP has no NSAccessoryTrackingUsageDescription — it would be killed at launch."
+    echo "!! (Xcode moves the usage descriptions out of Info.plist; gen_xcodeproj.py emits them.)"
+    exit 1; }
 
   if [ -n "${KL_SKIP_INSTALL:-}" ]; then
     # Every install observed on this device ROTATES the data container, which
@@ -210,11 +270,56 @@ print(phys[0]["identifier"])
     echo "[4/5] install skipped (KL_SKIP_INSTALL=1 - existing app and its data container kept)"
   else
     echo "[4/5] installing…"
-    xcrun devicectl device install app --device "$DEVID" "$APP" | tail -2
+    # The install is the first step that needs the headset itself, and the two
+    # ways it fails for a first-time owner have nothing to do with the build:
+    #
+    #  - the headset is not in the signing profile, because it has never been
+    #    registered with the developer account. The build above is for a generic
+    #    destination and cannot register anything; so build once more FOR this
+    #    device, which lets Xcode register it and re-sign, then install again.
+    #  - the connection drops ("peer is no longer reachable"). Once more, after
+    #    a pause, is all it has ever taken.
+    #
+    # Either way the outcome is this script's status, with the reason on a line
+    # of its own — a pipe into `tail` used to be all that reported it.
+    INSTALL_LOG="$(mktemp)"
+    install_app() {
+      xcrun devicectl device install app --device "$DEVID" "$APP" > "$INSTALL_LOG" 2>&1
+      local rc=$?
+      tail -2 "$INSTALL_LOG"
+      return $rc
+    }
+    set +e
+    install_app; INSTALL_RC=$?
+    if [ $INSTALL_RC -ne 0 ] && grep -qiE 'provisioning profile|not registered|0xe8008015|0xe8008012' "$INSTALL_LOG"; then
+      echo "  this headset is not in the signing profile yet — registering it and signing again…"
+      xcodebuild -project "$PRODUCT.xcodeproj" -scheme "$PRODUCT" -configuration Debug \
+        -destination "id=$DEVID" -derivedDataPath "build/dd-device-$KLT_NAME$DD_SUFFIX" \
+        -allowProvisioningUpdates -allowProvisioningDeviceRegistration build 2>&1 | grep -E 'error:|\*\* BUILD'
+      install_app; INSTALL_RC=$?
+    elif [ $INSTALL_RC -ne 0 ]; then
+      echo "  install failed — once more in 5 s"
+      sleep 5
+      install_app; INSTALL_RC=$?
+    fi
+    set -e
+    if [ $INSTALL_RC -ne 0 ]; then
+      echo "!! install FAILED: $(grep -iE 'error|failed' "$INSTALL_LOG" | tail -1 | cut -c1-200)"
+      rm -f "$INSTALL_LOG"
+      exit 1
+    fi
+    rm -f "$INSTALL_LOG"
   fi
   # Installing can rotate the data container, so assets are staged *after*.
   stage_if_needed "$DEVID" "$DEVID"
 
+  # Install-only: the app and its assets are on the device and nothing is
+  # started — for a headset someone is wearing, or a target that is not the one
+  # being worked on.
+  if [ -n "${KL_SKIP_LAUNCH:-}" ]; then
+    echo "[5/5] launch skipped (KL_SKIP_LAUNCH=1)"
+    exit 0
+  fi
   echo "[5/5] launching (report also renders on-screen)…"
   # KL_FRAMES carries the app past the initJni gate into the Android lifecycle
   # — which is where libil2cpp and its 3,083 veneers first load under
@@ -396,7 +501,9 @@ fi
 # nothing — silently, right after "[2/5] project…", before the message below
 # ever prints. Cost a "build crash" report that was really a missing `device`
 # argument on a machine with no simulator booted.
-UDID=$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1 || true)
+# KLEPTON_SIM_UDID names the simulator outright: "the first booted one" is an
+# iPhone as soon as somebody has one open for another project.
+UDID="${KLEPTON_SIM_UDID:-$(xcrun simctl list devices booted | grep -o '[0-9A-F-]\{36\}' | head -1 || true)}"
 [ -n "$UDID" ] || { echo "!! no booted visionOS simulator (did you mean ./run.sh device ?)"; exit 1; }
 
 echo "[3/5] building for the simulator…"
@@ -410,6 +517,16 @@ set -e
 APP="build/dd-sim-$KLT_NAME$DD_SUFFIX/Build/Products/Debug-xrsimulator/$PRODUCT.app"
 [ "$BUILD_RC" = 0 ] || { echo "!! build FAILED (see errors above) — not installing a stale app"; exit 1; }
 [ -f "$APP/Info.plist" ] || { echo "!! no usable .app at $APP"; exit 1; }
+# The build above signs nothing (CODE_SIGNING_ALLOWED=NO), and the linker's own
+# ad-hoc signature is only on what the linker made: the app's binary, ANGLE,
+# MoltenVK. The guest's translated libraries come out of klepton-ld without one,
+# and an arm64 simulator refuses to map unsigned code — dlopen of the first
+# library in the chain failed, with a message cut off before its reason
+# (visionOS 27 simulator, 2026-10-11). Ad-hoc is all a simulator asks for.
+for F in "$APP"/Frameworks/*.framework; do
+  [ -d "$F" ] || continue
+  codesign -dv "$F" >/dev/null 2>&1 || codesign -f -s - "$F" >/dev/null 2>&1 || true
+done
 
 echo "[4/5] installing + staging…"
 xcrun simctl install "$UDID" "$APP"

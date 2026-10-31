@@ -1,0 +1,91 @@
+--- a/src/Data/DataGetter.cpp
++++ b/src/Data/DataGetter.cpp
+@@ -4,6 +4,7 @@
+ #include "logging.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cerrno>
+ #include <cctype>
+ #include <chrono>
+@@ -196,8 +197,16 @@
+             size_t size
+         ) {
+             const auto destinationString = destination.string();
+-            std::string temporaryString = destinationString + ".tmp.XXXXXX";
+-            int descriptor = ::mkstemp(temporaryString.data());
++            // Android aliases can expand when translated to host paths; mkstemp
++            // cannot safely rewrite a caller-sized Android pathname in place.
++            static std::atomic<unsigned long long> sequence{0};
++            std::string temporaryString;
++            int descriptor = -1;
++            for (unsigned attempt = 0; attempt < 128; ++attempt) {
++                temporaryString = destinationString + ".tmp." + std::to_string(::getpid()) + "-" + std::to_string(sequence.fetch_add(1));
++                descriptor = ::open(temporaryString.c_str(), O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600);
++                if (descriptor >= 0 || errno != EEXIST) break;
++            }
+             if (descriptor < 0) {
+                 const int error = errno;
+                 ERROR(
+--- a/src/Data/SongDetailsContainer.cpp
++++ b/src/Data/SongDetailsContainer.cpp
+@@ -48,8 +48,8 @@
+     shared_ptr_vector<Song> SongDetailsContainer::songs;
+     shared_ptr_vector<SongDifficulty> SongDetailsContainer::difficulties;
+ 
+-    BSHookUtils::UnorderedEventCallback<> SongDetailsContainer::dataAvailableOrUpdatedInternal;
+-    BSHookUtils::UnorderedEventCallback<std::string> SongDetailsContainer::dataLoadFailedInternal;
++    BSHookUtils::UnorderedEventCallback<> SongDetailsContainer::dataAvailableOrUpdatedInternal __attribute__((init_priority(200)));
++    BSHookUtils::UnorderedEventCallback<std::string> SongDetailsContainer::dataLoadFailedInternal __attribute__((init_priority(200)));
+ 
+     std::future<void> SongDetailsContainer::Load(bool reload, int acceptableAgeHours) {
+         return std::async(std::launch::async, std::bind(&SongDetailsContainer::Load_internal, reload, acceptableAgeHours));
+--- a/src/SongDetails.cpp
++++ b/src/SongDetails.cpp
+@@ -1,12 +1,15 @@
+ #include "SongDetails.hpp"
++#include <thread>
+ #include "Data/Song.hpp"
+ #include "Data/DataGetter.hpp"
+ #include "Data/SongDetailsContainer.hpp"
+ 
+ namespace SongDetailsCache {
+-    SongDetails SongDetails::instance{};
+-    BSHookUtils::UnorderedEventCallback<> SongDetails::dataAvailableOrUpdated;
+-    BSHookUtils::UnorderedEventCallback<std::string> SongDetails::dataLoadFailed;
++    // Initialize callback containers before the singleton registers its original
++    // forwarders. Link order may vary across translation/packaging workspaces.
++    SongDetails SongDetails::instance __attribute__((init_priority(300))) {};
++    BSHookUtils::UnorderedEventCallback<> SongDetails::dataAvailableOrUpdated __attribute__((init_priority(200)));
++    BSHookUtils::UnorderedEventCallback<std::string> SongDetails::dataLoadFailed __attribute__((init_priority(200)));
+ 
+     bool ::SongDetailsCache::SongDetails::isLoading = false;
+ 
+--- a/src/Utils.cpp
++++ b/src/Utils.cpp
+@@ -3,6 +3,7 @@
+ #include "Data/SongDetailsContainer.hpp"
+ 
+ #include <charconv>
++#include <cstdlib>
+ #include <limits>
+ #include <memory>
+ #include <stdexcept>
+@@ -214,12 +215,15 @@
+             !setOption(CURLOPT_HEADERFUNCTION, CurlWriteCallback) ||
+             !setOption(CURLOPT_HEADERDATA, &headerTarget) ||
+             !setOption(CURLOPT_USERAGENT, USER_AGENT) ||
+-            // TODO: Configure a Quest-compatible CA bundle, then enable peer verification.
+-            !setOption(CURLOPT_SSL_VERIFYPEER, 0L)
++            !setOption(CURLOPT_SSL_VERIFYHOST, 2L) ||
++            !setOption(CURLOPT_SSL_VERIFYPEER, 1L)
+         ) {
+             return response;
+         }
+ 
++        if (const char* ca = std::getenv("KL_SCOTLAND2_CA_BUNDLE"); ca && *ca) {
++            if (!setOption(CURLOPT_CAINFO, ca)) return response;
++        }
+         response.curlStatus = curl_easy_perform(curl.get());
+         /* Check for errors */
+         if (response.curlStatus != CURLE_OK) {

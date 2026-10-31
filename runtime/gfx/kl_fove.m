@@ -20,11 +20,13 @@
 //     hidden-area mask passes when those are on.
 //
 //  2. THE MAP. One MTLRasterizationRateMap per target shape, screen size = the
-//     eye target, separable: one peak per eye at that eye's straight-ahead
-//     point (from the frustum the runtime hands the guest), the double-wide
-//     eye as two horizontal peaks, a layered eye pair as one map layer per
-//     eye. Per axis the profile is Half-Life: Alyx's square density profile
-//     re-centred per eye: full density inside a box, a linear ramp, a floor.
+//     eye target, separable: per eye the envelope of two peaks, at that eye's
+//     straight-ahead point (from the frustum the runtime hands the guest) and
+//     at the other eye's placed in the same rect, so both eyes get the same
+//     map relative to their pictures (KL_FOVE_PER_EYE=1: its own peak only);
+//     the double-wide eye as one such pair per half, a layered eye pair as
+//     one map layer per eye. Per axis the profile is Half-Life: Alyx's square
+//     density profile: full density inside a box, a linear ramp, a floor.
 //     The marked encoders get it on a copy of their descriptor and render IN
 //     PLACE into the guest's screen-size images (Metal writes the top-left
 //     physical region; LOAD/STORE passes sharing a map join).
@@ -134,16 +136,21 @@ static float kf_profile(float d, float box, float ramp, float fl) {
     return 1.0f - (1.0f - fl) * d / ramp;
 }
 
-int kl_fove_curves(uint32_t W, uint32_t H, const float cx[2], float cy,
-                   float box, float ramp, float fl, int nh, float *h, int nv, float *v) {
+// The envelope of two peaks: the larger of the two profiles.
+static float kf_profile2(float x, const float c[2], float box, float ramp, float fl) {
+    return fmaxf(kf_profile(x - c[0], box, ramp, fl), kf_profile(x - c[1], box, ramp, fl));
+}
+
+int kl_fove_curves_env2(uint32_t W, uint32_t H, const float cx0[2], const float cx1[2], float cy,
+                        float box, float ramp, float fl, int nh, float *h, int nv, float *v) {
     if (!W || !H || nh < 2 || nv < 2 || !h || !v || !(fl > 0) || fl > 1 || box < 0 || ramp < 0)
         return 0;
     float half = W * 0.5f;
     for (int k = 0; k < nh; k++) {
         float x = (float)k * (float)W / (float)(nh - 1);
-        // Each eye's half of the target follows its own peak; the sample ON
+        // Each eye's half of the target follows its own peaks; the sample ON
         // the seam takes the larger of the two (curves are minimums).
-        float a = kf_profile(x - cx[0], box, ramp, fl), b = kf_profile(x - cx[1], box, ramp, fl);
+        float a = kf_profile2(x, cx0, box, ramp, fl), b = kf_profile2(x, cx1, box, ramp, fl);
         h[k] = x < half ? a : x > half ? b : fmaxf(a, b);
     }
     for (int k = 0; k < nv; k++) {
@@ -153,13 +160,25 @@ int kl_fove_curves(uint32_t W, uint32_t H, const float cx[2], float cy,
     return 1;
 }
 
-int kl_fove_curves1(uint32_t W, uint32_t H, float cx, float cy,
-                    float box, float ramp, float fl, int nh, float *h, int nv, float *v) {
+int kl_fove_curves(uint32_t W, uint32_t H, const float cx[2], float cy,
+                   float box, float ramp, float fl, int nh, float *h, int nv, float *v) {
+    const float a[2] = { cx[0], cx[0] }, b[2] = { cx[1], cx[1] };
+    return kl_fove_curves_env2(W, H, a, b, cy, box, ramp, fl, nh, h, nv, v);
+}
+
+int kl_fove_curves_env(uint32_t W, uint32_t H, const float cx[2], const float cy[2],
+                       float box, float ramp, float fl, int nh, float *h, int nv, float *v) {
     if (!W || !H || nh < 2 || nv < 2 || !h || !v || !(fl > 0) || fl > 1 || box < 0 || ramp < 0)
         return 0;
-    for (int k = 0; k < nh; k++) h[k] = kf_profile((float)k * (float)W / (float)(nh - 1) - cx, box, ramp, fl);
-    for (int k = 0; k < nv; k++) v[k] = kf_profile((float)k * (float)H / (float)(nv - 1) - cy, box, ramp, fl);
+    for (int k = 0; k < nh; k++) h[k] = kf_profile2((float)k * (float)W / (float)(nh - 1), cx, box, ramp, fl);
+    for (int k = 0; k < nv; k++) v[k] = kf_profile2((float)k * (float)H / (float)(nv - 1), cy, box, ramp, fl);
     return 1;
+}
+
+int kl_fove_curves1(uint32_t W, uint32_t H, float cx, float cy,
+                    float box, float ramp, float fl, int nh, float *h, int nv, float *v) {
+    const float a[2] = { cx, cx }, b[2] = { cy, cy };
+    return kl_fove_curves_env(W, H, a, b, box, ramp, fl, nh, h, nv, v);
 }
 
 // ---------------------------------------------------------------- state
@@ -173,6 +192,11 @@ static int g_patch_fc = 1, g_expand = 1, g_idx = 20;
 static int g_msaa, g_expand_fovea = 1;
 static int g_fence_on = 1;           // KL_FOVE_FENCE: order the guest's passes after the expand
 static int g_inter = 1;              // KL_FOVE_INTERMEDIATE: foveate a confirmed eye-size intermediate
+static int g_subp_helpers = 1;       // KL_FOVE_SUBPASS_HELPERS: a helper's subpass read gets the physical position
+// KL_FOVE_PER_EYE: 1 = each eye's map peaks at its own straight-ahead point
+// only (the shape until toolchain 565). 0, the default = the envelope of both
+// eyes' points, the same map for both (kf_map_for has the reasons).
+static int g_per_eye;
 static int g_slow;                    // KL_FOVE_SLOW=<n> (debug stress): n busy iterations per MSAA expand fragment
 static const char *g_dump;
 // The double-wide eye's geometry: its extent and both eyes' frustum tangents
@@ -233,6 +257,10 @@ typedef struct {
     int offx[2], offy;                // screen - physical inside those rectangles
     int failed;
     float cx[2], cy[2];               // ARRAY: the centre each layer was built around (for the re-centre)
+    float ocx[2], ocy[2];             // ARRAY: the other eye's point in that layer (the envelope's second peak)
+    int env;                          // built as the envelope of both eyes' points (not KL_FOVE_PER_EYE)
+    int superseded;                   // re-centred into another slot while expands still referred to this one:
+                                      // lookups skip it, its pending expands still read it, recycled once none does
 } kf_map_t;
 #define KF_MAP_N 8
 static kf_map_t g_maps[KF_MAP_N];
@@ -313,6 +341,16 @@ static void kf_turn_off(const char *why) {
 
 static void kf_read_env(void) {
     const char *s = kl_env_str("KL_FOVEATION", "off");
+    // This fork has a second rate-map module, kl_mtl_foveate.m (KL_VK_FOVEATE,
+    // what Half-Life: Alyx is drawn through). Both replace the same two Metal
+    // methods, so only one may be in force: where the older one is asked for,
+    // this one stays off and says so.
+    if (strcmp(s, "off") && strcmp(s, "0") && *s && kl_env_float("KL_VK_FOVEATE", 0.0f) > 0.0f) {
+        fprintf(stderr, "  [fove] KL_FOVEATION=%s ignored: KL_VK_FOVEATE is set, and the two "
+                        "foveation modules cannot both be in force\n", s);
+        g_on = 0;
+        return;
+    }
     // Half-Life: Alyx's square density profile per level (docs/FOVEATION.md
     // §3.1), re-centred per eye: box and
     // ramp measured at a 2016-high target (box 1216/1024/768 px, ramp ~384),
@@ -349,6 +387,8 @@ static void kf_read_env(void) {
     if (g_slow < 0) g_slow = 0;
     g_fence_on = kl_env_on("KL_FOVE_FENCE", 1);
     g_inter = kl_env_on("KL_FOVE_INTERMEDIATE", 1);
+    g_subp_helpers = kl_env_on("KL_FOVE_SUBPASS_HELPERS", 1);
+    g_per_eye = kl_env_on("KL_FOVE_PER_EYE", 0);
     g_on = 1;
 }
 
@@ -414,6 +454,31 @@ static void kf_dump(const char *src, size_t n, uint64_t h, const char *tag) {
     if (!f) return;
     fwrite(src, 1, n, f);
     fclose(f);
+}
+
+// Whether `id` (length n) names a parameter in the list [pb, pe) whose type is a
+// texture (`texture…` / `depth…`): the receiver of a subpass read in a helper.
+// A template argument list may hold commas, so the type's start is found with
+// '<' / '>' balanced.
+static int kf_param_is_texture(const char *pb, const char *pe, const char *id, size_t n) {
+    for (const char *p = pb; p + n <= pe; p++) {
+        if (strncmp(p, id, n)) continue;
+        if (p > pb && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) continue;
+        char after = p + n < pe ? p[n] : ')';
+        if (isalnum((unsigned char)after) || after == '_') continue;
+        if (after != ',' && after != ')' && after != ' ' && after != '[') continue;
+        const char *t = p;
+        int ang = 0;
+        while (t > pb) {
+            if (t[-1] == '>') ang++;
+            else if (t[-1] == '<') ang--;
+            else if ((t[-1] == ',' || t[-1] == '(') && ang == 0) break;
+            t--;
+        }
+        while (t < p && (*t == ' ' || *t == '\n')) t++;
+        if (!strncmp(t, "texture", 7) || !strncmp(t, "depth", 5)) return 1;
+    }
+    return 0;
 }
 
 // Returns a patched copy (malloc'd) or NULL to leave the source alone.
@@ -494,6 +559,90 @@ static char *kf_patch_msl(const char *s, size_t n) {
     size_t subp_l = strlen(subp);
     int nsub = 0;
     for (const char *p = brace; (p = strstr(p, subp)); p += subp_l) nsub++;
+    // The same emulation inside a HELPER function. Unreal 4's mobile depth
+    // fetch (`VulkanSubpassDepthFetch`, DepthFade / soft-edge translucency in
+    // Moss) is a static inline function above the entry point that takes the
+    // position as `thread float4& <name>` and reads `.read(uint2(<name>.xy), ...)`.
+    // The scan above starts at the entry's brace and never sees it, so the
+    // helper got the REMAPPED (screen) position and read the physical-layout
+    // depth at the wrong texel. A helper whose only uses of <name> are that
+    // spelling, read from one of its own texture parameters, is fed the saved
+    // physical position at its call sites in the entry body instead.
+    enum { KF_HC_N = 64 };
+    const char *hc[KF_HC_N];
+    int nhc = 0;
+    size_t name_l = strlen(name);
+    if (g_subp_helpers) {                    // KL_FOVE_SUBPASS_HELPERS=0: the old behaviour (A/B)
+        char par[160];
+        snprintf(par, sizeof par, "thread float4& %s", name);
+        size_t par_l = strlen(par);
+        for (const char *p = s; (p = strstr(p, par)) && p < f; p += par_l) {
+            const char *pe = p + par_l;
+            if (isalnum((unsigned char)*pe) || *pe == '_') continue;
+            // The helper's name: the identifier before the '(' that opens this list.
+            const char *lp = p;
+            int d = 0;
+            while (lp > s && !(lp[-1] == '(' && d == 0)) {
+                if (lp[-1] == ')') d++;
+                else if (lp[-1] == '(') d--;
+                if (lp[-1] == '\n' || lp[-1] == ';' || lp[-1] == '}') break;
+                lp--;
+            }
+            if (lp <= s || lp[-1] != '(') continue;
+            const char *pc = lp;                 // the parameter list's ')'
+            for (int pd = 1; *pc && pc < f; pc++) {
+                if (*pc == '(') pd++;
+                else if (*pc == ')' && --pd == 0) break;
+            }
+            if (*pc != ')') continue;
+            const char *ne = lp - 1, *nb = ne;
+            while (nb > s && (isalnum((unsigned char)nb[-1]) || nb[-1] == '_')) nb--;
+            if (nb == ne || (size_t)(ne - nb) > 120) continue;
+            // Its body: the first '{' after the parameter list, to its match.
+            const char *bo = strchr(pe, '{'), *bc = NULL;
+            if (!bo || bo > f) continue;
+            int bd = 0;
+            for (const char *q = bo; *q && q < f; q++) {
+                if (*q == '{') bd++;
+                else if (*q == '}' && --bd == 0) { bc = q; break; }
+            }
+            if (!bc) continue;
+            int uses = 0, reads = 0;
+            for (const char *q = bo; (q = strstr(q, name)) && q < bc; q += name_l) {
+                if ((q > s && (isalnum((unsigned char)q[-1]) || q[-1] == '_')) ||
+                    isalnum((unsigned char)q[name_l]) || q[name_l] == '_') continue;
+                uses++;
+                // Only `<tex>.read(uint2(<name>.xy)…` with <tex> a texture parameter of
+                // this helper: the subpass emulation, not some other uint2 of the position.
+                if (q - bo >= 12 && !strncmp(q - 6, "uint2(", 6) && !strncmp(q + name_l, ".xy)", 4) &&
+                    !strncmp(q - 12, ".read(", 6)) {
+                    const char *te = q - 12, *tb = te;
+                    while (tb > bo && (isalnum((unsigned char)tb[-1]) || tb[-1] == '_')) tb--;
+                    if (tb < te && kf_param_is_texture(lp, pc, tb, (size_t)(te - tb))) reads++;
+                }
+            }
+            if (!reads || reads != uses) continue;
+            // Every call of it in the entry body: the bare <name> argument.
+            char hn[128];
+            size_t hl = (size_t)(ne - nb);
+            memcpy(hn, nb, hl); hn[hl] = 0;
+            for (const char *q = brace; (q = strstr(q, hn)) && nhc < KF_HC_N; q += hl) {
+                if (q[hl] != '(' || isalnum((unsigned char)q[-1]) || q[-1] == '_') continue;
+                int cd = 0;
+                for (const char *a = q + hl; *a; a++) {
+                    if (*a == '(') cd++;
+                    else if (*a == ')' && --cd == 0) break;
+                    else if (cd == 1 && !strncmp(a, name, name_l) && (a[-1] == '(' || a[-1] == ' ' || a[-1] == ',') &&
+                             (a[name_l] == ',' || a[name_l] == ')' || a[name_l] == ' ') && nhc < KF_HC_N)
+                        hc[nhc++] = a;
+                }
+            }
+        }
+        // Copied out in source order below.
+        for (int i = 1; i < nhc; i++)
+            for (int j = i; j > 0 && hc[j - 1] > hc[j]; j--) { const char *t = hc[j]; hc[j] = hc[j - 1]; hc[j - 1] = t; }
+    }
+    nsub += nhc;
     // MSAA eyes (seen first in Half-Life: Alyx): with tiler mode off Valve's
     // translucent shaders read the eye's own multisampled DEPTH (soft
     // particles) and one draw its multisampled COLOUR as textures,
@@ -623,11 +772,19 @@ static char *kf_patch_msl(const char *s, size_t n) {
     memcpy(o + k, arg, (size_t)al); k += (size_t)al;
     memcpy(o + k, s + a, c - a); k += c - a;
     memcpy(o + k, stmt, (size_t)sl); k += (size_t)sl;
-    int mi = 0;
+    int mi = 0, hi = 0;
     for (const char *p = s + c; *p; ) {      // the body, with the subpass (and MSAA eye) reads kept physical
         const char *q = nsub ? strstr(p, subp) : NULL;
         while (mi < nmsr && msr[mi] < p) mi++;
         const char *m = mi < nmsr ? msr[mi] : NULL;
+        while (hi < nhc && hc[hi] < p) hi++;
+        const char *hp = hi < nhc ? hc[hi] : NULL;
+        if (hp && (!q || hp < q) && (!m || hp < m) && (!ret || ret < p || hp < ret)) {
+            memcpy(o + k, p, (size_t)(hp - p)); k += (size_t)(hp - p);
+            k += (size_t)sprintf(o + k, "kl_fove_phys");
+            p = hp + name_l; hi++;
+            continue;
+        }
         if (ret && (!q || ret < q) && (!m || ret < m) && ret >= p) {   // debug grid before `return out;`
             memcpy(o + k, p, (size_t)(ret - p)); k += (size_t)(ret - p);
             memcpy(o + k, grid, gl); k += gl;
@@ -649,8 +806,8 @@ static char *kf_patch_msl(const char *s, size_t n) {
     __atomic_add_fetch(&g_st.patched, 1, __ATOMIC_RELAXED);
     if (nsub) {
         uint64_t m = __atomic_add_fetch(&g_st.subpass, 1, __ATOMIC_RELAXED);
-        if (m <= 4) KFI("shader %016llx: %d subpass-input read(s) kept at the PHYSICAL position\n",
-                        (unsigned long long)h, nsub);
+        if (m <= 4) KFI("shader %016llx: %d subpass-input read(s) kept at the PHYSICAL position (%d through a helper's call)\n",
+                        (unsigned long long)h, nsub, nhc);
     }
     if (nmsr) {
         uint64_t m = __atomic_add_fetch(&g_st.msread, 1, __ATOMIC_RELAXED);
@@ -663,6 +820,7 @@ static char *kf_patch_msl(const char *s, size_t n) {
 
 // t_fove: the patch on a source string, with the defaults (slot 20, patch on).
 char *kl_fove_patch_for_test(const char *src) { return src ? kf_patch_msl(src, strlen(src)) : NULL; }
+void kl_fove_set_subpass_helpers_for_test(int on) { g_subp_helpers = on != 0; }
 
 static NSString *kf_patched_source(NSString *src) {
     if (!src) return nil;
@@ -757,11 +915,35 @@ void kl_fove_test_eye_record(int on, const float fx[2], const float fy[2], const
     pthread_mutex_unlock(&g_mu);
 }
 
-// Maps replaced by a re-centre: kept alive, never freed, as encoders
-// already in flight hold the old one. Bounded by KF_RECENTRE_MAX.
-#define KF_RECENTRE_MAX 8
-static id g_retired[2 * KF_RECENTRE_MAX];
-static int g_nretired, g_recentres;
+// Maps replaced by a re-centre: kept alive for KF_RETIRE_S seconds, as
+// encoders already in flight hold the old one, then released. Until toolchain
+// 565 they were never freed and a run got 8 re-centres; a guest on dynamic
+// resolution (Alien: Rogue Incursion, KL_OVRP_ADAPTIVE_RES) moves its render
+// viewport every few seconds, and from the ninth move on its fovea stayed where
+// the eighth had put it. A re-centre that finds every slot younger than that
+// is put off to a later lookup.
+#define KF_RETIRED_N 32
+#define KF_RETIRE_S 2.0
+static struct { id map, buf; double t; } g_retired[KF_RETIRED_N];
+static int g_recentres;
+static double kf_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+// g_mu held. A free retirement slot (releasing the ones old enough), or -1.
+static int kf_retire_slot(void) {
+    double now = kf_now();
+    int fr = -1;
+    for (int i = 0; i < KF_RETIRED_N; i++) {
+        if (g_retired[i].map && now - g_retired[i].t >= KF_RETIRE_S) {
+            KF_RELEASE(g_retired[i].map); KF_RELEASE(g_retired[i].buf);
+            g_retired[i].map = nil; g_retired[i].buf = nil;
+        }
+        if (!g_retired[i].map && fr < 0) fr = i;
+    }
+    return fr;
+}
 
 // The straight-ahead point of eye e inside a W x H one-eye image,
 // in screen px. The frustum: the guest's own eye-layer Fov when it set one up
@@ -770,16 +952,9 @@ static int g_nretired, g_recentres;
 // where the told cone puts it), else the one kl_ovrp tells it (kl_openxr's
 // xrLocateViews answers from the same call). Tangents l, r, t, b, positive. A
 // sub-rect the guest rendered into (renderViewportScale) moves the point.
-static int kf_eye_point(int e, uint32_t W, uint32_t H, float *cx, float *cy, float *fx, float *fy, char *why, size_t nwhy) {
-    if (g_trec_on) {
-        *fx = g_trec_fx[e & 1]; *fy = g_trec_fy[e & 1];
-        int got = g_trec_of[0] > 0;
-        int used = kl_fove_eye_px(*fx, *fy, W, H, got ? g_trec_vp[e & 1] : NULL, got ? g_trec_of : NULL, cx, cy);
-        snprintf(why, nwhy, !got ? "no frame record: full image" : used ? "viewport %d,%d %dx%d of %dx%d (test)"
-                                                                        : "unusable (test)",
-                 g_trec_vp[e & 1][0], g_trec_vp[e & 1][1], g_trec_vp[e & 1][2], g_trec_vp[e & 1][3], g_trec_of[0], g_trec_of[1]);
-        return 2;
-    }
+// The straight-ahead fraction of eye e (kl_fove_centre): 2 = from the guest's
+// eye-layer Fov, 1 = the cone kl_ovrp tells it, 0 = none (centred).
+static int kf_eye_frac(int e, float *fx, float *fy) {
     float t4[4] = {0, 0, 0, 0};
     // The cone the guest says it rendered with (its eye layer's Fov — the union
     // under symmetric projection) beats the one it was told.
@@ -789,9 +964,45 @@ static int kf_eye_point(int e, uint32_t W, uint32_t H, float *cx, float *cy, flo
     float t[4] = { -t4[0], t4[1], -t4[3], t4[2] };
     if (!have) { t[0] = -1; t[1] = 1; t[2] = -1; t[3] = 1; }
     kl_fove_centre(t, fx, fy);
+    return have ? (from_layer ? 2 : 1) : 0;
+}
+
+// ...and, when ocx is not NULL, the OTHER eye's straight-ahead point placed in
+// eye e's own rect (its fraction, this eye's viewport): the second peak of the
+// envelope (kf_map_for).
+static int kf_eye_point(int e, uint32_t W, uint32_t H, float *cx, float *cy, float *fx, float *fy,
+                        float *ocx, float *ocy, char *why, size_t nwhy) {
+    if (g_trec_on) {
+        *fx = g_trec_fx[e & 1]; *fy = g_trec_fy[e & 1];
+        int got = g_trec_of[0] > 0;
+        int used = kl_fove_eye_px(*fx, *fy, W, H, got ? g_trec_vp[e & 1] : NULL, got ? g_trec_of : NULL, cx, cy);
+        if (ocx) kl_fove_eye_px(g_trec_fx[(e & 1) ^ 1], g_trec_fy[(e & 1) ^ 1], W, H, got ? g_trec_vp[e & 1] : NULL,
+                                got ? g_trec_of : NULL, ocx, ocy);
+        snprintf(why, nwhy, !got ? "no frame record: full image" : used ? "viewport %d,%d %dx%d of %dx%d (test)"
+                                                                        : "unusable (test)",
+                 g_trec_vp[e & 1][0], g_trec_vp[e & 1][1], g_trec_vp[e & 1][2], g_trec_vp[e & 1][3], g_trec_of[0], g_trec_of[1]);
+        return 2;
+    }
+    int have = kf_eye_frac(e, fx, fy);
     kl_ovrp_render_pose rec;
     int got = kf_last_record(&rec);
     int used = kl_fove_eye_px(*fx, *fy, W, H, got ? rec.viewport[e] : NULL, got ? rec.viewport_of : NULL, cx, cy);
+    {   // A guest whose records alternate between a rect and none would flip the map.
+        static int last = -1, said;
+        if (got && used != last) {
+            if (last >= 0 && said < 6) {
+                said++;
+                KFI("frame record (stage %d) %s a render viewport for eye %d (was %s)\n", rec.stage,
+                    used ? "carries" : "carries no usable", e, last ? "a rect" : "none");
+            }
+            last = used;
+        }
+    }
+    if (ocx) {
+        float ofx, ofy;
+        kf_eye_frac(e ^ 1, &ofx, &ofy);
+        kl_fove_eye_px(ofx, ofy, W, H, got ? rec.viewport[e] : NULL, got ? rec.viewport_of : NULL, ocx, ocy);
+    }
     // For the map line: which generation the centre came from.
     if (!got) snprintf(why, nwhy, "no frame record: full image");
     else if (!used) snprintf(why, nwhy, "viewport %dx%d of %dx%d unusable: full image", rec.viewport[e][2],
@@ -800,17 +1011,46 @@ static int kf_eye_point(int e, uint32_t W, uint32_t H, float *cx, float *cy, flo
                   rec.viewport[e][2], rec.viewport[e][3], rec.viewport_of[0], rec.viewport_of[1],
                   (uint32_t)rec.viewport_of[0] != W || (uint32_t)rec.viewport_of[1] != H
                       ? ", another generation: scaled as a fraction" : "");
-    return have ? (from_layer ? 2 : 1) : 0;   // 2: the guest's eye-layer Fov, 1: the told cone
+    return have;
+}
+
+// g_mu held. Does a pending expand still refer to map slot mi?
+static int kf_map_referenced(int mi) {
+    for (int i = 0; i < KF_CB_N; i++) if (g_pend[i].cb && g_pend[i].map == mi) return 1;
+    return 0;
 }
 
 // g_mu held. The cached map for a target shape, built on first use; NULL when
-// it cannot be built (logged once per shape).
-static kf_map_t *kf_map_for(uint32_t W, uint32_t H, int kind, int layers, int eye) {
+// it cannot be built (logged once per shape). keep_mi: the map slot the
+// calling command buffer has already drawn with (its pending entry's), or -1;
+// that buffer keeps it for the rest of its passes, re-centred or not (a scene
+// subpass and the eye subpass that reads it must share one map).
+static kf_map_t *kf_map_for_cb(uint32_t W, uint32_t H, int kind, int layers, int eye, int keep_mi) {
     kf_map_t *mp = NULL, *fr = NULL;
     for (int i = 0; i < KF_MAP_N; i++) {
         kf_map_t *c = &g_maps[i];
+        if (i == keep_mi && c->W == W && c->H == H && c->kind == kind && c->layers == layers && c->eye == eye && c->map)
+            return c;
+    }
+    for (int i = 0; i < KF_MAP_N; i++) {
+        kf_map_t *c = &g_maps[i];
+        if (c->superseded) continue;
         if (c->W == W && c->H == H && c->kind == kind && c->layers == layers && c->eye == eye) { mp = c; break; }
-        if (!c->W && !fr) fr = c;
+    }
+    // A free slot: never used, or superseded with no expand left on it (its map
+    // is retired like a re-centred one, kept a while for frames in flight).
+    for (int i = 0; i < KF_MAP_N && !fr; i++) {
+        kf_map_t *c = &g_maps[i];
+        if (!c->W) fr = c;
+        else if (c->superseded && !kf_map_referenced(i)) {
+            int rs = kf_retire_slot();
+            if (rs < 0) continue;
+            g_retired[rs].map = c->map; g_retired[rs].buf = c->buf; g_retired[rs].t = kf_now();
+            c->map = nil; c->buf = nil;
+            *c = (kf_map_t){0};
+            if (g_lastmap == c) g_lastmap = NULL;
+            fr = c;
+        }
     }
     int recentre = 0;
     if (mp && !mp->failed && kind == KF_ARRAY) {
@@ -820,34 +1060,53 @@ static kf_map_t *kf_map_for(uint32_t W, uint32_t H, int kind, int layers, int ey
         // into a 4012-wide sub-rect of a 5088 texture (eye0 at 0, eye1 at
         // 1075), so its fovea sat 682 px off the straight-ahead point and the
         // ramp crossed the middle of the view: a hard vertical clear/blurry
-        // line in both eyes. Rebuilt in place when a layer's centre moves more
-        // than 4 px, but never while a pending expand still refers to it.
+        // line in both eyes. Rebuilt when a layer's centre moves more than
+        // 4 px: in place when no pending expand refers to the map, else into
+        // another slot, this one superseded until its expands have run. Until
+        // toolchain 565 a referenced map was simply kept, and Alien: Rogue
+        // Incursion always has an expand in flight: its map stayed where the
+        // fifth re-centre put it while dynamic resolution took the viewport
+        // from 79% to 55% of the image (the fovea ~800 px off on the Mac).
         char w[128];
         float ncx, ncy, nfx, nfy;
-        int moved = 0, busy = 0, mi = (int)(mp - g_maps);
+        int moved = 0, mi = (int)(mp - g_maps);
         for (int l = 0; l < layers && l < 2; l++) {
             int e = layers == 2 ? l : (eye == 1 ? 1 : 0);
-            kf_eye_point(e, W, H, &ncx, &ncy, &nfx, &nfy, w, sizeof w);
+            kf_eye_point(e, W, H, &ncx, &ncy, &nfx, &nfy, NULL, NULL, w, sizeof w);
             if (fabsf(ncx - mp->cx[l]) > 4.0f || fabsf(ncy - mp->cy[l]) > 4.0f) moved = 1;
         }
-        for (int i = 0; moved && i < KF_CB_N; i++) if (g_pend[i].cb && g_pend[i].map == mi) busy = 1;
-        if (!moved || busy) return mp;
-        if (g_recentres >= KF_RECENTRE_MAX) {
+        if (!moved) return mp;
+        if (kf_map_referenced(mi)) {
+            if (!fr) return mp;           // no slot to build into: next lookup
+            g_recentres++;
+            if (g_recentres <= 8 || g_recentres % 50 == 0)
+                KFI("map %ux%u RE-CENTRED (#%d): it was built at %.0f,%.0f / %.0f,%.0f — the frame record moved the "
+                    "straight-ahead point (built into slot %d; slot %d kept for the expands still pending on it)\n",
+                    W, H, g_recentres, mp->cx[0], mp->cy[0], mp->cx[1], mp->cy[1], (int)(fr - g_maps), mi);
+            mp->superseded = 1;
+            mp = fr;
+            recentre = 1;
+            goto build;
+        }
+        int rs = kf_retire_slot();
+        if (rs < 0) {
             static int said;
-            if (!said++) KFI("map %ux%u: the centre moved again but %d re-centres were already made — kept\n", W, H,
-                             KF_RECENTRE_MAX);
+            if (!said++) KFI("map %ux%u: the centre moved again but all %d retired maps are younger than %.0f s — "
+                             "kept for now\n", W, H, KF_RETIRED_N, KF_RETIRE_S);
             return mp;
         }
         g_recentres++;
         recentre = 1;
-        KFI("map %ux%u RE-CENTRED (#%d): it was built at %.0f,%.0f / %.0f,%.0f — the frame record moved the "
-            "straight-ahead point (rebuilt in place, the old map kept for frames in flight)\n", W, H, g_recentres,
-            mp->cx[0], mp->cy[0], mp->cx[1], mp->cy[1]);
-        if (g_nretired + 2 <= 2 * KF_RECENTRE_MAX) { g_retired[g_nretired++] = mp->map; g_retired[g_nretired++] = mp->buf; }
+        if (g_recentres <= 8 || g_recentres % 50 == 0)
+            KFI("map %ux%u RE-CENTRED (#%d): it was built at %.0f,%.0f / %.0f,%.0f — the frame record moved the "
+                "straight-ahead point (rebuilt in place, the old map kept %.0f s for frames in flight)\n", W, H,
+                g_recentres, mp->cx[0], mp->cy[0], mp->cx[1], mp->cy[1], KF_RETIRE_S);
+        g_retired[rs].map = mp->map; g_retired[rs].buf = mp->buf; g_retired[rs].t = kf_now();
         mp->map = nil; mp->buf = nil;
     } else if (mp) return mp->failed ? NULL : mp;
     if (!fr && !recentre) fr = &g_maps[KF_MAP_N - 1];   // evict the last (never reached: one guest, one or two shapes)
     if (!recentre) mp = fr;
+build:
     if (mp->map && g_nold < 15) { g_old[g_nold++] = mp->map; g_old[g_nold++] = mp->buf; }
     *mp = (kf_map_t){0};
     mp->W = W; mp->H = H; mp->kind = kind; mp->layers = layers; mp->eye = eye; mp->failed = 1;
@@ -859,7 +1118,8 @@ static kf_map_t *kf_map_for(uint32_t W, uint32_t H, int kind, int layers, int ey
     float *vc[2] = { malloc(sizeof(float) * (size_t)nv), malloc(sizeof(float) * (size_t)nv) };
     int ok = hc[0] && hc[1] && vc[0] && vc[1];
     float cx[2] = {0, 0}, cy[2] = {0, 0}, fx[2] = {0.5f, 0.5f}, fy[2] = {0.5f, 0.5f};
-    int have = 0;
+    float ocx[2] = {0, 0}, ocy[2] = {0, 0};
+    int have = 0, env = !g_per_eye;
     char vwhy[2][128] = { "", "" };
     uint32_t ew = 0, eh = 0;
     if (ok && kind == KF_DOUBLE) {
@@ -870,12 +1130,29 @@ static kf_map_t *kf_map_for(uint32_t W, uint32_t H, int kind, int layers, int ey
         float half = W * 0.5f;
         cx[0] = fx[0] * half; cx[1] = half + fx[1] * half;
         cy[0] = cy[1] = 0.5f * (fy[0] + fy[1]) * (float)H;
-        ok = kl_fove_curves(W, H, cx, cy[0], box, ramp, g_floor, nh, hc[0], nv, vc[0]);
+        // The envelope (below): each half also peaks where the other eye's
+        // point would be in it.
+        float e0[2] = { cx[0], env ? fx[1] * half : cx[0] }, e1[2] = { cx[1], env ? half + fx[0] * half : cx[1] };
+        ok = kl_fove_curves_env2(W, H, e0, e1, cy[0], box, ramp, g_floor, nh, hc[0], nv, vc[0]);
     } else if (ok) {
+        // Each eye's straight-ahead point is off the middle of its picture,
+        // toward the nose (the Vision Pro's cone is 60 degrees out and 45 in:
+        // 63% across the left eye, 37% across the right). A map peaked there
+        // alone leaves the outer side of each eye at the floor — the left eye
+        // blurred over its left half, the right eye over its right half, as
+        // seen in Alien: Rogue Incursion (toolchain 565) and, through the
+        // display's own curves, in Doom 3 (f9f514f). So each layer is the
+        // ENVELOPE of both eyes' points placed in that eye's rect: the same
+        // curve relative to each eye's picture, symmetric about its middle,
+        // both straight-ahead points at full rate. A symmetric cone (or the
+        // union cone under symmetric projection) makes the two points one
+        // and changes nothing. KL_FOVE_PER_EYE=1 is the single peak.
         for (int l = 0; l < layers && ok; l++) {
             int e = layers == 2 ? l : (eye == 1 ? 1 : 0);
-            have = kf_eye_point(e, W, H, &cx[l], &cy[l], &fx[l], &fy[l], vwhy[l], sizeof vwhy[l]);
-            ok = kl_fove_curves1(W, H, cx[l], cy[l], box, ramp, g_floor, nh, hc[l], nv, vc[l]);
+            have = kf_eye_point(e, W, H, &cx[l], &cy[l], &fx[l], &fy[l], &ocx[l], &ocy[l], vwhy[l], sizeof vwhy[l]);
+            if (!env) { ocx[l] = cx[l]; ocy[l] = cy[l]; }
+            const float ex[2] = { cx[l], ocx[l] }, ey[2] = { cy[l], ocy[l] };
+            ok = kl_fove_curves_env(W, H, ex, ey, box, ramp, g_floor, nh, hc[l], nv, vc[l]);
         }
     }
     id<MTLRasterizationRateMap> m = nil;
@@ -936,6 +1213,8 @@ static kf_map_t *kf_map_for(uint32_t W, uint32_t H, int kind, int layers, int ey
     mp->fy0 = frr[2][0]; mp->fy1 = frr[2][1];
     mp->offx[0] = fo[0]; mp->offx[1] = fo[1]; mp->offy = fo[2];
     mp->cx[0] = cx[0]; mp->cx[1] = cx[1]; mp->cy[0] = cy[0]; mp->cy[1] = cy[1];
+    mp->ocx[0] = ocx[0]; mp->ocx[1] = ocx[1]; mp->ocy[0] = ocy[0]; mp->ocy[1] = ocy[1];
+    mp->env = env;
     mp->failed = 0;
     g_lastmap = mp;
     double frac = 0;
@@ -964,11 +1243,25 @@ static kf_map_t *kf_map_for(uint32_t W, uint32_t H, int kind, int layers, int ey
             KFI("map %ux%u layer 1 = eye 1 centre %.0f,%.0f (%.1f%% / %.1f%%; %s) physical %ux%u\n",
                 W, H, cx[1], cy[1], 100 * fx[1], 100 * fy[1], vwhy[1], mp->lpw[1], mp->lph[1]);
     }
+    if (env && kind == KF_DOUBLE)
+        KFI("map %ux%u: the envelope of both eyes' points (KL_FOVE_PER_EYE=0): each half also at full rate at "
+            "x %.0f / %.0f\n", W, H, fx[1] * half, half + fx[0] * half);
+    else if (env)
+        for (int l = 0; l < layers; l++)
+            KFI("map %ux%u layer %d: the envelope of both eyes' points (KL_FOVE_PER_EYE=0) — also at full rate at "
+                "%.0f,%.0f, the other eye's point in this eye's rect; full-rate middle x %.0f\n", W, H, l, ocx[l],
+                ocy[l], 0.5f * (cx[l] + ocx[l]));
+    else
+        KFI("map %ux%u: one peak per eye (KL_FOVE_PER_EYE=1)\n", W, H);
     if (g_msaa && layers == 1)
         KFI("full-rate rectangles (MSAA eyes copy these per sample): eye 0 x %u..%u, eye 1 x %u..%u, y %u..%u "
             "(screen - physical: x %d / %d, y %d)\n", mp->fx0[0], mp->fx1[0], mp->fx0[1], mp->fx1[1],
             mp->fy0, mp->fy1, mp->offx[0], mp->offx[1], mp->offy);
     return mp;
+}
+
+static kf_map_t *kf_map_for(uint32_t W, uint32_t H, int kind, int layers, int eye) {
+    return kf_map_for_cb(W, H, kind, layers, eye, -1);
 }
 
 // ---------------------------------------------------------------- the expand
@@ -1915,7 +2208,9 @@ static id kf_render(id self, SEL cmd, MTLRenderPassDescriptor *d) {
             eye = -1;
             full = 1;
         }
-        kf_map_t *mp = eye >= 0 ? kf_map_for(g_eye[eye].w, g_eye[eye].h, kind, layers, ekey) : NULL;
+        int pe = eye >= 0 ? kl_fove_pend_find((__bridge void *)self, gen) : -1;
+        kf_map_t *mp = eye >= 0 ? kf_map_for_cb(g_eye[eye].w, g_eye[eye].h, kind, layers, ekey,
+                                                pe >= 0 ? g_pend[pe].map : -1) : NULL;
         if (mp) {
             map = mp->map; mb = mp->buf; mi = (int)(mp - g_maps);
             // MSAA (tiler mode off): the frame opens with a DEPTH-ONLY clear of
@@ -2901,7 +3196,10 @@ int kl_fove_recentre_selftest(char *why, unsigned cap) {
         float b0 = kf_t_box_mid(m1, 0, W, 1476), b1 = kf_t_box_mid(m1, 1, W, 1476);
         KFI("recentre selftest: before the record, full-rate box middles x %.0f / %.0f; rate at x 2544: %.2f / %.2f\n",
             b0, b1, kf_t_rate(m1, 0, 2544, 1476), kf_t_rate(m1, 1, 2544, 1476));
-        // 2. The record arrives while a pending expand refers to the map: kept.
+        // 2. The record arrives while another command buffer's pending expand
+        //    refers to the map: the new map goes into another slot, the old
+        //    one stays as it was (superseded) for that expand, and the buffer
+        //    that already drew with it keeps getting it.
         int mi = (int)(mp - g_maps);
         kl_fove_test_eye_record(1, fx, fy, vp, of);
         pthread_mutex_lock(&g_mu);
@@ -2909,23 +3207,33 @@ int kl_fove_recentre_selftest(char *why, unsigned cap) {
         for (int i = 0; i < KF_CB_N; i++) if (!g_pend[i].cb) { ps = i; break; }
         if (ps >= 0) { g_pend[ps].cb = (void *)0x5eed; g_pend[ps].gen = 1; g_pend[ps].map = mi; g_pend[ps].slot = -1; }
         kf_map_t *mq = kf_map_for(W, H, KF_ARRAY, 2, -1);
-        if (ps < 0 || mq != mp || mq->map != m1) { bad++; KFI("recentre selftest: re-centred under a pending expand\n"); }
+        if (ps < 0 || !mq || mq == mp || mp->map != m1 || !mp->superseded) {
+            bad++; KFI("recentre selftest: under another buffer's pending expand: not built into a new slot, or the "
+                       "old map not kept\n");
+        }
+        if (kf_map_for_cb(W, H, KF_ARRAY, 2, -1, mi) != mp) { bad++; KFI("recentre selftest: the drawing buffer lost its map\n"); }
         if (ps >= 0) memset(&g_pend[ps], 0, sizeof g_pend[ps]);
-        // 3. Nothing pending: re-centred in place to 2544 / 2544.
+        // 3. The new map: 2544 / 2544, and looked up again without a rebuild.
+        kf_map_t *mn = mq;
         mq = kf_map_for(W, H, KF_ARRAY, 2, -1);
         id<MTLRasterizationRateMap> m2 = mq ? mq->map : nil;
         c0 = mq ? mq->cx[0] : -1; c1 = mq ? mq->cx[1] : -1;
         int rc = g_recentres - r0;
         pthread_mutex_unlock(&g_mu);
-        if (mq != mp || !m2 || m2 == m1 || rc != 1) { bad++; KFI("recentre selftest: not rebuilt in place (re-centres %d)\n", rc); }
+        if (mq != mn || !m2 || m2 == m1 || rc != 1) { bad++; KFI("recentre selftest: not re-centred once (re-centres %d)\n", rc); }
         if (fabsf(c0 - 2544) > 2 || fabsf(c1 - 2544) > 2) {
             bad++; KFI("recentre selftest: record centres %.0f / %.0f, want 2544 / 2544\n", c0, c1);
         }
         if (m2) {
+            // The full-rate box spans both eyes' points placed in this eye's
+            // rect (the envelope; KL_FOVE_PER_EYE=1: its own point alone), so
+            // its middle is the middle of the two; 2544 itself stays at full rate.
             for (int l = 0; l < 2; l++) {
+                float want = mq->env ? 0.5f * (mq->cx[l] + mq->ocx[l]) : 2544;
                 float bm = kf_t_box_mid(m2, l, W, 1476), r = kf_t_rate(m2, l, 2544, 1476);
-                KFI("recentre selftest: layer %d full-rate box middle x %.0f, rate at 2544 %.2f\n", l, bm, r);
-                if (fabsf(bm - 2544) > 48 || r < 0.97f) { bad++; KFI("recentre selftest: layer %d fovea not at 2544\n", l); }
+                KFI("recentre selftest: layer %d full-rate box middle x %.0f (want %.0f), rate at 2544 %.2f\n", l, bm,
+                    want, r);
+                if (fabsf(bm - want) > 48 || r < 0.97f) { bad++; KFI("recentre selftest: layer %d fovea not at 2544\n", l); }
             }
         }
         // 4. The same record again: no rebuild. Into the Radius's full-image record with a
@@ -3000,5 +3308,349 @@ int kl_fove_scratch_selftest(char *why, unsigned cap) {
         g_nold = nold0;
         pthread_mutex_unlock(&g_mu);
     }
+    return bad;
+}
+
+// t_fove: the layered eye pair through the GPU. Pass 1 draws both layers of a
+// 2-layer target under the map (one instance per layer, as MoltenVK lowers
+// multiview); each fragment writes the screen x of its own centre (R) and a
+// 2-px checker of its screen position (G). Pass 2 brings each slice back to
+// screen layout as the expand does (R nearest, G linear). A screen column is
+// drawn at full rate when R is its own centre; the share of distinct R values
+// over a stretch is that stretch's rate.
+static NSString *kLayersMSL = @
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct V { float4 pos [[position]]; uint layer [[render_target_array_index]]; };\n"
+    "vertex V lt_vs(uint vid [[vertex_id]], uint iid [[instance_id]]) {\n"
+    "  float2 p = float2((vid << 1) & 2, vid & 2);\n"
+    "  V o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); o.layer = iid; return o;\n"
+    "}\n"
+    "fragment float2 lt_draw(V in [[stage_in]], constant rasterization_rate_map_data& d [[buffer(0)]]) {\n"
+    "  rasterization_rate_map_decoder dec(d);\n"
+    "  float2 s = dec.map_physical_to_screen_coordinates(in.pos.xy, in.layer);\n"
+    "  float2 c = floor(s * 0.5);\n"
+    "  return float2(s.x, fmod(c.x + c.y, 2.0));\n"
+    "}\n"
+    "struct W1 { float4 pos [[position]]; };\n"
+    "vertex W1 lt_vs1(uint vid [[vertex_id]]) {\n"
+    "  float2 p = float2((vid << 1) & 2, vid & 2);\n"
+    "  W1 o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;\n"
+    "}\n"
+    "struct L { uint layer; float pw; float ph; float pad; };\n"
+    "fragment float2 lt_expand(W1 in [[stage_in]], constant rasterization_rate_map_data& d [[buffer(0)]],\n"
+    "                          constant L& c [[buffer(1)]], texture2d_array<float> ph [[texture(0)]]) {\n"
+    "  constexpr sampler ns(coord::pixel, filter::nearest, address::clamp_to_edge);\n"
+    "  constexpr sampler ls(coord::pixel, filter::linear, address::clamp_to_edge);\n"
+    "  rasterization_rate_map_decoder dec(d);\n"
+    "  float2 p = dec.map_screen_to_physical_coordinates(in.pos.xy, c.layer);\n"
+    "  p = clamp(p, float2(0.5), float2(c.pw, c.ph) - 0.5);\n"
+    "  return float2(ph.sample(ns, p, c.layer).r, ph.sample(ls, p, c.layer).g);\n"
+    "}\n";
+
+// g_mu held. Forget the cached map of a shape (test only: nothing in flight).
+static void kf_t_drop(uint32_t W, uint32_t H, int kind, int layers, int eye) {
+    for (int i = 0; i < KF_MAP_N; i++) {
+        kf_map_t *c = &g_maps[i];
+        if (c->W == W && c->H == H && c->kind == kind && c->layers == layers && c->eye == eye) {
+            KF_RELEASE(c->map); KF_RELEASE(c->buf);
+            c->map = nil; c->buf = nil;
+            *c = (kf_map_t){0};
+            if (g_lastmap == c) g_lastmap = NULL;
+        }
+    }
+}
+
+// A w x h crop (from 0,0) of an RG32Float slice as a 24-bit BMP of its
+// horizontal rate: 1 / how many screen pixels of the row share a fragment
+// (channel 0 is the fragment's screen x). Green = full rate, red = the floor;
+// columns mx[0] (white) and mx[1] (blue) marked.
+static void kf_t_bmp_heat(const char *path, const float *rg, uint32_t stride, uint32_t w, uint32_t h,
+                          const float mx[2]) {
+    float *q = malloc(sizeof(float) * (size_t)w * h);
+    if (!q) return;
+    for (uint32_t y = 0; y < h; y++) {       // along x: runs of equal fragment x
+        uint32_t x = 0;
+        while (x < w) {
+            uint32_t e = x + 1;
+            while (e < w && rg[((size_t)y * stride + e) * 2] == rg[((size_t)y * stride + x) * 2]) e++;
+            for (uint32_t k = x; k < e; k++) q[(size_t)y * w + k] = 1.0f / (float)(e - x);
+            x = e;
+        }
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(q); return; }
+    uint32_t row = (w * 3 + 3) & ~3u, size = 54 + row * h;
+    uint8_t hd[54] = { 'B', 'M' };
+    memcpy(hd + 2, &size, 4);
+    uint32_t off = 54, dib = 40, ppm = 2835, sz = row * h;
+    int32_t iw = (int32_t)w, ih = (int32_t)h;
+    uint16_t planes = 1, bpp = 24;
+    memcpy(hd + 10, &off, 4); memcpy(hd + 14, &dib, 4); memcpy(hd + 18, &iw, 4); memcpy(hd + 22, &ih, 4);
+    memcpy(hd + 26, &planes, 2); memcpy(hd + 28, &bpp, 2); memcpy(hd + 34, &sz, 4);
+    memcpy(hd + 38, &ppm, 4); memcpy(hd + 42, &ppm, 4);
+    fwrite(hd, 1, 54, f);
+    uint8_t *line = calloc(1, row);
+    for (uint32_t y = 0; line && y < h; y++) {
+        uint32_t sy = h - 1 - y;
+        for (uint32_t x = 0; x < w; x++) {
+            float v = q[(size_t)sy * w + x];
+            uint8_t b = 0, g = (uint8_t)(v * 255.0f), r = (uint8_t)((1.0f - v) * 255.0f);
+            if (mx && fabsf((float)x - mx[0]) < 2) b = g = r = 255;
+            else if (mx && fabsf((float)x - mx[1]) < 2) { b = 255; g = 64; r = 0; }
+            line[3 * x] = b; line[3 * x + 1] = g; line[3 * x + 2] = r;
+        }
+        fwrite(line, 1, row, f);
+    }
+    free(line); free(q);
+    fclose(f);
+}
+
+// A W x H crop of channel 1 of an RG32Float slice as a grey 24-bit BMP.
+static void kf_t_bmp(const char *path, const float *rg, uint32_t stride, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    uint32_t row = (w * 3 + 3) & ~3u, size = 54 + row * h;
+    uint8_t hd[54] = { 'B', 'M' };
+    memcpy(hd + 2, &size, 4);
+    uint32_t off = 54, dib = 40, ppm = 2835, sz = row * h;
+    int32_t iw = (int32_t)w, ih = (int32_t)h;
+    uint16_t planes = 1, bpp = 24;
+    memcpy(hd + 10, &off, 4); memcpy(hd + 14, &dib, 4); memcpy(hd + 18, &iw, 4); memcpy(hd + 22, &ih, 4);
+    memcpy(hd + 26, &planes, 2); memcpy(hd + 28, &bpp, 2); memcpy(hd + 34, &sz, 4);
+    memcpy(hd + 38, &ppm, 4); memcpy(hd + 42, &ppm, 4);
+    fwrite(hd, 1, 54, f);
+    uint8_t *line = calloc(1, row);
+    for (uint32_t y = 0; line && y < h; y++) {
+        const float *src = rg + ((size_t)(y0 + h - 1 - y) * stride + x0) * 2;
+        for (uint32_t x = 0; x < w; x++) {
+            float g = src[2 * x + 1];
+            uint8_t v = (uint8_t)(g <= 0 ? 0 : g >= 1 ? 255 : g * 255.0f + 0.5f);
+            line[3 * x] = line[3 * x + 1] = line[3 * x + 2] = v;
+        }
+        fwrite(line, 1, row, f);
+    }
+    free(line);
+    fclose(f);
+}
+
+// Draw both layers of mp through the GPU and read them back (RG32Float, W x H
+// per slice, into out[l]). 0 on failure.
+static int kf_t_draw_layers(kf_map_t *mp, float *out[2]) {
+    static id<MTLRenderPipelineState> draw, expand;
+    static id<MTLCommandQueue> q;
+    const uint32_t W = mp->W, H = mp->H;
+    if (!draw) {
+        NSError *err = nil;
+        t_in = 1;
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:kLayersMSL options:nil error:&err];
+        t_in = 0;
+        if (!lib) { KFI("layers selftest: shader: %s\n", err ? err.description.UTF8String : "?"); return 0; }
+        MTLRenderPipelineDescriptor *pd = [objc_getClass("MTLRenderPipelineDescriptor") new];
+        id<MTLFunction> f1 = [lib newFunctionWithName:@"lt_vs"], f2 = [lib newFunctionWithName:@"lt_draw"];
+        id<MTLFunction> f3 = [lib newFunctionWithName:@"lt_vs1"], f4 = [lib newFunctionWithName:@"lt_expand"];
+        pd.vertexFunction = f1; pd.fragmentFunction = f2;
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRG32Float;
+        pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+        draw = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        pd.vertexFunction = f3; pd.fragmentFunction = f4;
+        pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassUnspecified;
+        expand = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        KF_RELEASE(pd); KF_RELEASE(f1); KF_RELEASE(f2); KF_RELEASE(f3); KF_RELEASE(f4); KF_RELEASE(lib);
+        q = [g_dev newCommandQueue];
+        if (!draw || !expand || !q) { KFI("layers selftest: pipeline: %s\n", err ? err.description.UTF8String : "?"); return 0; }
+    }
+    id<MTLTexture> phys = kf_t_tex(g_dev, MTLPixelFormatRG32Float, W, H, 1);
+    id<MTLTexture> scr = kf_t_tex(g_dev, MTLPixelFormatRG32Float, W, H, 1);
+    size_t slice = (size_t)W * H * 8;
+    id<MTLBuffer> rb = KF_AUTORELEASE([g_dev newBufferWithLength:2 * slice options:MTLResourceStorageModeShared]);
+    if (!phys || !scr || !rb) return 0;
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    t_in = 1;
+    MTLRenderPassDescriptor *d = [objc_getClass("MTLRenderPassDescriptor") renderPassDescriptor];
+    d.colorAttachments[0].texture = phys;
+    d.colorAttachments[0].loadAction = MTLLoadActionClear;
+    d.colorAttachments[0].clearColor = MTLClearColorMake(-1, 0, 0, 0);
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    d.renderTargetArrayLength = 2;
+    d.rasterizationRateMap = mp->map;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:d];
+    [e setRenderPipelineState:draw];
+    [e setFragmentBuffer:mp->buf offset:0 atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:2];
+    [e endEncoding];
+    for (int l = 0; l < 2; l++) {
+        MTLRenderPassDescriptor *d2 = [objc_getClass("MTLRenderPassDescriptor") renderPassDescriptor];
+        d2.colorAttachments[0].texture = scr;
+        d2.colorAttachments[0].slice = (NSUInteger)l;
+        d2.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        d2.colorAttachments[0].storeAction = MTLStoreActionStore;
+        struct { uint32_t layer; float pw, ph, pad; } c = { (uint32_t)l, (float)mp->lpw[l], (float)mp->lph[l], 0 };
+        id<MTLRenderCommandEncoder> e2 = [cb renderCommandEncoderWithDescriptor:d2];
+        [e2 setRenderPipelineState:expand];
+        [e2 setFragmentBuffer:mp->buf offset:0 atIndex:0];
+        [e2 setFragmentBytes:&c length:sizeof c atIndex:1];
+        [e2 setFragmentTexture:phys atIndex:0];
+        [e2 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [e2 endEncoding];
+    }
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    for (int l = 0; l < 2; l++)
+        [b copyFromTexture:scr sourceSlice:(NSUInteger)l sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                sourceSize:MTLSizeMake(W, H, 1) toBuffer:rb destinationOffset:(NSUInteger)l * slice
+                destinationBytesPerRow:(NSUInteger)W * 8 destinationBytesPerImage:slice];
+    [b endEncoding];
+    t_in = 0;
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) { KFI("layers selftest: command buffer failed\n"); return 0; }
+    for (int l = 0; l < 2; l++) memcpy(out[l], (const char *)rb.contents + (size_t)l * slice, slice);
+    return 1;
+}
+
+// Is screen column x of row y (an RG slice of width W) drawn at full rate?
+static int kf_t_sharp(const float *rg, uint32_t W, uint32_t x, uint32_t y) {
+    return fabsf(rg[((size_t)y * W + x) * 2] - ((float)x + 0.5f)) < 0.26f;
+}
+// The rate over columns [x0, x1) of row y: distinct fragments / columns.
+static float kf_t_run_rate(const float *rg, uint32_t W, uint32_t x0, uint32_t x1, uint32_t y) {
+    int n = 0;
+    for (uint32_t x = x0; x < x1; x++)
+        if (x == x0 || rg[((size_t)y * W + x) * 2] != rg[((size_t)y * W + x - 1) * 2]) n++;
+    return x1 > x0 ? (float)n / (float)(x1 - x0) : 0;
+}
+
+int kl_fove_layers_selftest(char *why, unsigned cap, float *rates, const char *shots) {
+    if (!kl_fove_on() || !g_dev) { snprintf(why, cap, "no foveation device (run after the intermediate GPU self-test)"); return -1; }
+    int bad = 0;
+    // Alien: Rogue Incursion's shape at half size: a 2-layer eye image both of
+    // whose eyes render into 0,0 at 70% of it (dynamic resolution), with the
+    // Vision Pro's cones (KL_OVRP_EYE_TAN=vision: 63.4% / 36.6% across, 45.6% down).
+    const uint32_t W = 1520, H = 1232;
+    const float fx[2] = { 0.634f, 0.366f }, fy[2] = { 0.456f, 0.456f };
+    const int vw = 1064, vh = 862;
+    const int vp[2][4] = { { 0, 0, vw, vh }, { 0, 0, vw, vh } }, of[2] = { (int)W, (int)H };
+    const uint32_t y = (uint32_t)(fy[0] * vh);
+    float *img[2][2] = { { malloc((size_t)W * H * 8), malloc((size_t)W * H * 8) },
+                         { malloc((size_t)W * H * 8), malloc((size_t)W * H * 8) } };
+    if (!img[0][0] || !img[0][1] || !img[1][0] || !img[1][1]) { snprintf(why, cap, "out of memory"); return -1; }
+    int saved = g_per_eye;
+    @autoreleasepool {
+        kl_fove_test_eye_record(1, fx, fy, vp, of);
+        for (int mode = 0; mode < 2; mode++) {   // 0: one peak per eye (until 565), 1: the envelope
+            pthread_mutex_lock(&g_mu);
+            g_per_eye = !mode;
+            kf_t_drop(W, H, KF_ARRAY, 2, -1);
+            kf_map_t *mp = kf_map_for(W, H, KF_ARRAY, 2, -1);
+            float c[2] = { mp ? mp->cx[0] : 0, mp ? mp->cx[1] : 0 }, oc[2] = { mp ? mp->ocx[0] : 0, mp ? mp->ocx[1] : 0 };
+            uint32_t pw[2] = { mp ? mp->lpw[0] : 0, mp ? mp->lpw[1] : 0 }, ph[2] = { mp ? mp->lph[0] : 0, mp ? mp->lph[1] : 0 };
+            pthread_mutex_unlock(&g_mu);
+            // Unlocked: the swizzled encoder and commit methods take g_mu.
+            int ok = mp && mp->map && kf_t_draw_layers(mp, img[mode]);
+            if (!ok) { bad++; KFI("layers selftest: %s map not drawn\n", mode ? "envelope" : "per-eye"); continue; }
+            float r[2][8];
+            for (int l = 0; l < 2; l++)
+                for (int k = 0; k < 8; k++) {
+                    r[l][k] = kf_t_run_rate(img[mode][l], W, (uint32_t)(k * vw / 8), (uint32_t)((k + 1) * vw / 8), y);
+                    if (rates) rates[(mode * 2 + l) * 8 + k] = r[l][k];
+                }
+            for (int l = 0; l < 2; l++)
+                KFI("layers selftest: %-8s eye %d (%s) rate by eighths of its rect: %.2f %.2f %.2f %.2f | %.2f %.2f "
+                    "%.2f %.2f; physical %ux%u\n", mode ? "envelope" : "per-eye", l, l ? "right" : "left",
+                    r[l][0], r[l][1], r[l][2], r[l][3], r[l][4], r[l][5], r[l][6], r[l][7], pw[l], ph[l]);
+            // Each eye's own straight-ahead point is at full rate in both modes.
+            for (int l = 0; l < 2; l++)
+                for (int dx = -4; dx <= 4; dx++)
+                    if (!kf_t_sharp(img[mode][l], W, (uint32_t)(c[l] + dx), y)) {
+                        bad++; KFI("layers selftest: %s eye %d: its own point x %.0f not at full rate\n",
+                                   mode ? "envelope" : "per-eye", l, c[l]); break;
+                    }
+            if (!mode) {
+                // The bug, reproduced: the outer side of each eye is the coarse one.
+                if (!(r[0][0] + 0.2f < r[0][7])) { bad++; KFI("layers selftest: per-eye: the left eye's left side is not coarser\n"); }
+                if (!(r[1][7] + 0.2f < r[1][0])) { bad++; KFI("layers selftest: per-eye: the right eye's right side is not coarser\n"); }
+                continue;
+            }
+            // The envelope: both eyes the same, each symmetric about its rect's middle.
+            for (int k = 0; k < 8; k++) {
+                if (fabsf(r[0][k] - r[1][k]) > 0.03f) {
+                    bad++; KFI("layers selftest: eighth %d: left %.2f, right %.2f — not equally sharp\n", k, r[0][k], r[1][k]);
+                }
+                for (int l = 0; l < 2; l++)
+                    if (fabsf(r[l][k] - r[l][7 - k]) > 0.08f) {
+                        bad++; KFI("layers selftest: eye %d eighths %d / %d: %.2f / %.2f — not symmetric\n", l, k, 7 - k,
+                                   r[l][k], r[l][7 - k]);
+                    }
+            }
+            for (int l = 0; l < 2; l++) {
+                float pts[3] = { oc[l], 0.5f * (float)vw, c[l] };
+                for (int i = 0; i < 3; i++)
+                    for (int dx = -4; dx <= 4; dx++)
+                        if (!kf_t_sharp(img[1][l], W, (uint32_t)(pts[i] + dx), y)) {
+                            bad++; KFI("layers selftest: envelope eye %d: x %.0f not at full rate\n", l, pts[i]); break;
+                        }
+            }
+            if (pw[0] != pw[1] || ph[0] != ph[1]) { bad++; KFI("layers selftest: the two layers' physical sizes differ\n"); }
+        }
+        if (shots && *shots) {
+            static const char *nm[2] = { "per-eye", "envelope" };
+            char p[1024];
+            for (int mode = 0; mode < 2; mode++)
+                for (int l = 0; l < 2; l++) {
+                    snprintf(p, sizeof p, "%s/t_fove-%s-%s.bmp", shots, nm[mode], l ? "right" : "left");
+                    kf_t_bmp(p, img[mode][l], W, 0, 0, (uint32_t)vw, (uint32_t)vh);
+                    // own point white, the other eye's point (in this rect) blue
+                    const float mx[2] = { fx[l] * vw, fx[l ^ 1] * vw };
+                    snprintf(p, sizeof p, "%s/t_fove-rate-%s-%s.bmp", shots, nm[mode], l ? "right" : "left");
+                    kf_t_bmp_heat(p, img[mode][l], W, (uint32_t)vw, (uint32_t)vh, mx);
+                }
+            KFI("layers selftest: pictures in %s\n", shots);
+        }
+        // Dynamic resolution: the viewport grows from 70% to 100% in 20 steps,
+        // and the map follows every one (the cap was 8 re-centres a run).
+        pthread_mutex_lock(&g_mu);
+        g_per_eye = 0;
+        int r0 = g_recentres, followed = 0;
+        pthread_mutex_unlock(&g_mu);
+        for (int s = 1; s <= 20; s++) {
+            int w = (int)W * (70 + 30 * s / 20) / 100, h = (int)H * (70 + 30 * s / 20) / 100;
+            const int v2[2][4] = { { 0, 0, w, h }, { 0, 0, w, h } };
+            pthread_mutex_lock(&g_mu);
+            // Every other step an expand of another buffer is still pending on
+            // the current map (Alien always has one): a new slot, recycled later.
+            int ps = -1;
+            kf_map_t *cur = kf_map_for(W, H, KF_ARRAY, 2, -1);   // the previous step's record: no rebuild
+            if (s & 1 && cur)
+                for (int i = 0; i < KF_CB_N; i++)
+                    if (!g_pend[i].cb) {
+                        ps = i; g_pend[i].cb = (void *)0x5eef; g_pend[i].gen = (uint64_t)s;
+                        g_pend[i].map = (int)(cur - g_maps); g_pend[i].slot = -1; break;
+                    }
+            pthread_mutex_unlock(&g_mu);
+            kl_fove_test_eye_record(1, fx, fy, v2, of);
+            pthread_mutex_lock(&g_mu);
+            kf_map_t *mp = kf_map_for(W, H, KF_ARRAY, 2, -1);
+            if (s & 1 && (mp == cur || !cur || !cur->superseded)) {
+                bad++; KFI("layers selftest: step %d: not built into another slot under a pending expand\n", s);
+            }
+            if (mp && fabsf(mp->cx[0] - fx[0] * w) < 2 && fabsf(mp->cx[1] - fx[1] * w) < 2 &&
+                fabsf(mp->ocx[0] - fx[1] * w) < 2 && fabsf(mp->ocx[1] - fx[0] * w) < 2)
+                followed++;
+            if (ps >= 0) memset(&g_pend[ps], 0, sizeof g_pend[ps]);
+            pthread_mutex_unlock(&g_mu);
+        }
+        pthread_mutex_lock(&g_mu);
+        int rc = g_recentres - r0, live = 0;
+        for (int i = 0; i < KF_MAP_N; i++) live += g_maps[i].W == W && g_maps[i].H == H;
+        kf_t_drop(W, H, KF_ARRAY, 2, -1);
+        g_per_eye = saved;
+        pthread_mutex_unlock(&g_mu);
+        KFI("layers selftest: dynamic resolution: %d of 20 viewport steps followed (10 under another buffer's pending "
+            "expand), %d re-centres, %d slot(s) of this shape left\n", followed, rc, live);
+        if (followed != 20 || rc != 20) { bad++; KFI("layers selftest: the map stopped following the viewport\n"); }
+        if (live > 2) { bad++; KFI("layers selftest: superseded slots are not recycled (%d live)\n", live); }
+        kl_fove_test_eye_record(0, fx, fy, NULL, NULL);
+    }
+    for (int m = 0; m < 2; m++) for (int l = 0; l < 2; l++) free(img[m][l]);
     return bad;
 }

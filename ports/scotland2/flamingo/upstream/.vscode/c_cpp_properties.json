@@ -1,0 +1,32 @@
+{
+    "configurations": [
+        {
+            "defines": [
+                "VERSION=\"0.1.0\"",
+                "__GNUC__",
+                "__aarch64__",
+                "MOD_ID=\"flamingo\"",
+                "__aarch64__"
+            ],
+            "includePath": [
+                "${workspaceFolder}/",
+                "/mnt/c/android-ndk-r23/sources/cxx-stl/llvm-libc++abi/include/",
+                "/mnt/c/android-ndk-r23/sources/cxx-stl/llvm-libc++/include/",
+                "/mnt/c/android-ndk-r23/sources/cxx-stl/system/include/",
+                "/mnt/c/android-ndk-r23/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/",
+                "/mnt/c/android-ndk-r23/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/12.0.5/include/",
+                "${workspaceFolder}/shared",
+                "${workspaceFolder}/extern",
+                "${workspaceFolder}/extern/libil2cpp/il2cpp/libil2cpp"
+            ],
+            "name": "Quest",
+            "compilerPath": "/mnt/c/android-ndk-r23/toolchains/llvm/prebuilt/linux-x86_64/bin/clang-12 -fno-ms-extensions",
+            "cStandard": "c11",
+            "cppStandard": "c++20",
+            "intelliSenseMode": "linux-clang-x64",
+            "compileCommands": "${workspaceFolder}/build/compile_commands.json"
+            // "configurationProvider": "ms-vscode.cmake-tools"
+        }
+    ],
+    "version": 4
+}

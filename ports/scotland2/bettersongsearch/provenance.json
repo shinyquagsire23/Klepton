@@ -1,0 +1,86 @@
+{
+  "name": "BetterSongSearch",
+  "repository": "bsq-ports/BetterSongSearchQuest",
+  "commit": "771b01056cd41ca727585fd665f2b4b35cff5709",
+  "version": "2.2.9",
+  "sourceBuilt": true,
+  "declaredDependencies": [
+    {
+      "id": "beatsaber-hook",
+      "versionRange": "^6.4.2",
+      "additionalData": {}
+    },
+    {
+      "id": "beatsaverplusplus",
+      "versionRange": "^0.2.1",
+      "additionalData": {}
+    },
+    {
+      "id": "bs-cordl",
+      "versionRange": "4008.*",
+      "additionalData": {}
+    },
+    {
+      "id": "bsml",
+      "versionRange": "^0.4.55",
+      "additionalData": {}
+    },
+    {
+      "id": "config-utils",
+      "versionRange": "^2.0.3",
+      "additionalData": {}
+    },
+    {
+      "id": "custom-types",
+      "versionRange": "^0.18.3",
+      "additionalData": {}
+    },
+    {
+      "id": "fmt",
+      "versionRange": "^11.0.2",
+      "additionalData": {}
+    },
+    {
+      "id": "kaleb",
+      "versionRange": "^0.1.9",
+      "additionalData": {
+        "private": true
+      }
+    },
+    {
+      "id": "paper2_scotland2",
+      "versionRange": "^4.6.4",
+      "additionalData": {}
+    },
+    {
+      "id": "scotland2",
+      "versionRange": "^0.1.6",
+      "additionalData": {
+        "includeQmod": false,
+        "private": true
+      }
+    },
+    {
+      "id": "sombrero",
+      "versionRange": "^0.1.43",
+      "additionalData": {}
+    },
+    {
+      "id": "song-details",
+      "versionRange": "^1.0.3",
+      "additionalData": {}
+    },
+    {
+      "id": "songcore",
+      "versionRange": "^1.1.24",
+      "additionalData": {}
+    },
+    {
+      "id": "web-utils",
+      "versionRange": "^0.6.7",
+      "additionalData": {}
+    }
+  ],
+  "adaptation": "Existing shared pinned ABI retained; compiler-resolved signed hook targets; original UI, searching, filtering and downloading code retained",
+  "scope": "Host build validation only; no headset or authenticated Airbuds history testing"
+}

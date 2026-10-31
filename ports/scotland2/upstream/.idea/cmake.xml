@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CMakeSharedSettings">
+    <configurations>
+      <configuration PROFILE_NAME="Quest" ENABLED="true" CONFIG_NAME="RelWithDebInfo" />
+      <configuration PROFILE_NAME="Linux WSL" ENABLED="true" CONFIG_NAME="RelWithDebInfo" TOOLCHAIN_NAME="WSL" GENERATION_OPTIONS="-DBUILD_FOR=LINUX" BUILD_OPTIONS="-j 8" />
+      <configuration PROFILE_NAME="Linux WSL Debug" ENABLED="true" CONFIG_NAME="Debug" TOOLCHAIN_NAME="WSL" GENERATION_OPTIONS="-DBUILD_FOR=LINUX" BUILD_OPTIONS="-j 8" />
+    </configurations>
+  </component>
+</project>

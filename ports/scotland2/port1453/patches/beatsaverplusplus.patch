@@ -1,0 +1,59 @@
+--- a/include/Utils.hpp
++++ b/include/Utils.hpp
+@@ -3,6 +3,10 @@
+ #include <string>
+ #include <filesystem>
+ #include <ranges>
++#include <span>
++#include <optional>
++#include <vector>
++#include <cstdint>
+ 
+ namespace BeatSaver::Utils {
+     std::string ReplaceIllegalCharsInPath(std::string path);
+--- a/shared/macros.hpp
++++ b/shared/macros.hpp
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <functional>
+ 
+ #include "web-utils/shared/Response.hpp"
+ #include "./Exceptions.hpp"
+--- a/src/Utils.cpp
++++ b/src/Utils.cpp
+@@ -1,11 +1,17 @@
+ #include "Utils.hpp"
++#ifndef SC2_AOT_HOOKS
+ #include "zip/shared/zip.h"
++#endif
+ #include "web-utils/shared/DownloaderUtility.hpp"
+ 
+ #include <algorithm>
+ #include <fstream>
+ #include <vector>
+ 
++#ifdef SC2_AOT_HOOKS
++extern "C" bool sc2_beatsaver_extract(std::span<const uint8_t>,const std::filesystem::path&);
++#endif
++
+ namespace BeatSaver::Utils {
+     static const WebUtils::DownloaderUtility downloader{.userAgent=MOD_ID "/" VERSION " (+https://github.com/RedBrumbler/BeatSaverPlusPlus)"};
+ 
+@@ -25,6 +31,9 @@
+     }
+ 
+     bool ExtractAll(std::span<uint8_t const> zipData, std::filesystem::path const& outputPath) {
++#ifdef SC2_AOT_HOOKS
++        return sc2_beatsaver_extract(zipData,outputPath);
++#else
+         zip_error_t error;
+         zip_error_init(&error);
+ 
+@@ -65,6 +74,7 @@
+         }
+ 
+         return true;
++#endif
+     }
+ 
+     std::optional<std::vector<uint8_t>> GetData(std::string dataURL) {

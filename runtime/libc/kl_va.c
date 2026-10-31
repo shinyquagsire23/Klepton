@@ -99,8 +99,12 @@ size_t kl_va_marshal(const char *fmt, kl_va *src, void *dstv, size_t cap, int mo
         switch (*p) {
         case 'd': case 'i': case 'o': case 'u': case 'x': case 'X':
             cls = lng ? CLS_INT64 : CLS_INT32; break;
-        case 'c':                          cls = CLS_INT32;  break;
-        case 's': case 'p': case 'n':      cls = CLS_INT64;  break;
+        // %C / %S are the SUSv2 spellings of %lc / %ls (bionic and Darwin both
+        // take them). Missing here, every argument from the first %S on was
+        // left out of the marshalled list: Tea For God formats nearly all its
+        // names with %S and read back "(null)" for each one.
+        case 'c': case 'C':                cls = CLS_INT32;  break;
+        case 's': case 'S': case 'p': case 'n': cls = CLS_INT64; break;
         case 'f': case 'F': case 'e': case 'E':
         case 'g': case 'G': case 'a': case 'A': cls = CLS_DOUBLE; break;
         default:                           cls = CLS_NONE;   break;

@@ -31,8 +31,12 @@
 #include "kl_vtdec.h"   // pulls in <CoreVideo/CoreVideo.h>
 #include "kl_jni_int.h"
 
-#define KLE_H264_CLASS  "com/epicgames/unreal/ElectraVideoDecoderH264"
-#define KLE_H265_CLASS  "com/epicgames/unreal/ElectraVideoDecoderH265"
+// Spelled in the ue4 package: the JNI surface folds every
+// `com/epicgames/unreal/` class onto `com/epicgames/ue4/` at its intern funnel
+// (kl_jni.c, klj_fold_class_name), so the class the guest asks for as
+// com/epicgames/unreal/ElectraVideoDecoderH264 is interned under this name.
+#define KLE_H264_CLASS  "com/epicgames/ue4/ElectraVideoDecoderH264"
+#define KLE_H265_CLASS  "com/epicgames/ue4/ElectraVideoDecoderH265"
 
 // UE5's Electra registers a decoder class per codec — H264 and H265 — and the
 // engine probes BOTH at startup (GetDecoderInformation) to enumerate codec

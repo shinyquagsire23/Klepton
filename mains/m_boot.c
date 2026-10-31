@@ -128,11 +128,11 @@ static int drm_call(const char *name) {
 //   fabricated answer in the sense the refusals below are about; it is the
 //   true state of affairs for the only way this project is used.
 //
-//   DLC is a different question and stays refused, because it is one we
-//   genuinely cannot answer: paid content here is out-of-band asset data plus
-//   a licence held by a platform that is absent, and neither half is on this
-//   host to check. Claiming ownership of content we cannot see IS the
-//   circumvention, so it keeps aborting by name.
+//   DLC delivery stays refused. Claiming ownership of content we cannot see
+//   is the circumvention, so DownloadById keeps aborting. Enumerating what is
+//   already on disk is not that claim: Walkabout reports a course only when
+//   its real track bundle is present (kl_ovrplat.c). This check does not
+//   require the list to be empty — it requires the call to return.
 //
 // The two are separable because the API separates them — the viewer-entitled
 // call is about the app, the AssetFile and IAP families are about content.
@@ -187,10 +187,10 @@ static int check_drm_guard(void) {
         return fail("DRM guard did NOT abort on ovr_AssetFile_DownloadById — a "
                     "content-delivery call must never be answered");
 
-    // 3. The carve-out, in the other direction: enumerating installed DLC is
-    //    answered with "none", because that grants nothing (kl_ovrplat.c,
-    //    g_plat_absent). If this ever starts aborting the game stops at the
-    //    language select again.
+    // 3. The carve-out, in the other direction: enumerating installed asset
+    //    files must return. An empty list is the answer when nothing is on
+    //    disk; Walkabout fills it only from real course bundles. If this
+    //    aborts, the game stops at the language select again.
     r = drm_call("ovr_AssetFile_GetList");
     if (r == KLDRM_UNRESOLVED) return fail("ovr_AssetFile_GetList resolved to nothing");
     if (r == KLDRM_ABORTED)
@@ -198,8 +198,8 @@ static int check_drm_guard(void) {
                     "is a fact about this host, not a licence decision");
 
     printf("  the app's own entitlement answers yes AND completes, DLC delivery\n"
-           "  refuses and aborts (guard verified); DLC enumeration answers\n"
-           "  \"none\" without granting anything\n");
+           "  refuses and aborts (guard verified); course enumeration is answered\n"
+           "  from files on disk and does not fetch anything\n");
     return 0;
 }
 
@@ -553,6 +553,24 @@ static int recon_run(int view_pump) {
                         ? (unsigned)strtoul(getenv("KL_ALARM"), NULL, 10) : 20);
     if (TARGET->kind == KL_GUEST_STEAMLINK) return steamlink_run(view_pump);
     if (TARGET->kind == KL_GUEST_UE4 || TARGET->kind == KL_GUEST_JKXR)
+        return native_door_run(view_pump);
+    // A GLES3JNILib guest owns its render thread too, so once its lifecycle is
+    // asked for it needs the same wall-clock pump (KL_NATIVE_WAIT) rather than
+    // the Unity frame count below, which returns at once and lets the report —
+    // and the process — end while the engine is still creating its session.
+    // Without KL_LIFECYCLE it keeps the boot-only gate it always had.
+    if (TARGET->kind == KL_GUEST_GLES3JNI && getenv("KL_LIFECYCLE"))
+        return native_door_run(view_pump);
+    // ...and so does an SDL2 guest (Counter-Strike VR): nativeRunMain is its
+    // whole engine on a thread of its own, and the Unity frame loop below ends
+    // at once for a guest with no nativeRender — the process then reported and
+    // left while the engine was still opening its files.
+    if (TARGET->kind == KL_GUEST_SDL2 && getenv("KL_LIFECYCLE"))
+        return native_door_run(view_pump);
+    // ...and a NativeActivity guest with a render thread of its own (HITMAN 3
+    // VR: Reloaded): without the pump the host run ended three seconds in, at
+    // the loading screen, and KL_NATIVE_WAIT did nothing.
+    if (TARGET->kind == KL_GUEST_NATIVE && getenv("KL_LIFECYCLE"))
         return native_door_run(view_pump);
 
     if (kl_driver_boot(stdout) != 0) return fail(kl_driver_error());

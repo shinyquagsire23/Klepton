@@ -1,0 +1,11 @@
+{
+  "repository": "sc2ad/capstone-qpm",
+  "tag": "v0.1.0",
+  "commit": "914496e27746bd307c712f5a979d71cea69ead2f",
+  "libraryUrl": "https://github.com/sc2ad/capstone-qpm/releases/download/v0.1.0/libcapstone.a",
+  "sha256": "00c760cf5e6c8ee9159d42dfa3891e01889d17794fcbe3e0e2332a40e5f764aa",
+  "size": 6123986,
+  "manifest": "ports/scotland2/upstream/qpm.shared.json",
+  "scope": "Original Android static dependency of Scotland2 and beatsaber-hook; kept in the guest ABI domain.",
+  "sourceArchiveSha256": "3112f1c33d3c1b0b6966e4c58735b2d4a12b13eff3c0d0d2d601704aa7ef781c"
+}

@@ -1,10 +1,12 @@
-// java.util.zip.ZipFile, java.io.InputStream, AVPro's crypto helpers
+// java.util.zip.ZipFile, java.io.InputStream, java.io.FileOutputStream,
+// AVPro's crypto helpers
 //
 // One family of the synthetic JNIEnv's Java classes. The mechanism (registries,
 // dispatch, id interning) is kl_jni.c; this file owns implementations and the
 // binding table that names them. See runtime/jni/kl_jni_int.h for the seam.
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -20,6 +22,7 @@
 #include "kl_fault.h"
 #include "kl_target.h"
 #include "kl_env.h"
+#include "guest/kl_driver.h"
 #include "kl_ovrp.h"
 #include "kl_avdec.h"
 #include "kl_egl.h"
@@ -165,24 +168,50 @@ static int klj_zip_data_off(const klj_zip *z, const klj_zent *e, uint64_t *out) 
 }
 
 // Whether `new ZipFile(<missing>)` THROWS, as Java's does, or only answers
-// null, as this file always has. Unity reads the main OBB's GUID, then tries
-// patch.<code>.<package>.obb and keeps that one's GUID unless the constructor
-// throws FileNotFoundException — so on null it compares '' with the APK's GUID
-// and never gets past "Application OBB has mismatching GUID ... got ''" for a
-// title that ships a main OBB and no patch OBB: Pistol Whip (x2104963472963790,
-// black screen) and Drop Dead: Dual Strike Edition (x1935017546592600, on its
-// logo). Per target, because no other row has been run with a throwing
-// constructor; KL_JNI_ZIP_THROW=1/0 forces it either way for trying another title.
+// null, as this file always has. Pistol Whip's Unity reads the main OBB's GUID,
+// then tries patch.<code>.<package>.obb and keeps that one's GUID unless the
+// constructor throws FileNotFoundException — so on null it compares '' with
+// the APK's GUID and never gets past "Application OBB has mismatching GUID"
+// (black screen; the title ships no patch OBB). Per target, because no other
+// row has been run with a throwing constructor yet; KL_JNI_ZIP_THROW=1/0
+// forces it either way for trying another title.
 static int klj_zip_throws(void) {
     static int v = -1;
     if (v < 0) {
-        extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
+        // Pistol Whip and Drop Dead: Dual Strike Edition — both ship a main OBB and
+        // no patch OBB, and Drop Dead's log stops on the same "mismatching GUID ...
+        // got ''" with the game sitting on its logo.
         int dflt = t && (strcmp(t, "x2104963472963790") == 0    // Pistol Whip
                       || strcmp(t, "x1935017546592600") == 0);  // Drop Dead: Dual Strike
         v = kl_env_on("KL_JNI_ZIP_THROW", dflt);
     }
     return v;
+}
+
+// Red Matter's com.VerticalRobot.RedMatter.VRFL.vrFL(prefix): open the app's
+// own APK (ApplicationInfo.sourceDir) as a zip and return the full name of
+// every entry that starts with `prefix`, in central-directory order — read out
+// of its dex, which is the whole method. UE4 uses it to find files it ships in
+// the APK; a null here aborted the title at boot. An APK we cannot read answers
+// an empty array, as the Java version's catch-and-continue does.
+static klj_val klj_VRFL_vrFL(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *prefix = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!prefix) prefix = "";
+    klj_zip z = {0};
+    unsigned hits = 0;
+    if (klj_zip_open(&z, kl_jni_apk_path()) == 0)
+        for (unsigned i = 0; i < z.n; i++)
+            if (strncmp(z.e[i].name, prefix, strlen(prefix)) == 0) hits++;
+    void *arr = klj_new_array('L', "java/lang/String", (int)hits);
+    for (unsigned i = 0, k = 0; i < z.n && k < hits; i++)
+        if (strncmp(z.e[i].name, prefix, strlen(prefix)) == 0)
+            ((void **)klj_arr(arr)->data)[k++] = kl_jni_new_string(z.e[i].name);
+    KLJ_LOG("VRFL.vrFL(\"%s\") -> %u APK entries", prefix, hits);
+    if (z.f) fclose(z.f);
+    free(z.e);
+    return (klj_val){.l = arr};
 }
 
 static klj_val klj_ZipFile_init(void *env, void *clazz, const klj_val *a, int n) {
@@ -198,7 +227,7 @@ static klj_val klj_ZipFile_init(void *env, void *clazz, const klj_val *a, int n)
         if (klj_zip_throws())
             klj_raise(missing ? "java/io/FileNotFoundException" : "java/util/zip/ZipException",
                       path);
-        return (klj_val){.l = NULL};      // guest catches IOException
+        return (klj_val){.l = NULL};
     }
     void *obj = kl_jni_new_object("java/util/zip/ZipFile");
     klj_as_object(obj)->data = z;
@@ -380,6 +409,118 @@ static klj_val klj_InputStream_close(void *env, void *self, const klj_val *a, in
     return (klj_val){.l = NULL};
 }
 
+// ---- java.io.FileOutputStream ----
+// BattleGroupVR2 0.251 (fix 38, 2026-10-13) reaches FileOutputStream(File) at
+// its start, from the Firebase SDK's cache of the files it embeds, and stopped
+// here. Real writes, to the path java.io.File and the guest's own open() name:
+// the same kl_guest_path mapping, nothing wider. A failed open or write throws
+// what Java's does; it must never look saved.
+typedef struct { int fd; pthread_mutex_t lock; } klj_output;
+
+static int klj_output_close(klj_output *st) {
+    if (!st) return 0;
+    pthread_mutex_lock(&st->lock);
+    int fd = st->fd, error = 0;
+    st->fd = -1;
+    if (fd >= 0 && close(fd) != 0) error = errno;
+    pthread_mutex_unlock(&st->lock);
+    return error;
+}
+static void klj_output_free(void *p) {
+    klj_output *st = p;
+    if (!st) return;
+    klj_output_close(st);
+    pthread_mutex_destroy(&st->lock);
+    free(st);
+}
+static klj_val klj_output_open(const char *path, int append) {
+    if (!path) {
+        klj_raise("java/lang/NullPointerException", "FileOutputStream path is null");
+        return (klj_val){0};
+    }
+    klj_output *st = calloc(1, sizeof *st);
+    if (!st) {
+        klj_raise("java/lang/OutOfMemoryError", "FileOutputStream");
+        return (klj_val){0};
+    }
+    int error = pthread_mutex_init(&st->lock, NULL);
+    if (error) {
+        free(st);
+        klj_raise("java/io/IOException", strerror(error));
+        return (klj_val){0};
+    }
+    char kp[1024];
+    st->fd = open(kl_guest_path(path, kp, sizeof kp),
+                  O_WRONLY | O_CREAT | O_CLOEXEC | (append ? O_APPEND : O_TRUNC), 0666);
+    if (st->fd < 0) {
+        error = errno;
+        klj_output_free(st);
+        KLJ_LOG("FileOutputStream(%s): %s", path, strerror(error));
+        klj_raise("java/io/FileNotFoundException", strerror(error));
+        return (klj_val){0};
+    }
+    KLJ_LOG("FileOutputStream(%s, append=%d) opened", path, append);
+    return (klj_val){.l = klj_own(klj_new_object_data("java/io/FileOutputStream", st),
+                                 klj_output_free)};
+}
+static klj_val klj_FileOutputStream_init_file(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    klj_object *file = n > 0 ? klj_as_object(a[0].l) : NULL;
+    return klj_output_open(file ? file->data : NULL, n > 1 && a[1].j != 0);
+}
+static klj_val klj_FileOutputStream_init_str(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    return klj_output_open(n > 0 ? klj_str(a[0].l) : NULL, n > 1 && a[1].j != 0);
+}
+static klj_val klj_output_write(void *self, const void *data, size_t len) {
+    klj_object *o = klj_as_object(self);
+    klj_output *st = o ? o->data : NULL;
+    int error = EBADF;
+    if (st) {
+        pthread_mutex_lock(&st->lock);
+        if (st->fd >= 0) {
+            error = 0;
+            const uint8_t *p = data;
+            while (len) {
+                ssize_t done = write(st->fd, p, len);
+                if (done < 0 && errno == EINTR) continue;
+                if (done <= 0) { error = done < 0 ? errno : EIO; break; }
+                p += done; len -= (size_t)done;
+            }
+        }
+        pthread_mutex_unlock(&st->lock);
+    }
+    if (error) klj_raise("java/io/IOException", strerror(error));
+    return (klj_val){0};
+}
+static klj_val klj_FileOutputStream_write_off(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_array *b = n > 0 ? klj_arr(a[0].l) : NULL;
+    if (!b) {
+        klj_raise("java/lang/NullPointerException", "FileOutputStream byte array is null");
+        return (klj_val){0};
+    }
+    int off = n > 1 ? (int)a[1].j : 0, len = n > 2 ? (int)a[2].j : b->len;
+    // Subtract after checking off: off + len could overflow for bad arguments.
+    if (off < 0 || len < 0 || off > b->len || len > b->len - off) {
+        klj_raise("java/lang/IndexOutOfBoundsException", "FileOutputStream byte range");
+        return (klj_val){0};
+    }
+    return klj_output_write(self, len ? (const uint8_t *)b->data + off : NULL, (size_t)len);
+}
+static klj_val klj_FileOutputStream_write1(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    uint8_t byte = n > 0 ? (uint8_t)a[0].j : 0;
+    return klj_output_write(self, &byte, 1);
+}
+static klj_val klj_FileOutputStream_close(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    int error = klj_output_close(o ? o->data : NULL);
+    if (error) klj_raise("java/io/IOException", strerror(error));
+    return (klj_val){0};
+}
+
 // ---- AVPro Video's Java crypto helpers ----
 //
 // VRChat ships RenderHeads' AVPro Video, whose native half keeps five crypto
@@ -534,7 +675,110 @@ static klj_val klj_AVPro_FinaliseCryptor(void *env, void *self, const klj_val *a
     return (klj_val){.j = (uint64_t)moved};
 }
 
+// Heap IntBuffer used when the guest transitions into the next story scene.
+// The backing int[] is shared, zero-initialized storage, not a direct buffer.
+typedef struct { void *array; int capacity, position, limit; } klj_intbuffer;
+static klj_intbuffer *intbuffer(void *self) {
+    klj_object *o=klj_as_object(self);
+    return o && !strcmp(o->cls,"java/nio/IntBuffer") ? o->data : NULL;
+}
+static klj_val intbuffer_allocate(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int capacity=n ? (int32_t)a[0].j : -1;
+    if(capacity<0){klj_raise("java/lang/IllegalArgumentException","negative capacity");return (klj_val){0};}
+    klj_intbuffer *b=calloc(1,sizeof *b);
+    if(!b){klj_raise("java/lang/OutOfMemoryError","IntBuffer allocation");return (klj_val){0};}
+    b->array=klj_new_array('I',NULL,capacity);b->capacity=b->limit=capacity;
+    // Retain the array beyond the allocating local frame. It may also be
+    // handed directly to guest code by array(), so its storage must be shared.
+    kl_jni_pin_object(b->array);
+    return (klj_val){.l=klj_own(klj_new_object_data("java/nio/IntBuffer",b),free)};
+}
+static klj_val intbuffer_array(void *env, void *self, const klj_val *a, int n) {
+    (void)env;(void)a;(void)n;klj_intbuffer *b=intbuffer(self);return (klj_val){.l=b ? b->array : NULL};
+}
+static klj_val intbuffer_capacity(void *env, void *self, const klj_val *a, int n) {
+    (void)env;(void)a;(void)n;klj_intbuffer *b=intbuffer(self);return (klj_val){.j=b ? b->capacity : 0};
+}
+static klj_val intbuffer_position(void *env, void *self, const klj_val *a, int n) {
+    (void)env;klj_intbuffer *b=intbuffer(self);if(!b)return (klj_val){0};
+    if(!n)return (klj_val){.j=b->position};
+    int value=(int32_t)a[0].j;
+    if(value<0 || value>b->limit){klj_raise("java/lang/IllegalArgumentException","position outside limit");return (klj_val){0};}
+    b->position=value;return (klj_val){.l=self};
+}
+static klj_val intbuffer_limit(void *env, void *self, const klj_val *a, int n) {
+    (void)env;klj_intbuffer *b=intbuffer(self);if(!b)return (klj_val){0};
+    if(!n)return (klj_val){.j=b->limit};
+    int value=(int32_t)a[0].j;
+    if(value<0 || value>b->capacity){klj_raise("java/lang/IllegalArgumentException","limit outside capacity");return (klj_val){0};}
+    b->limit=value;if(b->position>value)b->position=value;return (klj_val){.l=self};
+}
+static klj_val intbuffer_get(void *env, void *self, const klj_val *a, int n) {
+    (void)env;klj_intbuffer *b=intbuffer(self);if(!b)return (klj_val){0};int index=n ? (int32_t)a[0].j : b->position;
+    if(index<0 || index>=b->limit){klj_raise(n ? "java/lang/IndexOutOfBoundsException" : "java/nio/BufferUnderflowException","IntBuffer get");return (klj_val){0};}
+    int32_t value=((int32_t *)klj_arr(b->array)->data)[index];if(!n)b->position++;
+    return (klj_val){.j=(uint64_t)(int64_t)value};
+}
+static klj_val intbuffer_put(void *env, void *self, const klj_val *a, int n) {
+    (void)env;klj_intbuffer *b=intbuffer(self);if(!b)return (klj_val){0};int index=n==2 ? (int32_t)a[0].j : b->position;
+    if(index<0 || index>=b->limit){klj_raise(n==2 ? "java/lang/IndexOutOfBoundsException" : "java/nio/BufferOverflowException","IntBuffer put");return (klj_val){0};}
+    ((int32_t *)klj_arr(b->array)->data)[index]=(int32_t)a[n==2 ? 1 : 0].j;if(n!=2)b->position++;
+    return (klj_val){.l=self};
+}
+static klj_val intbuffer_rewind(void *env, void *self, const klj_val *a, int n) {
+    (void)env;(void)a;(void)n;klj_intbuffer *b=intbuffer(self);if(b)b->position=0;return (klj_val){.l=self};
+}
+// Android's NativeGallery has no host Photos bridge yet. Its documented
+// Permission.Denied is 0: report absence normally rather than abort the app.
+static klj_val klj_NativeGallery_denied(void *env,void *self,const klj_val *a,int n) {
+    (void)env;(void)self;(void)a;(void)n;
+    KLJ_LOG("NativeGallery: host gallery permission unavailable (Denied)");
+    return (klj_val){.j=0};
+}
+
+static klj_val klj_NativeGallery_request_denied(void *env,void *self,const klj_val *a,int n) {
+    (void)env;(void)self;
+    KLJ_LOG("NativeGallery: asynchronous permission request denied normally");
+    if (n >= 2 && a[1].l) {
+        void *args = klj_new_array('L', "java/lang/Object", 1);
+        ((void **)klj_arr(args)->data)[0] = klj_box_int(0);
+        klj_proxy_invoke_named_args(a[1].l,
+            "com/yasirkula/unity/NativeGalleryPermissionReceiver",
+            "OnPermissionResult", "(I)V", args);
+    }
+    return (klj_val){0};
+}
+
 const klj_binding klj_bind_io[] = {
+    {"com/yasirkula/unity/NativeGallery", "RequestPermission",
+     "(Lcom/unity3d/player/UnityPlayerActivity;Lcom/yasirkula/unity/NativeGalleryPermissionReceiver;ZI)V", klj_NativeGallery_request_denied},
+    {"com/yasirkula/unity/NativeGallery", "RequestPermission",
+     "(Landroid/content/Context;Lcom/yasirkula/unity/NativeGalleryPermissionReceiver;ZI)V", klj_NativeGallery_request_denied},
+
+    {"com/yasirkula/unity/NativeGallery", "CheckPermission",
+     "(Lcom/unity3d/player/UnityPlayerActivity;ZI)I", klj_NativeGallery_denied},
+    {"com/yasirkula/unity/NativeGallery", "CheckPermission",
+     "(Landroid/content/Context;ZI)I", klj_NativeGallery_denied},
+    {"com/yasirkula/unity/NativeGallery", "RequestPermission",
+     "(Lcom/unity3d/player/UnityPlayerActivity;ZI)I", klj_NativeGallery_denied},
+    {"com/yasirkula/unity/NativeGallery", "RequestPermission",
+     "(Landroid/content/Context;ZI)I", klj_NativeGallery_denied},
+
+    {"java/nio/IntBuffer","allocate","(I)Ljava/nio/IntBuffer;",intbuffer_allocate},
+    {"java/nio/IntBuffer","array","()[I",intbuffer_array},
+    {"java/nio/IntBuffer","capacity","()I",intbuffer_capacity},
+    {"java/nio/IntBuffer","position","()I",intbuffer_position},
+    {"java/nio/IntBuffer","position","(I)Ljava/nio/Buffer;",intbuffer_position},
+    {"java/nio/IntBuffer","limit","()I",intbuffer_limit},
+    {"java/nio/IntBuffer","limit","(I)Ljava/nio/Buffer;",intbuffer_limit},
+    {"java/nio/IntBuffer","get","()I",intbuffer_get},
+    {"java/nio/IntBuffer","get","(I)I",intbuffer_get},
+    {"java/nio/IntBuffer","put","(I)Ljava/nio/IntBuffer;",intbuffer_put},
+    {"java/nio/IntBuffer","put","(II)Ljava/nio/IntBuffer;",intbuffer_put},
+    {"java/nio/IntBuffer","rewind","()Ljava/nio/Buffer;",intbuffer_rewind},
+
+    {"com/VerticalRobot/RedMatter/VRFL", "vrFL", "(Ljava/lang/String;)[Ljava/lang/String;", klj_VRFL_vrFL},
     {"com/renderheads/AVPro/Video/Manager", "SHA256", "([B)[B", klj_AVPro_SHA256},
     {"com/renderheads/AVPro/Video/Manager", "KeyDerivationPBKDF",
      "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;ILjava/nio/ByteBuffer;)I", klj_AVPro_KeyDerivationPBKDF},
@@ -561,5 +805,13 @@ const klj_binding klj_bind_io[] = {
     {"java/io/InputStream", "skip",      "(J)J",    klj_InputStream_skip},
     {"java/io/InputStream", "available", "()I",     klj_InputStream_available},
     {"java/io/InputStream", "close",     "()V",     klj_InputStream_close},
+    {"java/io/FileOutputStream", "<init>", "(Ljava/io/File;)V", klj_FileOutputStream_init_file},
+    {"java/io/FileOutputStream", "<init>", "(Ljava/io/File;Z)V", klj_FileOutputStream_init_file},
+    {"java/io/FileOutputStream", "<init>", "(Ljava/lang/String;)V", klj_FileOutputStream_init_str},
+    {"java/io/FileOutputStream", "<init>", "(Ljava/lang/String;Z)V", klj_FileOutputStream_init_str},
+    {"java/io/FileOutputStream", "write", "([BII)V", klj_FileOutputStream_write_off},
+    {"java/io/FileOutputStream", "write", "([B)V", klj_FileOutputStream_write_off},
+    {"java/io/FileOutputStream", "write", "(I)V", klj_FileOutputStream_write1},
+    {"java/io/FileOutputStream", "close", "()V", klj_FileOutputStream_close},
     {0}
 };

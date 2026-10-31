@@ -19,6 +19,11 @@
 // Usage:
 //   klepton-ld <input.so> -o <output.dylib> [--platform macos|visionos|
 //              visionossim|ios|iossim] [--install-name NAME] [--quiet]
+//              [--abi android|linux]
+//
+// --abi linux is for a glibc guest (see KLX_ABI_LINUX in kl_x18.h): the thread
+// pointer and `svc` are veneered rather than TPIDR_EL0 being flipped, and the
+// input may be a PIE executable or the dynamic loader as well as a library.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +39,7 @@
 #include <mach-o/nlist.h>
 #include "../runtime/kl_x18.h"
 #include "../runtime/guest/kl_guestpatch.h"
+#include "../runtime/linux/kl_lx_name.h"
 
 // ---------- ELF64 subset (macOS has no <elf.h>) ----------
 typedef struct { uint8_t e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version;
@@ -187,10 +193,26 @@ int main(int argc, char **argv) {
     const struct platform *plat = &PLATFORMS[0];
     int quiet = 0;
 
+    // --print-name <elf>: the file name the Linux runtime will look for this
+    // ELF's translation under (kl_lx_name.h). Nothing is translated.
+    if (argc == 3 && !strcmp(argv[1], "--print-name")) {
+        char name[512];
+        int nfd = open(argv[2], O_RDONLY);
+        if (nfd < 0) die("open %s: %s", argv[2], strerror(errno));
+        kl_lx_translation_name(argv[2], nfd, name, sizeof name);
+        puts(name);
+        return 0;
+    }
+
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--install-name") && i + 1 < argc) install_name = argv[++i];
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
+        else if (!strcmp(argv[i], "--abi") && i + 1 < argc) {
+            const char *w = argv[++i];
+            if (!strcmp(w, "linux")) kl_x18_set_abi(KLX_ABI_LINUX);
+            else if (strcmp(w, "android")) die("unknown abi '%s'", w);
+        }
         else if (!strcmp(argv[i], "--platform") && i + 1 < argc) {
             const char *w = argv[++i];
             plat = NULL;
@@ -292,7 +314,10 @@ int main(int argc, char **argv) {
         while (kl_x18_next_code(sh[i].sh_addr, (size_t)sh[i].sh_size,
                                 skip, nskip, &cursor, &cva, &csz)) {
             uint8_t *p = img + sh[i].sh_offset + (cva - sh[i].sh_addr);
-            tls_rewrites += rewrite_tls(p, csz, cva, &tls_refused);
+            // The flip is the Android ABI's answer to TPIDR_EL0. Under the
+            // Linux ABI those reads are veneer sites, counted just below.
+            if (kl_x18_abi() != KLX_ABI_LINUX)
+                tls_rewrites += rewrite_tls(p, csz, cva, &tls_refused);
             x18_sites    += kl_x18_count(p, csz);
             x18_termbr   += kl_x18_count_termbr(p, csz);
         }
@@ -544,6 +569,13 @@ int main(int argc, char **argv) {
                 x18st.jt_sites    += st.jt_sites;
                 x18st.jt_thunks   += st.jt_thunks;
                 x18st.jt_fallback += st.jt_fallback;
+                // ...and the Linux ABI's populations (the Alyx work in this fork).
+                x18st.tp_sites    += st.tp_sites;
+                x18st.tp_patched  += st.tp_patched;
+                x18st.svc_sites   += st.svc_sites;
+                x18st.svc_patched += st.svc_patched;
+                x18st.lx_refused  += st.lx_refused;
+                x18st.far_refused += st.far_refused;
                 *pused            += used;
                 off               += slice;
             }
@@ -580,6 +612,15 @@ int main(int argc, char **argv) {
                         "answer %#llx%s\n", in, x18st.ctr_sites,
                 x18st.ctr_patched, (unsigned long long)kl_x18_ctr_value(),
                 x18st.ctr_refused ? " — SOME REFUSED, they will SIGILL" : "");
+
+    // A refused thread-pointer or svc site is not survivable either way: one
+    // reads a register the kernel clobbers, the other enters Darwin's syscall
+    // table with a Linux number. Named, with the encodings, like the x18 ones.
+    if (x18st.lx_refused) {
+        fprintf(stderr, "klepton-ld: %s: %u thread-pointer/svc site(s) REFUSED:\n",
+                in, x18st.lx_refused);
+        kl_x18_report(stderr);
+    }
 
     // ---- the measured guest patches (kl_guestpatch.c) ----
     // The same table the runtime loader applies, at the same point in the same
@@ -877,7 +918,8 @@ int main(int argc, char **argv) {
         klx_stat_section rec = { KLX_STAT_MAGIC, x18st.sites, x18st.patched,
                                  x18st.refused, tls_rewrites, KLX_TSD_SLOT,
                                  x18st.ctr_sites, x18st.ctr_patched,
-                                 kl_x18_ctr_value() };
+                                 kl_x18_ctr_value(), (uint32_t)kl_x18_abi(),
+                                 x18st.tp_patched, x18st.svc_patched };
         memcpy(o + seg_foff[0] + stat_va, &rec, sizeof rec);
     }
 
@@ -929,6 +971,10 @@ int main(int argc, char **argv) {
         printf("  CTR_EL0 reads %u   veneered %u   refused %u   (answering %#llx)\n",
                x18st.ctr_sites, x18st.ctr_patched, x18st.ctr_refused,
                (unsigned long long)kl_x18_ctr_value());
+        if (kl_x18_abi() == KLX_ABI_LINUX)
+            printf("  linux abi     tp sites %u veneered %u   svc sites %u veneered %u   "
+                   "refused %u\n", x18st.tp_sites, x18st.tp_patched,
+                   x18st.svc_sites, x18st.svc_patched, x18st.lx_refused);
         printf("  total         %llu bytes\n", (unsigned long long)total);
     }
     return 0;

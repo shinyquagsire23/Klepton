@@ -1,0 +1,16 @@
+﻿<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<modal id="settingsModal" clickerino-offerino-closerino='true' size-delta-x='80' size-delta-y='45' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+		<vertical horizontal-fit='Unconstrained' pad='4' pad-top='9'>
+			<horizontal bg='panel-top-gradient' ignore-layout='true' anchor-max-x='.97' anchor-min-x='.03' anchor-min-y='1' anchor-pos-y='-5'>
+				<text text='BetterSongSearch - Settings' align='Center'/>
+			</horizontal>
+			<toggle-setting text='Return to BSS from Solo' value="returnToBssFromSolo" bind-value="true" apply-on-change="true" hover-hint="When Playing a song from Better Song Search, return once leaving the Solo menu"/>
+			<toggle-setting text='Download Song previews' value="loadSongPreviews" bind-value="true" apply-on-change="true" hover-hint="Load and play a short preview of songs not downloaded yet"/>
+			<toggle-setting text='Smaller Font size' value="smallerFontSize" bind-value="true" apply-on-change="true" hover-hint="Makes the Font size of the Song List smaller"/>
+			<list-setting text='Preferred leaderboard' value="preferredLeaderboard" choices='preferredLeaderboardOptions' bind-value="true" apply-on-change="true" hover-hint="Sets your preferred leaderboard when you don't filer by any leaderboard" />
+			<horizontal pad-top="2">
+				<button text='Close' on-click='CloseModal'/>
+			</horizontal>
+		</vertical>
+	</modal>
+</bg>

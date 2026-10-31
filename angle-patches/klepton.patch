@@ -1,3 +1,121 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 014df1f..84cb3e7 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -836,6 +836,12 @@ void GenMetalTraverser::emitPostQualifier(const EmitVariableDeclarationConfig &e
+             mOut << " [[point_size]]";
+             break;
+ 
++        // Klepton: OVR_multiview. The vertex stage picks the array slice it
++        // rasterizes into; see the multiview block in TranslatorMSL.cpp.
++        case TQualifier::EvqLayerOut:
++            mOut << " [[render_target_array_index]]";
++            break;
++
+         case TQualifier::EvqVertexID:
+             if (evdConfig.isMainParameter)
+             {
+@@ -1175,6 +1181,18 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
+     const TQualifier qual = type.getQualifier();
+     switch (qual)
+     {
++        // Klepton: OVR_multiview. An integer varying must be flat, but this one
++        // is deliberately NOT reported through hasFlatInput: that flag turns on
++        // provoking-vertex emulation (an index buffer rebuilt per draw), and the
++        // view id is the same at every vertex of a primitive, so which vertex
++        // provokes cannot matter.
++        case TQualifier::EvqEmulatedViewIDOVR:
++            if (mPipelineStructs.fragmentIn.external == &parent)
++            {
++                mOut << " [[flat]]";
++            }
++            break;
++
+         case TQualifier::EvqFlatIn:
+             if (mPipelineStructs.fragmentIn.external == &parent)
+             {
+diff --git a/src/compiler/translator/msl/Pipeline.cpp b/src/compiler/translator/msl/Pipeline.cpp
+index 4fa250a..34e1ca3 100644
+--- a/src/compiler/translator/msl/Pipeline.cpp
++++ b/src/compiler/translator/msl/Pipeline.cpp
+@@ -55,6 +55,11 @@ bool Pipeline::uses(const TVariable &var) const
+                 case TQualifier::EvqSampleOut:
+                 case TQualifier::EvqNoPerspectiveCentroidOut:
+                 case TQualifier::EvqNoPerspectiveSampleOut:
++                // Klepton: OVR_multiview. The emulated gl_ViewID_OVR is a flat
++                // varying the vertex stage writes, and EvqLayerOut is the
++                // [[render_target_array_index]] member TranslatorMSL adds beside it.
++                case TQualifier::EvqEmulatedViewIDOVR:
++                case TQualifier::EvqLayerOut:
+                     return true;
+                 default:
+                     return false;
+@@ -72,6 +77,8 @@ bool Pipeline::uses(const TVariable &var) const
+                 case TQualifier::EvqSampleIn:
+                 case TQualifier::EvqNoPerspectiveCentroidIn:
+                 case TQualifier::EvqNoPerspectiveSampleIn:
++                // Klepton: OVR_multiview — the emulated gl_ViewID_OVR, read back.
++                case TQualifier::EvqEmulatedViewIDOVR:
+                     return true;
+                 default:
+                     return false;
+diff --git a/src/compiler/translator/msl/TranslatorMSL.cpp b/src/compiler/translator/msl/TranslatorMSL.cpp
+index 2804221..f23d1ed 100644
+--- a/src/compiler/translator/msl/TranslatorMSL.cpp
++++ b/src/compiler/translator/msl/TranslatorMSL.cpp
+@@ -1249,8 +1249,52 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+     else if (getShaderType() == GL_VERTEX_SHADER)
+     {
+         DeclareRightBeforeMain(*root, *BuiltInVariable::gl_Position());
++
++        // Klepton: OVR_multiview on Metal, by instancing into a layered pass.
++        //
++        // DeclareAndInitBuiltinsForInstancedMultiview has already run (ShaderMtl
++        // asks for it): gl_ViewID_OVR is now the global ViewID_OVR, set from
++        // gl_InstanceID % num_views at the top of main, and the backend draws
++        // every primitive num_views times. What that pass does not do for this
++        // output is ROUTE each copy to its view. On Metal that is one more
++        // vertex output, [[render_target_array_index]], which selects the slice
++        // of the pass's array attachments; so declare it and copy the view id in
++        // at the end of main. The framebuffer side presents the views as slices
++        // 0..n-1 (FramebufferMtl), so no base index is added here.
++        bool isMultiviewVertexShader = false;
++        if (compileOptions.initializeBuiltinsForInstancedMultiview)
++        {
++            const TIntermSymbol *viewID = FindSymbolNode(root, ImmutableString("ViewID_OVR"));
++            if (viewID != nullptr &&
++                viewID->getType().getQualifier() == TQualifier::EvqEmulatedViewIDOVR)
++            {
++                isMultiviewVertexShader = true;
++                const TVariable *layer =
++                    new TVariable(&getSymbolTable(), ImmutableString("ANGLELayer"),
++                                  new TType(EbtUInt, EbpHigh, EvqLayerOut),
++                                  SymbolType::AngleInternal);
++                DeclareRightBeforeMain(*root, *layer);
++                TIntermBinary *assignLayer =
++                    new TIntermBinary(TOperator::EOpAssign, new TIntermSymbol(layer),
++                                      new TIntermSymbol(&viewID->variable()));
++                if (!RunAtTheEndOfShader(this, root, assignLayer, &getSymbolTable()))
++                {
++                    return false;
++                }
++            }
++        }
+         // Always declare gl_PointSize to get [[point_size]] defined in case
+         // client draws with GL_POINTS.
++        //
++        // Klepton: ...except in a multiview vertex shader that never mentions it.
++        // A layered pass obliges the pipeline to state its primitive topology
++        // class, and with the class stated Metal refuses a vertex function that
++        // writes point size for anything but points ("Vertex shader writes point
++        // size but inputPrimitiveTopology is MTLPrimitiveTopologyClassTriangle").
++        // The unconditional declaration is only safe while the class is
++        // Unspecified, which a multiview pipeline can never be.
++        if (!isMultiviewVertexShader ||
++            FindSymbolNode(root, ImmutableString("gl_PointSize")) != nullptr)
+         {
+ 
+             const TVariable *pointSize = getShaderVersion() >= 300
 diff --git a/src/libANGLE/Constants.h b/src/libANGLE/Constants.h
 index 62d983b..3aa3a4a 100644
 --- a/src/libANGLE/Constants.h
@@ -37,11 +155,96 @@ index 0e6d9b3..19b15a1 100644
  
      // clang-format on
  
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index 4ea4a3c..d0e9124 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -604,6 +604,9 @@ class ContextMtl : public ContextImpl, public mtl::Context
+ 
+     // State
+     mtl::RenderPipelineDesc mRenderPipelineDesc;
++    // Klepton: OVR_multiview — the mode of the draw being set up, for the
++    // pipeline's inputPrimitiveTopology in a layered pass.
++    gl::PrimitiveMode mLastDrawMode = gl::PrimitiveMode::Triangles;
+     mtl::DepthStencilDesc mDepthStencilDesc;
+     mtl::BlendDescArray mBlendDescArray;
+     mtl::WriteMaskArray mWriteMaskArray;
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index ad2cd40..971a9b8 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -433,6 +433,7 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+                                          GLsizei instances,
+                                          GLuint baseInstance)
+ {
++    mLastDrawMode = mode;  // Klepton: see checkIfPipelineChanged
+     // Real instances count. Zero means this is not instanced draw.
+     GLsizei instanceCount = instances ? instances : 1;
+ 
+@@ -756,6 +757,7 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+                                            GLint baseVertex,
+                                            GLuint baseInstance)
+ {
++    mLastDrawMode = mode;  // Klepton: see checkIfPipelineChanged
+     // Real instances count. Zero means this is not instanced draw.
+     GLsizei instanceCount = instances ? instances : 1;
+ 
+@@ -2860,9 +2862,30 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+                                                  bool *isPipelineDescChanged)
+ {
+     ASSERT(mRenderEncoder.valid());
+-    bool rppChange =
+-        mDirtyBits.test(DIRTY_BIT_RENDER_PIPELINE) ||
+-        MTLPrimitiveTopologyClassUnspecified != mRenderPipelineDesc.getInputPrimitiveTopology();
++    // Klepton: OVR_multiview. A pipeline that renders into a LAYERED pass must
++    // name its primitive topology class — Metal refuses the pipeline otherwise —
++    // so for a multiview framebuffer it follows the draw's mode. Everything else
++    // keeps Unspecified, as before.
++    MTLPrimitiveTopologyClass wantTopology = MTLPrimitiveTopologyClassUnspecified;
++    if (mRenderEncoder.renderPassDesc().renderTargetArrayLength > 1)
++    {
++        switch (mLastDrawMode)
++        {
++            case gl::PrimitiveMode::Points:
++                wantTopology = MTLPrimitiveTopologyClassPoint;
++                break;
++            case gl::PrimitiveMode::Lines:
++            case gl::PrimitiveMode::LineLoop:
++            case gl::PrimitiveMode::LineStrip:
++                wantTopology = MTLPrimitiveTopologyClassLine;
++                break;
++            default:
++                wantTopology = MTLPrimitiveTopologyClassTriangle;
++                break;
++        }
++    }
++    bool rppChange = mDirtyBits.test(DIRTY_BIT_RENDER_PIPELINE) ||
++                     wantTopology != mRenderPipelineDesc.getInputPrimitiveTopology();
+ 
+     // Obtain RenderPipelineDesc's vertex array descriptor.
+     ANGLE_TRY(mVertexArray->setupDraw(context, &mRenderEncoder, &rppChange,
+@@ -2892,7 +2915,7 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+         {
+             mRenderPipelineDesc.setRasterizationType(mtl::RenderPipelineRasterization::Enabled);
+         }
+-        mRenderPipelineDesc.setInputPrimitiveTopology(MTLPrimitiveTopologyClassUnspecified);
++        mRenderPipelineDesc.setInputPrimitiveTopology(wantTopology);
+         mRenderPipelineDesc.setAlphaToCoverageEnabled(
+             mState.isSampleAlphaToCoverageEnabled() &&
+             mRenderPipelineDesc.outputDescriptor.getRasterSampleCount() > 1 &&
 diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
-index 71f0c61..dbc9481 100644
+index 71f0c61..3d1756c 100644
 --- a/src/libANGLE/renderer/metal/DisplayMtl.mm
 +++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
-@@ -959,6 +959,13 @@ void DisplayMtl::initializeExtensions() const
+@@ -749,6 +749,7 @@ bool IsMetalDisplayAvailable()
+ #endif
+ 
+     mNativeCaps.maxArrayTextureLayers = 2048;
++    mNativeCaps.maxViews              = 4;  // Klepton: OVR_multiview (see initializeExtensions)
+     mNativeCaps.maxLODBias            = std::log2(mNativeCaps.max2DTextureSize) + 1;
+     mNativeCaps.maxCubeMapTextureSize = mNativeCaps.max2DTextureSize;
+     mNativeCaps.maxRenderbufferSize   = mNativeCaps.max2DTextureSize;
+@@ -959,6 +960,13 @@ bool IsMetalDisplayAvailable()
      mNativeExtensions.textureMirrorClampToEdgeEXT   = true;
      mNativeExtensions.depthClampEXT                 = true;
      mNativeExtensions.rgbxInternalFormatANGLE       = mFeatures.hasTextureSwizzle.enabled;
@@ -55,11 +258,40 @@ index 71f0c61..dbc9481 100644
  
      // EXT_debug_marker is not implemented yet, but the entry points must be exposed for the
      // Metal backend to be used in Chrome (http://anglebug.com/42263519)
+@@ -994,6 +1002,19 @@ bool IsMetalDisplayAvailable()
+     mNativeExtensions.instancedArraysANGLE = true;
+     mNativeExtensions.instancedArraysEXT   = mNativeExtensions.instancedArraysANGLE;
+ 
++    // Klepton: OVR_multiview / OVR_multiview2, emulated the way the D3D11 and GL
++    // backends do it — every draw instanced num_views times — with the view
++    // routed by [[render_target_array_index]] into a layered render pass.
++    // Layered rendering is Apple GPU family 5 and up (A12/M1), which is every
++    // device this build can run on.
++    mNativeExtensions.multiviewOVR  = true;
++    mNativeExtensions.multiview2OVR = true;
++    // Klepton: and its multisampled form, where implicit resolve exists at all —
++    // the layered pass draws into a multisampled array and Metal resolves each
++    // slice into the array texture when the pass ends.
++    mNativeExtensions.multiviewMultisampledRenderToTextureOVR =
++        mNativeExtensions.multisampledRenderToTextureEXT;
++
+     mNativeExtensions.robustBufferAccessBehaviorKHR = false;
+ 
+     mNativeExtensions.EGLSyncOES = false;
 diff --git a/src/libANGLE/renderer/metal/FrameBufferMtl.mm b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
-index 2825a7c..49f308d 100644
+index 2825a7c..1c468a9 100644
 --- a/src/libANGLE/renderer/metal/FrameBufferMtl.mm
 +++ b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
-@@ -29,6 +29,33 @@ namespace rx
+@@ -7,6 +7,8 @@
+ //    Implements the class methods for FramebufferMtl.
+ //
+ 
++#include <atomic>
++#include <cstdio>
+ #include "libANGLE/angletypes.h"
+ #include "libANGLE/renderer/metal/ContextMtl.h"
+ 
+@@ -29,6 +31,33 @@
  {
  namespace
  {
@@ -93,7 +325,7 @@ index 2825a7c..49f308d 100644
  // Override clear color based on texture's write mask
  void OverrideMTLClearColor(const mtl::TextureRef &texture,
                             const mtl::ClearColorValue &clearColor,
-@@ -567,6 +594,56 @@ angle::Result FramebufferMtl::blit(const gl::Context *context,
+@@ -567,6 +596,56 @@ void RoundValueAndAdjustCorrespondingValue(float a,
      baseParams.unpackFlipX = false;
      baseParams.unpackFlipY = false;
  
@@ -150,7 +382,41 @@ index 2825a7c..49f308d 100644
      return blitWithDraw(context, srcFrameBuffer, blitColorBuffer, blitDepthBuffer,
                          blitStencilBuffer, filter, baseParams);
  }
-@@ -1144,6 +1221,46 @@ angle::Result FramebufferMtl::prepareRenderPass(const gl::Context *context,
+@@ -1083,6 +1162,7 @@ void RoundValueAndAdjustCorrespondingValue(float a,
+     uint32_t maxColorAttachments = static_cast<uint32_t>(mState.getColorAttachments().size());
+     desc.numColorAttachments     = 0;
+     desc.rasterSampleCount       = 1;
++    desc.renderTargetArrayLength = 0;
+     for (uint32_t colorIndexGL = 0; colorIndexGL < maxColorAttachments; ++colorIndexGL)
+     {
+         ASSERT(colorIndexGL < mColorRenderTargets.size());
+@@ -1100,6 +1180,8 @@ void RoundValueAndAdjustCorrespondingValue(float a,
+             desc.numColorAttachments = std::max(desc.numColorAttachments, colorIndexGL + 1);
+             desc.rasterSampleCount =
+                 std::max(desc.rasterSampleCount, colorRenderTarget->getRenderSamples());
++            desc.renderTargetArrayLength =
++                std::max(desc.renderTargetArrayLength, colorRenderTarget->getLayerCount());
+ 
+             if (!mRenderPassFirstColorAttachmentFormat)
+             {
+@@ -1127,6 +1209,8 @@ void RoundValueAndAdjustCorrespondingValue(float a,
+         mDepthRenderTarget->toRenderPassAttachmentDesc(&desc.depthAttachment);
+         desc.rasterSampleCount =
+             std::max(desc.rasterSampleCount, mDepthRenderTarget->getRenderSamples());
++        desc.renderTargetArrayLength =
++            std::max(desc.renderTargetArrayLength, mDepthRenderTarget->getLayerCount());
+     }
+     else
+     {
+@@ -1138,12 +1222,54 @@ void RoundValueAndAdjustCorrespondingValue(float a,
+         mStencilRenderTarget->toRenderPassAttachmentDesc(&desc.stencilAttachment);
+         desc.rasterSampleCount =
+             std::max(desc.rasterSampleCount, mStencilRenderTarget->getRenderSamples());
++        desc.renderTargetArrayLength =
++            std::max(desc.renderTargetArrayLength, mStencilRenderTarget->getLayerCount());
+     }
+     else
+     {
          desc.stencilAttachment = {};
      }
  
@@ -197,6 +463,398 @@ index 2825a7c..49f308d 100644
      if (desc.numColorAttachments == 0 && mDepthRenderTarget == nullptr &&
          mStencilRenderTarget == nullptr)
      {
+@@ -1824,6 +1950,30 @@ void RoundValueAndAdjustCorrespondingValue(float a,
+ angle::Result FramebufferMtl::unresolveIfNeeded(const gl::Context *context,
+                                                 mtl::RenderCommandEncoder *encoder)
+ {
++    // Klepton: a layered multisampled pass (OVR_multiview_multisampled_render_to_
++    // texture) that is opened over content it has to keep. With kept samples
++    // that is a plain load; with memoryless ones it would need the unresolve
++    // draws below, which are not layered. Counted, so a run says whether a
++    // guest ever does it (KL_ANGLE_MSMV_MEMORYLESS decides which case this is).
++    if (encoder->renderPassDesc().renderTargetArrayLength > 1 && encoder->renderPassDesc().numColorAttachments > 0 &&
++        encoder->renderPassDesc().colorAttachments[0].hasImplicitMSTexture())
++    {
++        static std::atomic<uint32_t> opened{0}, reloaded{0};
++        uint32_t n = ++opened;
++        bool load = encoder->renderPassDesc().colorAttachments[0].loadAction == MTLLoadActionLoad;
++        uint32_t r = load ? ++reloaded : reloaded.load();
++        if ((load && (r <= 3 || r % 2000 == 0)) || n == 1 || n % 20000 == 0)
++        {
++            fprintf(stderr,
++                    "  [angle] layered multisampled pass: opened %u times, %u of them over "
++                    "kept content%s\n",
++                    n, r,
++                    encoder->renderPassDesc().colorAttachments[0].implicitMSTexture->shouldNotLoadStore()
++                        ? " (memoryless: restored by a draw per view)"
++                        : "");
++        }
++    }
++
+     ContextMtl *contextMtl = mtl::GetImpl(context);
+     DisplayMtl *display    = contextMtl->getDisplay();
+ 
+@@ -1843,74 +1993,89 @@ void RoundValueAndAdjustCorrespondingValue(float a,
+     baseParams.unpackFlipX = false;
+     baseParams.unpackFlipY = false;
+ 
+-    // Unresolve any color attachment if the intended loadAction = MTLLoadActionLoad and the
+-    // respective MS texture is memoryless.
+-    mtl::ColorBlitParams colorBlitParams;
+-    colorBlitParams.BlitParams::operator=(baseParams);
+-    for (uint32_t colorIndexGL = 0; colorIndexGL < renderPassDesc.numColorAttachments;
+-         ++colorIndexGL)
+-    {
+-        const mtl::RenderPassColorAttachmentDesc &colorAttachment =
+-            renderPassDesc.colorAttachments[colorIndexGL];
++    // Klepton: a pass that rasterizes through a rate map restores texel for texel.
++    // The resolved texture holds the picture already warped, and this draw goes
++    // through the same map, so sampling it at screen-space coordinates would warp
++    // it a second time.
++    baseParams.physicalPassthrough = renderPassDesc.rasterizationRateMap.get() != nil;
+ 
+-        if (colorAttachment.loadAction != MTLLoadActionLoad ||
+-            !colorAttachment.hasImplicitMSTexture() ||
+-            !colorAttachment.implicitMSTexture->shouldNotLoadStore())
++    // Klepton: in a layered pass (OVR_multiview_multisampled_render_to_texture)
++    // every view is restored, each from its own slice of the resolved texture
++    // into its own slice of the multisampled array (blitLayeredVS).
++    const uint32_t viewCount = std::max<uint32_t>(1, renderPassDesc.renderTargetArrayLength);
++    for (uint32_t view = 0; view < viewCount; ++view)
++    {
++        // Unresolve any color attachment if the intended loadAction = MTLLoadActionLoad and the
++        // respective MS texture is memoryless.
++        mtl::ColorBlitParams colorBlitParams;
++        colorBlitParams.BlitParams::operator=(baseParams);
++        for (uint32_t colorIndexGL = 0; colorIndexGL < renderPassDesc.numColorAttachments;
++             ++colorIndexGL)
+         {
+-            continue;
+-        }
+-        const RenderTargetMtl *colorRenderTarget = mColorRenderTargets[colorIndexGL];
+-        const angle::Format &angleFormat = colorRenderTarget->getFormat().actualAngleFormat();
++            const mtl::RenderPassColorAttachmentDesc &colorAttachment =
++                renderPassDesc.colorAttachments[colorIndexGL];
+ 
+-        // Blit the resolve texture to the MS texture.
+-        colorBlitParams.src      = colorAttachment.texture;
+-        colorBlitParams.srcLevel = colorAttachment.level;
+-        colorBlitParams.srcLayer = colorAttachment.sliceOrDepth;
++            if (colorAttachment.loadAction != MTLLoadActionLoad ||
++                !colorAttachment.hasImplicitMSTexture() ||
++                !colorAttachment.implicitMSTexture->shouldNotLoadStore())
++            {
++                continue;
++            }
++            const RenderTargetMtl *colorRenderTarget = mColorRenderTargets[colorIndexGL];
++            const angle::Format &angleFormat = colorRenderTarget->getFormat().actualAngleFormat();
++
++            // Blit the resolve texture to the MS texture.
++            colorBlitParams.src      = colorAttachment.texture;
++            colorBlitParams.srcLevel = colorAttachment.level;
++            colorBlitParams.srcLayer = colorAttachment.sliceOrDepth + view;
++            colorBlitParams.dstLayer = view;
++
++            colorBlitParams.enabledBuffers.reset();
++            colorBlitParams.enabledBuffers.set(colorIndexGL);
++            colorBlitParams.filter       = GL_NEAREST;
++            colorBlitParams.dstLuminance = angleFormat.isLUMA();
++
++            ANGLE_TRY(
++                display->getUtils().blitColorWithDraw(context, encoder, angleFormat, colorBlitParams));
++        }
+ 
+-        colorBlitParams.enabledBuffers.reset();
+-        colorBlitParams.enabledBuffers.set(colorIndexGL);
+-        colorBlitParams.filter       = GL_NEAREST;
+-        colorBlitParams.dstLuminance = angleFormat.isLUMA();
++        // Similarly, unresolve depth/stencil attachments.
++        mtl::DepthStencilBlitParams dsBlitParams;
++        dsBlitParams.BlitParams::operator=(baseParams);
++        dsBlitParams.dstLayer = view;
++        const mtl::RenderPassDepthAttachmentDesc &depthAttachment = renderPassDesc.depthAttachment;
++        if (depthAttachment.loadAction == MTLLoadActionLoad && depthAttachment.hasImplicitMSTexture() &&
++            depthAttachment.implicitMSTexture->shouldNotLoadStore())
++        {
++            dsBlitParams.src      = depthAttachment.texture;
++            dsBlitParams.srcLevel = depthAttachment.level;
++            dsBlitParams.srcLayer = depthAttachment.sliceOrDepth + view;
++        }
+ 
+-        ANGLE_TRY(
+-            display->getUtils().blitColorWithDraw(context, encoder, angleFormat, colorBlitParams));
+-    }
++        const mtl::RenderPassStencilAttachmentDesc &stencilAttachment =
++            renderPassDesc.stencilAttachment;
++        if (stencilAttachment.loadAction == MTLLoadActionLoad &&
++            stencilAttachment.hasImplicitMSTexture() &&
++            stencilAttachment.implicitMSTexture->shouldNotLoadStore())
++        {
++            if (mState.hasSeparateDepthAndStencilAttachments())
++            {
++                // Blit depth/stencil separately.
++                ANGLE_TRY(contextMtl->getDisplay()->getUtils().blitDepthStencilWithDraw(
++                    context, encoder, dsBlitParams));
++                dsBlitParams.src = nullptr;
++            }
+ 
+-    // Similarly, unresolve depth/stencil attachments.
+-    mtl::DepthStencilBlitParams dsBlitParams;
+-    dsBlitParams.BlitParams::operator=(baseParams);
+-    const mtl::RenderPassDepthAttachmentDesc &depthAttachment = renderPassDesc.depthAttachment;
+-    if (depthAttachment.loadAction == MTLLoadActionLoad && depthAttachment.hasImplicitMSTexture() &&
+-        depthAttachment.implicitMSTexture->shouldNotLoadStore())
+-    {
+-        dsBlitParams.src      = depthAttachment.texture;
+-        dsBlitParams.srcLevel = depthAttachment.level;
+-        dsBlitParams.srcLayer = depthAttachment.sliceOrDepth;
+-    }
++            dsBlitParams.srcStencil = stencilAttachment.texture->getStencilView();
++            dsBlitParams.srcLevel   = stencilAttachment.level;
++            dsBlitParams.srcLayer   = stencilAttachment.sliceOrDepth + view;
++        }
+ 
+-    const mtl::RenderPassStencilAttachmentDesc &stencilAttachment =
+-        renderPassDesc.stencilAttachment;
+-    if (stencilAttachment.loadAction == MTLLoadActionLoad &&
+-        stencilAttachment.hasImplicitMSTexture() &&
+-        stencilAttachment.implicitMSTexture->shouldNotLoadStore())
+-    {
+-        if (mState.hasSeparateDepthAndStencilAttachments())
++        if (dsBlitParams.src || dsBlitParams.srcStencil)
+         {
+-            // Blit depth/stencil separately.
+-            ANGLE_TRY(contextMtl->getDisplay()->getUtils().blitDepthStencilWithDraw(
+-                context, encoder, dsBlitParams));
+-            dsBlitParams.src = nullptr;
++            ANGLE_TRY(contextMtl->getDisplay()->getUtils().blitDepthStencilWithDraw(context, encoder,
++                                                                                    dsBlitParams));
+         }
+-
+-        dsBlitParams.srcStencil = stencilAttachment.texture->getStencilView();
+-        dsBlitParams.srcLevel   = stencilAttachment.level;
+-        dsBlitParams.srcLayer   = stencilAttachment.sliceOrDepth;
+-    }
+-
+-    if (dsBlitParams.src || dsBlitParams.srcStencil)
+-    {
+-        ANGLE_TRY(contextMtl->getDisplay()->getUtils().blitDepthStencilWithDraw(context, encoder,
+-                                                                                dsBlitParams));
+     }
+ 
+     return angle::Result::Continue;
+diff --git a/src/libANGLE/renderer/metal/RenderTargetMtl.h b/src/libANGLE/renderer/metal/RenderTargetMtl.h
+index 281085b..91f1feb 100644
+--- a/src/libANGLE/renderer/metal/RenderTargetMtl.h
++++ b/src/libANGLE/renderer/metal/RenderTargetMtl.h
+@@ -47,6 +47,10 @@ class RenderTargetMtl final : public FramebufferAttachmentRenderTarget
+     mtl::TextureRef getImplicitMSTexture() const { return mImplicitMSTexture.lock(); }
+     const mtl::MipmapNativeLevel &getLevelIndex() const { return mLevelIndex; }
+     uint32_t getLayerIndex() const { return mLayerIndex; }
++    // Klepton: OVR_multiview. >1 when this target is a RANGE of array slices
++    // (mLayerIndex .. mLayerIndex + count - 1) rendered as one layered pass.
++    void setLayerCount(uint32_t count) { mLayerCount = count; }
++    uint32_t getLayerCount() const { return mLayerCount; }
+     uint32_t getRenderSamples() const;
+     const mtl::Format &getFormat() const { return mFormat; }
+ 
+@@ -57,6 +61,7 @@ class RenderTargetMtl final : public FramebufferAttachmentRenderTarget
+     mtl::TextureWeakRef mImplicitMSTexture;
+     mtl::MipmapNativeLevel mLevelIndex = mtl::kZeroNativeMipLevel;
+     uint32_t mLayerIndex               = 0;
++    uint32_t mLayerCount               = 0;
+     mtl::Format mFormat;
+ };
+ }  // namespace rx
+diff --git a/src/libANGLE/renderer/metal/RenderTargetMtl.mm b/src/libANGLE/renderer/metal/RenderTargetMtl.mm
+index 18e62da..227866b 100644
+--- a/src/libANGLE/renderer/metal/RenderTargetMtl.mm
++++ b/src/libANGLE/renderer/metal/RenderTargetMtl.mm
+@@ -36,6 +36,7 @@
+     mImplicitMSTexture = implicitMSTexture;
+     mLevelIndex        = level;
+     mLayerIndex        = layer;
++    mLayerCount        = 0;
+     mFormat            = format;
+ }
+ 
+@@ -53,6 +54,7 @@
+ {
+     setWithImplicitMSTexture(src.getTexture(), src.getImplicitMSTexture(), src.getLevelIndex(),
+                              src.getLayerIndex(), src.getFormat());
++    mLayerCount = src.getLayerCount();
+ }
+ 
+ void RenderTargetMtl::reset()
+@@ -61,6 +63,7 @@
+     mImplicitMSTexture.reset();
+     mLevelIndex = mtl::kZeroNativeMipLevel;
+     mLayerIndex = 0;
++    mLayerCount = 0;
+     mFormat     = mtl::Format();
+ }
+ 
+diff --git a/src/libANGLE/renderer/metal/ShaderMtl.mm b/src/libANGLE/renderer/metal/ShaderMtl.mm
+index fd75a48..8dd0ca1 100644
+--- a/src/libANGLE/renderer/metal/ShaderMtl.mm
++++ b/src/libANGLE/renderer/metal/ShaderMtl.mm
+@@ -89,6 +89,13 @@ void postTranslate(ShHandle compiler, const gl::CompiledShaderState &compiledSta
+         options->emulateAlphaToCoverage = true;
+     }
+ 
++    // Klepton: OVR_multiview. gl_ViewID_OVR is emulated by instancing (see the
++    // multiview block in TranslatorMSL.cpp and RenderCommandEncoder's view count).
++    if (context->getExtensions().multiviewOVR || context->getExtensions().multiview2OVR)
++    {
++        options->initializeBuiltinsForInstancedMultiview = true;
++    }
++
+     options->removeInactiveVariables = true;
+     options->retainInactiveFragmentOutputs = true;
+ 
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.mm b/src/libANGLE/renderer/metal/TextureMtl.mm
+index 7894742..fc4e855 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.mm
++++ b/src/libANGLE/renderer/metal/TextureMtl.mm
+@@ -1432,6 +1432,13 @@ uint32_t height(GLuint glLevel) const
+             else
+             {
+                 rtt.set(imageDef.image, mtl::kZeroNativeMipLevel, layer, format);
++                // Klepton: OVR_multiview. glFramebufferTextureMultiviewOVR arrives
++                // as an image index with a layer RANGE; keep the count so the
++                // framebuffer can open a layered render pass over it.
++                if (imageIndex.getLayerCount() > 1)
++                {
++                    rtt.setLayerCount(static_cast<uint32_t>(imageIndex.getLayerCount()));
++                }
+             }
+         }
+     }
+@@ -1444,8 +1451,31 @@ uint32_t height(GLuint glLevel) const
+         if (!msTexture)
+         {
+             const gl::ImageDesc &desc = mState.getImageDesc(imageIndex);
+-            ANGLE_TRY(mtl::Texture::MakeMemoryLess2DMSTexture(
+-                context, format, desc.size.width, desc.size.height, implicitSamples, &msTexture));
++            if (imageIndex.getLayerCount() > 1)
++            {
++                // Klepton: OVR_multiview_multisampled_render_to_texture. A layered
++                // pass needs a multisampled ARRAY, one slice per view; Metal
++                // resolves every slice into the array texture's slices at the
++                // end of the pass. Memoryless, like the single-view form: a pass
++                // reopened over what it drew before gets it back by a draw per
++                // view (FramebufferMtl::unresolveIfNeeded). At eye-texture sizes
++                // kept samples would be gigabytes; KL_ANGLE_MSMV_MEMORYLESS=0
++                // keeps them all the same, for comparison.
++                static const bool memoryLess = []() {
++                    const char *v = getenv("KL_ANGLE_MSMV_MEMORYLESS");
++                    return !(v && v[0] == '0');
++                }();
++                ANGLE_TRY(mtl::Texture::Make2DMSArrayTexture(
++                    context, format, desc.size.width, desc.size.height, implicitSamples,
++                    static_cast<uint32_t>(imageIndex.getLayerCount()), memoryLess, &msTexture));
++            }
++            else
++            {
++                ANGLE_TRY(mtl::Texture::MakeMemoryLess2DMSTexture(context, format,
++                                                                  desc.size.width,
++                                                                  desc.size.height,
++                                                                  implicitSamples, &msTexture));
++            }
+         }
+         rtt.setImplicitMSTexture(msTexture);
+     }
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.h b/src/libANGLE/renderer/metal/mtl_command_buffer.h
+index 2221ba0..063eb5c 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.h
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.h
+@@ -641,6 +641,10 @@ class RenderCommandEncoder final : public CommandEncoder
+     const OcclusionQueryPool &mOcclusionQueryPool;
+     bool mRecording    = false;
+     bool mHasDrawCalls = false;
++    // Klepton: OVR_multiview. The number of views of the pass being encoded;
++    // every draw is issued for that many times the instances it asked for, and
++    // the vertex stage turns instance_id back into (view, instance).
++    uint32_t mViewCount = 1;
+     IntermediateCommandStream mCommands;
+ 
+     gl::ShaderMap<uint8_t> mSetBufferCmds;
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.mm b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+index 1dd725d..e8db7a0 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.mm
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+@@ -1724,6 +1724,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     mRenderPassDesc           = desc;
+     mRecording                = true;
+     mHasDrawCalls             = false;
++    mViewCount                = std::max<uint32_t>(1, desc.renderTargetArrayLength);
+     mRenderPassMaxScissorRect = {.x      = 0,
+                                  .y      = 0,
+                                  .width  = std::numeric_limits<NSUInteger>::max(),
+@@ -2088,6 +2089,10 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     ASSERT(mPipelineStateSet &&
+            "Render Pipeline State was never set and we've issued a draw command.");
+     CheckPrimitiveType(primitiveType);
++    if (mViewCount > 1)
++    {
++        return drawInstanced(primitiveType, vertexStart, vertexCount, 1);
++    }
+     mHasDrawCalls = true;
+     mCommands.push(CmdType::Draw).push(primitiveType).push(vertexStart).push(vertexCount);
+ 
+@@ -2107,7 +2112,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+         .push(primitiveType)
+         .push(vertexStart)
+         .push(vertexCount)
+-        .push(instances);
++        .push(instances * mViewCount);
+ 
+     return *this;
+ }
+@@ -2127,8 +2132,8 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+         .push(primitiveType)
+         .push(vertexStart)
+         .push(vertexCount)
+-        .push(instances)
+-        .push(baseInstance);
++        .push(instances * mViewCount)
++        .push(baseInstance * mViewCount);
+ 
+     return *this;
+ }
+@@ -2146,6 +2151,11 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+     {
+         return *this;
+     }
++    if (mViewCount > 1)
++    {
++        return drawIndexedInstanced(primitiveType, indexCount, indexType, indexBuffer,
++                                    bufferOffset, 1);
++    }
+ 
+     mHasDrawCalls = true;
+     cmdBuffer().setReadDependency(indexBuffer, /*isRenderCommand=*/true);
+@@ -2184,7 +2194,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+         .push(indexType)
+         .push([indexBuffer->get() ANGLE_MTL_RETAIN])
+         .push(bufferOffset)
+-        .push(instances);
++        .push(instances * mViewCount);
+ 
+     return *this;
+ }
+@@ -2216,9 +2226,9 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+         .push(indexType)
+         .push([indexBuffer->get() ANGLE_MTL_RETAIN])
+         .push(bufferOffset)
+-        .push(instances)
++        .push(instances * mViewCount)
+         .push(baseVertex)
+-        .push(baseInstance);
++        .push(baseInstance * mViewCount);
+ 
+     return *this;
+ }
 diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
 index 85cc743..1b76b7e 100644
 --- a/src/libANGLE/renderer/metal/mtl_common.h
@@ -347,7 +1005,7 @@ index d5f657b..c1658d0 100644
  #include "libANGLE/angletypes.h"
  #include "libANGLE/renderer/metal/DisplayMtl.h"
  
-@@ -87,5 +91,211 @@ mtl::CommandQueue &Context::cmdQueue()
+@@ -87,5 +91,211 @@
      return mDisplay->cmdQueue();
  }
  
@@ -563,7 +1221,7 @@ diff --git a/src/libANGLE/renderer/metal/mtl_format_table_autogen.mm b/src/libAN
 index 7ec88c5..d49c3e1 100644
 --- a/src/libANGLE/renderer/metal/mtl_format_table_autogen.mm
 +++ b/src/libANGLE/renderer/metal/mtl_format_table_autogen.mm
-@@ -304,6 +304,12 @@ angle::FormatID Format::MetalToAngleFormatID(MTLPixelFormat formatMtl)
+@@ -304,6 +304,12 @@
              return angle::FormatID::ASTC_8x8_UNORM_BLOCK;
  #    endif  // TARGET_OS_IOS || TARGET_OS_OSX || TARGET_OS_VISION
  #endif      // TARGET_OS_IPHONE || mac 11.0+
@@ -576,7 +1234,7 @@ index 7ec88c5..d49c3e1 100644
          default:
              return angle::FormatID::NONE;
      }
-@@ -2848,6 +2854,21 @@ void Format::init(const DisplayMtl *display, angle::FormatID intendedFormatId_)
+@@ -2848,6 +2854,21 @@
              break;
  
  #endif  // TARGET_OS_OSX && (__MAC_OS_X_VERSION_MAX_ALLOWED >= 110000))
@@ -602,7 +1260,7 @@ diff --git a/src/libANGLE/renderer/metal/mtl_format_utils.mm b/src/libANGLE/rend
 index 180cc18..014dd64 100644
 --- a/src/libANGLE/renderer/metal/mtl_format_utils.mm
 +++ b/src/libANGLE/renderer/metal/mtl_format_utils.mm
-@@ -436,6 +436,18 @@ void FormatTable::adjustFormatCapsForDevice(const mtl::ContextDevice &device,
+@@ -436,6 +436,18 @@ void GenerateTextureCapsMap(const FormatTable &formatTable,
  void FormatTable::initNativeFormatCaps(const DisplayMtl *display)
  {
      initNativeFormatCapsAutogen(display);
@@ -622,10 +1280,19 @@ index 180cc18..014dd64 100644
  
  }  // namespace mtl
 diff --git a/src/libANGLE/renderer/metal/mtl_render_utils.h b/src/libANGLE/renderer/metal/mtl_render_utils.h
-index 1ae4533..eaccdb0 100644
+index 1ae4533..d58a520 100644
 --- a/src/libANGLE/renderer/metal/mtl_render_utils.h
 +++ b/src/libANGLE/renderer/metal/mtl_render_utils.h
-@@ -87,6 +87,12 @@ struct BlitParams
+@@ -78,6 +78,8 @@ struct BlitParams
+     TextureRef src;
+     MipmapNativeLevel srcLevel = kZeroNativeMipLevel;
+     uint32_t srcLayer          = 0;
++    // Klepton: the slice of a layered pass to draw into (only read there).
++    uint32_t dstLayer = 0;
+ 
+     // Source rectangle:
+     // NOTE: if srcYFlipped=true, this rectangle will be converted internally to flipped rect before
+@@ -87,6 +89,12 @@ struct BlitParams
      bool srcYFlipped = false;  // source texture has data flipped in Y direction
      bool unpackFlipX = false;  // flip texture data copying process in X direction
      bool unpackFlipY = false;  // flip texture data copying process in Y direction
@@ -638,11 +1305,35 @@ index 1ae4533..eaccdb0 100644
  };
  
  struct ColorBlitParams : public BlitParams
+@@ -224,6 +232,7 @@ class ClearUtils final : angle::NonCopyable
+     const std::string mFragmentShaderName;
+ 
+     angle::ObjCPtr<id<MTLFunction>> mVertexShader;
++    angle::ObjCPtr<id<MTLFunction>> mLayeredVertexShader;  // Klepton: OVR_multiview
+     std::array<angle::ObjCPtr<id<MTLFunction>>, kMaxRenderTargets + 1> mFragmentShaders;
+ };
+ 
+@@ -301,6 +310,7 @@ class ColorBlitUtils final : angle::NonCopyable
+     const std::string mFragmentShaderName;
+ 
+     angle::ObjCPtr<id<MTLFunction>> mVertexShader;
++    angle::ObjCPtr<id<MTLFunction>> mLayeredVertexShader;  // Klepton: OVR_multiview
+ 
+     // Blit fragment shaders.
+     std::unordered_map<ShaderKey, angle::ObjCPtr<id<MTLFunction>>, ShaderKey::Hash>
+@@ -344,6 +354,7 @@ class DepthStencilBlitUtils final : angle::NonCopyable
+         angle::ObjCPtr<id<MTLComputePipelineState>> *outComputePipelineState);
+ 
+     angle::ObjCPtr<id<MTLFunction>> mVertexShader;
++    angle::ObjCPtr<id<MTLFunction>> mLayeredVertexShader;  // Klepton: OVR_multiview
+ 
+     std::array<angle::ObjCPtr<id<MTLFunction>>, mtl_shader::kTextureTypeCount>
+         mDepthBlitFragmentShaders;
 diff --git a/src/libANGLE/renderer/metal/mtl_render_utils.mm b/src/libANGLE/renderer/metal/mtl_render_utils.mm
-index 0710ffe..ad3916b 100644
+index 0710ffe..b58a2c8 100644
 --- a/src/libANGLE/renderer/metal/mtl_render_utils.mm
 +++ b/src/libANGLE/renderer/metal/mtl_render_utils.mm
-@@ -59,7 +59,11 @@ struct BlitParamsUniform
+@@ -59,7 +59,16 @@
      int srcLevel         = 0;
      int srcLayer         = 0;
      uint8_t dstLuminance = 0;  // dest texture is luminace
@@ -651,11 +1342,16 @@ index 0710ffe..ad3916b 100644
 +    // through screen space. Only correct when source and destination carry the
 +    // same rasterization rate map. See blit.metal's blitSourceCoords.
 +    uint8_t physicalPassthrough = 0;
-+    uint8_t padding[6];
++    // Klepton: the slice of a layered pass this blit draws into.
++    uint8_t dstLayer = 0;
++    uint8_t padding[5];
++    // Klepton: 1 / the source texture's size (blit.metal's blitTexCoords).
++    float invPhysicalSize[2] = {0, 0};
++    float padding2[2]        = {0, 0};
  };
  
  struct BlitStencilToBufferParamsUniform
-@@ -591,8 +595,9 @@ void SetupBlitWithDrawUniformData(RenderCommandEncoder *cmdEncoder,
+@@ -591,8 +600,17 @@ void SetupBlitWithDrawUniformData(RenderCommandEncoder *cmdEncoder,
      // e.g., a clipped triangle, would produce various texture sampling artifacts on that hardware.
  
      BlitParamsUniform uniformParams;
@@ -664,11 +1360,170 @@ index 0710ffe..ad3916b 100644
 +    uniformParams.srcLevel            = params.srcLevel.get();
 +    uniformParams.srcLayer            = params.srcLayer;
 +    uniformParams.physicalPassthrough = params.physicalPassthrough ? 1 : 0;
++    uniformParams.dstLayer            = static_cast<uint8_t>(params.dstLayer);
++    if (params.physicalPassthrough && params.dstTextureSize.width > 0 &&
++        params.dstTextureSize.height > 0)
++    {
++        // A passthrough is only ever asked for between surfaces of one size.
++        uniformParams.invPhysicalSize[0] = 1.0f / static_cast<float>(params.dstTextureSize.width);
++        uniformParams.invPhysicalSize[1] = 1.0f / static_cast<float>(params.dstTextureSize.height);
++    }
      if (isColorBlit)
      {
          const ColorBlitParams *colorParams = static_cast<const ColorBlitParams *>(&params);
+@@ -1000,6 +1018,14 @@ ANGLE_INLINE void SetPipelineState(ComputeCommandEncoder *encoder,
+             mVertexShader = angle::adoptObjCPtr([shaderLib newFunctionWithName:@"clearVS"]);
+             ANGLE_CHECK(ctx, mVertexShader, gl::err::kInternalError, GL_INVALID_OPERATION);
+         }
++        // Klepton: OVR_multiview — see clearLayeredVS in shaders/clear.metal.
++        if (!mLayeredVertexShader)
++        {
++            id<MTLLibrary> shaderLib = ctx->getDisplay()->getDefaultShadersLib();
++            mLayeredVertexShader =
++                angle::adoptObjCPtr([shaderLib newFunctionWithName:@"clearLayeredVS"]);
++            ANGLE_CHECK(ctx, mLayeredVertexShader, gl::err::kInternalError, GL_INVALID_OPERATION);
++        }
+ 
+         if (!mFragmentShaders[numOutputs])
+         {
+@@ -1084,8 +1110,9 @@ ANGLE_INLINE void SetPipelineState(ComputeCommandEncoder *encoder,
+     ANGLE_TRY(ensureShadersInitialized(contextMtl, renderPassDesc.numColorAttachments));
+ 
+     return contextMtl->getPipelineCache().getRenderPipeline(
+-        contextMtl, mVertexShader, mFragmentShaders[renderPassDesc.numColorAttachments],
+-        pipelineDesc, outPipelineState);
++        contextMtl,
++        renderPassDesc.renderTargetArrayLength > 1 ? mLayeredVertexShader : mVertexShader,
++        mFragmentShaders[renderPassDesc.numColorAttachments], pipelineDesc, outPipelineState);
+ }
+ 
+ angle::Result ClearUtils::setupClearWithDraw(const gl::Context *context,
+@@ -1190,6 +1217,14 @@ ANGLE_INLINE void SetPipelineState(ComputeCommandEncoder *encoder,
+             mVertexShader = angle::adoptObjCPtr([shaderLib newFunctionWithName:@"blitVS"]);
+             ANGLE_CHECK(ctx, mVertexShader, gl::err::kInternalError, GL_INVALID_OPERATION);
+         }
++        if (!mLayeredVertexShader)
++        {
++            // Klepton: OVR_multiview — see blitLayeredVS in shaders/blit.metal.
++            id<MTLLibrary> shaderLib = ctx->getDisplay()->getDefaultShadersLib();
++            mLayeredVertexShader =
++                angle::adoptObjCPtr([shaderLib newFunctionWithName:@"blitLayeredVS"]);
++            ANGLE_CHECK(ctx, mLayeredVertexShader, gl::err::kInternalError, GL_INVALID_OPERATION);
++        }
+ 
+         if (!(*fragmentShaderOut))
+         {
+@@ -1259,7 +1294,9 @@ ShaderKey key(GetShaderTextureType(params.src), renderPassDesc.numColorAttachmen
+     ANGLE_TRY(ensureShadersInitialized(contextMtl, key, fragmentShader));
+ 
+     return contextMtl->getPipelineCache().getRenderPipeline(
+-        contextMtl, mVertexShader, *fragmentShader, pipelineDesc, outPipelineState);
++        contextMtl,
++        renderPassDesc.renderTargetArrayLength > 1 ? mLayeredVertexShader : mVertexShader,
++        *fragmentShader, pipelineDesc, outPipelineState);
+ }
+ 
+ angle::Result ColorBlitUtils::setupColorBlitWithDraw(const gl::Context *context,
+@@ -1332,6 +1369,14 @@ ShaderKey key(GetShaderTextureType(params.src), renderPassDesc.numColorAttachmen
+             mVertexShader = angle::adoptObjCPtr([shaderLib newFunctionWithName:@"blitVS"]);
+             ANGLE_CHECK(ctx, mVertexShader, gl::err::kInternalError, GL_INVALID_OPERATION);
+         }
++        if (!mLayeredVertexShader)
++        {
++            // Klepton: OVR_multiview — see blitLayeredVS in shaders/blit.metal.
++            id<MTLLibrary> shaderLib = ctx->getDisplay()->getDefaultShadersLib();
++            mLayeredVertexShader =
++                angle::adoptObjCPtr([shaderLib newFunctionWithName:@"blitLayeredVS"]);
++            ANGLE_CHECK(ctx, mLayeredVertexShader, gl::err::kInternalError, GL_INVALID_OPERATION);
++        }
+ 
+         if (!(*fragmentShaderOut))
+         {
+@@ -1448,7 +1493,9 @@ ShaderKey key(GetShaderTextureType(params.src), renderPassDesc.numColorAttachmen
+         ensureShadersInitialized(contextMtl, depthTextureType, stencilTextureType, fragmentShader));
+ 
+     return contextMtl->getPipelineCache().getRenderPipeline(
+-        contextMtl, mVertexShader, *fragmentShader, pipelineDesc, outRenderPipelineState);
++        contextMtl,
++        renderPassDesc.renderTargetArrayLength > 1 ? mLayeredVertexShader : mVertexShader,
++        *fragmentShader, pipelineDesc, outRenderPipelineState);
+ }
+ 
+ angle::Result DepthStencilBlitUtils::setupDepthStencilBlitWithDraw(
+diff --git a/src/libANGLE/renderer/metal/mtl_resources.h b/src/libANGLE/renderer/metal/mtl_resources.h
+index 8916375..ccdd1f5 100644
+--- a/src/libANGLE/renderer/metal/mtl_resources.h
++++ b/src/libANGLE/renderer/metal/mtl_resources.h
+@@ -181,6 +181,19 @@ class Texture final : public Resource,
+                                                    uint32_t samples,
+                                                    TextureRef *refOut);
+ 
++    // Klepton: OVR_multiview_multisampled_render_to_texture. The multisampled
++    // side of a LAYERED pass: one slice per view, resolved into the array
++    // texture's slices when the pass ends. Memoryless where the pass never has
++    // to be reopened; otherwise the samples are kept (see TextureMtl).
++    static angle::Result Make2DMSArrayTexture(ContextMtl *context,
++                                              const Format &format,
++                                              uint32_t width,
++                                              uint32_t height,
++                                              uint32_t samples,
++                                              uint32_t arrayLength,
++                                              bool memoryLess,
++                                              TextureRef *refOut);
++
+     static angle::Result MakeCubeTexture(ContextMtl *context,
+                                          const Format &format,
+                                          uint32_t size,
+diff --git a/src/libANGLE/renderer/metal/mtl_resources.mm b/src/libANGLE/renderer/metal/mtl_resources.mm
+index fcd258b..d1c6c63 100644
+--- a/src/libANGLE/renderer/metal/mtl_resources.mm
++++ b/src/libANGLE/renderer/metal/mtl_resources.mm
+@@ -193,6 +193,33 @@ MTLResourceOptions resourceOptionsForStorageMode(MTLStorageMode storageMode)
+     }  // ANGLE_MTL_OBJC_SCOPE
+ }
+ /** static */
++angle::Result Texture::Make2DMSArrayTexture(ContextMtl *context,
++                                            const Format &format,
++                                            uint32_t width,
++                                            uint32_t height,
++                                            uint32_t samples,
++                                            uint32_t arrayLength,
++                                            bool memoryLess,
++                                            TextureRef *refOut)
++{
++    ANGLE_MTL_OBJC_SCOPE
++    {
++        MTLTextureDescriptor *desc =
++            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format.metalFormat
++                                                               width:width
++                                                              height:height
++                                                           mipmapped:NO];
++        desc.textureType = MTLTextureType2DMultisampleArray;
++        desc.sampleCount = samples;
++        desc.arrayLength = arrayLength;
++
++        // Kept samples of a packed depth-stencil format need the stencil view,
++        // which memoryless ones never do.
++        return MakeTexture(context, format, desc, 1, /*renderTargetOnly=*/true,
++                           /*allowFormatView=*/!memoryLess, memoryLess, refOut);
++    }  // ANGLE_MTL_OBJC_SCOPE
++}
++/** static */
+ angle::Result Texture::MakeCubeTexture(ContextMtl *context,
+                                        const Format &format,
+                                        uint32_t size,
+@@ -447,7 +474,8 @@ bool needMultisampleColorFormatShaderReadWorkaround(ContextMtl *context, MTLText
+             mShouldNotLoadStore = true;
+         }
+         else if (context->getNativeFormatCaps(desc.pixelFormat).depthRenderable ||
+-                 desc.textureType == MTLTextureType2DMultisample)
++                 desc.textureType == MTLTextureType2DMultisample ||
++                 desc.textureType == MTLTextureType2DMultisampleArray)
+         {
+             // Metal doesn't support host access to depth stencil texture's data
+             desc.resourceOptions = MTLResourceStorageModePrivate;
 diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.h b/src/libANGLE/renderer/metal/mtl_state_cache.h
-index 329402d..f010383 100644
+index 329402d..95b5727 100644
 --- a/src/libANGLE/renderer/metal/mtl_state_cache.h
 +++ b/src/libANGLE/renderer/metal/mtl_state_cache.h
 @@ -15,6 +15,7 @@
@@ -679,10 +1534,13 @@ index 329402d..f010383 100644
  #include "common/hash_utils.h"
  #include "common/unsafe_buffers.h"
  #include "libANGLE/State.h"
-@@ -743,6 +744,28 @@ struct RenderPassDesc
+@@ -743,6 +744,31 @@ struct RenderPassDesc
      uint32_t rasterSampleCount   = 1;
      uint32_t defaultWidth        = 0;
      uint32_t defaultHeight       = 0;
++    // Klepton: OVR_multiview. Non-zero makes this a LAYERED pass over that many
++    // slices of its (array) attachments; the vertex stage picks the slice.
++    uint32_t renderTargetArrayLength = 0;
 +
 +    // Klepton: variable rasterization rate. OWNING, and it has to be.
 +    //
@@ -709,13 +1567,18 @@ index 329402d..f010383 100644
  
  }  // namespace mtl
 diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.mm b/src/libANGLE/renderer/metal/mtl_state_cache.mm
-index ec81f97..39b8d35 100644
+index ec81f97..3eaa620 100644
 --- a/src/libANGLE/renderer/metal/mtl_state_cache.mm
 +++ b/src/libANGLE/renderer/metal/mtl_state_cache.mm
-@@ -580,6 +580,14 @@ bool RenderPassDesc::equalIgnoreLoadStoreOptions(const RenderPassDesc &other) co
+@@ -580,6 +580,19 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
          return false;
      }
  
++    if (renderTargetArrayLength != other.renderTargetArrayLength)
++    {
++        return false;
++    }
++
 +    // Klepton: a rate map change is a render pass change. It cannot be set on an
 +    // encoder after the fact, so an in-flight pass has to be ended and restarted
 +    // — which is exactly what a false here causes.
@@ -727,20 +1590,24 @@ index ec81f97..39b8d35 100644
      return depthAttachment.equalIgnoreLoadStoreOptions(other.depthAttachment) &&
             stencilAttachment.equalIgnoreLoadStoreOptions(other.stencilAttachment);
  }
-@@ -600,7 +608,8 @@ bool RenderPassDesc::operator==(const RenderPassDesc &other) const
+@@ -600,7 +613,9 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
      }
      return depthAttachment == other.depthAttachment &&
             stencilAttachment == other.stencilAttachment && defaultWidth == other.defaultWidth &&
 -           defaultHeight == other.defaultHeight && rasterSampleCount == other.rasterSampleCount;
 +           defaultHeight == other.defaultHeight && rasterSampleCount == other.rasterSampleCount &&
++           renderTargetArrayLength == other.renderTargetArrayLength &&
 +           rasterizationRateMap == other.rasterizationRateMap;
  }
  
  // Convert to Metal object
-@@ -627,6 +636,19 @@ void RenderPassDesc::convertToMetalDesc(MTLRenderPassDescriptor *objCDesc,
+@@ -627,6 +642,22 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
      ToObjC(depthAttachment, objCDesc.depthAttachment);
      ToObjC(stencilAttachment, objCDesc.stencilAttachment);
  
++    // Klepton: OVR_multiview — a layered pass. Zero is Metal's "not layered".
++    objCDesc.renderTargetArrayLength = renderTargetArrayLength;
++
 +    // Klepton: variable rasterization rate. Metal then rasterizes into the
 +    // (smaller) physical region of the attachment while the viewport, the
 +    // scissor and every screen-space coordinate stay in the map's SCREEN space —
@@ -758,10 +1625,10 @@ index ec81f97..39b8d35 100644
      {
          objCDesc.renderTargetWidth        = defaultWidth;
 diff --git a/src/libANGLE/renderer/metal/shaders/blit.metal b/src/libANGLE/renderer/metal/shaders/blit.metal
-index c8dfd29..abbce55 100644
+index c8dfd29..7121ae2 100644
 --- a/src/libANGLE/renderer/metal/shaders/blit.metal
 +++ b/src/libANGLE/renderer/metal/shaders/blit.metal
-@@ -34,7 +34,11 @@ struct BlitParams
+@@ -34,7 +34,17 @@ struct BlitParams
      int srcLevel;  // Source texture level.
      int srcLayer;  // Source texture layer.
      bool dstLuminance;  // destination texture is luminance. Unused by depth & stencil blitting.
@@ -770,11 +1637,62 @@ index c8dfd29..abbce55 100644
 +    // this blit must copy physical texel to physical texel rather than resample
 +    // through screen space. See blitSourceCoords below.
 +    bool physicalPassthrough;
-+    uint8_t padding[6];
++    // Klepton: which slice of a LAYERED pass this blit draws into (blitLayeredVS).
++    uint8_t dstLayer;
++    uint8_t padding[5];
++    // Klepton: 1 / the source texture's size, for the passthrough of an array,
++    // depth or stencil source (blitTexCoords).
++    float2 invPhysicalSize;
++    float2 padding2;
  };
  
  struct BlitVSOut
-@@ -62,10 +66,38 @@ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
+@@ -43,6 +53,14 @@ struct BlitVSOut
+     float2 texCoords [[center_no_perspective, user(locn1)]];
+ };
+ 
++// Klepton: the texture coordinates a source is sampled at. Under a physical
++// passthrough that is this fragment's own physical texel — its position over
++// the texture's size — instead of the interpolated screen-space coordinates.
++static inline float2 blitTexCoords(float2 texCoords, float4 position, constant BlitParams &options)
++{
++    return options.physicalPassthrough ? position.xy * options.invPhysicalSize : texCoords;
++}
++
+ vertex BlitVSOut blitVS(unsigned int vid [[vertex_id]], constant BlitParams &options [[buffer(0)]])
+ {
+     BlitVSOut output;
+@@ -53,6 +71,29 @@ vertex BlitVSOut blitVS(unsigned int vid [[vertex_id]], constant BlitParams &opt
+     return output;
+ }
+ 
++// Klepton: the same quad into ONE slice of a layered pass (OVR_multiview). Without
++// [[render_target_array_index]] a draw in such a pass lands in slice 0 only; the
++// restore of a multisampled multiview target draws once per view with this.
++struct BlitLayeredVSOut
++{
++    float4 position [[position]];
++    float2 texCoords [[center_no_perspective, user(locn1)]];
++    uint layer [[render_target_array_index]];
++};
++
++vertex BlitLayeredVSOut blitLayeredVS(unsigned int vid [[vertex_id]],
++                                      constant BlitParams &options [[buffer(0)]])
++{
++    BlitLayeredVSOut output;
++    output.position.xy = select(float2(-1.0f), float2(1.0f), bool2(vid & uint2(2, 1)));
++    output.position.zw = float2(0.0, 1.0);
++    output.texCoords =
++        select(options.srcTexCoords.xy, options.srcTexCoords.zw, bool2(vid & uint2(2, 1)));
++    output.layer = options.dstLayer;
++
++    return output;
++}
++
+ template <typename SrcTexture2d>
+ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
+ {
+@@ -62,10 +103,38 @@ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
      return coords;
  }
  
@@ -815,7 +1733,7 @@ index c8dfd29..abbce55 100644
      return resolveTextureMS(srcTexture, coords);
  }
  
-@@ -106,14 +138,28 @@ static inline vec<T, 4> blitReadTexture(BLIT_COLOR_FS_PARAMS(T))
+@@ -106,14 +175,29 @@ static inline vec<T, 4> blitReadTexture(BLIT_COLOR_FS_PARAMS(T))
      switch (kSourceTextureType)
      {
          case kTextureType2D:
@@ -836,8 +1754,11 @@ index c8dfd29..abbce55 100644
 +            }
              break;
          case kTextureType2DArray:
-             output = srcTexture2dArray.sample(textureSampler, input.texCoords, options.srcLayer,
-                                               level(options.srcLevel));
+-            output = srcTexture2dArray.sample(textureSampler, input.texCoords, options.srcLayer,
+-                                              level(options.srcLevel));
++            output = srcTexture2dArray.sample(
++                textureSampler, blitTexCoords(input.texCoords, input.position, options),
++                options.srcLayer, level(options.srcLevel));
              break;
          case kTextureType2DMultisample:
 -            output = blitSampleTextureMS(srcTexture2dMS, input.texCoords);
@@ -846,21 +1767,123 @@ index c8dfd29..abbce55 100644
              break;
          case kTextureTypeCube:
              output = srcTextureCube.sample(textureSampler,
+@@ -234,7 +318,7 @@ fragment FragmentDepthOut blitDepthFS(BlitVSOut input [[stage_in]],
+     FragmentDepthOut re;
+ 
+     re.depth = sampleDepth(srcTexture2d, srcTexture2dArray, srcTexture2dMS, srcTextureCube,
+-                           input.texCoords, options);
++                           blitTexCoords(input.texCoords, input.position, options), options);
+ 
+     return re;
+ }
+@@ -354,7 +438,7 @@ fragment FragmentStencilOut blitStencilFS(
+     FragmentStencilOut re;
+ 
+     re.stencil = sampleStencil(srcTexture2d, srcTexture2dArray, srcTexture2dMS, srcTextureCube,
+-                               input.texCoords, options.srcLevel, options.srcLayer);
++                               blitTexCoords(input.texCoords, input.position, options), options.srcLevel, options.srcLayer);
+ 
+     return re;
+ }
+@@ -385,10 +469,10 @@ fragment FragmentDepthStencilOut blitDepthStencilFS(
+     FragmentDepthStencilOut re;
+ 
+     re.depth = sampleDepth(srcDepthTexture2d, srcDepthTexture2dArray, srcDepthTexture2dMS,
+-                           srcDepthTextureCube, input.texCoords, options);
++                           srcDepthTextureCube, blitTexCoords(input.texCoords, input.position, options), options);
+     re.stencil =
+         sampleStencil(srcStencilTexture2d, srcStencilTexture2dArray, srcStencilTexture2dMS,
+-                      srcStencilTextureCube, input.texCoords, options.srcLevel, options.srcLayer);
++                      srcStencilTextureCube, blitTexCoords(input.texCoords, input.position, options), options.srcLevel, options.srcLayer);
+     return re;
+ }
+ @@#endif  // __METAL_VERSION__ >= 210
+diff --git a/src/libANGLE/renderer/metal/shaders/clear.metal b/src/libANGLE/renderer/metal/shaders/clear.metal
+index aec1601..544bfc8 100644
+--- a/src/libANGLE/renderer/metal/shaders/clear.metal
++++ b/src/libANGLE/renderer/metal/shaders/clear.metal
+@@ -21,6 +21,29 @@ vertex float4 clearVS(unsigned int vid [[ vertex_id ]],
+     return float4(gCorners[vid], clearParams.clearDepth, 1.0);
+ }
+ 
++// Klepton: OVR_multiview. A clear that has to be DRAWN (scissored, masked, or
++// in the middle of a pass) must reach every view of a layered pass, and a
++// vertex function that does not write the slice lands in slice 0 only — id
++// Tech 4's per-light stencil clears then cleared the left eye and left the
++// right eye's stencil from the previous light. The render encoder already
++// draws this quad once per view (RenderCommandEncoder::mViewCount), so the
++// instance id IS the view.
++struct ClearLayeredVSOut
++{
++    float4 position [[position]];
++    uint layer [[render_target_array_index]];
++};
++
++vertex ClearLayeredVSOut clearLayeredVS(unsigned int vid [[ vertex_id ]],
++                                        unsigned int iid [[ instance_id ]],
++                                        constant ClearParams &clearParams [[buffer(0)]])
++{
++    ClearLayeredVSOut out;
++    out.position = float4(gCorners[vid], clearParams.clearDepth, 1.0);
++    out.layer    = iid;
++    return out;
++}
++
+ fragment MultipleColorOutputs<float> clearFloatFS(constant ClearParams &clearParams [[buffer(0)]])
+ {
+     return toMultipleColorOutputs(clearParams.clearColor);
 diff --git a/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_autogen.metal b/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_autogen.metal
-index c1b0128..4f75696 100644
+index c1b0128..752c390 100644
 --- a/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_autogen.metal
 +++ b/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_autogen.metal
-@@ -251,7 +251,8 @@ struct BlitParams
+@@ -251,13 +251,21 @@ struct BlitParams
      int srcLevel;
      int srcLayer;
      bool dstLuminance;
 -    uint8_t padding[7];
 +    bool physicalPassthrough;
-+    uint8_t padding[6];
++    uint8_t dstLayer;
++    uint8_t padding[5];
++    float2 invPhysicalSize;
++    float2 padding2;
  };
  struct BlitVSOut
  {
-@@ -273,10 +274,25 @@ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
+     float4 position [[position]];
+     float2 texCoords [[center_no_perspective, user(locn1)]];
+ };
++static inline float2 blitTexCoords(float2 texCoords, float4 position, constant BlitParams &options)
++{
++    return options.physicalPassthrough ? position.xy * options.invPhysicalSize : texCoords;
++}
+ vertex BlitVSOut blitVS(unsigned int vid [[vertex_id]], constant BlitParams &options [[buffer(0)]])
+ {
+     BlitVSOut output;
+@@ -266,6 +274,23 @@ vertex BlitVSOut blitVS(unsigned int vid [[vertex_id]], constant BlitParams &opt
+     output.texCoords = select(options.srcTexCoords.xy, options.srcTexCoords.zw, bool2(vid & uint2(2, 1)));
+     return output;
+ }
++struct BlitLayeredVSOut
++{
++    float4 position [[position]];
++    float2 texCoords [[center_no_perspective, user(locn1)]];
++    uint layer [[render_target_array_index]];
++};
++vertex BlitLayeredVSOut blitLayeredVS(unsigned int vid [[vertex_id]],
++                                      constant BlitParams &options [[buffer(0)]])
++{
++    BlitLayeredVSOut output;
++    output.position.xy = select(float2(-1.0f), float2(1.0f), bool2(vid & uint2(2, 1)));
++    output.position.zw = float2(0.0, 1.0);
++    output.texCoords =
++        select(options.srcTexCoords.xy, options.srcTexCoords.zw, bool2(vid & uint2(2, 1)));
++    output.layer = options.dstLayer;
++    return output;
++}
+ template <typename SrcTexture2d>
+ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
+ {
+@@ -273,10 +298,25 @@ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
      uint2 coords = uint2(texCoords * float2(dimens));
      return coords;
  }
@@ -888,7 +1911,7 @@ index c1b0128..4f75696 100644
      return resolveTextureMS(srcTexture, coords);
  }
  template <typename T>
-@@ -296,14 +312,25 @@ static inline vec<T, 4> blitReadTexture(BlitVSOut input [[stage_in]], texture2d<
+@@ -296,14 +336,26 @@ static inline vec<T, 4> blitReadTexture(BlitVSOut input [[stage_in]], texture2d<
      switch (kSourceTextureType)
      {
          case kTextureType2D:
@@ -906,8 +1929,11 @@ index c1b0128..4f75696 100644
 +            }
              break;
          case kTextureType2DArray:
-             output = srcTexture2dArray.sample(textureSampler, input.texCoords, options.srcLayer,
-                                               level(options.srcLevel));
+-            output = srcTexture2dArray.sample(textureSampler, input.texCoords, options.srcLayer,
+-                                              level(options.srcLevel));
++            output = srcTexture2dArray.sample(
++                textureSampler, blitTexCoords(input.texCoords, input.position, options),
++                options.srcLayer, level(options.srcLevel));
              break;
          case kTextureType2DMultisample:
 -            output = blitSampleTextureMS(srcTexture2dMS, input.texCoords);
@@ -916,8 +1942,60 @@ index c1b0128..4f75696 100644
              break;
          case kTextureTypeCube:
              output = srcTextureCube.sample(textureSampler,
+@@ -407,7 +459,7 @@ fragment FragmentDepthOut blitDepthFS(BlitVSOut input [[stage_in]],
+ {
+     FragmentDepthOut re;
+     re.depth = sampleDepth(srcTexture2d, srcTexture2dArray, srcTexture2dMS, srcTextureCube,
+-                           input.texCoords, options);
++                           blitTexCoords(input.texCoords, input.position, options), options);
+     return re;
+ }
+ static inline uint32_t sampleStencil(
+@@ -507,7 +559,7 @@ fragment FragmentStencilOut blitStencilFS(
+ {
+     FragmentStencilOut re;
+     re.stencil = sampleStencil(srcTexture2d, srcTexture2dArray, srcTexture2dMS, srcTextureCube,
+-                               input.texCoords, options.srcLevel, options.srcLayer);
++                               blitTexCoords(input.texCoords, input.position, options), options.srcLevel, options.srcLayer);
+     return re;
+ }
+ fragment FragmentDepthStencilOut blitDepthStencilFS(
+@@ -531,10 +583,10 @@ fragment FragmentDepthStencilOut blitDepthStencilFS(
+ {
+     FragmentDepthStencilOut re;
+     re.depth = sampleDepth(srcDepthTexture2d, srcDepthTexture2dArray, srcDepthTexture2dMS,
+-                           srcDepthTextureCube, input.texCoords, options);
++                           srcDepthTextureCube, blitTexCoords(input.texCoords, input.position, options), options);
+     re.stencil =
+         sampleStencil(srcStencilTexture2d, srcStencilTexture2dArray, srcStencilTexture2dMS,
+-                      srcStencilTextureCube, input.texCoords, options.srcLevel, options.srcLayer);
++                      srcStencilTextureCube, blitTexCoords(input.texCoords, input.position, options), options.srcLevel, options.srcLayer);
+     return re;
+ }
+ #endif
+@@ -549,6 +601,20 @@ vertex float4 clearVS(unsigned int vid [[ vertex_id ]],
+ {
+     return float4(gCorners[vid], clearParams.clearDepth, 1.0);
+ }
++struct ClearLayeredVSOut
++{
++    float4 position [[position]];
++    uint layer [[render_target_array_index]];
++};
++vertex ClearLayeredVSOut clearLayeredVS(unsigned int vid [[ vertex_id ]],
++                                        unsigned int iid [[ instance_id ]],
++                                        constant ClearParams &clearParams [[buffer(0)]])
++{
++    ClearLayeredVSOut out;
++    out.position = float4(gCorners[vid], clearParams.clearDepth, 1.0);
++    out.layer = iid;
++    return out;
++}
+ fragment MultipleColorOutputs<float> clearFloatFS(constant ClearParams &clearParams [[buffer(0)]])
+ {
+     return toMultipleColorOutputs(clearParams.clearColor);
 diff --git a/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_src_autogen.h b/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_src_autogen.h
-index 3d70820..b9edac8 100644
+index 3d70820..c901602 100644
 --- a/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_src_autogen.h
 +++ b/src/libANGLE/renderer/metal/shaders/mtl_internal_shaders_src_autogen.h
 @@ -8,6 +8,8 @@
@@ -929,17 +2007,54 @@ index 3d70820..b9edac8 100644
  static char gDefaultMetallibSrc[] = R"(
  # include <simd/simd.h>
  # include <metal_stdlib>
-@@ -252,7 +254,8 @@ struct BlitParams
+@@ -252,13 +254,21 @@ struct BlitParams
      int srcLevel;
      int srcLayer;
      bool dstLuminance;
 -    uint8_t padding[7];
 +    bool physicalPassthrough;
-+    uint8_t padding[6];
++    uint8_t dstLayer;
++    uint8_t padding[5];
++    float2 invPhysicalSize;
++    float2 padding2;
  };
  struct BlitVSOut
  {
-@@ -274,10 +277,25 @@ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
+     float4 position [[position]];
+     float2 texCoords [[center_no_perspective, user(locn1)]];
+ };
++static inline float2 blitTexCoords(float2 texCoords, float4 position, constant BlitParams &options)
++{
++    return options.physicalPassthrough ? position.xy * options.invPhysicalSize : texCoords;
++}
+ vertex BlitVSOut blitVS(unsigned int vid [[vertex_id]], constant BlitParams &options [[buffer(0)]])
+ {
+     BlitVSOut output;
+@@ -267,6 +277,23 @@ vertex BlitVSOut blitVS(unsigned int vid [[vertex_id]], constant BlitParams &opt
+     output.texCoords = select(options.srcTexCoords.xy, options.srcTexCoords.zw, bool2(vid & uint2(2, 1)));
+     return output;
+ }
++struct BlitLayeredVSOut
++{
++    float4 position [[position]];
++    float2 texCoords [[center_no_perspective, user(locn1)]];
++    uint layer [[render_target_array_index]];
++};
++vertex BlitLayeredVSOut blitLayeredVS(unsigned int vid [[vertex_id]],
++                                      constant BlitParams &options [[buffer(0)]])
++{
++    BlitLayeredVSOut output;
++    output.position.xy = select(float2(-1.0f), float2(1.0f), bool2(vid & uint2(2, 1)));
++    output.position.zw = float2(0.0, 1.0);
++    output.texCoords =
++        select(options.srcTexCoords.xy, options.srcTexCoords.zw, bool2(vid & uint2(2, 1)));
++    output.layer = options.dstLayer;
++    return output;
++}
+ template <typename SrcTexture2d>
+ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
+ {
+@@ -274,10 +301,25 @@ static uint2 getImageCoords(SrcTexture2d srcTexture, float2 texCoords)
      uint2 coords = uint2(texCoords * float2(dimens));
      return coords;
  }
@@ -967,7 +2082,7 @@ index 3d70820..b9edac8 100644
      return resolveTextureMS(srcTexture, coords);
  }
  template <typename T>
-@@ -297,14 +315,25 @@ static inline vec<T, 4> blitReadTexture(BlitVSOut input [[stage_in]], texture2d<
+@@ -297,14 +339,26 @@ static inline vec<T, 4> blitReadTexture(BlitVSOut input [[stage_in]], texture2d<
      switch (kSourceTextureType)
      {
          case kTextureType2D:
@@ -985,8 +2100,11 @@ index 3d70820..b9edac8 100644
 +            }
              break;
          case kTextureType2DArray:
-             output = srcTexture2dArray.sample(textureSampler, input.texCoords, options.srcLayer,
-                                               level(options.srcLevel));
+-            output = srcTexture2dArray.sample(textureSampler, input.texCoords, options.srcLayer,
+-                                              level(options.srcLevel));
++            output = srcTexture2dArray.sample(
++                textureSampler, blitTexCoords(input.texCoords, input.position, options),
++                options.srcLayer, level(options.srcLevel));
              break;
          case kTextureType2DMultisample:
 -            output = blitSampleTextureMS(srcTexture2dMS, input.texCoords);
@@ -995,3 +2113,55 @@ index 3d70820..b9edac8 100644
              break;
          case kTextureTypeCube:
              output = srcTextureCube.sample(textureSampler,
+@@ -408,7 +462,7 @@ fragment FragmentDepthOut blitDepthFS(BlitVSOut input [[stage_in]],
+ {
+     FragmentDepthOut re;
+     re.depth = sampleDepth(srcTexture2d, srcTexture2dArray, srcTexture2dMS, srcTextureCube,
+-                           input.texCoords, options);
++                           blitTexCoords(input.texCoords, input.position, options), options);
+     return re;
+ }
+ static inline uint32_t sampleStencil(
+@@ -508,7 +562,7 @@ fragment FragmentStencilOut blitStencilFS(
+ {
+     FragmentStencilOut re;
+     re.stencil = sampleStencil(srcTexture2d, srcTexture2dArray, srcTexture2dMS, srcTextureCube,
+-                               input.texCoords, options.srcLevel, options.srcLayer);
++                               blitTexCoords(input.texCoords, input.position, options), options.srcLevel, options.srcLayer);
+     return re;
+ }
+ fragment FragmentDepthStencilOut blitDepthStencilFS(
+@@ -532,10 +586,10 @@ fragment FragmentDepthStencilOut blitDepthStencilFS(
+ {
+     FragmentDepthStencilOut re;
+     re.depth = sampleDepth(srcDepthTexture2d, srcDepthTexture2dArray, srcDepthTexture2dMS,
+-                           srcDepthTextureCube, input.texCoords, options);
++                           srcDepthTextureCube, blitTexCoords(input.texCoords, input.position, options), options);
+     re.stencil =
+         sampleStencil(srcStencilTexture2d, srcStencilTexture2dArray, srcStencilTexture2dMS,
+-                      srcStencilTextureCube, input.texCoords, options.srcLevel, options.srcLayer);
++                      srcStencilTextureCube, blitTexCoords(input.texCoords, input.position, options), options.srcLevel, options.srcLayer);
+     return re;
+ }
+ #endif
+@@ -550,6 +604,20 @@ vertex float4 clearVS(unsigned int vid [[ vertex_id ]],
+ {
+     return float4(gCorners[vid], clearParams.clearDepth, 1.0);
+ }
++struct ClearLayeredVSOut
++{
++    float4 position [[position]];
++    uint layer [[render_target_array_index]];
++};
++vertex ClearLayeredVSOut clearLayeredVS(unsigned int vid [[ vertex_id ]],
++                                        unsigned int iid [[ instance_id ]],
++                                        constant ClearParams &clearParams [[buffer(0)]])
++{
++    ClearLayeredVSOut out;
++    out.position = float4(gCorners[vid], clearParams.clearDepth, 1.0);
++    out.layer = iid;
++    return out;
++}
+ fragment MultipleColorOutputs<float> clearFloatFS(constant ClearParams &clearParams [[buffer(0)]])
+ {
+     return toMultipleColorOutputs(clearParams.clearColor);

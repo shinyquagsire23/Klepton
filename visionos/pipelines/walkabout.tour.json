@@ -1,0 +1,17 @@
+{
+ "package": "com.MightyCoconut.WalkaboutMiniGolf",
+ "from_frame": 14000,
+ "load": "XRRig::LoadScene",
+ "frames_per_scene": 3000,
+ "names": "Mighty.Tester.MightyTestManager::coursesToTest",
+ "names_field": "SceneName",
+ "before": [
+  "Mighty.Homestar.HomestarManager::GoToBasement"
+ ],
+ "alarm_seconds": 14400,
+ "objects": {
+  "call": "Mighty.Homestar.HSLauncher::Launch",
+  "count": 36,
+  "then": "Mighty.Homestar.HomestarMenuUtility::ReturnToBasement"
+ }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "bsml",
+  "repository": "bsq-ports/Quest-BSML",
+  "tag": "v0.4.55",
+  "commit": "4987a88698becce955e44301fd4d573fc9180c2f",
+  "sha256": "c21267915d773dc48f225c44f50a2e94f57e5d98e8107bffb3275658c95656b1",
+  "modifiedFiles": [
+    "include/hooking.hpp"
+  ],
+  "scope": "Original BSML source, compiler-resolved read-only hook catalog; embedded And64 excluded in favor of imported signed backend. Not built or run yet."
+}

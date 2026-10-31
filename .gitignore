@@ -93,3 +93,40 @@ visionos/*.xcodeproj/
 # Python bytecode from visionos/targets.py, imported by gen_xcodeproj.py
 visionos/__pycache__/
 tools/__pycache__/
+
+# Per-game artwork is never part of this tree: an installer writes the icon and
+# the start picture from the owner's own copy of the game at build time.
+visionos/Assets.xcassets/AppIcon-*.solidimagestack/
+visionos/Assets.xcassets/StartHero-*.imageset/
+
+# Custom-song developer artifacts and owner-supplied game data
+/beatsaber140/
+/port-deps/toolchains/*
+!/port-deps/toolchains/ndk-lock.json
+/port-deps/sources/*
+!/port-deps/sources/*lock.json
+/port-results/*
+!/port-results/coremods/
+/port-results/coremods/*
+!/port-results/coremods/coremods-lock.json
+/visionos/Scotland2Metadata/
+*.obb
+*.ipa
+*.mobileprovision
+*.p12
+__pycache__/
+
+# Explicit local input links and builder-generated outputs
+/beatsaber140
+/vendor
+/vendor-moltenvk
+/build-input-receipt.json
+/.scotland2-avp-local.json
+
+# This nested public dependency pin is part of clean-source builds.
+!/port-deps/sources/capstone-qpm/
+/port-deps/sources/capstone-qpm/*
+!/port-deps/sources/capstone-qpm/lock.json
+
+# Prebuilt mods per game version (pack_avp_mods.py); the toolchain package carries them.
+/ports/scotland2/prebuilt/

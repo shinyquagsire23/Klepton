@@ -1,0 +1,5 @@
+<vertical child-expand-height='false' spacing='2' pad-top='2' vertical-fit='PreferredSize'>
+    <page-button on-click='list#PageUp' direction='Up' pref-width='30' pref-height='5'/>
+    <list id='list' select-cell='SettingsClick' list-style='Simple' list-width='30' visible-cells='6' anchor-pos-y='8'/>
+    <page-button on-click='list#PageDown' direction='Down' pref-width='30' pref-height='5'/>
+</vertical>

@@ -1,0 +1,12 @@
+{
+  "upstream": "https://github.com/sc2ad/scotland2",
+  "commit": "432f67bca61e822a87b27c001bddcd1061d25bf4",
+  "modifiedUpstreamFiles": [
+    "include/log.h",
+    "shared/loader.hpp",
+    "shared/modloader.h",
+    "src/modloader.cpp",
+    "src/loader.cpp"
+  ],
+  "notes": "Pinned source port. Current verified scope: see repository CUSTOM-SONGS.md; historical phase notes retained in other provenance records."
+}

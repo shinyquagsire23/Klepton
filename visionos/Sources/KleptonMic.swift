@@ -70,14 +70,18 @@ struct MicView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Microphone").font(.headline)
-            Text("Let a guest use the headset microphone — for example Steam "
-                 + "Link's voice chat. Off by default. Turning it on asks for "
-                 + "microphone permission and switches audio to play-and-record, "
-                 + "which lets the silent switch mute app audio.")
+            Text(klT("Microphone", "Mikrofon")).font(.headline)
+            Text(klT("Let the game use the headset microphone — for voice chat, such as Steam "
+                     + "Link's or the players' in a multiplayer room. Off by default. Turning it on asks for "
+                     + "microphone permission and switches audio to play-and-record, "
+                     + "which lets the silent switch mute app audio.",
+                     "Lässt das Spiel das Mikrofon der Brille benutzen – für den Sprachchat, etwa in Steam "
+                     + "Link oder mit den Mitspielern in einem Multiplayer-Raum. Standardmäßig aus. Beim Einschalten "
+                     + "fragt visionOS nach dem Mikrofon, und der Ton läuft dann über Wiedergabe und Aufnahme, "
+                     + "wodurch der Stummschalter den Ton der App stumm schalten kann."))
                 .font(.caption).foregroundStyle(.secondary)
 
-            Toggle("Allow microphone", isOn: $mic.settings.enabled)
+            Toggle(klT("Allow microphone", "Mikrofon erlauben"), isOn: $mic.settings.enabled)
 
             Text(KleptonMic.describe(mic.settings))
                 .font(.system(.caption2, design: .monospaced))

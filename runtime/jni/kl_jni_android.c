@@ -24,6 +24,7 @@
 #include "kl_ovrp.h"
 #include "kl_avdec.h"
 #include "kl_egl.h"
+#include "../guest/kl_mono.h"
 #include "kl_ndk.h"
 #include "kl_va.h"
 #include <zlib.h>
@@ -315,6 +316,17 @@ static klj_val klj_VRCInfo_getVersionCode(void *env, void *self, const klj_val *
     (void)env; (void)self; (void)a; (void)n;
     return klj_PackageInfo_versionCode();
 }
+// vros.os.VrosBuild.getSdkVersion() — the Horizon OS release a Quest runs, as a
+// number (v76 answers 76). The class is part of the OS image, not of any APK.
+// Beat Saber 1.45 reads it right after its analytics id request, once it has a
+// user; there was no entry and the run stopped here by name (on a Mac host,
+// 2026-10-12). One release is named rather than the newest: a guest may switch
+// on OS features by this number, and none of those exist here. KL_VROS_SDK
+// overrides.
+static klj_val klj_VrosBuild_getSdkVersion(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)kl_env_int("KL_VROS_SDK", 76)};
+}
 static klj_val klj_VRCInfo_getVersionName(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return klj_PackageInfo_versionName();
@@ -408,7 +420,7 @@ static klj_val klj_Intent_getExtras(void *env, void *self, const klj_val *a, int
             extras = klj_new_object_data("android/os/Bundle", kv);
             ((klj_object *)extras)->pinned = 1;   // host-held across frames
             for (int i = 0; i < k; i++)
-                KLJ_LOG("launch extra %s = \"%s\"", kv[i].key, kv[i].val);
+                KLJ_LOG("launch extra %s (%zu bytes)", kv[i].key, kv[i].val ? strlen(kv[i].val) : 0);
         }
     }
     return (klj_val){.l = extras};
@@ -418,7 +430,11 @@ static klj_val klj_Intent_init(void *env, void *clazz, const klj_val *a, int n) 
     (void)env; (void)clazz;
     const char *action = n > 0 ? klj_str(a[0].l) : NULL;
     void       *obj    = kl_jni_new_object("android/content/Intent");
+    if (!obj) return (klj_val){.l = NULL};
+    // Owned, as every other writer of an Intent's data is (setAction frees the
+    // old one): without it the action leaked when the object was recycled.
     klj_as_object(obj)->data = action ? strdup(action) : NULL;
+    klj_own(obj, free);
     KLJ_LOG("new Intent(\"%s\")", action ? action : "(null)");
     return (klj_val){.l = obj};
 }
@@ -521,9 +537,23 @@ static klj_val klj_Context_registerReceiver(void *env, void *self, const klj_val
     }
 
     void *obj = kl_jni_new_object("android/content/Intent");
+    if (!obj) return (klj_val){.l = NULL};
     klj_as_object(obj)->data = strdup(KLJ_ACTION_BATTERY);
     klj_own(obj, free);
     return (klj_val){.l = obj};
+}
+
+// ...and the other half of the pair, per the family rule: registerReceiver
+// above keeps nothing (nothing here broadcasts), so there is nothing to remove.
+// Bound because a guest that registers on resume unregisters on pause, and an
+// unimplemented call is fatal here.
+static klj_val klj_Context_unregisterReceiver(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static int said;
+    if (!said++)
+        KLJ_LOG("Context.unregisterReceiver() — nothing was ever registered to "
+                "unregister");
+    return (klj_val){.j = 0};
 }
 
 // Intent.getIntExtra(key, default). Only the battery Intent above carries any,
@@ -724,6 +754,24 @@ static klj_val klj_WebView_getSettings(void *env, void *self, const klj_val *a, 
     static void *settings;
     return klj_singleton("android/webkit/WebSettings", &settings);
 }
+// WebSettings.getDefaultUserAgent(Context) — static, and asked without a web
+// view: an HTTP client reads it for its own User-Agent header. Real VR Fishing
+// (x2582932495064035) asks, by its sender, and there was no answer (fix 37,
+// 2026-10-14; not run here). There is no browser engine here to name, so the
+// string says what Build.* already says — the Android release and the model,
+// read from the same table so the two cannot disagree — in the usual shape of
+// such a string, and claims no Chrome build.
+static klj_val klj_WebSettings_getDefaultUserAgent(void *env, void *self,
+                                                   const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    const char *rel = kl_jni_build_string("RELEASE"), *model = kl_jni_build_string("MODEL");
+    char ua[192];
+    snprintf(ua, sizeof ua, "Mozilla/5.0 (Linux; Android %s; %s) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Version/4.0 Mobile VR Safari/537.36",
+             rel ? rel : "10", model ? model : "Quest 2");
+    KLJ_LOG("WebSettings.getDefaultUserAgent() -> \"%s\"", ua);
+    return (klj_val){.l = kl_jni_new_string(ua)};
+}
 // draw(Canvas): the one call that would produce pixels. It does not, and it
 // says so once rather than every frame.
 static klj_val klj_WebView_draw(void *env, void *self, const klj_val *a, int n) {
@@ -772,32 +820,357 @@ static klj_val klj_false(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 0};
 }
-// Bitmap/Canvas: handles with no backing store, because nothing ever writes to
-// them. copyPixelsToBuffer therefore leaves the guest's buffer untouched —
-// which is the correct consequence of a WebView that drew nothing, not a
-// separate decision.
-static klj_val klj_Bitmap_createBitmap(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self;
-    KLJ_LOG("Bitmap.createBitmap(%d, %d) — handle only, no pixel store",
-            n > 0 ? (int)a[0].j : 0, n > 1 ? (int)a[1].j : 0);
-    static void *bmp;
-    return klj_singleton("android/graphics/Bitmap", &bmp);
-}
-static klj_val klj_BitmapConfig_valueOf(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
+// ARGB_8888 bitmaps need actual pixels for the game's custom cursor path.
+typedef struct { int width,height,recycled; uint32_t *pixels; } klj_bitmap;
+klj_val klj_BitmapConfig_argb8888(void) {
     static void *cfg;
     return klj_singleton("android/graphics/Bitmap$Config", &cfg);
 }
+static klj_bitmap *bitmap(void *self) {
+    klj_object *o=klj_as_object(self);
+    klj_bitmap *b=o && !strcmp(o->cls,"android/graphics/Bitmap") ? o->data : NULL;
+    if(b && b->recycled){klj_raise("java/lang/IllegalStateException","bitmap recycled");return NULL;}
+    return b;
+}
+static void bitmap_free(void *data){klj_bitmap *b=data;if(b){free(b->pixels);free(b);}}
+static int bitmap_region(klj_bitmap *b,int x,int y,int w,int h) {
+    return b && x>=0 && y>=0 && w>=0 && h>=0 && (int64_t)x+w<=b->width && (int64_t)y+h<=b->height;
+}
+static int bitmap_array_region(klj_array *ar,int offset,int stride,int w,int h) {
+    if(!ar || ar->kind!='I' || offset<0 || (int64_t)llabs((long long)stride)<w)return 0;
+    if(!w || !h)return offset<=ar->len;
+    int64_t last=(int64_t)offset+(int64_t)(h-1)*stride;
+    return (last<offset ? last : offset)>=0 && (last>offset ? last : offset)+w<=ar->len;
+}
+static klj_val klj_Bitmap_createBitmap(void *env, void *self, const klj_val *a, int n) {
+    (void)env;(void)self;
+    klj_array *ar=NULL;int offset=0,stride=0,w=0,h=0;void *cfg=NULL;
+    if(n==3){w=(int32_t)a[0].j;h=(int32_t)a[1].j;cfg=a[2].l;}
+    // Any other configuration, from a size alone: a handle with no pixel store,
+    // as every bitmap was before there were stores. That is what the callers
+    // that only ever hand a bitmap to a Canvas have always got.
+    if(n==3 && w>0 && h>0 && cfg!=klj_BitmapConfig_argb8888().l) {
+        KLJ_LOG("Bitmap.createBitmap(%d, %d) — not ARGB_8888: handle only, no pixel store",w,h);
+        static void *bmp;
+        return klj_singleton("android/graphics/Bitmap", &bmp);
+    }
+    else if(n==4){ar=klj_arr(a[0].l);w=(int32_t)a[1].j;h=(int32_t)a[2].j;stride=w;cfg=a[3].l;}
+    else if(n==6){ar=klj_arr(a[0].l);offset=(int32_t)a[1].j;stride=(int32_t)a[2].j;w=(int32_t)a[3].j;h=(int32_t)a[4].j;cfg=a[5].l;}
+    if(w<=0 || h<=0 || cfg!=klj_BitmapConfig_argb8888().l || (ar && !bitmap_array_region(ar,offset,stride,w,h)) || (n!=3 && !ar)) {
+        klj_raise("java/lang/IllegalArgumentException","invalid bitmap dimensions, pixels or config");return (klj_val){0};
+    }
+    if((uint64_t)w*h>INT32_MAX/4){klj_raise("java/lang/OutOfMemoryError","bitmap too large");return (klj_val){0};}
+    klj_bitmap *b=calloc(1,sizeof *b);if(!b)return (klj_val){0};
+    b->width=w;b->height=h;b->pixels=calloc((size_t)w*h,4);
+    if(!b->pixels){free(b);klj_raise("java/lang/OutOfMemoryError","bitmap pixels");return (klj_val){0};}
+    if(ar)for(int y=0;y<h;y++)memcpy(b->pixels+(size_t)y*w,(uint32_t *)ar->data+offset+(int64_t)y*stride,(size_t)w*4);
+    KLJ_LOG("Bitmap.createBitmap(%d,%d) with %s pixel store",w,h,ar ? "supplied" : "zeroed");
+    return (klj_val){.l=klj_own(klj_new_object_data("android/graphics/Bitmap",b),bitmap_free)};
+}
+static klj_val klj_BitmapConfig_valueOf(void *env, void *self, const klj_val *a, int n) {
+    (void)env;(void)self;
+    const char *name=n ? klj_str(a[0].l) : NULL;
+    if(name && !strcmp(name,"ARGB_8888"))return klj_BitmapConfig_argb8888();
+    // Every other configuration is one object that is not ARGB_8888: a bitmap
+    // made with it is a handle without pixels (see createBitmap).
+    static void *other;
+    return klj_singleton("android/graphics/Bitmap$Config", &other);
+}
+static klj_val bitmap_width(void *e,void *s,const klj_val *a,int n){(void)e;(void)a;(void)n;klj_bitmap *b=bitmap(s);return (klj_val){.j=b ? b->width : 0};}
+static klj_val bitmap_height(void *e,void *s,const klj_val *a,int n){(void)e;(void)a;(void)n;klj_bitmap *b=bitmap(s);return (klj_val){.j=b ? b->height : 0};}
+static klj_val bitmap_bytes(void *e,void *s,const klj_val *a,int n){(void)e;(void)a;(void)n;klj_bitmap *b=bitmap(s);return (klj_val){.j=b ? (uint64_t)b->width*b->height*4 : 0};}
+static klj_val bitmap_rowbytes(void *e,void *s,const klj_val *a,int n){(void)e;(void)a;(void)n;klj_bitmap *b=bitmap(s);return (klj_val){.j=b ? b->width*4 : 0};}
+static klj_val bitmap_getpixel(void *env,void *self,const klj_val *a,int n){
+    (void)env;klj_bitmap *b=bitmap(self);int x=n>0 ? (int32_t)a[0].j : -1,y=n>1 ? (int32_t)a[1].j : -1;
+    if(!bitmap_region(b,x,y,1,1)){klj_raise("java/lang/IllegalArgumentException","pixel outside bitmap");return (klj_val){0};}
+    return (klj_val){.j=(uint64_t)(int64_t)(int32_t)b->pixels[(size_t)y*b->width+x]};
+}
+static klj_val bitmap_getpixels(void *env,void *self,const klj_val *a,int n){
+    (void)env;klj_bitmap *b=bitmap(self);klj_array *ar=n ? klj_arr(a[0].l) : NULL;
+    int o=n>1?(int32_t)a[1].j:0,st=n>2?(int32_t)a[2].j:0,x=n>3?(int32_t)a[3].j:0,y=n>4?(int32_t)a[4].j:0,w=n>5?(int32_t)a[5].j:0,h=n>6?(int32_t)a[6].j:0;
+    if(n!=7 || !bitmap_region(b,x,y,w,h) || !bitmap_array_region(ar,o,st,w,h)){klj_raise("java/lang/IllegalArgumentException","invalid pixel region");return (klj_val){0};}
+    for(int row=0;row<h;row++)memcpy((uint32_t *)ar->data+o+(int64_t)row*st,b->pixels+(size_t)(row+y)*b->width+x,(size_t)w*4);
+    return (klj_val){0};
+}
+static klj_val bitmap_copybuffer(void *env,void *self,const klj_val *a,int n){
+    (void)env;klj_bitmap *b=bitmap(self);klj_direct_buffer *buffer=n ? klj_direct(a[0].l) : NULL;
+    size_t bytes=b ? (size_t)b->width*b->height*4 : 0;
+    // A handle without pixels, or a buffer that is not a direct one: the
+    // guest's buffer stays untouched, as it always did (a WebView that drew
+    // nothing). Only a store that exists is copied.
+    if(!b || !b->pixels || !buffer || buffer->capacity<(int64_t)bytes || !buffer->addr)return (klj_val){0};
+    uint8_t *out=buffer->addr;
+    // Android's native ARGB_8888 pixel storage is RGBA bytes, premultiplied.
+    for(size_t i=0;i<bytes/4;i++){uint32_t c=b->pixels[i],alpha=c>>24;out[4*i]=(((c>>16)&255)*alpha+127)/255;out[4*i+1]=(((c>>8)&255)*alpha+127)/255;out[4*i+2]=((c&255)*alpha+127)/255;out[4*i+3]=alpha;}
+    return (klj_val){0};
+}
+static klj_val bitmap_recycle(void *env,void *self,const klj_val *a,int n){(void)env;(void)a;(void)n;klj_object *o=klj_as_object(self);klj_bitmap *b=o ? o->data : NULL;if(b && !b->recycled){free(b->pixels);b->pixels=NULL;b->recycled=1;}return (klj_val){0};}
+static klj_val bitmap_isrecycled(void *env,void *self,const klj_val *a,int n){(void)env;(void)a;(void)n;klj_object *o=klj_as_object(self);klj_bitmap *b=o ? o->data : NULL;return (klj_val){.j=b ? b->recycled : 1};}
+
 static klj_val klj_Canvas_init(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     return (klj_val){.l = self};
 }
 
+// What an outgoing intent names — its data URI and its target package — kept
+// beside the Intent object (whose `data` already holds the action) for the
+// intent startActivity then receives. A few slots: an app builds one intent at a
+// time.
+#define KLJ_INTENT_SLOTS 8
+static struct { void *obj; char uri[1024]; char pkg[256]; } g_intent_out[KLJ_INTENT_SLOTS];
+static unsigned g_intent_next;
+static pthread_mutex_t g_intent_mu = PTHREAD_MUTEX_INITIALIZER;
+static void klj_intent_note(void *obj, const char *uri, const char *pkg) {
+    if (!obj) return;
+    pthread_mutex_lock(&g_intent_mu);
+    int i = 0;
+    for (; i < KLJ_INTENT_SLOTS; i++) if (g_intent_out[i].obj == obj) break;
+    if (i == KLJ_INTENT_SLOTS) {
+        i = (int)(g_intent_next++ % KLJ_INTENT_SLOTS);
+        g_intent_out[i].obj = obj; g_intent_out[i].uri[0] = g_intent_out[i].pkg[0] = 0;
+    }
+    if (uri) snprintf(g_intent_out[i].uri, sizeof g_intent_out[i].uri, "%s", uri);
+    if (pkg) snprintf(g_intent_out[i].pkg, sizeof g_intent_out[i].pkg, "%s", pkg);
+    pthread_mutex_unlock(&g_intent_mu);
+}
+// A URI as the log may show it: its scheme and host ("https://open.spotify.com",
+// "ovrweb://pwa"), or only its scheme for an opaque one ("mailto:"). Never the
+// path, query, user part or port: a link can carry a token or an account.
+static const char *klj_uri_brief(const char *uri, char *out, size_t cap) {
+    if (!uri || !*uri) return "(no data)";
+    size_t sl = strspn(uri, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-.");
+    if (sl == 0 || uri[sl] != ':') return "(not a URI)";
+    if (strncmp(uri + sl, "://", 3) != 0) {
+        snprintf(out, cap, "%.*s:", (int)sl, uri);
+        return out;
+    }
+    const char *auth = uri + sl + 3;
+    size_t al = strcspn(auth, "/?#");
+    const char *host = auth;
+    for (size_t i = 0; i < al; i++) if (auth[i] == '@') host = auth + i + 1;
+    // An IPv6 literal is "[...]" and has colons of its own: keep it whole, up
+    // to its bracket, and drop the port after it as for a name.
+    size_t hl;
+    if (*host == '[') {
+        const char *close = memchr(host, ']', al - (size_t)(host - auth));
+        hl = close ? (size_t)(close - host) + 1 : strcspn(host, "/?#");
+    } else {
+        hl = strcspn(host, ":/?#");
+    }
+    snprintf(out, cap, "%.*s://%.*s", (int)sl, uri, (int)hl, host);
+    return out;
+}
+// The string an android/net/Uri or ComponentName made below carries, or NULL for
+// anything else (Uri.EMPTY, the launch Intent's ComponentName, a stray pointer).
+static const char *klj_obj_str(void *p, const char *cls) {
+    klj_object *o = klj_as_object(p);
+    return (o && !strcmp(o->cls, cls)) ? (const char *)o->data : NULL;
+}
 static klj_val klj_Intent_setPackage(void *env, void *self, const klj_val *a, int n) {
     (void)env;
     const char *p = n > 0 ? klj_str(a[0].l) : NULL;
     KLJ_LOG("Intent.setPackage(\"%s\")", p ? p : "(null)");
+    klj_intent_note(self, NULL, p ? p : "");
     return (klj_val){.l = self};
+}
+// An explicit target: `new ComponentName(package, class)`, then
+// Intent.setComponent / setClassName. Only the package matters here (it is what
+// startActivity reports; DreamSpace's YouTube button goes this way, 2026-10-16),
+// so the object carries it.
+static klj_val klj_ComponentName_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *pkg = n > 0 ? klj_str(a[0].l) : NULL;
+    const char *cls = n > 1 ? klj_str(a[1].l) : NULL;
+    void *obj = kl_jni_new_object("android/content/ComponentName");
+    if (!obj) return (klj_val){.l = NULL};
+    klj_as_object(obj)->data = pkg ? strdup(pkg) : NULL;
+    klj_own(obj, free);
+    KLJ_LOG("new ComponentName(\"%s\", \"%s\")", pkg ? pkg : "(null)", cls ? cls : "(null)");
+    return (klj_val){.l = obj};
+}
+static klj_val klj_Intent_setComponent(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *pkg = n > 0 ? klj_obj_str(a[0].l, "android/content/ComponentName") : NULL;
+    KLJ_LOG("Intent.setComponent(%s)", pkg ? pkg : "(null)");
+    if (pkg) klj_intent_note(self, NULL, pkg);
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_setClassName(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *pkg = n > 0 ? klj_str(a[0].l) : NULL;
+    const char *cls = n > 1 ? klj_str(a[1].l) : NULL;
+    KLJ_LOG("Intent.setClassName(\"%s\", \"%s\")", pkg ? pkg : "(null)", cls ? cls : "(null)");
+    if (pkg) klj_intent_note(self, NULL, pkg);
+    return (klj_val){.l = self};
+}
+// Extras. A web address passed as one is taken as the page to open (a video
+// link, say); everything else is dropped, as nothing reads it back. Only the
+// key is logged, never the value.
+static klj_val klj_Intent_putExtraString(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *k = n > 0 ? klj_str(a[0].l) : NULL;
+    const char *v = n > 1 ? klj_str(a[1].l) : NULL;
+    KLJ_LOG("Intent.putExtra(\"%s\", <string>)", k ? k : "(null)");
+    if (v && (!strncmp(v, "https://", 8) || !strncmp(v, "http://", 7))) klj_intent_note(self, v, NULL);
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_putExtraScalar(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *k = n > 0 ? klj_str(a[0].l) : NULL;
+    KLJ_LOG("Intent.putExtra(\"%s\", <value>)", k ? k : "(null)");
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_setFlags(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    KLJ_LOG("Intent.setFlags(0x%llx)", n > 0 ? (unsigned long long)a[0].j : 0ULL);
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_setAction(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *s = n > 0 ? klj_str(a[0].l) : NULL;
+    klj_object *o = klj_as_object(self);
+    if (o) {
+        // An Intent's payload is its action, always ours on the heap (or none),
+        // so the one it replaces is freed and the new one goes with the object.
+        free(o->data);
+        o->data = s ? strdup(s) : NULL;   // what getAction reads
+        klj_own(self, free);
+    }
+    KLJ_LOG("Intent.setAction(\"%s\")", s ? s : "(null)");
+    return (klj_val){.l = self};
+}
+static klj_val klj_Intent_setData(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    const char *u = n > 0 ? klj_obj_str(a[0].l, "android/net/Uri") : NULL;
+    char brief[320];
+    KLJ_LOG("Intent.setData(%s)", u ? klj_uri_brief(u, brief, sizeof brief) : "(null)");
+    klj_intent_note(self, u ? u : "", NULL);
+    return (klj_val){.l = self};
+}
+// Uri.parse: an android/net/Uri carrying its string, which is all anything
+// here reads back (Intent.setData notes it).
+static klj_val klj_Uri_parse(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    const char *s = n > 0 ? klj_str(a[0].l) : NULL;
+    void *obj = kl_jni_new_object("android/net/Uri");
+    if (!obj) return (klj_val){.l = NULL};
+    klj_as_object(obj)->data = s ? strdup(s) : NULL;
+    klj_own(obj, free);
+    return (klj_val){.l = obj};
+}
+// There is no Android here to hand an intent to — no Meta browser, no Spotify,
+// no YouTube app. What CAN be honoured is a web page: an intent to VIEW one is
+// turned into an https URL and handed to the frontend, which opens it in a web
+// window of its own (kl_mono_request_open_url). Quest's own app links are
+// mapped to the web page of the same service — DreamSpace's Spotify button asks
+// the Meta browser for `ovrweb://pwa?packageName=com.spotify.horizon`. Anything
+// else does nothing and says so. (On Android an intent nobody can handle throws
+// ActivityNotFoundException; doing nothing is the gentler of the two for a guest
+// that does not catch it.)
+//   KL_JNI_OPEN_URL=0|1 — hand such a page to the frontend. Default 1 for
+//       DreamSpace (x9449316705178989), else 0: every other guest's intent is
+//       logged and refused, as before. Only what kl_mono_web_url allows is
+//       handed over.
+static int klj_open_url_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_JNI_OPEN_URL", t && !strcmp(t, "x9449316705178989"));
+    }
+    return on;
+}
+static const struct { const char *pkg, *url; } g_web_for_pkg[] = {
+    { "com.spotify.horizon",                       "https://open.spotify.com/" },
+    { "com.spotify.music",                         "https://open.spotify.com/" },
+    { "com.google.android.apps.youtube.vr.oculus", "https://www.youtube.com/" },
+    { "com.google.android.youtube",                "https://www.youtube.com/" },
+    { "com.youtube.horizon",                       "https://www.youtube.com/" },
+};
+static const char *klj_web_for_pkg(const char *p) {
+    if (!p || !*p) return NULL;
+    for (size_t i = 0; i < sizeof g_web_for_pkg / sizeof g_web_for_pkg[0]; i++)
+        if (!strcmp(p, g_web_for_pkg[i].pkg)) return g_web_for_pkg[i].url;
+    return NULL;
+}
+// A query parameter's value (no percent-decoding needed for the ones read here
+// except url=, which is decoded).
+static int klj_query_param(const char *uri, const char *key, char *out, size_t cap) {
+    const char *q = strchr(uri, '?');
+    size_t kl = strlen(key);
+    for (const char *p = q; p && *p; ) {
+        p++;
+        if (!strncmp(p, key, kl) && p[kl] == '=') {
+            const char *v = p + kl + 1;
+            size_t o = 0;
+            for (; *v && *v != '&' && o + 1 < cap; v++) {
+                if (*v == '%' && isxdigit((unsigned char)v[1]) && isxdigit((unsigned char)v[2])) {
+                    char h[3] = { v[1], v[2], 0 };
+                    out[o++] = (char)strtol(h, NULL, 16); v += 2;
+                } else out[o++] = *v;
+            }
+            out[o] = 0;
+            return o > 0;
+        }
+        p = strchr(p, '&');
+    }
+    return 0;
+}
+// The web address an intent names, before kl_mono_web_url's rule: its data
+// when it VIEWs an http(s) address, the url= (or the web page of the
+// packageName=) of an ovrweb:// link, or the web page of its target package.
+int kl_jni_intent_web(const char *act, const char *uri, const char *pkg,
+                      char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = 0;
+    uri = uri ? uri : "";
+    int view = act && !strcmp(act, "android.intent.action.VIEW");
+    if (view && (!strncmp(uri, "https://", 8) || !strncmp(uri, "http://", 7))) {
+        snprintf(out, cap, "%s", uri);
+    } else if (view && !strncmp(uri, "ovrweb://", 9)) {
+        char v[1024];
+        if (klj_query_param(uri, "url", v, sizeof v))
+            snprintf(out, cap, "%s", v);
+        else if (klj_query_param(uri, "packageName", v, sizeof v) && klj_web_for_pkg(v))
+            snprintf(out, cap, "%s", klj_web_for_pkg(v));
+    } else if (klj_web_for_pkg(pkg)) {
+        snprintf(out, cap, "%s", klj_web_for_pkg(pkg));
+    }
+    return out[0] != 0;
+}
+static klj_val klj_Context_startActivity(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    void *intent = n > 0 ? a[0].l : NULL;
+    const char *act = klj_obj_str(intent, "android/content/Intent");
+    char uri[1024] = "", pkg[256] = "";
+    pthread_mutex_lock(&g_intent_mu);
+    for (int i = 0; i < KLJ_INTENT_SLOTS; i++)
+        if (intent && g_intent_out[i].obj == intent) {
+            snprintf(uri, sizeof uri, "%s", g_intent_out[i].uri);
+            snprintf(pkg, sizeof pkg, "%s", g_intent_out[i].pkg);
+            g_intent_out[i].obj = NULL;   // started: a recycled object starts clean
+        }
+    pthread_mutex_unlock(&g_intent_mu);
+    char brief[320];
+    char web[2048], page[2048];
+    const char *why = NULL;
+    if (klj_open_url_on() && kl_jni_intent_web(act, uri, pkg, web, sizeof web)) {
+        char where[320];
+        if (kl_mono_web_url(web, page, sizeof page, 0, &why)) {
+            KLJ_LOG("startActivity(%s %s, package %s) -> opening %s in a web window",
+                    act ? act : "(null)", klj_uri_brief(uri, brief, sizeof brief),
+                    pkg[0] ? pkg : "-", klj_uri_brief(page, where, sizeof where));
+            kl_mono_request_open_url(page);
+        } else {
+            KLJ_LOG("startActivity(%s %s, package %s) — refused to open %s: %s",
+                    act ? act : "(null)", klj_uri_brief(uri, brief, sizeof brief),
+                    pkg[0] ? pkg : "-", klj_uri_brief(web, where, sizeof where), why);
+        }
+        return (klj_val){.j = 0};
+    }
+    KLJ_LOG("startActivity(%s %s, package %s) — refused: no other app to open on this host",
+            act ? act : "(null)", klj_uri_brief(uri, brief, sizeof brief), pkg[0] ? pkg : "-");
+    return (klj_val){.j = 0};
 }
 static klj_val klj_Intent_addFlags(void *env, void *self, const klj_val *a, int n) {
     (void)env;
@@ -830,6 +1203,133 @@ static klj_val klj_List_get(void *env, void *self, const klj_val *a, int n) {
     int         i = n > 0 ? (int)a[0].j : -1;
     if (!l || i < 0 || i >= l->count) return (klj_val){.l = NULL};
     return (klj_val){.l = l->items[i]};
+}
+
+// ---- a mutable java/util/HashMap ----
+// The List above is a view over contents WE chose. A HashMap is the opposite
+// case: the guest constructs an empty one and fills it — a crash reporter's tag
+// bag, an analytics context map — so this one needs storage of its own. Linear
+// scan over a growable vector of pairs, in the shape klj_pref_set already uses
+// for the same job: at the handful of entries these maps carry, hashing buys
+// nothing measurable and costs a second structure to keep coherent.
+//
+// Deliberately NOT bound to the java/util/Map family in kl_jni_prefs.c. That
+// one is a read-only view over a klj_pref_set, and it reads `data` without a
+// type check — passing a HashMap into Map.entrySet() would walk our pairs as
+// preferences. A guest that needs Map-typed access to one of these gets an
+// honest abort instead of a misread, and that seam can be built when something
+// actually asks for it.
+typedef struct { void *key, *val; } klj_map_pair;
+typedef struct { klj_map_pair *v; unsigned n, cap; } klj_map;
+
+static void klj_map_free(void *p) {
+    klj_map *m = p;
+    if (!m) return;
+    free(m->v);
+    free(m);
+}
+// The destructor doubles as the type tag, the way klj_locale_of does it: a
+// HashMap method reached on some other object's `data` returns empty rather
+// than reinterpreting whatever payload is there.
+static klj_map *klj_map_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return (o && o->destroy == klj_map_free) ? (klj_map *)o->data : NULL;
+}
+
+// A real equals(), not identity. The keys that arrive here are Strings, and two
+// distinct jstrings spelling the same text ARE one key in Java — comparing by
+// pointer would silently give the map two entries under that name and make
+// get() miss the one just put. Everything else falls back to identity, which is
+// exactly what java/lang/Object.equals does.
+static int klj_map_eq(void *a, void *b) {
+    if (a == b) return 1;
+    klj_object *x = klj_as_object(a), *y = klj_as_object(b);
+    if (!x || !y) return 0;
+    if (strcmp(x->cls, KLJ_CLASS_STRING) || strcmp(y->cls, KLJ_CLASS_STRING)) return 0;
+    return x->data && y->data && strcmp(x->data, y->data) == 0;
+}
+static klj_map_pair *klj_map_find(klj_map *m, void *key) {
+    for (unsigned i = 0; m && i < m->n; i++)
+        if (klj_map_eq(m->v[i].key, key)) return &m->v[i];
+    return NULL;
+}
+
+// HashMap(int) and HashMap(int,float) are the same map — initial capacity and
+// load factor are performance hints with nothing observable behind them, so all
+// three constructors land here. klj_class_name(clazz) rather than a literal, so
+// a sibling class that wants the same behaviour can bind this unchanged.
+static klj_val klj_HashMap_init(void *env, void *clazz, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    void       *obj = kl_jni_new_object(klj_class_name(clazz));
+    klj_object *o   = klj_as_object(obj);
+    o->data    = calloc(1, sizeof(klj_map));
+    o->destroy = klj_map_free;
+    return (klj_val){.l = obj};
+}
+
+// Stored keys and values are PINNED. A Java HashMap holds a strong reference,
+// and the jobjects arriving at put() are ordinarily locals — without the pin
+// the next PopLocalFrame retires them and a later get() hands back a pointer
+// whose magic is zero, which surfaces far away as "GetObjectClass on an
+// untagged pointer" (the failure klj_host_cache documents). Nothing here ever
+// unpins: a displaced value is handed straight back to the guest as put()'s
+// return, so dropping the map's pin at that moment is the one thing that could
+// retire an object the guest is about to read. These maps are small and live
+// for the process, so the retained slots are not worth the hazard.
+static klj_val klj_HashMap_put(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_map *m = klj_map_of(self);
+    if (!m || n < 2) return (klj_val){.l = NULL};
+    klj_map_pair *p = klj_map_find(m, a[0].l);
+    if (p) {
+        void *old = p->val;
+        p->val = klj_host_cache(a[1].l);
+        return (klj_val){.l = old};
+    }
+    if (m->n == m->cap) {
+        m->cap = m->cap ? m->cap * 2 : 8;
+        m->v   = realloc(m->v, m->cap * sizeof *m->v);
+    }
+    m->v[m->n].key = klj_host_cache(a[0].l);
+    m->v[m->n].val = klj_host_cache(a[1].l);
+    m->n++;
+    return (klj_val){.l = NULL};
+}
+static klj_val klj_HashMap_get(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_map_pair *p = n > 0 ? klj_map_find(klj_map_of(self), a[0].l) : NULL;
+    return (klj_val){.l = p ? p->val : NULL};
+}
+static klj_val klj_HashMap_containsKey(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    return (klj_val){.j = n > 0 && klj_map_find(klj_map_of(self), a[0].l) != NULL};
+}
+// Shift rather than swap-with-last: a LinkedHashMap binding this would need
+// insertion order, and at these sizes the memmove is free either way.
+static klj_val klj_HashMap_remove(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_map      *m = klj_map_of(self);
+    klj_map_pair *p = n > 0 ? klj_map_find(m, a[0].l) : NULL;
+    if (!p) return (klj_val){.l = NULL};
+    void     *old = p->val;
+    unsigned  i   = (unsigned)(p - m->v);
+    memmove(&m->v[i], &m->v[i + 1], (m->n - i - 1) * sizeof *m->v);
+    m->n--;
+    return (klj_val){.l = old};
+}
+static klj_val klj_HashMap_size(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_map *m = klj_map_of(self);
+    return (klj_val){.j = m ? m->n : 0};
+}
+static klj_val klj_HashMap_isEmpty(void *env, void *self, const klj_val *a, int n) {
+    return (klj_val){.j = klj_HashMap_size(env, self, a, n).j == 0};
+}
+static klj_val klj_HashMap_clear(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_map *m = klj_map_of(self);
+    if (m) m->n = 0;
+    return (klj_val){0};
 }
 
 // Unity asks whether its *own* activity is registered under the VR category —
@@ -1108,6 +1608,30 @@ static klj_val klj_WifiLock_isHeld(void *env, void *self, const klj_val *a, int 
     return (klj_val){.j = 1};
 }
 
+// ---- BluetoothManager and BluetoothAdapter ----
+// There is no Android Bluetooth stack on visionOS, but games query Bluetooth
+// availability on startup (e.g. DeoVR queries BluetoothManager for haptics).
+// Returning an adapter that reports isEnabled() -> false lets the game detect
+// that Bluetooth is off cleanly rather than throwing NullReferenceException.
+static klj_val klj_BluetoothManager_getAdapter(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *adapter;
+    return klj_singleton("android/bluetooth/BluetoothAdapter", &adapter);
+}
+static klj_val klj_BluetoothAdapter_isEnabled(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("BluetoothAdapter.isEnabled() -> false (no Android Bluetooth stack on this host)");
+    return (klj_val){.j = 0};
+}
+static klj_val klj_BluetoothAdapter_getState(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("BluetoothAdapter.getState() -> 10 (STATE_OFF)");
+    return (klj_val){.j = 10};
+}
+static klj_val klj_BluetoothAdapter_getDefaultAdapter(void *env, void *self, const klj_val *a, int n) {
+    return klj_BluetoothManager_getAdapter(env, self, a, n);
+}
+
 // getSystemService returns the manager object for a service name. Returning null
 // for an unknown one is legitimate Android — a device need not offer every
 // service — so unknowns are logged rather than fabricated.
@@ -1129,6 +1653,7 @@ static klj_val klj_Context_getSystemService(void *env, void *self, const klj_val
         {"notification", "android/app/NotificationManager"},
         {"media_router", "android/media/MediaRouter"},
         {"batterymanager", "android/os/BatteryManager"},
+        {"bluetooth",    "android/bluetooth/BluetoothManager"},
         {NULL, NULL},
     };
     const char *want = n > 0 ? klj_str(a[0].l) : NULL;
@@ -1137,7 +1662,9 @@ static klj_val klj_Context_getSystemService(void *env, void *self, const klj_val
     static void *cache[sizeof services / sizeof services[0]];
     for (unsigned i = 0; services[i].svc; i++) {
         if (strcmp(services[i].svc, want)) continue;
-        if (!cache[i]) cache[i] = kl_jni_new_object(services[i].cls);
+        // Host-cached: the same service object comes back on every lookup, so
+        // it has to survive the local frame the first lookup happened in.
+        if (!cache[i]) cache[i] = klj_host_cache(kl_jni_new_object(services[i].cls));
         KLJ_LOG("getSystemService(\"%s\") -> %s", want, services[i].cls);
         return (klj_val){.l = cache[i]};
     }
@@ -1213,14 +1740,23 @@ const char *kl_jni_files_dir(void) {
 
     // The APK itself. Unity opens this as a zip to read streaming assets, so it has
 // to be a real file — the unpacked tree under beatsaber/ is not a substitute.
- const char *g_apk_path = "beatsaber.apk";
+ // The host default is beatsaber.apk; KL_APK points a host run at another
+// title's APK (visionOS sets the path explicitly via kl_app.c).
+const char *g_apk_path;
 void kl_jni_set_apk_path(const char *path) { g_apk_path = klj_abspath(path); }
-const char *kl_jni_apk_path(void) { return g_apk_path; }
+static const char *klj_apk_path(void) {
+    if (!g_apk_path) {
+        const char *env = kl_env_str("KL_APK", NULL);
+        g_apk_path = klj_abspath(env && *env ? env : "beatsaber.apk");
+    }
+    return g_apk_path;
+}
+const char *kl_jni_apk_path(void) { return klj_apk_path(); }
 
 static klj_val klj_Context_getPackageCodePath(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
-    KLJ_LOG("getPackageCodePath() -> %s", g_apk_path);
-    return (klj_val){.l = kl_jni_new_string(g_apk_path)};
+    KLJ_LOG("getPackageCodePath() -> %s", klj_apk_path());
+    return (klj_val){.l = kl_jni_new_string(klj_apk_path())};
 }
 
 // Where the guest's own .so files live. Unity reads this to dlopen further
@@ -1230,7 +1766,7 @@ void kl_jni_set_native_lib_dir(const char *dir) { g_native_lib_dir = klj_abspath
 
 // ApplicationInfo is a plain data holder — Unity reads its fields directly
 // rather than calling accessors, so these are field getters, not methods.
- klj_val klj_appinfo_sourceDir(void)     { return (klj_val){.l = kl_jni_new_string(g_apk_path)}; }
+ klj_val klj_appinfo_sourceDir(void)     { return (klj_val){.l = kl_jni_new_string(klj_apk_path())}; }
  klj_val klj_appinfo_nativeLibraryDir(void) { return (klj_val){.l = kl_jni_new_string(g_native_lib_dir)}; }
  klj_val klj_appinfo_dataDir(void)       { return (klj_val){.l = kl_jni_new_string(kl_jni_files_dir())}; }
 // This APK is not a split install, so there are no additional source dirs. An
@@ -1238,7 +1774,7 @@ void kl_jni_set_native_lib_dir(const char *dir) { g_native_lib_dir = klj_abspath
 // "no splits" to a caller that checks length.
  klj_val klj_appinfo_splitSourceDirs(void) {
     static void *empty;
-    if (!empty) empty = klj_new_array('L', "java/lang/String", 0);
+    if (!empty) empty = klj_host_cache(klj_new_array('L', "java/lang/String", 0));
     return (klj_val){.l = empty};
 }
 
@@ -1278,6 +1814,33 @@ static klj_val klj_ClassLoader_findLibrary(void *env, void *self, const klj_val 
     int found = kl_can_dlopen(path);
     KLJ_LOG("ClassLoader.findLibrary(\"%s\") -> %s", name, found ? path : "null");
     return (klj_val){.l = found ? kl_jni_new_string(path) : NULL};
+}
+
+// Is this guest Beat Saber on Unity's OpenXR plugin — 1.45 and whatever the
+// store carries after it — rather than 1.40 and older on the Oculus XR plugin?
+//
+// The two are the same title under the same rows (`beatsaber140`, the one
+// players have installed, and `beatsaber`), and a row is a name, not a build:
+// which of them was translated into this bundle is a property of the APK. What
+// tells them apart without a version table is the library itself — the newer
+// one ships libUnityOpenXR.so and the older one does not. Asked of kl_can_load
+// for the reason findLibrary above is: in the bundle the translation is there
+// and the ELF is not.
+//
+// Everything that differs between the two hangs on this one answer (the GL
+// names in kl_egl.c, the platform user in kl_ovrplat.c, the plugin version and
+// the eye size in kl_ovrp.c, the immersion style in kl_app.c), so that 1.40
+// keeps exactly the answers it was verified with. Not cached: it is asked a
+// handful of times, and the first of them must not pin an answer taken before
+// the library directory was set.
+int kl_guest_beatsaber_openxr(void) {
+    extern const char *kl_driver_target_name(void);
+    extern int kl_can_load(const char *path);
+    const char *t = kl_driver_target_name();
+    if (!t || (strcmp(t, "beatsaber") != 0 && strcmp(t, "beatsaber140") != 0)) return 0;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/libUnityOpenXR.so", g_native_lib_dir);
+    return kl_can_load(path);
 }
 
     // getObbDir() and getObbDirs() are ONE answer asked two ways — Android's plural
@@ -1439,8 +2002,11 @@ static klj_val klj_Context_getObbDirs(void *env, void *self, const klj_val *a, i
     (void)env; (void)self; (void)a; (void)n;
     static void *dirs;
     if (!dirs) {
-        dirs = klj_new_array('L', "java/io/File", 1);
-        ((void **)klj_arr(dirs)->data)[0] = klj_new_file(klj_obb_dir());
+        dirs = klj_host_cache(klj_new_array('L', "java/io/File", 1));
+        // The element is pinned separately: an object array owns only its
+        // pointer buffer, so the File inside would otherwise be retired by the
+        // frame it was built in while the cached array kept pointing at it.
+        ((void **)klj_arr(dirs)->data)[0] = klj_host_cache(klj_new_file(klj_obb_dir()));
     }
     return (klj_val){.l = dirs};
 }
@@ -1449,76 +2015,7 @@ static klj_val klj_Context_getObbDir(void *env, void *self, const klj_val *a, in
     return (klj_val){.l = klj_new_file(klj_obb_dir())};
 }
 
-// java/util/HashMap — a real (small, linear) map. Guests build one and hand it
-// to a subsystem that reads it back (Into the Radius populates one right after
-// SentryBridgeJava.init), so a no-op put that drops the entry is not enough: the
-// value has to come back out. Keys are compared by string content when both are
-// Java strings (the common case — tag maps, config maps) and by identity
-// otherwise.
-typedef struct { void *k, *v; } klj_map_pair;
-typedef struct { klj_map_pair *e; unsigned n, cap; } klj_map;
-
-static int klj_map_key_eq(void *a, void *b) {
-    if (a == b) return 1;
-    const char *sa = a ? klj_str(a) : NULL, *sb = b ? klj_str(b) : NULL;
-    if (sa && sb) return strcmp(sa, sb) == 0;
-    return 0;
-}
-static klj_map *klj_map_of(void *self) {
-    klj_object *o = klj_as_object(self);
-    return o ? o->data : NULL;
-}
-static klj_val klj_HashMap_init(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)a; (void)n;
-    if (self) klj_as_object(self)->data = calloc(1, sizeof(klj_map));
-    return (klj_val){.l = self};
-}
-static klj_val klj_HashMap_put(void *env, void *self, const klj_val *a, int n) {
-    (void)env;
-    klj_map *m = klj_map_of(self);
-    if (!m || n < 2) return (klj_val){.l = NULL};
-    for (unsigned i = 0; i < m->n; i++)
-        if (klj_map_key_eq(m->e[i].k, a[0].l)) {
-            void *old = m->e[i].v; m->e[i].v = a[1].l;
-            return (klj_val){.l = old};
-        }
-    if (m->n == m->cap) {
-        m->cap = m->cap ? m->cap * 2 : 8;
-        m->e = realloc(m->e, m->cap * sizeof *m->e);
-    }
-    m->e[m->n].k = a[0].l; m->e[m->n].v = a[1].l; m->n++;
-    return (klj_val){.l = NULL};
-}
-static klj_val klj_HashMap_get(void *env, void *self, const klj_val *a, int n) {
-    (void)env;
-    klj_map *m = klj_map_of(self);
-    if (m && n >= 1)
-        for (unsigned i = 0; i < m->n; i++)
-            if (klj_map_key_eq(m->e[i].k, a[0].l)) return (klj_val){.l = m->e[i].v};
-    return (klj_val){.l = NULL};
-}
-static klj_val klj_HashMap_containsKey(void *env, void *self, const klj_val *a, int n) {
-    (void)env;
-    klj_map *m = klj_map_of(self);
-    if (m && n >= 1)
-        for (unsigned i = 0; i < m->n; i++)
-            if (klj_map_key_eq(m->e[i].k, a[0].l)) return (klj_val){.j = 1};
-    return (klj_val){.j = 0};
-}
-static klj_val klj_HashMap_size(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)a; (void)n;
-    klj_map *m = klj_map_of(self);
-    return (klj_val){.j = m ? (int)m->n : 0};
-}
-
 const klj_binding klj_bind_android[] = {
-    {"java/util/HashMap", "<init>", "()V", klj_HashMap_init},
-    {"java/util/HashMap", "put",
-     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_put},
-    {"java/util/HashMap", "get",
-     "(Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_get},
-    {"java/util/HashMap", "containsKey", "(Ljava/lang/Object;)Z", klj_HashMap_containsKey},
-    {"java/util/HashMap", "size", "()I", klj_HashMap_size},
 // ICU's time zones, which is where Mono's TimeZoneInfo looks on Android.
     {"android/icu/util/TimeZone", "getDefault", "()Ljava/lang/Object;", klj_TimeZone_getDefault},
     {"android/icu/util/TimeZone", "getID", "()Ljava/lang/String;", klj_TimeZone_getID},
@@ -1543,13 +2040,39 @@ const klj_binding klj_bind_android[] = {
     {"com/vrchat/android/plugin/Info", "instance", "()Ljava/lang/Object;", klj_VRCInfo_instance},
     {"com/vrchat/android/plugin/Info", "getVersionCode", "()I", klj_VRCInfo_getVersionCode},
     {"com/vrchat/android/plugin/Info", "getVersionName", "()Ljava/lang/String;", klj_VRCInfo_getVersionName},
+    {"vros/os/VrosBuild", "getSdkVersion", "()I", klj_VrosBuild_getSdkVersion},
     {"android/media/AudioManager", "isStreamMute", "(I)Z", klj_false},
     {"android/media/AudioManager", "isMicrophoneMute", "()Z", klj_false},
+    // isMusicActive() — "is anything playing on STREAM_MUSIC right now", which
+    // apps ask before ducking or before starting their own music. False: this
+    // host has no other Android app to be playing, and the guest's own output
+    // goes to CoreAudio rather than through an Android stream this could see.
+    // UE4 asks it on its way out (FAndroidMisc's audio teardown).
+    {"android/media/AudioManager", "isMusicActive", "()Z", klj_false},
+    // ...and the routing predicates beside it, asked in the same sweep. There is
+    // no Bluetooth SCO link, no wired headset and no speakerphone route on this
+    // host — kl_jni already answers HeadsetReceiver.stateChanged(0) for the same
+    // reason, and isBluetoothA2dpOn is answered false in kl_jni_window.c — so
+    // false is the truth for all of them, not a placeholder.
+    {"android/media/AudioManager", "isBluetoothScoOn", "()Z", klj_false},
+    {"android/media/AudioManager", "isWiredHeadsetOn", "()Z", klj_false},
+    {"android/media/AudioManager", "isSpeakerphoneOn", "()Z", klj_false},
     {"java/lang/ClassLoader", "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", klj_ClassLoader_findLibrary},
 
     {"android/app/Activity",   "getIntent",  "()Landroid/content/Intent;", klj_Activity_getIntent},
     {"android/app/Activity",   "getApplicationContext", "()Landroid/content/Context;",
      klj_Activity_getApplicationContext},
+    // The same singleton reached from the Application and from a Context that
+    // was handed round — libEOSSDK.so arrives via ActivityThread and asks the
+    // Application for it, which is the standard route for a native library
+    // that was never given an Activity.
+    {"android/app/Application", "getApplicationContext", "()Landroid/content/Context;",
+     klj_Activity_getApplicationContext},
+    {"android/content/Context", "getApplicationContext", "()Landroid/content/Context;",
+     klj_Activity_getApplicationContext},
+    // EOS voice probes for a hardware echo canceller. There is no capture path
+    // here (kl_aaudio refuses input streams), so there is none to offer.
+    {"android/media/audiofx/AcousticEchoCanceler", "isAvailable", "()Z", klj_false},
     {"android/util/DisplayMetrics", "<init>", "()V", klj_generic_init},
     // Unity's ReflectionHelper spells every reference return as Object, so it asks
     // for getClass with a signature real Java does not declare. Matching is on the
@@ -1592,15 +2115,41 @@ const klj_binding klj_bind_android[] = {
     {"android/content/Context", "registerReceiver",
      "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;I)Landroid/content/Intent;",
      klj_Context_registerReceiver},
+    // Beat Saber 1.45's own receiver for debug commands sent to the headset as
+    // broadcasts (com.beatgames.beatsaber.terminal). Unity asks for it through
+    // reflection, so the signature carries the guest's dotted names and
+    // java.lang.Object as the return type. Registering is accepted as any other
+    // non-sticky filter is; nothing here broadcasts, so its callback never runs
+    // (the receiver's setCallback is in kl_jni_services.c).
+    {"android/content/Context", "registerReceiver",
+     "(Lcom.beatgames.beatsaber.terminal.TerminalBroadcastReceiver;Landroid.content.IntentFilter;)Ljava/lang/Object;",
+     klj_Context_registerReceiver},
+    {"android/content/Context", "unregisterReceiver",
+     "(Landroid/content/BroadcastReceiver;)V", klj_Context_unregisterReceiver},
     // The in-headset UI panel — see the WebView block above for why every one
     // of these is accepted and none of them produces a pixel.
     {"android/webkit/WebView", "<init>", "(Landroid/content/Context;)V", klj_WebView_init},
     {"android/webkit/WebView", "loadUrl", "(Ljava/lang/String;)V", klj_WebView_loadUrl},
     {"android/webkit/WebView", "getSettings", "()Landroid/webkit/WebSettings;", klj_WebView_getSettings},
+    // Declared as Java declares it; a guest that spells the argument as its
+    // own activity class reaches it through the assignability tier in kl_jni.c.
+    {"android/webkit/WebSettings", "getDefaultUserAgent",
+     "(Landroid/content/Context;)Ljava/lang/String;", klj_WebSettings_getDefaultUserAgent},
     {"android/webkit/WebView", "draw", "(Landroid/graphics/Canvas;)V", klj_WebView_draw},
     {"android/webkit/WebView", "dispatchTouchEvent", "(Landroid/view/MotionEvent;)Z", klj_false},
     {"android/graphics/Bitmap", "createBitmap",
      "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;", klj_Bitmap_createBitmap},
+    {"android/graphics/Bitmap", "createBitmap", "([IIILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;", klj_Bitmap_createBitmap},
+    {"android/graphics/Bitmap", "createBitmap", "([IIIIILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;", klj_Bitmap_createBitmap},
+    {"android/graphics/Bitmap", "getWidth", "()I", bitmap_width},
+    {"android/graphics/Bitmap", "getHeight", "()I", bitmap_height},
+    {"android/graphics/Bitmap", "getByteCount", "()I", bitmap_bytes},
+    {"android/graphics/Bitmap", "getRowBytes", "()I", bitmap_rowbytes},
+    {"android/graphics/Bitmap", "getPixel", "(II)I", bitmap_getpixel},
+    {"android/graphics/Bitmap", "getPixels", "([IIIIIII)V", bitmap_getpixels},
+    {"android/graphics/Bitmap", "copyPixelsToBuffer", "(Ljava/nio/Buffer;)V", bitmap_copybuffer},
+    {"android/graphics/Bitmap", "recycle", "()V", bitmap_recycle},
+    {"android/graphics/Bitmap", "isRecycled", "()Z", bitmap_isrecycled},
     {"android/graphics/Bitmap$Config", "valueOf",
      "(Ljava/lang/String;)Landroid/graphics/Bitmap$Config;", klj_BitmapConfig_valueOf},
     {"java/nio/ByteBuffer", "rewind", "()Ljava/nio/Buffer;", klj_Buffer_rewind},
@@ -1615,6 +2164,19 @@ const klj_binding klj_bind_android[] = {
 
     {"android/content/Intent", "setPackage",  "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_setPackage},
     {"android/content/Intent", "addFlags",    "(I)Landroid/content/Intent;",                 klj_Intent_addFlags},
+    {"android/content/Intent", "<init>",      "()V",                                         klj_Intent_init},
+    {"android/content/Intent", "setAction",   "(Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_setAction},
+    {"android/content/Intent", "setFlags",    "(I)Landroid/content/Intent;",                 klj_Intent_setFlags},
+    {"android/content/ComponentName", "<init>", "(Ljava/lang/String;Ljava/lang/String;)V",   klj_ComponentName_init},
+    {"android/content/Intent", "setComponent", "(Landroid/content/ComponentName;)Landroid/content/Intent;", klj_Intent_setComponent},
+    {"android/content/Intent", "setClassName", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_setClassName},
+    {"android/content/Intent", "putExtra", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;", klj_Intent_putExtraString},
+    {"android/content/Intent", "putExtra", "(Ljava/lang/String;I)Landroid/content/Intent;",  klj_Intent_putExtraScalar},
+    {"android/content/Intent", "putExtra", "(Ljava/lang/String;Z)Landroid/content/Intent;",  klj_Intent_putExtraScalar},
+    {"android/content/Intent", "setData",     "(Landroid/net/Uri;)Landroid/content/Intent;",  klj_Intent_setData},
+    {"android/net/Uri",        "parse",       "(Ljava/lang/String;)Landroid/net/Uri;",        klj_Uri_parse},
+    {"android/content/Context", "startActivity", "(Landroid/content/Intent;)V",              klj_Context_startActivity},
+    {"android/app/Activity",    "startActivity", "(Landroid/content/Intent;)V",              klj_Context_startActivity},
     {"android/content/Intent", "toUri",       "(I)Ljava/lang/String;",                       klj_Intent_toUri},
     {"android/content/Context", "getPackageManager", "()Landroid/content/pm/PackageManager;", klj_Context_getPackageManager},
     {"android/content/Context", "getPackageName", "()Ljava/lang/String;", klj_Context_getPackageName},
@@ -1638,6 +2200,10 @@ const klj_binding klj_bind_android[] = {
      klj_WifiManager_createWifiLock},
     {"android/net/wifi/WifiManager$WifiLock", "acquire", "()V", klj_WifiLock_acquire},
     {"android/net/wifi/WifiManager$WifiLock", "isHeld",  "()Z", klj_WifiLock_isHeld},
+    {"android/bluetooth/BluetoothManager", "getAdapter", "()Landroid/bluetooth/BluetoothAdapter;", klj_BluetoothManager_getAdapter},
+    {"android/bluetooth/BluetoothAdapter", "getDefaultAdapter", "()Landroid/bluetooth/BluetoothAdapter;", klj_BluetoothAdapter_getDefaultAdapter},
+    {"android/bluetooth/BluetoothAdapter", "isEnabled", "()Z", klj_BluetoothAdapter_isEnabled},
+    {"android/bluetooth/BluetoothAdapter", "getState", "()I", klj_BluetoothAdapter_getState},
     {"android/content/Context", "getPackageCodePath", "()Ljava/lang/String;", klj_Context_getPackageCodePath},
     {"android/content/Context", "getObbDirs", "()[Ljava/io/File;", klj_Context_getObbDirs},
     {"android/content/Context", "getObbDir",  "()Ljava/io/File;",  klj_Context_getObbDir},
@@ -1673,6 +2239,21 @@ const klj_binding klj_bind_android[] = {
     {"java/util/List", "size",    "()I",                 klj_List_size},
     {"java/util/List", "isEmpty", "()Z",                 klj_List_isEmpty},
     {"java/util/List", "get",  "(I)Ljava/lang/Object;",  klj_List_get},
+
+    {"java/util/HashMap", "<init>", "()V",   klj_HashMap_init},
+    {"java/util/HashMap", "<init>", "(I)V",  klj_HashMap_init},
+    {"java/util/HashMap", "<init>", "(IF)V", klj_HashMap_init},
+    {"java/util/HashMap", "put",
+     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_put},
+    {"java/util/HashMap", "get",
+     "(Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_get},
+    {"java/util/HashMap", "remove",
+     "(Ljava/lang/Object;)Ljava/lang/Object;", klj_HashMap_remove},
+    {"java/util/HashMap", "containsKey",
+     "(Ljava/lang/Object;)Z", klj_HashMap_containsKey},
+    {"java/util/HashMap", "size",    "()I", klj_HashMap_size},
+    {"java/util/HashMap", "isEmpty", "()Z", klj_HashMap_isEmpty},
+    {"java/util/HashMap", "clear",   "()V", klj_HashMap_clear},
     // No screensaver policy is set, no other app is playing audio, and no
     // InputDevice with a gamepad source is presented — controllers reach this
     // guest through the XR seam, not through android.view.InputDevice.

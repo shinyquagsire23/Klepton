@@ -24,6 +24,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=".."
 eval "$(python3 targets.py "${KLEPTON_TARGET:-}")"
+# A Linux process has no APK and no assets/: its data is a sysroot and a game
+# tree, tens of GB of it, and stage_sync.py stages that incrementally. There is
+# no metadata pass for it either. KL_LX_PHASE picks how much (base|start|all).
+if [ "$KLT_KIND" = linux ]; then
+  [ "${1:-}" = "--meta" ] && exit 0
+  [ -n "${1:-}" ] || { echo "!! a Linux target is staged onto a device (pass its udid)"; exit 1; }
+  exec python3 stage_sync.py --device "$1" --phase "${KL_LX_PHASE:-start}"
+fi
 BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
 APK="$ROOT/$KLT_APK"
 ASSETS="$ROOT/$KLT_ASSETS"

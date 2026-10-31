@@ -1,0 +1,20 @@
+diff --git a/include/fmt/base.h b/include/fmt/base.h
+index 6276494..60dff59 100644
+--- a/include/fmt/base.h
++++ b/include/fmt/base.h
+@@ -111,6 +111,7 @@
+ #endif
+ 
+ // Detect consteval, C++20 constexpr extensions and std::is_constant_evaluated.
++#ifndef FMT_USE_CONSTEVAL
+ #if !defined(__cpp_lib_is_constant_evaluated)
+ #  define FMT_USE_CONSTEVAL 0
+ #elif FMT_CPLUSPLUS < 201709L
+@@ -130,6 +131,7 @@
+ #else
+ #  define FMT_USE_CONSTEVAL 0
+ #endif
++#endif  // allow the Apple port to disable fmt 11.0.2 consteval on clang 21
+ #if FMT_USE_CONSTEVAL
+ #  define FMT_CONSTEVAL consteval
+ #  define FMT_CONSTEXPR20 constexpr

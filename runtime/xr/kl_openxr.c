@@ -31,16 +31,20 @@
 //     chained through `next`. We never invent a layout: anything we fill in is
 //     transcribed from the specification, and anything we have not transcribed
 //     is a refusal rather than a partly-populated struct.
+#include <stdatomic.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#include <mach/mach.h>   // vm_read_overwrite — klxr_note_frame_chains reads guest chains without faulting
 #include <unistd.h>
 #include "kl_openxr.h"
+#include "kl_steamapi.h"
 #include "kl_jni.h"
 #include "kl_ovrp.h"
 #include "kl_egl.h"
@@ -51,6 +55,8 @@
 // checkout with no MoltenVK vendored (the stub half of kl_vulkan.c answers
 // "not supported" and the extension is then never advertised).
 #include "kl_vulkan.h"
+#include <pthread.h>
+#include <pthread/qos.h>
 #include "klepton.h"
 
 // ------------------------------------------------------- transcribed from the spec
@@ -102,6 +108,12 @@ enum {
     XR_TYPE_HAPTIC_ACTION_INFO          = 59,
     XR_TYPE_REFERENCE_SPACE_CREATE_INFO = 37,
     XR_TYPE_SPACE_LOCATION              = 42,
+    XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT = 1000051000,
+    XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT = 1000051001,
+    XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT = 1000051002,
+    XR_TYPE_HAND_JOINT_LOCATIONS_EXT = 1000051003,
+    XR_TYPE_HAND_JOINT_VELOCITIES_EXT = 1000051004,
+    XR_TYPE_HAND_TRACKING_AIM_STATE_FB = 1000111001,
     XR_TYPE_ACTION_STATE_BOOLEAN        = 23,
     XR_TYPE_ACTION_STATE_FLOAT          = 24,
     XR_TYPE_ACTION_STATE_VECTOR2F       = 25,
@@ -112,11 +124,14 @@ enum {
     XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING = 51,
     XR_TYPE_INTERACTION_PROFILE_STATE   = 53,
     XR_TYPE_BATTERY_STATE_DISPLAY_EXT   = 1000836000,
-    XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO = 54,
+    // 62/63 are Khronos's values (openxr.h 1.1.49). 54/62 were transcribed
+    // wrong, and every correct caller of these two getters was refused with
+    // VALIDATION_FAILURE. Vivecraft calls bound-sources for every action read.
+    XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO = 62,
     XR_TYPE_ACTION_STATE_GET_INFO       = 58,
     XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO = 60,
     XR_TYPE_ACTIONS_SYNC_INFO           = 61,
-    XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO = 62,
+    XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO = 63,
     XR_TYPE_SWAPCHAIN_CREATE_INFO       = 9,
     XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO = 55,
     XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO   = 56,
@@ -395,11 +410,27 @@ typedef struct { int32_t type; const void *next;
 typedef struct { int32_t type; const void *next;
                  XrPosef pose; XrFovf fov;
                  XrSwapchainSubImage subImage; } XrCompositionLayerProjectionView;
+typedef struct { int32_t type; const void *next; XrSwapchainSubImage subImage;
+                 float minDepth, maxDepth, nearZ, farZ;
+} XrCompositionLayerDepthInfoKHR;
 typedef struct { int32_t type; const void *next;
                  uint64_t layerFlags; void *space;
                  uint32_t viewCount;
                  const XrCompositionLayerProjectionView *views;
                } XrCompositionLayerProjection;
+
+// XR_FB_space_warp's input, chained onto a projection view: where the game
+// drew this view's motion vectors and depth, and how its app space moved since
+// the previous frame. The motion vectors are an RGBA16F image (a quarter of the
+// eye, as recommended in klxr_fill_space_warp_props), the depth an ordinary
+// depth swapchain with the projection's near and far planes.
+typedef struct { int32_t type; const void *next;
+                 uint64_t layerFlags;
+                 XrSwapchainSubImage motionVectorSubImage;
+                 XrPosef appSpaceDeltaPose;
+                 XrSwapchainSubImage depthSubImage;
+                 float minDepth, maxDepth, nearZ, farZ;
+               } XrCompositionLayerSpaceWarpInfoFB;
 
 // A flat panel in space: one swapchain image, one pose, one size in metres.
 // `eyeVisibility` is BOTH(0) / LEFT(1) / RIGHT(2) — a guest showing different
@@ -427,6 +458,18 @@ typedef struct { int32_t type; const void *next;
                  XrPosef pose;
                  float radius, centralAngle, aspectRatio;
                } XrCompositionLayerCylinderKHR;
+
+// A panorama around the viewer (XR_KHR_composition_layer_equirect2): what a
+// SteamVR game's skybox override arrives as through xrizer — Half-Life: Alyx's
+// loading screen, the only thing it submits while a level loads.
+#define XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR 1000091000
+typedef struct { int32_t type; const void *next;
+                 uint64_t layerFlags; void *space;
+                 int32_t eyeVisibility;
+                 XrSwapchainSubImage subImage;
+                 XrPosef pose;
+                 float radius, centralHorizontalAngle, upperVerticalAngle, lowerVerticalAngle;
+               } XrCompositionLayerEquirect2KHR;
 
 typedef struct { int32_t type; const void *next;
                  int64_t displayTime;
@@ -549,6 +592,7 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     X(xrPollEvent)                                                             \
     /* spaces */                                                               \
     X(xrCreateReferenceSpace) X(xrDestroySpace)                                \
+    X(xrCreateHandTrackerEXT) X(xrDestroyHandTrackerEXT) X(xrLocateHandJointsEXT) \
     X(xrGetReferenceSpaceBoundsRect) X(xrLocateSpace)                          \
     X(xrEnumerateReferenceSpaces)                                              \
     /* swapchains */                                                           \
@@ -586,17 +630,27 @@ enum { KLXR_VIEW_CONFIG_PRIMARY_STEREO = 2 };
     X(xrEnumerateDisplayRefreshRatesFB) X(xrGetDisplayRefreshRateFB)           \
     X(xrRequestDisplayRefreshRateFB)                                           \
     X(xrConvertTimespecTimeToTimeKHR) X(xrConvertTimeToTimespecTimeKHR)         \
+    X(xrGetVisibilityMaskKHR)                                                  \
     X(xrPerfSettingsSetPerformanceLevelEXT)                                    \
     X(xrEnumeratePerformanceMetricsCounterPathsMETA)                           \
     X(xrSetPerformanceMetricsStateMETA) X(xrGetPerformanceMetricsStateMETA)    \
     X(xrQueryPerformanceMetricsCounterMETA)                                    \
     X(xrSetAndroidApplicationThreadKHR)                                        \
     X(xrEnumerateColorSpacesFB) X(xrSetColorSpaceFB)                          \
+    X(xrCreateFoveationProfileFB) X(xrDestroyFoveationProfileFB)               \
+    X(xrUpdateSwapchainFB) X(xrGetSwapchainStateFB)                            \
     X(xrCreatePassthroughFB) X(xrDestroyPassthroughFB)                         \
     X(xrPassthroughStartFB) X(xrPassthroughPauseFB)                            \
     X(xrCreatePassthroughLayerFB) X(xrDestroyPassthroughLayerFB)               \
     X(xrPassthroughLayerPauseFB) X(xrPassthroughLayerResumeFB)                 \
     X(xrPassthroughLayerSetStyleFB)                                          \
+    /* the room (served only with KL_OVRP_SCENE_ROOM) */                       \
+    X(xrDiscoverSpacesMETA) X(xrRetrieveSpaceDiscoveryResultsMETA)             \
+    X(xrGetSpaceUuidFB) X(xrEnumerateSpaceSupportedComponentsFB)               \
+    X(xrGetSpaceComponentStatusFB) X(xrSetSpaceComponentStatusFB)              \
+    X(xrGetSpaceContainerFB) X(xrGetSpaceRoomLayoutFB)                         \
+    X(xrGetSpaceBoundingBox2DFB) X(xrGetSpaceBoundingBox3DFB)                  \
+    X(xrGetSpaceBoundary2DFB) X(xrGetSpaceSemanticLabelsFB)                    \
     X(xrCreateSwapchainAndroidSurfaceKHR)
 
 // ------------------------------------------------------------------ bookkeeping
@@ -715,6 +769,10 @@ KL_XR_ENTRY_POINTS(X)
 // the guest is entitled to ask about an extension entry point it will then not
 // use. The assertion is still the call, and the stub it gets back is what
 // makes that assertion by name.
+static int klxr_is_scene_entry(const char *name);   // the room, defined with the spaces
+static int klxr_scene_on(void);
+static int klxr_is_hand_entry(const char *name);    // XR_EXT_hand_tracking, BRINK Traveler only
+static int klxr_hands_on(void);
 static int klxr_GetInstanceProcAddr(void *instance, const char *name, void **function) {
     (void)instance;
     if (!function) KLXR_RET(KLXR_ERROR_FUNCTION_UNSUPPORTED);
@@ -722,6 +780,8 @@ static int klxr_GetInstanceProcAddr(void *instance, const char *name, void **fun
     if (!name) KLXR_RET(KLXR_ERROR_FUNCTION_UNSUPPORTED);
 
     klxr_row *row = klxr_row_for(name);
+    if (row && klxr_is_scene_entry(name) && !klxr_scene_on()) row = NULL;
+    if (row && klxr_is_hand_entry(name) && !klxr_hands_on()) row = NULL;
     if (!row) {
         // Printed once per distinct name and not counted, because it is neither
         // a resolution nor a call. This is the line that will name any
@@ -805,6 +865,24 @@ static klxr_instance *klxr_inst(void *h) {
     return (i && i->magic == KLXR_MAGIC_INSTANCE) ? i : NULL;
 }
 
+// Is the guest Steam's Android build of Moss (depot 846472, made for Steam
+// Frame)? It shares the target `moss` with the Meta build – same package, same
+// engine, same library names – and differs in its XR path: OpenXR here,
+// OVRPlugin there. What this runtime does for it alone asks here, so the Meta
+// build and every other OpenXR guest get what they got. Told from the Meta
+// build by Steam's library in the game's files, like Walkabout's Steam build
+// (klxr_pitches).
+static int klxr_target_is(const char *name) {
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    return t && !strcmp(t, name);
+}
+static int klxr_moss_from_steam(void) {
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    return t && !strcmp(t, "moss") && (kl_steamapi_shipped() || kl_steamapi_in_use());
+}
+
 // The extensions we advertise, and the list is deliberately short.
 //
 // The guest's own log lines say what it does with the answer: it needs
@@ -825,11 +903,24 @@ static klxr_instance *klxr_inst(void *h) {
 enum { KLXR_GATE_ALWAYS = 0,      // unconditional
        KLXR_GATE_REFRESH = 1,     // ...unless KL_XR_REFRESH_EXT=0
        KLXR_GATE_VULKAN = 2,      // ...only when MoltenVK is actually reachable
-       KLXR_GATE_USER_PRESENCE = 3 };  // ...missioniss only (see below)
+       KLXR_GATE_USER_PRESENCE = 3,    // ...missioniss only (see below)
+       KLXR_GATE_PERF_METRICS = 4,     // ...not for Moss from Steam (see below)
+       KLXR_GATE_FRAME_CONTROLLER = 5,     // ...Moss from Steam only (see below)
+       KLXR_GATE_HITMAN3 = 6,              // ...HITMAN 3 VR: Reloaded only (see below)
+       KLXR_GATE_BRINK_HANDS = 7,          // ...BRINK Traveler only
+       KLXR_GATE_BRINK_DEPTH = 8 };        // ...BRINK Traveler, unless KL_XR_DEPTH=0
 
 static const struct { const char *name; uint32_t version; int gate; } g_extensions[] = {
     { "XR_KHR_opengl_es_enable",       10, KLXR_GATE_ALWAYS },
     { "XR_KHR_android_create_instance", 3, KLXR_GATE_ALWAYS },
+    { "XR_KHR_composition_layer_depth", 6, KLXR_GATE_BRINK_DEPTH },
+    { "XR_EXT_hand_tracking", 4, KLXR_GATE_BRINK_HANDS },
+    // The Unity Meta Hand Tracking Aim feature requests this alongside the
+    // core skeleton. No new entry points: it extends xrLocateHandJointsEXT's
+    // XrHandJointLocationsEXT.next output chain.
+    { "XR_FB_hand_tracking_aim", 2, KLXR_GATE_BRINK_HANDS },
+    // Native hand grip/pinch/poke bindings; BRINK-only and sourced from ARKit.
+    { "XR_EXT_hand_interaction", 1, KLXR_GATE_BRINK_HANDS },
     // XR_KHR_convert_timespec_time is the cheapest honest claim in this table:
     // our XrTime IS CLOCK_MONOTONIC nanoseconds (klxr_now), so the conversion is
     // arithmetic and cannot be wrong. Without it the guest logs "not available
@@ -889,6 +980,23 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     // spec makes the level advisory and the notification event optional, so an
     // app cannot distinguish "noted and ignored" from "noted and unhelpful".
     { "XR_EXT_performance_settings",    4, KLXR_GATE_ALWAYS },
+    // XR_FB_foveation (+ _configuration) and XR_FB_swapchain_update_state
+    // (+ _opengl_es) — Doom3Quest, which REQUIRES all four at instance creation
+    // and uses them for exactly one thing: it builds a fixed-foveation profile
+    // and attaches it to its eye swapchain with xrUpdateSwapchainFB.
+    //
+    // Fixed foveation is the app asking the runtime to shade the periphery of
+    // ITS swapchain images at a lower rate — a tiled-GPU feature of the Quest's
+    // own driver. Nothing here can do that to a texture the guest renders into
+    // through ANGLE, and nothing needs to: an unfoveated image is a correct
+    // image, only a more expensive one, and the spec lets a runtime leave a
+    // requested level unapplied. So the profile is a handle with nothing
+    // behind it and the update is accepted and said so once. (Foveation of the
+    // guest's own rendering is a different mechanism here — KL_VRR.)
+    { "XR_FB_foveation",                        1, KLXR_GATE_ALWAYS },
+    { "XR_FB_foveation_configuration",          1, KLXR_GATE_ALWAYS },
+    { "XR_FB_swapchain_update_state",           3, KLXR_GATE_ALWAYS },
+    { "XR_FB_swapchain_update_state_opengl_es", 1, KLXR_GATE_ALWAYS },
     // XR_KHR_android_thread_settings — JKXR again, and required by it for the
     // same reason and with the same shape: one entry point, carrying a hint.
     // The app names a thread by tid and says what it is for (its main thread,
@@ -913,6 +1021,10 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     { "XR_KHR_android_surface_swapchain",     4, KLXR_GATE_ALWAYS },
     { "XR_KHR_composition_layer_cylinder",    4, KLXR_GATE_ALWAYS },
     { "XR_KHR_composition_layer_equirect2",   1, KLXR_GATE_ALWAYS },
+    // The part of each eye's picture the display cannot show — see
+    // klxr_GetVisibilityMaskKHR. Claimed always: with nothing hidden the mask
+    // comes back empty, which is the extension's own way of saying so.
+    { "XR_KHR_visibility_mask",               2, KLXR_GATE_ALWAYS },
     { "XR_FB_composition_layer_image_layout", 1, KLXR_GATE_ALWAYS },
     { "XR_FB_composition_layer_settings",     3, KLXR_GATE_ALWAYS },
     // XR_FB_passthrough — some guests REQUIRE it (instance creation fails
@@ -922,8 +1034,42 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
     // environment, and the guest's screens render on top through the
     // projection layer. Graduates to a real body if the background must show.
     { "XR_FB_passthrough",                    1, KLXR_GATE_ALWAYS },
-    { "XR_META_performance_metrics",          2, KLXR_GATE_ALWAYS },
+    { "XR_META_performance_metrics",          2, KLXR_GATE_PERF_METRICS },
     { "XR_EXT_user_presence",                 1, KLXR_GATE_USER_PRESENCE },
+    { "XR_VALVE_frame_controller_interaction", 1, KLXR_GATE_FRAME_CONTROLLER },
+    // XR_FB_space_warp — HITMAN 3 VR: Reloaded (x8012387035448196, IOI's Glacier
+    // engine as "Anubis", OpenXR + Vulkan) REQUIRES it at xrCreateInstance,
+    // whether or not it was enumerated. Refused, it does not stop: it goes on
+    // without an instance, every call after that is XR_ERROR_HANDLE_INVALID,
+    // "No capable Vulkan physical device found", and it hands MoltenVK a NULL
+    // VkDevice in vkGetDeviceProcAddr — SIGSEGV in MVKDevice::getProcAddr on
+    // the headset (2026-10-20, toolchain 701, both launches).
+    //
+    // The extension has no entry points. It is one output struct on
+    // xrGetSystemProperties (the recommended motion-vector size, filled below)
+    // and one input struct chained onto each projection view (motion vectors
+    // and depth for the runtime to synthesise frames from). Nothing here
+    // synthesises frames: the chained info is named and not read, as before,
+    // and each frame the game submits is shown as it is. The motion-vector and
+    // depth swapchains are ordinary Vulkan swapchains (RGBA16F, D24S8/D32 are
+    // in the format list already). Gated to that one target, because a game
+    // that only PROBES for it would otherwise switch space warp on and may
+    // render at half rate, expecting the runtime to fill in; KL_XR_HITMAN3_EXTS
+    // overrides.
+    //
+    // The same game requires two more, also without entry points (a Mac run
+    // lists every name it asks for, see klxr_CreateInstance):
+    // XR_FB_foveation_vulkan — a fragment-density-map image chained onto
+    // xrEnumerateSwapchainImages for a swapchain created with the FB foveation
+    // flag; the chained struct is not filled, so the game is told no such
+    // image (VK_NULL_HANDLE), the same answer as "no foveation", and MoltenVK
+    // has no fragment density maps to offer anyway.
+    // XR_META_vulkan_swapchain_create_info — extra VkImage create/usage flags
+    // chained onto xrCreateSwapchain; named and not read, the images are
+    // created with kl_vulkan's own usage set.
+    { "XR_FB_space_warp",                     2, KLXR_GATE_HITMAN3 },
+    { "XR_FB_foveation_vulkan",               1, KLXR_GATE_HITMAN3 },
+    { "XR_META_vulkan_swapchain_create_info", 1, KLXR_GATE_HITMAN3 },
     // Standard per-device battery query. A client opts in by enabling this and
     // chaining XrBatteryStateDisplayEXT to xrGetCurrentInteractionProfile.
     // The visionOS frontend supplies real per-hand GCController readings.
@@ -975,8 +1121,24 @@ static struct { const char *name; uint32_t version; }
        g_ext_live[KLXR_EXT_ALL + KLXR_EXT_EXTRA_MAX];
 static uint32_t g_ext_nlive;
 
+static int klxr_ext_gate_open(int gate);
+static int klxr_hands_on(void) { return klxr_ext_gate_open(KLXR_GATE_BRINK_HANDS); }
+static int klxr_is_hand_entry(const char *name) {
+    return !strcmp(name, "xrCreateHandTrackerEXT") || !strcmp(name, "xrDestroyHandTrackerEXT") ||
+           !strcmp(name, "xrLocateHandJointsEXT");
+}
+
 static int klxr_ext_gate_open(int gate) {
     switch (gate) {
+    case KLXR_GATE_BRINK_DEPTH: {
+        const char *e = getenv("KL_XR_DEPTH");
+        return klxr_ext_gate_open(KLXR_GATE_BRINK_HANDS) && !(e && !strcmp(e,"0"));
+    }
+    case KLXR_GATE_BRINK_HANDS: {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        return t && !strcmp(t, "x3635172946605196");
+    }
     case KLXR_GATE_REFRESH: {
         const char *e = getenv("KL_XR_REFRESH_EXT");
         return !(e && !strcmp(e, "0"));
@@ -1003,6 +1165,31 @@ static int klxr_ext_gate_open(int gate) {
         extern const char *kl_driver_target_name(void);
         const char *t = kl_driver_target_name();
         return kl_env_on("KL_XR_USER_PRESENCE", t && !strcmp(t, "missioniss"));
+    }
+    case KLXR_GATE_FRAME_CONTROLLER:
+        // The Steam Frame's own controller profile. Moss from Steam binds its jump and attack to that
+        // controller's keys and, of the Touch profile, only the sticks (its other Touch keys are the
+        // OVRPlugin input module's, which this build does not load): on the headset the reader could walk
+        // and nothing else (2026-10-14). Without the extension Unreal suggests the profile under a null
+        // path. The profile itself has been driveable here since VRChat. For that build only;
+        // KL_XR_FRAME_CONTROLLER overrides.
+        return kl_env_on("KL_XR_FRAME_CONTROLLER", klxr_moss_from_steam());
+    case KLXR_GATE_HITMAN3: {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        return kl_env_on("KL_XR_HITMAN3_EXTS", t && !strcmp(t, "x8012387035448196"));
+    }
+    case KLXR_GATE_PERF_METRICS: {
+        // XR_META_performance_metrics was once in the list by name only, none of
+        // its four entry points served. Moss from Steam (depot 846472, UE 4.27.2
+        // with Valve's SteamFrameOpenXRExtension) enabled the extension because
+        // it is offered, did not check, and called the NULL it was given: a jump
+        // to address 0 right after xrEnumerateViewConfigurationViews, before the
+        // session. Withheld, it does not enable it and goes on. The four are
+        // served now (zero counters, see below), but that build was verified
+        // with the extension withheld, so it stays that way; KL_XR_PERF_METRICS
+        // overrides.
+        return kl_env_on("KL_XR_PERF_METRICS", !klxr_moss_from_steam());
     }
     default:
         return 1;
@@ -1093,6 +1280,101 @@ static void klxr_log_chain(const char *where, const void *next) {
     for (int i = 0; i < n_seen; i++) if (seen[i] == where) return;
     if (n_seen < KLXR_CHAIN_SEEN) seen[n_seen++] = where;
     fprintf(stderr, "  [xr] %s: a chained struct was supplied (left unread)\n", where);
+}
+
+// ...and the frame's INPUT chains, by type. What a guest chains onto its
+// xrEndFrame, its layers and its projection views is what it would hand a
+// compositor that asked: depth (XR_KHR_composition_layer_depth), motion vectors
+// (XR_FB_space_warp), depth testing. None is advertised and nothing is read
+// from them; this only names what arrives, once per game for each (site, type),
+// so the ground for depth or space warp can be measured before it is built.
+// The XrFrameEndInfo, its layers and their views are read anyway (they must
+// be valid); the chained nodes are not trusted — every one is read through
+// vm_read_overwrite, which fails instead of faulting (the garbage `next`
+// above), and a walk stops at 8 nodes. Cost: nothing on a frame without a
+// chain; with one, a few reads every frame for the first 300 frames, then every
+// 30th, and none at all once the table is full.
+static const char *klxr_chain_type_name(int32_t t) {
+    switch (t) {
+    case 1000010000: return "XrCompositionLayerDepthInfoKHR";
+    case 1000034000: return "XrCompositionLayerColorScaleBiasKHR";
+    case 1000040000: return "XrCompositionLayerImageLayoutFB";
+    case 1000041001: return "XrCompositionLayerAlphaBlendFB";
+    case 1000053003: return "XrSecondaryViewConfigurationFrameEndInfoMSFT";
+    case 1000066000: return "XrCompositionLayerReprojectionInfoMSFT";
+    case 1000072000: return "XrCompositionLayerSecureContentFB";
+    case 1000122000: return "XrCompositionLayerDepthTestVARJO";
+    case 1000135000: return "XrFrameEndInfoML";
+    case 1000171000: return "XrCompositionLayerSpaceWarpInfoFB";
+    case 1000171001: return "XrSystemSpaceWarpPropertiesFB";
+    case 1000204000: return "XrCompositionLayerSettingsFB";
+    case 1000212000: return "XrCompositionLayerDepthTestFB";
+    case 1000216000: return "XrLocalDimmingFrameEndInfoMETA";
+    default:         return "unknown to this runtime";
+    }
+}
+#define KLXR_FRAME_CHAIN_SEEN 32
+static struct { const char *site; int32_t type; } g_frame_chain_seen[KLXR_FRAME_CHAIN_SEEN];
+static int g_frame_chain_n;
+static pthread_mutex_t g_frame_chain_mu = PTHREAD_MUTEX_INITIALIZER;
+static void klxr_note_chain_types(const char *site, const void *next, uint32_t layer_type) {
+    for (int depth = 0; next && depth < 8; depth++) {
+        struct { int32_t type; int32_t pad; const void *next; } node;
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)next, sizeof node,
+                              (vm_address_t)&node, &got) != KERN_SUCCESS || got != sizeof node) {
+            node.type = 0; node.next = NULL;    // say it once as type 0, unreadable
+        }
+        int known = 0;
+        for (int i = 0; i < g_frame_chain_n; i++)
+            if (g_frame_chain_seen[i].site == site && g_frame_chain_seen[i].type == node.type) known = 1;
+        if (!known && g_frame_chain_n < KLXR_FRAME_CHAIN_SEEN) {
+            g_frame_chain_seen[g_frame_chain_n].site = site;
+            g_frame_chain_seen[g_frame_chain_n++].type = node.type;
+            if (node.type == 0)
+                fprintf(stderr, "  [xr] chain on %s: unreadable next %p — walk stopped\n", site, next);
+            else if (layer_type)
+                fprintf(stderr, "  [xr] chain on %s (layer type %u): XrStructureType %d (%s) — not read\n",
+                        site, layer_type, node.type, klxr_chain_type_name(node.type));
+            else
+                fprintf(stderr, "  [xr] chain on %s: XrStructureType %d (%s) — not read\n",
+                        site, node.type, klxr_chain_type_name(node.type));
+        }
+        next = node.next;
+    }
+}
+static void klxr_note_frame_chains(const XrFrameEndInfo *info, uint64_t frame) {
+    if (g_frame_chain_n >= KLXR_FRAME_CHAIN_SEEN) return;
+    if (frame >= 300 && frame % 30) return;
+    pthread_mutex_lock(&g_frame_chain_mu);
+    klxr_note_chain_types("xrEndFrame", info->next, 0);
+    for (uint32_t i = 0; i < info->layerCount && info->layers; i++) {
+        const XrCompositionLayerBaseHeader *l = info->layers[i];
+        if (!l) continue;
+        if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+            const XrCompositionLayerProjection *p = (const XrCompositionLayerProjection *)l;
+            klxr_note_chain_types("projection layer", p->next, 0);
+            for (uint32_t v = 0; v < p->viewCount && v < 4 && p->views; v++)
+                klxr_note_chain_types("projection view", p->views[v].next, 0);
+        } else {
+            klxr_note_chain_types("other layer", l->next, (uint32_t)l->type);
+        }
+    }
+    pthread_mutex_unlock(&g_frame_chain_mu);
+}
+
+// The XrCompositionLayerSpaceWarpInfoFB on a projection view's chain, copied
+// into `out`; 0 when there is none. Read the way klxr_note_chain_types reads
+// (vm_read_overwrite, at most 8 nodes): the chain is the guest's memory.
+static int klxr_space_warp_info(const void *next, XrCompositionLayerSpaceWarpInfoFB *out) {
+    for (int depth = 0; next && depth < 8; depth++) {
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)next, sizeof *out,
+                              (vm_address_t)out, &got) != KERN_SUCCESS || got != sizeof *out) return 0;
+        if (out->type == 1000171000) return 1;
+        next = out->next;
+    }
+    return 0;
 }
 
 // ...and the one chained struct that must NOT merely be logged. The guest asks
@@ -1210,7 +1492,7 @@ static XrResult klxr_EnumerateViewConfigurations(void *instance, XrSystemId syst
 // frusta here are the display's own (kl_ovrp_eye_view / the compositor's
 // measured tangents). A guest told it could mutate them would submit a picture
 // rendered for a projection the compositor is not going to use.
-#define KLXR_TYPE_VIEW_CONFIGURATION_PROPERTIES 42
+#define KLXR_TYPE_VIEW_CONFIGURATION_PROPERTIES 45   /* Khronos; was 42 (= SPACE_LOCATION) */
 static XrResult klxr_GetViewConfigurationProperties(void *instance, XrSystemId system_id,
                                                     int32_t view_config_type, void *props) {
     if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
@@ -1285,17 +1567,23 @@ static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **ins
             (unsigned long long)(g_instance.api_version >> 48) & 0xffff,
             (unsigned long long)(g_instance.api_version >> 32) & 0xffff,
             (unsigned long long)(g_instance.api_version & 0xffffffff));
+    // Every name is listed before the refusal, not only the first missing one:
+    // a guest that asks for several it was never offered (HITMAN 3 VR: Reloaded
+    // asked for XR_FB_space_warp, then XR_FB_foveation_vulkan) otherwise costs
+    // one run per name.
+    int missing = 0;
     for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
         const char *name = info->enabledExtensionNames[i];
         int known = klxr_ext_advertised(name);
         fprintf(stderr, "  [xr]   extension: %-40s %s\n", name,
                 known ? "enabled" : "NOT PRESENT");
-        if (!known) { g_instance.magic = 0; KLXR_RET(KLXR_ERROR_EXTENSION_NOT_PRESENT); }
+        if (!known) { missing++; continue; }
         if (strcmp(name, "XR_KHR_opengl_es_enable") == 0) g_instance.ext_opengl_es = 1;
         if (strcmp(name, "XR_KHR_vulkan_enable") == 0)    g_instance.ext_vulkan = 1;
         if (strcmp(name, "XR_EXT_interaction_profile_battery_state_display") == 0)
             g_instance.ext_controller_battery = 1;
     }
+    if (missing) { g_instance.magic = 0; KLXR_RET(KLXR_ERROR_EXTENSION_NOT_PRESENT); }
 
     *instance = &g_instance;
     return KLXR_SUCCESS;
@@ -1341,6 +1629,35 @@ static XrResult klxr_GetSystem(void *instance, const XrSystemGetInfo *info,
     return KLXR_SUCCESS;
 }
 
+// XrSystemSpaceWarpPropertiesFB, for the one game that gets XR_FB_space_warp
+// (KLXR_GATE_HITMAN3). The exception to "we never fill chained structs":
+// that game sizes its motion-vector swapchain from these two numbers, and the
+// zero an unfilled struct leaves would be a swapchain of no size. The chain is
+// still not trusted — every node is read through vm_read_overwrite (see
+// klxr_note_chain_types) and the walk stops at 8 — and the struct is written
+// only after all of it read back. The size is a quarter of the eye in each
+// direction: motion vectors are a low-resolution image, and the number is a
+// recommendation the game may round or ignore.
+struct klxr_space_warp_props { int32_t type; int32_t pad; void *next; uint32_t w, h; };
+static void klxr_fill_space_warp_props(void *next, int ew, int eh) {
+    for (int depth = 0; next && depth < 8; depth++) {
+        struct klxr_space_warp_props node;
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)next, sizeof node,
+                              (vm_address_t)&node, &got) != KERN_SUCCESS || got != sizeof node) return;
+        if (node.type == 1000171001) {
+            uint32_t w = (uint32_t)((ew > 0 ? ew : 1832) / 4), h = (uint32_t)((eh > 0 ? eh : 1920) / 4);
+            uint32_t *size = (uint32_t *)((char *)next + offsetof(struct klxr_space_warp_props, w));
+            size[0] = w;
+            size[1] = h;
+            fprintf(stderr, "  [xr] XR_FB_space_warp: motion vectors %ux%u recommended (a quarter of the eye); "
+                            "frames are not synthesised here\n", w, h);
+            return;
+        }
+        next = node.next;
+    }
+}
+
 static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
                                          XrSystemProperties *props) {
     fprintf(stderr, "  [xr] >> %s\n", "xrGetSystemProperties");
@@ -1351,6 +1668,13 @@ static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
     // them untouched is how we report the feature absent: the guest zeroes the
     // struct before the call, so an unwritten supported flag reads as false.
     klxr_log_chain("xrGetSystemProperties", props->next);
+    struct klxr_out_chain { int32_t type; void *next; };
+    struct klxr_hand_props { int32_t type; void *next; uint32_t supportsHandTracking; };
+    for (struct klxr_out_chain *c = klxr_hands_on() ? props->next : NULL, *next; c; c = next) {
+        next = c->next;
+        if (c->type == XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT)
+            ((struct klxr_hand_props *)c)->supportsHandTracking = 1;
+    }
 
     int ew = 0, eh = 0;
     kl_ovrp_eye_texture_size(&ew, &eh);
@@ -1380,8 +1704,17 @@ static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
     // Steam host, not from here), so it is the target to watch for a
     // regression.
     props->vendorId = (uint32_t)kl_env_int("KL_XR_VENDOR_ID", 0x2833);
+    // steamlink-vr presents a Quest 3 (kl_jni.c, klj_field_sval), and the system
+    // name says the same so the two identities agree.
+    extern const char *kl_driver_target_name(void);
+    const char *t = kl_driver_target_name();
+    // Roboquest VR's Meta Store build (x9269393463181825) is presented as a
+    // Quest 3 too (kl_jni.c).
     snprintf(props->systemName, sizeof props->systemName, "%s",
-             kl_env_str("KL_XR_SYSTEM_NAME", "Oculus Quest2"));
+             kl_env_str("KL_XR_SYSTEM_NAME",
+                        t && (strcmp(t, "steamlink-vr") == 0 ||
+                              strcmp(t, "x9269393463181825") == 0) ? "Meta Quest 3"
+                                                                   : "Oculus Quest2"));
     // The maxima are a ceiling on what a swapchain may ask for, not a
     // recommendation — so they are generous, and the recommendation lives in
     // the view configuration below where the guest will actually read it.
@@ -1390,6 +1723,7 @@ static XrResult klxr_GetSystemProperties(void *instance, XrSystemId system_id,
     props->graphicsProperties.maxLayerCount = 16;
     props->trackingProperties.orientationTracking = 1;
     props->trackingProperties.positionTracking = 1;
+    if (klxr_ext_gate_open(KLXR_GATE_HITMAN3)) klxr_fill_space_warp_props(props->next, ew, eh);
     return KLXR_SUCCESS;
 }
 
@@ -1409,8 +1743,30 @@ static XrResult klxr_EnumerateViewConfigurationViews(
     if (!views) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
 
     int ew = 0, eh = 0;
-    kl_ovrp_eye_texture_size(&ew, &eh);
+    kl_ovrp_eye_texture_size_for_cone(&ew, &eh);
     if (ew <= 0 || eh <= 0) { ew = 2290; eh = 2400; }   // the Quest 2 default
+
+    // Moss from Steam (depot 846472, UE 4.27.2 on its OpenXR plugin with mobile
+    // multiview) drew a black picture at the 2290 above. The engine makes its
+    // swapchain the recommended size rounded UP to a multiple of 4 (2292) and
+    // keeps the view rect at the recommendation (2290); a render target larger
+    // than the views sends its mobile renderer down the "needs upscaling" road:
+    // the scene goes into the engine's own scene colour and the pass that would
+    // carry it on never comes for an array target. Traced on the Mac: every
+    // frame three passes into its own 2292x2400 pair, none into a swapchain
+    // image, no copy either – and the headsets this build was made for all
+    // recommend multiples of 4. With one here the two sizes agree and the
+    // scene pass resolves straight into the swapchain image.
+    // Rounded down, so a size that was capped stays under its cap. For that
+    // build only; KL_XR_EYE_ALIGN=<n> sets the multiple for any guest, 1 for
+    // none.
+    {
+        int align = kl_env_int("KL_XR_EYE_ALIGN", klxr_moss_from_steam() ? 4 : 1);
+        if (align > 1 && align <= 64 && ew >= 2 * align && eh >= 2 * align) {
+            ew -= ew % align;
+            eh -= eh % align;
+        }
+    }
 
     for (uint32_t i = 0; i < 2; i++) {
         klxr_log_chain("xrEnumerateViewConfigurationViews", views[i].next);
@@ -1667,7 +2023,8 @@ static XrResult klxr_GetVulkanGraphicsDevice2KHR(
 // worn — there is no such signal on the host, and an idle guest looks exactly
 // like a hung one.
 enum { KLXR_MAGIC_SESSION = 0x584b4c53 /* 'XKLS' */ };
-enum { KLXR_EVENT_QUEUE = 16 };
+enum { KLXR_EVENT_QUEUE = 64 };   // was 16; room for a burst (a room discovery
+                                  // plus a status change per anchor, all at once)
 
 // Which graphics API a session is bound with — see `gfx` below.
 enum { KLXR_GFX_NONE = 0, KLXR_GFX_GLES = 1, KLXR_GFX_VULKAN = 2 };
@@ -1698,6 +2055,10 @@ typedef struct {
     int64_t  predict_time;
     int      predict_valid;
     float    predict_q[4], predict_p[3];
+    // Whether frame predict_on_frame predicts (kl_openxr_set_predict): 0 not
+    // latched yet, 1 off, 2 on. Under g_predict_mu.
+    uint64_t predict_on_frame;
+    int      predict_on;
     // KL_XR_POSE_TRACE: the head this frame was answered with, per entry
     // point, so "the guest draws from one head and declares another" is a
     // measurement rather than a reading of the guest's source. Indexed by
@@ -1723,7 +2084,8 @@ typedef struct {
 } klxr_session;
 
 enum { KLXR_EV_SESSION_STATE = 0, KLXR_EV_INTERACTION_PROFILE = 1,
-       KLXR_EV_USER_PRESENCE = 2 };
+       KLXR_EV_USER_PRESENCE = 2,
+       KLXR_EV_SCENE = 3 };   // state = a slot in g_scene_ev (the room, below)
 
 // XR_EXT_user_presence (advertised only to missioniss, see KLXR_GATE_USER_PRESENCE).
 #define KLXR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT 1000470000
@@ -1772,6 +2134,15 @@ static void klxr_report_frames(FILE *f) {
                     ? "  <- some frames had no compositor slot for this layer" : "");
     }
 }
+
+int kl_openxr_native_handles(uint64_t *instance, uint64_t *session) {
+    if (g_instance.magic != KLXR_MAGIC_INSTANCE || g_session.magic != KLXR_MAGIC_SESSION)
+        return 0;
+    *instance = (uint64_t)(uintptr_t)&g_instance;
+    *session  = (uint64_t)(uintptr_t)&g_session;
+    return 1;
+}
+void *kl_openxr_get_instance_proc_addr(void) { return (void *)klxr_GetInstanceProcAddr; }
 
 static klxr_session *klxr_sess(void *h) {
     klxr_session *s = (klxr_session *)h;
@@ -1908,6 +2279,52 @@ static XrResult klxr_SetColorSpaceFB(void *session, int space) {
     return KLXR_SUCCESS;
 }
 
+
+// ------------------------------------- XR_FB_foveation / XR_FB_swapchain_update_state
+//
+// See the extension table: accepted, recorded, not applied. The profile handle
+// is a cookie — nothing reads it back — and it is non-NULL because the guest
+// passes it on to xrUpdateSwapchainFB and a NULL there is XR_NULL_HANDLE.
+static XrResult klxr_CreateFoveationProfileFB(void *session, const void *info,
+                                              void **profile) {
+    (void)info;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!profile) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    static int cookie;
+    *profile = &cookie;
+    return KLXR_SUCCESS;
+}
+static XrResult klxr_DestroyFoveationProfileFB(void *profile) {
+    (void)profile;
+    return KLXR_SUCCESS;
+}
+static XrResult klxr_UpdateSwapchainFB(void *swapchain, const void *state) {
+    (void)swapchain; (void)state;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [xr] xrUpdateSwapchainFB: swapchain state (fixed "
+                        "foveation) accepted and not applied — the guest's eye "
+                        "images are rendered at full rate\n");
+    return KLXR_SUCCESS;
+}
+
+// The getter half of XR_FB_swapchain_update_state. The guest RESOLVES it (Steam
+// Link's XR UI init does), and, unlike most, calls the pointer without checking
+// that it resolved — so a missing one is not a tidy XR_ERROR, it is a call
+// through NULL: on device that is the CODESIGNING "Invalid Page at 0" SIGKILL
+// that ended Steam Link right after its swapchains were created. Serving it is
+// what turns that into a real call. There is no dynamic state to report (the
+// update side is a no-op above), so the caller's own state struct is left as it
+// set it and the call succeeds. `state` carries a `type`/`next` header this
+// does not need to read to say "nothing changed".
+static XrResult klxr_GetSwapchainStateFB(void *swapchain, void *state) {
+    (void)swapchain; (void)state;
+    static int said;
+    if (!said++)
+        fprintf(stderr, "  [xr] xrGetSwapchainStateFB: no dynamic swapchain state "
+                        "here — returning success, state left unchanged\n");
+    return KLXR_SUCCESS;
+}
 
 // ---------------------------------------------------------- XR_EXT_performance_settings
 //
@@ -2069,6 +2486,18 @@ static int64_t klxr_now(void) {
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
+// The two instants the boot gate reports against. Defined here, above every
+// writer, because the gate itself lives down in the frame path: t0 is
+// xrCreateSession — the moment the guest starts bringing VR up — and everything
+// the gate prints is an offset from it.
+static int64_t g_boot_t0;            // xrCreateSession
+static int64_t g_boot_profile_ns;    // first xrGetCurrentInteractionProfile
+
+// Is the head pose we would hand out a MEASUREMENT? Forward-declared here
+// because the two locate calls and klxr_space_pose_ex all ask it and all sit
+// above the frontend seam it reads. Defined beside the boot gate.
+static int klxr_head_pose_ready(void);
+
 static const char *klxr_state_name(int s) {
     switch (s) {
         case KLXR_SESSION_STATE_IDLE:         return "IDLE";
@@ -2100,6 +2529,39 @@ static void klxr_post_event(klxr_session *s, int kind, int state) {
 
 static void klxr_post_state(klxr_session *s, int state) {
     klxr_post_event(s, KLXR_EV_SESSION_STATE, state);
+}
+
+// ---- scene events (XR_META_spatial_entity_discovery, XR_FB_spatial_entity) ----
+// Structures as in openxr.h 1.1.60; the compiler lays them out exactly as the
+// header does (natural alignment, 64-bit pointers and handles).
+typedef struct { uint8_t data[16]; } klxr_uuid;
+#define KLXR_TYPE_EVENT_DATA_SPACE_SET_STATUS_COMPLETE_FB            1000113006
+#define KLXR_TYPE_EVENT_DATA_SPACE_DISCOVERY_RESULTS_AVAILABLE_META  1000247007
+#define KLXR_TYPE_EVENT_DATA_SPACE_DISCOVERY_COMPLETE_META           1000247008
+typedef struct { int32_t type; const void *next; uint64_t requestId; } klxr_ev_discovery_available;
+typedef struct { int32_t type; const void *next; uint64_t requestId; int32_t result; } klxr_ev_discovery_complete;
+typedef struct { int32_t type; const void *next; uint64_t requestId; int32_t result;
+                 void *space; klxr_uuid uuid; int32_t componentType; uint32_t enabled; } klxr_ev_set_status_complete;
+_Static_assert(sizeof(klxr_ev_set_status_complete) == 64, "XrEventDataSpaceSetStatusCompleteFB");
+enum { KLXR_SCENE_EV_AVAILABLE, KLXR_SCENE_EV_COMPLETE, KLXR_SCENE_EV_SET_STATUS };
+#define KLXR_SCENE_EV_MAX 64
+// Not locked, and neither is g_disc below: both are written by the guest's
+// xrDiscoverSpacesMETA / xrSetSpaceComponentStatusFB and read by its
+// xrPollEvent, which an OpenXR app normally calls from its session thread.
+// A guest that split those across threads would need a lock.
+static struct { int what; uint64_t request; void *space; klxr_uuid uuid; int32_t comp; uint32_t enabled; }
+    g_scene_ev[KLXR_SCENE_EV_MAX];
+static unsigned g_scene_ev_next;
+static void klxr_post_scene(klxr_session *s, int what, uint64_t request, void *space,
+                            const klxr_uuid *uuid, int32_t comp, uint32_t enabled) {
+    unsigned slot = g_scene_ev_next++ % KLXR_SCENE_EV_MAX;
+    g_scene_ev[slot].what = what;
+    g_scene_ev[slot].request = request;
+    g_scene_ev[slot].space = space;
+    if (uuid) g_scene_ev[slot].uuid = *uuid; else memset(&g_scene_ev[slot].uuid, 0, sizeof g_scene_ev[slot].uuid);
+    g_scene_ev[slot].comp = comp;
+    g_scene_ev[slot].enabled = enabled;
+    klxr_post_event(s, KLXR_EV_SCENE, (int)slot);
 }
 
 static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *info,
@@ -2144,6 +2606,11 @@ static XrResult klxr_CreateSession(void *instance, const XrSessionCreateInfo *in
         KLXR_RET(KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING);
     if (vk && !inst->vk_requirements_queried)
         KLXR_RET(KLXR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING);
+
+    // Bring-up starts here as far as the boot gate is concerned: every offset
+    // it prints is measured from this instant, so a reader can tell "the hands
+    // were already there" from "the hands took another second".
+    g_boot_t0 = klxr_now();
 
     memset(&g_session, 0, sizeof g_session);
     g_session.magic = KLXR_MAGIC_SESSION;
@@ -2260,7 +2727,16 @@ static XrResult klxr_RequestExitSession(void *session) {
 // caller testing `result == XR_SUCCESS` rather than `>= 0` reads an empty queue
 // as an event. That is the guest's business, but it is why this returns the
 // specified code rather than an error.
+static XrResult klxr_PollEvent_inner(void *instance, XrEventDataBuffer *data);
+// Every event handed out is also forwarded to the handlers a guest registered
+// with OVRPlugin (kl_ovrp_dispatch_openxr_event) — what the real plugin's
+// xrPollEvent hook does on Meta's OpenXR backend.
 static XrResult klxr_PollEvent(void *instance, XrEventDataBuffer *data) {
+    XrResult r = klxr_PollEvent_inner(instance, data);
+    if (r == KLXR_SUCCESS) kl_ovrp_dispatch_openxr_event(data);
+    return r;
+}
+static XrResult klxr_PollEvent_inner(void *instance, XrEventDataBuffer *data) {
     KLXR_TRACE("xrPollEvent");
     if (!klxr_inst(instance)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (!data) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
@@ -2286,6 +2762,32 @@ static XrResult klxr_PollEvent(void *instance, XrEventDataBuffer *data) {
         return KLXR_SUCCESS;
     }
 
+    if (kind == KLXR_EV_SCENE) {
+        const typeof(g_scene_ev[0]) *e = &g_scene_ev[state % KLXR_SCENE_EV_MAX];
+        if (e->what == KLXR_SCENE_EV_AVAILABLE) {
+            klxr_ev_discovery_available *ev = (klxr_ev_discovery_available *)data;
+            ev->type = KLXR_TYPE_EVENT_DATA_SPACE_DISCOVERY_RESULTS_AVAILABLE_META;
+            ev->next = NULL; ev->requestId = e->request;
+        } else if (e->what == KLXR_SCENE_EV_COMPLETE) {
+            klxr_ev_discovery_complete *ev = (klxr_ev_discovery_complete *)data;
+            ev->type = KLXR_TYPE_EVENT_DATA_SPACE_DISCOVERY_COMPLETE_META;
+            ev->next = NULL; ev->requestId = e->request; ev->result = KLXR_SUCCESS;
+        } else {
+            klxr_ev_set_status_complete *ev = (klxr_ev_set_status_complete *)data;
+            ev->type = KLXR_TYPE_EVENT_DATA_SPACE_SET_STATUS_COMPLETE_FB;
+            ev->next = NULL; ev->requestId = e->request; ev->result = KLXR_SUCCESS;
+            ev->space = e->space; ev->uuid = e->uuid;
+            ev->componentType = e->comp; ev->enabled = e->enabled;
+        }
+        static unsigned said;
+        if (said++ < 40)
+            fprintf(stderr, "  [xr] scene event: %s (request %#llx)\n",
+                    e->what == KLXR_SCENE_EV_AVAILABLE ? "discovery results available"
+                    : e->what == KLXR_SCENE_EV_COMPLETE ? "discovery complete"
+                    : "component status set", (unsigned long long)e->request);
+        return KLXR_SUCCESS;
+    }
+
     if (kind == KLXR_EV_USER_PRESENCE) {
         XrEventDataUserPresenceChangedEXT *ev = (XrEventDataUserPresenceChangedEXT *)data;
         ev->type = KLXR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT;
@@ -2308,6 +2810,108 @@ static XrResult klxr_PollEvent(void *instance, XrEventDataBuffer *data) {
     return KLXR_SUCCESS;
 }
 
+// ----------------------------- ARKit hand skeleton delivery (26 OpenXR joints)
+#define KLXR_HAND_JOINT_COUNT 26
+static pthread_mutex_t g_hand_joint_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+    float poses[KLXR_HAND_JOINT_COUNT][8]; // xyz, xyzw, radius in tracking space
+    uint32_t valid[KLXR_HAND_JOINT_COUNT];
+    int active;
+    int64_t last_ns;
+} klxr_hand_sample;
+static klxr_hand_sample g_hand_samples[2];
+
+void kl_openxr_set_hand_joints(int hand, const float *pose8,
+                              const uint32_t *valid, int count) {
+    if (hand < 0 || hand > 1) return;
+    pthread_mutex_lock(&g_hand_joint_lock);
+    klxr_hand_sample *s = &g_hand_samples[hand];
+    s->active = (pose8 && valid && count == KLXR_HAND_JOINT_COUNT && valid[1] != 0);
+    if (s->active) {
+        memcpy(s->poses, pose8, sizeof s->poses);
+        memcpy(s->valid, valid, sizeof s->valid);
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        s->last_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    } else {
+        memset(s->valid, 0, sizeof s->valid);
+        s->last_ns = 0;
+    }
+    pthread_mutex_unlock(&g_hand_joint_lock);
+}
+
+enum {
+    KLXR_SRC_NONE = 0,
+    KLXR_SRC_BUTTON,          // a bit of the RAW buttons word
+    KLXR_SRC_TOUCH,           // ...of the RAW touches word
+    KLXR_SRC_BUTTON_OTHER,    // a bit of EITHER hand's buttons word (see klxr_eval_other)
+    KLXR_SRC_INDEX_TRIGGER,
+    KLXR_SRC_HAND_TRIGGER,
+    KLXR_SRC_STICK_X,
+    KLXR_SRC_STICK_Y,
+    KLXR_SRC_STICK_VEC,       // the whole stick, read as a Vector2f
+    KLXR_SRC_POSE,            // .../input/grip/pose — the hilt
+    KLXR_SRC_POSE_AIM,        // .../input/aim/pose  — the ray
+    KLXR_SRC_HAPTIC,
+    KLXR_SRC_HAND_GRIP,
+    KLXR_SRC_HAND_AIM,
+    KLXR_SRC_HAND_PINCH_POSE,
+    KLXR_SRC_HAND_POKE,
+    KLXR_SRC_HAND_PINCH,
+    KLXR_SRC_HAND_READY,
+    KLXR_SRC_HAND_GRASP,
+};
+
+// Native hand-interaction actions read the same atomic sample as XR_EXT_hand_tracking.
+// Hand grip/aim/pinch/poke are ANATOMICAL, independent of virtual Touch controllers.
+static int klxr_native_hand_sample(int hand, klxr_hand_sample *out) {
+    if (hand < 0 || hand > 1 || !out) return 0;
+    pthread_mutex_lock(&g_hand_joint_lock);
+    *out = g_hand_samples[hand];
+    pthread_mutex_unlock(&g_hand_joint_lock);
+    if (!out->active) return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    return now >= out->last_ns && now - out->last_ns < 500000000LL &&
+           (out->valid[1] & 1) && (out->valid[1] & 2);
+}
+static float klxr_native_pinch(const klxr_hand_sample *s, int tip) {
+    if (!(s->valid[5] & 1) || !(s->valid[tip] & 1)) return 0;
+    float dx=s->poses[5][0]-s->poses[tip][0];
+    float dy=s->poses[5][1]-s->poses[tip][1];
+    float dz=s->poses[5][2]-s->poses[tip][2];
+    float d=sqrtf(dx*dx + dy*dy + dz*dz);
+    return isfinite(d) ? fmaxf(0, fminf(1, (0.05f-d)/0.02f)) : 0;
+}
+static int klxr_native_hand_pose(int hand, int kind, XrPosef *pose) {
+    klxr_hand_sample s;
+    if (!pose || !klxr_native_hand_sample(hand, &s)) return 0;
+    int j = 0;
+    switch (kind) {
+        case KLXR_SRC_HAND_GRIP: j = (s.valid[0] & 3) == 3 ? 0 : 1; break;
+        case KLXR_SRC_HAND_AIM:  j = 7; break;     // index knuckle basis
+        case KLXR_SRC_HAND_PINCH_POSE: j = 10; break;
+        case KLXR_SRC_HAND_POKE: j = 10; break;    // physical fingertip
+        default: return 0;
+    }
+    if ((s.valid[j] & 3) != 3) return 0;
+    const float *v=s.poses[j];
+    pose->position=(XrVector3f){v[0],v[1],v[2]};
+    pose->orientation=(XrQuaternionf){v[3],v[4],v[5],v[6]};
+    float n = v[3]*v[3]+v[4]*v[4]+v[5]*v[5]+v[6]*v[6];
+    if (!isfinite(n) || n < 0.01f) return 0;
+    if (kind == KLXR_SRC_HAND_PINCH_POSE && (s.valid[5] & 1)) {
+        pose->position.x = (v[0] + s.poses[5][0]) * 0.5f;
+        pose->position.y = (v[1] + s.poses[5][1]) * 0.5f;
+        pose->position.z = (v[2] + s.poses[5][2]) * 0.5f;
+    }
+    return 1;
+}
+static int klxr_native_kind(int kind) {
+    return kind >= KLXR_SRC_HAND_GRIP && kind <= KLXR_SRC_HAND_GRASP;
+}
+
 // ------------------------------------------------------------------- spaces
 //
 // A space is a coordinate frame with a handle. There are two kinds and we serve
@@ -2326,12 +2930,48 @@ static XrResult klxr_PollEvent(void *instance, XrEventDataBuffer *data) {
 // that latches.
 enum { KLXR_MAGIC_SPACE = 0x584b4c50 /* 'XKLP' */, KLXR_SPACE_MAX = 32 };
 
-enum { KLXR_REF_SPACE_VIEW = 1, KLXR_REF_SPACE_LOCAL = 2, KLXR_REF_SPACE_STAGE = 3 };
+enum { KLXR_REF_SPACE_VIEW = 1, KLXR_REF_SPACE_LOCAL = 2, KLXR_REF_SPACE_STAGE = 3,
+       KLXR_REF_SPACE_LOCAL_FLOOR = 1000426000 };
+// A room anchor handed out by xrDiscoverSpacesMETA: reference_type is this base
+// plus the anchor's index in kl_ovrp's emulated room (0 room, 1 floor, ...).
+// Nonzero, so nothing mistakes it for an action space; far from every real
+// XrReferenceSpaceType.
+enum { KLXR_REF_SPACE_ANCHOR = 0x6b6c5000, KLXR_ANCHOR_MAX = 64 };
+#define KLXR_IS_ANCHOR(t) ((t) >= KLXR_REF_SPACE_ANCHOR && (t) < KLXR_REF_SPACE_ANCHOR + KLXR_ANCHOR_MAX)
+
+// LOCAL_FLOOR: XR_EXT_local_floor, promoted to core in OpenXR 1.1, and asked
+// for by an instance created with apiVersion >= 1.1 (Unity's OpenXR plugin
+// 1.1.53). Defined as LOCAL's x, z and yaw with y on the floor. Here LOCAL is
+// the tracking origin raised to the eye height, and the origin is on the floor,
+// so LOCAL_FLOOR is the origin itself — the pose STAGE already has. Refused,
+// DreamSpace asked for it ~4000 times a run and never reached xrBeginSession: a
+// black picture with its music playing (2026-10-16). Fluid (x6946182742093178,
+// Unity OpenXR, api 1.1.54) did the same: ~6000 refusals, no xrBeginSession,
+// black (2026-10-21). Spatial Zombies (x24151641901194680, Unity 6000.6 +
+// OpenXR, api 1.1.54) again: ~2400 refusals, no xrBeginSession, a black picture
+// with its music looping (2026-10-28).
+//   KL_XR_LOCAL_FLOOR=0|1 — default 1 for DreamSpace (x9449316705178989),
+//       Fluid (x6946182742093178) and Spatial Zombies (x24151641901194680),
+//       else 0: a guest that runs today keeps the reference spaces it was given.
+static int klxr_local_floor_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_XR_LOCAL_FLOOR", t && (!strcmp(t, "x3635172946605196") || !strcmp(t, "x9449316705178989") ||
+                                                  !strcmp(t, "x6946182742093178") ||
+                                                  !strcmp(t, "x24151641901194680")));
+    }
+    // Core from 1.1 on; before that it is an extension we do not advertise.
+    uint64_t v = (uint64_t)g_instance.api_version;
+    return on && (((v >> 48) & 0xffff) > 1 ||
+                  (((v >> 48) & 0xffff) == 1 && ((v >> 32) & 0xffff) >= 1));
+}
 
 typedef struct {
     uint32_t magic;
     klxr_session *session;
-    int     reference_type;       // one of the three above, 0 for an action space
+    int     reference_type;       // any supported reference type, 0 for an action space
     XrPosef offset;               // poseInReferenceSpace / poseInActionSpace
     void   *action;               // action spaces only: what this is anchored to
     XrPath  subaction_path;       // ...and which hand of it
@@ -2359,7 +2999,11 @@ static const char *klxr_ref_space_name(int t) {
         case KLXR_REF_SPACE_VIEW:  return "VIEW";
         case KLXR_REF_SPACE_LOCAL: return "LOCAL";
         case KLXR_REF_SPACE_STAGE: return "STAGE";
-        default:                   return "?";
+        case KLXR_REF_SPACE_LOCAL_FLOOR: return "LOCAL_FLOOR";
+        case KLXR_REF_SPACE_ANCHOR + 0:  return "room anchor";
+        case KLXR_REF_SPACE_ANCHOR + 1:  return "floor anchor";
+        case KLXR_REF_SPACE_ANCHOR + 2:  return "ceiling anchor";
+        default:                   return KLXR_IS_ANCHOR(t) ? "wall anchor" : "?";
     }
 }
 
@@ -2553,11 +3197,54 @@ static void klxr_pitches(float *grip, float *aim) {
     if (!init) {
         init = 1;
         grip_pitch = kl_env_float("KL_XR_GRIP_PITCH", KLXR_GRIP_PITCH_DEFAULT);
-        aim_pitch  = kl_env_float("KL_XR_AIM_PITCH", KLXR_AIM_PITCH_DEFAULT);
+        // The aim ray, per target where it has been MEASURED. With the default the
+        // ray is the frontend's hilt frame, and for a PS VR2 Sense controller held
+        // the way one points a pistol straight ahead that frame points 34 to 40
+        // degrees ABOVE the horizon (KL_XR_AIM_LOG on the device, 2026-10-11: three
+        // holds of several seconds each read +34, +39 and +40). Counter-Strike VR
+        // lays its weapon along the aim pose with no correction of its own, so its
+        // player had to tip the hand forward to shoot level — by "about 45", in
+        // his own estimate. 40 degrees more sits between the readings and that.
+        // Only for this target: Steam Link's pointer and the other aim users were
+        // tuned by eye against the default and have not been asked.
+        float aim_default = KLXR_AIM_PITCH_DEFAULT;
+        {
+            extern const char *kl_driver_target_name(void);
+            const char *t = kl_driver_target_name();
+            if (t && strcmp(t, "cs1") == 0) aim_default = -77.0f;
+        }
+        aim_pitch  = kl_env_float("KL_XR_AIM_PITCH", aim_default);
         fprintf(stderr, "  [xr] controller pose: grip pitched %.1f deg "
                         "(KL_XR_GRIP_PITCH), aim a further %.1f deg "
                         "(KL_XR_AIM_PITCH)\n",
                 (double)grip_pitch, (double)aim_pitch);
+    }
+    // The Steam build of a game that is also in the Meta Store (Walkabout Mini
+    // Golf from depot 1408232): the same two poses, devicepose and pointer, and
+    // the same numbers handed over — and its hand pointed UP where the Meta
+    // build's sits right. The game places its hand differently per store, so
+    // the difference is its own and has to be taken out here. Judged on the
+    // headset with a fresh profile (2026-10-13): wrong at 37, right at 0, with
+    // the aim left 37 below. For this game only; no other Steam build has been
+    // looked at.
+    //
+    // Not cached with the pair above: which build this is comes from the game's
+    // files, and on the Mac those are known only once the target is set up.
+    {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (t && strcmp(t, "walkabout") == 0 && (kl_steamapi_shipped() || kl_steamapi_in_use()) &&
+            !getenv("KL_XR_GRIP_PITCH") && !getenv("KL_XR_AIM_PITCH")) {
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  [xr] controller pose, Steam build of this game: grip pitched "
+                                "0.0 deg instead, aim a further -37.0 deg\n");
+            }
+            if (grip) *grip = 0.0f;
+            if (aim)  *aim  = -37.0f;
+            return;
+        }
     }
     if (grip) *grip = grip_pitch;
     if (aim)  *aim  = aim_pitch;
@@ -2595,6 +3282,18 @@ static XrVector3f klxr_grip_pos(int hand) {
         for (int h = 0; h < 2; h++)
             off[h] = klxr_grip_vec(h, "KL_XR_GRIP_POS", "KL_XR_GRIP_POS_L",
                                    "KL_XR_GRIP_POS_R");
+        // DreamSpace draws Quest controllers on the grip pose, and on PSVR2
+        // Sense controllers they hovered above the real ones: 5 cm down was
+        // half of it, and they also wanted 2 cm further from the hand along
+        // the pointing direction (-Z) — both read off the headset, 2026-10-16.
+        // Overridden by the knobs above.
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (t && !strcmp(t, "x9449316705178989") && !kl_env_str("KL_XR_GRIP_POS", NULL) &&
+            !kl_env_str("KL_XR_GRIP_POS_L", NULL) && !kl_env_str("KL_XR_GRIP_POS_R", NULL)) {
+            off[0] = off[1] = (XrVector3f){ 0.0f, -0.10f, -0.02f };
+            fprintf(stderr, "  [xr] KL_XR_GRIP_POS: DreamSpace default 0 -0.10 -0.02 m in the grip's own frame\n");
+        }
     }
     return off[(unsigned)hand > 1 ? 0 : hand];
 }
@@ -2713,6 +3412,29 @@ static void klxr_pose_corrections(XrPosef *p, int is_aim, int hand) {
     XrQuaternionf before = p->orientation;
     klxr_pitch_about_x(p, grip_pitch);
     if (is_aim) klxr_pitch_about_x(p, aim_pitch);
+    // KL_XR_AIM_LOG=1: where each hand's aim ray points, once a second, as an
+    // angle above the horizon. The number a per-game aim pitch is read off: have
+    // the person hold the controller the way they would point a pistol straight
+    // ahead, and the elevation printed then is the error to take out.
+    if (is_aim && (hand == 0 || hand == 1)) {
+        static int on = -1;
+        if (on < 0) on = kl_env_on("KL_XR_AIM_LOG", 0);
+        if (on) {
+            static int64_t next[2];
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+            if (now >= next[hand]) {
+                next[hand] = now + 500;
+                XrVector3f f = klxr_qrot(p->orientation, (XrVector3f){ 0.0f, 0.0f, -1.0f });
+                float fy = f.y > 1.0f ? 1.0f : f.y < -1.0f ? -1.0f : f.y;
+                fprintf(stderr, "  [xr] aim %s: ray %+.1f deg above the horizon "
+                                "(grip pitch %.1f, aim pitch %.1f in force)\n",
+                        hand ? "R" : "L", (double)(asinf(fy) * 180.0f / 3.14159265f),
+                        (double)grip_pitch, (double)aim_pitch);
+            }
+        }
+    }
     // Hold the pivot still across whatever the two pitches just did.
     XrVector3f c = pivot;
     if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f) {
@@ -2803,31 +3525,140 @@ static int64_t klxr_predict_ahead(int64_t display_time) {
 // declines (every host run — `kl_ovrp_set_head_at` is the visionOS
 // compositor's) leaves the delta invalid and every pose is the latched head,
 // which is what this produced before the seam existed and keeps the two entry
-// points agreeing for free. KL_XR_PREDICT=0 is the A/B.
+// points agreeing for free. Off unless KL_XR_PREDICT=1 (see below).
 typedef struct { int valid; float q[4], p[3]; } klxr_head_delta;
+
+// The cache is read and filled from whichever guest threads locate poses
+// (Unity's render and sim threads both do), so the key and the q/p it names
+// are one unit: a reader that saw a new key beside the previous q/p would
+// answer a head that belongs to neither. Key and q/p are therefore only ever
+// read and written together under g_predict_mu. File-static rather than in the
+// session, because the session struct is zeroed whole (and the self-test
+// builds one on the stack).
+//
+// Lock order: g_predict_mu is a LEAF. Nothing is called while it is held but
+// memcpy, and none of this file's other locks (g_defer.mu) is held when it is
+// taken — xrLocateSpace, xrLocateViews and xrEndFrame reach it bare. The
+// prediction itself runs OUTSIDE it, because what it reaches is not ours to
+// order against:
+//
+//   kl_ovrp_head_predict_delta
+//     -> the frontend's head_at callback (visionOS: KleptonCompositor.headAt,
+//        up to eleven ARKit queryDeviceAnchor calls behind ARKit's own locks
+//        and queues, of unbounded duration)
+//     -> klovrp_head(): the one-pose and frame-latch seqlocks (g_op_seq,
+//        g_frame_pose_seq) and the published-pose seqlock (g_pose_seq) —
+//        read side only, bounded retries, no blocking
+//
+// Holding g_predict_mu across that would make every pose entry point on every
+// guest thread wait out an ARKit query, and put a runtime mutex underneath
+// locks of the tracker's that a thread of its could in turn hold while
+// waiting on ours — an inversion this file has no way to rule out. So:
+//
+//   1. under the lock, look the key up; a hit is the answer;
+//   2. with no lock, predict;
+//   3. under the lock again, publish — unless another thread published the
+//      same (frame, instant) first, in which case ITS head is the answer and
+//      ours is dropped. First publisher wins, so two threads missing together
+//      still hand out one head per (frame, instant). A result for a frame
+//      older than the one already cached is returned to its caller but not
+//      published, so a thread descheduled across a frame boundary cannot roll
+//      the cache back.
+//
+// **Off by default** (since 2026-10-15, after the owner's headset test: games
+// run as well without it). KL_XR_PREDICT=1 turns it on — on the launch line, or
+// from the app's Advanced › Test switch "XR prediction" (KleptonTestSwitches,
+// which an installation can start on: KLEPTON_TEST_ON=KL_XR_PREDICT).
+//
+// The value can still be changed while the game runs (kl_openxr_set_predict;
+// only the self-test does, no control in the app offers it any more). The
+// request is an atomic, and it is LATCHED per frame under g_predict_mu: the
+// first entry point to ask about a new frame decides for the whole frame, so a
+// switch arriving mid-frame cannot leave xrLocateSpace predicted and
+// xrLocateViews not. The request is read BEFORE the lock (its first read is the
+// environment's), and under it there is only the latch, so g_predict_mu stays
+// a leaf.
+static pthread_mutex_t g_predict_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_predict_want = -1;        // -1 until read from KL_XR_PREDICT
+
+int kl_openxr_predict(void) {
+    int on = atomic_load(&g_predict_want);
+    if (on >= 0) return on;
+    int from_env = kl_env_on("KL_XR_PREDICT", 0) ? 1 : 0;
+    // Two first readers read the same environment; whichever stores, it is that.
+    if (atomic_compare_exchange_strong(&g_predict_want, &on, from_env))
+        fprintf(stderr, "  [xr] head prediction %s (KL_XR_PREDICT%s)\n", from_env ? "ON" : "OFF",
+                from_env ? "=1" : " unset or 0, the default");
+    return atomic_load(&g_predict_want);
+}
+
+void kl_openxr_set_predict(int on) {
+    on = on != 0;
+    (void)kl_openxr_predict();                 // the environment's value first, so the log says what changed
+    int was = atomic_exchange(&g_predict_want, on);
+    if (was != on)
+        fprintf(stderr, "  [xr] head prediction switched %s (from the next frame)\n", on ? "ON" : "OFF");
+}
+
+// Whether `frame` predicts, given what is asked for now (`want`, read before
+// the lock). Under g_predict_mu. Kept in the session beside the cache, so a new
+// session — whose frame count starts over — latches afresh. A frame older than
+// the latched one (a thread descheduled across the boundary) gets the newer
+// frame's answer rather than rolling the latch back.
+static int klxr_predict_on_locked(klxr_session *s, uint64_t frame, int want) {
+    if (!s->predict_on || frame > s->predict_on_frame) {
+        s->predict_on = want ? 2 : 1;
+        s->predict_on_frame = frame;
+    }
+    return s->predict_on == 2;
+}
+
+// The cached entry for (frame, instant) into `d`, if that is what is cached.
+// Under g_predict_mu.
+static int klxr_predict_lookup_locked(const klxr_session *s, uint64_t frame,
+                                      int64_t display_time, klxr_head_delta *d) {
+    if (s->predict_frame != frame || s->predict_time != display_time) return 0;
+    d->valid = s->predict_valid;
+    memcpy(d->q, s->predict_q, sizeof d->q);
+    memcpy(d->p, s->predict_p, sizeof d->p);
+    return 1;
+}
 
 static klxr_head_delta klxr_frame_head_delta(klxr_session *s, int64_t display_time) {
     klxr_head_delta d = { 0, {0, 0, 0, 1}, {0, 0, 0} };
-    static int predict_on = -1;
-    if (predict_on < 0) predict_on = kl_env_on("KL_XR_PREDICT", 1);
     // A displayTime of 0 is the guest saying it has no frame in flight (JKXR's
     // recentre path locates spaces before its first xrWaitFrame). There is no
     // instant to predict to, so the latched head is the whole answer.
-    if (!predict_on || !s || display_time <= 0) return d;
-    if (s->predict_frame == s->frames_waited && s->predict_time == display_time) {
-        d.valid = s->predict_valid;
-        memcpy(d.q, s->predict_q, sizeof d.q);
-        memcpy(d.p, s->predict_p, sizeof d.p);
+    if (!s || display_time <= 0) return d;
+    int want = kl_openxr_predict();            // outside the lock: it may read the environment
+    // The key is fixed once, here: the prediction below is FOR this frame,
+    // even if xrWaitFrame advances the counter while it runs.
+    uint64_t frame = __atomic_load_n(&s->frames_waited, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_predict_mu);
+    int on = klxr_predict_on_locked(s, frame, want);
+    int hit = on && klxr_predict_lookup_locked(s, frame, display_time, &d);
+    pthread_mutex_unlock(&g_predict_mu);
+    if (!on || hit) return d;
+
+    klxr_head_delta mine = d;
+    mine.valid = kl_ovrp_head_predict_delta(
+        (double)(klxr_now() + klxr_predict_ahead(display_time)) / 1e9, mine.q, mine.p);
+
+    pthread_mutex_lock(&g_predict_mu);
+    if (klxr_predict_lookup_locked(s, frame, display_time, &d)) {
+        // Someone else published this key while we predicted: theirs stands.
+        pthread_mutex_unlock(&g_predict_mu);
         return d;
     }
-    d.valid = kl_ovrp_head_predict_delta(
-        (double)(klxr_now() + klxr_predict_ahead(display_time)) / 1e9, d.q, d.p);
-    s->predict_frame = s->frames_waited;
-    s->predict_time  = display_time;
-    s->predict_valid = d.valid;
-    memcpy(s->predict_q, d.q, sizeof d.q);
-    memcpy(s->predict_p, d.p, sizeof d.p);
-    return d;
+    if (frame >= s->predict_frame) {
+        s->predict_valid = mine.valid;
+        memcpy(s->predict_q, mine.q, sizeof mine.q);
+        memcpy(s->predict_p, mine.p, sizeof mine.p);
+        s->predict_time  = display_time;
+        s->predict_frame = frame;
+    }
+    pthread_mutex_unlock(&g_predict_mu);
+    return mine;
 }
 
 // pose' = delta o pose, the delta on the LEFT because it moves the head the
@@ -2841,10 +3672,59 @@ static XrPosef klxr_head_predicted(XrPosef p, const klxr_head_delta *d) {
     return p;
 }
 
+// LOCAL's height above the tracking floor. Normally kl_ovrp_eye_height(), which
+// is 0 for an OpenXR guest (it never selects an OVRPlugin origin), so LOCAL and
+// STAGE coincide — see the note in kl_openxr_space_selftest.
+//
+// Cave Crave separates them. It is a Unity XR Origin in DEVICE (eye-level)
+// mode that adds its own camera height on top of LOCAL — 1.2 m standing,
+// 0.6 m in its crawl areas — and detects crouching from the head's drop below
+// that. With LOCAL on the floor the measured head height (~1.2 m) is added to
+// the offset: the camera sits at ~2.4 m, kneeling still reads as standing, and
+// the tutorial's crouch step never completes. So for that target LOCAL is
+// what OpenXR says it is: the head's position when tracking started, i.e. the
+// first real head height seen (latched once; under 0.3 m is a frontend that
+// has not published a head yet, and is not latched).
+static float klxr_local_height(void) {
+    static int on = -1;
+    static float latched = -1.0f;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = t && strcmp(t, "x7527722310622065") == 0;
+        // Moss from Steam is the same case, seated: it places the reader's head against its table-top
+        // world from LOCAL as OpenXR defines it. With LOCAL on the floor the head stood 1.3 to 1.6 m above
+        // where the game expects it, and the whole scene lay far below and away ("viel zu weit weg von der
+        // Welt", headset 2026-10-14: `xrLocateSpace: VIEW in LOCAL: (-0.06 1.43 -0.06)`).
+        if (klxr_moss_from_steam()) on = 1;
+        // Flight Unlimited (store 10048506838538799) is seated too: it puts its cockpit and menus at
+        // LOCAL's origin and locates head and hands only in LOCAL. With LOCAL on the floor the eye sat
+        // ~1.3 m above the seat and cockpit and menus lay deep in the floor (headset 2026-10-16:
+        // `xrLocateViews in LOCAL: eye 0 at (-0.027 1.279 -0.036)`).
+        if (t && strcmp(t, "x10048506838538799") == 0) on = 1;
+        // HITMAN 3 VR: Reloaded likewise: it places menus, tutorial hints and the
+        // inventory from LOCAL as OpenXR defines it. With LOCAL on the floor they
+        // hung about a metre low (headset 2026-10-20: `VIEW in LOCAL: (-0.006
+        // 1.085 -0.032)`; on the Mac the dialog's buttons were below the view).
+        if (t && strcmp(t, "x8012387035448196") == 0) on = 1;
+    }
+    if (!on) return kl_ovrp_eye_height();
+    if (latched < 0.0f) {
+        float x, y, z, qx, qy, qz, qw;
+        kl_ovrp_get_guest_head_pose(&x, &y, &z, &qx, &qy, &qz, &qw);
+        if (y < 0.3f) return 0.0f;
+        latched = y;
+        fprintf(stderr, "  [xr] LOCAL origin latched at head height %.3f m "
+                        "(eye-level origin, this target)\n", latched);
+    }
+    return latched;
+}
+
 // `motion_known` reports whether lin/ang are a measurement — a frontend that
 // publishes pose only has them derived (kl_ovrp), and the first sample after a
 // gap has no basis at all. That case must reach the guest as velocityFlags == 0
 // and not as a velocity of zero, which asserts the controller is stationary.
+static int klxr_action_space_kind(const klxr_space *sp, int hand);
 static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
                                   float *lin, float *ang, int *motion_known,
                                   const klxr_head_delta *pred) {
@@ -2853,6 +3733,11 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
     if (motion_known) *motion_known = 0;
     if (!sp) return base;
     if (sp->reference_type == KLXR_REF_SPACE_VIEW) {
+        // Untracked until a frontend has published one — see
+        // klxr_head_pose_ready. The pose is still filled in below (a caller
+        // that ignores the flags gets the same plausible placeholder it always
+        // got); the flags are what stop a guest banking it as its origin.
+        if (tracked) *tracked = klxr_head_pose_ready();
         kl_ovrp_get_guest_head_pose(&base.position.x, &base.position.y,
                                     &base.position.z, &base.orientation.x,
                                     &base.orientation.y, &base.orientation.z,
@@ -2876,7 +3761,14 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
         // published poses, and reported as a measurement only when it is one.
         if (motion_known) *motion_known = kl_ovrp_head_motion(lin, ang);
     } else if (sp->reference_type == KLXR_REF_SPACE_LOCAL) {
-        base.position.y = kl_ovrp_eye_height();
+        base.position.y = klxr_local_height();
+    } else if (KLXR_IS_ANCHOR(sp->reference_type)) {
+        // A room anchor: where kl_ovrp's emulated room puts it, in the tracking
+        // space STAGE is. Static, so no motion to report.
+        float q[4], pp[3];
+        kl_ovrp_room_pose(sp->reference_type - KLXR_REF_SPACE_ANCHOR, q, pp);
+        base.orientation = (XrQuaternionf){ q[0], q[1], q[2], q[3] };
+        base.position    = (XrVector3f){ pp[0], pp[1], pp[2] };
     } else if (sp->reference_type == 0) {
         // An ACTION space — anchored to whatever its pose action is following,
         // which here is one of the two hands. The pose and its motion come out
@@ -2885,6 +3777,14 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
         int is_aim = 0;
         int hand = klxr_action_space_hand(sp, &is_aim);
         float pos[3], quat[4], v[3], a[3];
+        int hand_kind = klxr_action_space_kind(sp, hand);
+        if (klxr_native_kind(hand_kind)) {
+            int ok = klxr_native_hand_pose(hand, hand_kind, &base);
+            if (tracked) *tracked = ok;
+            if (!ok) return (XrPosef){ {0,0,0,1}, {0,0,0} };
+            // No velocity measurement: don't borrow a virtual controller's velocity.
+            goto klxr_space_offset;
+        }
         int present = hand >= 0 && kl_ovrp_hand_motion(hand, pos, quat, v, a);
         if (tracked) *tracked = present;
         if (!present) return base;
@@ -2897,6 +3797,7 @@ static XrPosef klxr_space_pose_ex(const klxr_space *sp, int *tracked,
         if (motion_known) *motion_known = kl_ovrp_hand_motion_known(hand);
     }
 
+klxr_space_offset:
     // ...and the pose the guest asked its space to sit at within that reference
     // space. Every space this guest creates is at the identity, so composing it
     // costs nothing here — but a field we store and never read is a trap for
@@ -2920,19 +3821,19 @@ static XrPosef klxr_space_pose(const klxr_space *sp, const klxr_head_delta *pred
     return klxr_space_pose_ex(sp, NULL, NULL, NULL, NULL, pred);
 }
 
-// The three reference spaces klxr_space_pose can place, and no others —
+// The supported reference spaces klxr_space_pose can place, and no others —
 // xrCreateReferenceSpace refuses everything outside this set, so this list and
 // that check are the same fact.
 static XrResult klxr_EnumerateReferenceSpaces(void *session, uint32_t capacity,
                                               uint32_t *count_out, int32_t *spaces) {
     if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     static const int32_t have[] = { KLXR_REF_SPACE_VIEW, KLXR_REF_SPACE_LOCAL,
-                                    KLXR_REF_SPACE_STAGE };
-    const uint32_t n = sizeof have / sizeof have[0];
+                                    KLXR_REF_SPACE_STAGE, KLXR_REF_SPACE_LOCAL_FLOOR };
+    const uint32_t n = sizeof have / sizeof have[0] - (klxr_local_floor_on() ? 0 : 1);
     XrResult r = klxr_two_call(capacity, count_out, n);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
     if (!spaces) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
-    memcpy(spaces, have, sizeof have);
+    memcpy(spaces, have, n * sizeof have[0]);
     return KLXR_SUCCESS;
 }
 
@@ -2947,12 +3848,13 @@ static XrResult klxr_CreateReferenceSpace(void *session,
         KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     klxr_log_chain("xrCreateReferenceSpace", info->next);
 
-    // VIEW, LOCAL and STAGE are the three every runtime must offer. The vendor
-    // ones (UNBOUNDED_MSFT and friends) are extensions we do not advertise, and
-    // refusing by name here is what makes a guest that wanted one say so.
+    // BRINK/Unity calls LOCAL_FLOOR every frame (OpenXR 1.1, value 1000426000).
+    // This frontend can serve it in its existing floor-aligned tracking frame.
+    // Keep rejecting unknown vendor spaces rather than silently lying.
     if (info->referenceSpaceType != KLXR_REF_SPACE_VIEW &&
         info->referenceSpaceType != KLXR_REF_SPACE_LOCAL &&
-        info->referenceSpaceType != KLXR_REF_SPACE_STAGE) {
+        info->referenceSpaceType != KLXR_REF_SPACE_STAGE &&
+        !(info->referenceSpaceType == KLXR_REF_SPACE_LOCAL_FLOOR && klxr_local_floor_on())) {
         fprintf(stderr, "  [xr] xrCreateReferenceSpace: type %d unsupported\n",
                 info->referenceSpaceType);
         KLXR_RET(KLXR_ERROR_REFERENCE_SPACE_UNSUPPORTED);
@@ -2976,6 +3878,319 @@ static XrResult klxr_DestroySpace(void *space) {
     if (!sp) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     memset(sp, 0, sizeof *sp);
     return KLXR_SUCCESS;
+}
+
+// ------------------------------------------------------------------ the room
+//
+// Meta's scene API over OpenXR — XR_META_spatial_entity_discovery to find the
+// anchors, XR_FB_spatial_entity for their uuids and components, XR_FB_scene
+// and XR_FB_spatial_entity_container for what each one is — answered from the
+// room kl_ovrp already emulates for the ovrp_* scene calls (KL_OVRP_SCENE_ROOM:
+// a box around the head, or visionOS's planes). Meta's MR Utility Kit loads its
+// room only this way; with these refused ("not served") it waits for a room
+// that never comes ("[MRUK] Extended wait timed out — genuinely wedged") and a
+// mixed-reality title shows nothing but the room's passthrough (DreamSpace,
+// 2026-10-16). Served only where that room is offered; everywhere else the
+// names stay "not served", as before.
+//
+// Each anchor is one space in the pool for as long as the guest keeps it, so a
+// rediscovery hands back the same handle instead of draining the pool.
+#define KLXR_SPACE_COMPONENT_NOT_SUPPORTED_FB (-1000113000)
+#define KLXR_TYPE_SPACE_FILTER_UUID_META       1000247003
+#define KLXR_TYPE_SPACE_FILTER_COMPONENT_META  1000247004
+typedef struct { int32_t type; const void *next; } klxr_filter_base;
+typedef struct { int32_t type; const void *next; uint32_t uuidCount; const klxr_uuid *uuids; } klxr_filter_uuid;
+typedef struct { int32_t type; const void *next; int32_t componentType; } klxr_filter_component;
+typedef struct { int32_t type; const void *next; uint32_t filterCount;
+                 const klxr_filter_base *const *filters; } klxr_discovery_info;
+typedef struct { void *space; klxr_uuid uuid; } klxr_discovery_result;
+typedef struct { int32_t type; void *next; uint32_t resultCapacityInput, resultCountOutput;
+                 klxr_discovery_result *results; } klxr_discovery_results;
+typedef struct { int32_t type; void *next; uint32_t enabled, changePending; } klxr_component_status;
+typedef struct { int32_t type; const void *next; int32_t componentType; uint32_t enabled;
+                 int64_t timeout; } klxr_component_status_set_info;
+typedef struct { int32_t type; const void *next; klxr_uuid floorUuid, ceilingUuid;
+                 uint32_t wallUuidCapacityInput, wallUuidCountOutput; klxr_uuid *wallUuids; } klxr_room_layout;
+typedef struct { int32_t type; const void *next; uint32_t uuidCapacityInput, uuidCountOutput;
+                 klxr_uuid *uuids; } klxr_space_container;
+typedef struct { int32_t type; const void *next; uint32_t vertexCapacityInput, vertexCountOutput;
+                 XrVector2f *vertices; } klxr_boundary2d;
+typedef struct { int32_t type; const void *next; uint32_t bufferCapacityInput, bufferCountOutput;
+                 char *buffer; } klxr_semantic_labels;
+typedef struct { XrVector2f offset; XrVector2f extent; } klxr_rect2d;   // XrRect2Df
+// Sizes as openxr.h lays them out (LP64), so a slip in a hand-written field shows here.
+_Static_assert(sizeof(klxr_discovery_result) == 24, "XrSpaceDiscoveryResultMETA");
+_Static_assert(sizeof(klxr_discovery_results) == 32, "XrSpaceDiscoveryResultsMETA");
+_Static_assert(sizeof(klxr_discovery_info) == 32, "XrSpaceDiscoveryInfoMETA");
+_Static_assert(sizeof(klxr_component_status_set_info) == 32, "XrSpaceComponentStatusSetInfoFB");
+_Static_assert(sizeof(klxr_room_layout) == 64, "XrRoomLayoutFB");
+_Static_assert(sizeof(klxr_space_container) == 32, "XrSpaceContainerFB");
+
+static klxr_space *g_anchor_space[KLXR_ANCHOR_MAX];
+
+static int klxr_scene_on(void) { return kl_ovrp_room_on(); }
+
+static klxr_space *klxr_anchor_space(klxr_session *s, int i) {
+    klxr_space *sp = g_anchor_space[i];
+    if (sp && sp->magic == KLXR_MAGIC_SPACE && sp->reference_type == KLXR_REF_SPACE_ANCHOR + i)
+        return sp;
+    sp = klxr_space_alloc();
+    if (!sp) return NULL;
+    memset(sp, 0, sizeof *sp);
+    sp->magic = KLXR_MAGIC_SPACE;
+    sp->session = s;
+    sp->reference_type = KLXR_REF_SPACE_ANCHOR + i;
+    sp->offset = (XrPosef){ {0, 0, 0, 1}, {0, 0, 0} };
+    g_anchor_space[i] = sp;
+    return sp;
+}
+// The anchor a space handle names, or -1.
+static int klxr_anchor_of(void *space) {
+    klxr_space *sp = klxr_space_of(space);
+    if (!sp || !KLXR_IS_ANCHOR(sp->reference_type)) return -1;
+    int i = sp->reference_type - KLXR_REF_SPACE_ANCHOR;
+    return i < kl_ovrp_room_count() ? i : -1;
+}
+
+// Discovery requests: which anchors each found, handed out once by
+// xrRetrieveSpaceDiscoveryResultsMETA.
+#define KLXR_DISC_REQS 16
+static struct { uint64_t id; int n; int idx[KLXR_ANCHOR_MAX]; } g_disc[KLXR_DISC_REQS];
+static uint64_t g_scene_next_req = 0x6b6c7800;
+
+static XrResult klxr_DiscoverSpacesMETA(void *session, const klxr_discovery_info *info,
+                                        uint64_t *requestId) {
+    fprintf(stderr, "  [xr] >> %s\n", "xrDiscoverSpacesMETA");
+    klxr_session *s = klxr_sess(session);
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !requestId) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    // Asking for rooms is where a load starts: the room is taken anew then (as
+    // ovrp_DiscoverSpaces does), and kept for the anchor queries that follow.
+    int asks_rooms = 0;
+    for (uint32_t f = 0; f < info->filterCount && info->filters; f++) {
+        const klxr_filter_base *h = info->filters[f];
+        if (h && h->type == KLXR_TYPE_SPACE_FILTER_COMPONENT_META &&
+            ((const klxr_filter_component *)h)->componentType == 6 /* ROOM_LAYOUT */)
+            asks_rooms = 1;
+    }
+    int n = kl_ovrp_room_prepare(asks_rooms);
+    if (n > KLXR_ANCHOR_MAX) n = KLXR_ANCHOR_MAX;
+    int pick[KLXR_ANCHOR_MAX];
+    for (int i = 0; i < n; i++) pick[i] = 1;
+    // Filters narrow, each one AND the next (as the ovrp form is answered).
+    for (uint32_t f = 0; f < info->filterCount && info->filters; f++) {
+        const klxr_filter_base *h = info->filters[f];
+        if (!h) continue;
+        if (h->type == KLXR_TYPE_SPACE_FILTER_COMPONENT_META) {
+            int c = ((const klxr_filter_component *)h)->componentType;
+            for (int i = 0; i < n; i++) if (!kl_ovrp_room_has(i, c)) pick[i] = 0;
+        } else if (h->type == KLXR_TYPE_SPACE_FILTER_UUID_META) {
+            const klxr_filter_uuid *fu = (const klxr_filter_uuid *)h;
+            int want[KLXR_ANCHOR_MAX] = {0};
+            for (uint32_t k = 0; k < fu->uuidCount && fu->uuids; k++) {
+                int i = kl_ovrp_room_index_of_uuid(fu->uuids[k].data);
+                if (i >= 0 && i < n) want[i] = 1;
+            }
+            for (int i = 0; i < n; i++) if (!want[i]) pick[i] = 0;
+        }
+    }
+    uint64_t id = ++g_scene_next_req;
+    int slot = (int)(id % KLXR_DISC_REQS), found = 0;
+    g_disc[slot].id = id;
+    for (int i = 0; i < n; i++) if (pick[i]) g_disc[slot].idx[found++] = i;
+    g_disc[slot].n = found;
+    *requestId = id;
+    fprintf(stderr, "  [xr] xrDiscoverSpacesMETA: %u filter(s) -> %d of %d room anchor(s) "
+                    "(request %#llx)\n", info->filterCount, found, n, (unsigned long long)id);
+    klxr_post_scene(s, KLXR_SCENE_EV_AVAILABLE, id, NULL, NULL, 0, 0);
+    klxr_post_scene(s, KLXR_SCENE_EV_COMPLETE, id, NULL, NULL, 0, 0);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_RetrieveSpaceDiscoveryResultsMETA(void *session, uint64_t requestId,
+                                                       klxr_discovery_results *out) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    int slot = (int)(requestId % KLXR_DISC_REQS);
+    if (g_disc[slot].id != requestId) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    uint32_t n = (uint32_t)g_disc[slot].n;
+    out->resultCountOutput = n;
+    if (out->resultCapacityInput == 0) return KLXR_SUCCESS;
+    if (out->resultCapacityInput < n) KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (!out->results) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    for (uint32_t k = 0; k < n; k++) {
+        int i = g_disc[slot].idx[k];
+        // The space pool can be full: say so rather than hand out a NULL space
+        // the guest would locate and dereference as a handle.
+        klxr_space *sp = klxr_anchor_space(s, i);
+        if (!sp) KLXR_RET(KLXR_ERROR_LIMIT_REACHED);
+        out->results[k].space = sp;
+        kl_ovrp_room_uuid(i, out->results[k].uuid.data);
+    }
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetSpaceUuidFB(void *space, klxr_uuid *uuid) {
+    int i = klxr_anchor_of(space);
+    if (i < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!uuid) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    kl_ovrp_room_uuid(i, uuid->data);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_EnumerateSpaceSupportedComponentsFB(void *space, uint32_t cap,
+                                                         uint32_t *count, int32_t *types) {
+    int i = klxr_anchor_of(space);
+    if (i < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!count) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    static const int32_t all[] = { 0, 3, 5, 6, 7 };   // locatable, 2D, labels, layout, container
+    uint32_t n = 0;
+    for (size_t k = 0; k < sizeof all / sizeof all[0]; k++) if (kl_ovrp_room_has(i, all[k])) n++;
+    *count = n;
+    if (cap == 0) return KLXR_SUCCESS;
+    if (cap < n) KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (!types) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    n = 0;
+    for (size_t k = 0; k < sizeof all / sizeof all[0]; k++)
+        if (kl_ovrp_room_has(i, all[k])) types[n++] = all[k];
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetSpaceComponentStatusFB(void *space, int32_t comp,
+                                               klxr_component_status *st) {
+    int i = klxr_anchor_of(space);
+    if (i < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!st) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!kl_ovrp_room_has(i, comp)) return KLXR_SPACE_COMPONENT_NOT_SUPPORTED_FB;
+    st->enabled = comp == 0 ? (uint32_t)kl_ovrp_room_locatable(i) : 1;
+    st->changePending = 0;
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_SetSpaceComponentStatusFB(void *space, const klxr_component_status_set_info *info,
+                                               uint64_t *requestId) {
+    klxr_space *sp = klxr_space_of(space);
+    int i = klxr_anchor_of(space);
+    if (i < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !requestId) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!kl_ovrp_room_has(i, info->componentType)) return KLXR_SPACE_COMPONENT_NOT_SUPPORTED_FB;
+    if (info->componentType == 0) kl_ovrp_room_set_locatable(i, info->enabled != 0);
+    uint64_t id = ++g_scene_next_req;
+    *requestId = id;
+    klxr_uuid u; kl_ovrp_room_uuid(i, u.data);
+    klxr_post_scene(sp->session, KLXR_SCENE_EV_SET_STATUS, id, space, &u,
+                    info->componentType, info->enabled != 0);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetSpaceContainerFB(void *session, void *space, klxr_space_container *out) {
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    int i = klxr_anchor_of(space);
+    if (i < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!kl_ovrp_room_has(i, 7)) return KLXR_SPACE_COMPONENT_NOT_SUPPORTED_FB;
+    uint32_t n = (uint32_t)kl_ovrp_room_count() - 1;          // everything but the room
+    out->uuidCountOutput = n;
+    if (out->uuidCapacityInput == 0) return KLXR_SUCCESS;
+    if (out->uuidCapacityInput < n) KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (!out->uuids) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    for (uint32_t k = 0; k < n; k++) kl_ovrp_room_uuid((int)k + 1, out->uuids[k].data);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetSpaceRoomLayoutFB(void *session, void *space, klxr_room_layout *out) {
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    int i = klxr_anchor_of(space);
+    if (i < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!kl_ovrp_room_has(i, 6)) return KLXR_SPACE_COMPONENT_NOT_SUPPORTED_FB;
+    kl_ovrp_room_uuid(1, out->floorUuid.data);
+    kl_ovrp_room_uuid(2, out->ceilingUuid.data);
+    uint32_t n = (uint32_t)kl_ovrp_room_count() - 3;
+    out->wallUuidCountOutput = n;
+    if (out->wallUuidCapacityInput == 0) return KLXR_SUCCESS;
+    if (out->wallUuidCapacityInput < n) KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (!out->wallUuids) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    for (uint32_t k = 0; k < n; k++) kl_ovrp_room_uuid((int)k + 3, out->wallUuids[k].data);
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetSpaceBoundingBox2DFB(void *session, void *space, klxr_rect2d *out) {
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    int i = klxr_anchor_of(space);
+    if (i < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!kl_ovrp_room_has(i, 3)) return KLXR_SPACE_COMPONENT_NOT_SUPPORTED_FB;
+    float w, h; kl_ovrp_room_extent(i, &w, &h);
+    out->offset = (XrVector2f){ -w / 2, -h / 2 };            // centred on the anchor
+    out->extent = (XrVector2f){ w, h };
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetSpaceBoundingBox3DFB(void *session, void *space, void *out) {
+    (void)out;
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (klxr_anchor_of(space) < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    return KLXR_SPACE_COMPONENT_NOT_SUPPORTED_FB;               // planes only, no volumes
+}
+
+static XrResult klxr_GetSpaceBoundary2DFB(void *session, void *space, klxr_boundary2d *out) {
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    int i = klxr_anchor_of(space);
+    if (i < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!kl_ovrp_room_has(i, 3)) return KLXR_SPACE_COMPONENT_NOT_SUPPORTED_FB;
+    out->vertexCountOutput = 4;
+    if (out->vertexCapacityInput == 0) return KLXR_SUCCESS;
+    if (out->vertexCapacityInput < 4) KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (!out->vertices) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    // The rectangle, counter-clockwise seen along the plane's normal (+Z).
+    float w, h; kl_ovrp_room_extent(i, &w, &h);
+    float x = w / 2, y = h / 2;
+    out->vertices[0] = (XrVector2f){ -x, -y };
+    out->vertices[1] = (XrVector2f){  x, -y };
+    out->vertices[2] = (XrVector2f){  x,  y };
+    out->vertices[3] = (XrVector2f){ -x,  y };
+    return KLXR_SUCCESS;
+}
+
+static XrResult klxr_GetSpaceSemanticLabelsFB(void *session, void *space, klxr_semantic_labels *out) {
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    int i = klxr_anchor_of(space);
+    if (i < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!kl_ovrp_room_has(i, 5)) return KLXR_SPACE_COMPONENT_NOT_SUPPORTED_FB;
+    // The count is the label's characters WITHOUT a terminating NUL: MR Utility
+    // Kit takes the buffer as (pointer, count), and with the NUL counted it read
+    // "FLOOR\0" and logged "Unrecognized label: FLOOR" for every anchor
+    // (DreamSpace, 2026-10-16). The NUL is still written when there is room.
+    // Same answer as ovrp_GetSpaceSemanticLabels.
+    const char *l = kl_ovrp_room_label(i);
+    uint32_t n = (uint32_t)strlen(l);
+    out->bufferCountOutput = n;
+    if (out->bufferCapacityInput == 0) return KLXR_SUCCESS;
+    if (out->bufferCapacityInput < n) KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (!out->buffer) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    memcpy(out->buffer, l, n);
+    if (out->bufferCapacityInput > n) out->buffer[n] = 0;
+    return KLXR_SUCCESS;
+}
+
+// Is `name` one of the room's entry points? They are served only while the
+// room is offered (klxr_scene_on); elsewhere a lookup says no, as before.
+static int klxr_is_scene_entry(const char *name) {
+    static const char *const names[] = {
+        "xrDiscoverSpacesMETA", "xrRetrieveSpaceDiscoveryResultsMETA",
+        "xrGetSpaceUuidFB", "xrEnumerateSpaceSupportedComponentsFB",
+        "xrGetSpaceComponentStatusFB", "xrSetSpaceComponentStatusFB",
+        "xrGetSpaceContainerFB", "xrGetSpaceRoomLayoutFB",
+        "xrGetSpaceBoundingBox2DFB", "xrGetSpaceBoundingBox3DFB",
+        "xrGetSpaceBoundary2DFB", "xrGetSpaceSemanticLabelsFB",
+    };
+    for (size_t k = 0; k < sizeof names / sizeof names[0]; k++)
+        if (!strcmp(names[k], name)) return 1;
+    return 0;
 }
 
 // The play area, in metres. XR_SPACE_BOUNDS_UNAVAILABLE is a SUCCESS code (7),
@@ -3025,7 +4240,11 @@ static XrResult klxr_GetReferenceSpaceBoundsRect(void *session, int32_t ref_type
 // inactive is the truth.
 enum { KLXR_MAGIC_ACTION_SET = 0x584b4c41 /* 'XKLA' */,
        KLXR_MAGIC_ACTION     = 0x584b4c61 /* 'XKLa' */ };
-enum { KLXR_PATH_MAX = 256, KLXR_ACTION_SET_MAX = 16, KLXR_ACTION_MAX = 128 };
+// Sized for Vivecraft, the largest action map so far. It creates one action
+// per Minecraft key mapping plus Vivecraft's hidden keys (~100 before mods)
+// across 8 sets. At 128, a modded instance hit LIMIT_REACHED, and the guest
+// then suggests a NULL action, which fails its whole profile.
+enum { KLXR_PATH_MAX = 512, KLXR_ACTION_SET_MAX = 16, KLXR_ACTION_MAX = 256 };
 
 enum { KLXR_ACTION_TYPE_BOOLEAN = 1, KLXR_ACTION_TYPE_FLOAT = 2,
        KLXR_ACTION_TYPE_VECTOR2F = 3, KLXR_ACTION_TYPE_POSE = 4,
@@ -3044,7 +4263,9 @@ enum { KLXR_ACTION_TYPE_BOOLEAN = 1, KLXR_ACTION_TYPE_FLOAT = 2,
 // shim presents a Quest 2 everywhere else (Build.MODEL, Build.PRODUCT
 // "hollywood", ovrp_GetSystemHeadsetType), and the guest's own oculus entry
 // reads "Oculus Quest2 (Left Controller)" / "oculus_touch". Answering a
-// different profile would be the inconsistent act.
+// different profile would be the inconsistent act. (Steam Link itself is now
+// told of a Quest 3, for the stream size; the Touch profile is still one a
+// Quest 3 runtime binds, so the lookup above is unchanged.)
 //
 // It is not, however, the ONLY profile we can drive, and it cannot be
 // hardcoded: VRChat NEVER suggests the Touch profile. A
@@ -3067,6 +4288,7 @@ enum { KLXR_ACTION_TYPE_BOOLEAN = 1, KLXR_ACTION_TYPE_FLOAT = 2,
 // only adds the profile to the driveable set and lets it be reported back as the
 // current interaction profile, which the guest needs to accept its own bindings.
 #define KLXR_PICO_PROFILE   "/interaction_profiles/pico/neo3_controller"
+#define KLXR_HAND_PROFILE   "/interaction_profiles/ext/hand_interaction_ext"
 
 // The profile the CURRENT run answers as bound, decided from the guest's own
 // suggestions (see the note above). Empty until one is suggested; the getter
@@ -3077,24 +4299,11 @@ static char g_active_profile[96];
 static int klxr_profile_driveable(const char *profile) {
     return strcmp(profile, KLXR_ACTIVE_PROFILE) == 0 ||
            strcmp(profile, KLXR_VALVE_PROFILE) == 0 ||
-           strcmp(profile, KLXR_PICO_PROFILE) == 0;
+           strcmp(profile, KLXR_PICO_PROFILE) == 0 ||
+           (strcmp(profile, KLXR_HAND_PROFILE) == 0 && klxr_ext_gate_open(KLXR_GATE_BRINK_HANDS));
 }
 
 // What one binding path reads, once decoded.
-enum {
-    KLXR_SRC_NONE = 0,
-    KLXR_SRC_BUTTON,          // a bit of the RAW buttons word
-    KLXR_SRC_TOUCH,           // ...of the RAW touches word
-    KLXR_SRC_INDEX_TRIGGER,
-    KLXR_SRC_HAND_TRIGGER,
-    KLXR_SRC_STICK_X,
-    KLXR_SRC_STICK_Y,
-    KLXR_SRC_STICK_VEC,       // the whole stick, read as a Vector2f
-    KLXR_SRC_POSE,            // .../input/grip/pose — the hilt
-    KLXR_SRC_POSE_AIM,        // .../input/aim/pose  — the ray
-    KLXR_SRC_HAPTIC,
-};
-
 // The decode table, and the whole of the judgement in this file's input path.
 //
 // `bit[hand]` is the ovrpButton/ovrpTouch RAW bit for the named control on that
@@ -3223,6 +4432,7 @@ static int klxr_path_hand(const char *p, const char **suffix) {
 static const char *klxr_src_name(int kind) {
     switch (kind) {
         case KLXR_SRC_BUTTON:        return "button";
+        case KLXR_SRC_BUTTON_OTHER:  return "button (either hand)";
         case KLXR_SRC_TOUCH:         return "touch";
         case KLXR_SRC_INDEX_TRIGGER: return "index trigger";
         case KLXR_SRC_HAND_TRIGGER:  return "hand trigger";
@@ -3232,6 +4442,13 @@ static const char *klxr_src_name(int kind) {
         case KLXR_SRC_POSE:          return "grip pose";
         case KLXR_SRC_POSE_AIM:      return "aim pose";
         case KLXR_SRC_HAPTIC:        return "haptic";
+        case KLXR_SRC_HAND_GRIP:     return "ARKit palm grip";
+        case KLXR_SRC_HAND_AIM:      return "ARKit index aim";
+        case KLXR_SRC_HAND_PINCH_POSE:return "ARKit pinch pose";
+        case KLXR_SRC_HAND_POKE:     return "ARKit index poke";
+        case KLXR_SRC_HAND_PINCH:    return "ARKit pinch value";
+        case KLXR_SRC_HAND_READY:    return "ARKit hand ready";
+        case KLXR_SRC_HAND_GRASP:    return "ARKit grasp value";
         default:                     return "unbound";
     }
 }
@@ -3345,10 +4562,16 @@ static klxr_action_set *klxr_action_set_of(void *h) {
         if (h == &g_action_sets[i] && g_action_sets[i].magic) return &g_action_sets[i];
     return NULL;
 }
+// The action pool is checked by address arithmetic rather than a scan. A
+// scan costs O(pool) on every getter, and Vivecraft makes ~4 getter calls per
+// action per frame over ~100 actions. The answer is the same: an in-pool,
+// element-aligned address with a live magic word.
 static klxr_action *klxr_action_of(void *h) {
-    for (int i = 0; i < KLXR_ACTION_MAX; i++)
-        if (h == &g_actions[i] && g_actions[i].magic) return &g_actions[i];
-    return NULL;
+    uintptr_t base = (uintptr_t)g_actions, p = (uintptr_t)h;
+    if (p < base || p >= base + sizeof g_actions) return NULL;
+    if ((p - base) % sizeof g_actions[0]) return NULL;
+    klxr_action *a = h;
+    return a->magic ? a : NULL;
 }
 
 static XrResult klxr_DestroyActionSet(void *action_set) {
@@ -3441,8 +4664,15 @@ static int klxr_action_space_hand(const klxr_space *sp, int *is_aim) {
             if (a->kind[h] != KLXR_SRC_NONE) { if (hand >= 0) return -1; hand = h; }
     }
     if (hand < 0) return -1;
-    if (is_aim) *is_aim = a->kind[hand] == KLXR_SRC_POSE_AIM;
+    if (is_aim) *is_aim = a->kind[hand] == KLXR_SRC_POSE_AIM ||
+                            a->kind[hand] == KLXR_SRC_HAND_AIM;
     return hand;
+}
+
+static int klxr_action_space_kind(const klxr_space *sp, int hand) {
+    if (!sp || hand < 0 || hand > 1) return KLXR_SRC_NONE;
+    klxr_action *a = klxr_action_of(sp->action);
+    return a ? a->kind[hand] : KLXR_SRC_NONE;
 }
 
 // The binding suggestions, and this is the interesting one: it is the guest
@@ -3487,15 +4717,29 @@ static XrResult klxr_SuggestInteractionProfileBindings(
         // explicit, and an app that rebinds mid-session (a settings screen)
         // would otherwise accumulate both maps and read whichever won the
         // last write. Cheap to get right here and impossible to notice later.
-        for (int i = 0; i < KLXR_ACTION_MAX; i++)
-            if (g_actions[i].magic)
-                for (int h = 0; h < 2; h++) {
-                    g_actions[i].kind[h] = KLXR_SRC_NONE;
-                    g_actions[i].bit[h] = 0;
-                    g_actions[i].bind[h] = 0;
-                }
+        if (klxr_ext_gate_open(KLXR_GATE_BRINK_HANDS)) {
+            // BRINK submits separate controller and anatomical-hand maps.
+            // Preserve its complementary actions as in the confirmed port.
+            for (uint32_t i = 0; i < bindings->countSuggestedBindings; i++) {
+                klxr_action *a = klxr_action_of(bindings->suggestedBindings[i].action);
+                if (!a) continue;
+                int h = klxr_path_hand(klxr_path_str(bindings->suggestedBindings[i].binding), NULL);
+                if (h >= 0) { a->kind[h] = KLXR_SRC_NONE; a->bit[h] = 0; a->bind[h] = 0; }
+            }
+        } else {
+            // Keep 824's replacement semantics for every other guest.
+            for (int i = 0; i < KLXR_ACTION_MAX; i++)
+                if (g_actions[i].magic)
+                    for (int h = 0; h < 2; h++) {
+                        g_actions[i].kind[h] = KLXR_SRC_NONE;
+                        g_actions[i].bit[h] = 0;
+                        g_actions[i].bind[h] = 0;
+                    }
+        }
     }
 
+    if (active && !strcmp(profile, KLXR_HAND_PROFILE))
+        fprintf(stderr, "  [xr] BRINK native hand profile: anatomy-based grip, pinch, poke enabled\n");
     unsigned took = 0, unknown = 0;
     for (uint32_t i = 0; i < bindings->countSuggestedBindings; i++) {
         const XrActionSuggestedBinding *b = &bindings->suggestedBindings[i];
@@ -3513,6 +4757,62 @@ static XrResult klxr_SuggestInteractionProfileBindings(
                     bit  = g_xr_sources[s].bit[hand];
                     break;
                 }
+            // XR_EXT_hand_interaction has its own, ANATOMICAL action sources.
+            // It must not inherit Oculus Touch grip/aim offsets or threshold bits.
+            if (!strcmp(profile, KLXR_HAND_PROFILE)) {
+                kind = KLXR_SRC_NONE; bit = 0;
+                if (!strcmp(suffix, "/input/grip/pose")) kind = KLXR_SRC_HAND_GRIP;
+                else if (!strcmp(suffix, "/input/aim/pose")) kind = KLXR_SRC_HAND_AIM;
+                else if (!strcmp(suffix, "/input/pinch_ext/pose")) kind = KLXR_SRC_HAND_PINCH_POSE;
+                else if (!strcmp(suffix, "/input/poke_ext/pose")) kind = KLXR_SRC_HAND_POKE;
+                else if (!strcmp(suffix, "/input/pinch_ext/value") ||
+                         !strcmp(suffix, "/input/aim_activate_ext/value"))
+                    kind = KLXR_SRC_HAND_PINCH;
+                else if (!strcmp(suffix, "/input/grasp_ext/value")) kind = KLXR_SRC_HAND_GRASP;
+                else if (!strcmp(suffix, "/input/pinch_ext/ready_ext") ||
+                         !strcmp(suffix, "/input/aim_activate_ext/ready_ext") ||
+                         !strcmp(suffix, "/input/grasp_ext/ready_ext"))
+                    kind = KLXR_SRC_HAND_READY;
+            }
+            // Unreal binds a "grip click" key to the BARE /input/squeeze – the
+            // Touch profile has no squeeze/click, the runtime is to make the
+            // press out of the value. Moss from Steam suggests it for both
+            // hands and both came out "not recognised", a grip press that
+            // never arrives. Served like squeeze/click above, from the hand
+            // trigger's own threshold bit. For that build only: no other
+            // guest's use of the bare path has been looked at.
+            // ...and Roboquest VR's Meta Store build (x9269393463181825, UE 5.6),
+            // whose grab is that key: the hand closed on the grip (its pose is
+            // the axis, squeeze/value) and the weapon in the tutorial could not
+            // be picked up (on device, 2026-10-23, both hands "not recognised").
+            if (kind == KLXR_SRC_NONE && strcmp(suffix, "/input/squeeze") == 0 &&
+                (klxr_moss_from_steam() || klxr_target_is("x9269393463181825"))) {
+                kind = KLXR_SRC_BUTTON;
+                bit  = hand ? KL_OVRP_RAW_RHAND_TRIGGER : KL_OVRP_RAW_LHAND_TRIGGER;
+            }
+            // The Steam Frame's right controller carries all four face buttons; the two
+            // controllers here carry two each, as Touch does. For Moss from Steam the right
+            // hand's x and y are the LEFT controller's (Square and Triangle on a Sense
+            // controller), so that attack (right x) and jump (right a) are two buttons.
+            // Without this both read the right A. Attack is ALSO the right B (Circle): that
+            // is where the Quest build has it (HeroPrimary <- OculusPress_Right_FaceButtonB),
+            // and what the owner asked for after the first run with Square alone.
+            if (hand == 1 && klxr_moss_from_steam() && strcmp(profile, KLXR_VALVE_PROFILE) == 0) {
+                if (strcmp(suffix, "/input/x/click") == 0) { kind = KLXR_SRC_BUTTON_OTHER; bit = KL_OVRP_RAW_X | KL_OVRP_RAW_B; }
+                if (strcmp(suffix, "/input/y/click") == 0) { kind = KLXR_SRC_BUTTON_OTHER; bit = KL_OVRP_RAW_Y; }
+                if (strcmp(suffix, "/input/x/touch") == 0 || strcmp(suffix, "/input/y/touch") == 0) kind = KLXR_SRC_NONE;
+            }
+            // A BOOLEAN action bound to the bare /input/thumbstick reads the
+            // stick's click: the spec has a boolean bound to an identifier take
+            // its click component. Served as the whole stick it read the X
+            // deflection, non-zero on every push — HITMAN 3 VR: Reloaded binds
+            // "thumbstick_click" that way, so each snap turn on the right stick
+            // toggled crouching and each step on the left one let go of a
+            // dragged body (headset, 2026-10-20).
+            if (kind == KLXR_SRC_STICK_VEC && a->type == KLXR_ACTION_TYPE_BOOLEAN) {
+                kind = KLXR_SRC_BUTTON;
+                bit  = hand ? KL_OVRP_RAW_RTHUMBSTICK : KL_OVRP_RAW_LTHUMBSTICK;
+            }
             // A row whose bit for THIS hand is zero names a control this hand
             // does not have (a/b on the left, x/y on the right). Not an error
             // — just not bound.
@@ -3626,6 +4926,12 @@ static XrResult klxr_GetCurrentInteractionProfile(void *session, XrPath top_leve
                                                   : KLXR_ACTIVE_PROFILE;
         klxr_StringToPath(s->instance, profile, &state->interactionProfile);
     }
+    // When the guest first asked which controller it has — the third seam of
+    // the boot race, and the one that is already race-free: the answer above
+    // does not wait for a controller to appear, it is the profile the guest
+    // itself suggested. Timestamped anyway, so the gate's line can show that it
+    // was answered early and rule it out rather than leave it arguable.
+    if (!g_boot_profile_ns) g_boot_profile_ns = klxr_now();
     // Only an app that enabled the extension is allowed to supply this chain.
     // Walk the normal OpenXR output chain (bounded like the velocity helper),
     // leaving unrelated structures untouched. A missing platform reading is
@@ -3661,6 +4967,55 @@ static XrResult klxr_GetCurrentInteractionProfile(void *session, XrPath top_leve
     return KLXR_SUCCESS;
 }
 
+// ---- the dominant hand ------------------------------------------------------
+//
+// A SteamVR game with a "weapon hand" option does not ship a second set of
+// bindings for it. Half-Life: Alyx's binding files are all a right-handed
+// player's (Fire on the right trigger); set to left it calls
+// IVRInput::SetDominantHand(LeftHand), moves the gun to the left hand itself and
+// expects the RUNTIME to drive the bindings written for one hand's controls from
+// the other controller — buttons, triggers, sticks and haptics. Poses stay with
+// their controllers. (Glovebox's finding and rule, github.com/glovebox-vr/
+// glovebox, runtime/openvr/src/klvr_input.cpp, MIT.) xrizer hands the call on
+// (third-party/xrizer/xrizer-dominant-hand.py, kl_lx_interstitial.c), and since
+// OpenXR cannot rebind an attached session the swap is made here, where the
+// bindings are read: a binding suggested for one hand is evaluated on the other
+// controller and reported as that controller's hand. An action bound the same
+// on both hands — a grip, a stick — is unchanged by it.
+static _Atomic int g_xr_mirror;
+
+void kl_openxr_set_dominant_hand(int left) {
+    left = !!left;
+    if (atomic_exchange(&g_xr_mirror, left) == left) return;
+    fprintf(stderr, "  [xr] dominant hand: %s\n",
+            left ? "left — each hand's buttons, triggers, sticks and haptics are "
+                   "driven by the other controller; poses stay with their controllers"
+                 : "right — bindings as suggested");
+}
+
+// Which hand's binding the controller in `hand` drives.
+static int klxr_bind_hand(const klxr_action *a, int hand) {
+    if (!atomic_load(&g_xr_mirror) || a->type == KLXR_ACTION_TYPE_POSE) return hand;
+    return hand ^ 1;
+}
+
+// A button word for one hand's controls, as the same controls on the other.
+static uint32_t klxr_mirror_bits(uint32_t b) {
+    static const uint32_t pair[][2] = {
+        { KL_OVRP_RAW_A, KL_OVRP_RAW_X }, { KL_OVRP_RAW_B, KL_OVRP_RAW_Y },
+        { KL_OVRP_RAW_RTHUMBSTICK, KL_OVRP_RAW_LTHUMBSTICK },
+        { KL_OVRP_RAW_RINDEX_TRIGGER, KL_OVRP_RAW_LINDEX_TRIGGER },
+        { KL_OVRP_RAW_RHAND_TRIGGER, KL_OVRP_RAW_LHAND_TRIGGER },
+    };
+    uint32_t out = b;
+    for (unsigned i = 0; i < sizeof pair / sizeof pair[0]; i++) {
+        out &= ~(pair[i][0] | pair[i][1]);
+        if (b & pair[i][0]) out |= pair[i][1];
+        if (b & pair[i][1]) out |= pair[i][0];
+    }
+    return out;
+}
+
 // ---- the per-frame snapshot ------------------------------------------------
 //
 // One read of kl_ovrp per hand, then every bound action evaluated against it.
@@ -3674,10 +5029,29 @@ typedef struct {
     float    index_trigger, hand_trigger, stick_x, stick_y;
 } klxr_hand_input;
 
-static float klxr_eval(const klxr_action *a, int hand, const klxr_hand_input *in) {
-    switch (a->kind[hand]) {
-        case KLXR_SRC_BUTTON:        return (in->buttons & a->bit[hand]) ? 1.0f : 0.0f;
-        case KLXR_SRC_TOUCH:         return (in->touches & a->bit[hand]) ? 1.0f : 0.0f;
+// `bind` is the hand whose suggested binding is read, `in` the controller it is
+// read on — the same hand, except under a left dominant hand (klxr_bind_hand),
+// where the binding's button is the other controller's counterpart.
+// The other controller's snapshot, for KLXR_SRC_BUTTON_OTHER; set by klxr_SyncActions around each call.
+static const klxr_hand_input *klxr_eval_other;
+static float klxr_eval(const klxr_action *a, int bind, int hand, const klxr_hand_input *in) {
+    uint32_t bit = bind == hand ? a->bit[bind] : klxr_mirror_bits(a->bit[bind]);
+    int kind = a->kind[bind];
+    if (kind == KLXR_SRC_HAND_PINCH || kind == KLXR_SRC_HAND_GRASP) {
+        klxr_hand_sample s;
+        if (!klxr_native_hand_sample(hand, &s)) return 0;
+        return klxr_native_pinch(&s, kind == KLXR_SRC_HAND_GRASP ? 15 : 10);
+    }
+    switch (kind) {
+        case KLXR_SRC_BUTTON:        return (in->buttons & bit) ? 1.0f : 0.0f;
+        case KLXR_SRC_BUTTON_OTHER: {
+            // A and B are in the right hand's word and X and Y in the left's (kl_ovrp.h), so one mask over
+            // both words names buttons of either controller without ambiguity.
+            uint32_t all = in->buttons;
+            if (klxr_eval_other && klxr_eval_other->present) all |= klxr_eval_other->buttons;
+            return (all & a->bit[bind]) ? 1.0f : 0.0f;
+        }
+        case KLXR_SRC_TOUCH:         return (in->touches & bit) ? 1.0f : 0.0f;
         case KLXR_SRC_INDEX_TRIGGER: return in->index_trigger;
         case KLXR_SRC_HAND_TRIGGER:  return in->hand_trigger;
         case KLXR_SRC_STICK_X:       return in->stick_x;
@@ -3687,6 +5061,11 @@ static float klxr_eval(const klxr_action *a, int hand, const klxr_hand_input *in
         // isActive from the same field as everything else. STICK_VEC behaves
         // like POSE here too — its real value is a vector and is handled in
         // klxr_SyncActions — and 1 on the way in is only the activity marker.
+        case KLXR_SRC_HAND_GRIP:
+        case KLXR_SRC_HAND_AIM:
+        case KLXR_SRC_HAND_PINCH_POSE:
+        case KLXR_SRC_HAND_POKE:
+        case KLXR_SRC_HAND_READY:
         case KLXR_SRC_STICK_VEC:
         case KLXR_SRC_POSE:
         case KLXR_SRC_POSE_AIM:
@@ -3729,10 +5108,16 @@ static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
         klxr_action *a = &g_actions[i];
         if (!a->magic) continue;
         for (int h = 0; h < 2; h++) {
-            int active = a->kind[h] != KLXR_SRC_NONE && in[h].present;
+            int b = klxr_bind_hand(a, h);
+            int kind = a->kind[b];
+            int active = kind != KLXR_SRC_NONE && in[h].present;
+            if (klxr_native_kind(kind)) {
+                klxr_hand_sample hs;
+                active = klxr_native_hand_sample(h, &hs);
+            }
             float v = 0.0f, w = 0.0f;
             if (active) {
-                if (a->kind[h] == KLXR_SRC_STICK_VEC) {
+                if (kind == KLXR_SRC_STICK_VEC) {
                     // The whole-stick action: both components, sampled once.
                     // A Vector2f must never be assembled from two reads that
                     // could straddle a sync (the reason nothing here reads
@@ -3740,7 +5125,8 @@ static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
                     // way the scalars are.
                     v = in[h].stick_x; w = in[h].stick_y;
                 } else {
-                    v = klxr_eval(a, h, &in[h]);
+                    klxr_eval_other = &in[1 - h];
+                    v = klxr_eval(a, b, h, &in[h]);
                 }
             }
             // "Changed" only between two ACTIVE syncs. A controller appearing
@@ -3749,7 +5135,7 @@ static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
             // a hand comes into view. For a vector, either component moving is
             // a change.
             a->changed[h] = active && a->active[h] &&
-                (a->kind[h] == KLXR_SRC_STICK_VEC
+                (kind == KLXR_SRC_STICK_VEC
                      ? (v != a->value[h] || w != a->value2[h]) : v != a->value[h]);
             if (a->changed[h]) a->change_time[h] = now;
             a->value[h]  = v;
@@ -3782,13 +5168,13 @@ static XrResult klxr_SyncActions(void *session, const XrActionsSyncInfo *info) {
 static int klxr_hands_for(const klxr_action *a, XrPath sub, const char **why) {
     if (sub == 0) {
         int m = 0;
-        for (int h = 0; h < 2; h++) if (a->kind[h] != KLXR_SRC_NONE) m |= 1 << h;
+        for (int h = 0; h < 2; h++) if (a->kind[klxr_bind_hand(a, h)] != KLXR_SRC_NONE) m |= 1 << h;
         if (!m && why) *why = "unbound on both hands";
         return m;
     }
     int hand = klxr_path_hand(klxr_path_str(sub), NULL);
     if (hand < 0) { if (why) *why = "subaction path is not a hand"; return 0; }
-    if (a->kind[hand] == KLXR_SRC_NONE) { if (why) *why = "unbound on that hand"; return 0; }
+    if (a->kind[klxr_bind_hand(a, hand)] == KLXR_SRC_NONE) { if (why) *why = "unbound on that hand"; return 0; }
     return 1 << hand;
 }
 
@@ -3819,9 +5205,10 @@ static void klxr_note_active(klxr_action *a, int hand, float v) {
     // is actually asking — did the button I pressed arrive as `menu/click` or
     // as `system/click`? The path is what the guest suggested, so this line is
     // the join between a physical press and the control the app thinks it is.
-    XrPath p = a->bind[hand];
+    int b = klxr_bind_hand(a, hand);
+    XrPath p = a->bind[b];
     fprintf(stderr, "  [xr] action \"%s\" fired on the %s hand (%s = %.2f) <- %s\n",
-            a->name, hand ? "right" : "left", klxr_src_name(a->kind[hand]),
+            a->name, hand ? "right" : "left", klxr_src_name(a->kind[b]),
             (double)v,
             (p && p <= g_path_count) ? g_paths[p - 1] : "(no path recorded)");
 }
@@ -4047,11 +5434,11 @@ static XrResult klxr_GetInputSourceLocalizedName(
 static int klxr_haptic_hands(const klxr_action *a, XrPath sub) {
     if (sub == 0) {
         int m = 0;
-        for (int h = 0; h < 2; h++) if (a->kind[h] == KLXR_SRC_HAPTIC) m |= 1 << h;
+        for (int h = 0; h < 2; h++) if (a->kind[klxr_bind_hand(a, h)] == KLXR_SRC_HAPTIC) m |= 1 << h;
         return m;
     }
     int hand = klxr_path_hand(klxr_path_str(sub), NULL);
-    if (hand < 0 || a->kind[hand] != KLXR_SRC_HAPTIC) return 0;
+    if (hand < 0 || a->kind[klxr_bind_hand(a, hand)] != KLXR_SRC_HAPTIC) return 0;
     return 1 << hand;
 }
 
@@ -4185,14 +5572,27 @@ typedef struct {
     uint64_t usage;
     uint32_t tex[KLXR_SWAPCHAIN_IMAGES];       // GLES: texture names
     uint64_t vk_img[KLXR_SWAPCHAIN_IMAGES];    // Vulkan: VkImage handles
+    uint64_t vk_fdm[KLXR_SWAPCHAIN_IMAGES];    // Vulkan: XR_FB_foveation_vulkan density maps (klxr_fill_foveation_image)
     int      count;
-    int      acquired;        // index the app currently holds, -1 when none
+    int      acquired;        // the OLDEST index the app holds, -1 when none
+    int      held;            // how many it holds (acquired, not yet released)...
+    int      waited;          // ...and how many of those, oldest first, it has waited on
+    int      said_pipelined;  // the one line saying it holds more than one
     int      last_released;   // ...and the last one it handed BACK, which is the
                               // image it drew: by xrEndFrame the guest's own
                               // framebuffer may already point at the next one
     int      next_index;      // round-robin, which is all "which is free" means
                               // here: nothing else reads these images yet
     int      eye;             // which eye this swapchain was registered as, -1 if not
+    // Vulkan: the eyes this swapchain's images are published for, bit per eye.
+    // A mask and not `mtl_eye`'s single value because an ARRAY swapchain serves
+    // both eyes at once (xrizer submits one, slice 0 and slice 1): with one
+    // value the two views took the swapchain from each other every frame —
+    // six texture publications and four log lines a frame — and its destruction
+    // released only whichever eye had it last, leaving the other eye's table
+    // entries pointing at freed textures.
+    unsigned vk_pub;
+    unsigned said_eyes;      // ...and the eyes its registration line was printed for
     int      mtl_eye;         // ...and which eye its images were BACKED as, -1 if
                               // none. Separate from `eye` because every
                               // projection layer's views claim an eye and only
@@ -4205,6 +5605,10 @@ typedef struct {
     // are GL FBOs over tex[], reused to copy the default framebuffer in.
     void    *surface;
     uint32_t blit_fbo[KLXR_SWAPCHAIN_IMAGES];
+    // Vulkan: 1 + the first compositor stage this swapchain's images are filed
+    // under (klxr_vk_stage_base), 0 while none is assigned.
+    int      vk_stage1;
+    int      vk_flat;      // its images were told to kl_vulkan as a flat layer's (klxr_vk_flat)
 } klxr_swapchain;
 
 static klxr_swapchain g_swapchains[KLXR_SWAPCHAIN_MAX];
@@ -4305,6 +5709,7 @@ static XrResult klxr_EnumerateSwapchainFormats(void *session, uint32_t capacity,
 // knowing which is underneath — exactly as klovrp_SetupEyeTexture2 does it.
 static void (*gl_GenTextures)(int32_t, uint32_t *);
 static void (*gl_DeleteTextures)(int32_t, const uint32_t *);
+static void (*gl_Finish)(void);
 static void (*gl_BindTexture)(uint32_t, uint32_t);
 static void (*gl_TexStorage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
 static void (*gl_TexStorage3D)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t);
@@ -4324,6 +5729,7 @@ static void klxr_gl_init(void) {
     if (gl_GenTextures) return;
     gl_GenTextures    = kl_egl_sym("glGenTextures");
     gl_DeleteTextures = kl_egl_sym("glDeleteTextures");
+    gl_Finish = kl_egl_sym("glFinish");
     gl_BindTexture    = kl_egl_sym("glBindTexture");
     gl_TexStorage2D   = kl_egl_sym("glTexStorage2D");
     gl_TexStorage3D   = kl_egl_sym("glTexStorage3D");
@@ -4357,10 +5763,25 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
                 s->gfx == KLXR_GFX_VULKAN ? "VkFormat" : "GL internal format");
         KLXR_RET(KLXR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED);
     }
-    if (info->sampleCount > 1) {
+    if (info->sampleCount > 1 && s->gfx == KLXR_GFX_VULKAN) {
         fprintf(stderr, "  [xr] xrCreateSwapchain: sampleCount %u — only 1 is served\n",
                 info->sampleCount);
         KLXR_RET(KLXR_ERROR_FEATURE_UNSUPPORTED);
+    }
+    // On GLES the count is not a property of the IMAGES. A Quest hands back
+    // ordinary single-sample textures for a "2-sample" GLES swapchain, and the
+    // app gets its antialiasing by attaching them with a multisampled-render-to-
+    // texture call (glFramebufferTexture[2D]Multisample[Multiview]…), which
+    // resolves implicitly. Doom3Quest asks for 2 this way and treats a refusal as
+    // having no eye buffer at all. So the swapchain is served exactly as a
+    // 1-sample one; whether the guest then multisamples is decided by which of
+    // those attach entry points it finds (kl_egl_sym).
+    if (info->sampleCount > 1) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [xr] xrCreateSwapchain: sampleCount %u on GLES — served as "
+                            "single-sample images (the guest's own multisampled attach, "
+                            "if it has one, is what would antialias)\n", info->sampleCount);
     }
     // faceCount 6 is a cubemap. Nothing in the eye path wants one; refused
     // rather than served as a 2D image.
@@ -4411,6 +5832,8 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
     sc->last_released = -1;
     sc->eye = -1;
     sc->mtl_eye = -1;
+    sc->vk_pub = 0;
+    sc->said_eyes = 0;
 
     if (s->gfx == KLXR_GFX_VULKAN) {
         // The images are VkImages, allocated by kl_vulkan on the device the
@@ -4521,25 +5944,68 @@ static XrResult klxr_CreateSwapchain(void *session, const XrSwapchainCreateInfo 
 // through them and the frame record names the one it drew. Publishing only the
 // released image would leave the compositor sampling a stage that was never
 // filled on the two frames either side of it.
+// Where a Vulkan swapchain's images are filed in the compositor's eye table: a
+// block of its own per swapchain. They used to be filed under their image index
+// alone, so two projection layers from two swapchains — HITMAN 3 VR: Reloaded's
+// world and its interface — landed in the same entries: the interface replaced
+// the world in the compositor (a black world under the menus), and because one
+// swapchain at a time owned an eye the two re-published over each other every
+// frame (the world flashing up now and then; headset, 2026-10-20). The first
+// swapchain gets block 0, so a guest with one projection layer is filed as
+// before. A block is free when no live swapchain holds it.
+static int klxr_vk_stage_base(klxr_swapchain *sc) {
+    if (sc->vk_stage1) return sc->vk_stage1 - 1;
+    for (int b = 0; b + sc->count <= KL_MTL_MAX_STAGES; b += KLXR_SWAPCHAIN_IMAGES) {
+        int used = 0;
+        for (int i = 0; i < KLXR_SWAPCHAIN_MAX && !used; i++)
+            if (&g_swapchains[i] != sc && g_swapchains[i].magic == KLXR_MAGIC_SWAPCHAIN &&
+                g_swapchains[i].vk_stage1 == b + 1) used = 1;
+        if (!used) {
+            sc->vk_stage1 = b + 1;
+            if (b) fprintf(stderr, "  [xr] swapchain %ux%u filed under compositor stages %d..%d "
+                                   "(another projection swapchain holds 0..)\n",
+                           sc->width, sc->height, b, b + sc->count - 1);
+            return b;
+        }
+    }
+    sc->vk_stage1 = 1;
+    return 0;
+}
+
+// A Vulkan swapchain submitted as a flat layer (quad, cylinder, equirect) is
+// not an eye: kl_vulkan takes every swapchain image for one until told, and
+// foveation would shade a panel around the eye's straight-ahead point
+// (kl_vulkan_xr_image_not_eye — HITMAN 3 VR: Reloaded's loading screens).
+static void klxr_vk_flat(klxr_swapchain *sc) {
+    if (!sc || sc->vk_flat || !sc->session || sc->session->gfx != KLXR_GFX_VULKAN) return;
+    sc->vk_flat = 1;
+    for (int i = 0; i < sc->count; i++)
+        kl_vulkan_xr_image_not_eye((unsigned long long)(uintptr_t)sc->vk_img[i]);
+}
+
 static void klxr_publish_eye_vulkan(klxr_swapchain *sc, int eye, int slice) {
-    if (sc->mtl_eye == eye) return;
+    if (sc->vk_pub & (1u << eye)) return;
     if (klxr_format_is_depth(sc->session, sc->format)) return;
     int done = 0;
     for (int k = 0; k < sc->count; k++) {
         void *tex = kl_vulkan_xr_image_mtl(sc->vk_img[k]);
         if (!tex) continue;
-        kl_glfb_note_eye_mtl_texture(eye, k, tex, slice,
+        kl_glfb_note_eye_mtl_texture(eye, klxr_vk_stage_base(sc) + k, tex, slice,
                                      (int)sc->width, (int)sc->height);
         done++;
     }
     if (done == sc->count) {
-        // Same rule as the GL route: exactly one swapchain owns an eye at a
-        // time, and the guest rebuilds its eye swapchains across scenes with
-        // the OLD one destroyed after the new one is asserted.
+        // Same rule as the GL route, within a block of stages: one swapchain
+        // owns an eye's entries at a time, and the guest rebuilds its eye
+        // swapchains across scenes with the OLD one destroyed after the new one
+        // is asserted. A swapchain filed under other stages is left alone.
         for (int i = 0; i < KLXR_SWAPCHAIN_MAX; i++)
-            if (&g_swapchains[i] != sc && g_swapchains[i].mtl_eye == eye)
-                g_swapchains[i].mtl_eye = -1;
+            if (&g_swapchains[i] != sc && g_swapchains[i].vk_stage1 == sc->vk_stage1) {
+                if (g_swapchains[i].mtl_eye == eye) g_swapchains[i].mtl_eye = -1;
+                g_swapchains[i].vk_pub &= ~(1u << eye);
+            }
         sc->mtl_eye = eye;
+        sc->vk_pub |= 1u << eye;
         fprintf(stderr, "  [xr] eye %d: %d Vulkan swapchain image(s) %ux%u slice %d "
                         "exported as MTLTextures — the compositor can sample them\n",
                 eye, done, sc->width, sc->height, slice);
@@ -4640,6 +6106,33 @@ static void klxr_back_eye_images(klxr_swapchain *sc, int eye) {
 // Defined below, beside the quad path that also uses it: a swapchain's index in
 // the table, which is the stable per-swapchain identity the eye mirror keys on.
 static int klxr_layer_id(const klxr_swapchain *sc);
+
+// Every view of a projection layer read from view 0's image rect. A multiview
+// render pass draws all views through one viewport unless the device has
+// VK_QCOM_multiview_per_view_viewports / _render_areas, which MoltenVK does not.
+// HITMAN 3 VR: Reloaded asks for them and, without them, still reports where
+// they would have put each eye: the right eye at x 613 of its 2903-wide slice
+// (Mac, Vision Pro cones) while it was drawn at x 0, like the left. The
+// compositor then read the right eye from the wrong part of the slice — a
+// shifted, distorted right picture that would not fuse (headset, 2026-10-20).
+// Reading view 0's rect alone was not enough: the right eye's picture is drawn
+// with view 0's frustum too — the two Mac captures differ by 1..20 px of
+// parallax, where the right eye's own frustum would move everything ~613 px —
+// so that frustum is the one it is placed with; only the pose stays the view's.
+// On by default for that game only; KL_XR_VIEW0_RECT=1/0 forces it.
+static int klxr_view0_rect_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_XR_VIEW0_RECT", t && !strcmp(t, "x8012387035448196"));
+        if (on)
+            fprintf(stderr, "  [xr] every eye of a projection layer is read from view 0's "
+                            "image rect with view 0's frustum (no per-view viewports here; KL_XR_VIEW0_RECT=0 "
+                            "uses each view's own)\n");
+    }
+    return on;
+}
 
 static int klxr_eye_mirror_on(void) {
     static int on = -1;
@@ -5031,7 +6524,12 @@ static XrResult klxr_DestroySwapchain(void *swapchain) {
     // or the other rather than both: deleting twice is a silent GL no-op but
     // double-counts in the object census, which is what that census exists to
     // be trusted for.
-    if (sc->mtl_eye >= 0) {
+    if (sc->vk_pub) {
+        int base = sc->vk_stage1 ? sc->vk_stage1 - 1 : 0;
+        for (int e = 0; e < 2; e++)
+            if (sc->vk_pub & (1u << e))
+                for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(e, base + i);
+    } else if (sc->mtl_eye >= 0) {
         for (int i = 0; i < sc->count; i++) kl_glfb_release_eye_texture(sc->mtl_eye, i);
     } else if (gl_DeleteTextures) {
         gl_DeleteTextures(sc->count, sc->tex);
@@ -5043,6 +6541,41 @@ static XrResult klxr_DestroySwapchain(void *swapchain) {
             if (sc->blit_fbo[i]) gl_DeleteFramebuffers(1, &sc->blit_fbo[i]);
     memset(sc, 0, sizeof *sc);
     return KLXR_SUCCESS;
+}
+
+// XR_FB_foveation_vulkan: an XrSwapchainImageFoveationVulkanFB chained onto an
+// element asks for the swapchain image's fragment density map. HITMAN 3 VR:
+// Reloaded creates a view on it without checking, and VK_NULL_HANDLE made that
+// a SIGSEGV inside MoltenVK's MVKImageView (Mac run 2026-10-20). So it gets a
+// real image: R8G8_UNORM, one texel per 32x32 pixels (the Quest's density
+// texel size), as many layers as the swapchain. MoltenVK has no fragment
+// density maps, so nothing reads it — the eye is shaded at full density, which
+// is what an unfoveated image is anyway. The chain is read through
+// vm_read_overwrite like every guest chain here and written only once it read
+// back. Made once per image, kept with the swapchain like its colour images.
+struct klxr_fov_vk { int32_t type; int32_t pad; void *next; uint64_t image; uint32_t width, height; };
+static void klxr_fill_foveation_image(klxr_swapchain *sc, int i, void *next) {
+    for (int depth = 0; next && depth < 8; depth++) {
+        struct klxr_fov_vk node;
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)next, sizeof node,
+                              (vm_address_t)&node, &got) != KERN_SUCCESS || got != sizeof node) return;
+        if (node.type == 1000160000) {   // XR_TYPE_SWAPCHAIN_IMAGE_FOVEATION_VULKAN_FB
+            uint32_t w = (sc->width + 31) / 32, h = (sc->height + 31) / 32;
+            if (!sc->vk_fdm[i])
+                sc->vk_fdm[i] = kl_vulkan_xr_image(w, h, sc->array_size, 1, 16 /* VK_FORMAT_R8G8_UNORM */, 0);
+            struct klxr_fov_vk *out = (struct klxr_fov_vk *)next;
+            out->image = sc->vk_fdm[i];
+            out->width = w;
+            out->height = h;
+            if (i == 0)
+                fprintf(stderr, "  [xr] XR_FB_foveation_vulkan: density map %ux%u x%u for swapchain %ux%u "
+                                "(not read: MoltenVK has no fragment density maps)\n",
+                        w, h, sc->array_size, sc->width, sc->height);
+            return;
+        }
+        next = node.next;
+    }
 }
 
 static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity,
@@ -5070,7 +6603,10 @@ static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity
             KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
         }
         XrSwapchainImageVulkanKHR *vk = (XrSwapchainImageVulkanKHR *)images;
-        for (int i = 0; i < sc->count; i++) vk[i].image = sc->vk_img[i];
+        for (int i = 0; i < sc->count; i++) {
+            vk[i].image = sc->vk_img[i];
+            klxr_fill_foveation_image(sc, i, vk[i].next);
+        }
         return KLXR_SUCCESS;
     }
     if (got != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR) {
@@ -5092,8 +6628,23 @@ static XrResult klxr_EnumerateSwapchainImages(void *swapchain, uint32_t capacity
 // consumer — so wait returns immediately. That is a correct answer for the
 // present arrangement rather than a stub for a missing one, but it is the line
 // that has to change the day the compositor samples an image the guest could
-// still be drawing into. The call ORDER is enforced, because a double-acquire
-// is a guest bug we would rather name than absorb.
+// still be drawing into. The call ORDER is enforced as the spec states it.
+//
+// That order allows MORE than one image to be held at a time: an app may
+// acquire again before it releases (a frame-deep pipeline), up to the number of
+// images, and wait and release then work oldest-first. Unreal 5.6's OpenXR
+// path does exactly that (Roboquest VR, x3151760 and the Meta Store build
+// x9269393463181825): it acquires the next frame's image while the last one is
+// still held. This runtime used to allow one, and answered every second acquire
+// with XR_ERROR_CALL_ORDER_INVALID — 7825 times in one run, about every other
+// frame — and the game drew those frames into an image it was never given: a
+// black picture with glimpses of models and UI, stuttering (on device,
+// 2026-10-22, and again for the Meta Store build on 2026-10-23). Held images are always the oldest run of
+// the round-robin, so `last_released`, the one the compositor reads, is never
+// one the app still holds. An app that holds one at a time sees exactly what it
+// saw before.
+static pthread_mutex_t g_klxr_sc_img_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static XrResult klxr_AcquireSwapchainImage(void *swapchain,
                                            const XrSwapchainImageAcquireInfo *info,
                                            uint32_t *index) {
@@ -5102,10 +6653,22 @@ static XrResult klxr_AcquireSwapchainImage(void *swapchain,
     if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (!index) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info) klxr_log_chain("xrAcquireSwapchainImage", info->next);
-    if (sc->acquired >= 0) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
-    sc->acquired = sc->next_index;
+    pthread_mutex_lock(&g_klxr_sc_img_lock);
+    if (sc->held >= sc->count) {             // every image is already held
+        pthread_mutex_unlock(&g_klxr_sc_img_lock);
+        KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
+    }
+    int idx = sc->next_index;
     sc->next_index = (sc->next_index + 1) % sc->count;
-    *index = (uint32_t)sc->acquired;
+    if (sc->held++ == 0) sc->acquired = idx;
+    int held = sc->held, say = held > 1 && !sc->said_pipelined;
+    if (say) sc->said_pipelined = 1;
+    pthread_mutex_unlock(&g_klxr_sc_img_lock);
+    if (say)
+        fprintf(stderr, "  [xr] swapchain %ux%u: the app holds %d images at once "
+                        "(acquired before releasing) — served oldest-first\n",
+                sc->width, sc->height, held);
+    *index = (uint32_t)idx;
     return KLXR_SUCCESS;
 }
 
@@ -5115,7 +6678,13 @@ static XrResult klxr_WaitSwapchainImage(void *swapchain,
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
     if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (info) klxr_log_chain("xrWaitSwapchainImage", info->next);
-    if (sc->acquired < 0) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
+    // Waits are counted oldest-first. A second wait on an image that is already
+    // waited on was accepted before and still is: only "nothing held" is refused.
+    pthread_mutex_lock(&g_klxr_sc_img_lock);
+    int ok = sc->held > 0;
+    if (sc->waited < sc->held) sc->waited++;
+    pthread_mutex_unlock(&g_klxr_sc_img_lock);
+    if (!ok) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
     return KLXR_SUCCESS;
 }
 
@@ -5125,9 +6694,19 @@ static XrResult klxr_ReleaseSwapchainImage(void *swapchain,
     klxr_swapchain *sc = klxr_swapchain_of(swapchain);
     if (!sc) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
     if (info) klxr_log_chain("xrReleaseSwapchainImage", info->next);
-    if (sc->acquired < 0) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
-    sc->last_released = sc->acquired;
-    sc->acquired = -1;
+    // Releases the oldest held image. A release without a wait was accepted
+    // before and still is, so an app that holds one image at a time is answered
+    // exactly as it always was.
+    pthread_mutex_lock(&g_klxr_sc_img_lock);
+    int ok = sc->held > 0;
+    if (ok) {
+        sc->last_released = sc->acquired;
+        sc->held--;
+        if (sc->waited > 0) sc->waited--;
+        sc->acquired = sc->held ? (sc->acquired + 1) % sc->count : -1;
+    }
+    pthread_mutex_unlock(&g_klxr_sc_img_lock);
+    if (!ok) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
     return KLXR_SUCCESS;
 }
 
@@ -5210,6 +6789,143 @@ static void klxr_fovea_trace(int eye, float x0, float y0, float x1, float y1,
     memset(&fv[eye], 0, sizeof fv[eye]);
 }
 
+// ---- the boot gate: nothing the guest reads on frame 0 may be a placeholder --
+//
+// **The bug this exists to close.** A guest brings VR up in one straight line —
+// create the session, attach the actions, sample the head, sample the hands,
+// and DECIDE, once, what kind of session it is in. Everything after that
+// decision is downstream of it. On this frontend the two things it samples do
+// not arrive together and do not arrive at bring-up: the head pose comes from
+// ARKit's device anchor on the compositor's first frame, and the hands only
+// after visionOS has connected the Sense controllers AND rebuilt its spatial
+// providers around them — measured at +2.2 s after the first compositor frame
+// in every captured launch (`[cp] spatial controllers: []` at +0 ms, the real
+// list at +2.2 s). Bring-up reaches xrCreateSession at about +6 s, so the good
+// launch clears both by four seconds. Nothing enforces that four seconds.
+//
+// When it is not cleared, neither seam refuses — they answer plausibly:
+//
+//   * the head reads as the IDENTITY orientation at eye height (kl_ovrp's
+//     `g_head_set` is still 0), which a guest that captures its VR origin from
+//     the first pose banks as "the user is facing straight ahead, level" while
+//     the user is in fact looking down at the floor putting the headset on. The
+//     whole world is then pitched by that difference forever: the floor runs
+//     DOWNHILL.
+//   * both hands read as absent — kl_ovrp_hand_motion returns 0, so every
+//     action space is untracked and every action inactive. A guest whose aim
+//     comes from the controller and cannot find one falls back to its
+//     flat-screen aim: HL2VR's `vr_moveaim_mode`, a reticle pushed around the
+//     screen by the thumbstick. The crosshair behaves like a MOUSE CURSOR.
+//
+// Both symptoms seen in the headset — a downhill floor and a mouse-cursor
+// crosshair in Half-Life 2 VR — from one missed sample, and a relaunch cures
+// it because a relaunch re-rolls the race. The log line below names which seam
+// was missing on the next occurrence.
+//
+// The fix is to make the first frame WAIT rather than to make the placeholder
+// better, because there is no better placeholder — "facing straight ahead at
+// eye height" is exactly what a correct pose looks like. xrWaitFrame is where a
+// runtime is allowed to hold an app back (it exists to throttle the frame loop)
+// and it is the last call before the guest's first rendered frame, so it is the
+// gate. Held once, on the first wait of the session, never again.
+//
+// Armed only where there is a frontend that publishes poses — `g_frame_pacer`
+// is set exactly by the visionOS compositor (kl_app.c) and by nothing else — so
+// the host path, which publishes no head pose at all in mono, is untouched and
+// waits for nothing. KL_XR_BOOT_GATE=0 disables it, =1 forces it on anywhere;
+// KL_XR_BOOT_GATE_MS sets the deadline (default 4000).
+static int klxr_boot_gate_ms(void) {
+    static int ms = -1;
+    if (ms < 0) {
+        ms = kl_env_int("KL_XR_BOOT_GATE_MS", 4000);
+        if (ms < 0) ms = 0;
+    }
+    return ms;
+}
+
+// Whether the gate is armed at all. Auto = "a display frontend is publishing".
+static int klxr_boot_gate_on(void) {
+    static int on = -1;
+    // rebelancap's fork switches this on wherever a display paces the frames.
+    // Here it is a switch (Advanced > Test), off: Steam Link, Counter-Strike and
+    // Doom 3 were seen starting without it.
+    if (on < 0) on = kl_env_on("KL_XR_BOOT_GATE", 0);
+    return on;
+}
+
+// The head pose as a claim about the world, rather than as seven floats.
+//
+// Before a frontend has published, kl_ovrp answers the identity orientation at
+// eye height — a pose, not a refusal — and OpenXR has exactly one way to say
+// "this is not a measurement": leave the VALID bits out. Saying so is the
+// second half of the boot-race fix and the half that survives the gate timing
+// out: a guest that recentres off an untracked head has been told not to.
+//
+// Only where a frontend is expected to publish at all. The host path runs
+// mono, never calls kl_ovrp_set_head_pose, and must keep locating its head —
+// which is why this is gated on the same frame pacer the boot gate is, and not
+// on the published flag alone. KL_XR_HONEST_HEAD=0 restores the old
+// always-valid answer.
+static int klxr_head_pose_ready(void) {
+    static int honest = -1;
+    // ...and so is this, for the same reason (his default is on).
+    if (honest < 0) honest = kl_env_on("KL_XR_HONEST_HEAD", 0);
+    if (!honest || !g_frame_pacer) return 1;
+    return kl_ovrp_head_pose_published();
+}
+
+static void klxr_boot_gate(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    if (!klxr_boot_gate_on()) return;
+
+    int64_t t_enter = klxr_now();
+    int64_t deadline = t_enter + (int64_t)klxr_boot_gate_ms() * 1000000LL;
+    int64_t head_ns = kl_ovrp_head_pose_published() ? t_enter : 0;
+    int64_t hand_ns[2] = { kl_ovrp_hand_pose_published(0) ? t_enter : 0,
+                           kl_ovrp_hand_pose_published(1) ? t_enter : 0 };
+
+    // 4 ms is well under a display period at any rate this runtime serves, so
+    // the gate costs at most one frame of latency past the instant the last
+    // seam goes live — and on a good launch it costs nothing, because
+    // everything is already true on entry and the loop never runs.
+    while (!head_ns || !hand_ns[0] || !hand_ns[1]) {
+        int64_t now = klxr_now();
+        if (!head_ns && kl_ovrp_head_pose_published()) head_ns = now;
+        for (int h = 0; h < 2; h++)
+            if (!hand_ns[h] && kl_ovrp_hand_pose_published(h)) hand_ns[h] = now;
+        if (head_ns && hand_ns[0] && hand_ns[1]) break;
+        if (now >= deadline) break;
+        usleep(4000);
+    }
+
+    int64_t t_exit = klxr_now();
+    int64_t t0 = g_boot_t0 ? g_boot_t0 : t_enter;
+    // "never" rather than a negative number: a seam that did not arrive inside
+    // the deadline has no offset, and printing one invites reading it as an
+    // offset. Four buffers because all four go into one printf.
+    char b[4][32];
+    const int64_t nsv[4] = { head_ns, hand_ns[0], hand_ns[1], g_boot_profile_ns };
+    for (int i = 0; i < 4; i++) {
+        if (nsv[i]) snprintf(b[i], sizeof b[i], "+%.0f ms",
+                             (double)(nsv[i] - t0) / 1e6);
+        else        snprintf(b[i], sizeof b[i], "NEVER");
+    }
+    // ONE line, and it is the whole diagnosis. On a good launch every offset is
+    // small and none is NEVER. On a bad launch, the missing seam is the one
+    // reading NEVER — and if it is the hands, the flat-screen aim and
+    // the tilted world both follow from it.
+    fprintf(stderr,
+            "  [xr] boot gate: head pose %s, left hand %s, right hand %s, "
+            "profile %s; first frame held %.0f ms of %d ms%s\n",
+            b[0], b[1], b[2], b[3],
+            (double)(t_exit - t_enter) / 1e6, klxr_boot_gate_ms(),
+            (head_ns && hand_ns[0] && hand_ns[1]) ? ""
+                : " — TIMED OUT, the guest starts VR without them "
+                  "(tilted floor / thumbstick crosshair)");
+}
+
 static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
                                XrFrameState *state) {
     KLXR_TRACE("xrWaitFrame");
@@ -5223,6 +6939,10 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
     if (!state) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
     if (info) klxr_log_chain("xrWaitFrame", info->next);
     if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);
+
+    // Before the pacer and before the latch: the first frame must not be
+    // latched against a pose no frontend has published.
+    klxr_boot_gate();
 
     // Block here if the driver has a display to be paced by, BEFORE the latch:
     // the pose this frame is pinned to must be the one the compositor just
@@ -5257,8 +6977,16 @@ static XrResult klxr_WaitFrame(void *session, const XrFrameWaitInfo *info,
     // on is true.
     state->shouldRender = (s->state == KLXR_SESSION_STATE_VISIBLE ||
                            s->state == KLXR_SESSION_STATE_FOCUSED);
+    // Said whenever it changes: an app told "no" submits nothing, and from the
+    // outside that is indistinguishable from an app that never rendered.
+    { static int last = -1;
+      if (last != (int)state->shouldRender) {
+          last = (int)state->shouldRender;
+          fprintf(stderr, "  [xr] xrWaitFrame: shouldRender -> %d (session state %d)\n",
+                  last, (int)s->state);
+      } }
     s->frame_predicted_time = state->predictedDisplayTime;
-    s->frames_waited++;
+    __atomic_add_fetch(&s->frames_waited, 1, __ATOMIC_RELAXED);   // read by klxr_frame_head_delta
     return KLXR_SUCCESS;
 }
 
@@ -5391,7 +7119,234 @@ static void klxr_pose_trace_report(klxr_session *s) {
     memset(worst_m, 0, sizeof worst_m);
 }
 
+// ---------------------------------------------------------------------------
+// A frame published when the GPU has finished it, not when the guest has
+// (KL_VK_FRAME_ASYNC; default on for Half-Life: Alyx, kl_driver.c).
+//
+// xrEndFrame for a Vulkan guest used to wait for the guest's queue to go idle
+// and then publish (kl_vulkan_frame_done). That wait is on the guest's frame
+// thread, so its next frame could not begin until the GPU was done with this
+// one. Here xrEndFrame only MARKS the queue (kl_vulkan_frame_mark) and hands
+// what it was about to publish to one worker thread, which waits for the mark
+// and publishes in the same order as before: the Vulkan serial first, then the
+// frame's record, its layers and its panels.
+//
+// One frame may be in flight. The next xrEndFrame waits for it before taking
+// its own mark — that is where a GPU-bound guest now waits, one frame later and
+// with its own CPU work already done — and it is also what keeps a guest with a
+// three-image swapchain from drawing into the image a compositor is showing:
+// shown N, in flight N+1, being drawn N+2.
+//
+// A frame the GPU does not finish within a second is published anyway. A
+// picture that may be torn is better than a display that never changes again,
+// and the line says so.
+typedef struct {
+    int                 have_rec;
+    kl_ovrp_render_pose rec;
+    int                 have_pl, npl;
+    kl_ovrp_proj_layer  pl[8];
+    int                 nquads;
+    kl_ovrp_overlay     quads[4];
+    int                 eye_layer;
+} klxr_publication;
+
+static struct {
+    pthread_mutex_t  mu;
+    pthread_cond_t   cv;
+    int              started, busy;
+    klxr_publication next;
+    unsigned long    frames, late;
+    // What the change is for, measured: how long the guest still stood at
+    // xrEndFrame for the frame before, and how long the GPU needed after it.
+    uint64_t         held_ns, gpu_ns, since_ns;
+    unsigned         n;
+} g_defer = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, {0}, 0, 0, 0, 0, 0, 0 };
+
+static uint64_t klxr_defer_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+static void *klxr_defer_thread(void *unused) {
+    (void)unused;
+    pthread_setname_np("Klepton Frame Publish");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    for (;;) {
+        pthread_mutex_lock(&g_defer.mu);
+        while (!g_defer.busy) pthread_cond_wait(&g_defer.cv, &g_defer.mu);
+        klxr_publication p = g_defer.next;
+        pthread_mutex_unlock(&g_defer.mu);
+
+        uint64_t t0 = klxr_defer_now();
+        int done = kl_vulkan_frame_wait(1000);
+        uint64_t gpu = klxr_defer_now() - t0;
+        kl_vulkan_frame_publish();
+        if (p.have_rec) kl_ovrp_frame_end_commit(&p.rec);
+        if (p.have_pl) kl_ovrp_proj_layers_external(p.pl, p.npl);
+        kl_ovrp_overlays_external(p.quads, p.nquads);
+        kl_ovrp_eye_layer_external(p.eye_layer);
+        if (p.eye_layer) kl_interstitial_done();
+
+        pthread_mutex_lock(&g_defer.mu);
+        g_defer.frames++;
+        g_defer.gpu_ns += gpu;
+        if (++g_defer.n >= 300) {
+            uint64_t now = klxr_defer_now();
+            if (g_defer.since_ns)
+                fprintf(stderr, "  [xr] FRAME ASYNC over %u frames: %.1f ms a frame; the GPU "
+                                "finished %.1f ms after xrEndFrame; the guest stood %.1f ms "
+                                "at xrEndFrame for the frame before\n", g_defer.n,
+                        (double)(now - g_defer.since_ns) / 1e6 / g_defer.n,
+                        (double)g_defer.gpu_ns / 1e6 / g_defer.n,
+                        (double)g_defer.held_ns / 1e6 / g_defer.n);
+            g_defer.since_ns = now;
+            g_defer.n = 0; g_defer.gpu_ns = 0; g_defer.held_ns = 0;
+        }
+        if (!done && g_defer.late++ < 8)
+            fprintf(stderr, "  [xr] a frame was published before the GPU reported it "
+                            "finished (no answer within 1 s) — %lu of %lu so far\n",
+                    g_defer.late, g_defer.frames);
+        g_defer.busy = 0;
+        pthread_cond_broadcast(&g_defer.cv);
+        pthread_mutex_unlock(&g_defer.mu);
+    }
+    return NULL;
+}
+
+// Wait for the frame in flight, if there is one.
+static void klxr_defer_drain(void) {
+    pthread_mutex_lock(&g_defer.mu);
+    if (g_defer.busy) {
+        uint64_t t0 = klxr_defer_now();
+        while (g_defer.busy) pthread_cond_wait(&g_defer.cv, &g_defer.mu);
+        g_defer.held_ns += klxr_defer_now() - t0;
+    }
+    pthread_mutex_unlock(&g_defer.mu);
+}
+
+// 1 when this frame is to be published by the worker: the frame before it has
+// been published and the guest's queue carries this frame's mark.
+static int klxr_defer_begin(klxr_publication *pub) {
+    static int on = -1;
+    if (on < 0) {
+        on = kl_env_on("KL_VK_FRAME_ASYNC", 0);
+        if (on) fprintf(stderr, "  [xr] KL_VK_FRAME_ASYNC: frames are published by a worker "
+                                "when the GPU has finished them; xrEndFrame no longer waits\n");
+    }
+    if (!on) return 0;
+    klxr_defer_drain();
+    if (!kl_vulkan_frame_mark()) return 0;
+    memset(pub, 0, sizeof *pub);
+    return 1;
+}
+
+static void klxr_defer_submit(const klxr_publication *pub) {
+    pthread_mutex_lock(&g_defer.mu);
+    if (!g_defer.started) {
+        pthread_t t;
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        g_defer.started = pthread_create(&t, &a, klxr_defer_thread, NULL) == 0;
+        pthread_attr_destroy(&a);
+    }
+    if (g_defer.started) {
+        g_defer.next = *pub;
+        g_defer.busy = 1;
+        pthread_cond_broadcast(&g_defer.cv);
+        pthread_mutex_unlock(&g_defer.mu);
+        return;
+    }
+    pthread_mutex_unlock(&g_defer.mu);
+    // No worker: finish it here, the old way.
+    kl_vulkan_frame_wait(1000);
+    kl_vulkan_frame_publish();
+    if (pub->have_rec) kl_ovrp_frame_end_commit(&pub->rec);
+    if (pub->have_pl) kl_ovrp_proj_layers_external(pub->pl, pub->npl);
+    kl_ovrp_overlays_external(pub->quads, pub->nquads);
+    kl_ovrp_eye_layer_external(pub->eye_layer);
+    if (pub->eye_layer) kl_interstitial_done();
+}
+
+// One projection view's XrCompositionLayerSpaceWarpInfoFB (moonshot s3-framegen:
+// frame generation from the game's own motion vectors). Named once per layer
+// and eye — sizes, formats, planes, the app-space delta — and, with
+// KL_XR_SPACEWARP_OUT=<dir>, the motion vectors and depth written raw every
+// KL_VK_OUT_EVERY-th frame (Mac lab; tools/framegen reads them).
+static void klxr_space_warp_seen(klxr_session *s, uint32_t li, uint32_t v,
+                                 const XrCompositionLayerSpaceWarpInfoFB *sw, kl_ovrp_proj_layer *pl) {
+    klxr_swapchain *mv = klxr_swapchain_of(sw->motionVectorSubImage.swapchain);
+    klxr_swapchain *dp = klxr_swapchain_of(sw->depthSubImage.swapchain);
+    // For the compositor's frame generation: the images this frame's views carry, beside the layer.
+    if (pl && v < 2 && mv && mv->last_released >= 0 && mv->last_released < mv->count &&
+        mv->session && mv->session->gfx == KLXR_GFX_VULKAN) {
+        pl->sw_mv[v] = kl_vulkan_xr_image_mtl(mv->vk_img[mv->last_released]);
+        pl->sw_mv_slice[v] = mv->array_size > 1 ? (int)sw->motionVectorSubImage.imageArrayIndex : 0;
+        const XrRect2Di *r = &sw->motionVectorSubImage.imageRect;
+        float *pr = pl->sw_mv_rect[v];
+        pr[0] = pr[1] = pr[2] = pr[3] = 0.0f;
+        if (mv->width > 0 && mv->height > 0 && r->offset.x >= 0 && r->offset.y >= 0 &&
+            r->extent.width > 0 && r->extent.height > 0 &&
+            (uint32_t)(r->offset.x + r->extent.width) <= mv->width &&
+            (uint32_t)(r->offset.y + r->extent.height) <= mv->height) {
+            pr[0] = (float)r->offset.x / (float)mv->width;
+            pr[1] = (float)r->offset.y / (float)mv->height;
+            pr[2] = (float)(r->offset.x + r->extent.width) / (float)mv->width;
+            pr[3] = (float)(r->offset.y + r->extent.height) / (float)mv->height;
+        }
+        if (dp && dp->last_released >= 0 && dp->last_released < dp->count) {
+            pl->sw_depth[v] = kl_vulkan_xr_image_mtl(dp->vk_img[dp->last_released]);
+            pl->sw_depth_slice[v] = dp->array_size > 1 ? (int)sw->depthSubImage.imageArrayIndex : 0;
+        }
+        pl->sw_planes[0] = sw->minDepth; pl->sw_planes[1] = sw->maxDepth;
+        pl->sw_planes[2] = sw->nearZ;    pl->sw_planes[3] = sw->farZ;
+        const XrPosef *dl = &sw->appSpaceDeltaPose;
+        pl->sw_delta[0] = dl->position.x; pl->sw_delta[1] = dl->position.y; pl->sw_delta[2] = dl->position.z;
+        pl->sw_delta[3] = dl->orientation.x; pl->sw_delta[4] = dl->orientation.y;
+        pl->sw_delta[5] = dl->orientation.z; pl->sw_delta[6] = dl->orientation.w;
+    }
+    static unsigned said;
+    unsigned bit = 1u << ((li * 2 + v) & 31);
+    if (!(said & bit)) {
+        said |= bit;
+        const XrRect2Di *mr = &sw->motionVectorSubImage.imageRect, *dr = &sw->depthSubImage.imageRect;
+        const XrPosef *dl = &sw->appSpaceDeltaPose;
+        fprintf(stderr, "  [xr] space warp on layer %u eye %u: flags %#llx, motion vectors %ux%u fmt %lld "
+                        "rect %d,%d %dx%d slice %u; depth %ux%u fmt %lld rect %d,%d %dx%d slice %u; "
+                        "depth %.3f..%.3f, near %.4f far %.1f; app delta q(%.4f %.4f %.4f %.4f) "
+                        "p(%.4f %.4f %.4f)\n",
+                li, v, (unsigned long long)sw->layerFlags,
+                mv ? mv->width : 0, mv ? mv->height : 0, mv ? (long long)mv->format : 0,
+                mr->offset.x, mr->offset.y, mr->extent.width, mr->extent.height,
+                sw->motionVectorSubImage.imageArrayIndex,
+                dp ? dp->width : 0, dp ? dp->height : 0, dp ? (long long)dp->format : 0,
+                dr->offset.x, dr->offset.y, dr->extent.width, dr->extent.height,
+                sw->depthSubImage.imageArrayIndex,
+                (double)sw->minDepth, (double)sw->maxDepth, (double)sw->nearZ, (double)sw->farZ,
+                (double)dl->orientation.x, (double)dl->orientation.y, (double)dl->orientation.z,
+                (double)dl->orientation.w, (double)dl->position.x, (double)dl->position.y,
+                (double)dl->position.z);
+    }
+    static const char *dir = (const char *)-1;
+    if (dir == (const char *)-1) dir = kl_env_str("KL_XR_SPACEWARP_OUT", NULL);
+    if (!dir || !mv || !dp || mv->last_released < 0 || dp->last_released < 0) return;
+    int every = kl_env_int("KL_VK_OUT_EVERY", 1), run = kl_env_int("KL_VK_OUT_RUN", 1);
+    unsigned f = (unsigned)s->frames_ended;
+    if (every > 1 && f % (unsigned)every >= (unsigned)(run < 1 ? 1 : run)) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/sw_f%05u_layer%u_eye%u_mv_%ux%u.rgba16f", dir, f, li, v, mv->width, mv->height);
+    kl_vulkan_xr_image_capture_raw(mv->vk_img[mv->last_released], mv->width, mv->height, 8, 0,
+                                   sw->motionVectorSubImage.imageArrayIndex, path);
+    snprintf(path, sizeof path, "%s/sw_f%05u_layer%u_eye%u_depth_%ux%u.f32", dir, f, li, v, dp->width, dp->height);
+    kl_vulkan_xr_image_capture_raw(dp->vk_img[dp->last_released], dp->width, dp->height, 4, 1,
+                                   sw->depthSubImage.imageArrayIndex, path);
+    const XrPosef *dl = &sw->appSpaceDeltaPose;
+    fprintf(stderr, "  [xr] space warp f%u layer %u eye %u: near %.4f far %.1f, app delta q(%.4f %.4f %.4f %.4f) "
+                    "p(%.4f %.4f %.4f)\n", f, li, v, (double)sw->nearZ, (double)sw->farZ,
+            (double)dl->orientation.x, (double)dl->orientation.y, (double)dl->orientation.z,
+            (double)dl->orientation.w, (double)dl->position.x, (double)dl->position.y, (double)dl->position.z);
+}
+
 static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
+    // The stall watch's heartbeat (runtime/diag/kl_stall.c; KL_STALL_MS).
+    { extern void kl_stall_frame(void); kl_stall_frame(); }
     KLXR_TRACE("xrEndFrame");
     klxr_session *s = klxr_sess(session);
     if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
@@ -5401,7 +7356,39 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);
     if (!s->frame_begun) KLXR_RET(KLXR_ERROR_CALL_ORDER_INVALID);
     s->frame_begun = 0;
+    klxr_note_frame_chains(info, (uint64_t)s->frames_ended);
     s->frames_ended++;
+    // A passthrough layer filed through OVRPlugin counts on this frame boundary
+    // too (Meta's OpenXR backend; see kl_ovrp_openxr_frame_end).
+    kl_ovrp_openxr_frame_end();
+
+    // Back-pressure for a GLES guest that out-runs the GPU. xrWaitFrame paces by
+    // the clock, and ANGLE queues a frame's commands without waiting for them,
+    // so nothing here ever told the guest its previous frame had not finished:
+    // Doom3Quest kept submitting ~100 frames a second into a GPU completing far
+    // fewer, the queue grew without bound, and the compositor's own passes sat
+    // behind all of it (cadence 11 ms -> 22 ms -> 440 ms over three minutes, on
+    // device). A real runtime blocks in xrWaitFrame/xrAcquireSwapchainImage in
+    // that state. glFinish here is the same contract by the bluntest means: the
+    // guest cannot end frame N+1 until frame N is on the GPU's finished side, so
+    // it runs at the rate the GPU sustains and the compositor is never more than
+    // one guest frame behind. Per target, since a guest that fits its budget
+    // only pays latency for it; KL_XR_GL_FINISH=0/1 is the A/B.
+    if (s->gfx != KLXR_GFX_VULKAN && gl_Finish) {
+        static int fin = -1;
+        if (fin < 0) {
+            extern const char *kl_driver_target_name(void);
+            const char *t = kl_driver_target_name();
+            // Tea For God (x6323807174332876) shows the same runaway queue:
+            // 11 ms in its splash, then composite GPU queued 40 -> 250 ms
+            // in-game, felt as heavy judder.
+            fin = kl_env_on("KL_XR_GL_FINISH", t && (strcmp(t, "doom3quest") == 0 ||
+                                                     strcmp(t, "x6323807174332876") == 0));
+            if (fin) fprintf(stderr, "  [xr] xrEndFrame waits for the guest's GL frame to "
+                                     "complete (KL_XR_GL_FINISH)\n");
+        }
+        if (fin) gl_Finish();
+    }
 
     // KL_GLFB_DRAW_CENSUS: periodically dump WHERE the guest's draws land and
     // each framebuffer's colour attachment (texture, array layer, format). The
@@ -5588,6 +7575,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // kl_ovrp_frame_end_external: taking these from the submission rather than
     // from our latch is what stops the compositor correcting a delta the guest
     // has already corrected.
+    kl_ovrp_render_pose depth_meta = {0};
     int   have_layer_pose = 0;
     // Zeroed, not merely assigned below: eye 1's four tangents are written only
     // when the captured layer's SECOND view is walked, and the record is
@@ -5620,6 +7608,52 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             // one layer" is indistinguishable from "the guest composites nothing
             // we understand" — which is the state JKXR was in until the quad was
             // drawn. Cylinder and equirect are the two that would come next.
+            // The panorama: filed with the panels, as the shape the compositor
+            // draws behind everything (kl_ovrp_overlay shape 5). In a frame with
+            // no projection layer it is the whole picture.
+            if (layer->type == XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR) {
+                const XrCompositionLayerEquirect2KHR *eq =
+                    (const XrCompositionLayerEquirect2KHR *)layer;
+                klxr_swapchain *sc = klxr_swapchain_of(eq->subImage.swapchain);
+                klxr_vk_flat(sc);
+                if (sc && sc->last_released >= 0 && sc->last_released < sc->count &&
+                    nquads < (int)(sizeof quads / sizeof *quads)) {
+                    kl_ovrp_overlay *o = &quads[nquads];
+                    memset(o, 0, sizeof *o);
+                    o->layer_id = klxr_layer_id(sc);
+                    o->shape    = 5;                  // ovrpShape Equirect
+                    o->stage    = sc->last_released;
+                    o->tex_w    = (int)sc->width;
+                    o->tex_h    = (int)sc->height;
+                    o->pose[3]  = 1.0f;
+                    o->origin_top_left = sc->session && sc->session->gfx == KLXR_GFX_VULKAN;
+                    // Not a handle: the compositor asks for a non-zero one before
+                    // it draws a panorama, and resolves one below 0x10000 through
+                    // the layer's own image, which is where this picture is.
+                    o->tex      = 1;
+                    o->eq_hscale = eq->centralHorizontalAngle > 0.01f
+                                 ? 6.2831853f / eq->centralHorizontalAngle : 1.0f;
+                    klxr_back_layer_images(sc, sc->array_size > 1
+                        ? (int)eq->subImage.imageArrayIndex : -1);
+                    static int said_eq;
+                    if (!said_eq++)
+                        fprintf(stderr, "  [xr] an equirect layer (a skybox, the loading screen of a "
+                                        "SteamVR game): %ux%u, format %lld, %.0f x %.0f degrees — "
+                                        "composited behind everything\n",
+                                sc->width, sc->height, (long long)sc->format,
+                                (double)(eq->centralHorizontalAngle * 57.2958f),
+                                (double)((eq->upperVerticalAngle - eq->lowerVerticalAngle) * 57.2958f));
+                    if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN)
+                        kl_vulkan_xr_image_capture((unsigned long long)(uintptr_t)sc->vk_img[sc->last_released],
+                                                   sc->width, sc->height, (long long)sc->format, 0,
+                                                   (unsigned)s->frames_ended, 0, 9);
+                    nquads++;
+                    s->layers_quad++;
+                    continue;
+                }
+                s->layers_ignored++;
+                continue;
+            }
             if (layer->type != XR_TYPE_COMPOSITION_LAYER_QUAD &&
                 layer->type != XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR) {
                 static int said[8];
@@ -5654,25 +7688,46 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     qbuf.next = cyl->next; qbuf.layerFlags = cyl->layerFlags;
                     qbuf.space = cyl->space; qbuf.eyeVisibility = cyl->eyeVisibility;
                     qbuf.subImage = cyl->subImage; qbuf.pose = cyl->pose;
-                    float w = cyl->radius * cyl->centralAngle;   // arc length -> flat width
-                    if (!(w > 0)) w = 1.0f;
-                    // A wide cylinder flattens to an ENORMOUS flat panel — cs1's
-                    // menu came out 18.85 m (~124deg), which is what "the menu is
-                    // huge" is. Cap the flat width to a comfortable field of view
-                    // so the flattened menu matches the quad-layer menus (hl1's is
-                    // ~58deg). The guest renders the same texture; only the panel
-                    // it is shown on shrinks, so the cursor mapping is unchanged.
-                    if (cyl->radius > 0.0f) {
-                        const float cap_deg = 53.0f;   // ~hl1's quad menu (5 m @ 4.5 m)
-                        float cap_w = 2.0f * cyl->radius *
-                                      tanf(cap_deg * 0.5f * 3.14159265f / 180.0f);
-                        if (w > cap_w) w = cap_w;
-                    }
+                    // The flat stand-in for a curved panel, placed where the
+                    // panel IS.
+                    //
+                    // A cylinder layer's pose is the CENTRE of the cylinder — its
+                    // axis — and the visible section lies `radius` in front of
+                    // that (pose -Z), spanning centralAngle. This used to hand the
+                    // quad the cylinder's pose unchanged, i.e. put the panel on
+                    // the axis: Doom3Quest's menu (radius 12 m, 90 deg, centre 4 m
+                    // in front of the head) became a 12 m panel at 4 m, >110 deg
+                    // across, where a Quest shows that same layer ~68 deg wide.
+                    // (cs1's "18.85 m, ~124 deg" was this too, and the width cap
+                    // that answered it measured the angle from the wrong point.)
+                    //
+                    // So the quad is the CHORD of the section: as wide as the
+                    // chord, at the chord's plane — which puts both vertical
+                    // edges exactly where the cylinder's are. Only the bow of the
+                    // middle is lost.
+                    //
+                    // Its height follows from the chord, not from the arc. The
+                    // layer's aspectRatio is the shape of the PICTURE (arc length
+                    // over height), and a flat panel that is a chord wide and an
+                    // arc-over-aspect tall shows that picture squeezed sideways by
+                    // chord/arc — 10 % for a 90 degree section. CSVR's 4:3 menu
+                    // (radius 12 m, 90 degrees) came out 16.97 x 14.14 m, i.e. 6:5.
+                    float r = cyl->radius, half = cyl->centralAngle * 0.5f;
+                    if (!(r > 0)) r = 1.0f;
+                    if (!(half > 0) || half > 1.5f) half = half > 1.5f ? 1.5f : 0.5f;
+                    float w = 2.0f * r * sinf(half);
+                    float arc = r * 2.0f * half;
+                    XrVector3f fwd = { 0.0f, 0.0f, -r * cosf(half) };
+                    XrVector3f off = klxr_qrot(cyl->pose.orientation, fwd);
+                    qbuf.pose.position.x += off.x;
+                    qbuf.pose.position.y += off.y;
+                    qbuf.pose.position.z += off.z;
                     qbuf.size.width  = w;
-                    qbuf.size.height = cyl->aspectRatio > 0 ? w / cyl->aspectRatio : w;
+                    qbuf.size.height = cyl->aspectRatio > 0 ? w / cyl->aspectRatio : arc;
                     q = &qbuf;
                 }
                 klxr_swapchain *sc = klxr_swapchain_of(q->subImage.swapchain);
+                klxr_vk_flat(sc);
                 if (sc && sc->last_released >= 0 &&
                     sc->last_released < sc->count) {
                     // eyeVisibility BOTH means one image for both eyes; LEFT
@@ -5720,6 +7775,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 memset(pl_cur, 0, sizeof *pl_cur);
                 pl_cur->slot[0] = pl_cur->slot[1] = -1;
                 pl_cur->pose[6] = 1.0f;          // identity orientation
+                pl_cur->xr_flags = (int)proj->layerFlags;
             } else {
                 static int said;
                 if (!said++)
@@ -5886,7 +7942,7 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     // GL path's array-vs-2D split has no counterpart.
                     klxr_publish_eye_vulkan(sc, (int)v,
                                             (int)proj->views[v].subImage.imageArrayIndex);
-                    slot = sc->last_released;
+                    slot = klxr_vk_stage_base(sc) + sc->last_released;
                 } else if (klxr_eye_mirror_on() || sc->array_size > 1) {
                     slot = klxr_mirror_eye_image(sc, (int)v,
                                           (int)proj->views[v].subImage.imageArrayIndex);
@@ -5894,7 +7950,8 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     klxr_back_eye_images(sc, (int)v);
                     slot = sc->last_released;
                 }
-                if (layers_on && pl_cur && li > 0 && slot == sc->last_released) {
+                if (layers_on && pl_cur && li > 0 && slot == sc->last_released &&
+                    !(sc->session && sc->session->gfx == KLXR_GFX_VULKAN)) {
                     static int said;
                     if (!said++)
                         fprintf(stderr, "  [xr] projection layer %u reaches the "
@@ -5932,6 +7989,11 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     lsp ? klxr_space_pose(lsp, &fpred) : (XrPosef){{0,0,0,1},{0,0,0}},
                     proj->views[v].pose);
                 const XrFovf *f = &proj->views[v].fov;
+                // Drawn through view 0's viewport, the picture also carries view
+                // 0's frustum (klxr_view0_rect_on): only the pose is the view's.
+                if (v > 0 && klxr_view0_rect_on() &&
+                    proj->views[0].subImage.swapchain == proj->views[v].subImage.swapchain)
+                    f = &proj->views[0].fov;
 
                 // This layer's own record, which is the per-layer composite:
                 // its picture, its frustum, its pose, placed against the
@@ -5953,6 +8015,53 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     // for a texture it allocated.
                     pl_cur->origin_top_left =
                         sc->session && sc->session->gfx == KLXR_GFX_VULKAN;
+                    // The part of the image that is the picture. Left at zero
+                    // (= all of it) for a rect that is empty or reaches outside
+                    // the image, which is not a rect anybody can sample.
+                    {
+                        const XrRect2Di *ir = &proj->views[v].subImage.imageRect;
+                        if (v > 0 && klxr_view0_rect_on() &&
+                            proj->views[0].subImage.swapchain == proj->views[v].subImage.swapchain) {
+                            const XrRect2Di *r0 = &proj->views[0].subImage.imageRect;
+                            static int said_shift;
+                            if (!said_shift && (r0->offset.x != ir->offset.x ||
+                                                r0->offset.y != ir->offset.y)) {
+                                said_shift = 1;
+                                fprintf(stderr, "  [xr] view %u says its picture is at %dx%d+%d+%d, "
+                                                "view 0's at %dx%d+%d+%d — read from view 0's "
+                                                "(KL_XR_VIEW0_RECT)\n", v,
+                                        ir->extent.width, ir->extent.height, ir->offset.x, ir->offset.y,
+                                        r0->extent.width, r0->extent.height, r0->offset.x, r0->offset.y);
+                            }
+                            ir = r0;
+                        }
+                        float *pr = pl_cur->rect[v];
+                        pr[0] = pr[1] = pr[2] = pr[3] = 0.0f;
+                        if (sc->width > 0 && sc->height > 0 && ir->offset.x >= 0 &&
+                            ir->offset.y >= 0 && ir->extent.width > 0 &&
+                            ir->extent.height > 0 &&
+                            (uint32_t)(ir->offset.x + ir->extent.width) <= sc->width &&
+                            (uint32_t)(ir->offset.y + ir->extent.height) <= sc->height) {
+                            pr[0] = (float)ir->offset.x / (float)sc->width;
+                            pr[1] = (float)ir->offset.y / (float)sc->height;
+                            pr[2] = (float)(ir->offset.x + ir->extent.width) / (float)sc->width;
+                            pr[3] = (float)(ir->offset.y + ir->extent.height) / (float)sc->height;
+                        }
+                        // The guest's own resolution scaling, said when it moves
+                        // and at most once a second: it is the only place the
+                        // size it is REALLY drawing at appears, and a controller
+                        // hunting between two sizes would otherwise fill the log.
+                        static int said_w, said_h;
+                        static time_t said_at;
+                        time_t now = time(NULL);
+                        if (v == 0 && li == 0 && now != said_at &&
+                            (ir->extent.width != said_w || ir->extent.height != said_h)) {
+                            said_w = ir->extent.width; said_h = ir->extent.height; said_at = now;
+                            fprintf(stderr, "  [xr] the guest is drawing %dx%d of its %ux%u "
+                                            "eye texture\n", ir->extent.width,
+                                    ir->extent.height, sc->width, sc->height);
+                        }
+                    }
                     // The head, as the eye pass wants it: the first view seeds
                     // the pose and the second averages its position in. The
                     // orientation is view 0's — the two are measured 0.000 deg
@@ -6013,6 +8122,48 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                 // the eye texture the base was mirrored into. Flattening only —
                 // the per-layer composite maps no layer into another's space,
                 // which is the whole point of it.
+                static int depth_on = -1;
+                if (depth_on < 0) depth_on = klxr_ext_gate_open(KLXR_GATE_BRINK_DEPTH);
+                static unsigned depth_probe;
+                if(depth_on && depth_probe++<4) {
+                    const XrCompositionLayerDepthInfoKHR *p=proj->views[v].next;
+                    fprintf(stderr,"  [brink-depth] chain eye%u layers=%d next=%p type=%d\n",v,layers_on,(void*)p,p?p->type:0);
+                }
+                if (!layers_on && depth_on) {
+                    const XrCompositionLayerDepthInfoKHR *di = proj->views[v].next;
+                    for (int nc=0; di && nc<32; ++nc, di=di->next) {
+                        if (di->type != 1000010000) continue;
+                        klxr_swapchain *ds = klxr_swapchain_of(di->subImage.swapchain);
+                        XrRect2Di dr=di->subImage.imageRect, cr=proj->views[v].subImage.imageRect;
+                        static unsigned depth_probe2;
+                        if(depth_probe2++<4) fprintf(stderr,"  [brink-depth] depth=%p stage=%d array=%u near=%g far=%g range=%g..%g rect=%dx%d+%d+%d color=%dx%d+%d+%d\n",(void*)ds,ds?ds->last_released:-99,di->subImage.imageArrayIndex,di->nearZ,di->farZ,di->minDepth,di->maxDepth,dr.extent.width,dr.extent.height,dr.offset.x,dr.offset.y,cr.extent.width,cr.extent.height,cr.offset.x,cr.offset.y);
+                        if (ds && ds->session && ds->session->gfx==KLXR_GFX_VULKAN &&
+                            klxr_format_is_depth(ds->session, ds->format) && ds->last_released>=0 &&
+                            ds->last_released<ds->count && ds->width==sc->width && ds->height==sc->height &&
+                            !dr.offset.x && !dr.offset.y && !cr.offset.x && !cr.offset.y &&
+                            dr.extent.width==(int)ds->width && dr.extent.height==(int)ds->height &&
+                            cr.extent.width==dr.extent.width && cr.extent.height==dr.extent.height &&
+                            di->subImage.imageArrayIndex<ds->array_size &&
+                            di->minDepth>=0 && di->maxDepth<=1 && di->maxDepth>di->minDepth &&
+                            di->nearZ>0 && di->farZ>0 && di->nearZ!=di->farZ) {
+                            void *mt=kl_vulkan_xr_image_mtl(ds->vk_img[ds->last_released]);
+                            if (mt) {
+                                int id=klxr_layer_id(ds);
+                                kl_glfb_note_layer_mtl_texture(id,ds->last_released,mt,ds->width,ds->height);
+                                depth_meta.depth[v].layer_plus_one=id+1;
+                                depth_meta.depth[v].stage=ds->last_released;
+                                depth_meta.depth[v].slice=di->subImage.imageArrayIndex;
+                                depth_meta.depth[v].near_z=di->nearZ;
+                                depth_meta.depth[v].far_z=di->farZ;
+                                depth_meta.depth[v].min_depth=di->minDepth;
+                                depth_meta.depth[v].max_depth=di->maxDepth;
+                                static unsigned dn;
+                                if(dn++<2) fprintf(stderr,"  [brink-depth] submitted eye %u depth sc%d stage%d near=%g far=%g range=%g..%g\n",v,id,ds->last_released,di->nearZ,di->farZ,di->minDepth,di->maxDepth);
+                            }
+                        }
+                        break;
+                    }
+                }
                 if (!layers_on) {
                     base_tan[v][0] = tanf(f->angleLeft);
                     base_tan[v][1] = tanf(f->angleRight);
@@ -6055,8 +8206,28 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
                     ninset++;
                 }
             }
-            if (sc->eye == (int)v) continue;            // already this eye
+            // KL_VK_OUT, for the Vulkan eyes. The capture path below is GL's;
+            // without this a Vulkan guest's eye images can only be judged by
+            // wearing them, and the host has nothing to wear them with.
+            if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN &&
+                sc->last_released >= 0 && sc->last_released < sc->count)
+                kl_vulkan_xr_image_capture(sc->vk_img[sc->last_released], sc->width,
+                                           sc->height, (long long)sc->format,
+                                           proj->views[v].subImage.imageArrayIndex,
+                                           (unsigned)s->frames_ended, (int)v, (int)li);
+            {
+                XrCompositionLayerSpaceWarpInfoFB sw;
+                if (klxr_space_warp_info(proj->views[v].next, &sw)) klxr_space_warp_seen(s, li, v, &sw, pl_cur);
+            }
+            // Already this eye. For a Vulkan swapchain that is "already published
+            // for this eye": an array swapchain is both eyes' at once, and asking
+            // whether it was last seen as the OTHER one is true every frame.
+            if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN
+                    ? (sc->eye >= 0 && (sc->vk_pub & (1u << v)) && sc->said_eyes & (1u << v))
+                    : sc->eye == (int)v)
+                continue;
             sc->eye = (int)v;
+            sc->said_eyes |= 1u << v;
             // The capture path is GL's, and there are no GL names on the Vulkan
             // path to give it — the eyes reach a compositor through the
             // MTLTextures published above instead.
@@ -6207,8 +8378,24 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // frame was submitted" into "the picture is complete" — the eye MTLTextures
     // are the guest's own images, so nothing of ours is in its submissions and
     // there is no MTLSharedEvent to wait on instead.
-    if (drawn_stage >= 0 && s->gfx == KLXR_GFX_VULKAN)
-        kl_vulkan_frame_done(drawn_stage);
+    //
+    // KL_VK_FRAME_ASYNC: the same completion without the stall. The guest's
+    // queue is marked here and everything this function would publish from
+    // here on is handed, whole, to a worker that publishes it once the GPU has
+    // reached the mark — so the guest's next frame is being built while this
+    // one is still being drawn (klxr_defer_*, above).
+    klxr_publication pub;
+    int defer = 0;
+    if (s->gfx == KLXR_GFX_VULKAN) {
+        if (drawn_stage >= 0) {
+            defer = klxr_defer_begin(&pub);
+            if (!defer) kl_vulkan_frame_done(drawn_stage);
+        } else {
+            // A frame without an eye picture publishes at once, and must not
+            // overtake the one before it.
+            klxr_defer_drain();
+        }
+    }
 
     // ...and this is the VR path's swap. kl_glfb's capture and the frontend
     // seams both hang off eglSwapBuffers, which an OpenXR guest never calls —
@@ -6254,10 +8441,15 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         klxr_pose_note(s, KLXR_POSE_SRC_SUBMIT, sub);
     }
     klxr_pose_trace_report(s);
-    if (drawn_stage >= 0)
-        kl_ovrp_frame_end_external(drawn_stage,
-                                   have_layer_pose ? layer_pose : NULL,
-                                   have_layer_pose ? layer_tan : NULL);
+    if (drawn_stage >= 0) {
+        kl_ovrp_render_pose rec;
+        int have_rec=kl_ovrp_frame_end_prepare(drawn_stage,
+                            have_layer_pose ? layer_pose : NULL,
+                            have_layer_pose ? layer_tan : NULL, &rec);
+        if(have_rec) memcpy(rec.depth,depth_meta.depth,sizeof rec.depth);
+        if(defer) { pub.have_rec=have_rec; if(have_rec) pub.rec=rec; }
+        else if(have_rec) kl_ovrp_frame_end_commit(&rec);
+    }
 
     // ...and this frame's PROJECTION layers, in the order the guest submitted
     // them, replaced whole for the same reason the panels below are. Filed only
@@ -6284,7 +8476,13 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
         for (int k = 0; k < npl; k++)
             if (pl[k].slot[0] >= 0 || pl[k].slot[1] >= 0) { any_reachable = 1; break; }
         if (npl == 0 || any_reachable) {
-            kl_ovrp_proj_layers_external(pl, npl);
+            if (defer) {
+                pub.have_pl = 1;
+                pub.npl = npl;
+                if (npl > 0) memcpy(pub.pl, pl, (size_t)npl * sizeof *pl);
+            } else {
+                kl_ovrp_proj_layers_external(pl, npl);
+            }
         } else {
             static int said;
             if (!said++)
@@ -6334,12 +8532,110 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
     // how a guest taking a menu down is expressed. Unconditional rather than
     // guarded on nquads: leaving the previous frame's list standing would keep
     // drawing a layer the guest has stopped submitting.
+    if (defer) {
+        pub.nquads = nquads;
+        if (nquads > 0) memcpy(pub.quads, quads, (size_t)nquads * sizeof *quads);
+        pub.eye_layer = proj_layers > 0;
+        klxr_defer_submit(&pub);
+        return KLXR_SUCCESS;
+    }
     kl_ovrp_overlays_external(quads, nquads);
     // The same statement for the eye, which had no way to be told "not this
     // frame" — see kl_ovrp.h. A guest that alternates between a projection pair
     // and a quad shows one or the other, not both at once.
     kl_ovrp_eye_layer_external(proj_layers > 0);
+    if (proj_layers > 0) kl_interstitial_done();
 
+    return KLXR_SUCCESS;
+}
+
+// ---------------------------------------------------------- XR_KHR_visibility_mask
+//
+// Which part of the picture a guest draws can never reach the eye, as a mesh it
+// can stencil out before shading anything. A headset's own answer is the shape
+// of its lenses; this runtime has no such shape to offer, but it has one large
+// region it knows exactly: under KL_OVRP_UNIFY_FRUSTUM both eyes are told the
+// UNION of the two cones, so each eye draws the other eye's outer field — on a
+// Vision Pro the 45..60 degree band on the nose side, a fifth of the picture's
+// width — which that eye's display does not have. A fill-bound guest (Half-Life:
+// Alyx, ~2 ms per megapixel on the headset) spends that fifth of its frame on
+// nothing.
+//
+// Vertices are in view space on the plane z = -1, i.e. tangents: +x right, +y
+// up. A margin is kept beyond the display's edge because the compositor
+// reprojects the picture to a newer head rotation, which slides the edge inward
+// by however far the head turned since the frame was drawn.
+typedef struct {
+    int type; const void *next;
+    uint32_t vertexCapacityInput, vertexCountOutput; XrVector2f *vertices;
+    uint32_t indexCapacityInput, indexCountOutput; uint32_t *indices;
+} XrVisibilityMaskKHR;
+#define KLXR_VISMASK_MARGIN 1.10f
+
+static XrResult klxr_GetVisibilityMaskKHR(void *session, int view_config, uint32_t view,
+                                          int type, XrVisibilityMaskKHR *mask) {
+    KLXR_TRACE("xrGetVisibilityMaskKHR");
+    if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!mask || view > 1) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (view_config != KLXR_VIEW_CONFIG_PRIMARY_STEREO)
+        KLXR_RET(KLXR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
+
+    float px, py, pz, qx, qy, qz, qw, told[4], disp[4];
+    kl_ovrp_eye_view((int)view, &px, &py, &pz, &qx, &qy, &qz, &qw, told);
+    kl_ovrp_eye_display_tangents((int)view, disp);
+    // The visible rectangle inside the told one, in tangents: [x0,x1] x [y0,y1].
+    float X0 = -told[0], X1 = told[1], Y1 = told[2], Y0 = -told[3];
+    float x0 = -disp[0] * KLXR_VISMASK_MARGIN, x1 = disp[1] * KLXR_VISMASK_MARGIN;
+    float y1 = disp[2] * KLXR_VISMASK_MARGIN,  y0 = -disp[3] * KLXR_VISMASK_MARGIN;
+    if (x0 < X0) x0 = X0;
+    if (x1 > X1) x1 = X1;
+    if (y0 < Y0) y0 = Y0;
+    if (y1 > Y1) y1 = Y1;
+
+    XrVector2f v[16];
+    uint32_t   ix[24], nv = 0, ni = 0;
+    #define QUAD(ax, ay, bx, by) do {                                   \
+        uint32_t b = nv;                                                \
+        v[nv++] = (XrVector2f){ (ax), (ay) }; v[nv++] = (XrVector2f){ (bx), (ay) }; \
+        v[nv++] = (XrVector2f){ (bx), (by) }; v[nv++] = (XrVector2f){ (ax), (by) }; \
+        ix[ni++] = b; ix[ni++] = b + 1; ix[ni++] = b + 2;               \
+        ix[ni++] = b; ix[ni++] = b + 2; ix[ni++] = b + 3;               \
+    } while (0)
+    const float eps = 0.01f;
+    // KL_XR_VISMASK=0: nothing is hidden. The A/B for what the mask saves, and
+    // the way back if a guest draws its mask wrongly.
+    if (!kl_env_on("KL_XR_VISMASK", 1)) { x0 = X0; x1 = X1; y0 = Y0; y1 = Y1; }
+    if (type == 1) {                         // XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR
+        if (x0 - X0 > eps) QUAD(X0, Y0, x0, Y1);            // left band
+        if (X1 - x1 > eps) QUAD(x1, Y0, X1, Y1);            // right band
+        if (y0 - Y0 > eps) QUAD(x0, Y0, x1, y0);            // bottom band
+        if (Y1 - y1 > eps) QUAD(x0, y1, x1, Y1);            // top band
+    } else if (type == 2) {                  // ...VISIBLE_TRIANGLE_MESH_KHR
+        QUAD(x0, y0, x1, y1);
+    } else if (type == 3) {                  // ...LINE_LOOP_KHR
+        v[nv++] = (XrVector2f){ x0, y0 }; v[nv++] = (XrVector2f){ x1, y0 };
+        v[nv++] = (XrVector2f){ x1, y1 }; v[nv++] = (XrVector2f){ x0, y1 };
+        for (uint32_t i = 0; i < 4; i++) ix[ni++] = i;
+    } else {
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    }
+    #undef QUAD
+
+    static unsigned said;
+    if (type == 1 && !(said & (1u << view))) {
+        said |= 1u << view;
+        float hidden = 1.0f - ((x1 - x0) * (y1 - y0)) / ((X1 - X0) * (Y1 - Y0));
+        fprintf(stderr, "  [xr] visibility mask, eye %u: %u hidden triangle(s), %.0f%% of the "
+                        "picture is outside what the display shows\n", view, ni / 3,
+                (double)(hidden * 100.0f));
+    }
+    mask->vertexCountOutput = nv;
+    mask->indexCountOutput = ni;
+    if (mask->vertexCapacityInput == 0 && mask->indexCapacityInput == 0) return KLXR_SUCCESS;
+    if (mask->vertexCapacityInput < nv || mask->indexCapacityInput < ni)
+        KLXR_RET(KLXR_ERROR_SIZE_INSUFFICIENT);
+    if (nv && mask->vertices) memcpy(mask->vertices, v, nv * sizeof *v);
+    if (ni && mask->indices)  memcpy(mask->indices, ix, ni * sizeof *ix);
     return KLXR_SUCCESS;
 }
 
@@ -6371,8 +8667,13 @@ static XrResult klxr_LocateViews(void *session, const XrViewLocateInfo *info,
     if (!base) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
 
     view_state->type = XR_TYPE_VIEW_STATE;
-    view_state->viewStateFlags = KLXR_VIEW_ORIENTATION_VALID | KLXR_VIEW_POSITION_VALID |
-                                 KLXR_VIEW_ORIENTATION_TRACKED | KLXR_VIEW_POSITION_TRACKED;
+    // Same claim as xrLocateSpace(VIEW) makes, and it must be the same claim:
+    // a guest told its head is untracked by one call and tracked by the other
+    // has been told nothing. Zero flags is the specified "no measurement".
+    view_state->viewStateFlags = klxr_head_pose_ready()
+        ? (KLXR_VIEW_ORIENTATION_VALID | KLXR_VIEW_POSITION_VALID |
+           KLXR_VIEW_ORIENTATION_TRACKED | KLXR_VIEW_POSITION_TRACKED)
+        : 0;
 
     XrResult r = klxr_two_call(capacity, count_out, 2);
     if (r != KLXR_SUCCESS || capacity == 0) return r;
@@ -6501,7 +8802,9 @@ static XrResult klxr_LocateSpace(void *space, void *base_space, int64_t time,
     // alternative is an unfilled struct becoming the client's basis for pose
     // prediction.
     int base_static = bs->reference_type == KLXR_REF_SPACE_LOCAL ||
-                      bs->reference_type == KLXR_REF_SPACE_STAGE;
+                      bs->reference_type == KLXR_REF_SPACE_STAGE ||
+                      bs->reference_type == KLXR_REF_SPACE_LOCAL_FLOOR ||
+                      KLXR_IS_ANCHOR(bs->reference_type);
     // ...and only if it is a measurement. Without this the derived-velocity
     // seam would report zeros as valid for exactly the samples that have no
     // basis, which is the lie this whole path exists to avoid.
@@ -6578,6 +8881,193 @@ static XrResult klxr_ResultToString(void *instance, XrResult value, char *buffer
 }
 
 // ---------------------------------------------------------------- XR_FB_passthrough
+// XR_EXT_hand_tracking. Separate handles from XrSpaces; locate joints in the
+// caller's actual baseSpace using the runtime's existing space algebra.
+typedef struct {
+    int32_t type; const void *next; int32_t hand; int32_t handJointSet;
+} XrHandTrackerCreateInfoEXT;
+typedef struct {
+    int32_t type; const void *next; void *baseSpace; int64_t time;
+} XrHandJointsLocateInfoEXT;
+typedef struct {
+    uint64_t locationFlags; XrPosef pose; float radius;
+} XrHandJointLocationEXT;
+typedef struct {
+    int32_t type; void *next; uint32_t isActive; uint32_t jointCount;
+    XrHandJointLocationEXT *jointLocations;
+} XrHandJointLocationsEXT;
+typedef struct {
+    int32_t type; void *next; uint32_t jointCount; void *jointVelocities;
+} XrHandJointVelocitiesEXT;
+// Khronos XR_FB_hand_tracking_aim output chain, 8-byte aligned for flags.
+typedef struct {
+    int32_t type; void *next; uint64_t status; XrPosef aimPose;
+    float pinchStrengthIndex, pinchStrengthMiddle;
+    float pinchStrengthRing, pinchStrengthLittle;
+} XrHandTrackingAimStateFB;
+static float klxr_finger_pinch_strength(const klxr_hand_sample *sample, int tip) {
+    if (!(sample->valid[5] & 1) || !(sample->valid[tip] & 1)) return 0;
+    float dx = sample->poses[5][0] - sample->poses[tip][0];
+    float dy = sample->poses[5][1] - sample->poses[tip][1];
+    float dz = sample->poses[5][2] - sample->poses[tip][2];
+    float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (!isfinite(dist)) return 0;
+    // Same 3-5 cm pinch envelope used by Klepton's existing controller path.
+    float value = (0.05f - dist) / 0.02f;
+    return fminf(1, fmaxf(0, value));
+}
+
+enum { KLXR_HAND_TRACKER_MAGIC = 0x48584b4c };
+static struct { uint32_t magic; klxr_session *session; int hand; } g_hand_trackers[8];
+
+static XrResult klxr_CreateHandTrackerEXT(void *session,
+        const XrHandTrackerCreateInfoEXT *info, void **out) {
+    KLXR_TRACE("xrCreateHandTrackerEXT");
+    klxr_session *s = klxr_sess(session);
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !out || info->type != XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT)
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if ((info->hand != 1 && info->hand != 2) || info->handJointSet != 0)
+        KLXR_RET(KLXR_ERROR_FEATURE_UNSUPPORTED);
+    for (size_t i = 0; i < sizeof g_hand_trackers / sizeof g_hand_trackers[0]; i++) {
+        if (!g_hand_trackers[i].magic) {
+            g_hand_trackers[i].magic = KLXR_HAND_TRACKER_MAGIC;
+            g_hand_trackers[i].session = s;
+            g_hand_trackers[i].hand = info->hand - 1;
+            *out = &g_hand_trackers[i];
+            fprintf(stderr, "  [xr] hand tracker created: %s\n", info->hand == 1 ? "left" : "right");
+            return KLXR_SUCCESS;
+        }
+    }
+    KLXR_RET(KLXR_ERROR_FEATURE_UNSUPPORTED);
+}
+static int klxr_hand_tracker_index(void *handle) {
+    for (size_t i = 0; i < sizeof g_hand_trackers / sizeof g_hand_trackers[0]; i++)
+        if (handle == &g_hand_trackers[i] && g_hand_trackers[i].magic == KLXR_HAND_TRACKER_MAGIC
+            && klxr_sess(g_hand_trackers[i].session)) return (int)i;
+    return -1;
+}
+static XrResult klxr_DestroyHandTrackerEXT(void *tracker) {
+    KLXR_TRACE("xrDestroyHandTrackerEXT");
+    int idx = klxr_hand_tracker_index(tracker);
+    if (idx < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    memset(&g_hand_trackers[idx], 0, sizeof g_hand_trackers[idx]);
+    return KLXR_SUCCESS;
+}
+static XrResult klxr_LocateHandJointsEXT(void *tracker,
+        const XrHandJointsLocateInfoEXT *info, XrHandJointLocationsEXT *out) {
+    KLXR_TRACE("xrLocateHandJointsEXT");
+    int idx = klxr_hand_tracker_index(tracker);
+    if (idx < 0) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !out || info->type != XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT ||
+        out->type != XR_TYPE_HAND_JOINT_LOCATIONS_EXT ||
+        out->jointCount != KLXR_HAND_JOINT_COUNT || !out->jointLocations)
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    klxr_space *base = klxr_space_of(info->baseSpace);
+    if (!base) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    out->isActive = 0;
+    klxr_hand_sample sample;
+    pthread_mutex_lock(&g_hand_joint_lock);
+    sample = g_hand_samples[g_hand_trackers[idx].hand];
+    pthread_mutex_unlock(&g_hand_joint_lock);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    // Never show frozen fingers after ARKit tracking is lost.
+    if (!sample.active || now - sample.last_ns > 500000000LL) {
+        for (uint32_t j = 0; j < out->jointCount; j++)
+            out->jointLocations[j].locationFlags = 0;
+        struct klxr_hand_chain { int32_t type; void *next; };
+        for (struct klxr_hand_chain *n = out->next; n; n = n->next) {
+            if (n->type == XR_TYPE_HAND_TRACKING_AIM_STATE_FB)
+                ((XrHandTrackingAimStateFB *)n)->status = 0;
+        }
+        return KLXR_SUCCESS;
+    }
+    int base_tracked = 1;
+    XrPosef base_pose = klxr_space_pose_ex(base, &base_tracked, NULL, NULL, NULL, NULL);
+    if (!base_tracked) {
+        for (uint32_t j = 0; j < out->jointCount; j++)
+            out->jointLocations[j].locationFlags = 0;
+        return KLXR_SUCCESS;
+    }
+    out->isActive = 1;
+    static unsigned report_joints[2];
+    int hand_idx = g_hand_trackers[idx].hand;
+    if (++report_joints[hand_idx] == 1 || report_joints[hand_idx] % 600 == 0) {
+        unsigned count_valid = 0;
+        for (int j = 0; j < KLXR_HAND_JOINT_COUNT; j++)
+            if (sample.valid[j]) count_valid++;
+        fprintf(stderr, "  [xr] hand joints %s: active, wrist (%.3f %.3f %.3f), "
+                        "valid=%u/26\n", hand_idx == 0 ? "L" : "R",
+                sample.poses[1][0], sample.poses[1][1], sample.poses[1][2], count_valid);
+        float controller[3], quat[4], vel[3], ang[3];
+        if (kl_ovrp_hand_motion(hand_idx, controller, quat, vel, ang))
+            fprintf(stderr, "  [xr] BRINK wrist-vs-controller %s: delta "
+                            "(%.3f %.3f %.3f) m\n", hand_idx == 0 ? "L" : "R",
+                    controller[0] - sample.poses[1][0],
+                    controller[1] - sample.poses[1][1],
+                    controller[2] - sample.poses[1][2]);
+    }
+    for (int j = 0; j < KLXR_HAND_JOINT_COUNT; j++) {
+        const float *v = sample.poses[j];
+        XrHandJointLocationEXT *joint = &out->jointLocations[j];
+        joint->locationFlags = sample.valid[j];
+        if (!sample.valid[j]) continue;
+        XrPosef world = { { v[3], v[4], v[5], v[6] }, { v[0], v[1], v[2] } };
+        joint->pose = klxr_pose_rel(base_pose, world);
+        joint->radius = v[7];
+    }
+    // Iterate the typed output chain correctly. Unity may request aim pose
+    // and velocity output simultaneously, in either order.
+    struct klxr_hand_out_next { int32_t type; void *next; };
+    for (struct klxr_hand_out_next *node = out->next, *next; node; node = next) {
+        next = node->next;
+        if (node->type == XR_TYPE_HAND_JOINT_VELOCITIES_EXT) {
+            XrHandJointVelocitiesEXT *vel = (XrHandJointVelocitiesEXT *)node;
+            if (vel->jointCount == KLXR_HAND_JOINT_COUNT && vel->jointVelocities) {
+                // We have no measured velocities: zero validity, not fake data.
+                memset(vel->jointVelocities, 0, KLXR_HAND_JOINT_COUNT * 32);
+            }
+        } else if (node->type == XR_TYPE_HAND_TRACKING_AIM_STATE_FB) {
+            XrHandTrackingAimStateFB *aim = (XrHandTrackingAimStateFB *)node;
+            aim->status = 0;
+            aim->pinchStrengthIndex = klxr_finger_pinch_strength(&sample, 10);
+            aim->pinchStrengthMiddle = klxr_finger_pinch_strength(&sample, 15);
+            aim->pinchStrengthRing = klxr_finger_pinch_strength(&sample, 20);
+            aim->pinchStrengthLittle = klxr_finger_pinch_strength(&sample, 25);
+            // Use the SAME measured and calibrated virtual aim controller
+            // geometry as the working OpenXR /input/aim/pose action so UI
+            // interaction does not suddenly aim in a different direction.
+            float p[3], q[4], v[3], ang[3];
+            if (kl_ovrp_hand_motion(hand_idx, p, q, v, ang)) {
+                XrPosef stage_aim = {
+                    { q[0], q[1], q[2], q[3] }, { p[0], p[1], p[2] }
+                };
+                klxr_pose_corrections(&stage_aim, 1, hand_idx);
+                aim->aimPose = klxr_pose_rel(base_pose, stage_aim);
+                // COMPUTED and VALID. Index pinch status is derived from
+                // measured fingertip separation, not synthesized triggers.
+                aim->status = 0x1 | 0x2;
+                if (aim->pinchStrengthIndex >= 0.55f) aim->status |= 0x4;
+                if (aim->pinchStrengthMiddle >= 0.55f) aim->status |= 0x8;
+                if (aim->pinchStrengthRing >= 0.55f) aim->status |= 0x10;
+                if (aim->pinchStrengthLittle >= 0.55f) aim->status |= 0x20;
+                static unsigned logAim[2];
+                if (++logAim[hand_idx] % 600 == 1) {
+                    fprintf(stderr, "  [xr] FB hand aim %s: index=%.2f bits=0x%llx"
+                                    " aim pos (%.3f %.3f %.3f)\n",
+                            hand_idx ? "R" : "L", (double)aim->pinchStrengthIndex,
+                            (unsigned long long)aim->status,
+                            aim->aimPose.position.x, aim->aimPose.position.y,
+                            aim->aimPose.position.z);
+                }
+            }
+        }
+    }
+    return KLXR_SUCCESS;
+}
+
 // Stub passthrough: some guests require the extension and drive these, but nothing
 // here composites a passthrough layer (visionOS supplies the environment). The
 // handles are sentinels the guest only ever hands back to us; start/pause/style
@@ -6651,6 +9141,7 @@ static void klxr_install(void) {
         {"xrGetDisplayRefreshRateFB", (void *)klxr_GetDisplayRefreshRateFB},
         {"xrRequestDisplayRefreshRateFB",
                                    (void *)klxr_RequestDisplayRefreshRateFB},
+        {"xrGetVisibilityMaskKHR",  (void *)klxr_GetVisibilityMaskKHR},
         {"xrConvertTimespecTimeToTimeKHR",
                                    (void *)klxr_ConvertTimespecTimeToTimeKHR},
         {"xrConvertTimeToTimespecTimeKHR",
@@ -6669,6 +9160,10 @@ static void klxr_install(void) {
                                    (void *)klxr_SetAndroidApplicationThreadKHR},
         {"xrEnumerateColorSpacesFB", (void *)klxr_EnumerateColorSpacesFB},
         {"xrSetColorSpaceFB",        (void *)klxr_SetColorSpaceFB},
+        {"xrCreateFoveationProfileFB",  (void *)klxr_CreateFoveationProfileFB},
+        {"xrDestroyFoveationProfileFB", (void *)klxr_DestroyFoveationProfileFB},
+        {"xrUpdateSwapchainFB",         (void *)klxr_UpdateSwapchainFB},
+        {"xrGetSwapchainStateFB",       (void *)klxr_GetSwapchainStateFB},
         // XR_FB_passthrough (stubbed — see above)
         {"xrCreatePassthroughFB",       (void *)klxr_CreatePassthroughFB},
         {"xrDestroyPassthroughFB",      (void *)klxr_DestroyPassthroughFB},
@@ -6679,6 +9174,19 @@ static void klxr_install(void) {
         {"xrPassthroughLayerPauseFB",   (void *)klxr_PassthroughLayerPauseFB},
         {"xrPassthroughLayerResumeFB",  (void *)klxr_PassthroughLayerResumeFB},
         {"xrPassthroughLayerSetStyleFB",(void *)klxr_PassthroughLayerSetStyleFB},
+        // the room — see klxr_is_scene_entry for when these are handed out
+        {"xrDiscoverSpacesMETA",                 (void *)klxr_DiscoverSpacesMETA},
+        {"xrRetrieveSpaceDiscoveryResultsMETA",  (void *)klxr_RetrieveSpaceDiscoveryResultsMETA},
+        {"xrGetSpaceUuidFB",                     (void *)klxr_GetSpaceUuidFB},
+        {"xrEnumerateSpaceSupportedComponentsFB",(void *)klxr_EnumerateSpaceSupportedComponentsFB},
+        {"xrGetSpaceComponentStatusFB",          (void *)klxr_GetSpaceComponentStatusFB},
+        {"xrSetSpaceComponentStatusFB",          (void *)klxr_SetSpaceComponentStatusFB},
+        {"xrGetSpaceContainerFB",                (void *)klxr_GetSpaceContainerFB},
+        {"xrGetSpaceRoomLayoutFB",               (void *)klxr_GetSpaceRoomLayoutFB},
+        {"xrGetSpaceBoundingBox2DFB",            (void *)klxr_GetSpaceBoundingBox2DFB},
+        {"xrGetSpaceBoundingBox3DFB",            (void *)klxr_GetSpaceBoundingBox3DFB},
+        {"xrGetSpaceBoundary2DFB",               (void *)klxr_GetSpaceBoundary2DFB},
+        {"xrGetSpaceSemanticLabelsFB",           (void *)klxr_GetSpaceSemanticLabelsFB},
         // the session, and the state machine xrPollEvent drives
         {"xrCreateSession",        (void *)klxr_CreateSession},
         {"xrDestroySession",       (void *)klxr_DestroySession},
@@ -6694,6 +9202,9 @@ static void klxr_install(void) {
         {"xrStructureTypeToString",     (void *)klxr_StructureTypeToString},
         // spaces — xrLocateSpace is deliberately still a refusal, see above
         {"xrCreateReferenceSpace", (void *)klxr_CreateReferenceSpace},
+        {"xrCreateHandTrackerEXT", (void *)klxr_CreateHandTrackerEXT},
+        {"xrDestroyHandTrackerEXT", (void *)klxr_DestroyHandTrackerEXT},
+        {"xrLocateHandJointsEXT", (void *)klxr_LocateHandJointsEXT},
         {"xrDestroySpace",         (void *)klxr_DestroySpace},
         {"xrGetReferenceSpaceBoundsRect",
                                    (void *)klxr_GetReferenceSpaceBoundsRect},
@@ -6746,9 +9257,18 @@ static void klxr_install(void) {
     }
 }
 
+// Every entry point this runtime has a row for, implemented or refused, by
+// index; NULL past the end. For a caller that has to publish the whole surface
+// up front rather than answer lookups one at a time (a Linux guest's loader
+// wants an ELF symbol table — runtime/linux/kl_lx_openxr.c).
+const char *kl_openxr_name(int i) {
+    return i >= 0 && i < KLXR_COUNT ? g_xr[i].name : NULL;
+}
+
 void *kl_openxr_lookup(const char *name) {
     klxr_install();
     klxr_row *row = klxr_row_for(name);
+    if (row && klxr_is_scene_entry(name) && !klxr_scene_on()) row = NULL;
     if (!row) return NULL;      // a lookup must still be able to say no
     row->resolved++;
     return row->fn;
@@ -6785,12 +9305,15 @@ int kl_openxr_claims(const char *soname) {
     return strcmp(b, "libopenxr_loader.so") == 0;
 }
 
+static int g_xr_opened;
 void *kl_openxr_dlopen(const char *soname) {
     if (!kl_openxr_claims(soname)) return NULL;
     fprintf(stderr, "  [xr] guest dlopen(\"libopenxr_loader.so\") -> synthetic OpenXR "
                     "runtime (the real loader would look for an Android broker)\n");
+    __atomic_store_n(&g_xr_opened, 1, __ATOMIC_RELEASE);
     return (void *)g_xr_handle;
 }
+int kl_openxr_in_use(void) { return __atomic_load_n(&g_xr_opened, __ATOMIC_ACQUIRE); }
 
 int kl_openxr_is_handle(const void *h) { return h == (const void *)g_xr_handle; }
 
@@ -7093,6 +9616,45 @@ int kl_openxr_input_selftest(FILE *f) {
                      klxr_st_bool(press0, "/user/hand/left", &b) &&
                      b.changedSinceLastSync && !b.currentState);
 
+    // The dominant hand (kl_openxr_set_dominant_hand). press-6 is the one action
+    // in this map bound on one hand only — the right's system button, which the
+    // right controller is still holding — so it is the one that shows the swap:
+    // with the left hand dominant the LEFT controller drives that binding and
+    // the answer is the left hand's. What is bound alike on both hands must not
+    // move, and neither may a pose.
+    fprintf(f, "  --- the left hand as the dominant one ---\n");
+    kl_openxr_set_dominant_hand(1);
+    kl_ovrp_set_controller_input(0, KL_OVRP_RAW_X, 0, 0.25f, 0, -1.0f, 0);
+    klxr_st_sync();
+    ok &= klxr_st_ok(f, "a binding written for the right hand only is no longer the right hand's",
+                     klxr_st_bool(press6, "/user/hand/right", &b) && !b.isActive);
+    ok &= klxr_st_ok(f, "...it is the left hand's, and the right controller's press does not reach it",
+                     klxr_st_bool(press6, "/user/hand/left", &b) && b.isActive && !b.currentState);
+    ok &= klxr_st_ok(f, "a button bound on both hands still reads its own controller (x for a)",
+                     klxr_st_bool(press0, "/user/hand/left", &b) && b.isActive && b.currentState &&
+                     klxr_st_bool(press0, "/user/hand/right", &b) && b.isActive && !b.currentState);
+    ok &= klxr_st_ok(f, "a trigger bound on both hands still reads its own controller",
+                     klxr_st_float(analog0, "/user/hand/left", &fl) && fabsf(fl.currentState - 0.25f) < 1e-4f &&
+                     klxr_st_float(analog0, "/user/hand/right", &fl) && fabsf(fl.currentState - 0.75f) < 1e-4f);
+    { XrActionStateGetInfo gi; XrActionStatePose ps;
+      memset(&gi, 0, sizeof gi); memset(&ps, 0, sizeof ps);
+      gi.type = XR_TYPE_ACTION_STATE_GET_INFO; gi.action = pose;
+      klxr_StringToPath(&g_instance, "/user/hand/left", &gi.subactionPath);
+      ok &= klxr_st_ok(f, "a pose stays with its controller",
+                       klxr_GetActionStatePose(&g_session, &gi, &ps) == KLXR_SUCCESS && ps.isActive &&
+                       klxr_bind_hand((klxr_action *)pose, 0) == 0 && klxr_bind_hand((klxr_action *)pose, 1) == 1); }
+    kl_ovrp_set_controller_input(0, KL_OVRP_RAW_X | KL_OVRP_RAW_BACK, 0, 0.25f, 0, -1.0f, 0);
+    klxr_st_sync();
+    ok &= klxr_st_ok(f, "the left controller's own press does",
+                     klxr_st_bool(press6, "/user/hand/left", &b) && b.isActive && b.currentState &&
+                     klxr_st_bool(press6, NULL, &b) && b.currentState);
+    kl_openxr_set_dominant_hand(0);
+    kl_ovrp_set_controller_input(0, 0, 0, 0.25f, 0, -1.0f, 0);
+    klxr_st_sync();
+    ok &= klxr_st_ok(f, "back to the right hand, the binding is the right controller's again",
+                     klxr_st_bool(press6, "/user/hand/right", &b) && b.isActive && b.currentState &&
+                     klxr_st_bool(press6, "/user/hand/left", &b) && !b.isActive);
+
     // Controller batteries share the same frontend seam for OVRPlugin and
     // OpenXR. Exercise the independent values and OpenXR's standard output
     // chain here; OVRPlugin's ControllerState4 layout is compiled separately.
@@ -7121,6 +9683,9 @@ int kl_openxr_input_selftest(FILE *f) {
                          (XR_BATTERY_STATE_DISPLAY_STATE_VALID_BIT_EXT |
                           XR_BATTERY_STATE_DISPLAY_STATE_CHARGING_BIT_EXT |
                           XR_BATTERY_STATE_DISPLAY_STATE_PLUGGED_IN_BIT_EXT));
+    kl_ovrp_set_controller_battery(0, -1, KL_CONTROLLER_BATTERY_UNKNOWN);
+    kl_ovrp_set_controller_battery(1, -1, KL_CONTROLLER_BATTERY_UNKNOWN);
+    g_instance.ext_controller_battery = 0;
 
     // The action space, and the invariant that matters: it must follow the hand
     // named by its subaction path and no other.
@@ -7405,6 +9970,50 @@ int kl_openxr_input_selftest(FILE *f) {
                          strstr(nb, "Right Controller") != NULL);
     }
 
+    // A BOOLEAN bound to the bare /input/thumbstick is the stick's click, not
+    // its deflection — HITMAN 3 VR: Reloaded's "thumbstick_click" (crouch on
+    // the right, the drag release on the left) fired on every push before.
+    klxr_st_boot();
+    {
+        XrActionSetCreateInfo hsi; memset(&hsi, 0, sizeof hsi);
+        hsi.type = XR_TYPE_ACTION_SET_CREATE_INFO;
+        snprintf(hsi.actionSetName, sizeof hsi.actionSetName, "%s", "hitman");
+        void *hset = NULL;
+        klxr_CreateActionSet(&g_instance, &hsi, &hset);
+        void *hclick = klxr_st_action(hset, "thumbstick_click", KLXR_ACTION_TYPE_BOOLEAN);
+        void *hpos   = klxr_st_action(hset, "thumbstick_pos", KLXR_ACTION_TYPE_VECTOR2F);
+        const XrActionSuggestedBinding hitman_map[] = {
+            klxr_st_sb(hclick, "/user/hand/right/input/thumbstick"),
+            klxr_st_sb(hpos,   "/user/hand/right/input/thumbstick"),
+        };
+        klxr_st_bind_all(KLXR_ACTIVE_PROFILE, hitman_map, 2);
+        ok &= klxr_st_ok(f, "bare thumbstick: a boolean binds the click, a Vector2f the stick",
+                         ((klxr_action *)hclick)->kind[1] == KLXR_SRC_BUTTON &&
+                         ((klxr_action *)hclick)->bit[1] == KL_OVRP_RAW_RTHUMBSTICK &&
+                         ((klxr_action *)hpos)->kind[1] == KLXR_SRC_STICK_VEC);
+
+        XrActionStateGetInfo hgi; memset(&hgi, 0, sizeof hgi);
+        hgi.type = XR_TYPE_ACTION_STATE_GET_INFO;
+        hgi.action = hclick;
+        klxr_StringToPath(&g_instance, "/user/hand/right", &hgi.subactionPath);
+        XrActionStateBoolean hb;
+        kl_ovrp_set_hand_pose(1, 0.2f, 1.0f, -0.3f, 0, 0, 0, 1);
+        kl_ovrp_set_controller_input(1, 0, 0, 0, 0, 1.0f, 0.0f);
+        kl_ovrp_frame_latch();
+        klxr_st_sync();
+        memset(&hb, 0, sizeof hb);
+        klxr_GetActionStateBoolean(&g_session, &hgi, &hb);
+        ok &= klxr_st_ok(f, "bare thumbstick: a full push is not a click",
+                         hb.isActive && !hb.currentState);
+        kl_ovrp_set_controller_input(1, KL_OVRP_RAW_RTHUMBSTICK, 0, 0, 0, 0.0f, 0.0f);
+        kl_ovrp_frame_latch();
+        klxr_st_sync();
+        memset(&hb, 0, sizeof hb);
+        klxr_GetActionStateBoolean(&g_session, &hgi, &hb);
+        ok &= klxr_st_ok(f, "bare thumbstick: pressing the stick is",
+                         hb.isActive && hb.currentState);
+    }
+
     memset(&g_session, 0, sizeof g_session);
     memset(&g_instance, 0, sizeof g_instance);
     return ok;
@@ -7421,10 +10030,35 @@ static int klxr_st_head_at(double time_s, float *pose7) {
     return 1;
 }
 
+// A tracker that answers each caller with a DIFFERENT head (5, 10, ... degrees
+// of yaw) and holds the first caller until a second one is inside too — or a
+// second has passed. Two threads missing on one (frame, instant) therefore
+// both predict, and both predictions differ, so only the cache's publish step
+// can make them agree. A runtime that predicted under its cache lock would
+// never let the second caller in.
+static int g_st_race_calls;
+static int klxr_st_head_at_race(double time_s, float *pose7) {
+    (void)time_s;
+    int n = __atomic_add_fetch(&g_st_race_calls, 1, __ATOMIC_ACQ_REL);
+    for (int i = 0; i < 1000 && __atomic_load_n(&g_st_race_calls, __ATOMIC_ACQUIRE) < 2; i++)
+        usleep(1000);
+    float half = 0.5f * (float)n * 5.0f * 0.017453292f;
+    pose7[0] = 0.0f; pose7[1] = sinf(half); pose7[2] = 0.0f; pose7[3] = cosf(half);
+    pose7[4] = 0.0f; pose7[5] = 1.6f;       pose7[6] = 0.0f;
+    return 1;
+}
+typedef struct { klxr_session *s; int64_t t; klxr_head_delta d; } klxr_st_race;
+static void *klxr_st_race_run(void *arg) {
+    klxr_st_race *r = arg;
+    r->d = klxr_frame_head_delta(r->s, r->t);
+    return NULL;
+}
+
 int kl_openxr_space_selftest(FILE *f) {
     klxr_space view  = klxr_st_space(KLXR_REF_SPACE_VIEW, 0, 0, 0);
     klxr_space stage = klxr_st_space(KLXR_REF_SPACE_STAGE, 0, 0, 0);
     klxr_space local = klxr_st_space(KLXR_REF_SPACE_LOCAL, 0, 0, 0);
+    klxr_space floor = klxr_st_space(KLXR_REF_SPACE_LOCAL_FLOOR, 0, 0, 0);
     float eh = kl_ovrp_eye_height();
     int ok = 1;
 
@@ -7483,6 +10117,12 @@ int kl_openxr_space_selftest(FILE *f) {
                                                klxr_space_pose(&local, NULL));
         ok &= klxr_st_pos(f, "LOCAL in STAGE is the standing height",
                           local_in_stage.position, 0, eh, 0);
+        // Local-floor is the floor-height equivalent of LOCAL, not LOCAL's
+        // eye-height offset. This is currently the same frame as STAGE.
+        XrPosef floor_in_stage = klxr_pose_rel(klxr_space_pose(&stage, NULL),
+                                               klxr_space_pose(&floor, NULL));
+        ok &= klxr_st_pos(f, "LOCAL_FLOOR in STAGE stays on the floor",
+                          floor_in_stage.position, 0, 0, 0);
 
         // poseInReferenceSpace. In VIEW it must be ROTATED by the head, not
         // merely added to it: a metre in
@@ -7509,6 +10149,9 @@ int kl_openxr_space_selftest(FILE *f) {
     // head 10 degrees further, so a runtime that predicts only one of the two
     // fails by that whole angle rather than by a rounding error.
     {
+        // Prediction is off by default; these checks are about what it does when it is on.
+        int predict_was = kl_openxr_predict();
+        kl_openxr_set_predict(1);
         kl_ovrp_set_head_pose(0, 1.6f, 0, 0, 0, 0, 1);
         kl_ovrp_frame_latch();
         kl_ovrp_set_head_at(klxr_st_head_at);
@@ -7576,7 +10219,66 @@ int kl_openxr_space_selftest(FILE *f) {
                    "(%.3f rad/s about y%s)\n", spinning ? "ok  " : "FAIL",
                 (double)ang[1], known ? "" : ", NOT a measurement");
         ok &= spinning;
+
+        // Two threads missing on the same (frame, instant) at once. The
+        // prediction runs outside the cache lock (so both reach the tracker)
+        // and the first to publish wins (so both answer the same head).
+        kl_ovrp_set_head_at(klxr_st_head_at_race);
+        __atomic_store_n(&g_st_race_calls, 0, __ATOMIC_RELEASE);
+        klxr_session rs;
+        memset(&rs, 0, sizeof rs);
+        rs.frames_waited = 1;
+        int64_t when = klxr_now() + 8000000LL;
+        klxr_st_race r[2] = { { &rs, when, { 0 } }, { &rs, when, { 0 } } };
+        pthread_t rt[2];
+        for (int i = 0; i < 2; i++) pthread_create(&rt[i], NULL, klxr_st_race_run, &r[i]);
+        for (int i = 0; i < 2; i++) pthread_join(rt[i], NULL);
+        int both = __atomic_load_n(&g_st_race_calls, __ATOMIC_ACQUIRE) == 2;
+        fprintf(f, "  %s the tracker is queried outside the cache lock "
+                   "(%d concurrent queries)\n", both ? "ok  " : "FAIL", g_st_race_calls);
+        ok &= both;
+        int same = r[0].d.valid && r[1].d.valid &&
+                   memcmp(r[0].d.q, r[1].d.q, sizeof r[0].d.q) == 0 &&
+                   memcmp(r[0].d.p, r[1].d.p, sizeof r[0].d.p) == 0;
+        // ...and what was published is the answer a third caller gets.
+        klxr_head_delta again = klxr_frame_head_delta(&rs, when);
+        same &= memcmp(again.q, r[0].d.q, sizeof again.q) == 0 &&
+                __atomic_load_n(&g_st_race_calls, __ATOMIC_ACQUIRE) == 2;
+        fprintf(f, "  %s two threads racing on one instant get one head\n",
+                same ? "ok  " : "FAIL");
+        ok &= same;
+
+        // Switched while the game runs (kl_openxr_set_predict): from the next
+        // frame, and never inside one — a frame that has answered predicted
+        // keeps answering predicted, or its two entry points would disagree.
+        kl_ovrp_set_head_at(klxr_st_head_at);
+        int was = kl_openxr_predict();
+        kl_openxr_set_predict(1);
+        klxr_session ts;
+        memset(&ts, 0, sizeof ts);
+        ts.frames_waited = 1;
+        int64_t t1 = klxr_now() + 8000000LL;
+        klxr_head_delta a = klxr_frame_head_delta(&ts, t1);
+        kl_openxr_set_predict(0);
+        klxr_head_delta b = klxr_frame_head_delta(&ts, t1);
+        klxr_head_delta b2 = klxr_frame_head_delta(&ts, t1 + 1000000LL);
+        int held = a.valid && b.valid && b2.valid && memcmp(a.q, b.q, sizeof a.q) == 0;
+        fprintf(f, "  %s switching prediction off mid-frame leaves that frame "
+                   "predicted\n", held ? "ok  " : "FAIL");
+        ok &= held;
+        ts.frames_waited = 2;
+        klxr_head_delta c = klxr_frame_head_delta(&ts, t1 + 11000000LL);
+        int off = !c.valid;
+        fprintf(f, "  %s ...and the next frame answers the latched head\n", off ? "ok  " : "FAIL");
+        ok &= off;
+        kl_openxr_set_predict(1);
+        ts.frames_waited = 3;
+        klxr_head_delta e = klxr_frame_head_delta(&ts, t1 + 22000000LL);
+        fprintf(f, "  %s ...and switched back on, predicts again\n", e.valid ? "ok  " : "FAIL");
+        ok &= e.valid;
+        kl_openxr_set_predict(was);
         kl_ovrp_set_head_at(NULL);
+        kl_openxr_set_predict(predict_was);
     }
 
     // The regression itself, stated as one comparison: moving and turning the

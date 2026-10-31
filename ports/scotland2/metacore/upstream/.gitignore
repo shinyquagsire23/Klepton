@@ -1,0 +1,23 @@
+# VSCode
+.cache/
+
+# Jetbrains
+.idea/
+
+# NDK
+ndkpath.txt
+*.zip
+*.txt
+*.log
+
+# QPM
+extern/
+qpm_defines.cmake
+extern.cmake
+
+# build
+!CMakeLists.txt
+build/
+mod.json
+mod.json.schema
+*.qmod

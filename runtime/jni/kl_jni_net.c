@@ -251,6 +251,16 @@ static klj_val klj_System_load(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.j = 0};
 }
 
+// System.loadLibrary(name) itself, called straight from managed code through
+// AndroidJavaClass("java.lang.System") rather than through one of the wrappers
+// (Max Mustard does this after its platform init). Same resolution and the same
+// JNI_OnLoad as UnityPlayer.loadLibrary; the boolean is dropped because the
+// Java method returns void.
+static klj_val klj_System_loadLibrary(void *env, void *self, const klj_val *a, int n) {
+    klj_UnityPlayer_loadLibrary(env, self, a, n);
+    return (klj_val){.l = NULL};
+}
+
 // Epic Online Services' own loader: com.epicgames.mobile.eossdk.LibraryLoader
 // .load() is a no-arg System.loadLibrary("EOSSDK") wrapper (ZIX ships
 // libEOSSDK.so). It aborted as an unimplemented Java method; route it through
@@ -267,20 +277,170 @@ static klj_val klj_EOS_LibraryLoader_load(void *env, void *self, const klj_val *
     return (klj_val){.l = NULL};
 }
 
+// The static EOSSDK helpers libEOSSDK calls back into during
+// EOS_Platform_Create (Cave Crave). verifyPlatformsOptions checks that the APK
+// carries the EOS login redirect setup for the given client — an unmodified
+// APK does, so on a Quest it is true. GetOSVersion answers from the same
+// Build.VERSION.RELEASE the guest reads directly, so the two cannot disagree.
+static klj_val klj_EOS_true(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 1};
+}
+static klj_val klj_EOS_false(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 0};
+}
+static klj_val klj_EOS_GetOSVersion(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    const char *rel = kl_jni_build_string("RELEASE");
+    return (klj_val){.l = kl_jni_new_string(rel ? rel : "10")};
+}
+// The rest are read out of EOSSDK's own bytecode in the state it is in here:
+// init() is a no-op, so mCustomTabsSession/mSharedPreferences are null and no
+// browser resolves. PrewarmURL's null-session arm returns
+// LaunchUrlResult.CUSTOM_TAB_EXCEPTION.Value(), LaunchURL's no-browser arm
+// RESOLVE_ACTIVITY_EXCEPTION (the enum's values equal its ordinals); the
+// keychain without preferences reads "" and refuses writes; the sales market
+// is GetInstallerSourceName(), which maps the null installer
+// PackageManager reports here to "Unknown".
+enum { KLJ_EOS_RESOLVE_ACTIVITY_EXCEPTION = 2, KLJ_EOS_CUSTOM_TAB_EXCEPTION = 4 };
+static klj_val klj_EOS_PrewarmURL(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = KLJ_EOS_CUSTOM_TAB_EXCEPTION};
+}
+static klj_val klj_EOS_LaunchURL(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)n;
+    KLJ_LOG("EOSSDK.LaunchURL(%s) — no browser on this host", klj_str(a[0].l));
+    return (klj_val){.j = KLJ_EOS_RESOLVE_ACTIVITY_EXCEPTION};
+}
+static klj_val klj_EOS_Keychain_ReadValue(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("")};
+}
+static klj_val klj_EOS_GetSalesMarketIdentifier(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("Unknown")};
+}
+
 // The output devices AudioManager knows about. Answered as an empty array, which
 // is the one honest answer available: we do not enumerate host audio hardware, and
 // every field of an AudioDeviceInfo — id, type, sample rates, channel masks —
 // would have to be invented to fill even one entry.
 //
-// Empty is not a silent zero of the trap-6d kind. Unity uses this list to notice
-// device *changes* (headphones, Bluetooth) and to pick a non-default output; with
-// nothing to choose from it stays on the default path, which is the OpenSL device
-// that already works. If something later needs a populated list, the trace will
-// name the AudioDeviceInfo getter it calls rather than leaving us to guess.
+// This was answered as an EMPTY array, on the reasoning that we do not enumerate
+// host audio hardware and every field of an AudioDeviceInfo would have to be
+// invented. Batman: Arkham Shadow (UE4 + Meta XR Audio for Wwise) shows what that
+// costs: it resolves getChannelCounts, getProductName, getSampleRates and
+// isSource, gets the empty list, and then
+//
+//     I/MetaXRAudioWwise: ERROR: OculusEndpointSink failed to get default device
+//                         info: Unspecified error occured
+//
+// and the game is silent. Meta's XR Audio Wwise sink picks its output by walking
+// this list; an empty walk leaves it with no default device, so
+// OculusEndpointSink::Init bails — and because the sink registered itself before
+// it failed, every later retry reports "Attempting to initialize another
+// instance ... Aborting initialization." With no sink there is no output to
+// hear, whatever the soundbanks do.
+//
+// So one entry, describing what the guest is told it is running on everywhere
+// else (Build.MODEL, ovrp_GetSystemProductName): the built-in stereo speakers at
+// the sample rate AudioManager already reports through OUTPUT_SAMPLE_RATE. This
+// is the same correction as InputDevice.getDeviceIds() — an empty list is not
+// the conservative answer when the caller's next move is to pick from it; it is
+// a confidently wrong one. On a Quest the speakers really are an enumerable
+// output device, so reporting one is the truthful answer, not an invented one.
+#define KLJ_AUDIO_DEV_ID       1
+#define KLJ_AUDIO_TYPE_SPEAKER 2      // AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+
 static klj_val klj_AudioManager_getDevices(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
+    // Pistol Whip's Wwise/Unity route monitor treats an empty output census as
+    // device loss and keeps re-evaluating its sink. Klepton really does have
+    // one stable default output here: the CoreAudio route kl_audio owns. Keep
+    // that compatibility answer local to the measured title.
+    //
+    // rebelancap's fork answers one output to every guest (the note above:
+    // Meta's XR Audio sink for Wwise walks this list). Taken over as a switch,
+    // KL_AUDIO_ONE_OUTPUT=1, off: the games listed here were heard with the
+    // empty list.
+    extern const char *kl_driver_target_name(void);
+    const char *target = kl_driver_target_name();
+    static int one = -1;
+    // Mission: ISS (x2094303753986147) too: its Wwise output is Meta's
+    // OculusEndpointSink, which picks its default output from this list
+    // (AudioDeviceAndroid walks getDevices(GET_DEVICES_ALL) and takes the first
+    // device that is not a source). With the empty list the game was silent
+    // from the first frame — music, voices, everything — and Training, which
+    // waits for Mission Control to finish speaking, never let him move.
+    if (one < 0) one = kl_env_on("KL_AUDIO_ONE_OUTPUT",
+                                 target && (strcmp(target, "x2104963472963790") == 0 ||
+                                            strcmp(target, "x2094303753986147") == 0));
+    if (one) {
+        // Cached, so pinned (klj_host_cache, kl_jni.c): the first caller's
+        // local frame would otherwise retire both, and every later caller got
+        // a pointer no longer recognised as an array — an EMPTY list. Unity
+        // asks first (flags 2) and Meta's Wwise sink later (flags 3), so the
+        // sink always saw nothing and failed with "OculusEndpointSink failed
+        // to get default device info".
+        static void *devices;
+        if (!devices) {
+            devices = klj_host_cache(klj_new_array('L', "android/media/AudioDeviceInfo", 1));
+            ((void **)klj_arr(devices)->data)[0] = klj_host_cache(
+                klj_new_object_data("android/media/AudioDeviceInfo", (void *)(intptr_t)1));
+        }
+        KLJ_LOG("AudioManager.getDevices() -> built-in speaker (one stable output)");
+        return (klj_val){.l = devices};
+    }
     KLJ_LOG("AudioManager.getDevices() -> empty (host devices are not enumerated)");
     return (klj_val){.l = klj_new_array('L', "android/media/AudioDeviceInfo", 0)};
+}
+
+// Properties of the same stable 48 kHz stereo output kl_audio advertises.
+static klj_val klj_AudioDeviceInfo_getId(void *e, void *s, const klj_val *a, int n) {
+    (void)e; (void)s; (void)a; (void)n; return (klj_val){.j = 1};
+}
+static klj_val klj_AudioDeviceInfo_getType(void *e, void *s, const klj_val *a, int n) {
+    (void)e; (void)s; (void)a; (void)n; return (klj_val){.j = 2};
+}
+static klj_val klj_AudioDeviceInfo_isSink(void *e, void *s, const klj_val *a, int n) {
+    (void)e; (void)s; (void)a; (void)n; return (klj_val){.j = 1};
+}
+static klj_val klj_AudioDeviceInfo_isSource(void *e, void *s, const klj_val *a, int n) {
+    (void)e; (void)s; (void)a; (void)n; return (klj_val){.j = 0};
+}
+static klj_val klj_AudioDeviceInfo_getProductName(void *e, void *s, const klj_val *a, int n) {
+    (void)e; (void)s; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("Built-in Audio")};
+}
+static klj_val klj_AudioDeviceInfo_getAddress(void *e, void *s, const klj_val *a, int n) {
+    (void)e; (void)s; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("")};
+}
+static void *klj_audio_ints(const int32_t *values, int count) {
+    void *array = klj_new_array('I', NULL, count);
+    if (count) memcpy(klj_arr(array)->data, values, (size_t)count * sizeof(*values));
+    return array;
+}
+static klj_val klj_AudioDeviceInfo_getSampleRates(void *e, void *s, const klj_val *a, int n) {
+    (void)e; (void)s; (void)a; (void)n;
+    static void *v; if (!v) { const int32_t x[] = {48000}; v = klj_audio_ints(x, 1); }
+    return (klj_val){.l = v};
+}
+static klj_val klj_AudioDeviceInfo_getChannelCounts(void *e, void *s, const klj_val *a, int n) {
+    (void)e; (void)s; (void)a; (void)n;
+    static void *v; if (!v) { const int32_t x[] = {2}; v = klj_audio_ints(x, 1); }
+    return (klj_val){.l = v};
+}
+static klj_val klj_AudioDeviceInfo_getEncodings(void *e, void *s, const klj_val *a, int n) {
+    (void)e; (void)s; (void)a; (void)n;
+    static void *v; if (!v) { const int32_t x[] = {2}; v = klj_audio_ints(x, 1); }
+    return (klj_val){.l = v};
+}
+static klj_val klj_AudioDeviceInfo_emptyInts(void *e, void *s, const klj_val *a, int n) {
+    (void)e; (void)s; (void)a; (void)n;
+    static void *v; if (!v) v = klj_new_array('I', NULL, 0);
+    return (klj_val){.l = v};
 }
 
 // MediaRouter.getSelectedRoute(type). Android always returns a route here — the
@@ -291,7 +451,7 @@ static klj_val klj_AudioManager_getDevices(void *env, void *self, const klj_val 
 static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *route;
-    if (!route) route = kl_jni_new_object("android/media/MediaRouter$RouteInfo");
+    if (!route) route = klj_host_cache(kl_jni_new_object("android/media/MediaRouter$RouteInfo"));
     return (klj_val){.l = route};
 }
 
@@ -301,15 +461,20 @@ static klj_val klj_MediaRouter_getSelectedRoute(void *env, void *self, const klj
 // which is exactly how this presented under KL_PERMISSIVE, as a SIGABRT with no
 // JNI call named because the permissive zero *was* the answer.
 //
-// The value is synthetic and constant: Android's own android_id is a per-device,
-// per-app-signing-key random 64-bit value, so any 16-hex-digit string is a
-// well-formed one. Stable across runs because callers cache it and compare.
-#define KLJ_ANDROID_ID "4b6c6570746f6e01"      /* "Klepton\1" as hex */
+// The value is synthetic and constant, and it lives in kl_jni_int.h as
+// KLJ_ANDROID_ID rather than here, because UE asks the same question through a
+// different door (GameActivity.AndroidThunkJava_GetAndroidId, kl_jni_ue4.c) and
+// the two must not answer differently.
 
 static klj_val klj_Context_getContentResolver(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
+    // Kept across calls, so pinned (kl_jni_pin_object): unpinned it was retired
+    // at the caller's next local-frame pop, and the second caller was handed a
+    // dead pointer. Unity asks once, for its device identifier; Demeo's own C#
+    // asks again as it signs in, and stopped on "GetObjectClass on an untagged
+    // pointer" (Mac host, 2026-10-13).
     static void *resolver;
-    if (!resolver) resolver = kl_jni_new_object("android/content/ContentResolver");
+    if (!resolver) resolver = klj_host_cache(kl_jni_new_object("android/content/ContentResolver"));
     return (klj_val){.l = resolver};
 }
 
@@ -323,6 +488,34 @@ static klj_val klj_Settings_Secure_getString(void *env, void *self, const klj_va
     KLJ_LOG("Settings.Secure.getString(\"%s\") -> null (not a setting we serve)",
             key ? key : "(null)");
     return (klj_val){.l = NULL};
+}
+
+// Settings.Global and Settings.System are the other two tables behind the same
+// ContentResolver, and a guest that misses a key in one asks the next: Unity's
+// own device-name lookup walks Global then Secure. So all three share this
+// implementation rather than deciding separately — a "device_name" that is null
+// in one table and a string in another is the group-answer mistake, and here it
+// would surface as a device that renames itself depending on which door was
+// used.
+//
+// The typed getters honour the caller's default, which is what Android does for
+// an absent key. The no-default overloads throw SettingNotFoundException on
+// Android; nothing here can throw, so they answer 0 and say so.
+static klj_val klj_Settings_getInt(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *key = n > 1 ? klj_str(a[1].l) : NULL;
+    kl_jint dflt = n > 2 ? (kl_jint)a[2].j : 0;
+    KLJ_LOG("Settings.getInt(\"%s\") -> %d (%s)", key ? key : "(null)", (int)dflt,
+            n > 2 ? "the caller's default; not a setting we serve"
+                  : "no default was offered and nothing here throws");
+    return (klj_val){.j = (uint64_t)(int64_t)dflt};
+}
+static klj_val klj_Settings_getFloat(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *key = n > 1 ? klj_str(a[1].l) : NULL;
+    double dflt = n > 2 ? a[2].d : 0.0;
+    KLJ_LOG("Settings.getFloat(\"%s\") -> %f (the caller's default)", key ? key : "(null)", dflt);
+    return (klj_val){.d = dflt};
 }
 
 // Thread.start(). This one is deliberately not a plain no-op, because a no-op
@@ -411,13 +604,125 @@ static klj_val klj_ctor_object(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     return (klj_val){.l = kl_jni_new_object(klj_class_name(self))};
 }
-static klj_val klj_horizon_zero_i(void *env, void *self, const klj_val *a, int n) {
-    (void)env; (void)self; (void)a; (void)n;
-    return (klj_val){.j = 0};   // no queued platform messages
-}
 static klj_val klj_horizon_session_id(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     return (klj_val){.j = 0x484F52495A4F4Ell};   // a fixed, non-zero synthetic session id
+}
+
+// ---- Horizon Platform: the application's own entitlement ----
+//
+// The Horizon-SDK twin of the ovr_Entitlement_GetIsViewerEntitled carve-out in
+// runtime/xr/kl_ovrplat.c, and drawn on the SAME line for the SAME reason:
+// Klepton runs an APK unpacked from a copy of the app the user already bought
+// (avpplay confirms the purchase with Meta before every install), so "is the
+// viewer entitled to THIS application" has a true answer, and it is yes.
+// Answering it describes that purchase; it does not manufacture one.
+//
+// Exactly ONE request is answered: service "entitlements", method
+// "get_is_viewer_entitled". Matched by exact string, never by substring, so
+// every other entitlement, IAP, purchase, DLC/asset or ownership request keeps
+// the old behaviour — an id is handed back and no reply ever comes. That is
+// strictly more restrictive than the truth, as kl_ovrplat.c's refusals are.
+//
+// HARD BULLET (x8116626111777808) gates its first scene on this reply: without
+// it the frame loop runs and the eye shows a black void indefinitely, while the
+// guest polls getMessageCount every frame. KL_HZ_ENTITLEMENT=0 restores the
+// silence for an A/B.
+//
+// The guest correlates the reply with the id makeRequest returned, so each
+// answered request gets its own id; unanswered ones keep the shared synthetic
+// session id they always had.
+#define KLJ_HZ_MAX_PENDING 8
+static pthread_mutex_t g_hz_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_hz_pending[KLJ_HZ_MAX_PENDING];
+static int      g_hz_npending;
+static uint64_t g_hz_next_id = 0x484F525A00000001ull;
+
+static int klj_hz_is_app_entitlement(const char *service, const char *method) {
+    return service && method &&
+           strcmp(service, "entitlements") == 0 &&
+           strcmp(method, "get_is_viewer_entitled") == 0;
+}
+
+static klj_val klj_horizon_make_request(void *env, void *self, const klj_val *a, int n) {
+    const char *s0 = n > 0 ? klj_str(a[0].l) : NULL, *s1 = n > 1 ? klj_str(a[1].l) : NULL;
+    const char *s3 = n > 3 ? klj_str(a[3].l) : NULL;
+    if (klj_hz_is_app_entitlement(s0, s1) && kl_env_on("KL_HZ_ENTITLEMENT", 1)) {
+        pthread_mutex_lock(&g_hz_lock);
+        uint64_t id = g_hz_next_id++;
+        int queued = g_hz_npending < KLJ_HZ_MAX_PENDING;
+        if (queued) g_hz_pending[g_hz_npending++] = id;
+        pthread_mutex_unlock(&g_hz_lock);
+        KLJ_LOG("HorizonPlatformCore.makeRequest(\"%s\", \"%s\") -> id 0x%llx — the "
+                "application's own entitlement; reply queued%s", s0, s1,
+                (unsigned long long)id, queued ? "" : " (queue full, dropped)");
+        return (klj_val){.j = id};
+    }
+    KLJ_LOG("HorizonPlatformCore.makeRequest(\"%.120s\", \"%.120s\", %d, \"%.200s\", %d) — no reply will come",
+            s0 ? s0 : "(null)", s1 ? s1 : "(null)", n > 2 ? (int)a[2].j : 0,
+            s3 ? s3 : "(null)", n > 4 ? (int)a[4].j : 0);
+    return klj_horizon_session_id(env, self, a, n);
+}
+
+// popMessage(session, flag) -> Object: hand back the oldest queued reply, or
+// NULL when there is none. The real class lives in Horizon OS, not the APK, so
+// its shape is learned from what the guest reads off it; until then the object
+// is inert and the first field or method the guest asks for is named in the log.
+#define KLJ_HZ_MSG_CLASS "horizonos/supplement/hzplatformclientcore/HorizonMessage"
+static struct { void *obj; uint64_t id; } g_hz_msgs[KLJ_HZ_MAX_PENDING];
+static unsigned g_hz_nmsgs;
+
+// The reply's fields, read by the guest with GetFieldID/Get*Field. Measured on
+// HARD BULLET (2026-10-11), in read order: requestId J, statusCode I,
+// statusMessage String, data String, cookie I. requestId is the id makeRequest
+// returned; statusCode 0 is success, which for this request IS the answer (as
+// Entitlement_GetIsViewerEntitled is in kl_ovrplat.c: no payload), and the
+// rest are empty. Any field is logged by name and type and anything not
+// named here answers 0/NULL, so a new shape shows up in one run.
+int klj_horizon_message_field(void *obj, const char *cls, const char *name,
+                              const char *sig, klj_val *out) {
+    if (strcmp(cls, KLJ_HZ_MSG_CLASS) != 0) return 0;
+    uint64_t id = 0;
+    pthread_mutex_lock(&g_hz_lock);
+    for (unsigned i = 0; i < KLJ_HZ_MAX_PENDING; i++)
+        if (g_hz_msgs[i].obj == obj) id = g_hz_msgs[i].id;
+    pthread_mutex_unlock(&g_hz_lock);
+    *out = (klj_val){0};
+    if (strcmp(name, "requestId") == 0 && sig[0] == 'J') out->j = id;
+    else if (strcmp(name, "errorCode") != 0)
+        KLJ_LOG("HorizonMessage.%s %s read — not modelled yet, answering 0/NULL", name, sig);
+    KLJ_LOG("HorizonMessage(0x%llx).%s %s -> 0x%llx", (unsigned long long)id, name, sig,
+            (unsigned long long)out->j);
+    return 1;
+}
+static klj_val klj_horizon_pop_message(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    pthread_mutex_lock(&g_hz_lock);
+    uint64_t id = 0;
+    if (g_hz_npending > 0) {
+        id = g_hz_pending[0];
+        memmove(g_hz_pending, g_hz_pending + 1, (size_t)(--g_hz_npending) * sizeof g_hz_pending[0]);
+    }
+    pthread_mutex_unlock(&g_hz_lock);
+    if (!id) return (klj_val){.l = NULL};
+    void *msg = kl_jni_new_object(KLJ_HZ_MSG_CLASS);
+    pthread_mutex_lock(&g_hz_lock);
+    g_hz_msgs[g_hz_nmsgs % KLJ_HZ_MAX_PENDING] = (typeof(g_hz_msgs[0])){msg, id};
+    g_hz_nmsgs++;
+    pthread_mutex_unlock(&g_hz_lock);
+    KLJ_LOG("HorizonPlatformCore.popMessage(flag=%d) -> entitlement reply for id 0x%llx",
+            n > 1 ? (int)a[1].j : -1, (unsigned long long)id);
+    return (klj_val){.l = msg};
+}
+
+// getMessageCount(session): how many replies are waiting — only ever the
+// entitlement replies queued above.
+static klj_val klj_horizon_message_count(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    pthread_mutex_lock(&g_hz_lock);
+    int c = g_hz_npending;
+    pthread_mutex_unlock(&g_hz_lock);
+    return (klj_val){.j = (uint64_t)c};
 }
 
 
@@ -476,6 +781,7 @@ const klj_binding klj_bind_net[] = {
     {"android/content/Context", "getResources",
      "()Landroid/content/res/Resources;", klj_Context_getResources},
     {"java/lang/System", "load", "(Ljava/lang/String;)V", klj_System_load},
+    {"java/lang/System", "loadLibrary", "(Ljava/lang/String;)V", klj_System_loadLibrary},
     {"com/epicgames/mobile/eossdk/LibraryLoader", "load", "()V", klj_EOS_LibraryLoader_load},
     // EOSSDK.init(activity) — EOS bring-up after the loader ran. Online/account
     // services; a no-op lets the game boot offline (the platform SDKs are all
@@ -484,6 +790,29 @@ const klj_binding klj_bind_net[] = {
      "(Landroid/app/Activity;)V", klj_void_noop},
     {"com/epicgames/mobile/eossdk/EOSSDK", "init",
      "(Lcom/unity3d/player/UnityPlayerActivity;)V", klj_void_noop},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "verifyPlatformsOptions",
+     "(Ljava/lang/String;)Z", klj_EOS_true},
+    // The user agent is only stored for the overlay's WebView, which is not here.
+    {"com/epicgames/mobile/eossdk/EOSSDK", "setUserAgent",
+     "(Ljava/lang/String;)V", klj_void_noop},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "GetOSVersion",
+     "()Ljava/lang/String;", klj_EOS_GetOSVersion},
+    // Surface.ROTATION_0: a headset is never rotated.
+    {"com/epicgames/mobile/eossdk/EOSSDK", "getDeviceOrientation", "()I", klj_EOS_false},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "PrewarmURL", "(Ljava/lang/String;)J", klj_EOS_PrewarmURL},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "LaunchURL",  "(Ljava/lang/String;)J", klj_EOS_LaunchURL},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "Keychain_ReadValue",
+     "(Ljava/lang/String;)Ljava/lang/String;", klj_EOS_Keychain_ReadValue},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "Keychain_WriteValue",
+     "(Ljava/lang/String;Ljava/lang/String;)Z", klj_EOS_false},
+    {"com/epicgames/mobile/eossdk/EOSSDK", "GetSalesMarketIdentifier",
+     "()Ljava/lang/String;", klj_EOS_GetSalesMarketIdentifier},
+    // The web overlay (a WebView) does not exist here, so it is never enabled.
+    {"com/epicgames/mobile/eossdk/EOSOverlay", "GetEnabledForNextLaunch", "()Z", klj_EOS_false},
+    // ...and its settings have nowhere to go: no WebView to enable or restrict.
+    {"com/epicgames/mobile/eossdk/EOSOverlay", "SetEnabledForNextLaunch", "(Z)V", klj_void_noop},
+    {"com/epicgames/mobile/eossdk/EOSOverlay", "SetValidDomains",
+     "([Ljava/lang/String;)V", klj_void_noop},
     // Meta Horizon platform client config ctor (ZIX). Meta platform SDK, like
     // the Oculus platform — construct the object (NewObject makes it) and let
     // the ctor be a no-op; the game boots without Horizon platform services.
@@ -506,15 +835,40 @@ const klj_binding klj_bind_net[] = {
     {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "makeSession",
      "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;I)J", klj_horizon_session_id},
     {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "makeRequest",
-     "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;I)J", klj_horizon_session_id},
+     "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;I)J", klj_horizon_make_request},
     {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "getMessageCount",
-     "(J)I", klj_horizon_zero_i},
+     "(J)I", klj_horizon_message_count},
+    {"horizonos/supplement/hzplatformclientcore/HorizonPlatformCore", "popMessage",
+     "(JZ)Ljava/lang/Object;", klj_horizon_pop_message},
     {"com/unity3d/player/UnityPlayer", "hidePreservedContent", "()V", klj_UnityPlayer_hidePreservedContent},
     {"com/unity3d/player/UnityPlayer", "executeMainThreadJobs", "()V", klj_UnityPlayer_executeMainThreadJobs},
     {"com/unity3d/player/UnityPlayer", "applyWindowUIChanges", "(Z)V", klj_void_noop},
     {"android/content/Context", "getContentResolver", "()Landroid/content/ContentResolver;", klj_Context_getContentResolver},
     {"android/provider/Settings$Secure", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
+    // Same three tables, same answers — see klj_Settings_getInt.
+    {"android/provider/Settings$Global", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
+    {"android/provider/Settings$System", "getString", "(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;", klj_Settings_Secure_getString},
+#define KLJ_SETTING_TABLE(T) \
+    {"android/provider/Settings$" T, "getInt",   "(Landroid/content/ContentResolver;Ljava/lang/String;I)I", klj_Settings_getInt}, \
+    {"android/provider/Settings$" T, "getInt",   "(Landroid/content/ContentResolver;Ljava/lang/String;)I",  klj_Settings_getInt}, \
+    {"android/provider/Settings$" T, "getFloat", "(Landroid/content/ContentResolver;Ljava/lang/String;F)F", klj_Settings_getFloat}, \
+    {"android/provider/Settings$" T, "getFloat", "(Landroid/content/ContentResolver;Ljava/lang/String;)F",  klj_Settings_getFloat}
+    KLJ_SETTING_TABLE("Secure"),
+    KLJ_SETTING_TABLE("Global"),
+    KLJ_SETTING_TABLE("System"),
+#undef KLJ_SETTING_TABLE
     {"android/media/AudioManager", "getDevices", "(I)[Landroid/media/AudioDeviceInfo;", klj_AudioManager_getDevices},
+    {"android/media/AudioDeviceInfo", "getId", "()I", klj_AudioDeviceInfo_getId},
+    {"android/media/AudioDeviceInfo", "getType", "()I", klj_AudioDeviceInfo_getType},
+    {"android/media/AudioDeviceInfo", "isSink", "()Z", klj_AudioDeviceInfo_isSink},
+    {"android/media/AudioDeviceInfo", "isSource", "()Z", klj_AudioDeviceInfo_isSource},
+    {"android/media/AudioDeviceInfo", "getProductName", "()Ljava/lang/CharSequence;", klj_AudioDeviceInfo_getProductName},
+    {"android/media/AudioDeviceInfo", "getAddress", "()Ljava/lang/String;", klj_AudioDeviceInfo_getAddress},
+    {"android/media/AudioDeviceInfo", "getSampleRates", "()[I", klj_AudioDeviceInfo_getSampleRates},
+    {"android/media/AudioDeviceInfo", "getChannelCounts", "()[I", klj_AudioDeviceInfo_getChannelCounts},
+    {"android/media/AudioDeviceInfo", "getEncodings", "()[I", klj_AudioDeviceInfo_getEncodings},
+    {"android/media/AudioDeviceInfo", "getChannelMasks", "()[I", klj_AudioDeviceInfo_emptyInts},
+    {"android/media/AudioDeviceInfo", "getChannelIndexMasks", "()[I", klj_AudioDeviceInfo_emptyInts},
     {"android/media/MediaRouter", "getSelectedRoute", "(I)Landroid/media/MediaRouter$RouteInfo;", klj_MediaRouter_getSelectedRoute},
     {"java/lang/Thread", "start", "()V", klj_Thread_start},
     // UE4 names its own threads through Java — see klj_Thread_currentThread.
@@ -560,5 +914,12 @@ const klj_binding klj_bind_net[] = {
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_KeepScreenOn", "(Z)V", klj_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_SetSustainedPerformanceMode", "(Z)V", klj_void_noop},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_DismissSplashScreen", "()V", klj_void_noop},
+    // The other half of the connectivity LISTENER pair whose add is bound in
+    // kl_jni_ue4.c. The Java behind it registers a NetworkCallback whose only
+    // job is to call nativeNetworkChanged when the connection type changes;
+    // nothing about the host's network changes under a guest here, so a
+    // listener that registers and never fires is exactly what that Java would
+    // have produced. The engine's shutdown calls the remover (Pinball FX VR).
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_RemoveNetworkListener", "()V", klj_void_noop},
     {0}
 };

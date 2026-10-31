@@ -1,0 +1,47 @@
+--- a/include/hooking.hpp
++++ b/include/hooking.hpp
+@@ -52,7 +52,22 @@
+     };                                                                                              \
+     static Auto_Hook_##name_ Auto_Hook_Instance_##name_
+ 
++#ifdef SC2_AOT_HOOKS
++struct SC2BuildHookTarget {
++    uint64_t address;
++    uint32_t originalHook, reserved;
++    char name[128];
++};
++static_assert(sizeof(SC2BuildHookTarget)==144);
++#define SC2_RECORD_HOOK(name_, mPtr, orig_) \
++    static const SC2BuildHookTarget sc2_target_##name_ __attribute__((used,section(".sc2_hooks"))) = { \
++        ::il2cpp_utils::il2cpp_type_check::MetadataGetter<mPtr>::addrs, orig_, 0, #name_ };
++#else
++#define SC2_RECORD_HOOK(name_, mPtr, orig_)
++#endif
++
+ #define MAKE_AUTO_HOOK_MATCH(name_, mPtr, retval, ...)                                                                                              \
++    SC2_RECORD_HOOK(name_, mPtr, 0) \
+     struct Hook_##name_ {                                                                                                                           \
+         using funcType = retval (*)(__VA_ARGS__);                                                                                                   \
+         static_assert(SongCore::match_hookable<mPtr>);                                                                                              \
+@@ -68,6 +83,7 @@
+     retval Hook_##name_::hook_##name_(__VA_ARGS__)
+ 
+ #define MAKE_AUTO_HOOK_ORIG_MATCH(name_, mPtr, retval, ...)                                                                                         \
++    SC2_RECORD_HOOK(name_, mPtr, 1) \
+     struct Hook_##name_ {                                                                                                                           \
+         using funcType = retval (*)(__VA_ARGS__);                                                                                                   \
+         static_assert(SongCore::match_hookable<mPtr>);                                                                                              \
+--- a/src/SongLoader/NavigationControllerUpdater.cpp
++++ b/src/SongLoader/NavigationControllerUpdater.cpp
+@@ -74,7 +74,10 @@
+             },
+             [this, levelId, scrollPosition](){
+                 INFO("Selecting level '{}'", levelId);
+-                auto level = _beatmapLevelsModel->GetBeatmapLevel(levelId);
++                // No saved selection is normal for the first empty custom-song scan.
++                // Preserve scroll restoration while avoiding an empty-ID lookup.
++                auto level = levelId && !static_cast<std::u16string_view>(levelId).empty()
++                    ? _beatmapLevelsModel->GetBeatmapLevel(levelId) : nullptr;
+ 
+                 auto levelCollectionTableView = _levelCollectionViewController->_levelCollectionTableView;
+                 if (level && levelCollectionTableView) levelCollectionTableView->SelectLevel(level);

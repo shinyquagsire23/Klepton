@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "gameElfSha256": "edae5059bd5a85ba354eb679e1cdcc3816116d2e2b29b3a16a70c05b56dd07cb",
+  "metadataSha256": "1814358a82213ff8ab48b088eae65c4039801f2ca0e9ec48157e74d84f329c17",
+  "sourceCommit": "4556891fb93a2a71549df11404074589daf8b31d",
+  "target": {
+    "name": "LRUCache_Add",
+    "vaddr": "0x3708fb8",
+    "expect": "0xd10103ff"
+  },
+  "discovery": "Actual physical IL2CPP FindMethodUnsafe(LRUCache<String,Sprite>, Add, 2) target; independent host resolution required by preflight."
+}

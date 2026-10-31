@@ -1,0 +1,9 @@
+{
+  "name": "metacore",
+  "repository": "Metalit/MetaCore",
+  "tag": "v1.6.2",
+  "commit": "f54126c58b4604d5fe04c105a774aaa1bd81a593",
+  "archive": "metacore-f54126c.tar.gz",
+  "sha256": "55ed75653f1049dd4dcc2246ee6abfe00434de62545da37735f3c970c8f724cf",
+  "scope": "Exact original released source downloaded for port work; not built or tested."
+}

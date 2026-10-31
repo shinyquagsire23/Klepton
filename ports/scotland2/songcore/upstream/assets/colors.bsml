@@ -1,0 +1,16 @@
+<modal id='_colorsOptionsModal' anchor-pos-x='-5' anchor-pos-y='5'
+    clickerino-offerino-closerino='false' size-delta-x='85' size-delta-y='30'
+    xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+    xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+    <vertical
+        horizontal-fit='PreferredSize'
+        pref-width='80'>
+        <checkbox-setting text='Allow Custom Song Note Colors' value='customSongNoteColors' hover-hint='Allow Custom Songs to override note colors' apply-on-change='true'/>
+        <checkbox-setting text='Allow Custom Song Obstacle Colors' value='customSongObstacleColors' hover-hint='Allow Custom Songs to override wall colors' apply-on-change='true'/>
+        <checkbox-setting text='Allow Custom Song Environment Colors' value='customSongEnvironmentColors' hover-hint='Allow Custom Songs to override light colors' apply-on-change='true'/>
+        <horizontal spacing='-5'>
+            <text text='Selected Custom Song&#39;s Colors' italics='true' />
+            <background id='_selectedColorBG'/>
+        </horizontal>
+    </vertical>
+</modal>

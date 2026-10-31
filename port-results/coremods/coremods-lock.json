@@ -1,0 +1,1545 @@
+{
+  "root": {
+    "_QPVersion": "0.1.1",
+    "name": "Core mods for 1.40.8_7379",
+    "id": "CoreMods_1.40.8_7379",
+    "author": "QuestPackageManager",
+    "description": "Downloads the following mods: custom-types@^0.18.3, lapiz@^0.2.23, bsml@^0.4.55, songcore@^1.1.24, playlistcore@^1.5.5, paper2_scotland2@^4.6.4, songdownloader@^0.8.8, unicode@^0.1.7, datakeeper@^0.2.5, metacore@^1.6.2, FakeId@^0.1.9",
+    "version": "2025.9.14-043000000Z",
+    "packageId": "com.beatgames.beatsaber",
+    "packageVersion": "1.40.8_7379",
+    "modloader": "Scotland2",
+    "modFiles": [],
+    "libraryFiles": [],
+    "fileCopies": [],
+    "copyExtensions": [],
+    "dependencies": [
+      {
+        "id": "custom-types",
+        "version": "^0.18.3",
+        "downloadIfMissing": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod"
+      },
+      {
+        "id": "lapiz",
+        "version": "^0.2.23",
+        "downloadIfMissing": "https://github.com/raineaeternal/Lapiz/releases/download/v0.2.23/Lapiz.qmod"
+      },
+      {
+        "id": "bsml",
+        "version": "^0.4.55",
+        "downloadIfMissing": "https://github.com/bsq-ports/Quest-BSML/releases/download/v0.4.55/BSML.qmod"
+      },
+      {
+        "id": "songcore",
+        "version": "^1.1.24",
+        "downloadIfMissing": "https://github.com/raineaeternal/Quest-SongCore/releases/download/v1.1.24/SongCore.qmod"
+      },
+      {
+        "id": "playlistcore",
+        "version": "^1.5.5",
+        "downloadIfMissing": "https://github.com/Metalit/PlaylistCore/releases/download/v1.5.5/PlaylistCore.qmod"
+      },
+      {
+        "id": "paper2_scotland2",
+        "version": "^4.6.4",
+        "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+      },
+      {
+        "id": "songdownloader",
+        "version": "^0.8.8",
+        "downloadIfMissing": "https://github.com/darknight1050/SongDownloader/releases/download/v0.8.8/SongDownloader.qmod"
+      },
+      {
+        "id": "unicode",
+        "version": "^0.1.7",
+        "downloadIfMissing": "https://github.com/Metalit/UnicodeQuest/releases/download/v0.1.7/Unicode.qmod"
+      },
+      {
+        "id": "datakeeper",
+        "version": "^0.2.5",
+        "downloadIfMissing": "https://github.com/Metalit/PlayerDataKeeper/releases/download/v0.2.5/PlayerDataKeeper.qmod"
+      },
+      {
+        "id": "metacore",
+        "version": "^1.6.2",
+        "downloadIfMissing": "https://github.com/Metalit/MetaCore/releases/download/v1.6.2/MetaCore.qmod"
+      },
+      {
+        "id": "FakeId",
+        "version": "^0.1.9",
+        "downloadIfMissing": "https://github.com/DanTheMan827-BeatSaber/Quest.FakeID/releases/download/v0.1.9%2B1.40.8_7379/Fake.ID.qmod"
+      }
+    ]
+  },
+  "packages": [
+    {
+      "id": "custom-types",
+      "url": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod",
+      "sha256": "9b665017d47b4074c56265f4e7cd7104d83b44c137bdc2c73ae29b7a3724b1c7",
+      "archive": "archives/custom-types-9e5afffb45f5.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "0.1.1",
+        "name": "custom-types",
+        "id": "custom-types",
+        "modloader": "Scotland2",
+        "author": "Sc2ad",
+        "version": "0.18.3",
+        "description": "Core mod required for other mods to function!",
+        "coverImage": "cover.png",
+        "isLibrary": true,
+        "dependencies": [
+          {
+            "version": "^6.2.0",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.3.0/beatsaber-hook.qmod"
+          },
+          {
+            "version": "^4.2.1",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.4.0/paper2_scotland2.qmod"
+          }
+        ],
+        "modFiles": [],
+        "lateModFiles": [],
+        "libraryFiles": [
+          "libcustom-types.so"
+        ],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "lapiz",
+      "url": "https://github.com/raineaeternal/Lapiz/releases/download/v0.2.23/Lapiz.qmod",
+      "sha256": "ae1b688cf61c7620ea006f071e02a6ba8fd77fb6084f3b8fe66de017685b15c8",
+      "archive": "archives/lapiz-132e86064be9.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "1.1.0",
+        "name": "Lapiz",
+        "id": "lapiz",
+        "modloader": "Scotland2",
+        "author": "Raine",
+        "version": "0.2.23",
+        "packageId": "com.beatgames.beatsaber",
+        "packageVersion": "1.40.8_7379",
+        "description": "Lapiz makes modders' lives easier by exposing utilities to them cleanly. This mod does nothing on its own.",
+        "dependencies": [
+          {
+            "version": "^6.4.1",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod"
+          },
+          {
+            "version": "^0.18.2",
+            "id": "custom-types",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod"
+          },
+          {
+            "version": "^4.6.1",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+          }
+        ],
+        "modFiles": [
+          "liblapiz.so"
+        ],
+        "lateModFiles": [],
+        "libraryFiles": [],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "bsml",
+      "url": "https://github.com/bsq-ports/Quest-BSML/releases/download/v0.4.55/BSML.qmod",
+      "sha256": "04d7cf8aaaae485f605b3719e98daf2031a603d5be997c5dc17392f925820764",
+      "archive": "archives/bsml-87d6be904fcc.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "1.1.0",
+        "name": "BSML",
+        "id": "bsml",
+        "modloader": "Scotland2",
+        "author": "RedBrumbler",
+        "version": "0.4.55",
+        "packageId": "com.beatgames.beatsaber",
+        "packageVersion": "1.40.8_7379",
+        "description": "Library that parses BeatSaber Markup Language to create UI elements",
+        "coverImage": "cover.png",
+        "isLibrary": true,
+        "dependencies": [
+          {
+            "version": "^6.4.1",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod"
+          },
+          {
+            "version": "^0.18.2",
+            "id": "custom-types",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod"
+          },
+          {
+            "version": "^4.6.1",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+          },
+          {
+            "version": "^10.0.0",
+            "id": "tinyxml2",
+            "downloadIfMissing": "https://github.com/MillzyDev/NDK-tinyxml2/releases/download/v10.0.0/tinyxml2.qmod"
+          }
+        ],
+        "modFiles": [
+          "libbsml.so"
+        ],
+        "lateModFiles": [],
+        "libraryFiles": [],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "songcore",
+      "url": "https://github.com/raineaeternal/Quest-SongCore/releases/download/v1.1.24/SongCore.qmod",
+      "sha256": "9572f6cb1e540aaa0bf0318afb46acd0957b0d71b9575550c83bc12c58a37d26",
+      "archive": "archives/songcore-da5f4505dafd.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "0.1.1",
+        "name": "SongCore",
+        "id": "songcore",
+        "modloader": "Scotland2",
+        "author": "Raine & RedBrumbler",
+        "version": "1.1.24",
+        "packageId": "com.beatgames.beatsaber",
+        "packageVersion": "1.40.8_7379",
+        "description": "Adds songloading, map requirement handling and related utilities to the game.",
+        "coverImage": "cover.jpg",
+        "dependencies": [
+          {
+            "version": "^6.4.2",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod"
+          },
+          {
+            "version": "^4.6.4",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+          },
+          {
+            "version": "^0.4.53",
+            "id": "bsml",
+            "downloadIfMissing": "https://github.com/bsq-ports/Quest-BSML/releases/download/v0.4.55/BSML.qmod"
+          },
+          {
+            "version": "^0.2.21",
+            "id": "lapiz",
+            "downloadIfMissing": "https://github.com/raineaeternal/Lapiz/releases/download/v0.2.23/Lapiz.qmod"
+          },
+          {
+            "version": "^0.18.3",
+            "id": "custom-types",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod"
+          }
+        ],
+        "modFiles": [],
+        "lateModFiles": [
+          "libsongcore.so"
+        ],
+        "libraryFiles": [],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "playlistcore",
+      "url": "https://github.com/Metalit/PlaylistCore/releases/download/v1.5.5/PlaylistCore.qmod",
+      "sha256": "967be7b0b753858d9d2848141ce943e6f42b4adbb5e9b65c656324c4895e03f7",
+      "archive": "archives/playlistcore-9769522b724d.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "0.1.1",
+        "name": "PlaylistCore",
+        "id": "playlistcore",
+        "modloader": "Scotland2",
+        "author": "Metalit, darknight1050",
+        "version": "1.5.5",
+        "packageId": "com.beatgames.beatsaber",
+        "packageVersion": "1.40.8_7379",
+        "description": "Loads playlists and provides lots of functionality to other mods.",
+        "coverImage": "cover.png",
+        "dependencies": [
+          {
+            "version": "^6.4.2",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod"
+          },
+          {
+            "version": "^0.4.54",
+            "id": "bsml",
+            "downloadIfMissing": "https://github.com/bsq-ports/Quest-BSML/releases/download/v0.4.55/BSML.qmod"
+          },
+          {
+            "version": "^0.18.3",
+            "id": "custom-types",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod"
+          },
+          {
+            "version": "^1.1.23",
+            "id": "songcore",
+            "downloadIfMissing": "https://github.com/raineaeternal/Quest-SongCore/releases/download/v1.1.24/SongCore.qmod"
+          },
+          {
+            "version": "^0.6.7",
+            "id": "web-utils",
+            "downloadIfMissing": "https://github.com/RedBrumbler/WebUtils/releases/download/v0.6.7/WebUtils.qmod"
+          },
+          {
+            "version": "^0.2.1",
+            "id": "beatsaverplusplus",
+            "downloadIfMissing": "https://github.com/bsq-ports/BeatSaverPlusPlus/releases/download/v0.2.1/BeatSaverPlusPlus.qmod"
+          },
+          {
+            "version": "^4.6.4",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+          },
+          {
+            "version": "^1.4.0",
+            "id": "metacore",
+            "downloadIfMissing": "https://github.com/Metalit/MetaCore/releases/download/v1.4.0/MetaCore.qmod"
+          }
+        ],
+        "modFiles": [],
+        "lateModFiles": [
+          "libplaylistcore.so"
+        ],
+        "libraryFiles": [],
+        "fileCopies": [],
+        "copyExtensions": [
+          {
+            "extension": "bplist",
+            "destination": "/sdcard/ModData/com.beatgames.beatsaber/Mods/PlaylistManager/Playlists"
+          }
+        ]
+      }
+    },
+    {
+      "id": "paper2_scotland2",
+      "url": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod",
+      "sha256": "d14d7aef777e4487dd20df1247e7926b1f6901d24397a6a19040b8a4d69bc92d",
+      "archive": "archives/paper2_scotland2-5ce6552419ba.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "1.1.0",
+        "name": "Paperlog Scotland2",
+        "id": "paper2_scotland2",
+        "modloader": "Scotland2",
+        "author": "Fernthedev",
+        "version": "4.6.4",
+        "description": "Paperlog Bootstrapper for Scotland2 modloader",
+        "isLibrary": true,
+        "dependencies": [],
+        "modFiles": [],
+        "lateModFiles": [],
+        "libraryFiles": [
+          "libpaper2_scotland2.so"
+        ],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "songdownloader",
+      "url": "https://github.com/darknight1050/SongDownloader/releases/download/v0.8.8/SongDownloader.qmod",
+      "sha256": "9782942f4e22abaf0d9475a789e0296582d3fe925ea0e98f214cc4f0080c463c",
+      "archive": "archives/songdownloader-d838232fb11d.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "0.1.1",
+        "name": "SongDownloader",
+        "id": "songdownloader",
+        "modloader": "Scotland2",
+        "author": "darknight1050, EnderdracheLP, Metalit",
+        "version": "0.8.8",
+        "packageId": "com.beatgames.beatsaber",
+        "packageVersion": "1.40.8_7379",
+        "description": "Download Custom Songs at Runtime",
+        "coverImage": "cover.png",
+        "dependencies": [
+          {
+            "version": "^6.4.2",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod"
+          },
+          {
+            "version": "^0.4.54",
+            "id": "bsml",
+            "downloadIfMissing": "https://github.com/bsq-ports/Quest-BSML/releases/download/v0.4.55/BSML.qmod"
+          },
+          {
+            "version": "^0.18.3",
+            "id": "custom-types",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod"
+          },
+          {
+            "version": "^4.6.4",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+          },
+          {
+            "version": "^1.5.3",
+            "id": "playlistcore",
+            "downloadIfMissing": "https://github.com/Metalit/PlaylistCore/releases/download/v1.5.5/PlaylistCore.qmod"
+          },
+          {
+            "version": "^1.1.23",
+            "id": "songcore",
+            "downloadIfMissing": "https://github.com/raineaeternal/Quest-SongCore/releases/download/v1.1.24/SongCore.qmod"
+          }
+        ],
+        "modFiles": [],
+        "lateModFiles": [
+          "libsongdownloader.so"
+        ],
+        "libraryFiles": [],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "unicode",
+      "url": "https://github.com/Metalit/UnicodeQuest/releases/download/v0.1.7/Unicode.qmod",
+      "sha256": "8bc1995fdcc892b8a3f4195bcb9584787208785fd0d559aee4df1f38a138e140",
+      "archive": "archives/unicode-a417cdeb7890.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "0.1.1",
+        "name": "Unicode",
+        "id": "unicode",
+        "modloader": "Scotland2",
+        "author": "Metalit",
+        "version": "0.1.7",
+        "packageId": "com.beatgames.beatsaber",
+        "packageVersion": "1.40.8_7379",
+        "description": "Finally, \ud808\ude19",
+        "coverImage": "cover.png",
+        "dependencies": [
+          {
+            "version": "^6.4.2",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod"
+          },
+          {
+            "version": "^4.6.4",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+          },
+          {
+            "version": "^1.4.0",
+            "id": "metacore",
+            "downloadIfMissing": "https://github.com/Metalit/MetaCore/releases/download/v1.4.0/MetaCore.qmod"
+          }
+        ],
+        "modFiles": [],
+        "lateModFiles": [
+          "libunicode.so"
+        ],
+        "libraryFiles": [],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "datakeeper",
+      "url": "https://github.com/Metalit/PlayerDataKeeper/releases/download/v0.2.5/PlayerDataKeeper.qmod",
+      "sha256": "a87cc49c23e51b56467ef3050b4f2c5328e015e0422133ab690a003f24e03f08",
+      "archive": "archives/datakeeper-d3ff01ee63fd.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "0.1.1",
+        "name": "PlayerDataKeeper",
+        "id": "datakeeper",
+        "modloader": "Scotland2",
+        "author": "Metalit",
+        "version": "0.2.5",
+        "packageId": "com.beatgames.beatsaber",
+        "packageVersion": "1.40.8_7379",
+        "description": "Preserves your player data (scores, controller offset, etc) between updates or any other time it might be lost",
+        "dependencies": [
+          {
+            "version": "^6.4.2",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod"
+          },
+          {
+            "version": "^4.6.4",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+          },
+          {
+            "version": "^0.18.3",
+            "id": "custom-types",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod"
+          }
+        ],
+        "modFiles": [
+          "libdatakeeper.so"
+        ],
+        "lateModFiles": [],
+        "libraryFiles": [],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "metacore",
+      "url": "https://github.com/Metalit/MetaCore/releases/download/v1.6.2/MetaCore.qmod",
+      "sha256": "76432b89821cf26ab3288e36ab4b956076472ffc81e68cfceeefe08853224388",
+      "archive": "archives/metacore-a0637caf4208.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "0.1.1",
+        "name": "MetaCore",
+        "id": "metacore",
+        "modloader": "Scotland2",
+        "author": "Metalit",
+        "version": "1.6.2",
+        "packageId": "com.beatgames.beatsaber",
+        "packageVersion": "1.40.8_7379",
+        "description": "Provides way too many utilities for mod developers",
+        "dependencies": [
+          {
+            "version": "^6.4.2",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod"
+          },
+          {
+            "version": "^4.6.4",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+          },
+          {
+            "version": "^0.18.3",
+            "id": "custom-types",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.18.3/CustomTypes.qmod"
+          },
+          {
+            "version": "^1.0.4",
+            "id": "song-details",
+            "downloadIfMissing": "https://github.com/bsq-ports/SongDetails/releases/download/v1.0.4/SongDetails.qmod"
+          },
+          {
+            "version": "^0.6.8",
+            "id": "web-utils",
+            "downloadIfMissing": "https://github.com/bsq-ports/WebUtils/releases/download/v0.6.8/WebUtils.qmod"
+          }
+        ],
+        "modFiles": [
+          "libmetacore.so"
+        ],
+        "lateModFiles": [],
+        "libraryFiles": [],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "FakeId",
+      "url": "https://github.com/DanTheMan827-BeatSaber/Quest.FakeID/releases/download/v0.1.9%2B1.40.8_7379/Fake.ID.qmod",
+      "sha256": "218cbaf284100e1f1ab7641f7f9a6ac5f69f6d53c03e4811cafa2b189cb11811",
+      "archive": "archives/FakeId-3128903b4b55.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "0.1.1",
+        "name": "Fake ID",
+        "id": "FakeId",
+        "modloader": "Scotland2",
+        "author": "DanTheMan827",
+        "version": "0.1.9",
+        "packageId": "com.beatgames.beatsaber",
+        "packageVersion": "1.40.8_7379",
+        "description": "Sets the player age to an adult.",
+        "coverImage": "cover.png",
+        "dependencies": [
+          {
+            "version": "^6.4.2",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod"
+          },
+          {
+            "version": "^4.6.4",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+          }
+        ],
+        "modFiles": [
+          "libFakeId.so"
+        ],
+        "lateModFiles": [],
+        "libraryFiles": [],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "beatsaber-hook",
+      "url": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.2/beatsaber-hook.qmod",
+      "sha256": "eb96c66aa15aa3ef0a1e7c6c00791193ae8545a98470889b441bf593383641d7",
+      "archive": "archives/beatsaber-hook-e9801ed65fff.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "0.1.1",
+        "name": "beatsaber-hook",
+        "id": "beatsaber-hook",
+        "modloader": "Scotland2",
+        "author": "sc2ad",
+        "version": "6.4.2",
+        "description": "Provides modding utilities for unity il2cpp games",
+        "isLibrary": true,
+        "dependencies": [
+          {
+            "version": "^4.4.0",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.4.0/paper2_scotland2.qmod"
+          }
+        ],
+        "modFiles": [],
+        "lateModFiles": [],
+        "libraryFiles": [
+          "libbeatsaber-hook.so"
+        ],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "tinyxml2",
+      "url": "https://github.com/MillzyDev/NDK-tinyxml2/releases/download/v10.0.0/tinyxml2.qmod",
+      "sha256": "dd4af8b43a251a7f96fc86a2e2e0801a1405d452497b30cbeab438142e56797a",
+      "archive": "archives/tinyxml2-a6a17c3b5ae5.qmod",
+      "manifest": {
+        "_QPVersion": "1.1.0",
+        "name": "tinyxml2",
+        "id": "tinyxml2",
+        "modloader": "Scotland2",
+        "author": "leethompson",
+        "porter": "Millzy",
+        "version": "10.0.0",
+        "packageId": "com.beatgames.beatsaber",
+        "packageVersion": "1.29.0_4466478251",
+        "description": "tinyxml2",
+        "isLibrary": true,
+        "dependencies": [],
+        "modFiles": [],
+        "lateModFiles": [],
+        "libraryFiles": [
+          "libtinyxml2.so"
+        ],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "web-utils",
+      "url": "https://github.com/bsq-ports/WebUtils/releases/download/v0.6.8/WebUtils.qmod",
+      "sha256": "fd9fca2e067290c88f9d5a48e68bb255a22be03949353359d6ce17048616ee8b",
+      "archive": "archives/web-utils-bc3941328eb0.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "0.1.1",
+        "name": "WebUtils",
+        "id": "web-utils",
+        "modloader": "Scotland2",
+        "author": "RedBrumbler",
+        "version": "0.6.8",
+        "packageId": "com.beatgames.beatsaber",
+        "description": "library to provide easier ways of downloading things from the web",
+        "isLibrary": true,
+        "dependencies": [],
+        "modFiles": [],
+        "lateModFiles": [],
+        "libraryFiles": [
+          "libweb-utils.so"
+        ],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "beatsaverplusplus",
+      "url": "https://github.com/bsq-ports/BeatSaverPlusPlus/releases/download/v0.2.1/BeatSaverPlusPlus.qmod",
+      "sha256": "0dc46ea94e4b673597b91c44c2e60be57902e1f0ee9f951d4a78ae84052fc145",
+      "archive": "archives/beatsaverplusplus-33938e7a67fd.qmod",
+      "manifest": {
+        "_QPVersion": "0.1.1",
+        "name": "BeatSaverPlusPlus",
+        "id": "beatsaverplusplus",
+        "modloader": "Scotland2",
+        "author": "RedBrumbler",
+        "version": "0.2.1",
+        "packageId": "com.beatgames.beatsaber",
+        "description": "C++ library to interact with beatsaver",
+        "isLibrary": true,
+        "dependencies": [
+          {
+            "version": "^4.0.0",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.4.2/paper2_scotland2.qmod"
+          },
+          {
+            "version": "^0.6.0",
+            "id": "web-utils",
+            "downloadIfMissing": "https://github.com/RedBrumbler/WebUtils/releases/download/v0.6.7/WebUtils.qmod"
+          },
+          {
+            "version": "*",
+            "id": "beatsaber-hook",
+            "downloadIfMissing": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v6.4.0/beatsaber-hook.qmod"
+          }
+        ],
+        "modFiles": [],
+        "lateModFiles": [],
+        "libraryFiles": [
+          "libbeatsaverplusplus.so",
+          "libzip.so"
+        ],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    },
+    {
+      "id": "song-details",
+      "url": "https://github.com/bsq-ports/SongDetails/releases/download/v1.0.4/SongDetails.qmod",
+      "sha256": "8602c954e6eb92297fea382b260f7ac3c531ad0bdaa4911e7a5cec215d5538bd",
+      "archive": "archives/song-details-5f278068c614.qmod",
+      "manifest": {
+        "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+        "_QPVersion": "1.1.0",
+        "name": "SongDetails",
+        "id": "song-details",
+        "modloader": "Scotland2",
+        "author": "RedBrumbler",
+        "version": "1.0.4",
+        "packageId": "com.beatgames.beatsaber",
+        "description": "Library that provides details about songs from BeatSaver",
+        "isLibrary": true,
+        "dependencies": [
+          {
+            "version": "^4.6.4",
+            "id": "paper2_scotland2",
+            "downloadIfMissing": "https://github.com/Fernthedev/paperlog/releases/download/v4.6.4/paper2_scotland2.qmod"
+          }
+        ],
+        "modFiles": [],
+        "lateModFiles": [],
+        "libraryFiles": [
+          "libsongdetails.so"
+        ],
+        "fileCopies": [],
+        "copyExtensions": []
+      }
+    }
+  ],
+  "constraints": [
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "custom-types",
+      "required": "^0.18.3",
+      "selected": "0.18.3",
+      "satisfied": true
+    },
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "lapiz",
+      "required": "^0.2.23",
+      "selected": "0.2.23",
+      "satisfied": true
+    },
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "bsml",
+      "required": "^0.4.55",
+      "selected": "0.4.55",
+      "satisfied": true
+    },
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "songcore",
+      "required": "^1.1.24",
+      "selected": "1.1.24",
+      "satisfied": true
+    },
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "playlistcore",
+      "required": "^1.5.5",
+      "selected": "1.5.5",
+      "satisfied": true
+    },
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "paper2_scotland2",
+      "required": "^4.6.4",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "songdownloader",
+      "required": "^0.8.8",
+      "selected": "0.8.8",
+      "satisfied": true
+    },
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "unicode",
+      "required": "^0.1.7",
+      "selected": "0.1.7",
+      "satisfied": true
+    },
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "datakeeper",
+      "required": "^0.2.5",
+      "selected": "0.2.5",
+      "satisfied": true
+    },
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "metacore",
+      "required": "^1.6.2",
+      "selected": "1.6.2",
+      "satisfied": true
+    },
+    {
+      "parent": "CoreMods_1.40.8_7379",
+      "id": "FakeId",
+      "required": "^0.1.9",
+      "selected": "0.1.9",
+      "satisfied": true
+    },
+    {
+      "parent": "custom-types",
+      "id": "beatsaber-hook",
+      "required": "^6.2.0",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "custom-types",
+      "id": "paper2_scotland2",
+      "required": "^4.2.1",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "lapiz",
+      "id": "beatsaber-hook",
+      "required": "^6.4.1",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "lapiz",
+      "id": "custom-types",
+      "required": "^0.18.2",
+      "selected": "0.18.3",
+      "satisfied": true
+    },
+    {
+      "parent": "lapiz",
+      "id": "paper2_scotland2",
+      "required": "^4.6.1",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "bsml",
+      "id": "beatsaber-hook",
+      "required": "^6.4.1",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "bsml",
+      "id": "custom-types",
+      "required": "^0.18.2",
+      "selected": "0.18.3",
+      "satisfied": true
+    },
+    {
+      "parent": "bsml",
+      "id": "paper2_scotland2",
+      "required": "^4.6.1",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "bsml",
+      "id": "tinyxml2",
+      "required": "^10.0.0",
+      "selected": "10.0.0",
+      "satisfied": true
+    },
+    {
+      "parent": "songcore",
+      "id": "beatsaber-hook",
+      "required": "^6.4.2",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "songcore",
+      "id": "paper2_scotland2",
+      "required": "^4.6.4",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "songcore",
+      "id": "bsml",
+      "required": "^0.4.53",
+      "selected": "0.4.55",
+      "satisfied": true
+    },
+    {
+      "parent": "songcore",
+      "id": "lapiz",
+      "required": "^0.2.21",
+      "selected": "0.2.23",
+      "satisfied": true
+    },
+    {
+      "parent": "songcore",
+      "id": "custom-types",
+      "required": "^0.18.3",
+      "selected": "0.18.3",
+      "satisfied": true
+    },
+    {
+      "parent": "playlistcore",
+      "id": "beatsaber-hook",
+      "required": "^6.4.2",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "playlistcore",
+      "id": "bsml",
+      "required": "^0.4.54",
+      "selected": "0.4.55",
+      "satisfied": true
+    },
+    {
+      "parent": "playlistcore",
+      "id": "custom-types",
+      "required": "^0.18.3",
+      "selected": "0.18.3",
+      "satisfied": true
+    },
+    {
+      "parent": "playlistcore",
+      "id": "songcore",
+      "required": "^1.1.23",
+      "selected": "1.1.24",
+      "satisfied": true
+    },
+    {
+      "parent": "playlistcore",
+      "id": "web-utils",
+      "required": "^0.6.7",
+      "selected": "0.6.8",
+      "satisfied": true
+    },
+    {
+      "parent": "playlistcore",
+      "id": "beatsaverplusplus",
+      "required": "^0.2.1",
+      "selected": "0.2.1",
+      "satisfied": true
+    },
+    {
+      "parent": "playlistcore",
+      "id": "paper2_scotland2",
+      "required": "^4.6.4",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "playlistcore",
+      "id": "metacore",
+      "required": "^1.4.0",
+      "selected": "1.6.2",
+      "satisfied": true
+    },
+    {
+      "parent": "songdownloader",
+      "id": "beatsaber-hook",
+      "required": "^6.4.2",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "songdownloader",
+      "id": "bsml",
+      "required": "^0.4.54",
+      "selected": "0.4.55",
+      "satisfied": true
+    },
+    {
+      "parent": "songdownloader",
+      "id": "custom-types",
+      "required": "^0.18.3",
+      "selected": "0.18.3",
+      "satisfied": true
+    },
+    {
+      "parent": "songdownloader",
+      "id": "paper2_scotland2",
+      "required": "^4.6.4",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "songdownloader",
+      "id": "playlistcore",
+      "required": "^1.5.3",
+      "selected": "1.5.5",
+      "satisfied": true
+    },
+    {
+      "parent": "songdownloader",
+      "id": "songcore",
+      "required": "^1.1.23",
+      "selected": "1.1.24",
+      "satisfied": true
+    },
+    {
+      "parent": "unicode",
+      "id": "beatsaber-hook",
+      "required": "^6.4.2",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "unicode",
+      "id": "paper2_scotland2",
+      "required": "^4.6.4",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "unicode",
+      "id": "metacore",
+      "required": "^1.4.0",
+      "selected": "1.6.2",
+      "satisfied": true
+    },
+    {
+      "parent": "datakeeper",
+      "id": "beatsaber-hook",
+      "required": "^6.4.2",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "datakeeper",
+      "id": "paper2_scotland2",
+      "required": "^4.6.4",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "datakeeper",
+      "id": "custom-types",
+      "required": "^0.18.3",
+      "selected": "0.18.3",
+      "satisfied": true
+    },
+    {
+      "parent": "metacore",
+      "id": "beatsaber-hook",
+      "required": "^6.4.2",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "metacore",
+      "id": "paper2_scotland2",
+      "required": "^4.6.4",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "metacore",
+      "id": "custom-types",
+      "required": "^0.18.3",
+      "selected": "0.18.3",
+      "satisfied": true
+    },
+    {
+      "parent": "metacore",
+      "id": "song-details",
+      "required": "^1.0.4",
+      "selected": "1.0.4",
+      "satisfied": true
+    },
+    {
+      "parent": "metacore",
+      "id": "web-utils",
+      "required": "^0.6.8",
+      "selected": "0.6.8",
+      "satisfied": true
+    },
+    {
+      "parent": "FakeId",
+      "id": "beatsaber-hook",
+      "required": "^6.4.2",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "FakeId",
+      "id": "paper2_scotland2",
+      "required": "^4.6.4",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "beatsaber-hook",
+      "id": "paper2_scotland2",
+      "required": "^4.2.1",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "beatsaber-hook",
+      "id": "paper2_scotland2",
+      "required": "^4.4.0",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "beatsaverplusplus",
+      "id": "paper2_scotland2",
+      "required": "^4.0.0",
+      "selected": "4.6.4",
+      "satisfied": true
+    },
+    {
+      "parent": "beatsaverplusplus",
+      "id": "web-utils",
+      "required": "^0.6.0",
+      "selected": "0.6.8",
+      "satisfied": true
+    },
+    {
+      "parent": "beatsaverplusplus",
+      "id": "beatsaber-hook",
+      "required": "*",
+      "selected": "6.4.2",
+      "satisfied": true
+    },
+    {
+      "parent": "song-details",
+      "id": "paper2_scotland2",
+      "required": "^4.6.4",
+      "selected": "4.6.4",
+      "satisfied": true
+    }
+  ],
+  "failures": [],
+  "binaries": [
+    {
+      "mod": "custom-types",
+      "member": "libcustom-types.so",
+      "file": "elf/custom-types/0.18.3/libcustom-types.so",
+      "sha256": "c4fd5d8049f8e1a59732ca0859f650cfa4961f0bd029e66586e3daa944c995ef",
+      "needed": [
+        "liblog.so",
+        "libbeatsaber-hook.so",
+        "libpaper2_scotland2.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 16432,
+        "GLOB_DAT": 103,
+        "ABS64": 145,
+        "JUMP_SLOT": 151
+      }
+    },
+    {
+      "mod": "lapiz",
+      "member": "liblapiz.so",
+      "file": "elf/lapiz/0.2.23/liblapiz.so",
+      "sha256": "86fda48858338d09c3afac0b4f949a34a2dd8c4b01f353867bb0fe1df494312a",
+      "needed": [
+        "liblog.so",
+        "libbeatsaber-hook.so",
+        "libcustom-types.so",
+        "libpaper2_scotland2.so",
+        "libsl2.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 2315,
+        "ABS64": 653,
+        "GLOB_DAT": 578,
+        "JUMP_SLOT": 184
+      }
+    },
+    {
+      "mod": "bsml",
+      "member": "libbsml.so",
+      "file": "elf/bsml/0.4.55/libbsml.so",
+      "sha256": "38327abdd35121bc18cd5f55d82579e63e5f480a66c16be9435016e2e861f81a",
+      "needed": [
+        "liblog.so",
+        "libz.so",
+        "libbeatsaber-hook.so",
+        "libcustom-types.so",
+        "libpaper2_scotland2.so",
+        "libsl2.so",
+        "libtinyxml2.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 11705,
+        "ABS64": 4377,
+        "GLOB_DAT": 2254,
+        "JUMP_SLOT": 496
+      }
+    },
+    {
+      "mod": "songcore",
+      "member": "libsongcore.so",
+      "file": "elf/songcore/1.1.24/libsongcore.so",
+      "sha256": "08447c624a2d100db748c82a12bccd35411264452777bdfc90ab8d2ee4857026",
+      "needed": [
+        "liblog.so",
+        "libbeatsaber-hook.so",
+        "libbsml.so",
+        "libcustom-types.so",
+        "liblapiz.so",
+        "libpaper2_scotland2.so",
+        "libsl2.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 7178,
+        "ABS64": 15970,
+        "GLOB_DAT": 1970,
+        "JUMP_SLOT": 1329
+      }
+    },
+    {
+      "mod": "playlistcore",
+      "member": "libplaylistcore.so",
+      "file": "elf/playlistcore/1.5.5/libplaylistcore.so",
+      "sha256": "393a0644497b9ee148063e10ad2a697891b4f26c512127e0e245d265906b4bdf",
+      "needed": [
+        "liblog.so",
+        "libbeatsaber-hook.so",
+        "libbeatsaverplusplus.so",
+        "libbsml.so",
+        "libcustom-types.so",
+        "libmetacore.so",
+        "libpaper2_scotland2.so",
+        "libsl2.so",
+        "libsongcore.so",
+        "libweb-utils.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 3853,
+        "GLOB_DAT": 2540,
+        "ABS64": 5680,
+        "JUMP_SLOT": 1453
+      }
+    },
+    {
+      "mod": "paper2_scotland2",
+      "member": "libpaper2_scotland2.so",
+      "file": "elf/paper2_scotland2/4.6.4/libpaper2_scotland2.so",
+      "sha256": "acc980f7dd4fa961557abf2c5c6869d7f715cfb514c4eba5ce323a51a63dd0ae",
+      "needed": [
+        "libsl2.so",
+        "libdl.so",
+        "liblog.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 1152,
+        "GLOB_DAT": 2,
+        "JUMP_SLOT": 71
+      }
+    },
+    {
+      "mod": "songdownloader",
+      "member": "libsongdownloader.so",
+      "file": "elf/songdownloader/0.8.8/libsongdownloader.so",
+      "sha256": "5d957202f56a1b33a407932c70ea8415c5c1a2effa200d8183aeb99158e23447",
+      "needed": [
+        "liblog.so",
+        "libz.so",
+        "libbeatsaber-hook.so",
+        "libbsml.so",
+        "libcustom-types.so",
+        "libpaper2_scotland2.so",
+        "libplaylistcore.so",
+        "libsl2.so",
+        "libsongcore.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 17905,
+        "ABS64": 5230,
+        "GLOB_DAT": 1602,
+        "JUMP_SLOT": 3478
+      }
+    },
+    {
+      "mod": "unicode",
+      "member": "libunicode.so",
+      "file": "elf/unicode/0.1.7/libunicode.so",
+      "sha256": "0ddc92defcd9aefe29d0e65825af903785c2e2b77459694187a51e204acfe08e",
+      "needed": [
+        "liblog.so",
+        "libjnigraphics.so",
+        "libOpenSLES.so",
+        "libGLESv3.so",
+        "libbeatsaber-hook.so",
+        "libmetacore.so",
+        "libpaper2_scotland2.so",
+        "libsl2.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 69,
+        "ABS64": 78,
+        "GLOB_DAT": 58,
+        "JUMP_SLOT": 169
+      }
+    },
+    {
+      "mod": "datakeeper",
+      "member": "libdatakeeper.so",
+      "file": "elf/datakeeper/0.2.5/libdatakeeper.so",
+      "sha256": "d30ae01a841c07a969c92fe2e42cab0a970730f03902e75a826dd3e22141b7c5",
+      "needed": [
+        "liblog.so",
+        "libbeatsaber-hook.so",
+        "libcustom-types.so",
+        "libpaper2_scotland2.so",
+        "libsl2.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 576,
+        "ABS64": 395,
+        "GLOB_DAT": 163,
+        "JUMP_SLOT": 205
+      }
+    },
+    {
+      "mod": "metacore",
+      "member": "libmetacore.so",
+      "file": "elf/metacore/1.6.2/libmetacore.so",
+      "sha256": "aac7f059865c2854b21bf36f4226e723de44898a2656fd0ea57ff1f6b07f7591",
+      "needed": [
+        "liblog.so",
+        "libbeatsaber-hook.so",
+        "libcustom-types.so",
+        "libpaper2_scotland2.so",
+        "libsl2.so",
+        "libsongdetails.so",
+        "libweb-utils.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 1815,
+        "ABS64": 734,
+        "GLOB_DAT": 352,
+        "JUMP_SLOT": 289
+      }
+    },
+    {
+      "mod": "FakeId",
+      "member": "libFakeId.so",
+      "file": "elf/FakeId/0.1.9/libFakeId.so",
+      "sha256": "1b18272fa5636be6bc97c68abcb9b0af645a46fe440416443898c69a8482dece",
+      "needed": [
+        "liblog.so",
+        "libbeatsaber-hook.so",
+        "libpaper2_scotland2.so",
+        "libsl2.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 54,
+        "ABS64": 19,
+        "GLOB_DAT": 27,
+        "JUMP_SLOT": 86
+      }
+    },
+    {
+      "mod": "beatsaber-hook",
+      "member": "libbeatsaber-hook.so",
+      "file": "elf/beatsaber-hook/6.4.2/libbeatsaber-hook.so",
+      "sha256": "b13ebc4809f02c787ef5e2d4ecf0a100c56a9dd390c4395da33e73bf2fbf2b1b",
+      "needed": [
+        "liblog.so",
+        "libpaper2_scotland2.so",
+        "libsl2.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 80,
+        "ABS64": 63,
+        "GLOB_DAT": 316,
+        "JUMP_SLOT": 180
+      }
+    },
+    {
+      "mod": "tinyxml2",
+      "member": "libtinyxml2.so",
+      "file": "elf/tinyxml2/10.0.0/libtinyxml2.so",
+      "sha256": "839e298cb4d61b75f7b1233dd087295b4cf67c1891bc6a99a7fbd0aed4636a8a",
+      "needed": [
+        "liblog.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 1126,
+        "GLOB_DAT": 39,
+        "ABS64": 594,
+        "JUMP_SLOT": 133
+      }
+    },
+    {
+      "mod": "beatsaverplusplus",
+      "member": "libbeatsaverplusplus.so",
+      "file": "elf/beatsaverplusplus/0.2.1/libbeatsaverplusplus.so",
+      "sha256": "7f637994d82dbec0757716c4515734c7ec8f40514cb8e52efd5561e0d80c098e",
+      "needed": [
+        "liblog.so",
+        "libz.so",
+        "libzip.so",
+        "libpaper2_scotland2.so",
+        "libweb-utils.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 1936,
+        "GLOB_DAT": 846,
+        "ABS64": 2271,
+        "JUMP_SLOT": 769
+      }
+    },
+    {
+      "mod": "beatsaverplusplus",
+      "member": "libzip.so",
+      "file": "elf/beatsaverplusplus/0.2.1/libzip.so",
+      "sha256": "0b1e934334509a7d8e0cc92fae3f49ba185f9dc5dfc1be3ffcba6e182e75c47e",
+      "needed": [
+        "liblog.so",
+        "libz.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 62,
+        "GLOB_DAT": 9,
+        "ABS64": 10,
+        "JUMP_SLOT": 145
+      }
+    },
+    {
+      "mod": "song-details",
+      "member": "libsongdetails.so",
+      "file": "elf/song-details/1.0.4/libsongdetails.so",
+      "sha256": "fcd988cc0c7b487672d7584159893cd6f087d6b4f68883dbb37fb91f23edc5ae",
+      "needed": [
+        "liblog.so",
+        "libz.so",
+        "libpaper2_scotland2.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 16841,
+        "GLOB_DAT": 24,
+        "ABS64": 27,
+        "JUMP_SLOT": 218
+      }
+    },
+    {
+      "mod": "web-utils",
+      "member": "libweb-utils.so",
+      "file": "elf/web-utils/0.6.8/libweb-utils.so",
+      "sha256": "3f84929adb4eeb36510b68a581d654eb7a78929b14355bc2fd2775fd116beb37",
+      "needed": [
+        "libz.so",
+        "liblog.so",
+        "libm.so",
+        "libdl.so",
+        "libc.so"
+      ],
+      "tls": null,
+      "relocations": {
+        "RELATIVE": 13425,
+        "GLOB_DAT": 16,
+        "ABS64": 11,
+        "JUMP_SLOT": 174
+      }
+    }
+  ],
+  "limitations": "Static inventory only. No mod executed; symbol providers and runtime hook compatibility are unproven."
+}

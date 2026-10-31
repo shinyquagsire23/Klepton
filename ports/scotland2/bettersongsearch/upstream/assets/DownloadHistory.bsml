@@ -1,0 +1,10 @@
+<vertical anchor-pos-x="-18" child-control-height="false" xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<horizontal bg='panel-top-gradient'>
+		<text text='DOWNLOAD HISTORY' align='Center' italics='true'/>
+	</horizontal>
+	<horizontal preferred-height='72' pad-top='0' pad-bottom='2' preferred-width='80'>
+		<vertical preferred-width='70'>
+			<list id='downloadList' select-cell='SelectSong' visible-cells='9' show-scrollbar='true' />
+		</vertical>
+	</horizontal>
+</vertical>

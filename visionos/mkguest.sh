@@ -26,6 +26,10 @@ cd "$(dirname "$0")"
 ROOT=".."
 LD="$ROOT/build/klepton-ld"
 eval "$(python3 targets.py "${KLEPTON_TARGET:-}")"
+# A Linux process is not built from one directory of .so files: its libraries
+# are named by content and chosen by what the process loads. mklxguest.py is
+# this script for that shape, and produces the same Frameworks/<target>/ layout.
+if [ "$KLT_KIND" = linux ]; then exec python3 mklxguest.py; fi
 SRC="$ROOT/$KLT_SRCDIR"
 OUT="Frameworks/$KLT_NAME"
 LIBS="$KLT_LIBS"

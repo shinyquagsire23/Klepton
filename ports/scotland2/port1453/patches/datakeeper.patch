@@ -1,0 +1,109 @@
+--- a/include/hooks.hpp
++++ b/include/hooks.hpp
+@@ -41,6 +41,7 @@
+         using cast_t = ::i2c::detail::method_check<cast_test, func_t>::type;                                                     \
+         static_assert(cast_test.operator()<cast_t>(), "Hook method signature does not match!");                                  \
+         static_assert(::i2c::detail::match_hookable<static_cast<cast_t>(method)>, "Method cannot be hooked!");                   \
++        SC2_RECORD_MATCH_1453(name_, method, cast_t) \
+         __INTERNAL_HOOK_STRUCT(name_, ::i2c::metadata_getter<static_cast<cast_t>(method)>::method_info(), ret_type, __VA_ARGS__) \
+     };                                                                                                                           \
+     AUTO_INSTALL(name_)                                                                                                          \
+@@ -53,6 +54,7 @@
+         using cast_t = ::i2c::detail::method_check<cast_test, func_t>::type;                                                     \
+         static_assert(cast_test.operator()<cast_t>(), "Hook method signature does not match!");                                  \
+         static_assert(::i2c::detail::match_hookable<static_cast<cast_t>(method)>, "Method cannot be hooked!");                   \
++        SC2_RECORD_MATCH_1453(name_, method, cast_t) \
+         __INTERNAL_HOOK_STRUCT(name_, ::i2c::metadata_getter<static_cast<cast_t>(method)>::method_info(), ret_type, __VA_ARGS__) \
+     };                                                                                                                           \
+     AUTO_INSTALL_ORIG(name_)                                                                                                     \
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,4 +1,7 @@
+ #include "main.hpp"
++#ifdef SC2_AOT_HOOKS
++#include "safe-save.hpp"
++#endif
+ 
+ #include "config.hpp"
+ #include "hooks.hpp"
+@@ -47,19 +50,33 @@
+ static void HandleSave(std::filesystem::path fullPath, std::string checkPath, std::string backupPath) {
+     if (fullPath.parent_path() == checkPath && !std::filesystem::is_directory(fullPath) && !std::regex_search(fullPath.string(), BLACKLIST)) {
+         logger.info("Copying for backup: {} -> {}", fullPath.string(), backupPath);
++#ifdef SC2_AOT_HOOKS
++        if (!sc2_save::atomic_copy(fullPath, backupPath / fullPath.filename()))
++            logger.error("Backup failed; previous backup retained: {}", fullPath.string());
++#else
+         std::filesystem::copy(fullPath, backupPath / fullPath.filename(), copyopt);
++#endif
+     }
+ }
+ 
+ static void HandleSave(std::string filePath) {
++#ifdef SC2_AOT_HOOKS
++    try {
++#endif
+     auto fullPath = std::filesystem::canonical(filePath);
+     logger.info("File saved, path: {} ({})", fullPath.string(), filePath);
+ 
+     HandleSave(fullPath, filesPath, GetBackupPath());
+     HandleSave(fullPath, localFilesPath, GetLocalsBackupPath());
++#ifdef SC2_AOT_HOOKS
++    } catch (const std::exception& error) { logger.error("Backup failed: {}",error.what()); }
++#endif
+ }
+ 
+ MAKE_AUTO_HOOK_MATCH(File_WriteAllText, &File::WriteAllText, void, StringW path, StringW contents) {
++#ifdef SC2_AOT_HOOKS
++    std::lock_guard<std::recursive_mutex> lock(sc2_save::mutex);
++#endif
+     File_WriteAllText(path, contents);
+     HandleSave(path);
+ }
+@@ -73,6 +90,9 @@
+     StringW destinationBackupFileName,
+     bool ignoreMetadataErrors
+ ) {
++#ifdef SC2_AOT_HOOKS
++    std::lock_guard<std::recursive_mutex> lock(sc2_save::mutex);
++#endif
+     File_Replace(sourceFileName, destinationFileName, destinationBackupFileName, ignoreMetadataErrors);
+     HandleSave(destinationFileName);
+ }
+@@ -187,7 +207,13 @@
+         for (auto const& file : std::filesystem::directory_iterator(backupFolder)) {
+             if (!std::filesystem::is_directory(file)) {
+                 logger.info("Loading backup: {}", file.path().string());
++#ifdef SC2_AOT_HOOKS
++                auto dest=std::filesystem::path(destFolder)/file.path().filename();
++                if (sc2_save::should_restore(file.path(),dest) && !sc2_save::atomic_copy(file.path(),dest))
++                    logger.error("Restore failed; destination retained: {}",dest.string());
++#else
+                 std::filesystem::copy(file, destFolder / file.path().filename(), copyopt);
++#endif
+             }
+         }
+     } else
+@@ -203,10 +229,22 @@
+     std::filesystem::create_directories(filesPath);
+     std::filesystem::create_directories(localFilesPath);
+ 
++#ifdef SC2_AOT_HOOKS
++    try {
++#endif
+     CopyFolder(GetBackupPath(), filesPath);
+     CopyFolder(GetLocalsBackupPath(), localFilesPath);
++#ifdef SC2_AOT_HOOKS
++    } catch (const std::exception& error) { logger.error("Restore failed: {}",error.what()); }
++#endif
+ 
++#ifdef SC2_AOT_HOOKS
++    // Installing backup support must preserve the player's current effects settings.
++    // The old one-time upstream lighting reset is unnecessary for this host port.
++    lightsSet = true;
++#else
+     lightsSet = getConfig().lightsSet.GetValue();
++#endif
+     if (!lightsSet)
+         getConfig().lightsSet.SetValue(true);
+ 

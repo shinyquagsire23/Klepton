@@ -41,6 +41,7 @@ from pathlib import Path
 
 OBJDUMP = "/usr/bin/objdump"
 TEST_REG = 9
+TEST_PAIR = 10      # tests/t_x18.c: what x18 becomes where it names a pair (CASP)
 
 # `x18` as an operand, not the tail of a hex literal (#0x18) or a vector name.
 X18 = re.compile(r"(?<![0-9A-Za-z_.$])([wx])18(?![0-9A-Za-z_])")
@@ -134,7 +135,22 @@ def check(t_x18, lib):
             if orig is None or got is None:
                 bad_subst.append((addr, word, subst, orig, got))
                 continue
-            want = X18.sub(lambda m: f"{m.group(1)}{TEST_REG}", orig)
+            if orig.startswith("casp"):
+                # x18 names the pair x18:x19 here, so the substituted word names
+                # TEST_PAIR and the register above it.
+                want = re.sub(r"\b(?P<r>[wx])18, (?P=r)19\b",
+                              lambda m: f"{m.group('r')}{TEST_PAIR}, {m.group('r')}{TEST_PAIR + 1}",
+                              orig, count=1)
+                # ...and as the base it is an ordinary register, which t_x18
+                # rewrites with the same number.
+                want = X18.sub(lambda m: f"{m.group(1)}{TEST_PAIR}", want)
+            else:
+                want = X18.sub(lambda m: f"{m.group(1)}{TEST_REG}", orig)
+            # `extr Xd, Xn, Xn, #s` is spelled `ror Xd, Xn, #s`, and the rewrite
+            # is what makes the two source registers equal.
+            want = re.sub(r"^extr\s+(\w+), (\w+), \2, (#\w+)$", r"ror \1, \2, \3", want)
+            want = re.sub(r"^ror\s+", "ror ", want)
+            got = re.sub(r"^ror\s+", "ror ", got)
             if got != want:
                 bad_subst.append((addr, word, subst, want, got))
 

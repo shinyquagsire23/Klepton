@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "note": "The mods a Beat Saber build with mods carries (port1453/selected-mods.json), with their authors, where they come from and the licence their repository states. Shown in the game's start window (Settings › Mods) and in AVP Play (Settings › Software used). Their authors asked to be named where players see it (2026-10-30). Where a repository has no licence file yet, its authors said MIT is what they want (2026-10-30, relayed by Marcel; nothing recorded on purpose).",
+  "port": {
+    "name": "Port of the mods to the Apple Vision Pro",
+    "authors": "naldo29",
+    "url": "https://github.com/naldo29/beat-saber-with-custom-song-support",
+    "license": "MIT"
+  },
+  "mods": [
+    {"name": "Scotland2", "version": "0.1.7", "authors": "sc2ad", "url": "https://github.com/sc2ad/scotland2", "license": "MIT", "role": "mod loader"},
+    {"name": "beatsaber-hook", "version": "9.3.0", "authors": "QuestPackageManager (sc2ad and contributors)", "url": "https://github.com/QuestPackageManager/beatsaber-hook", "license": "MIT", "role": "modding library"},
+    {"name": "custom-types", "version": "0.21.2", "authors": "QuestPackageManager", "url": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching", "license": "MIT", "role": "modding library"},
+    {"name": "Flamingo", "version": "1.2.1", "authors": "QuestPackageManager", "url": "https://github.com/QuestPackageManager/Flamingo", "license": "MIT", "role": "hooking library"},
+    {"name": "paper2", "version": "4.8.0", "authors": "Fernthedev", "url": "https://github.com/Fernthedev/paperlog", "license": "", "role": "logging"},
+    {"name": "reflect-cpp", "version": "0.25.0", "authors": "kodenamekrak", "url": "https://github.com/kodenamekrak/reflectcpp-qpm", "license": "MIT", "role": "library"},
+    {"name": "tinyxml2", "version": "10.0.0", "authors": "Lee Thomason, packaged by MillzyDev", "url": "https://github.com/MillzyDev/NDK-tinyxml2", "license": "zlib", "role": "library"},
+    {"name": "BSML", "version": "0.6.5", "authors": "bsq-ports", "url": "https://github.com/bsq-ports/Quest-BSML", "license": "MIT (per the authors; no licence file in the repository yet)", "role": "menu framework"},
+    {"name": "Lapiz", "version": "0.3.7", "authors": "raineaeternal", "url": "https://github.com/raineaeternal/Lapiz", "license": "MIT", "role": "modding library"},
+    {"name": "SongCore", "version": "1.3.5", "authors": "raineaeternal", "url": "https://github.com/raineaeternal/Quest-SongCore", "license": "MIT", "role": "custom songs"},
+    {"name": "PlaylistCore", "version": "1.7.2", "authors": "Metalit", "url": "https://github.com/Metalit/PlaylistCore", "license": "GPL-3.0", "role": "playlists"},
+    {"name": "SongDownloader", "version": "0.9.1", "authors": "darknight1050", "url": "https://github.com/darknight1050/SongDownloader", "license": "GPL-3.0", "role": "song downloads"},
+    {"name": "BeatSaverPlusPlus", "version": "0.2.4", "authors": "bsq-ports", "url": "https://github.com/bsq-ports/BeatSaverPlusPlus", "license": "MIT", "role": "BeatSaver access"},
+    {"name": "WebUtils", "version": "0.6.9", "authors": "bsq-ports", "url": "https://github.com/bsq-ports/WebUtils", "license": "MIT (per the authors; no licence file in the repository yet)", "role": "web requests"},
+    {"name": "SongDetails", "version": "1.0.5", "authors": "bsq-ports", "url": "https://github.com/bsq-ports/SongDetails", "license": "MIT (per the authors; no licence file in the repository yet)", "role": "song database"},
+    {"name": "MetaCore", "version": "2.0.6", "authors": "Metalit", "url": "https://github.com/Metalit/MetaCore", "license": "MIT (per the authors; no licence file in the repository yet)", "role": "modding library"},
+    {"name": "MetaCoreBS", "version": "1.0.1", "authors": "Metalit", "url": "https://github.com/Metalit/MetaCoreBS", "license": "MIT (per the authors; no licence file in the repository yet)", "role": "modding library"},
+    {"name": "Unicode", "version": "0.1.8", "authors": "Metalit", "url": "https://github.com/Metalit/UnicodeQuest", "license": "MIT (per the authors; no licence file in the repository yet)", "role": "text in all scripts"},
+    {"name": "PlayerDataKeeper", "version": "0.2.7", "authors": "Metalit", "url": "https://github.com/Metalit/PlayerDataKeeper", "license": "MIT (per the authors; no licence file in the repository yet)", "role": "save backups"},
+    {"name": "BetterSongSearch", "version": "2.3.0", "authors": "bsq-ports", "url": "https://github.com/bsq-ports/BetterSongSearchQuest", "license": "MIT", "role": "song search"},
+    {"name": "Airbuds Search (as Apple Music Search)", "version": "2.0.2", "authors": "zilewang7, based on Spotify Search by TychoTheTaco; Apple Music history by this project", "url": "https://github.com/zilewang7/Beat-Saber-Airbuds-Search", "license": "MIT (per the authors; no licence file in the repository yet)", "role": "songs from your listening history"}
+  ]
+}

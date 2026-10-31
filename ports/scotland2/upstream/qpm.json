@@ -1,0 +1,51 @@
+{
+  "sharedDir": "shared",
+  "dependenciesDir": "extern",
+  "info": {
+    "name": "scotland2",
+    "id": "scotland2",
+    "version": "0.1.7",
+    "url": "https://github.com/sc2ad/scotland2",
+    "additionalData": {
+      "overrideSoName": "libsl2.so"
+    }
+  },
+  "dependencies": [
+    {
+      "id": "fmt",
+      "versionRange": "^11.0.0",
+      "additionalData": {
+        "private": true
+      }
+    },
+    {
+      "id": "capstone",
+      "versionRange": "^0.1.0",
+      "additionalData": {
+        "private": true
+      }
+    },
+    {
+      "id": "flamingo",
+      "versionRange": "^1.1.1",
+      "additionalData": {
+        "private": true,
+        "extraFiles": [
+          "src/fixups.cpp",
+          "src/installer.cpp",
+          "src/page-allocator.cpp"
+        ]
+      }
+    }
+  ],
+  "workspace": {
+    "scripts": {
+      "build": [
+        "pwsh ./build.ps1"
+      ],
+      "copy": [
+        "pwsh ./copy.ps1"
+      ]
+    }
+  }
+}

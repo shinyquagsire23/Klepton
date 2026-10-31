@@ -1,0 +1,64 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+AccessModifierOffset: -1
+AlignAfterOpenBracket: BlockIndent
+AlignOperands: AlignAfterOperator
+AlignTrailingComments:
+  Kind: Never
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: Inline
+AllowShortLoopsOnASingleLine: false
+BinPackArguments: false
+BinPackParameters: false
+BraceWrapping:
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+BreakAfterAttributes: Never
+BreakBeforeConceptDeclarations: Always
+BreakConstructorInitializers: AfterColon
+BreakInheritanceList: AfterColon
+BreakStringLiterals: false
+ColumnLimit: 150
+DerivePointerAlignment: false
+FixNamespaceComments: false
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<ext/.*\.h>'
+    Priority: 2
+    SortPriority: 0
+    CaseSensitive: false
+  - Regex: '^<.*\.h>'
+    Priority: 1
+    SortPriority: 0
+    CaseSensitive: false
+  - Regex: "^<.*"
+    Priority: 2
+    SortPriority: 0
+    CaseSensitive: false
+  - Regex: ".*"
+    Priority: 3
+    SortPriority: 0
+    CaseSensitive: false
+IndentExternBlock: Indent
+IndentRequiresClause: false
+IndentWidth: 4
+InsertNewlineAtEOF: true
+KeepEmptyLinesAtTheStartOfBlocks: true
+LineEnding: LF
+NamespaceIndentation: All
+Macros:
+  - "DECLARE_CLASS_CODEGEN="
+  - "DECLARE_CLASS_CODEGEN_INTERFACES="
+  - "DECLARE_JSON_CLASS="
+PackConstructorInitializers: CurrentLine
+PenaltyExcessCharacter: 100
+PenaltyReturnTypeOnItsOwnLine: 0
+QualifierAlignment: Right
+RequiresClausePosition: OwnLine
+RequiresExpressionIndentation: OuterScope
+SkipMacroDefinitionBody: true
+SpaceAfterCStyleCast: true
+SpacesBeforeTrailingComments: 2

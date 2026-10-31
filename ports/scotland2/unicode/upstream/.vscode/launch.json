@@ -1,0 +1,42 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Beat Saber",
+            "type": "fb-lldb",
+            "request": "launch",
+            "preLaunchTask": "Powershell Build and Copy",
+            "android": {
+                "application": {
+                    "package": "com.beatgames.beatsaber",
+                    "activity": "com.unity3d.player.UnityPlayerActivity"
+                },
+                "lldbConfig": {
+                    "sourceMaps": [],
+                    "librarySearchPaths": [
+                        "${workspaceFolder}/build/debug/",
+                        "${workspaceFolder}/extern/libs/"
+                    ]
+                }
+            }
+        },
+        {
+            "name": "Attach to running Beat Saber Instance",
+            "type": "fb-lldb",
+            "request": "attach",
+            "android": {
+                "application": {
+                    "package": "com.beatgames.beatsaber",
+                    "activity": "com.unity3d.player.UnityPlayerActivity"
+                },
+                "lldbConfig": {
+                    "sourceMaps": [],
+                    "librarySearchPaths": [
+                        "${workspaceFolder}/build/debug/",
+                        "${workspaceFolder}/extern/libs/",
+                    ]
+                }
+            }
+        }
+    ]
+}

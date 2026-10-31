@@ -1,0 +1,40 @@
+<vertical xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+          xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'
+          horizontal-fit="Unconstrained"
+          id="root_"
+          bg="round-rect-panel">
+
+    <horizontal flex-height="100" vertical-fit="Unconstrained" spacing="1" pad-left="1" pad-right="1">
+
+        <image id="image_" image-color="white" src="UI/Skin/Background" preserve-aspect="true" pref-width="6"
+               pref-height="6" min-width="6" min-height="6" flex-height="0" raycast-target="false"/>
+
+        <vertical horizontal-fit="Unconstrained" flex-width="100" vertical-fit="PreferredSize">
+
+            <horizontal horizontal-fit="Unconstrained" spacing="2">
+                <text id='songNameTextView_' font-align="Left" overflow-mode='Ellipsis' font-size="2.7"
+                      word-wrapping='false'
+                      rich-text='false'/>
+                <text id='uploadTimeTextView_' font-align="Right" font-size="2.7" word-wrapping='false'
+                      rich-text='false'/>
+            </horizontal>
+
+            <horizontal spacing="2">
+                <text id='uploaderNameTextView_' font-align='Left' overflow-mode='Ellipsis' font-size="2.2"
+                      word-wrapping='false' color='#AAA'
+                      rich-text='false'/>
+                <text id='upvoteRatioTextView_' font-align='Right' font-size="2.2"
+                      word-wrapping='false' color='#AAA'
+                      rich-text='true'/>
+            </horizontal>
+
+        </vertical>
+
+    </horizontal>
+
+    <horizontal id='diffsContainer_' bg='round-rect-panel' bg-color='black'>
+        <text align='Center' overflow-mode='Truncate' word-wrapping="false" font-size="2"/>
+        <text align='Center' overflow-mode='Truncate' word-wrapping="false" font-size="2"/>
+    </horizontal>
+
+</vertical>

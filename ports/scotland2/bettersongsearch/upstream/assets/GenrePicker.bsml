@@ -1,0 +1,20 @@
+<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<modal id="genrePickerModal" clickerino-offerino-closerino='true' size-delta-x='80' size-delta-y='78'>
+		<vertical horizontal-fit='Unconstrained' pad='4' pad-bottom='2' pad-top='9'>
+			<horizontal bg='panel-top-gradient' ignore-layout='true' anchor-max-x='.97' anchor-min-x='.03' anchor-min-y='1' anchor-pos-y='-5'>
+				<text text='BetterSongSearch - Genre Filter' align='Center' font-size='4'/>
+			</horizontal>
+			<horizontal horizontal-fit='PreferredSize'>
+				<vertical horizontal-fit='Unconstrained'>
+					<list id="genresTableData" visible-cells='12' cell-size='5' select-cell='GenreSelected' show-scrollbar='true' stick-scrolling="true"/>
+				</vertical>
+				<vertical id='scrollbarContainer' preferred-width='8'/>
+			</horizontal>
+			<horizontal>
+				<primary-button text='Select' on-click='SelectGenre'  pref-width="15"/>
+				<button text='Clear Selection' on-click='ClearGenre'  pref-width="25" />
+				<button text='Close' on-click='CloseModal'  pref-width="15"/>
+			</horizontal>
+		</vertical>
+	</modal>
+</bg>

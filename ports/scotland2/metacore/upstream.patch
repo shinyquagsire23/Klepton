@@ -1,0 +1,68 @@
+--- a/include/hooks.hpp
++++ b/include/hooks.hpp
+@@ -34,7 +34,22 @@
+ #define AUTO_INSTALL(name_) \
+     AUTO_INSTALL_FUNCTION(Hook_##name_) { ::Hooking::InstallHook<Hook_##name_>(logger); }
+ 
+-#define MAKE_AUTO_HOOK_MATCH(name_, mPtr, retval, ...)                                                                                              \
++#ifdef SC2_AOT_HOOKS
++struct SC2BuildHookTarget {
++    uint64_t address;
++    uint32_t originalHook, reserved;
++    char name[128];
++};
++static_assert(sizeof(SC2BuildHookTarget)==144);
++#define SC2_RECORD_HOOK(name_, mPtr, orig_) \
++    static const SC2BuildHookTarget sc2_target_##name_ __attribute__((used,section(".sc2_hooks"))) = { \
++        ::il2cpp_utils::il2cpp_type_check::MetadataGetter<mPtr>::addrs, orig_, 0, #name_ };
++#else
++#define SC2_RECORD_HOOK(name_, mPtr, orig_)
++#endif
++
++#define MAKE_AUTO_HOOK_MATCH(name_, mPtr, retval, ...) \
++    SC2_RECORD_HOOK(name_, mPtr, 0)                                                                                              \
+     struct Hook_##name_ {                                                                                                                           \
+         using funcType = retval (*)(__VA_ARGS__);                                                                                                   \
+         static_assert(MATCH_HOOKABLE_ASSERT(mPtr));                                                                                                 \
+@@ -49,7 +64,8 @@
+     AUTO_INSTALL(name_)                                                                                                                             \
+     retval Hook_##name_::hook_##name_(__VA_ARGS__)
+ 
+-#define MAKE_AUTO_ORIG_HOOK_MATCH(name_, mPtr, retval, ...)                                                                                         \
++#define MAKE_AUTO_ORIG_HOOK_MATCH(name_, mPtr, retval, ...) \
++    SC2_RECORD_HOOK(name_, mPtr, 1)                                                                                         \
+     struct Hook_##name_ {                                                                                                                           \
+         using funcType = retval (*)(__VA_ARGS__);                                                                                                   \
+         static_assert(MATCH_HOOKABLE_ASSERT(mPtr));                                                                                                 \
+--- a/src/hooks.cpp
++++ b/src/hooks.cpp
+@@ -721,9 +721,16 @@
+ 
+ // hook abort and provide backtraces
+ MAKE_HOOK(delete_object_internal_step1, nullptr, void, char* object) {
++#ifdef SC2_METACORE_DELETE_OFFSET
++    // The measured entry in this Unity build accepts null before its ID read.
++    if (!object) { delete_object_internal_step1(object); return; }
++#endif
+     int instanceId = *(int*) (object + 8);
+     auto destroy = ObjectSignal::onDestroys.find(instanceId);
+     if (destroy != ObjectSignal::onDestroys.end() && destroy->second) {
++#if defined(SC2_METACORE_DELETE_OFFSET) && SC2_DIAGNOSTICS
++        logger.info("Native object destruction callback instanceId={}", instanceId);
++#endif
+         destroy->second();
+         ObjectSignal::onDestroys.erase(destroy);
+     }
+@@ -731,6 +738,12 @@
+ }
+ 
+ AUTO_INSTALL_FUNCTION(delete_object_internal_step1) {
++#ifdef SC2_METACORE_DELETE_OFFSET
++    // Supplied Unity image has a different native layout; the build validates
++    // this measured deletion entry and its callsites before preparing gates.
++    uintptr_t addr = baseAddr("libunity.so") + SC2_METACORE_DELETE_OFFSET;
++#else
+     uintptr_t addr = baseAddr("libunity.so") + 0x8d2898;
++#endif
+     INSTALL_HOOK_DIRECT(logger, delete_object_internal_step1, (void*) addr);
+ }

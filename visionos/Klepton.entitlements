@@ -72,9 +72,25 @@
   runtime/xr/kl_openxr.c is that A/B. Settle the cause there before concluding
   anything about this key.
 -->
+<!--
+  ===========================================================================
+  keychain-access-groups: the play area (KleptonRoomStore.swift). Every game is
+  signed by one team, and a team's provisioning profiles already allow its apps
+  "<team>.*" — so "<team>.avpplay.shared" needs nothing set up in Apple's portal,
+  works for a free team too, and is how all games share the rooms a player has
+  measured. The game's own group comes FIRST: the first group is where an item
+  without a group of its own is written, and the Meta session and Steam Cloud
+  items must stay where they were (the application identifier, which is that
+  same string).
+-->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+		<string>$(AppIdentifierPrefix)avpplay.shared</string>
+	</array>
 	<key>com.apple.developer.kernel.increased-memory-limit</key>
 	<true/>
 	<key>com.apple.developer.kernel.extended-virtual-addressing</key>

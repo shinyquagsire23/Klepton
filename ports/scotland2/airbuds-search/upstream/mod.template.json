@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/refs/heads/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+  "_QPVersion": "1.2.0",
+  "name": "${mod_name}",
+  "id": "${mod_id}",
+  "modloader": "Scotland2",
+  "author": "DDC forked from Tycho Bellers (original author)",
+  "packageId": "com.beatgames.beatsaber",
+  "packageVersion": "1.40.8_7379",
+  "description": "Use your Airbuds (support Spotify, Apple Music, SoundCloud, Deezer, Amazon Music, Audiomack) listening history to quickly search BeatSaver maps!\nFor better Japanese search results, install the 'Airbuds Search Kakasi' mod.\nForked from Tycho Bellers' original Spotify Search.",
+  "version": "${version}",
+  "dependencies": [],
+  "modFiles": [],
+  "lateModFiles": [
+    "libairbuds-search.so"
+  ],
+  "libraryFiles": [],
+  "fileCopies": [],
+  "copyExtensions": [],
+  "coverImage": "cover.jpg"
+}

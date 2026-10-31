@@ -1,0 +1,56 @@
+<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+    xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+
+    <vertical horizontal-fit="Unconstrained" spacing="1" child-control-height="false" child-align="UpperCenter" child-expand-height="false">
+
+        <!-- Airbuds Refresh Token -->
+        <vertical horizontal-fit="Unconstrained" pref-height="34" vertical-fit="PreferredSize" spacing="0">
+            <text text="Airbuds Refresh Token"/>
+            <text font-size="3" color="grey" text="Paste the refresh token from the Airbuds app to load your listening history."/>
+            <horizontal spacing="1" pad-top="1" pref-height="7">
+                <text-field id="refreshTokenTextField_" text="Refresh Token" pref-width="55" pref-height="6"/>
+                <icon-button id="refreshTokenPasteButton_" on-click="onPasteRefreshTokenButtonClicked" hover-hint="Paste" pref-width="8" pref-height="8"/>
+                <button id="refreshTokenClearButton_" text="Clear" on-click="onClearRefreshTokenButtonClicked" pref-height="6"/>
+            </horizontal>
+            <horizontal spacing="1" pref-height="6">
+                <text id="refreshTokenStatusTextView_" font-size="3" color="grey"/>
+                <button id="refreshTokenSaveButton_" text="Save" on-click="onSaveRefreshTokenButtonClicked" pref-height="6"/>
+            </horizontal>
+            <text font-size="2.5" color="#888888" text="In order to obtain refreshToken, the simplest way is to capture http packets on the app when logging in to the account. It is recommended to ask ai to get the most suitable way to obtain refresh_token for you." italics="true"/>
+        </vertical>
+
+        <!-- Kakasi Mod -->
+        <vertical horizontal-fit="Unconstrained" pref-height="12" vertical-fit="PreferredSize" spacing="0">
+            <horizontal spacing="4">
+                <text text="Airbuds Search Kakasi Mod"/>
+                <text id="kakasiStatusTextView_" font-size="3.5"/>
+            </horizontal>
+            <text font-size="3" color="grey" text="Enables better Japanese song/artist search by converting Japanese to romaji for additional search."/>
+        </vertical>
+
+        <!-- Image Cache -->
+        <horizontal spacing="4" pad-right="4" pref-height="8">
+            <text text="Image Cache"/>
+            <text id="cacheSizeTextView_" color="magenta" font-size="2.8"/>
+            <horizontal flex-width="100"/>
+            <button id="clearCacheButton_" text="Clear" on-click="onClearCacheButtonClicked" pref-width="20"/>
+        </horizontal>
+
+        <!-- History Cache -->
+        <horizontal spacing="2" pad-right="4" pref-height="8">
+            <text text="History Cache" pref-width="22"/>
+            <text id="historyCacheSizeTextView_" color="magenta" font-size="2.8" overflow-mode="Ellipsis" word-wrapping="false" pref-width="24"/>
+            <dropdown-list-setting id="historyClearRangeDropdown_" text="" options="historyClearRangeOptions_" value="historyClearRangeValue_" pref-width="28" apply-on-change="true"/>
+            <button id="clearHistoryButton_" text="Clear" on-click="onClearHistoryButtonClicked" pref-width="16"/>
+        </horizontal>
+
+        <!-- Friend History Cache -->
+        <horizontal spacing="2" pad-right="4" pref-height="8">
+            <text text="Friend Cache" pref-width="22"/>
+            <text id="friendHistoryCacheSizeTextView_" color="magenta" font-size="2.8" overflow-mode="Ellipsis" word-wrapping="false" pref-width="24"/>
+            <dropdown-list-setting id="friendHistoryClearRangeDropdown_" text="" options="friendHistoryClearRangeOptions_" value="friendHistoryClearRangeValue_" pref-width="28" apply-on-change="true"/>
+            <button id="clearFriendHistoryButton_" text="Clear" on-click="onClearFriendHistoryButtonClicked" pref-width="16"/>
+        </horizontal>
+    </vertical>
+
+</bg>

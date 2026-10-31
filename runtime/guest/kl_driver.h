@@ -70,6 +70,13 @@ int kl_driver_boot(FILE *out);
 
 // The active target's short name (targets.py key), or NULL before init.
 const char *kl_driver_target_name(void);
+// Moss or Moss: Book II — the targets that share Moss's tuning (kl_driver.c).
+int kl_driver_target_is_moss(void);
+// The profile for untested games (kl_driver.c): 1 for a store title (x<app id>)
+// that is not in kl_tuned.h, unless KL_UNTESTED says otherwise.
+int kl_untested_profile(void);
+int kl_untested_target(const char *target);
+int kl_target_tuned(const char *target);
 int kl_driver_gap_only(void);
 
 // Start the guest running: the Unity lifecycle natives (nativeRecreateGfxState,

@@ -1,0 +1,23 @@
+[
+  {
+    "repository": "Chlumsky/EasyGifReader",
+    "commit": "5203c993636353d8d817f5facd62ac71338aaa29",
+    "directory": "EasyGifReader",
+    "parentCommit": "4987a88698becce955e44301fd4d573fc9180c2f",
+    "sha256": "6ad43ad52dd49c016461d5656442f6435e48b06dc50b3255ede2700a38c12161"
+  },
+  {
+    "repository": "tplgy/cppcodec",
+    "commit": "8019b8b580f8573c33c50372baec7039dfe5a8ce",
+    "directory": "cppcodec",
+    "parentCommit": "4987a88698becce955e44301fd4d573fc9180c2f",
+    "sha256": "2547d492dfc32bdd3e12674114d52f054efa0b6acbf3bbff679f94ef1cbcf844"
+  },
+  {
+    "repository": "RedBrumbler/css-color-parser-cpp",
+    "commit": "9d28a41027e919930c706b3e59f75c6bfc521638",
+    "directory": "css-color-parser-cpp",
+    "parentCommit": "4987a88698becce955e44301fd4d573fc9180c2f",
+    "sha256": "43c41acb3b00fe6ba153a6b89a43e84a84ed5173b2c3a4468bb010a8d434e785"
+  }
+]

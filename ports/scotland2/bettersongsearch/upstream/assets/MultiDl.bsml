@@ -1,0 +1,16 @@
+﻿<modal id="modal" clickerino-offerino-closerino='true' size-delta-x='80' size-delta-y='55' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+	<vertical horizontal-fit='Unconstrained' pad='4' pad-top='9'>
+		<horizontal bg='panel-top-gradient'  ignore-layout='true' anchor-max-x='.97' anchor-min-x='.03' anchor-min-y='1' anchor-pos-y='-5'>
+			<text text='BetterSongSearch - Batch Download' align='Center'/>
+		</horizontal>
+		<text text='Download a certain amount of songs at once that match your critera, starting from your scroll location in the list' word-wrapping='true'/>
+		<horizontal>
+			<slider-setting value="songsToDownload" bind-value="true" apply-on-change="true" min='5' max='100' increment='1' text='Amount' integer-only='true' id='multiDlCountSlider' show-buttons='true'/>
+		</horizontal>
+		<!-- <text font-size='3' font-color='#CCC' text='Want to download even more? You can create a Playlist and download that in the background with Playlistmanager!' word-wrapping='true'/> -->
+		<horizontal pad-top='4'>
+			<primary-button text='Download' on-click='StartMultiDownload'/>
+			<button text='Cancel' on-click='CloseModal'/>
+		</horizontal>
+	</vertical>
+</modal>

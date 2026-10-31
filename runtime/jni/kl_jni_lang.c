@@ -37,12 +37,13 @@
 static klj_val klj_Class_getClassLoader(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)self; (void)a; (void)n;
     static void *loader;
-    if (!loader) loader = kl_jni_new_object("java/lang/ClassLoader");
+    if (!loader) loader = klj_host_cache(kl_jni_new_object("java/lang/ClassLoader"));
     return (klj_val){.l = loader};
 }
 
-// Class.forName(name, initialize, loader). Our FindClass never fails and there
-// is no initialization to run, so this is just interning under another name.
+// Class.forName(name, initialize, loader). Our FindClass interns any name but
+// the ones klj_class_absent lists, and there is no initialization to run, so
+// this is just interning under another name.
 // Note the JVM spelling: dots, not slashes.
 static klj_val klj_class_by_dotted_name(const klj_val *a, int n) {
     const char *dotted = n > 0 ? klj_str(a[0].l) : NULL;
@@ -52,6 +53,12 @@ static klj_val klj_class_by_dotted_name(const klj_val *a, int n) {
     for (; dotted[i] && i < sizeof internal - 1; i++)
         internal[i] = dotted[i] == '.' ? '/' : dotted[i];
     internal[i] = '\0';
+    // Unity's FindClass falls back to the app's class loader when JNI FindClass
+    // throws, so a class the APK does not ship must be absent here too.
+    if (klj_class_absent(internal)) {
+        klj_raise("java/lang/ClassNotFoundException", dotted);
+        return (klj_val){.l = NULL};
+    }
     pthread_mutex_lock(&g_lock);
     void *c = klj_intern_class_locked(internal)->as_object;
     pthread_mutex_unlock(&g_lock);
@@ -70,8 +77,9 @@ static klj_val klj_Class_forName(void *env, void *self, const klj_val *a, int n)
 // the plugin's classes are not on the boot classpath.
 //
 // Interning is the whole of it here for the same reason forName is: FindClass
-// never fails, so there is no loader delegation to model and no
-// ClassNotFoundException to throw. The distinction that matters on Android —
+// interns any name but the ones klj_class_absent lists (for those, a
+// ClassNotFoundException is left pending), so there is no loader delegation to
+// model. The distinction that matters on Android —
 // which ClassLoader a class came from — has no meaning against a synthetic
 // registry with exactly one namespace in it.
 static klj_val klj_ClassLoader_findClass(void *env, void *self, const klj_val *a, int n) {
@@ -143,17 +151,47 @@ static klj_val klj_SB_append_S(void *env, void *self, const klj_val *a, int n) {
     return (klj_val){.l = self};
 }
 
-// What a guest that caught one of klj_raise()'s exceptions asks of it: Unity
-// logs `toString()` and keeps `getMessage()`. "<dotted class>: <message>", as
-// Throwable.toString prints it.
-static klj_val klj_Throwable_toString(void *env, void *self, const klj_val *a, int n) {
+// Object.toString, as Java answers it: a String is itself, an exception is
+// "<binary.name>: <message>" (Throwable.toString), anything else
+// "<binary.name>@<hash>". Unity asks it of the exception it just caught —
+// the FileNotFoundException a missing patch OBB raises (klj_ZipFile_init).
+//
+// It is resolved on java/lang/Object and called on whatever the object is, and
+// every class without a toString of its own falls back to this row — so the
+// receiver decides: a class that has its own answer (StringBuilder, Locale)
+// gives that one, and for any other class the identity form is Java's default
+// but may not be what the real class says (a File, a Uri, an Integer print
+// their content). Those are named once each, so that a wrong string in a
+// guest's log has an address.
+static void klj_dotted(char *out, size_t cap, const char *cls) {
+    snprintf(out, cap, "%s", cls ? cls : "java/lang/Object");
+    for (char *c = out; *c; c++) if (*c == '/') *c = '.';
+}
+static klj_val klj_Object_toString(void *env, void *self, const klj_val *a, int n) {
     (void)env; (void)a; (void)n;
     klj_object *o = klj_as_object(self);
     if (!o) return (klj_val){.l = NULL};
+    if (strcmp(o->cls, KLJ_CLASS_STRING) == 0) return (klj_val){.l = self};
+    klj_impl own = klj_own_impl(o->cls, "toString", "()Ljava/lang/String;");
+    if (own && own != klj_Object_toString) return own(env, self, a, n);
+    char name[256], buf[1400];
+    klj_dotted(name, sizeof name, o->cls);
     const char *msg = klj_throwable_message(self);
-    char buf[1400];
-    snprintf(buf, sizeof buf, "%s%s%s", o->cls, msg && *msg ? ": " : "", msg ? msg : "");
-    for (char *c = buf; *c && *c != ':'; c++) if (*c == '/') *c = '.';
+    if (!msg) {
+        static char said[16][96];
+        static int nsaid;
+        int known = 0;
+        for (int i = 0; i < nsaid; i++) if (strcmp(said[i], o->cls) == 0) { known = 1; break; }
+        if (!known && nsaid < 16) {
+            snprintf(said[nsaid++], sizeof said[0], "%s", o->cls);
+            KLJ_LOG("Object.toString on a %s: answered with the identity form; a class that prints "
+                    "its content needs a toString binding of its own", name);
+        }
+    }
+    if (msg && *msg) snprintf(buf, sizeof buf, "%s: %s", name, msg);
+    else if (msg)    snprintf(buf, sizeof buf, "%s", name);
+    else             snprintf(buf, sizeof buf, "%s@%lx", name,
+                              (unsigned long)((uintptr_t)self >> 4) & 0xfffffffful);
     return (klj_val){.l = kl_jni_new_string(buf)};
 }
 static klj_val klj_Throwable_getMessage(void *env, void *self, const klj_val *a, int n) {
@@ -162,14 +200,50 @@ static klj_val klj_Throwable_getMessage(void *env, void *self, const klj_val *a,
     return (klj_val){.l = msg ? kl_jni_new_string(msg) : NULL};
 }
 
+// android.util.Log.getStackTraceString(Throwable) — Unity's C# side
+// (AndroidJNISafe.CheckException) asks it of every exception it converts into
+// an AndroidJavaException. There is no Java stack behind ours; the first line,
+// which is all a stack string's reader keys on, is the Throwable's toString.
+static klj_val klj_Log_getStackTraceString(void *env, void *self, const klj_val *a, int n) {
+    (void)self;
+    if (n < 1 || !a[0].l) return (klj_val){.l = kl_jni_new_string("")};
+    return klj_Object_toString(env, a[0].l, NULL, 0);
+}
+
 const klj_binding klj_bind_lang[] = {
 
-    {"java/lang/Throwable", "toString",   "()Ljava/lang/String;", klj_Throwable_toString},
+    {"android/util/Log", "getStackTraceString", "(Ljava/lang/Throwable;)Ljava/lang/String;",
+     klj_Log_getStackTraceString},
+
+    {"java/lang/Object",    "toString",   "()Ljava/lang/String;", klj_Object_toString},
+    {"java/lang/Throwable", "toString",   "()Ljava/lang/String;", klj_Object_toString},
     {"java/lang/Throwable", "getMessage", "()Ljava/lang/String;", klj_Throwable_getMessage},
 
     {"java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
+    // Space Atlas VR avatar SDK: the worker thread uses the same app loader.
+    {"java/lang/Thread", "getContextClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
     {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},
+    // The 1-arg form, and the same again as Unity's AndroidJavaClass spells it
+    // when C# asks CallStatic<AndroidJavaObject>("forName", name): the return
+    // type in the signature is the generic argument's, not Class. Arizona
+    // Sunshine reaches the second through ReflectionHelper.getMethodID.
+    {"java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Class;", klj_Class_forName},
+    {"java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Object;", klj_Class_forName},
     {"java/lang/ClassLoader", "findClass", "(Ljava/lang/String;)Ljava/lang/Class;", klj_ClassLoader_findClass},
+    // loadClass is findClass's public face; the delegation between them is the
+    // only difference on Android and there is nothing here to delegate to.
+    {"java/lang/ClassLoader", "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", klj_ClassLoader_findClass},
+    {"java/lang/ClassLoader", "loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;", klj_ClassLoader_findClass},
+    // Context.getClassLoader() — the same loader, reached the other way round.
+    // A native library that was handed no Class of its own gets there through
+    // the Context: `ActivityThread.currentActivityThread().getApplication()`,
+    // then `.getClassLoader()`, then `loadClass`. libEOSSDK.so takes exactly
+    // that route out of its JNI_OnLoad-cached VM. Every Context is the same
+    // Context here, and our class registry has a single namespace, so all
+    // three spellings answer with the one loader.
+    {"android/content/Context", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
+    {"android/app/Application", "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
+    {"android/app/Activity",    "getClassLoader", "()Ljava/lang/ClassLoader;", klj_Class_getClassLoader},
 
     {"java/lang/StringBuilder", "<init>",   "()V",                  klj_SB_init},
     {"java/lang/StringBuilder", "toString", "()Ljava/lang/String;", klj_SB_toString},

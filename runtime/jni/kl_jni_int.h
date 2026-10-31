@@ -140,6 +140,7 @@ const char *klj_class_name(void *clazz);
 void       *klj_class_object(const char *class_name);
 void       *klj_new_object_data(const char *class_name, void *data);
 void       *klj_own(void *obj, void (*destroy)(void *));
+void       *klj_host_cache(void *obj);   // a jobject the host keeps in a static
 const char *klj_str(void *s);
 klj_array  *klj_arr(void *a);
 void       *klj_new_array(char kind, const char *elem_cls, int len);
@@ -147,15 +148,20 @@ klj_direct_buffer *klj_direct(void *buf);
 void       *klj_want(void *clazz, const char *name, const char *sig, char kind);
 klj_val     klj_call(void *env, void *self, void *mid, kl_va *va, char want);
 void        klj_field_store(void *obj, void *fid, klj_val v);
+klj_val     klj_field_written(void *obj, void *fid); // zero if never set
 kl_jint     klj_ExceptionCheck(void *env);
-void        klj_raise(const char *cls, const char *msg);   // pending exception for the guest
-const char *klj_throwable_message(void *obj);              // NULL unless klj_raise/ThrowNew made it
+void        klj_raise(const char *cls, const char *msg);   // pending Java exception, this thread
+const char *klj_throwable_message(void *obj);              // NULL unless klj_raise made it
+klj_impl    klj_own_impl(const char *cls, const char *name, const char *sig);   // a class's own answer, never Object's
+int         klj_class_absent(const char *name);           // a class this APK does not ship (internal name)
 void       *klj_GetObjectClass(void *env, void *obj);
 kl_jint     klj_PushLocalFrame(void *env, kl_jint cap);
 void       *klj_PopLocalFrame(void *env, void *result);
 void       *klj_NewObjectV(void *env, void *clazz, void *mid, kl_va *va);
 void       *klj_NewDirectByteBuffer(void *env, void *address, int64_t capacity);
 kl_jint     klj_RegisterNatives(void *env, void *clazz, const kl_jni_method *m, kl_jint n);
+
+klj_val klj_BitmapConfig_argb8888(void);
 
 // ---------------------------------------------------------------- field seam
 // Runtime-valued fields: defined by the family that owns the underlying answer,
@@ -173,6 +179,7 @@ klj_val     klj_appinfo_splitSourceDirs(void);
 klj_val     klj_Uri_EMPTY(void);
 klj_val     klj_metaData_field(void);
 klj_val     klj_currentActivity_field(void);
+klj_val     klj_mUnityPlayer_field(void);
 klj_val     klj_porterduff_clear(void);
 
 // ---------------------------------------------------------------- the tables
@@ -192,9 +199,19 @@ extern const klj_binding klj_bind_ue4[];
 extern const klj_binding klj_bind_electra[];
 extern const klj_binding klj_bind_fmod[];
 extern const klj_binding klj_bind_jkxr[];
-extern const klj_binding klj_bind_bhaptics[];
 extern const klj_binding klj_bind_services[];
+extern const klj_binding klj_bind_haptics[];
 extern const klj_binding *const klj_binding_tables[];
+// One title's own answers, asked before the tables: each looks at the target
+// first and is NULL for every other (kl_jni_firebase.c, kl_jni_vivox.c,
+// kl_jni_vertigo.c, kl_jni_ghosttown.c).
+const klj_binding *klj_firebase_binding(const char *cls, const char *name, const char *sig);
+const klj_binding *klj_vivox_binding(const char *cls, const char *name, const char *sig);
+const klj_binding *klj_vertigo_binding(const char *cls, const char *name, const char *sig);
+const klj_binding *klj_ghosttown_binding(const char *cls, const char *name, const char *sig);
+// The UnityPlayer if a lifecycle call has made it, NULL before — for a caller on
+// another thread, which must not be the one to make it (kl_jni_softinput.c).
+void *klj_unity_player_made(void);
 
 
 
@@ -227,6 +244,24 @@ extern const klj_binding *const klj_binding_tables[];
 #define KLJ_DISPLAY_YDPI     320.0
 #define KLJ_DISPLAY_REFRESH  72.0f
 #define KLJ_DISPLAY_ROTATION 0       /* Surface.ROTATION_0 */
+
+// The device's `android_id`, and there is exactly ONE of it.
+//
+// Android's own is a per-device, per-app-signing-key random 64-bit value, so
+// any 16-hex-digit string is a well-formed one. It has to be a real string: a
+// null is not a harmless blank, it is the guest aborting inside its own string
+// handling — which is how it first presented, as a SIGABRT with no JNI call
+// named. Stable across runs because callers cache it and compare.
+//
+// It lives here rather than beside one handler because two unrelated surfaces
+// ask for it and must not answer differently: `Settings.Secure.getString(
+// resolver, "android_id")`, which is what Unity turns into
+// SystemInfo.deviceUniqueIdentifier (kl_jni_net.c), and UE's
+// `GameActivity.AndroidThunkJava_GetAndroidId()`, which is that same
+// Settings.Secure read wrapped in an activity method (kl_jni_ue4.c). A guest
+// that reached both — Pinball FX VR reaches the UE one — would otherwise see
+// one device claim to be two.
+#define KLJ_ANDROID_ID "4b6c6570746f6e01"      /* "Klepton\1" as hex */
 
 // NetworkCapabilities.TRANSPORT_* / NET_CAPABILITY_*, from android-34's
 // android.jar. Defined here rather than beside their handlers because both
@@ -266,7 +301,11 @@ extern const klj_binding *const klj_binding_tables[];
 
 typedef struct { char *url; char *path; int found, logged; } klj_webdoc;
 typedef struct { void **items; int count; } klj_list;
-typedef struct { int64_t native_ptr; void *classes; int disabled; } klj_proxy;
+// `unity_rh`: made by ReflectionHelper.newProxyInstance (Unity 6's door) rather
+// than JNIBridge.newInterfaceProxy. Such a proxy's native_ptr is meant for
+// ReflectionHelper.nativeProxyInvoke, not for JNIBridge.invoke; see
+// klj_proxy_invoke_named.
+typedef struct { int64_t native_ptr; void *classes; int disabled; int unity_rh; } klj_proxy;
 typedef struct { void *looper, *callback; } klj_handler;
 typedef struct { int32_t what, arg1, arg2; void *obj, *target; } klj_message;
 typedef struct {
@@ -302,6 +341,15 @@ klj_message *klj_as_message(void *obj);
 size_t       klj_stream_read(klj_stream *st, void *buf, size_t want);
 void         klj_stream_close(klj_stream *st);
 void         klj_stream_free(void *p);
+// A call by method NAME, the way Unity 6's own proxy handler makes it: a
+// ReflectionHelper proxy goes through ReflectionHelper.nativeProxyInvoke(ptr,
+// name, args); any other proxy falls back to klj_proxy_invoke. Only the callers
+// that know their proxy can be Unity 6's use it (Photon's AudioInAEC callback).
+// Deliver boxed arguments to either Unity ReflectionHelper or JNIBridge proxies.
+void        *klj_proxy_invoke_named_args(void *proxy, const char *iface,
+                                       const char *name, const char *sig, void *args);
+void        *klj_proxy_invoke_named(void *proxy, const char *iface,
+                                    const char *name, const char *sig);
 void        *klj_proxy_invoke(void *proxy, const char *iface,
                               const char *name, const char *sig, void *args);
 void        *klj_FromReflectedField(void *env, void *field);
@@ -311,6 +359,8 @@ int          klj_permission_state(const char *p, const char **why);
 klj_val klj_List_size(void *env, void *self, const klj_val *a, int n);
 klj_val klj_PM_queryIntentActivities(void *env, void *self, const klj_val *a, int n);
 klj_val klj_HandlerThread_start(void *env, void *self, const klj_val *a, int n);
+// The one AssetManager, which org.fmod.FMOD.getAssetManager must hand back.
+klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n);
 klj_val klj_AudioManager_getStreamVolume(void *env, void *self, const klj_val *a, int n);
 klj_val klj_Display_getAppVsyncOffsetNanos(void *env, void *self, const klj_val *a, int n);
 
@@ -322,8 +372,30 @@ klj_val klj_Display_getPresentationDeadlineNanos(void *env, void *self, const kl
 klj_val klj_Display_getRefreshRate(void *env, void *self, const klj_val *a, int n);
 klj_val klj_UnityPlayer_loadLibrary(void *env, void *self, const klj_val *a, int n);
 unsigned klj_drain_soft_input(void);
+
+// UE's GameActivity virtual keyboard (kl_jni_ue4.c). It answers the same
+// frontend contract Unity's soft input does — kl_jni.h's four
+// kl_jni_soft_input_* calls — so kl_jni_softinput.c asks these first and speaks
+// for Unity only when no UE field is open. A guest has one engine, so the two
+// can never both be open.
+int      klj_ue_vk_active(void);
+int      klj_ue_vk_get(char *buf, size_t cap, int *secure);
+void     klj_ue_vk_set(const char *utf8);
+void     klj_ue_vk_close(int canceled);
+unsigned klj_ue_vk_drain(void);
+
 void *klj_box_int(int32_t v);
 void klj_deliver_message(void *message);
 void klj_guest_version(long *code, const char **name);
+// Fields of the Horizon Platform reply object (kl_jni_net.c); 0 when obj is not one.
+int klj_horizon_message_field(void *obj, const char *cls, const char *name,
+                              const char *sig, klj_val *out);
+// Fields of UE4's MediaPlayer14$VideoTrackInfo (kl_jni_ue4.c); 0 when obj is not one.
+int klj_ue4_media_track_field(void *obj, const char *cls, const char *name,
+                              const char *sig, klj_val *out);
+// The web address an outgoing intent names (kl_jni_android.c, KL_JNI_OPEN_URL),
+// before kl_mono_web_url decides whether it may be opened: 1 with it in `out`.
+int kl_jni_intent_web(const char *act, const char *uri, const char *pkg,
+                      char *out, size_t cap);
 
 #endif /* KL_JNI_INT_H */

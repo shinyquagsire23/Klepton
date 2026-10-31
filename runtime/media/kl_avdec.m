@@ -37,6 +37,7 @@ struct kl_avdec {
 
     pthread_t       thread;
     pthread_mutex_t mu;
+    pthread_mutex_t fmu;        // held across a frame write and a reader's copy
     pthread_cond_t  cv;
     int         running;             // the thread should keep going
     int         playing;
@@ -127,10 +128,10 @@ static int slice_out(const char *container, long long off, long long len,
 // one-liner. Blocking is correct here: both callers are already on a thread
 // that owns the wait (the guest's own thread inside setDataSource, and the
 // decode thread before its first sample).
-static AVAssetTrack *first_video_track(AVAsset *asset) {
+static AVAssetTrack *first_track_of(AVAsset *asset, AVMediaType type) {
     __block AVAssetTrack *track = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [asset loadTracksWithMediaType:AVMediaTypeVideo
+    [asset loadTracksWithMediaType:type
                  completionHandler:^(NSArray<AVAssetTrack *> *tracks, NSError *err) {
         (void)err;
         // Retained across the semaphore: the array the completion handler is
@@ -144,6 +145,9 @@ static AVAssetTrack *first_video_track(AVAsset *asset) {
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
     return track;
 }
+static AVAssetTrack *first_video_track(AVAsset *asset) {
+    return first_track_of(asset, AVMediaTypeVideo);
+}
 
 static double now_seconds(void) {
     struct timespec ts;
@@ -152,6 +156,8 @@ static double now_seconds(void) {
 }
 
 // Copy one decoded frame out, tightly packed. Called with the lock NOT held.
+// It takes `fmu` around the write, so a reader inside kl_avdec_frame_lock never
+// copies a frame that is half the old one and half the next.
 static void publish(kl_avdec *d, CVPixelBufferRef pb, long long pts_ms) {
     CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
     size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
@@ -159,6 +165,7 @@ static void publish(kl_avdec *d, CVPixelBufferRef pb, long long pts_ms) {
     const unsigned char *src = CVPixelBufferGetBaseAddress(pb);
     size_t need = w * h * 4;
     if (src && need) {
+        pthread_mutex_lock(&d->fmu);
         pthread_mutex_lock(&d->mu);
         if (d->frame_bytes != need) {
             free(d->frame);
@@ -174,6 +181,7 @@ static void publish(kl_avdec *d, CVPixelBufferRef pb, long long pts_ms) {
             d->serial++;
         }
         pthread_mutex_unlock(&d->mu);
+        pthread_mutex_unlock(&d->fmu);
     }
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 }
@@ -333,6 +341,7 @@ kl_avdec *kl_avdec_open(const char *path, long long offset, long long size) {
     d->seek_ms = -1;
     d->running = 1;
     pthread_mutex_init(&d->mu, NULL);
+    pthread_mutex_init(&d->fmu, NULL);
     pthread_cond_init(&d->cv, NULL);
     if (pthread_create(&d->thread, NULL, decode_thread, d) != 0) {
         free(d);
@@ -352,6 +361,7 @@ void kl_avdec_close(kl_avdec *d) {
     pthread_join(d->thread, NULL);
     free(d->frame);
     pthread_mutex_destroy(&d->mu);
+    pthread_mutex_destroy(&d->fmu);
     pthread_cond_destroy(&d->cv);
     free(d);
 }
@@ -403,6 +413,9 @@ int kl_avdec_complete(kl_avdec *d) {
     return c;
 }
 
+void kl_avdec_frame_lock(kl_avdec *d)   { if (d) pthread_mutex_lock(&d->fmu); }
+void kl_avdec_frame_unlock(kl_avdec *d) { if (d) pthread_mutex_unlock(&d->fmu); }
+
 const void *kl_avdec_frame(kl_avdec *d, int *w, int *h, size_t *bytes,
                            unsigned long long *serial) {
     if (w) *w = 0;
@@ -453,7 +466,20 @@ struct kl_avdemux {
     long long      cur_pts_us;
     int            cur_key;
     int            eos;
+
+    // The SOUND of the clip, when it has any: its first audio track decoded by
+    // AVFoundation to 16-bit interleaved PCM and handed out in chunks of
+    // KLAD_AUDIO_CHUNK frames, as an "audio/raw" track (kl_mediandk.c). The
+    // reader starts on first use, so a guest that never selects it pays nothing.
+    void          *atrack, *areader, *aout;
+    int            arate, ach;
+    int            astarted, aeos;
+    unsigned char *apcm;             // the current decoded sample buffer
+    size_t         apcm_len, apos;
+    long long      apcm_pts_us;      // presentation time of apcm[0]
 };
+
+#define KLAD_AUDIO_CHUNK 1024        // frames per sample handed to the guest
 
 static const uint8_t k_startcode[4] = { 0, 0, 0, 1 };
 
@@ -622,14 +648,30 @@ kl_avdemux *kl_avdemux_open(const char *container, long long offset, long long s
         m->fps = t.nominalFrameRate;
         m->asset = (void *)CFBridgingRetain(asset);
         m->track = (void *)CFBridgingRetain(t);
+        AVAssetTrack *at = first_track_of(asset, AVMediaTypeAudio);
+        CMAudioFormatDescriptionRef afmt = at
+            ? (__bridge CMAudioFormatDescriptionRef)at.formatDescriptions.firstObject : NULL;
+        const AudioStreamBasicDescription *asbd =
+            afmt ? CMAudioFormatDescriptionGetStreamBasicDescription(afmt) : NULL;
+        if (asbd && asbd->mSampleRate > 0 && asbd->mChannelsPerFrame > 0) {
+            m->arate = (int)(asbd->mSampleRate + 0.5);
+            // Down to stereo: a guest that mixes the clip in plays it in a
+            // stereo mixer, and AVFoundation folds the rest in properly.
+            m->ach = asbd->mChannelsPerFrame > 2 ? 2 : (int)asbd->mChannelsPerFrame;
+            m->atrack = (void *)CFBridgingRetain(at);
+        }
         if (!demux_start_reader(m, kCMTimeZero)) {
             fprintf(stderr, "  [avdemux] %s: reader would not start\n", real);
             kl_avdemux_close(m); return NULL;
         }
     }
     demux_pull(m);      // make the first sample current
-    fprintf(stderr, "  [avdemux] %s: %s %dx%d, %lld us\n",
-            m->path, m->mime, m->width, m->height, m->duration_us);
+    fprintf(stderr, "  [avdemux] %s: %s %dx%d, %lld us%s\n",
+            m->path, m->mime, m->width, m->height, m->duration_us,
+            m->atrack ? ", with sound" : "");
+    if (m->atrack)
+        fprintf(stderr, "  [avdemux]   sound: %d Hz, %d channel(s), offered as audio/raw\n",
+                m->arate, m->ach);
     return m;
 }
 
@@ -638,9 +680,13 @@ void kl_avdemux_close(kl_avdemux *m) {
     if (m->out)    CFBridgingRelease(m->out);
     if (m->reader) CFBridgingRelease(m->reader);
     if (m->track)  CFBridgingRelease(m->track);
+    if (m->aout)    CFBridgingRelease(m->aout);
+    if (m->areader) CFBridgingRelease(m->areader);
+    if (m->atrack)  CFBridgingRelease(m->atrack);
     if (m->asset)  CFBridgingRelease(m->asset);
     free(m->psets);
     free(m->cur);
+    free(m->apcm);
     free(m);
 }
 
@@ -681,4 +727,122 @@ int kl_avdemux_seek_us(kl_avdemux *m, long long us) {
     if (!demux_start_reader(m, CMTimeMake(us, 1000000))) return 0;
     demux_pull(m);
     return m->eos ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// The sound track — see the fields in struct kl_avdemux.
+
+static int audio_start_reader(kl_avdemux *m, CMTime from) {
+    AVAsset *asset = (__bridge AVAsset *)m->asset;
+    AVAssetTrack *track = (__bridge AVAssetTrack *)m->atrack;
+    NSError *err = nil;
+    AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
+    if (!r) return 0;
+    NSDictionary *pcm = @{
+        AVFormatIDKey:               @(kAudioFormatLinearPCM),
+        AVLinearPCMBitDepthKey:      @16,
+        AVLinearPCMIsFloatKey:       @NO,
+        AVLinearPCMIsBigEndianKey:   @NO,
+        AVLinearPCMIsNonInterleaved: @NO,
+        AVSampleRateKey:             @(m->arate),
+        AVNumberOfChannelsKey:       @(m->ach),
+    };
+    AVAssetReaderTrackOutput *o =
+        [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track outputSettings:pcm];
+    o.alwaysCopiesSampleData = NO;
+    if (![r canAddOutput:o]) return 0;
+    [r addOutput:o];
+    if (CMTIME_IS_VALID(from) && CMTimeGetSeconds(from) > 0)
+        r.timeRange = CMTimeRangeMake(from, kCMTimePositiveInfinity);
+    if (![r startReading]) return 0;
+    if (m->areader) CFBridgingRelease(m->areader);
+    if (m->aout)    CFBridgingRelease(m->aout);
+    m->areader = (void *)CFBridgingRetain(r);
+    m->aout    = (void *)CFBridgingRetain(o);
+    return 1;
+}
+
+// The next decoded buffer into apcm; aeos at the end.
+static void audio_pull(kl_avdemux *m) {
+    AVAssetReaderTrackOutput *out = (__bridge AVAssetReaderTrackOutput *)m->aout;
+    free(m->apcm); m->apcm = NULL; m->apcm_len = 0; m->apos = 0;
+    for (;;) {
+        CMSampleBufferRef sb = out ? [out copyNextSampleBuffer] : NULL;
+        if (!sb) { m->aeos = 1; return; }
+        CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+        size_t n = bb ? CMBlockBufferGetDataLength(bb) : 0;
+        unsigned char *p = n ? malloc(n) : NULL;
+        if (p && CMBlockBufferCopyDataBytes(bb, 0, n, p) == noErr) {
+            CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
+            m->apcm = p; m->apcm_len = n;
+            m->apcm_pts_us = CMTIME_IS_VALID(pts) ? (long long)(CMTimeGetSeconds(pts) * 1e6) : 0;
+            CFRelease(sb);
+            return;
+        }
+        free(p);
+        CFRelease(sb);
+    }
+}
+
+static int audio_ready(kl_avdemux *m) {
+    if (!m || !m->atrack) return 0;
+    if (!m->astarted) {
+        m->astarted = 1;
+        @autoreleasepool {
+            if (!audio_start_reader(m, kCMTimeZero)) {
+                fprintf(stderr, "  [avdemux] %s: the sound reader would not start\n", m->path);
+                m->aeos = 1;
+                return 0;
+            }
+            audio_pull(m);
+        }
+    }
+    return !m->aeos;
+}
+
+static size_t audio_chunk(const kl_avdemux *m) {
+    size_t frame = (size_t)m->ach * 2;
+    size_t left = m->apcm_len - m->apos;
+    size_t want = (size_t)KLAD_AUDIO_CHUNK * frame;
+    return left < want ? left : want;
+}
+
+int kl_avdemux_audio_info(kl_avdemux *m, int *rate, int *channels) {
+    if (!m || !m->atrack) return 0;
+    if (rate)     *rate = m->arate;
+    if (channels) *channels = m->ach;
+    return 1;
+}
+
+long long kl_avdemux_audio_time_us(kl_avdemux *m) {
+    if (!audio_ready(m)) return -1;
+    long long frames = (long long)(m->apos / ((size_t)m->ach * 2));
+    return m->apcm_pts_us + frames * 1000000LL / m->arate;
+}
+
+long kl_avdemux_audio_read(kl_avdemux *m, unsigned char *buf, unsigned long cap) {
+    if (!audio_ready(m) || !m->apcm) return -1;
+    size_t n = audio_chunk(m);
+    if (buf && cap) memcpy(buf, m->apcm + m->apos, n < cap ? n : cap);
+    return (long)n;
+}
+
+int kl_avdemux_audio_advance(kl_avdemux *m) {
+    if (!audio_ready(m)) return 0;
+    m->apos += audio_chunk(m);
+    if (m->apos >= m->apcm_len) {
+        @autoreleasepool { audio_pull(m); }
+    }
+    return m->aeos ? 0 : 1;
+}
+
+int kl_avdemux_audio_seek_us(kl_avdemux *m, long long us) {
+    if (!m || !m->atrack) return 0;
+    m->astarted = 1;
+    m->aeos = 0;
+    @autoreleasepool {
+        if (!audio_start_reader(m, CMTimeMake(us, 1000000))) { m->aeos = 1; return 0; }
+        audio_pull(m);
+    }
+    return m->aeos ? 0 : 1;
 }

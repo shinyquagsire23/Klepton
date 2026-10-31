@@ -71,7 +71,69 @@ TARGETS = {
         # libunity -> the Android lifecycle; "steamlink" is kl_slink's doors.
         "kind":    "unity",
         "product": "Klepton",
+        # The version is in the name of the OLD builds: 1.40 is the one players
+        # install, and on the Home Screen it is simply the game.
+        "display": "Beat Saber 1.6",
+        # See beatsaber128.
+        "hand_matting": False,
+    },
+    "beatsaber140": {
+        # Beat Saber 1.40 beside 1.6.0, as its own app. A version variant of
+        # `beatsaber` normally just takes over beatsaber/ (see the trees note in
+        # tools/gen_libc_table.py); a second ROW is what gives it a bundle id, a
+        # container and a userdata profile of its own, so both stay installed.
+        # Split application binary: the OBB is main.<versionCode>.<package>.obb
+        # under this target's userdata, not beatsaber's.
+        "libs":    None,
+        "srcdir":  "beatsaber140/lib/arm64-v8a",
+        "tree":    "beatsaber140",
+        "apk":     "beatsaber-1.40.apk",
+        "assets":  "beatsaber140/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "Klepton",
         "display": "Beat Saber",
+        # See beatsaber128.
+        "hand_matting": False,
+        # The in-app data panel (KleptonGameData.swift): the OBB's file name,
+        # and the store's binary ids for the APK and the OBB this build was
+        # translated from. Empty ids leave the panel on its no-network path
+        # (copy the files in through Files, then Unpack).
+        "obb_file":    "main.1716.com.beatgames.beatsaber.obb",
+        "meta_apk_id": "30506607092319862",
+        "meta_obb_id": "30506602615653643",
+        # Foveated rendering is on by default (it is for every row) and a copy
+        # that stored "off" gets it back once. For Beat Saber from 1.45 on it is
+        # another thing than the setting people switched off: the game renders
+        # through the display's own map, a curve per eye, at the display's full
+        # size, and the unwarp no longer waves at the edge of the dense region.
+        # On device (2026-10-12) that held the panel's 120 Hz for a whole
+        # session at 6890x5526 an eye, where the same game unfoveated at 4000
+        # fell to 60 Hz inside a level. A choice made after this start stays.
+        "foveation_reset": 1,
+    },
+    "beatsaber128": {
+        # Beat Saber 1.28 (Unity 2019.4), a third row for the same reason as
+        # beatsaber140: its own bundle id, container and userdata. Not a split
+        # binary — the assets are in the APK, so there is no OBB to stage.
+        "libs":    None,
+        "srcdir":  "beatsaber128/lib/arm64-v8a",
+        "tree":    "beatsaber128",
+        "apk":     "beatsaber-1.28.apk",
+        "assets":  "beatsaber128/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "Klepton",
+        "display": "Beat Saber 1.28",
+        # Beat Saber draws its own sabers where the hands are, so the system's
+        # matte of the user's arms (and the controllers in them) over the
+        # picture is a second pair in the same place. False opens the space with
+        # .upperLimbVisibility(.hidden); see KLChromaSettings.handMatting.
+        "hand_matting": False,
     },
     "superhot": {
         # SUPERHOT VR — Unity + IL2CPP + the Oculus Mobile SDK, i.e. the same
@@ -98,6 +160,139 @@ TARGETS = {
         "kind":    "unity",
         "product": "KleptonSuperhot",
         "display": "SUPERHOT",
+    },
+    "walkabout": {
+        # Walkabout Mini Golf 6.7 (Mighty Coconut), package
+        # com.MightyCoconut.WalkaboutMiniGolf — Unity + IL2CPP through the stock
+        # com.unity3d.player.UnityPlayerActivity, Beat Saber 1.40's shape:
+        # libOVRPlugin + libOculusXRPlugin for the display, libovrplatformloader
+        # for the Meta platform.
+        #
+        # Split application binary (assets/unity_obb_guid is present): the APK
+        # carries the first scene only and the courses are in
+        # main.60366.com.MightyCoconut.WalkaboutMiniGolf.obb under this target's
+        # userdata.
+        "libs":    None,
+        "srcdir":  "walkabout/lib/arm64-v8a",
+        "tree":    "walkabout",
+        "apk":     "walkabout.apk",
+        "assets":  "walkabout/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonWalkabout",
+        "display": "Walkabout Mini Golf",
+        # The downloadable courses' `<course>common_assets_.bundle` files live
+        # BESIDE the packaged OBB, in Android's own obb directory, and the main
+        # menu's Addressables dependencies name all ten: with any missing it
+        # retries the load forever on the loading screen. So that directory is
+        # staged too (real bundles from the headset, or the placeholders
+        # tools/walkabout_stub_bundles.py writes).
+        "stage_files": "Android/obb/com.MightyCoconut.WalkaboutMiniGolf",
+        # The NAME is load-bearing in runtime/kl_dl.c: libMetaXRAudioUnity, refused
+        # on every guest, is served to this one as a no-op library, because its
+        # audio setup throws on each call into the absent plugin (KL_METAXR_AUDIO_STUB).
+        # See beatsaber128: the game draws its own hands and putter where the
+        # user's are, so the system's matte of the real arms is a second pair in
+        # the same place. False opens the space with
+        # .upperLimbVisibility(.hidden).
+        "hand_matting": False,
+    },
+    "x2582932495064035": {
+        # Real VR Fishing 3.06102 (com.Miragesoft.RealVrFishingQ).  Keep an
+        # explicit AVP Play target so this game uses the normal launcher and
+        # stable bundle/product identity instead of the generic Klepton route.
+        "libs":    None,
+        "srcdir":  "x2582932495064035/lib/arm64-v8a",
+        "tree":    "x2582932495064035",
+        "apk":     "x2582932495064035.apk",
+        "assets":  "x2582932495064035/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonX2582932495064035",
+        "display": "Real VR Fishing",
+        "hand_matting": False,
+        "stage_files": "Android/obb/com.Miragesoft.RealVrFishingQ",
+        "obb_file":    "main.1219.com.Miragesoft.RealVrFishingQ.obb",
+        "meta_apk_id": "29566115676319018",
+        "meta_obb_id": "29566100019653917",
+    },
+    "batman": {
+        # Batman: Arkham Shadow 1.4.1 (com.camouflaj.manta, versionCode 350961).
+        # Unity 2022 + IL2CPP + Burst, the Oculus XR plugin, Wwise for audio,
+        # and Vulkan REQUIRED by its manifest — so the same shape as bonelab
+        # (MoltenVK), on a title shipped for Quest 3 only. A FEASIBILITY target:
+        # added to run the host gates and the shim gap list against it, not
+        # because it is known to boot.
+        #
+        # The NAME is load-bearing: the runtime already special-cases a target
+        # called "batman" — the Adreno identity MoltenVK's device is reported
+        # under (kl_vulkan.c, KL_VK_SPOOF_ADRENO), the Quest 3 hardware identity
+        # (kl_jni.c), and two smaller ones. Under any other name this title pops
+        # "Your device does not match the hardware requirements", abandons
+        # Vulkan and dies in a GLES2 context — measured, as "arkhamshadow".
+        "libs":    None,
+        "srcdir":  "batman/lib/arm64-v8a",
+        "tree":    "batman",
+        "apk":     "batman.apk",
+        "assets":  "batman/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "libmain",
+        "kind":    "unity",
+        # Its own product, so its generated .xcodeproj sits beside Klepton.xcodeproj
+        # instead of replacing whichever Beat Saber build that one holds.
+        "product": "KleptonArkham",
+        "display": "Arkham Shadow",
+        # The game draws its own gauntlets where the hands are; the passthrough
+        # hands on top of them are a second, mismatched pair. Default them off
+        # (the in-app toggle still turns them back on).
+        "hand_matting": False,
+        # Fraction of the capped eye-texture size the game is told (the
+        # in-app "Render resolution" slider starts here). Measured on an M5 at
+        # 1.0 = 3072x2464 per eye: 71 fps in the menus, 50 in play, and in play
+        # the compositor itself fell from 100 Hz to 50 — every reprojection
+        # shown twice, judder on head turns. The game's own fixed foveation
+        # does not exist under MoltenVK, so resolution is the lever. 0.7 is
+        # half the pixels.
+        # The picture since 2026-10-13: foveated rendering at "high" (kl_fove,
+        # taken over from rebelancap's fork) at an eye cap of 4608 (kl_ovrp.c)
+        # and full render scale — his settings for this game from avp-play
+        # issue 16, without the 90 Hz he also names. Until then it ran unfoveated
+        # at 70% of a 3072 cap. On the owner's headset it draws 25.7% of the
+        # 4608x3697 eye that way (2144x2048), more picture points than before
+        # and far sharper in the middle, with no frame past its deadline; peak
+        # footprint 5.6 GB with 2.6 GB free. He looked at a test copy with his
+        # own save and made it the default.
+        # The 90 Hz pin was tried and taken out: here the panel ran at 50 and at
+        # 100 Hz in turn while the game was told 90, where it is otherwise told
+        # the panel's own rate. His fork separates the pinned rate from the
+        # panel's; this one does not have that yet.
+        # picture_reset: a copy installed under the old defaults drops its
+        # stored resolution and foveation level once, so everyone gets these.
+        "render_scale": 1.0,
+        "vk_foveation": "high",
+        "picture_reset": 1,
+        # In-game video on by default. A Vulkan guest's is otherwise refused
+        # (kl_mediandk.c, klm_extractor_enabled), on the assumption that decoded
+        # frames reach the renderer as AHardwareBuffers imported into Vulkan —
+        # which this title's Unity never does: it decodes with no surface and
+        # uploads the NV12 bytes itself, and that path is served. Confirmed on
+        # device with its tutorial clips.
+        "video": True,
+        # Its OBB directory is not one packaged *.obb: 69 Addressables bundles,
+        # three audio OBBs, the videos and a manifest sit LOOSE beside the main
+        # OBB, and the game opens each by name. Stage the directory wholesale
+        # (stage_assets.sh, KLT_OBB_RAW) or the device gets one file of 84.
+        "obb_raw": 1,
+        # On from the start, as the owner plays it (2026-10-17): every second
+        # refresh (an even 50 of 100 rather than 50-70 unevenly), and shaders
+        # compiled behind the picture — which took the half-second freezes of
+        # first-seen places out of his session.
+        "test_on": "KL_GUEST_PACE_DIV,KL_VK_ASYNC_PIPES",
     },
     "bonelab": {
         # BONELAB — Unity 2021.3.16f1 + IL2CPP, and the same front door again
@@ -407,6 +602,95 @@ TARGETS = {
         "product": "KleptonIntoTheRadius",
         "display": "Into the Radius",
     },
+    "wrath2": {
+        # Asgard's Wrath 2 (Sanzaru), package com.Sanzaru.Wrath2, versionCode
+        # 5513 (12.1.1689309) — UE 4.27.2 on Sanzaru's branch, GameActivity door,
+        # the shape vampire's row calls "wrath2's": FMOD Studio audio plus the
+        # Oculus spatializer, playcore, and libFbnsPlugin (Meta push, excluded by
+        # kl_dl.c). Vulkan only.
+        #
+        # The NAME is load-bearing, more than any other row's: the runtime
+        # already carries this title's measured workarounds under it — two guest
+        # patches keyed on THIS build's instruction words (IsVulkanAvailable and
+        # FShaderPipelineCache::NumPrecompilesRemaining, kl_guestpatch.c; all
+        # four expect-words verified against this APK), the no-async-loading-
+        # thread command line (kl_ue4.c), the MoltenVK compile timeout
+        # (kl_vulkan.c), the FMOD-poll usleep cap and guest QoS (kl_driver.c),
+        # and the ICU directory synthesis (kl_obbmap.c).
+        #
+        # One OBB, main.5513, tens of GB, read through in place.
+        "libs":    None,
+        "srcdir":  "wrath2/lib/arm64-v8a",
+        "tree":    "wrath2",
+        "apk":     "wrath2.apk",
+        "assets":  "wrath2/assets",
+        "qtplugins": "",
+        "obb":     "Android/obb/com.Sanzaru.Wrath2",
+        "entry":   "libUE4",
+        "kind":    "ue4",
+        "product": "KleptonWrath2",
+        "display": "Asgard's Wrath 2",
+        "autoboot": False,
+        "hand_matting": False,
+    },
+    "moss": {
+        # Moss (Polyarc), package com.polyarc.MossGame, versionCode 151047 —
+        # UE 4.27.2 through com.epicgames.ue4.GameActivity, RE4's shape, built
+        # for the original Quest (com.oculus.supportedDevices = quest). Audio is
+        # Wwise, linked into libUE4 with its effect plugins beside it as loose
+        # libAk*.so; XR is OVRPlugin 1.70 (the real plugin ships and is
+        # replaced, as always). bSupportsVulkan is true and both RHIs are in the
+        # binary, so which one it takes is read off the first run. A FEASIBILITY
+        # target until it has booted.
+        "libs":    None,
+        "srcdir":  "moss/lib/arm64-v8a",
+        "tree":    "moss",
+        "apk":     "moss.apk",
+        "assets":  "moss/assets",
+        "qtplugins": "",
+        # UE4 builds <external>/Android/obb/<package>/ itself — RE4's layout.
+        "obb":     "Android/obb/com.polyarc.MossGame",
+        "entry":   "libUE4",
+        "kind":    "ue4",
+        "product": "KleptonMoss",
+        "display": "Moss",
+        # Wait for the Start button instead of booting as soon as the window
+        # is up, so the settings below it can be changed first.
+        "autoboot": False,
+        # Moss draws its own controllers; the passthrough hands on top of them
+        # are a second pair. Off by default, the toggle turns them back on.
+        "hand_matting": False,
+        # The "Foveated rendering" setting starts ON for this target. Note what
+        # that setting reaches: the rate map is attached to render passes
+        # Klepton creates, i.e. an OpenGL guest's. A Vulkan guest's passes are
+        # MoltenVK's, so for Moss this is a stored preference with no effect on
+        # the picture until a Vulkan path for it exists.
+        "foveation": True,
+        # The picture since 2026-10-13, the owner's setting on the headset: the
+        # display's own eye size (4608, kl_ovrp.c) with the game's own 1.5x held to
+        # it, foveated rendering at "high" (kl_fove), 16x anisotropic filtering
+        # (kl_vulkan.c) and a frame on every second refresh (kl_app.c). Before, it
+        # took 4608x3697 an eye by its own scale over a 3072 cap, unfoveated – 45
+        # frames a second. picture_reset: an installed copy drops its stored
+        # resolution and foveation level once, so everyone gets these.
+        "vk_foveation": "high",
+        "picture_reset": 1,
+        # On an ordinary gamepad (see KleptonControllers.pollGamepad) Quill's
+        # attack belongs on Square, where the game's first release had it and
+        # where a thumb expects it. Moss reads attack from Touch B, which the
+        # default layout puts on Circle — right for the upper button of a Touch
+        # controller, wrong for a pad. So on a pad, and only there: Square is B
+        # and Circle takes Square's X. Touch and Sense controllers are untouched.
+        "gamepad_map": "square=b,circle=x",
+        # On from the start, as the owner tested it (2026-10-17): shaders
+        # compiled behind the picture. The first session of a fresh copy
+        # compiled 392 pipelines, 46 s in the compiler, with no freeze left
+        # but one of 170 ms at the start. And for the Steam build only, the
+        # pipeline list the game ships compiled at start, as the Meta build
+        # does (kl_ue4.c, KL_UE4_PSO_LIST) – the owner's word: on for every
+        # player, off only where it makes trouble.
+        "test_on": "KL_VK_ASYNC_PIPES,KL_UE4_PSO_LIST",
+    },
     # ---- JKXR: ONE APK, TWO GAMES, TWO ROWS ----
     #
     # JKXR is Team Beef's VR port of Jedi Knight II: Jedi Outcast and Jedi
@@ -606,6 +890,44 @@ TARGETS = {
         "product": "KleptonHalfLifeVR",
         "display": "Half Life",
     },
+    "doom3quest": {
+        # Doom3Quest 1.4.8 (Team Beef, com.drbeef.doom3quest) — id Tech 4 (d3es)
+        # behind drbeef's GLES3JNILib door, entry libdoom3, OpenXR. The same
+        # family as hl1/jkxr with one difference the driver carries: these
+        # natives take no handle (onCreate returns void).
+        #
+        # The APK ships the original Doom 3 DEMO (assets/demo0N.pk4) beside the
+        # port's own pak399; the Activity copies both into
+        # /sdcard/Doom3Quest/base, and kl_gles3jni does the same here. Retail
+        # pak000-008.pk4 from a copy the user owns go in
+        # userdata/doom3quest/Doom3Quest/base and take over from the demo.
+        "libs":    None,
+        "srcdir":  "doom3quest/lib/arm64-v8a",
+        "tree":    "doom3quest",
+        "apk":     "doom3quest.apk",
+        "assets":  "doom3quest/assets",
+        "qtplugins": "",
+        "obb":     "obb",
+        "stage_files": "Doom3Quest",
+        "entry":   "libdoom3",
+        "kind":    "gles3jni",
+        "product": "KleptonDoom3",
+        "display": "Doom 3",
+        # The game draws its own arms and weapons where the hands are; the
+        # system's matte of the user's real arms over the picture is a second
+        # pair in the same place (see beatsaber128).
+        "hand_matting": False,
+        # The whole of the eye-size ceiling kl_ovrp.c gives this target (4000):
+        # 4400x4400 per eye. Affordable because the eyes are foveated (below) —
+        # on device, 2026-10-08, 87-90 frames a second at this size with the
+        # map against 31-55 without it. The "Render resolution" setting lowers
+        # it (50% is the old picture).
+        "render_scale": 1.0,
+        # Fixed foveation on by default: this guest shades every pixel once per
+        # light, and its eyes can take the map although they are mirrored
+        # (kl_glfb.c, klfb_mirror_vrr).
+        "foveation": True,
+    },
     #   Source engine:
     "hl2": {
         # Half-Life 2 VR (com.valvesoftware.source.vrtest) — Source + SDL2
@@ -641,9 +963,334 @@ TARGETS = {
         "product": "KleptonPortalVR",
         "display": "Portal",
     },
+
+
+    # ---- A Linux (glibc) process, not an Android app ----
+    "alyx": {
+        # Half-Life: Alyx — Valve's own Linux ARM64 build (Steam app 546560,
+        # game/bin/linuxsteamrtarm64), run as a whole Linux process on the Steam
+        # Linux Runtime's ld.so and glibc (runtime/linux/, kl_linuxproc). Nothing
+        # of it is in this repository: the game and the runtime are the user's
+        # own Steam files beside the checkout (../alyx, ../steamrt).
+        #
+        # No APK, no assets/, no OBB — those fields are the Android shape and are
+        # empty here. The translated libraries are not a property of one
+        # directory either: they come from the game AND the sysroot, and the set
+        # is the one the process really loads (visionos/lx/alyx.loaded, recorded
+        # by a host run with KL_LX_LOADLOG). mklxguest.sh builds them and writes
+        # the list that `libs` is then read from — see lx_libs() below.
+        "libs":    "",
+        "srcdir":  "",
+        "tree":    "lx",
+        "apk":     "",
+        "assets":  "",
+        "qtplugins": "",
+        "obb":     "obb",
+        "entry":   "hlvr",
+        "kind":    "linux",
+        "product": "KleptonAlyx",
+        "display": "Half-Life Alyx",
+        # The Steam app whose public store artwork gives this target its icon
+        # and start picture (visionos/steam_art.py): there is no APK to take
+        # an icon from, and the installer only looks for Steam's pictures in a
+        # Steam client's cache on the Mac, which most Macs do not have.
+        "steam_app": "546560",
+    },
+    "x7527722310622065": {
+        # Cave Crave 1.1.4 (com.rrrgames.CaveCrave, versionCode 739), Meta Store
+        # app 7527722310622065. Unity 6 + IL2CPP. Otherwise exactly the generic
+        # store row (_generic_row) — this row exists for ONE field:
+        #
+        # The game's Addressables content ships as separate store asset files
+        # (scenematerials_*.bundle, catalog_1.1.4.*) that land BESIDE the main
+        # OBB, in Android's own obb directory, and at boot the game looks for
+        # them in getObbDir() ("[ADD] Searching for new asset files in ...")
+        # before filing them under <obb>/Bundles/. With the generic Unity "obb"
+        # the main OBB is in <files>/obb but the asset files are staged into
+        # <files>/Android/obb/<package> — two directories where Android has
+        # one — so every bundle "doesn't exist", the game reports corrupted
+        # files and loads scenes without their materials. Android's layout puts
+        # @obb and the asset files in the same place, and Unity is told that
+        # place through getObbDirs().
+        "libs":    None,
+        "srcdir":  "x7527722310622065/lib/arm64-v8a",
+        "tree":    "x7527722310622065",
+        "apk":     "x7527722310622065.apk",
+        "assets":  "x7527722310622065/assets",
+        "qtplugins": "",
+        "obb":     "Android/obb/com.rrrgames.CaveCrave",
+        "entry":   "libmain",
+        "kind":    "unity",
+        "product": "KleptonX7527722310622065",
+        "display": "Cave Crave",
+        "autoboot": False,
+        "generic": True,
+    },
 }
 
 DEFAULT = "beatsaber"
+
+
+# ---- an experimental target for a game this table has never met ------------
+#
+# Every row above was written by someone who had the game in front of them. An
+# installer that lets people TRY a game nobody has ported yet has no such row to
+# point at, and inventing one per game by hand is exactly the work the attempt
+# is meant to find out is worth doing.
+#
+# So one more target can be named from outside, for one build:
+#
+#     KLEPTON_GENERIC_TARGET=x<store app id>     the row's name
+#     KLEPTON_GENERIC_DISPLAY=<title>            what the app is called
+#
+# Everything else is read off the unpacked APK, which the installer puts at
+# <root>/<name>/ before anything here runs: which engine it is decides the entry
+# library, the boot sequence and where the game looks for its OBB. That is all
+# a row holds — none of the per-game adjustments the rows above carry. A game
+# that needs one will not run until it has a row of its own; this only gets it
+# as far as it gets on the engine's common path, which is the thing to report.
+#
+# The name is `x` and digits and nothing else, so it can never collide with a
+# row above or be a path. It is also the tree, the APK name and — through
+# bundle_for() — the app identifier, which keeps two such games apart on the
+# device.
+GENERIC_ENV = "KLEPTON_GENERIC_TARGET"
+
+# Where a generic target's guest looks for its OBB, where the engine guess in
+# _generic_row() is wrong for that one game. Keyed on the target name, so no
+# other title changes.
+#
+# Sniper Elite VR (com.JustAddWater.SniperEliteVR, x2544573735586536) is Unity,
+# but its levels are not one main.<version>.<package>.obb: they are ~27 loose
+# AssetBundles (common_assets, bridge_scenes, quest2.hd, ...) that the store
+# delivers into Android's own obb directory, <external>/Android/obb/<package>/,
+# and that is where they are staged. The game asks Context.getObbDir() for that
+# directory and opens the bundles from it; answering the Unity default
+# <files>/obb gave it an empty directory, every "Unable to open archive file",
+# and a loading screen that never ends.
+GENERIC_OBB = {
+    "x3635172946605196": "Android/obb/com.brink.vr.oculus.quest",
+    "x2544573735586536": "Android/obb/com.JustAddWater.SniperEliteVR",
+    # Ghost Town (com.FireproofStudios.GhostTown, x9531494193591052) is Unity,
+    # and its scenes are loose AssetBundles the store delivers into Android's
+    # obb directory, not a main.<version>.<package>.obb. At the fade-in it
+    # asks Context.getObbDir() ("OBB Path: ...") and then reports every bundle
+    # missing. The Unity default <files>/obb is empty; the bundles are staged
+    # at <files>/Android/obb/<package>, which is the directory Android's
+    # getObbDir() names.
+    "x9531494193591052": "Android/obb/com.FireproofStudios.GhostTown",
+    # iB Cricket (com.ProYuga.iBC, x5437449896288644) is Unity with a main OBB
+    # AND ~30 store AssetBundles (stadium_*, jerseys_*, ...) that are staged
+    # into <files>/Android/obb/<package>. At boot the game does not ask Java
+    # for its OBB: it stat()s the hardcoded
+    # /sdcard/Android/obb/<package>/main.<code>.<package>.obb, finds nothing
+    # there with the Unity default <files>/obb and throws OBB_FILE_MISSING.
+    # Android's layout puts @obb and the bundles in that one directory, as for
+    # Cave Crave.
+    "x5437449896288644": "Android/obb/com.ProYuga.iBC",
+}
+
+
+def ovrp_guest_version(tree):
+    """The OVRPlugin version a game ships, read from <tree>/lib/arm64-v8a/
+    libOVRPlugin.so: the one NUL-delimited "1.<minor>.<patch>" with a minor of 20
+    or more in it (the plugin's own number; the 1.5.x beside it in most builds
+    belongs to something else). "" when there is no such library or not exactly
+    one candidate. The same rule as kl_ovrp_guest_version_in in kl_ovrp.c;
+    checked against the games whose version was set by hand (1.98.0, 1.101.1,
+    1.108.0, 1.109.0, 1.115.0)."""
+    import os, re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, tree, "lib", "arm64-v8a", "libOVRPlugin.so")
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return ""
+    found = {m.group(1).decode() for m in re.finditer(rb"\x00(1\.(\d{1,3})\.\d{1,3})\x00", data)
+             if int(m.group(2)) >= 20}
+    return found.pop() if len(found) == 1 else ""
+
+
+def _generic_row(name):
+    import os, re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    libdir = os.path.join(root, name, "lib", "arm64-v8a")
+    try:
+        libs = set(os.listdir(libdir))
+    except OSError:
+        libs = set()
+    package, native_lib = "", ""
+    try:
+        with open(os.path.join(root, name, "AndroidManifest.xml"), errors="replace") as f:
+            manifest = f.read(400_000)
+        m = re.search(r'<manifest[^>]*\spackage="([A-Za-z0-9_.]+)"', manifest)
+        package = m.group(1) if m else ""
+        m = re.search(r'android:name="android\.app\.lib_name"\s+android:value="([A-Za-z0-9_.+-]+)"', manifest)
+        native_lib = m.group(1) if m else ""
+    except OSError:
+        pass
+    android_obb = f"Android/obb/{package}" if package else "obb"
+    if "libUE4.so" in libs:
+        kind, entry, obb = "ue4", "libUE4", android_obb
+    elif "libUnreal.so" in libs:
+        kind, entry, obb = "ue4", "libUnreal", android_obb
+    elif libs & {"libil2cpp.so", "libunity.so", "libmono.so", "libmonobdwgc-2.0.so"}:
+        # Unity asks Java for its OBB directory and gets the app's own (see the
+        # note on "obb" at the superhot row).
+        kind, entry, obb = "unity", "libmain", "obb"
+    elif "libSDL2.so" in libs:
+        kind, entry, obb = "sdl2", "libmain", "obb"
+    else:
+        # A NativeActivity names its library in the manifest; without that there
+        # is nothing to go on, and libmain is the least surprising guess.
+        kind, entry, obb = "native", ("lib" + native_lib) if native_lib else "libmain", android_obb
+    obb = GENERIC_OBB.get(name, obb)
+    display = os.environ.get("KLEPTON_GENERIC_DISPLAY", "") or name
+    display = "".join(c for c in display if c.isprintable())[:60].strip() or name
+    return {
+        "libs": None,
+        "srcdir": f"{name}/lib/arm64-v8a",
+        "tree": name,
+        "apk": f"{name}.apk",
+        "assets": f"{name}/assets",
+        "qtplugins": "",
+        "obb": obb,
+        "entry": entry,
+        "kind": kind,
+        "product": "Klepton" + name.upper(),
+        "display": display,
+        # Wait for Start, like every installed game; and say what this is.
+        "autoboot": False,
+        "generic": True,
+    }
+
+
+# What a store game is known to need on top of the generic row, where that is a
+# DEFAULT of a setting and nothing about how it is built — so the row stays the
+# one read off its APK and only the field named here differs.
+STORE_DEFAULTS = {
+    # Assassin's Creed Nexus VR. In-game video on: its loading screens play a
+    # clip through Unity's VideoPlayer, and with the Vulkan refusal
+    # (kl_mediandk.c, klm_extractor_enabled) the game opened that clip again on
+    # every frame of the loading screen, each failed attempt keeping about
+    # 0.6 MB — 50 MB a second, 2.4 GB over one long load, and the world's own
+    # textures then went over the process limit (the app was killed on arrival).
+    # Its Unity decodes with no surface and uploads the bytes itself, like
+    # Arkham Shadow's, which is the path that is served.
+    "x5812519008825194": {"video": True},
+    # Marvel's Deadpool VR. Edge smoothing at 4x: the game renders 2x, its
+    # settings are out of reach in an encrypted pak, and on device (Vision Pro
+    # M5, 2026-10-12) 4x cost no frame time that could be told from the spread
+    # between runs, and about 0.2 GB at 5 GB.
+    # ...and foveated rendering at "medium" (kl_fove, taken over from rebelancap's
+    # fork, who runs this game at "high" with a smaller box): the game ran
+    # unfoveated here until then, the owner looked at a test copy with the
+    # levels on a headset and chose medium as where it starts (2026-10-13).
+    "x3240283705987790": {"vk_msaa": 4, "vk_foveation": "medium"},
+    # Eye of the Temple. Foveated rendering off by default: in this game the
+    # fixed sharp patch is very plainly visible and buys hardly any frame time
+    # (the author on a headset, 2026-10-12), so the picture wins.
+    # "foveation_reset" calls back
+    # a choice a player's copy has already stored, once, so that the new default
+    # reaches the people who play it now and not only new installs; see
+    # KleptonRendering. They can turn it on again afterwards and it stays on.
+    "x5361030930653377": {"foveation": False, "foveation_reset": 1},
+    # Premium Bowling. Foveation off: it draws each eye into a texture of its
+    # own, without multisampling, and copies that into the eye texture. Only
+    # the copy is foveated (kl_glfb foveates the eye textures and a
+    # MULTISAMPLED scene target), so nothing is saved — the scene is shaded in
+    # full at 4915x3942 either way — and the copy thins the finished picture
+    # to a third of its pixels with one tap each: stair-stepped edges
+    # everywhere but the middle (on device, 2026-10-12; with it off the author
+    # found the picture "deutlich besser").
+    "x2773034772778845": {"foveation": False},
+    # Synth Riders 3.6.6 (Unity 6000.3.13f1). Foveation off: it draws the scene
+    # into a 4x MULTISAMPLED texture of the eye size and resolves that into the
+    # eye texture with glBlitFramebuffer. The size rule foveates the scene
+    # target, the blit does not rasterize through the map, so the eye received
+    # the warped picture as it lay in the physical corner: shifted to the lower
+    # left, distorted, and pink where nothing had been written (on device,
+    # 2026-10-15). "foveation_reset" calls back a stored "on" once. (Fix 42.)
+    "x2436558143118760": {"foveation": False, "foveation_reset": 1},
+    # Moss: Book II (Polyarc, UE 4.27.2 like Moss). Moss's picture and its
+    # shaders as the owner set them for Moss (see the moss row): foveated
+    # rendering on at "high", reset once, the passthrough hands off (the game
+    # draws its own), shaders compiled behind the picture from the start. The
+    # runtime side is kl_driver_target_is_moss. Moss's pad layout is not copied:
+    # this game's buttons are not looked at yet.
+    "x4395292760584049": {"foveation": True, "vk_foveation": "high", "picture_reset": 1,
+                          "hand_matting": False, "test_on": "KL_VK_ASYNC_PIPES"},
+    # PowerWash Simulator VR 2.5.0 (Unity 2020.3, Vulkan). A frame on every
+    # second refresh from the start, as its owner asked when calling it
+    # verified (2026-10-19), with the eye cap of 4000 in kl_ovrp.c: an even 50
+    # of 100 rather than a game that needs 8 to 11 ms of GPU a frame landing on
+    # the next refresh or the one after. A player turns it off in the start
+    # window (Advanced > Test), and that choice stays.
+    "x3713270985434472": {"test_on": "KL_GUEST_PACE_DIV"},
+    # Floor Plan 2 (Unity 2022.3, OVRPlugin 1.88, Vulkan). The owner's own
+    # choices in the start window, made the default when it was verified
+    # (2026-10-18): 120 Hz with a frame on every second refresh — an even 60 —
+    # and 4096 an eye (the eye cap is its row in kl_ovrp.c, klovrp_title_cap).
+    # Its physics step follows the refresh rate it is told (KL_OVRP_HZ_FOLLOW,
+    # kl_app.c, on for it by default), or what it holds shakes in the hand.
+    "x2401648309868679": {"max_rate": 120, "test_on": "KL_GUEST_PACE_DIV"},
+    # Star Wars Pinball VR (UE 4.25, GLES). Its owner's choices in the start
+    # window, made the default (2026-10-19): 120 Hz with a frame on every
+    # second refresh — an even 60 — and 4608 an eye (klovrp_title_cap in
+    # kl_ovrp.c). Both stay a player's choice in the start window.
+    "x3180994211970184": {"max_rate": 120, "test_on": "KL_GUEST_PACE_DIV"},
+    # Vader Immortal: Episode I (UE 4.19, GLES). Its owner's choices, made the
+    # default when it was verified (2026-10-19): 120 Hz with a frame on every
+    # second refresh — an even 60 — and 4096 an eye (klovrp_title_cap in
+    # kl_ovrp.c). Episodes II and III are the same engine and get the same,
+    # not yet run on a headset. All stay a player's choice in the start window.
+    # Since 2026-10-20 all three have the owner's later picture settings, read
+    # off his Episode I: 4608 an eye (kl_ovrp.c), rendered at 95 % and
+    # upscaled to the full eye size by MetalFX (KL_METALFX_UPSCALE).
+    "x2108775495884888": {"max_rate": 120, "render_scale": 0.95,
+                          "test_on": "KL_GUEST_PACE_DIV,KL_METALFX_UPSCALE"},
+    "x2223615721048141": {"max_rate": 120, "render_scale": 0.95,
+                          "test_on": "KL_GUEST_PACE_DIV,KL_METALFX_UPSCALE"},
+    "x2426206484098337": {"max_rate": 120, "render_scale": 0.95,
+                          "test_on": "KL_GUEST_PACE_DIV,KL_METALFX_UPSCALE"},
+    # Gods of Gravity (Unity 2021.3.45f2, OpenGL ES). Foveation off, Synth
+    # Riders' case one step further: the scene goes into a MULTISAMPLED target
+    # of the eye size, which the size rule foveates; its resolve (a blit, no
+    # rasterization through the map) copies the squeezed picture as it lies
+    # into a plain texture, and the final pass samples that by screen position
+    # into the eye texture — through the map a second time. The compositor
+    # undoes one squeeze, so the picture filled only part of the view and bent
+    # when the head turned (on device, 2026-10-18; the double squeeze measured
+    # on the Mac with KL_GLFB_MTL=1 KL_VRR=1 KL_GLFB_DUMP_FBOS=1).
+    "x3919415921458774": {"foveation": False, "foveation_reset": 1},
+    # HITMAN 3 VR: Reloaded (Glacier, Vulkan, OpenXR). Its owner's choices in
+    # the start window, made the default for new players (2026-10-20): 100 Hz
+    # (the mixed space, the default anyway), a frame on every second refresh —
+    # an even 50, the half rate the Quest build draws at with space warp — 3584
+    # an eye (klovrp_title_cap in kl_ovrp.c; 4096 ran out of memory at level
+    # changes) and foveated rendering at "high".
+    # No reset: a player who has chosen otherwise keeps it. Shaders compiled
+    # behind the picture as well (KL_VK_ASYNC_PIPES, with KL_VK_ASYNC_RP): each
+    # new one held the picture 0.3-0.9 s on the headset (2026-10-20); the Mac
+    # mission looks the same with it once they are there.
+    "x8012387035448196": {"foveation": True, "vk_foveation": "high",
+                          "test_on": "KL_GUEST_PACE_DIV,KL_VK_ASYNC_PIPES"},
+}
+
+
+def _add_generic():
+    import os, re
+    name = os.environ.get(GENERIC_ENV, "")
+    if not name or name in TARGETS:
+        return
+    if not re.fullmatch(r"x[0-9]{5,24}", name):
+        print(f"!! {GENERIC_ENV}={name!r} is not a name of the form x<digits>", file=sys.stderr)
+        sys.exit(1)
+    TARGETS[name] = {**_generic_row(name), **STORE_DEFAULTS.get(name, {})}
+
+
+_add_generic()
 
 
         # `"libs": None` means "whatever this tree would translate for that srcdir",
@@ -707,6 +1354,20 @@ def libs_for(srcdir):
 # identity is kept — changing this orphans the container the assets were staged
 # into, so the first build after it re-stages (run.sh's stamp is keyed on the id,
 # which is what makes that automatic rather than a silent empty container).
+# A Linux target's frameworks, as mklxguest.sh last built them. Read from the
+# list it writes rather than derived here, because the names carry a content
+# fingerprint (runtime/linux/kl_lx_name.h) and only the translator knows it.
+# Empty before the first mklxguest.sh run, which is what lets run.sh resolve the
+# target in order to run it.
+def lx_libs(name):
+    import os
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Frameworks", name, "LIBS")
+    try:
+        return " ".join(open(p).read().split())
+    except OSError:
+        return ""
+
+
 BUNDLE_PREFIX = "dev.klepton.target"
 
 
@@ -718,6 +1379,66 @@ def bundle_for(name):
     return f"{scope}.{ident}" if scope else ident
 
 
+# The name the headset shows under the icon (CFBundleDisplayName), for EVERY
+# target — the rows above and the generic one alike. A parallel copy of a game
+# beside the one already installed (a test build next to the player's own, with
+# KLEPTON_BUNDLE_ID set so it is a second app rather than a replacement) needs a
+# name of its own, or the two icons cannot be told apart.
+#
+#     KLEPTON_DISPLAY_OVERRIDE=<name>   the whole name, over the row's (and over
+#                                       KLEPTON_GENERIC_DISPLAY / the launcher's)
+#     KLEPTON_DISPLAY_SUFFIX=<text>     appended to whatever name that leaves,
+#                                       e.g. " (Test)" -> "Beat Saber (Test)"
+#
+# KLEPTON_DISPLAY_NAME is the older spelling of the override (gen_xcodeproj.py
+# read it on its own) and still works; KLEPTON_DISPLAY_OVERRIDE wins over it.
+# Unset or empty, both leave the name exactly as the row has it. Non-printable
+# characters are dropped, as for the generic display; a name that strips to
+# nothing falls back to `base`.
+def display_for(base):
+    import os
+    override = (os.environ.get("KLEPTON_DISPLAY_OVERRIDE", "")
+                or os.environ.get("KLEPTON_DISPLAY_NAME", ""))
+    suffix = os.environ.get("KLEPTON_DISPLAY_SUFFIX", "")
+    if not override and not suffix:
+        return base
+    clean = lambda v: "".join(c for c in v if c.isprintable())
+    name = clean(override).strip() or base
+    return (name + clean(suffix)).strip() or base
+
+
+def _follow_unpacked_build(t):
+    """The data panel's OBB name and store ids are a property of the BUILD.
+
+    A row states them for the build it was written against (Beat Saber 1.40.8:
+    main.1716...obb). The same row is built from a newer APK once the store
+    carries one — the installer unpacks whatever the player's recipe names into
+    <root>/<tree>/ — and the game then opens main.<its own version code>...obb.
+    Left as written, the app would look for 1716's file beside a 1.45 build,
+    find it missing and offer to download 1.40's data.
+
+    So where the unpacked APK is another build than the row's, the name follows
+    the APK and the ids are dropped: they name the other build's files, and no
+    download is better than the wrong one. Nothing changes for the build the
+    row was written against, or while nothing is unpacked.
+    """
+    import os, re
+    m = re.match(r"main\.(\d+)\.(.+)\.obb$", t.get("obb_file") or "")
+    if not m:
+        return
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        with open(os.path.join(root, t["tree"], "AndroidManifest.xml"), errors="replace") as f:
+            head = f.read(4000)
+    except OSError:
+        return
+    tag = re.search(r"<manifest[^>]*>", head)
+    code = re.search(r'\sandroid:versionCode="(\d+)"', tag.group(0)) if tag else None
+    if code and code.group(1) != m.group(1):
+        t["obb_file"] = f"main.{code.group(1)}.{m.group(2)}.obb"
+        t["meta_apk_id"] = t["meta_obb_id"] = ""
+
+
 def resolve(name):
     if name not in TARGETS:
         print(f"!! unknown target {name!r} — one of: {', '.join(sorted(TARGETS))}",
@@ -726,7 +1447,85 @@ def resolve(name):
     t = dict(TARGETS[name])
     t["name"] = name
     t["bundle"] = bundle_for(name)
-    if t["libs"] is None:
+    t["display"] = display_for(t["display"])
+    # The DEFAULTS only: the settings panel, KL_HAND_MATTING and KL_VRR still
+    # decide. Both are what a player wants from a game they just installed:
+    #
+    #  - hands hidden: nearly every guest draws its own hands or controllers
+    #    where the player's are, and the system's cut-out of the real arms on
+    #    top of them is a second pair in the same place.
+    #  - foveation on: it is the cheaper picture wherever it applies (an OpenGL
+    #    guest's passes; see KleptonRendering) and a stored preference with no
+    #    effect elsewhere. A target that must not have it says False.
+    t.setdefault("hand_matting", False)
+    t.setdefault("render_scale", 1.0)
+    t.setdefault("video", False)
+    t.setdefault("autoboot", True)
+    t.setdefault("foveation", True)
+    # A number a target raises to drop the stored foveation choice once, when
+    # its default changes and the players it already has should get the new
+    # one. 0: a stored choice is never touched.
+    t.setdefault("foveation_reset", 0)
+    # Test switches (KleptonTuning.swift, Advanced > Test) this game starts
+    # with: comma-separated variable names, added to the installer's list
+    # (KLEPTON_TEST_ON -> KLTestOn). A player still turns each off in the
+    # start window, and that choice stays. "" for every game not named here.
+    t.setdefault("test_on", "")
+    # Edge smoothing for a Vulkan guest that multisamples by itself with fewer
+    # samples (KL_VK_FORCE_SAMPLES): 0 leaves the game's own count, 4 raises it.
+    # 0 unless a game is named below, and it is named once it has been played
+    # that way: a multisampled target is real memory here, and a game near the
+    # process limit is ended at its first load by the difference (AC Nexus at
+    # 4x was, which is why it is told the device offers two).
+    t.setdefault("vk_msaa", 0)
+    # Foveated rendering for a Vulkan guest (KL_FOVEATION, runtime/gfx/kl_fove.m):
+    # "off", "low", "medium" or "high". Off unless a game is named above, and it
+    # is named once it has been looked at on a headset: the edge of the picture
+    # is drawn visibly coarser, and whether that is worth the frame time is a
+    # judgement per game. Half-Life: Alyx is not on this path (kl_mtl_foveate).
+    t.setdefault("vk_foveation", "off")
+    # Raised when a target's picture defaults (render_scale, vk_foveation) change
+    # and installed copies should take the new ones: a copy drops its stored
+    # resolution and Vulkan foveation level once per number (KLPictureReset).
+    t.setdefault("picture_reset", 0)
+    # The start window's "Frame rate" before a player chooses one: 100 (the
+    # mixed space, every game's start) or 120 (the full space). A choice made
+    # in the start window stays; a mixed-reality game is shown mixed anyway.
+    t.setdefault("max_rate", 100)
+    # The start window's "Frame generation" before a player chooses one: "off",
+    # "ahead" (a picture made where the game has none) or "between" (the middle
+    # between the game's last two, a display frame later). Half-Life: Alyx is
+    # "between": below its 50 most of the time, and its owner found it
+    # "fühlt sich auch besser an als ohne" (2026-10-28). A choice made in the
+    # start window stays; a copy that never chose takes a changed default.
+    t.setdefault("framegen", "between" if name == "alyx" else "off")
+    # How finely the compositor puts the finished picture on the display
+    # (KL_CP_QUALITY): "light" 0.40, "standard" 0.52, "full" 1.0. Light for
+    # everything whose picture is capped below what the display asks for even
+    # then (4633 px across at 0.40, against caps of 4000 and less) — for those
+    # it only makes the compositor's own pass cheaper. The games that render at
+    # the display's size get a smaller picture with it, so they stay at full,
+    # and so does Steam Link, whose picture is as large as the computer sends it.
+    t.setdefault("output", "full" if name in ("beatsaber", "beatsaber140", "doom3quest")
+                                     or name.startswith("steamlink") else "light")
+    # How a plain gamepad's four face buttons are laid over Touch A/B/X/Y where
+    # the default (cross=a, circle=b, square=x, triangle=y) puts an action under
+    # the wrong thumb for this game. "" keeps the default.
+    t.setdefault("gamepad_map", "")
+    t.setdefault("generic", False)
+    # The Steam app id whose store artwork stands in for an icon when the
+    # installer left none (gen_xcodeproj.py, steam_art.py). "" for the rest:
+    # their icon comes out of the APK.
+    t.setdefault("steam_app", "")
+    # Absent means "no data panel for this target" (obb_file) or "no download"
+    # (the ids); a Unity target that wants the panel states obb_file, even "".
+    for k in ("obb_file", "meta_apk_id", "meta_obb_id"):
+        t.setdefault(k, "")
+    t["data_panel"] = "obb_file" in TARGETS[name]
+    _follow_unpacked_build(t)
+    if t["kind"] == "linux":
+        t["libs"] = lx_libs(name)
+    elif t["libs"] is None:
         t["libs"] = libs_for(t["srcdir"])
     return t
 

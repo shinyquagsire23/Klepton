@@ -118,10 +118,30 @@ void kl_reproject_set_srgb_decode(int on) {
             klr_srgb_forced(&forced) ? " (overridden by KL_SRGB_DECODE)" : "");
 }
 
+// Per target, where the measurement above cannot see it. Sniper Elite VR
+// (x2544573735586536, Unity 2019.4 in Gamma color space) writes sRGB code values
+// into an RGBA16F eye texture with GL_FRAMEBUFFER_SRGB never touched, so the
+// sRGB-format test that turns the decode on for Steam Link does not fire, and the
+// composite showed its code values as linear: every scene under a flat white
+// veil, shadows lifted to grey. Confirmed on device with KL_SRGB_DECODE=1, which
+// the env still overrides either way. Catan VR (x3882524545155280, Unity 2018.4,
+// legacy VR, RGBA16F eye texture) is the same case: its menu looked washed out,
+// "brightness is very high" (2026-10-17).
+static int klr_srgb_target_default(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern const char *kl_driver_target_name(void);
+        const char *t = kl_driver_target_name();
+        if (!t) return 0;                      // not known yet: ask again later
+        v = strcmp(t, "x2544573735586536") == 0 || strcmp(t, "x3882524545155280") == 0;
+    }
+    return v;
+}
+
 int kl_reproject_srgb_decode(void) {
     int forced;
     if (klr_srgb_forced(&forced)) return forced;
-    return g_srgb_decode;
+    return g_srgb_decode || klr_srgb_target_default();
 }
 
 // The shader. Compiled from source at runtime by whichever compositor is
@@ -130,6 +150,18 @@ int kl_reproject_srgb_decode(void) {
 // contract, and having them in one file is how they stay one.
 //
 // Drawn as a 4-vertex triangle strip with no vertex buffer.
+// The guest's colour scale and offset for the eye picture — written by the
+// guest's frame thread, read by the compositor's. Component by component, which
+// can show one frame of a fade with a mixed step and nothing worse.
+static volatile float s_eye_scale[4] = { 1, 1, 1, 1 }, s_eye_offset[4];
+void kl_reproject_set_eye_color(const float scale[4], const float offset[4]) {
+    for (int i = 0; i < 4; i++) { s_eye_scale[i] = scale[i]; s_eye_offset[i] = offset[i]; }
+}
+// What the eye picture's alpha means — kl_reproject.h. One word, written by the
+// guest's frame thread and read by the compositor's, like the colour above.
+static volatile int s_eye_alpha;
+void kl_reproject_set_eye_alpha(int mode) { s_eye_alpha = mode; }
+
 static const char kl_msl_reproject[] =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
@@ -148,6 +180,9 @@ static const char kl_msl_reproject[] =
 "    float    chromaMin;\n"
 "    float    chromaMax;\n"
 "    packed_float3 chromaKey;  // packed: matches the C side's three floats\n"
+"    packed_float4 colorFade;  // 1 - the guest's colour scale; kl_reproject.h\n"
+"    packed_float4 colorOffset;\n"
+"    uint     eyeAlpha;   // KL_EYE_ALPHA_* — kl_reproject.h\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -169,6 +204,19 @@ static const char kl_msl_reproject[] =
 "    return float4(srgbDecode != 0u ? kl_srgb_to_linear(c) : c, 1.0);\n"
 "}\n"
 "\n"
+// The same sample with the guest's alpha read as how much of the pixel is the
+// game's (KL_EYE_ALPHA_*), for the one pass that may show the room through the
+// picture. The probes below keep kl_eye_sample and its forced 1.0.
+"static float4 kl_eye_sample_alpha(texture2d_array<float> tex, sampler samp,\n"
+"                                  float2 uv, uint slice, uint srgbDecode,\n"
+"                                  uint eyeAlpha)\n"
+"{\n"
+"    float4 t = tex.sample(samp, uv, slice);\n"
+"    float a = eyeAlpha == 2u ? 1.0 - t.a : t.a;\n"
+"    return float4(srgbDecode != 0u ? kl_srgb_to_linear(t.rgb) : t.rgb,\n"
+"                  saturate(a));\n"
+"}\n"
+"\n"
 // `slice` travels as a flat varying because the fragment stage has no
 // amplification_id: with both eyes drawn in one amplified pass, the uniform the
 // fragment shader would have to read is not the one it can index to.
@@ -186,13 +234,14 @@ static const char kl_msl_reproject[] =
 // the same texture is bound twice and this reduces to exactly what it was.
 "struct VOut { float4 pos [[position]]; float2 uv; uint slice [[flat]];\n"
 "              uint srgb [[flat]]; uint src [[flat]];\n"
+"              float3 colorFade [[flat]]; float3 colorOffset [[flat]];\n"
 // The chroma parameters travel as flat varyings for the same reason `slice` and
 // `srgbDecode` do: with both eyes drawn in one amplified pass the fragment stage
 // has no amplification_id, so it cannot index the per-view uniform array it
 // would otherwise read. Unlike the struct above these are varyings, not buffer
 // members, so a float3 here costs nothing and hides nothing.
 "              uint chromaOn [[flat]]; float3 chromaKey [[flat]];\n"
-"              float2 chromaRange [[flat]]; };\n"
+"              float2 chromaRange [[flat]]; uint eyeAlpha [[flat]]; };\n"
 "\n"
 // One place, so a rung of the probe ladder cannot disagree with the real pass
 // about which eye it is looking at — which is the failure this whole file keeps
@@ -319,6 +368,9 @@ static const char kl_msl_reproject[] =
 "    o.chromaOn = u.chromaOn;\n"
 "    o.chromaKey = float3(u.chromaKey);\n"
 "    o.chromaRange = float2(u.chromaMin, u.chromaMax);\n"
+"    o.eyeAlpha = u.eyeAlpha;\n"
+"    o.colorFade = float4(u.colorFade).rgb;\n"
+"    o.colorOffset = float4(u.colorOffset).rgb;\n"
 "    // The amplification index IS the texture slot: the caller binds the views'\n"
 "    // textures in the order it amplified them. A single-view pass amplifies\n"
 "    // once, lands on 0, and binds one texture.\n"
@@ -353,12 +405,31 @@ static const char kl_msl_reproject[] =
 "    return o;\n"
 "}\n"
 "\n"
-"fragment float4 kl_reproject_f(VOut in [[stage_in]],\n"
-"                               texture2d_array<float> tex [[texture(0)]],\n"
-"                               texture2d_array<float> tex1 [[texture(1)]],\n"
-"                               sampler samp [[sampler(0)]])\n"
+"static float4 kl_reproject_color(VOut in,\n"
+"                               texture2d_array<float> tex,\n"
+"                               texture2d_array<float> tex1,\n"
+"                               sampler samp)\n"
 "{\n"
-"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+// Opaque unless the guest put a passthrough layer under this picture: then its
+// alpha says where the room is, and what leaves here is premultiplied colour
+// with that alpha, which a mixed space blends over the room by itself.
+"    float4 c;\n"
+"    if (in.eyeAlpha == 0u)\n"
+"        c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+"    else if (in.src == 0u)\n"
+"        c = kl_eye_sample_alpha(tex, samp, in.uv, in.slice, in.srgb, in.eyeAlpha);\n"
+"    else\n"
+"        c = kl_eye_sample_alpha(tex1, samp, in.uv, in.slice, in.srgb, in.eyeAlpha);\n"
+// Nothing of the game's at all: write neither colour nor depth, which is the
+// state a mixed space is known to show the room in (a frame with no eye picture
+// has always shown it that way). Partly transparent pixels go on as alpha.
+// What a discarded pixel keeps is the pass's clear colour, so the caller has
+// to clear to transparent while this is in force (KleptonCompositor does).
+"    if (in.eyeAlpha != 0u && c.a < 0.004 && max(c.r, max(c.g, c.b)) < 0.004)\n"
+"        discard_fragment();\n"
+// The guest's own fade (ovrp_SetColorScaleAndOffset), before the matte: a
+// picture faded to black is black, not whatever the key colour makes of it.
+"    c.rgb = c.rgb * (float3(1.0) - in.colorFade) + in.colorOffset;\n"
 // The matte is applied HERE and in no probe below. A rung of the probe ladder
 // exists to answer "is the picture arriving", and one that could also be
 // keyed out would answer that question with the matte's opinion — which is the
@@ -366,6 +437,31 @@ static const char kl_msl_reproject[] =
 "    return kl_chroma_apply(c, in.chromaOn, in.chromaKey, in.chromaRange);\n"
 "}\n"
 "\n"
+"fragment float4 kl_reproject_f(VOut in [[stage_in]], texture2d_array<float> tex [[texture(0)]], texture2d_array<float> tex1 [[texture(1)]], sampler samp [[sampler(0)]]) {\n"
+"    return kl_reproject_color(in,tex,tex1,samp);\n"
+"}\n"
+"struct KLDepthOut { float4 color [[color(0)]]; float depth [[depth(any)]]; };\n"
+"fragment KLDepthOut kl_reproject_depth_f(VOut in [[stage_in]],\n"
+" texture2d_array<float> tex [[texture(0)]], texture2d_array<float> tex1 [[texture(1)]],\n"
+" depth2d_array<float> dep0 [[texture(2)]], depth2d_array<float> dep1 [[texture(3)]],\n"
+" sampler samp [[sampler(0)]], constant KLReproj *ua [[buffer(0)]], constant float4 *dp [[buffer(2)]]) {\n"
+"    KLDepthOut out; out.color=kl_reproject_color(in,tex,tex1,samp); out.depth=in.pos.z;\n"
+"    constant KLReproj &u=ua[in.src];\n"
+"    float4 r=dp[in.src*2]; uint slice=uint(dp[in.src*2+1].x);\n"
+"    constexpr sampler ds(coord::normalized, address::clamp_to_edge, filter::nearest);\n"
+"    float raw=in.src==0 ? dep0.sample(ds,in.uv,slice) : dep1.sample(ds,in.uv,slice);\n"
+"    float d=clamp((raw-r.z)/(r.w-r.z),0.0,1.0);\n"
+"    float z;\n"
+"    if(isinf(r.y)) z=r.x/max(1.0-d,1e-8);\n"
+"    else if(isinf(r.x)) z=r.y/max(d,1e-8);\n"
+"    else z=(r.x*r.y)/(r.y-d*(r.y-r.x));\n"
+"    float2 c=in.uv; if(u.flipY!=0u) c.y=1.0-c.y;\n"
+"    float4 p=float4(mix(-u.tangents.x,u.tangents.y,c.x)*z,\n"
+"                   mix(-u.tangents.w,u.tangents.z,c.y)*z,-z,1);\n"
+"    float4 clip=u.projection*u.modelView*p;\n"
+"    if(isfinite(z) && z>0 && clip.w>0) out.depth=clamp(clip.z/clip.w,0.0,1.0);\n"
+"    return out;\n"
+"}\n"
 // The probe ladder (KL_CP_PROBE). Same library, same vertex function, so each
 // rung differs from the real pass in exactly one respect and nothing else moves.
 // A picture that is black tells you nothing about WHICH link is dark; these do.
@@ -399,6 +495,9 @@ static const char kl_msl_reproject[] =
 "    o.chromaOn = ua[amp].chromaOn;\n"
 "    o.chromaKey = float3(ua[amp].chromaKey);\n"
 "    o.chromaRange = float2(ua[amp].chromaMin, ua[amp].chromaMax);\n"
+"    o.eyeAlpha = 0u;\n"
+"    o.colorFade = float3(0.0);\n"
+"    o.colorOffset = float3(0.0);\n"
 "    o.src = uint(amp);\n"
 "    o.pos = ua[amp].visible == 0u ? kl_offscreen\n"
 "                                  : float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
@@ -478,6 +577,11 @@ static const char kl_msl_overlay[] =
 "    uint     srgb_decode;\n"
 "    uint     visible;\n"
 "    uint     opaque;\n"
+"    uint     cyl_segments;\n"
+"    float    cyl_radius;\n"
+"    float    cyl_half_angle;\n"
+"    float4   color_scale;\n"
+"    float4   color_offset;\n"
 "};\n"
 "vertex VOut kl_ov_v(uint vid [[vertex_id]],\n"
 "                    constant KLOv *us [[buffer(0)]],\n"
@@ -489,6 +593,16 @@ static const char kl_msl_overlay[] =
 // ovrpLayerSubmit's Pose states its orientation in.
 "    float2 c = float2((vid & 1) ? 1.0 : -1.0, (vid & 2) ? -1.0 : 1.0);\n"
 "    float4 p = float4(c * u.half_size, 0.0, 1.0);\n"
+// A cylinder: the same strip bent round the pose — pairs of vertices (top,
+// bottom) stepping along the arc, on the inside of a surface `cyl_radius` away
+// in the direction the pose faces. c keeps its meaning (-1..1 across, +1 top)
+// so the texture coordinates below are the quad's.
+"    if (u.cyl_segments != 0u) {\n"
+"        float fx = float(vid >> 1) / float(u.cyl_segments);\n"
+"        c = float2(fx * 2.0 - 1.0, (vid & 1u) ? -1.0 : 1.0);\n"
+"        float th = c.x * u.cyl_half_angle;\n"
+"        p = float4(u.cyl_radius * sin(th), c.y * u.half_size.y, -u.cyl_radius * cos(th), 1.0);\n"
+"    }\n"
 "    o.pos = u.projection * (u.model_view * p);\n"
 // Bottom-left origin as the base, and `flip_y` meaning "the picture's origin is
 // the TOP left" — the same convention as the reprojection pass above and as
@@ -513,6 +627,7 @@ static const char kl_msl_overlay[] =
 "        c.rgb = select(hi, lo, c.rgb <= float3(0.04045));\n"
 "    }\n"
 "    if (u.opaque != 0u) c.a = 1.0;\n"
+"    c = c * u.color_scale + u.color_offset;\n"
 "    return c;\n"
 "}\n";
 
@@ -599,6 +714,19 @@ void kl_reproject_grid_identity(simd_float2 *out) {
     out[4] = simd_make_float2(1.0f, 1.0f);
 }
 
+// Red Matter 2 (Unreal, dynamic resolution) drew into the top 2244 of 3944
+// rows and showed a strip of its picture at the top of the view over black
+// until this was applied (owner, headset, 2026-10-13). Applied once, by the
+// compositor: runtime/xr/kl_ovrp.c used to mirror the same rect again for
+// store-built Unreal titles on Vulkan (KL_OVRP_VIEWPORT_TOP), and the two
+// mirrors cancelled — Alien: Rogue Incursion showed the lower part of its
+// picture at the top of the view and unwritten rows under it.
+void kl_reproject_viewport_for_pass(float vp[4], float tex_h, int top_left) {
+    if (!vp || !top_left || !(vp[2] > 0) || !(vp[3] > 0) || !(tex_h > 0)) return;
+    float y = tex_h - (vp[1] + vp[3]);
+    vp[1] = y > 0 ? y : 0;
+}
+
 void kl_reproject_grid_build(simd_float2 *out, uint32_t nx, uint32_t ny,
                              const float *vp,
                              float screen_w, float screen_h,
@@ -619,8 +747,8 @@ void kl_reproject_grid_build_eye(simd_float2 *out, uint32_t eye,
     // the correct picture for an unwarped, fully-drawn texture and merely the
     // wrong one otherwise — the strictly better failure of the two.
     if (!out) return;
-    if (nx == 0 || ny == 0 || nx > KL_REPROJECT_GRID_MAX ||
-        ny > KL_REPROJECT_GRID_MAX || !(tex_w > 0) || !(tex_h > 0) ||
+    if (nx == 0 || ny == 0 || nx > KL_REPROJECT_GRID_CELLS_MAX ||
+        ny > KL_REPROJECT_GRID_CELLS_MAX || !(tex_w > 0) || !(tex_h > 0) ||
         !(screen_w > 0) || !(screen_h > 0)) {
         // The identity, in this EYE's block of a 1x1 grid: the shader derives
         // every block's base from the header it reads, so collapsing the header
@@ -641,14 +769,19 @@ void kl_reproject_grid_build_eye(simd_float2 *out, uint32_t eye,
     float vx = 0, vy = 0, vw = screen_w, vh = screen_h;
     if (vp && vp[2] > 0 && vp[3] > 0) {
         vx = vp[0]; vy = vp[1]; vw = vp[2]; vh = vp[3];
-        // Clamped rather than trusted: a rect reaching past the screen would
-        // send this through the rate map at coordinates it was not built for,
-        // and Metal's answer there is not defined by anything we can check.
-        if (vx < 0) vx = 0;
-        if (vy < 0) vy = 0;
-        if (vx + vw > screen_w) vw = screen_w - vx;
-        if (vy + vh > screen_h) vh = screen_h - vy;
-        if (!(vw > 0) || !(vh > 0)) { vx = vy = 0; vw = screen_w; vh = screen_h; }
+        // A rect reaching past the screen is still the span the guest's
+        // projection covers, so the grid keeps it; only each sample point is
+        // held inside the screen below, because the rate map is not defined
+        // past its edge. Clamping the RECT instead squeezed that span onto the
+        // part inside: Angry Birds VR submits eye0 0..4000 and eye1 -64..3936
+        // of a 3936-wide texture (its OculusXR places the second eye at
+        // texture width minus viewport width), and both became 0..3936 — each
+        // eye stretched by 1.6% and the right one moved 64 px against the
+        // left, a wrong depth that swam with every head movement (2026-10-18).
+        // A rect with no overlap at all is nonsense and means the whole screen.
+        if (!(vx < screen_w) || !(vy < screen_h) || !(vx + vw > 0) || !(vy + vh > 0)) {
+            vx = vy = 0; vw = screen_w; vh = screen_h;
+        }
     }
     out[0] = simd_make_float2((float)nx, (float)ny);
     // Where this eye's block starts — the same arithmetic kl_reproject_build
@@ -669,6 +802,10 @@ void kl_reproject_grid_build_eye(simd_float2 *out, uint32_t eye,
             // the viewport existed, so the foveation measurements stand.
             float sx = vx + vw * (float)x / (float)nx;
             float sy = vy + vh * (float)y / (float)ny;
+            if (sx < 0) sx = 0;
+            if (sy < 0) sy = 0;
+            if (sx > screen_w) sx = screen_w;
+            if (sy > screen_h) sy = screen_h;
             float px = sx, py = sy;
             // No map is the identity, not a reason to give up: an unfoveated
             // eye with a shrunken viewport still has to be corrected, and it is
@@ -769,6 +906,11 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     // exactly this call and no other.
     u.chroma_on = (uint32_t)kl_reproject_chroma(u.chroma_key, &u.chroma_min,
                                                 &u.chroma_max);
+    for (int i = 0; i < 4; i++) {
+        u.color_fade[i]   = 1.0f - s_eye_scale[i];
+        u.color_offset[i] = s_eye_offset[i];
+    }
+    u.eye_alpha = (uint32_t)s_eye_alpha;
 
     if (rendered && rendered->serial) {
         const float *t = rendered->tangents[(unsigned)eye > 1 ? 0 : eye];
@@ -881,15 +1023,39 @@ kl_reproject_uniforms kl_proj_layer_build(const kl_ovrp_proj_layer *pl, int eye,
     r.qz = pl ? pl->pose[5] : 0.0f;
     r.qw = pl ? pl->pose[6] : 1.0f;
     if (pl) memcpy(r.tangents, pl->tangents, sizeof r.tangents);
-    // grid_per_eye = 0: this path binds the identity grid. A layer's picture is
-    // the guest's own swapchain image copied whole, so there is no rate map to
-    // undo and no render viewport smaller than the texture.
+    // grid_per_eye = 1: this path binds kl_proj_layer_grid's two blocks. There
+    // is no rate map to undo — a layer's picture is the guest's own swapchain
+    // image — but the picture may be only PART of that image (the layer's
+    // `rect`), and the two eyes' parts need not be the same.
     kl_reproject_uniforms u =
         kl_reproject_build(pl ? &r : NULL, eye, origin_from_device,
                            device_from_view, projection, slice,
-                           pl ? pl->origin_top_left : 0, 0);
+                           pl ? pl->origin_top_left : 0, 1);
     if (!pl || pl->slot[eye] < 0) u.visible = 0;
     return u;
+}
+
+void kl_proj_layer_grid(const kl_ovrp_proj_layer *pl, simd_float2 *out) {
+    if (!out) return;
+    out[0] = simd_make_float2(1.0f, 1.0f);      // 1 x 1 cells, one block per eye
+    for (int e = 0; e < 2; e++) {
+        float x0 = 0.0f, y0 = 0.0f, x1 = 1.0f, y1 = 1.0f;
+        if (pl && pl->rect[e][2] > pl->rect[e][0] && pl->rect[e][3] > pl->rect[e][1]) {
+            x0 = pl->rect[e][0]; y0 = pl->rect[e][1];
+            x1 = pl->rect[e][2]; y1 = pl->rect[e][3];
+        }
+        // The grid is in the reprojection pass's own space, where v = 0 is the
+        // BOTTOM of the picture, and the shader flips v afterwards for a picture
+        // whose row 0 is its top. The rect is measured from row 0 either way, so
+        // for such a picture it is mirrored here and comes out right there.
+        float v0 = y0, v1 = y1;
+        if (pl && pl->origin_top_left) { v0 = 1.0f - y1; v1 = 1.0f - y0; }
+        simd_float2 *b = out + 1 + 4 * e;
+        b[0] = simd_make_float2(x0, v0);
+        b[1] = simd_make_float2(x1, v0);
+        b[2] = simd_make_float2(x0, v1);
+        b[3] = simd_make_float2(x1, v1);
+    }
 }
 
 kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
@@ -903,15 +1069,23 @@ kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
     u.uv_rect    = simd_make_float4(0, 0, 1, 1);
     u.slice      = 0;
     u.visible    = 0;
+    u.color_scale = simd_make_float4(1, 1, 1, 1);
     if (!ov) return u;
+    if (ov->color_override) {
+        memcpy(&u.color_scale, ov->color_scale, sizeof ov->color_scale);
+        memcpy(&u.color_offset, ov->color_offset, sizeof ov->color_offset);
+    }
 
-    // Only the Quad is implemented, and an unimplemented shape is REFUSED
-    // rather than drawn as a quad: a cylinder or an equirect placed as a flat
+    // The Quad and the Cylinder are implemented, and any other shape is
+    // REFUSED rather than drawn as a quad: an equirect placed as a flat
     // rectangle is a wrong picture with no error surface, where an absent one
     // is the failure that is already happening and is at least honest. The
     // caller names it (see kl_reproject.h).
-    if (ov->shape != 0) return u;
-    if (!(ov->size[0] > 0.0f) || !(ov->size[1] > 0.0f)) return u;
+    int cylinder = ov->shape == 1;
+    if (ov->shape != 0 && !cylinder) return u;
+    if (cylinder) {
+        if (!(ov->cyl[0] > 0.0f) || !(ov->cyl[1] > 0.0f) || !(ov->cyl[2] > 0.0f)) return u;
+    } else if (!(ov->size[0] > 0.0f) || !(ov->size[1] > 0.0f)) return u;
 
     // Which eyes were named. LEFT(1) and RIGHT(2) are how a guest shows
     // different pixels to each eye — two quads, one per eye — so drawing one of
@@ -920,6 +1094,19 @@ kl_overlay_uniforms kl_overlay_build(const kl_ovrp_overlay *ov, int eye,
     if (ov->eye_visibility == 2 && eye != 1) return u;
 
     u.half_size = simd_make_float2(ov->size[0] * 0.5f, ov->size[1] * 0.5f);
+    if (cylinder) {
+        // ArcWidth is a length along the surface, so the angle it spans is
+        // that over the radius — capped at the whole turn. A segment every
+        // four degrees or so: at the two metres such a menu sits at, the
+        // chord's sag is well under a millimetre.
+        float angle = ov->cyl[0] / ov->cyl[2];
+        if (angle > 6.2831853f) angle = 6.2831853f;
+        u.half_size      = simd_make_float2(0.0f, ov->cyl[1] * 0.5f);
+        u.cyl_radius     = ov->cyl[2];
+        u.cyl_half_angle = angle * 0.5f;
+        u.cyl_segments   = (uint32_t)(angle / 0.07f) + 2u;
+        if (u.cyl_segments > 96u) u.cyl_segments = 96u;
+    }
 
     // Which part of the layer texture this eye reads. The guest states it in
     // PIXELS of its own texture, so it is carried as a fraction for the reason

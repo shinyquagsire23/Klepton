@@ -62,6 +62,14 @@ a new app with an empty one. That is not silent: the staging stamp is keyed on
 the bundle id, so the first build after a change re-stages by itself. It is
 still a 2.2 GB upload, and the old app is still installed until you delete it.
 
+The display name (CFBundleDisplayName) follows the same pattern:
+`KLEPTON_DISPLAY_OVERRIDE` replaces the row's `display` for any target, and
+`KLEPTON_DISPLAY_SUFFIX` is appended afterwards (`" (Test)"` gives
+`Beat Saber (Test)`). Combined with a new `KLEPTON_BUNDLE_ID`, that gives a
+parallel test install that can be told apart from the real one. Both are
+resolved in `targets.display_for`, so `KLT_DISPLAY` and the generated
+Info.plist agree. If they are unset or empty, the name does not change.
+
 `KLEPTON_TARGET` selects it at BUILD time; the chosen name is compiled into the
 app as `KL_TARGET_DEFAULT`, because an app launched by hand from the Home View
 has no environment at all. `KL_TARGET` overrides that at run time — but the two

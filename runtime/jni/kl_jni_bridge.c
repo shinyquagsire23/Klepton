@@ -174,26 +174,39 @@ static klj_val klj_ReflectionHelper_getConstructorID(void *env, void *self,
 // pointer, and ONE interface class rather than an array — but the object handed
 // back has to be the same kind, because klj_proxy_invoke is what dispatches
 // every callback through it and it knows exactly one representation.
-static klj_val klj_ReflectionHelper_newProxyInstance(void *env, void *clazz,
-                                                     const klj_val *a, int n) {
-    (void)env; (void)clazz;
+static klj_val klj_new_reflection_proxy(int64_t native_ptr, void *iface) {
     klj_proxy *p = calloc(1, sizeof *p);
-    p->native_ptr = n > 1 ? (int64_t)a[1].j : 0;
+    p->native_ptr = native_ptr;
+    p->unity_rh = 1;
     // Wrapped in a one-element array so the two doors' proxies are identical
     // down to the field, rather than alike: klj_proxy_invoke and the report
     // both read `classes` as an object array.
     void *ifaces = klj_new_array('L', "java/lang/Class", 1);
-    if (n > 2) ((void **)klj_arr(ifaces)->data)[0] = a[2].l;
+    ((void **)klj_arr(ifaces)->data)[0] = iface;
     klj_as_object(ifaces)->pinned = 1;
     p->classes = ifaces;
     KLJ_LOG("ReflectionHelper.newProxyInstance: implements %s (native 0x%llx)",
-            n > 2 ? klj_class_name(a[2].l) : "(none)",
+            iface ? klj_class_name(iface) : "(none)",
             (unsigned long long)p->native_ptr);
 
     void *obj = kl_jni_new_object(KLJ_CLASS_PROXY);
     klj_as_object(obj)->data = p;
     klj_as_object(obj)->pinned = 1;   // guest-held long-term via native_ptr
     return (klj_val){.l = obj};
+}
+
+static klj_val klj_ReflectionHelper_newProxyInstance(void *env, void *clazz,
+                                                     const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    return klj_new_reflection_proxy(n > 1 ? (int64_t)a[1].j : 0, n > 2 ? a[2].l : NULL);
+}
+
+// ...and the older shape, before the UnityPlayer argument was added: the same
+// pointer and class, one slot earlier. Iron Rebellion (Unity 2021.3.6f1).
+static klj_val klj_ReflectionHelper_newProxyInstance_old(void *env, void *clazz,
+                                                         const klj_val *a, int n) {
+    (void)env; (void)clazz;
+    return klj_new_reflection_proxy(n > 0 ? (int64_t)a[0].j : 0, n > 1 ? a[1].l : NULL);
 }
 
 static klj_val klj_ReflectionHelper_getFieldSignature(void *env, void *self,
@@ -268,6 +281,29 @@ static klj_val klj_Method_getDeclaringClass(void *env, void *self, const klj_val
                      klj_new_method(iface, name, sig), args);
     klj_PopLocalFrame(NULL, NULL);
     return r;
+}
+
+void *klj_proxy_invoke_named_args(void *proxy, const char *iface,
+                                  const char *name, const char *sig, void *args) {
+    klj_object *o = klj_as_object(proxy);
+    klj_proxy *p = (o && strcmp(o->cls, KLJ_CLASS_PROXY) == 0) ? o->data : NULL;
+    void *fn = p && p->unity_rh
+        ? kl_jni_native("com/unity3d/player/ReflectionHelper", "nativeProxyInvoke", NULL) : NULL;
+    if (!fn) return klj_proxy_invoke(proxy, iface, name, sig, args);
+    if (p->disabled) return NULL;
+    // static native Object nativeProxyInvoke(long ptr, String methodName, Object[] args)
+    void *(*invoke)(void *, void *, int64_t, void *, void *) = fn;
+    klj_PushLocalFrame(NULL, 0);
+    void *r = invoke(kl_jni_env(), klj_class_object("com/unity3d/player/ReflectionHelper"),
+                     p->native_ptr, kl_jni_new_string(name),
+                     args ? args : klj_new_array('L', "java/lang/Object", 0));
+    klj_PopLocalFrame(NULL, NULL);
+    return r;
+}
+
+void *klj_proxy_invoke_named(void *proxy, const char *iface,
+                             const char *name, const char *sig) {
+    return klj_proxy_invoke_named_args(proxy, iface, name, sig, NULL);
 }
 
 // Run everything the guest posted to the main looper. On Android this is what
@@ -456,12 +492,36 @@ static klj_val klj_View_setSysUiListener(void *env, void *self, const klj_val *a
     return (klj_val){.j = 0};
 }
 
+// ReflectionHelper.setNativeExceptionOnProxy(proxy, nativePtr, isNative) —
+// Unity's own bookkeeping on a proxy it just built, called on the Java side when
+// an exception has to be carried across the bridge. Its whole body assigns the
+// two values into the proxy's fields; nothing reads them except Unity's own
+// exception path, which runs on the guest side of the bridge and gets the values
+// from the guest.
+//
+// The id is fetched eagerly at UnityPlayer init in every boot of this title, and
+// never called yet — a latent abort that costs a launch the first time an
+// exception crosses a proxy. Bound to record: there is no Java-side proxy object
+// with fields to write, so recording is the whole of the behaviour.
+static klj_val klj_ReflectionHelper_setNativeExceptionOnProxy(void *env, void *self,
+                                                              const klj_val *a, int n) {
+    (void)env; (void)self;
+    KLJ_LOG("ReflectionHelper.setNativeExceptionOnProxy(proxy=%p, native=0x%llx, %s)"
+            " — recorded; the proxy's state lives on the guest side",
+            n > 0 ? a[0].l : NULL,
+            (unsigned long long)(n > 1 ? a[1].j : 0),
+            (n > 2 && a[2].j) ? "native" : "managed");
+    return (klj_val){.j = 0};
+}
+
 const klj_binding klj_bind_bridge[] = {
+    {"com/unity3d/player/ReflectionHelper", "setNativeExceptionOnProxy", "(Ljava/lang/Object;JZ)V", klj_ReflectionHelper_setNativeExceptionOnProxy},
 
     {"com/unity3d/player/ReflectionHelper", "getFieldID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Field;", klj_ReflectionHelper_getFieldID},
     {"com/unity3d/player/ReflectionHelper", "getMethodID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Method;", klj_ReflectionHelper_getMethodID},
     {"com/unity3d/player/ReflectionHelper", "getConstructorID", "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Constructor;", klj_ReflectionHelper_getConstructorID},
     {"com/unity3d/player/ReflectionHelper", "newProxyInstance", "(Lcom/unity3d/player/UnityPlayer;JLjava/lang/Class;)Ljava/lang/Object;", klj_ReflectionHelper_newProxyInstance},
+    {"com/unity3d/player/ReflectionHelper", "newProxyInstance", "(JLjava/lang/Class;)Ljava/lang/Object;", klj_ReflectionHelper_newProxyInstance_old},
     {"com/unity3d/player/ReflectionHelper", "getFieldSignature", "(Ljava/lang/reflect/Field;)Ljava/lang/String;", klj_ReflectionHelper_getFieldSignature},
     {"java/lang/reflect/Field", "getDeclaringClass", "()Ljava/lang/Class;", klj_Field_getDeclaringClass},
     {"java/lang/reflect/Method", "getName", "()Ljava/lang/String;", klj_Method_getName},

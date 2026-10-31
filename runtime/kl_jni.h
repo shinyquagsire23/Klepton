@@ -30,6 +30,7 @@ typedef struct {
 
 // Both handles are "pointer to a pointer to a function table" — the guest does
 // `ldr x8,[x0]; ldr x8,[x8,#slot*8]; blr x8` and nothing else.
+void *kl_jni_surface_window(void *surface); // NULL unless a decoded-video Surface
 void *kl_jni_vm(void);        // JavaVM*  — hand this to JNI_OnLoad
 void *kl_jni_env(void);       // JNIEnv*  — for the calling thread
 
@@ -49,6 +50,8 @@ const char *kl_jni_native_sig(const char *cls, const char *name);
 // which is where a title runs Resources.UnloadUnusedAssets(). The declaring
 // class comes from the natives table rather than being assumed. Returns 0 if
 // the guest never registered it. Driven from kl_mem_pressure_* (klepton.h).
+// For one Unity 6.2 title, which has no nativeLowMemory, it is the player's
+// nativeMemoryUsageChanged(Critical) instead (KL_LOWMEM_USAGE_CHANGED).
 int kl_jni_low_memory(void);
 
 // Construct the jobjects the host passes *into* guest natives. Every jobject the
@@ -59,6 +62,9 @@ void *kl_jni_new_object(const char *class_name);
 // Pin a host-made object against local-frame retirement (the C NewGlobalRef).
 // Use for objects the host caches and hands back more than once.
 void kl_jni_pin_object(void *obj);
+// Retire, by age, strings a guest makes outside any local frame and never
+// deletes. See klj_loose_note in kl_jni.c.
+void kl_jni_reclaim_frameless_strings(int on);
 
 // The rest of UnityPlayer's constructor, for a driver that has just run initJni.
 //
@@ -86,6 +92,17 @@ void *kl_jni_class(const char *name);
 // defaults to UnityPlayerActivity; the SDL3 target overrides it.
 void *kl_jni_activity(void);
 void kl_jni_set_activity_class(const char *cls);
+
+// The one UnityPlayer instance, for exactly the same reason the activity is a
+// singleton. kl_driver.c used to make a fresh `new UnityPlayer` per
+// lifecycle call — initJni got one, the nativeRecreateGfxState/Resume/Render
+// sequence got another — which real Android never does:
+// UnityPlayerActivity.onCreate constructs ONE and keeps it in mUnityPlayer
+// (UnityPlayerActivity.smali:121). A guest that reaches the player through
+// the activity's field and compares it with the `thiz` it was called on gets
+// two different objects, and a guest that reads that field at all needs it to
+// point at something. Both kl_driver.c call sites take their `thiz` from here.
+void *kl_jni_unity_player(void);
 void *kl_jni_new_string(const char *utf8);
 // A java/lang/String[] — what SDL3's nativeRunMain takes as argv, and what the
 // real SteamLink activity fills from the launching intent's "sArgs" extra.
@@ -128,6 +145,9 @@ void kl_jni_set_vrlink_running(int on);
 // installed every one of those thunks reports that it could not call back,
 // which is a stated refusal rather than a silent no-op.
 void kl_jni_set_guest_native_resolver(void *(*resolve)(const char *symbol));
+// The guest's exported native by symbol name, through that resolver; NULL when
+// none is installed or the guest has no such export.
+void *kl_jni_guest_native(const char *symbol);
 
 // Root for Context.getAssets()/AssetManager.open(). Defaults to "beatsaber/assets".
 // With no AAssetManager_* import, this JNI path is how assets reach Unity.
@@ -238,6 +258,9 @@ unsigned kl_jni_pending_ui_tasks(void);
 // this is Looper.loop() on the UI thread; there is no looper thread here, so the
 // host pumps it. Returns how many ran.
 unsigned kl_jni_drain_ui_tasks(void);
+// Photon Voice's AudioInAEC (kl_jni_services.c): hands the microphone's frames
+// to the guest's DataCallback. Called once a frame from the frame pump.
+void kl_jni_audioinaec_pump(void);
 
 // --- the on-screen keyboard, frontend side ----------------------------------
 //
@@ -274,6 +297,16 @@ void kl_jni_soft_input_close(int canceled);
 // pass. See the implementation's comment for why a runtime failure here is
 // invisible from everywhere else.
 int  kl_jni_soft_input_selftest(FILE *out);
+// The object model: host-cached jobjects survive a local frame, and every
+// erased spelling of a call answers with the same tagged object. tests/t_jniobj.c.
+int  kl_jni_object_lifetime_selftest(FILE *out);
+
+// The same gate for UE's GameActivity keyboard, which is what answers the four
+// calls above when the guest is an Unreal one — `make uevk`, in `make check`.
+// Same terms: no guest, no window, no headset. It publishes its own natives
+// through the real guest-native resolver seam and drives the real
+// AndroidThunkJava_* bindings. Returns non-zero on pass.
+int  kl_jni_ue_keyboard_selftest(FILE *out);
 
 // Fire the pending Choreographer frame callback, if the guest posted one. There is
 // no vsync source here, so the host's frame pump defines what a frame is. One-shot,

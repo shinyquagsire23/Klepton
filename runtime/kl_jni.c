@@ -24,6 +24,7 @@
 #include <CommonCrypto/CommonCryptoError.h>    // kCCSuccess
 #include <CommonCrypto/CommonCryptor.h>        // ...and its AES-CBC cryptor
 #include "klepton.h"
+#include "kl_key.h"
 #include "kl_jni.h"
 #include "kl_fault.h"
 #include "guest/kl_driver.h"   // the target name, for per-target JNI defaults
@@ -41,6 +42,24 @@
 
 static int g_permissive = 0;
 void kl_jni_set_permissive(int on) { g_permissive = on; }
+
+// KL_JNI_SOFT_UNKNOWN: a Java method or field with no answer here answers zero
+// (no-op for void, 0 / false, a null object) and is named in the log, instead
+// of ending the run. Only the method and field lookups: unlike KL_PERMISSIVE it
+// leaves EGL and GL alone, where a zero is a wrong answer rather than an absent
+// feature. Most of these calls are SDKs the game can live without (analytics,
+// crash reporting, voice chat, a vendor's own helper class) — about twenty of
+// the first 52 fixes users sent in were exactly that. Default on under the
+// profile for untested games (kl_untested_profile), off for every other title:
+// for a title being brought up, the stop by name is the work item.
+static int klj_soft_unknown(void) {
+    static int v = -1;
+    if (v < 0) {
+        extern int kl_untested_profile(void);
+        v = kl_env_on("KL_JNI_SOFT_UNKNOWN", kl_untested_profile());
+    }
+    return v;
+}
 
 // Table construction is deferred to first use; the host may build objects before
 // it ever touches the VM handle, so the public constructors force it too.
@@ -122,6 +141,13 @@ static unsigned g_retired[KLJ_MAX_OBJECTS];
 static unsigned g_retired_head, g_retired_tail;   // ring; head = oldest
 static unsigned g_retired_n;
 static uint64_t g_stat_alloc, g_stat_delete, g_stat_pop_freed, g_stat_freed;
+// Frameless strings retired by age — see klj_loose_note.
+#define KLJ_LOOSE_MAX 16384
+static unsigned g_loose_slot[KLJ_LOOSE_MAX];
+static void    *g_loose_data[KLJ_LOOSE_MAX];
+static unsigned g_loose_head, g_loose_n;
+static int      g_loose_on;
+static uint64_t g_stat_loose;
 
 typedef struct klj_frame {
     struct klj_frame *parent;
@@ -211,6 +237,39 @@ static void klj_forget_writes(void *obj);
     return obj;
 }
 
+// "The HOST is keeping this one in a static, and will hand the same pointer
+// back on every later call." That is a lifetime claim, and it has to be made
+// explicit or the object dies under the cache.
+//
+// A binding that caches its answer is doing the right thing — object identity
+// is load-bearing for anything Unity keys a slot on (see the InputDevice
+// comments) — but the object was still allocated inside whatever local frame
+// the FIRST caller happened to have open. PopLocalFrame retires everything that
+// frame recorded, `pinned` excepted; the static keeps pointing at the retired
+// slot, and the NEXT caller is handed a pointer whose magic is zero. It is not
+// a use-after-free — the slot is only quarantined, so the memory still reads
+// fine — it is a jobject the guest can hold and we can no longer recognise, and
+// it surfaces far away as "GetObjectClass on an untagged pointer".
+//
+// That is exactly how Paint the Town Red VR's boot died.
+// `InputDevice.getDeviceIds()` cached its `int[]` in a static; libunity called
+// it three times inside frames that were then popped; Rewired called it a
+// fourth time from C#, got the dead pointer back, and asked GetObjectClass for
+// its class. The exit census is the proof: `android/view/InputDevice x2` was
+// live — getDevice() pins — and there was no live `[I` at all.
+//
+// So: every host-side static that holds a jobject goes through here. It is the
+// same fact klj_singleton already asserts for the objects it makes; this is the
+// form for an object the caller built itself — an array, an object with a
+// payload, or an element stored inside a cached array (which the array does not
+// own: klj_new_array's destructor frees the element BUFFER, and the jobjects in
+// it are retired by their own frames unless they are pinned too).
+ void *klj_host_cache(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    if (o) o->pinned++;
+    return obj;
+}
+
 static klj_native g_natives[KLJ_MAX_NATIVES];
 static unsigned   g_nnatives;
 
@@ -219,10 +278,39 @@ static unsigned   g_nwanted;
 
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// Unreal Engine 5 renamed Epic's Java package: `com.epicgames.ue4.*` became
+// `com.epicgames.unreal.*` — GameActivity, MediaPlayer14 and its three track-
+// info inner classes, the VolumeReceiver/BatteryReceiver/HeadsetReceiver trio,
+// MessageBox01. It is a RENAME and not a new API: the method names, signatures
+// and semantics the four kl_jni_*.c tables transcribe are identical either side
+// of it (verified against Pinball FX VR's UE5.3.2 GameActivity.smali against
+// Deadpool VR's 4.27 one).
+//
+// So it is folded HERE, at the one funnel every class name enters the surface
+// through — klj_FindClass, kl_jni_class and kl_jni_new_object all call this —
+// rather than by duplicating some sixty table rows under a second spelling. A
+// duplicated table is a table that goes stale in one half, and the half that
+// goes stale is the one no target exercises yet.
+//
+// The fold is one-directional and narrow on purpose: only this exact package
+// prefix, only onto ue4's. Anything else keeps the name it was asked for, and
+// the interned name is the FOLDED one, so klj_class_name, the g_supers walk and
+// every klj_object's `cls` pointer all agree on one spelling downstream.
+#define KLJ_UE5_PKG "com/epicgames/unreal/"
+#define KLJ_UE4_PKG "com/epicgames/ue4/"
+
+static const char *klj_fold_class_name(const char *name, char *buf, size_t n) {
+    if (strncmp(name, KLJ_UE5_PKG, sizeof KLJ_UE5_PKG - 1) != 0) return name;
+    snprintf(buf, n, KLJ_UE4_PKG "%s", name + sizeof KLJ_UE5_PKG - 1);
+    return buf;
+}
+
 // Interning gives every class name one stable address, so a klj_object can hold
 // a bare `const char *cls` that stays valid forever, and the "have we seen this
 // before" log dedupe falls out of the same lookup.
- klj_class *klj_intern_class_locked(const char *name) {
+ klj_class *klj_intern_class_locked(const char *asked) {
+    char fold[256];
+    const char *name = klj_fold_class_name(asked, fold, sizeof fold);
     for (unsigned i = 0; i < g_nclasses; i++)
         if (strcmp(g_classes[i].name, name) == 0) return &g_classes[i];
     if (g_nclasses == KLJ_MAX_CLASSES) { KLJ_LOG("class table full at %s", name); kl_fatal_prepare(); abort(); }
@@ -338,13 +426,41 @@ const char *kl_jni_native_sig(const char *cls, const char *name) {
 // The class is looked up rather than assumed: nativeLowMemory is registered
 // through RegisterNatives like the other 45, and which class declares it is the
 // natives table's answer to give. Returns 1 if the guest was told.
+//
+// Unity 6.2 registers no nativeLowMemory. Its player has
+// nativeMemoryUsageChanged(int) instead, an INSTANCE native taking
+// ApplicationMemoryUsage, where Critical (4) raises both
+// Application.memoryUsageChanged and the old Application.lowMemory — as the
+// sender of fix 38 read it out of BattleGroupVR2 0.251 (2026-10-13); nobody
+// here has that build. It is called only where nativeLowMemory is not
+// registered, with the one player the lifecycle runs on, and only once that
+// player exists: this arrives on the OS's memory-pressure thread too.
+//
+// KL_LOWMEM_USAGE_CHANGED, default on for that title alone. A Unity 6.2 game
+// that runs today is told nothing under pressure and would start to be; what
+// each does with it has not been looked at.
+static int klj_lowmem_usage_changed(void) {
+    const char *t = kl_driver_target_name();
+    return kl_env_on("KL_LOWMEM_USAGE_CHANGED", t && strcmp(t, "x9386827918099701") == 0);
+}
 int kl_jni_low_memory(void) {
-    const klj_native *n = NULL;
+    const klj_native *n = NULL, *usage = NULL;
     pthread_mutex_lock(&g_lock);
-    for (unsigned i = 0; i < g_nnatives; i++)
+    for (unsigned i = 0; i < g_nnatives; i++) {
         if (strcmp(g_natives[i].name, "nativeLowMemory") == 0) { n = &g_natives[i]; break; }
+        if (!usage && strcmp(g_natives[i].name, "nativeMemoryUsageChanged") == 0 &&
+            strcmp(g_natives[i].sig, "(I)V") == 0 &&
+            (strcmp(g_natives[i].cls, "com/unity3d/player/UnityPlayerForActivityOrService") == 0 ||
+             strcmp(g_natives[i].cls, "com/unity3d/player/UnityPlayer") == 0))
+            usage = &g_natives[i];
+    }
     pthread_mutex_unlock(&g_lock);
-    if (!n) return 0;
+    if (!n) {
+        void *player = usage ? klj_unity_player_made() : NULL;
+        if (!player || !klj_lowmem_usage_changed()) return 0;
+        ((void (*)(void *, void *, kl_jint))usage->fn)(kl_jni_env(), player, 4);
+        return 1;
+    }
     // A static native is called with its declaring class as the second
     // argument. The guest may keep it, so it is the interned jclass, not NULL.
     ((void (*)(void *, void *))n->fn)(kl_jni_env(), kl_jni_class(n->cls));
@@ -360,6 +476,9 @@ void kl_jni_report(FILE *out) {
                 (unsigned long long)g_stat_delete,
                 (unsigned long long)g_stat_pop_freed,
                 g_nobjects - g_retired_n, g_retired_n);
+    if (g_loose_on)
+        fprintf(out, "  frameless strings: %llu retired by age (ring of %d, %u held)\n",
+                (unsigned long long)g_stat_loose, KLJ_LOOSE_MAX, g_loose_n);
     // What leaks: live objects by class, most common first. Built for the
     // per-frame leak hunt (swap-43582 pool exhaustion).
     {
@@ -400,14 +519,44 @@ void kl_jni_report(FILE *out) {
 // ---------------------------------------------------------------- JNIEnv impl
 // Implemented here are only the operations whose correct answer is forced, not
 // guessed. Reference management is the identity function because we have no GC
-// and a jobject is already a raw pointer; exception state is always "clear"
-// because nothing in this runtime can throw. Anything that would require us to
-// invent Java semantics stays an abort stub.
+// and a jobject is already a raw pointer. Exception state is one pending
+// Throwable per thread (klj_raise, Throw, ThrowNew, below): clear unless the
+// host raised one where Java would have — a ZipFile that is not there, a class
+// an APK does not ship — or the guest threw one itself. Anything that would
+// require us to invent Java semantics stays an abort stub.
 
 static void *klj_GetVersion(void *env) { (void)env; return (void *)(uintptr_t)KL_JNI_VERSION_1_6; }
 
+// Classes the APK does NOT ship, for a guest that probes for them. FindClass
+// here interns any name (see the Sentry note in kl_jni_services.c), which is
+// right for the Android framework and wrong for an application's OPTIONAL
+// dependency, where absence is the answer. Pistol Whip's Quest build carries
+// the PICO SDK's C# side but not its Java side (classes.dex has no
+// com/psmart/...): on a Quest `new AndroidJavaClass("com.psmart.aosoperation.
+// SysActivity")` throws and the game takes the Oculus path. Answered with a
+// class, it decides it is on a PICO, loads PxrPlatform (not in the APK),
+// throws DllNotFoundException and never starts the Oculus XR display —
+// frames run, every one black. Per target, like the ZipFile throw.
+int klj_class_absent(const char *name) {
+    // Not a guess for every guest: whether a class exists is a property of the
+    // APK, and the rule that would say it for all of them is the APK's own
+    // class list (classes*.dex), which nothing here reads yet.
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        if (!t) return 0;                                  // asked before the target is known: not settled yet
+        on = strcmp(t, "x2104963472963790") == 0;          // Pistol Whip
+    }
+    return on && name && strncmp(name, "com/psmart/", 11) == 0;
+}
+
 static void *klj_FindClass(void *env, const char *name) {
     (void)env;
+    if (klj_class_absent(name)) {
+        // JNI's FindClass returns NULL with NoClassDefFoundError pending.
+        klj_raise("java/lang/NoClassDefFoundError", name);
+        return NULL;
+    }
     pthread_mutex_lock(&g_lock);
     void *c = klj_intern_class_locked(name)->as_object;
     pthread_mutex_unlock(&g_lock);
@@ -421,12 +570,37 @@ static void *klj_FindClass(void *env, const char *name) {
 // can never resolve. See kl_jni.h.
 void *kl_jni_class(const char *name) { return klj_FindClass(NULL, name); }
 
+// A pointer that is not a LIVE jobject but is nonetheless one of our pool slots
+// is a RETIRED one: klj_retire_object_locked zeroes the magic and leaves
+// everything else standing, and the slot is only quarantined, never unmapped.
+// So the class it last held is still readable, and that is the whole diagnosis.
+static const char *klj_retired_slot(void *p, unsigned *idx) {
+    if (!p) return NULL;
+    char *base = (char *)g_objects, *q = (char *)p;
+    if (q < base || q >= base + sizeof g_objects) return NULL;
+    if ((size_t)(q - base) % sizeof g_objects[0]) return NULL;   // not a slot start
+    klj_object *o = (klj_object *)p;
+    if (idx) *idx = (unsigned)(o - g_objects);
+    return o->cls;
+}
+
  void *klj_GetObjectClass(void *env, void *obj) {
     (void)env;
     klj_object *o = klj_as_object(obj);
     if (!o) {
         KLJ_LOG("GetObjectClass on an untagged pointer %p — every jobject the guest "
                 "holds should have come from us", obj);
+        // ...unless it DID come from us and has since been retired, which is a
+        // different bug with a different fix, and the pool can tell the two
+        // apart: a retired slot is still one of ours, still carries the class
+        // it last held, and only its magic is gone. Saying so turns a bare
+        // pointer into the binding that needs klj_host_cache (or the guest
+        // holding a local ref past its frame).
+        unsigned slot; const char *was = klj_retired_slot(obj, &slot);
+        if (was)
+            KLJ_LOG("  it is our object pool slot %u, class %s, RETIRED — a local "
+                    "frame popped it while something still held the pointer; a "
+                    "host static caching it must go through klj_host_cache", slot, was);
         // The pointer says nothing; the caller says everything. A jobject that
         // did not come from us is almost always a return value of OURS that the
         // guest did not expect to be NULL, and the frame above names which one.
@@ -452,6 +626,9 @@ void *kl_jni_class(const char *name) { return klj_FindClass(NULL, name); }
         {
             const char *t = kl_driver_target_name();
             if (t && strcmp(t, "acnexusvr") == 0) soft_default = 1;
+            // ...and the same game as a store install, where the target is
+            // named after its Meta app id rather than "acnexusvr".
+            if (t && strcmp(t, "x5812519008825194") == 0) soft_default = 1;
             // hl2's libsourcevr does GetObjectClass on an untagged pointer while
             // reading a saved setting (getSharedPreferences -> getInt) in the menu
             // — the same shape as AC Nexus's UbiServices check. Answering Object
@@ -484,28 +661,34 @@ void *kl_jni_class(const char *name) { return klj_FindClass(NULL, name); }
 // absent only from `new ZipFile()` throwing FileNotFoundException; with no
 // exception it takes the "patch exists" branch, reads its GUID as '' over the
 // main OBB's good one, and stops on "Application OBB has mismatching GUID".
-// With nothing raised these are exactly the old constants.
+// With nothing raised these four are exactly the old constants.
 static __thread klj_object *t_pending_exc;
 
-static void klj_set_pending(klj_object *e) {
+void klj_raise(const char *cls, const char *msg) {
+    // The message rides in the object, for Throwable.getMessage/toString: the
+    // guest logs what it caught (Unity calls toString on it straight away).
+    void *o = klj_own(klj_new_object_data(cls, strdup(msg ? msg : "")), free);
     pthread_mutex_lock(&g_lock);
+    klj_object *e = klj_as_object(o);
     if (e) e->pinned++;                 // lives until ExceptionClear, not a frame pop
     klj_object *old = t_pending_exc;
     t_pending_exc = e;
     if (old && old->pinned) old->pinned--;
     pthread_mutex_unlock(&g_lock);
-}
-
-void klj_raise(const char *cls, const char *msg) {
-    // The message rides in the object, for Throwable.getMessage/toString: the
-    // guest logs what it caught (Unity calls toString on it straight away).
-    klj_set_pending(klj_as_object(klj_own(klj_new_object_data(cls, strdup(msg ? msg : "")), free)));
     KLJ_LOG("throw %s: %s", cls, msg ? msg : "");
 }
 
 // The guest's own throws. Unity catches what klj_raise() threw, logs it, and
 // hands it on with Throw — for its caller to catch — so these set the same
 // per-thread state. Both return 0 (JNI_OK).
+static void klj_set_pending(klj_object *e) {
+    pthread_mutex_lock(&g_lock);
+    if (e) e->pinned++;
+    klj_object *old = t_pending_exc;
+    t_pending_exc = e;
+    if (old && old->pinned) old->pinned--;
+    pthread_mutex_unlock(&g_lock);
+}
 static kl_jint klj_Throw(void *env, void *obj) {
     (void)env;
     klj_object *e = klj_as_object(obj);
@@ -613,14 +796,37 @@ static int klj_frame_holds(const klj_object *o) {
     return 0;
 }
 
+// The same shape from a UE4 guest building a String[]: AcquirePermissions
+// makes each name with a scoped ToJavaString, stores it with
+// SetObjectArrayElement and DeleteLocalRefs it at the end of the loop — on the
+// game thread, with no frame open — so on Android the array keeps every name
+// alive and here every name was retired before PermissionHelper read it
+// ("expected a java/lang/String, got an untagged pointer", 32 bytes apart).
+// KL_JNI_DEFER_STRING_DELETE: a deleted String is retired by age instead,
+// through the frameless-string ring (klj_loose_note), and a frame's String by
+// its pop. Default on for The Walking Dead: Saints & Sinners - Chapter 2
+// (x5190288877703616) alone, whose loading waits on that permission answer.
+static int klj_defer_string_delete(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *t = kl_driver_target_name();
+        on = kl_env_on("KL_JNI_DEFER_STRING_DELETE",
+                       t && strcmp(t, "x5190288877703616") == 0);
+    }
+    return on;
+}
+static void klj_loose_note(klj_object *o);
+
 static void  klj_DeleteLocalRef(void *env, void *obj) {
     (void)env;
     if (!obj) return;                       // DeleteLocalRef(NULL) is legal
     pthread_mutex_lock(&g_lock);
     klj_object *o = klj_as_object(obj);
     if (o) g_stat_delete++;
-    if (!t_frame || !o || klj_frame_holds(o)) klj_retire_object_locked(obj);
+    int defer = o && o->cls == KLJ_CLASS_STRING && !o->pinned && klj_defer_string_delete();
+    if (!defer && (!t_frame || !o || klj_frame_holds(o))) klj_retire_object_locked(obj);
     pthread_mutex_unlock(&g_lock);
+    if (defer && !t_frame) klj_loose_note(o);
 }
 static void *klj_NewGlobalRef(void *env, void *obj) {
     (void)env;
@@ -642,6 +848,13 @@ static kl_jint klj_IsSameObject(void *env, void *a, void *b) { (void)env; return
 // name match would say "no" and send the engine down its no-Activity path.
 static const struct { const char *cls, *super; } g_supers[] = {
     {"com/unity3d/player/UnityPlayerActivity", "android/app/Activity"},
+    {"com/unity3d/player/UnityPlayer", "android/widget/FrameLayout"},
+    // Unity 2023+ declares the lifecycle natives on this subclass (see
+    // unity_lifecycle_native in kl_driver.c). A method looked up on it and
+    // declared against UnityPlayer is UnityPlayer's.
+    {"com/unity3d/player/UnityPlayerForActivityOrService", "com/unity3d/player/UnityPlayer"},
+    {"android/widget/FrameLayout", "android/view/ViewGroup"},
+    {"android/view/ViewGroup", "android/view/View"},
     // Steam Link's own activity really does extend SDLActivity, and
     // SDL3 hands `SDLActivity.getContext()` — i.e. that subclass — to code that
     // then calls Context methods on it. Without this edge, getFilesDir() and
@@ -654,6 +867,13 @@ static const struct { const char *cls, *super; } g_supers[] = {
     // getIntent() on it. That is an Activity method, so without this edge every
     // inherited Activity method would need re-declaring against NativeActivity.
     {"android/app/NativeActivity",             "android/app/Activity"},
+    // UE4's GameActivity extends NativeActivity, so everything an Activity or a
+    // Context answers is answerable through it — and the guest calls those
+    // through the GameActivity class it holds. Without this edge only the rows
+    // keyed on GameActivity itself resolved: Red Matter aborted on
+    // GameActivity.getPackageName() deep into play (2026-10-12), with
+    // Context.getPackageName bound all along.
+    {"com/epicgames/ue4/GameActivity",         "android/app/NativeActivity"},
     // BONELAB's own libSLZQuestNative reaches its Context the way a native
     // plugin with no Context has to: ActivityThread.currentActivityThread()
     // .getApplication(). An Application IS a Context (through ContextWrapper),
@@ -681,19 +901,40 @@ static const struct { const char *cls, *super; } g_supers[] = {
     // What klj_raise() throws, so a guest that catches the base class (or asks
     // IsInstanceOf IOException) recognises it.
     {"java/io/FileNotFoundException",          "java/io/IOException"},
+    {"java/lang/NoClassDefFoundError",         "java/lang/LinkageError"},
+    {"java/lang/ClassNotFoundException",       "java/lang/ReflectiveOperationException"},
+    {"java/lang/ReflectiveOperationException", "java/lang/Exception"},
+    {"java/lang/LinkageError",                 "java/lang/Error"},
+    {"java/lang/Error",                        "java/lang/Throwable"},
     {"java/util/zip/ZipException",             "java/io/IOException"},
     {"java/io/IOException",                    "java/lang/Exception"},
+    // ...and what a guest throws of its own accord (ThrowNew), or catches by
+    // the base class: without these a RuntimeException was no Throwable here,
+    // its message was lost, and a catch of java.lang.Exception passed it by.
+    {"java/lang/IllegalStateException",        "java/lang/RuntimeException"},
+    {"java/lang/IllegalArgumentException",     "java/lang/RuntimeException"},
+    {"java/lang/NullPointerException",         "java/lang/RuntimeException"},
+    {"java/lang/UnsupportedOperationException","java/lang/RuntimeException"},
+    {"java/lang/IndexOutOfBoundsException",    "java/lang/RuntimeException"},
+    {"java/lang/SecurityException",            "java/lang/RuntimeException"},
+    {"java/lang/ClassCastException",           "java/lang/RuntimeException"},
+    {"java/lang/RuntimeException",             "java/lang/Exception"},
+    {"java/lang/NoSuchMethodError",            "java/lang/LinkageError"},
+    {"java/lang/NoSuchFieldError",             "java/lang/LinkageError"},
+    {"java/lang/UnsatisfiedLinkError",         "java/lang/LinkageError"},
     {"java/lang/Exception",                    "java/lang/Throwable"},
     {NULL, NULL},
 };
 
-// Is class `sub` the class `want`, or does it reach `want` by walking g_supers?
-// Every class is an Object. Shared by IsInstanceOf and IsAssignableFrom: both
-// ask the same question of the same hierarchy, one about an object's class and
-// one about two classes, so the walk lives in one place.
-static int klj_class_extends(const char *sub, const char *want) {
+// Does `cls` reach `want` by walking superclasses? The one answer behind both
+// IsInstanceOf (which asks it about an object's class) and the assignability
+// tier of klj_find_binding (which asks it about two parameter descriptors).
+// Factored out of IsInstanceOf rather than copied: two walks over g_supers that
+// could disagree is exactly the drift g_supers exists to prevent.
+static int klj_class_is_a(const char *cls, const char *want) {
+    if (!cls || !want) return 0;
     if (strcmp(want, "java/lang/Object") == 0) return 1;
-    for (const char *cur = sub; cur; ) {
+    for (const char *cur = cls; cur; ) {
         if (strcmp(cur, want) == 0) return 1;
         const char *next = NULL;
         for (int i = 0; g_supers[i].cls; i++)
@@ -703,34 +944,47 @@ static int klj_class_extends(const char *sub, const char *want) {
     return 0;
 }
 
-// The message of an exception klj_raise() or ThrowNew made, or NULL for any
-// other object.
-const char *klj_throwable_message(void *obj) {
-    klj_object *o = klj_as_object(obj);
-    if (!o || !o->data) return NULL;
-    return klj_class_extends(o->cls, "java/lang/Throwable") ? (const char *)o->data : NULL;
-}
-
 static kl_jint klj_IsInstanceOf(void *env, void *obj, void *clazz) {
     (void)env;
     if (!obj) return 1;                       // null is an instance of everything
     klj_object *o = klj_as_object(obj);
     if (!o) return 0;
-    return klj_class_extends(o->cls, klj_class_name(clazz));
+    return klj_class_is_a(o->cls, klj_class_name(clazz));
 }
 
-// IsAssignableFrom(clazz1, clazz2): can a clazz1 be stored where a clazz2 is
-// expected — i.e. is clazz1 the same class as, or a subclass of, clazz2. Ancient
-// Dungeon's LIV Creator Kit (liblck_core, Rust `jni` crate) asks this right
-// after resolving Settings$Secure.getString, as part of its device-ID lookup.
-// Interfaces are not modelled here, so a class is never assignable to one; the
-// callers seen so far only ask about concrete classes.
+// Can an object of clazz1 be cast to clazz2? Unity's reflection layer asks
+// this while matching argument types (HARD BULLET reaches it right after
+// loading liblck_core, on the main-menu path).
 static kl_jint klj_IsAssignableFrom(void *env, void *clazz1, void *clazz2) {
     (void)env;
-    const char *sub = klj_class_name(clazz1), *want = klj_class_name(clazz2);
-    kl_jint r = klj_class_extends(sub, want);
-    KLJ_LOG("IsAssignableFrom  %s -> %s = %d", sub, want, r);
+    kl_jint r = klj_class_is_a(klj_class_name(clazz1), klj_class_name(clazz2));
+    KLJ_LOG("IsAssignableFrom(%s, %s) -> %d",
+            klj_class_name(clazz1), klj_class_name(clazz2), r);
     return r;
+}
+
+// What a class answers a method with ITSELF — its own binding or an ancestor's,
+// never java/lang/Object's catch-all. For Object.toString, which is resolved on
+// Object and called on whatever the object is.
+static const klj_binding *klj_find_binding(const char *cls, const char *name, const char *sig);
+klj_impl klj_own_impl(const char *cls, const char *name, const char *sig) {
+    for (const char *cur = cls; cur && strcmp(cur, "java/lang/Object") != 0; ) {
+        const klj_binding *b = klj_find_binding(cur, name, sig);
+        if (b) return b->fn;
+        const char *next = NULL;
+        for (int i = 0; g_supers[i].cls; i++)
+            if (strcmp(g_supers[i].cls, cur) == 0) { next = g_supers[i].super; break; }
+        cur = next;
+    }
+    return NULL;
+}
+
+// The message of an exception klj_raise() made, or NULL for any other object.
+const char *klj_throwable_message(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    if (!o || !o->data) return NULL;
+    return klj_IsInstanceOf(NULL, obj, klj_class_object("java/lang/Throwable"))
+        ? (const char *)o->data : NULL;
 }
 
 // Strings. A jstring never crosses into real Java, so we are free to define the
@@ -768,9 +1022,53 @@ static const char *klj_GetStringUTFChars(void *env, void *jstr, uint8_t *isCopy)
 static void klj_ReleaseStringUTFChars(void *env, void *jstr, const char *chars) {
     (void)env; (void)jstr; (void)chars;   // nothing was copied, so nothing to free
 }
+// Strings a guest makes on a thread with no local frame, and never deletes.
+//
+// A native thread that attached itself has no frame to pop: on Android its local
+// references live until it deletes them or detaches, and ART's table is large
+// enough that a guest can leak one per call for hours. The pool here is not.
+// Doom3Quest's haptics do exactly that — NewStringUTF for the event name on
+// every haptic_updateevent/stopevent, some 300 a second in a level, none ever
+// deleted (host run, 2026-10-08: 45423 live java/lang/String after 150 s) —
+// which walks KLJ_MAX_OBJECTS to "object pool exhausted" and an abort after
+// about seven minutes of play (device crash report 2026-10-06 19:15).
+//
+// So such strings are kept in a ring and the oldest is RETIRED when the ring is
+// full: KLJ_LOOSE_MAX strings later, and then through the usual quarantine
+// before its slot or its bytes are reused. A guest would have to come back to a
+// string it made tens of thousands of strings ago to notice. Only for a door
+// that asks (kl_jni_reclaim_frameless_strings) — where the host makes its calls
+// inside frames this ring would never fill, but a host-side cache of an
+// unpinned frameless string is not something to find out about this way.
+void kl_jni_reclaim_frameless_strings(int on) { g_loose_on = on; }
+
+static void klj_loose_note(klj_object *o) {
+    pthread_mutex_lock(&g_lock);
+    if (g_loose_n == KLJ_LOOSE_MAX) {
+        klj_object *old = &g_objects[g_loose_slot[g_loose_head]];
+        // Still the string that was noted? The slot may have been deleted and
+        // recycled since; its payload pointer says which occupant this is.
+        if (old->magic == KLJ_OBJ_MAGIC && !old->pinned &&
+            old->cls == KLJ_CLASS_STRING && old->data == g_loose_data[g_loose_head]) {
+            klj_retire_object_locked(old);
+            g_stat_loose++;
+        }
+        g_loose_head = (g_loose_head + 1) % KLJ_LOOSE_MAX;
+        g_loose_n--;
+    }
+    unsigned at = (g_loose_head + g_loose_n) % KLJ_LOOSE_MAX;
+    g_loose_slot[at] = (unsigned)(o - g_objects);
+    g_loose_data[at] = o->data;
+    g_loose_n++;
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void *klj_NewStringUTF(void *env, const char *s) {
     (void)env;
-    return s ? kl_jni_new_string(s) : NULL;
+    if (!s) return NULL;
+    void *o = kl_jni_new_string(s);
+    if (g_loose_on && !t_frame && o) klj_loose_note(o);
+    return o;
 }
 
 // GetStringChars is the other direction, and unlike GetStringUTFChars it cannot
@@ -881,12 +1179,69 @@ static kl_jint klj_UnregisterNatives(void *env, void *clazz) { (void)env; (void)
 
 static kl_jint klj_GetJavaVM(void *env, void **vm) { (void)env; *vm = kl_jni_vm(); return 0; }
 
+// Defined below with the rest of the binding matcher; klj_want needs it to
+// resolve a lookup the guest made without a signature (see there).
+static const klj_binding *klj_resolve_by_name(const char *cls, const char *name,
+                                              int *nmatch);
+
 // The measurement instrument. Every id the guest wants is recorded; in strict
 // mode the first unknown one stops the run, which is the bring-up loop.
 // Permissive mode hands back a synthetic id so a single run
 // collects the whole batch of lookups an init path performs.
  void *klj_want(void *clazz, const char *name, const char *sig, char kind) {
     const char *cls = klj_class_name(clazz);
+    if (!sig) sig = "";
+
+    // ---- the guest asked with NO signature at all ----
+    //
+    // Unity's `AndroidJNIHelper.GetMethodID(jclass, name, signature = "",
+    // isStatic = false)` takes the signature as an OPTIONAL argument. Omit it
+    // and the managed side does not build one: it passes "" through to
+    // `com.unity3d.player.ReflectionHelper.getMethodID`, which on device
+    // resolves the method REFLECTIVELY — `getMethods()` filtered by name — and
+    // returns FromReflectedMethod. The signature is never spelled anywhere.
+    //
+    // bHaptics' Unity wrapper caches its ids both ways in one breath: with an
+    // explicit signature for most of BhapticsManagerWrapper and without one for
+    // five (`stopInt`, `stopAll`, `pingAll`, `isBhapticsUser`, `refreshPairing`),
+    // so the same class arrives spelled both ways in a single boot.
+    //
+    // An empty signature has no return kind (klj_return_kind gives '?') and no
+    // argument list, so it matches no binding and decodes no arguments. The id
+    // is issued happily — a lookup is only a measurement — and the run then dies
+    // at the CALL, on a method the table already implements, which is a
+    // confusing place to land: with `refreshPairing ()V` in the table and the
+    // dex agreeing, Paint the Town Red VR's call still aborted.
+    //
+    // Resolve it the way the device does: by (class, name) alone, and only when
+    // the answer is UNIQUE. Substituting the resolved signature here — before
+    // the id is interned — is what makes the rest of this file need to know
+    // nothing: the return-kind check, klj_decode_args and klj_resolve_binding
+    // all read w->sig and now see the real thing, and a later lookup that DOES
+    // spell the signature interns to the same entry rather than a second one.
+    //
+    // Ambiguity is refused, not guessed: `isPlayingByEventId` is declared twice
+    // (int and String) and picking either would marshal one as the other. A
+    // refusal leaves the empty signature in place, which is exactly today's
+    // behaviour — the call names the method and stops.
+    if ((kind == 'm' || kind == 'M') && !*sig) {
+        int n = 0;
+        const klj_binding *b = klj_resolve_by_name(cls, name, &n);
+        if (b)
+            KLJ_LOG("%s asked for %s.%s with NO signature (Unity's optional-arg "
+                    "spelling); resolved by name to %s",
+                    kind == 'M' ? "GetStaticMethodID" : "GetMethodID",
+                    cls, name, b->sig);
+        else if (n > 1)
+            KLJ_LOG("%s.%s asked with NO signature is AMBIGUOUS: %d bindings share "
+                    "that name — resolving by name would guess which one to "
+                    "marshal, so it is refused", cls, name, n);
+        else
+            KLJ_LOG("%s.%s asked with NO signature and no binding carries that "
+                    "name — nothing to resolve it to", cls, name);
+        if (b) sig = b->sig;
+    }
+
     pthread_mutex_lock(&g_lock);
     for (unsigned i = 0; i < g_nwanted; i++)
         if (g_wanted[i].cls == cls && g_wanted[i].kind == kind &&
@@ -954,7 +1309,17 @@ static int klj_decode_args(const char *sig, kl_va *va, klj_val *argv) {
     int argc = 0;
     for (const char *p = sig + 1; *p && *p != ')'; ) {
         if (argc == KLJ_MAX_ARGS) return -1;
-        while (*p == '[') p++;                       // arrays are references
+        if (*p == '[') {
+            // Every array is a jobject, including float[] and double[].
+            // Its element type must never select the FP argument registers.
+            while (*p == '[') p++;
+            if (*p == 'L') { while (*p && *p != ';') p++; if (*p) p++; }
+            else if (*p) p++;
+            else return -1;
+            argv[argc].l = (void *)(uintptr_t)kl_va_gp(va);
+            argc++;
+            continue;
+        }
         switch (*p) {
         case 'L':                                     // fully-qualified object
             while (*p && *p != ';') p++;
@@ -998,7 +1363,17 @@ static int klj_decode_args_a(const char *sig, const klj_jvalue *args, klj_val *a
         // something to read. Rejecting it outright turned every zero-argument
         // A-call into "cannot decode signature".
         if (argc == KLJ_MAX_ARGS || !args) return -1;
-        while (*p == '[') p++;                       // arrays are references
+        if (*p == '[') {
+            // Every array is a jobject, including float[] and double[].
+            // Its element type must never select the FP argument registers.
+            while (*p == '[') p++;
+            if (*p == 'L') { while (*p && *p != ';') p++; if (*p) p++; }
+            else if (*p) p++;
+            else return -1;
+            argv[argc].l = args[argc].l;
+            argc++;
+            continue;
+        }
         switch (*p) {
         case 'L':
             while (*p && *p != ';') p++;
@@ -1082,33 +1457,131 @@ static int klj_same_args(const char *a, const char *b) {
     return la == lb && klj_sig_eq_n(a, b, la);
 }
 
+// ---- the third tier: a parameter the guest spelled as a SUBCLASS ----
+//
+// The two tiers above compare argument lists character for character, and that
+// is not what Java does. `Class.getMethod(name, argTypes)` resolves by
+// ASSIGNABILITY: a method declared `init(Context)` is the method you get when
+// you ask with an Activity, because an Activity IS a Context.
+//
+// Unity's C# side asks exactly that way. `AndroidJavaClass.CallStatic` builds
+// the signature from the RUNTIME type of the object it was handed, so HARD
+// BULLET's FMOD wrapper asks for
+// `org/fmod/FMOD.init(Lcom.unity3d.player.UnityPlayerGameActivity;)V` where
+// FMOD.java declares `init(Landroid/content/Context;)V`. Nothing is wrong with
+// either spelling; on device the reflective lookup bridges them. Without this
+// tier every such call is a separate abort, and the "fix" is transcribing the
+// same binding once per subclass the guest happens to hold — which is the
+// duplication g_supers already exists to avoid.
+//
+// The relaxation is kept narrow so it cannot become a silent wrong answer:
+//   - arity must match, and the RETURN must match exactly (the tier above
+//     already owns the generic-return case);
+//   - primitives and arrays must match exactly — only `L…;` widens;
+//   - widening is the g_supers walk and nothing else, the same walk
+//     IsAssignableFrom answers with;
+//   - at least one parameter must genuinely differ, so this tier can never
+//     shadow an exact match;
+//   - and the candidate must be UNIQUE. Two bindings both assignable is a real
+//     overload set (`f(Context)` and `f(Activity)`), where picking either is a
+//     guess; that is refused and named rather than resolved by table order.
+static const char *klj_type_end(const char *p) {
+    while (*p == '[') p++;
+    if (*p == 'L') { const char *e = strchr(p, ';'); return e ? e + 1 : NULL; }
+    if (!*p || *p == ')') return NULL;
+    return p + 1;
+}
+
+// `from` fits in a `to` slot. Both are one descriptor, delimited by [ps,pe).
+//
+// One extra rule beyond the g_supers walk: a guest argument spelled EXACTLY
+// `Ljava/lang/Object;` fits any reference slot. That is not Java assignability
+// — Object is not a Handler — it is the ERASED spelling, and it is the same
+// fact the generic-return tier above already accepts on the other side of the
+// parens. Unity's `AndroidJNIHelper.GetSignature(object)` has no type to read
+// when the argument is `null` (or is held in an `object`/`AndroidJavaProxy`
+// variable), so it emits `Ljava/lang/Object;` and the managed caller asks for
+// a method the native caller asks for correctly. Paint the Town Red's Rewired
+// input source does exactly this:
+//
+//     InputManager.registerInputDeviceListener(
+//         Landroid.hardware.input.InputManager$InputDeviceListener;
+//         Ljava/lang/Object;)V          <- the null Handler, erased
+//
+// where libunity, in the same boot, resolved the identical method as
+// `(...;Landroid/os/Handler;)V`. Without this rule every erased-argument call
+// is a separate abort whose only fix is a duplicate table entry per call site.
+// It stays safe for the same reason the tiers above do: an exact match still
+// wins outright, at least one parameter must have widened, and a signature
+// that two bindings both accept is refused as AMBIGUOUS rather than guessed.
+static int klj_type_assignable(const char *from, const char *fe,
+                               const char *to, const char *te) {
+    size_t lf = (size_t)(fe - from), lt = (size_t)(te - to);
+    if (lf == lt && klj_sig_eq_n(from, to, lf)) return 1;
+    // The erased spelling: only ever accepted INTO a reference slot, never into
+    // a primitive one, so an Object can never be marshalled as an int.
+    if (lf == 18 && klj_sig_eq_n(from, "Ljava/lang/Object;", 18) &&
+        (*to == 'L' || *to == '[')) return 1;
+    if (*from != 'L' || *to != 'L') return 0;     // primitive/array: exact only
+    char f[192], t[192];
+    if (lf < 3 || lf >= sizeof f || lt < 3 || lt >= sizeof t) return 0;
+    size_t i;
+    for (i = 0; i < lf - 2; i++) f[i] = from[1 + i] == '.' ? '/' : from[1 + i];
+    f[i] = 0;
+    for (i = 0; i < lt - 2; i++) t[i] = to[1 + i] == '.' ? '/' : to[1 + i];
+    t[i] = 0;
+    return klj_class_is_a(f, t);
+}
+
+// The table declares `tbl`; the guest asked for `guest`. Returns 1 only if the
+// guest's arguments widen into the table's AND something actually widened.
+static int klj_args_assignable(const char *tbl, const char *guest) {
+    const char *a = strchr(tbl, '('), *b = strchr(guest, '(');
+    if (!a || !b) return 0;
+    a++; b++;
+    int widened = 0;
+    while (*a && *a != ')' && *b && *b != ')') {
+        const char *ae = klj_type_end(a), *be = klj_type_end(b);
+        if (!ae || !be) return 0;
+        if (!klj_type_assignable(b, be, a, ae)) return 0;
+        size_t la = (size_t)(ae - a), lb = (size_t)(be - b);
+        if (la != lb || !klj_sig_eq_n(a, b, la)) widened = 1;
+        a = ae; b = be;
+    }
+    if (*a != ')' || *b != ')') return 0;         // different arity
+    if (!widened) return 0;                       // never shadow an exact match
+    // The returns must agree — exactly, or the way the tier above already
+    // accepts them: both references. Java has no return-type overloading, so a
+    // reference return spelled two ways is still one method, and a guest that
+    // erased an ARGUMENT is exactly the guest that erases the RETURN in the
+    // same breath (`AndroidJavaObject.Call<AndroidJavaObject>(name, null)`
+    // erases both ends of the same call). Requiring an exact return here made
+    // that doubly-erased call resolve through neither tier: the loose tier
+    // wants identical arguments, this one wanted an identical return, and the
+    // one call that needs both relaxations at once fell between them.
+    return klj_sig_eq(a, b) || klj_same_args(a, b);
+}
+
 static const klj_binding *klj_find_binding(const char *cls, const char *name,
                                            const char *sig) {
-    // No signature at all: Unity's AndroidJNIHelper.GetMethodID(class, name)
-    // defaults the signature to "" and ReflectionHelper then answers by NAME
-    // alone — Java reflection's first method of that name. bHaptics' SDK2
-    // caches its ids that way (refreshPairing, stopAll, isBhapticsUser …), so
-    // the jmethodID carries no signature and the match is by name here too;
-    // klj_call_common types the arguments from the binding's signature instead.
-    if (!sig || !*sig) {
-        for (const klj_binding *const *t = klj_binding_tables; *t; t++)
-            for (const klj_binding *b = *t; b->cls; b++)
-                if (strcmp(b->cls, cls) == 0 && strcmp(b->name, name) == 0) {
-                    KLJ_LOG("binding %s.%s matched by NAME (guest gave no signature): table has %s",
-                            cls, name, b->sig);
-                    return b;
-                }
-        return NULL;
-    }
+    // One title's own answers first. Each of these is NULL unless the target
+    // is the one it was written for, so no other game's lookup changes.
+    const klj_binding *own = klj_firebase_binding(cls, name, sig);
+    if (!own) own = klj_vivox_binding(cls, name, sig);
+    if (!own) own = klj_vertigo_binding(cls, name, sig);
+    if (!own) own = klj_ghosttown_binding(cls, name, sig);
+    if (own) return own;
     // Exact wins outright across EVERY family table, so the answer does not
     // depend on which file a class landed in; a loose match is only ever the
     // fallback.
-    const klj_binding *loose = NULL;
+    const klj_binding *loose = NULL, *wide = NULL;
+    int nwide = 0;
     for (const klj_binding *const *t = klj_binding_tables; *t; t++)
         for (const klj_binding *b = *t; b->cls; b++) {
             if (strcmp(b->cls, cls) != 0 || strcmp(b->name, name) != 0) continue;
             if (klj_sig_eq(b->sig, sig)) return b;
             if (!loose && klj_same_args(b->sig, sig)) loose = b;
+            if (klj_args_assignable(b->sig, sig)) { if (!wide) wide = b; nwide++; }
         }
     // Named, once per (method, signature). A loose match is the right answer
     // for the generic-return case it exists for and a SILENT wrong answer for
@@ -1126,7 +1599,28 @@ static const klj_binding *klj_find_binding(const char *cls, const char *name,
                     cls, name, sig, loose->sig);
         }
     }
-    return loose;
+    if (loose) return loose;
+
+    // Named on the same terms and for the same reason: a widened match is the
+    // right answer for the subclass-argument case and a silent wrong one for
+    // anything else, so it goes on the record.
+    if (wide) {
+        if (nwide > 1) {
+            KLJ_LOG("binding %s.%s%s is AMBIGUOUS: %d table entries accept it by "
+                    "assignability — declare the exact signature", cls, name, sig, nwide);
+            return NULL;
+        }
+        static const char *seen[64];
+        static unsigned nseen;
+        unsigned i = 0;
+        for (; i < nseen; i++) if (seen[i] == wide->sig) break;
+        if (i == nseen && nseen < 64) {
+            seen[nseen++] = wide->sig;
+            KLJ_LOG("binding %s.%s matched by ASSIGNABILITY: guest asked %s, "
+                    "table has %s", cls, name, sig, wide->sig);
+        }
+    }
+    return wide;
 }
 
 static const klj_binding *klj_resolve_binding(const char *cls, const char *name,
@@ -1156,6 +1650,82 @@ static const klj_binding *klj_resolve_binding(const char *cls, const char *name,
     return klj_find_binding("java/lang/Object", name, sig);
 }
 
+// ---- the fourth tier: no signature at all ----
+//
+// Only ever reached from klj_want, for the empty-signature lookup documented
+// there. It is deliberately NOT part of klj_find_binding: a call always has a
+// signature by the time it gets there, and a name-only fallback at call time
+// would paper over a genuine mismatch. Here it is the whole of the information
+// the guest supplied.
+//
+// "Unique" is counted over distinct SIGNATURES, not table rows, so a method
+// deliberately declared in two family tables with the same spelling still
+// resolves; two different spellings is an overload set and is refused.
+static const klj_binding *klj_find_by_name(const char *cls, const char *name,
+                                           int *nmatch) {
+    const klj_binding *first = NULL;
+    const char *seen[16];
+    int n = 0;
+    for (const klj_binding *const *t = klj_binding_tables; *t; t++)
+        for (const klj_binding *b = *t; b->cls; b++) {
+            if (strcmp(b->cls, cls) != 0 || strcmp(b->name, name) != 0) continue;
+            int dup = 0;
+            for (int i = 0; i < n && i < 16; i++)
+                if (klj_sig_eq(seen[i], b->sig)) { dup = 1; break; }
+            if (dup) continue;
+            if (n < 16) seen[n] = b->sig;
+            if (!first) first = b;
+            n++;
+        }
+    *nmatch = n;
+    return n == 1 ? first : NULL;
+}
+
+// The same superclass walk klj_resolve_binding does, and it stops at the first
+// class in the chain that declares the name at all — a subclass that overloads
+// a name shadows the superclass's, exactly as Java resolution does, rather than
+// pooling both into a false ambiguity.
+static const klj_binding *klj_resolve_by_name(const char *cls, const char *name,
+                                              int *nmatch) {
+    for (const char *cur = cls; cur; ) {
+        int n = 0;
+        const klj_binding *b = klj_find_by_name(cur, name, &n);
+        if (n) { *nmatch = n; return b; }
+        const char *next = NULL;
+        for (int i = 0; g_supers[i].cls; i++)
+            if (strcmp(g_supers[i].cls, cur) == 0) { next = g_supers[i].super; break; }
+        cur = next;
+    }
+    return klj_find_by_name("java/lang/Object", name, nmatch);
+}
+
+// The Sentry crash reporter's Java SDK. Arizona Sunshine 2
+// (x5245041552210029) ships sentry-unity, whose Android integration asks the
+// Java side for its hub (Sentry.getCurrentHub) right after the splash, then
+// sets tags, builds Breadcrumbs (writing their fields) and reads SentryLevel
+// constants — each of which aborted the run. There is no Sentry Java SDK
+// running on this host, so every io.sentry call and field read answers
+// zero/NULL/void and a field write is not kept, as an uninitialised SDK does:
+// a NULL hub is what the C# wrapper's `hub?.Call(...)` chains already treat
+// as "Java SDK not enabled". Nothing is sent anywhere.
+// KL_JNI_DROP_SENTRY=0 restores the stop here, =1 tries the drop elsewhere.
+static int klj_drop_sentry(const klj_wanted *w) {
+    if (strncmp(w->cls, "io/sentry/", 10) != 0) return 0;
+    static int drop = -1;
+    if (drop < 0) {
+        const char *t = kl_driver_target_name();
+        drop = kl_env_on("KL_JNI_DROP_SENTRY", t && strcmp(t, "x5245041552210029") == 0);
+    }
+    if (!drop) return 0;
+    static int said;   // the first few name the entries; the rest are noise
+    if (said < 16) {
+        said++;
+        KLJ_LOG("%s.%s%s — Sentry Java SDK, dropped (not running on this host)",
+                w->cls, w->name, w->sig);
+    }
+    return 1;
+}
+
 // Exactly one of `va` / `args` is non-NULL; everything else about a call is
 // identical between the two conventions, so they share this path rather than
 // duplicating the binding lookup and the diagnostics.
@@ -1183,28 +1753,83 @@ static klj_val klj_call_common(void *env, void *self, void *mid, char want,
         kl_fatal_prepare(); abort();
     }
 
-    const klj_binding *b = klj_resolve_binding(w->cls, w->name, w->sig);
-    // An id looked up by name alone has no signature of its own (see
-    // klj_find_binding); the binding's is the only description of the arguments.
-    const char *sig = (w->sig[0] || !b) ? w->sig : b->sig;
-
-    char have = klj_return_kind(sig);
+    char have = klj_return_kind(w->sig);
     if (want != '?' && have != want)
         KLJ_LOG("WARNING %s.%s%s called through a '%c' slot but returns '%c'",
-                w->cls, w->name, sig, want, have);
+                w->cls, w->name, w->sig, want, have);
 
+    const klj_binding *b = klj_resolve_binding(w->cls, w->name, w->sig);
     if (b) {
         klj_val argv[KLJ_MAX_ARGS];
-        int argc = va ? klj_decode_args(sig, va, argv)
-                      : klj_decode_args_a(sig, args, argv);
+        int argc = va ? klj_decode_args(w->sig, va, argv)
+                      : klj_decode_args_a(w->sig, args, argv);
         if (argc < 0) {
-            KLJ_LOG("cannot decode signature %s for %s.%s", sig, w->cls, w->name);
+            KLJ_LOG("cannot decode signature %s for %s.%s", w->sig, w->cls, w->name);
             kl_fatal_prepare(); abort();
         }
         return b->fn(env, self, argv, argc);
     }
 
+    // Third-party analytics SDKs have no host to report to, and nothing a guest
+    // does with their answers is load-bearing: every call is dropped and answers
+    // zero/NULL/void, as a disabled SDK would. A whole class family rather than
+    // one row per method, because the guest's C# wrapper reaches for whichever
+    // entry its own error hook or event fires next. Max Mustard
+    // (x5269080709783454) aborted here on GameAnalytics.addErrorEvent right
+    // after its splash; HARD BULLET (x8116626111777808) on
+    // AmplitudePlugin.setLibraryName when Start is pressed in its main menu;
+    // LES MILLS BODYCOMBAT (x4015163475201433) on Cognitive3D's
+    // com/c3d/androidjavaplugin/Plugin.initSessionData during its first scene.
+    // KL_JNI_DROP_ANALYTICS=0 restores the abort.
+    static const char *const k_dropped[] = { "com/gameanalytics/",
+                                             "com/amplitude/",
+                                             "com/c3d/" };
+    for (unsigned i = 0; i < sizeof k_dropped / sizeof *k_dropped; i++)
+        if (strncmp(w->cls, k_dropped[i], strlen(k_dropped[i])) == 0 &&
+            kl_env_on("KL_JNI_DROP_ANALYTICS", 1)) {
+            static int said;   // the first few name the entries; the rest are noise
+            if (said < 16) {
+                said++;
+                KLJ_LOG("%s.%s%s — analytics SDK, dropped (no host to report to)",
+                        w->cls, w->name, w->sig);
+            }
+            return zero;
+        }
+
+    // The bHaptics entries the family table does not have. Its 40 rows are one
+    // version of the plugin's wrapper, read from Paint the Town Red's APK
+    // (runtime/jni/kl_jni_haptics.c). Real VR Fishing (x2582932495064035) has
+    // the plugin too, in a version nobody here has the files of to compare,
+    // and its sender ran it on a headset with every com.bhaptics call
+    // answering zero/NULL/void (fix 37, 2026-10-14). So for this title what the
+    // table does not answer is dropped that way, as a vest that is not there,
+    // instead of ending the run by name — and the names are logged, which is
+    // the list of rows to add. Every other guest keeps the stop.
+    // KL_JNI_DROP_BHAPTICS=0 restores it here, =1 tries the drop elsewhere.
+    if (strncmp(w->cls, "com/bhaptics/", 13) == 0) {
+        static int drop = -1;
+        if (drop < 0) {
+            const char *t = kl_driver_target_name();
+            drop = kl_env_on("KL_JNI_DROP_BHAPTICS", t && strcmp(t, "x2582932495064035") == 0);
+        }
+        if (drop) {
+            static int said;
+            if (said < 16) {
+                said++;
+                KLJ_LOG("%s.%s%s — not in the bHaptics table, dropped (no vest on this host)",
+                        w->cls, w->name, w->sig);
+            }
+            return zero;
+        }
+    }
+
+    if (klj_drop_sentry(w)) return zero;
+
     KLJ_LOG("no host implementation for %s.%s%s", w->cls, w->name, w->sig);
+    if (!g_permissive && klj_soft_unknown()) {
+        KLJ_LOG("  ...answered with zero (KL_JNI_SOFT_UNKNOWN, the profile for untested games)");
+        return zero;
+    }
     if (!g_permissive) {
         fprintf(stderr, "[jni] this is a work item — add it to the family table in runtime/jni/.\n");
         kl_jni_report(stderr);
@@ -1473,6 +2098,24 @@ static void klj_SetObjectArrayElement(void *env, void *a, kl_jint i, void *v) {
     ((void **)arr->data)[i] = v;
 }
 
+// Arrays live in host-owned contiguous storage; there is no moving JVM GC.
+// Critical access borrows that exact storage, as the typed Elements calls do.
+static void *klj_GetPrimitiveArrayCritical(void *env, void *array, uint8_t *is_copy) {
+    (void)env;
+    klj_object *o = klj_as_object(array);
+    klj_array *a = o && o->cls[0] == '[' ? klj_arr(array) : NULL;
+    if (!a || a->kind == 'L') {
+        klj_raise("java/lang/IllegalArgumentException", "critical access needs a primitive array");
+        return NULL;
+    }
+    if (is_copy) *is_copy = 0;
+    return a->data;
+}
+static void klj_ReleasePrimitiveArrayCritical(void *env, void *array, void *data, kl_jint mode) {
+    (void)env; (void)array; (void)data; (void)mode;
+    // No copied buffer to commit or discard. JNI_ABORT does not undo direct writes.
+}
+
 // Primitive arrays. New<T>Array / Get<T>ArrayElements / Release / Get-SetRegion
 // all reduce to the same four shapes, so they are generated rather than typed
 // out nine times — the same reasoning as the JNI slot table.
@@ -1549,21 +2192,65 @@ static const char *klj_field_sval(const klj_field *f) {
     // Kept on the Android-10/API-29 base the rest of the surface is built for, so
     // only the hardware identity changes; if a run shows batman also gates on the
     // OS version, bump SDK_INT/RELEASE for it too.
+    // Steam Link (steamlink-vr) as well, for a different reason: it tells the
+    // Steam host which headset it is by Build.PRODUCT ("[DeviceHMD] Found device
+    // static props for: hollywood"), and the host sizes the stream for that
+    // headset's panel. As a Quest 2 the picture arrived as a 1152x4608 HEVC
+    // stream, 2304x2304 an eye once unwarped, and was upscaled from there to a
+    // display that is far finer — washed out on the Vision Pro (owner,
+    // 2026-10-16). eureka is the finest panel in its hmd_config.json table.
+    // Roboquest VR's Meta Store build (x9269393463181825, UE 5.6) at its
+    // owner's request: as a Quest 2 it chose that headset's settings (its saved
+    // settings name the Quest 2's 1920x1832 panel) and the scene looked short
+    // of shadows (2026-10-23). The same Quest 3 everywhere it can ask: here,
+    // the OpenXR system name (kl_openxr.c) and ovrp_GetSystemHeadsetType
+    // (kl_ovrp.c).
     const char *t = kl_driver_target_name();
-    if (t && strcmp(t, "batman") == 0) {
+    if (t && (strcmp(t, "batman") == 0 || strcmp(t, "steamlink-vr") == 0 ||
+              strcmp(t, "x9269393463181825") == 0)) {
         if (!strcmp(f->name, "MODEL"))    return "Quest 3";
         if (!strcmp(f->name, "DEVICE"))   return "eureka";
         if (!strcmp(f->name, "PRODUCT"))  return "eureka";
         if (!strcmp(f->name, "FINGERPRINT"))
             return "oculus/eureka/eureka:10/SQ3A.220605.009.A1/1:user/release-keys";
     }
+    // Red Matter 2 decides what it runs on from the model first
+    // (CCrossPlatform::InitPlatformData, read out of its libUE4): "Pacific",
+    // "Quest" or "Pico Goblin", compared whole. Anything else is taken for a
+    // PC, where the tracking system's name decides — and "OculusHMD" there
+    // means its 3DoF platform: Is6DOFTracking() false. As "Quest 2" the game
+    // therefore ran its 3DoF movement on the headset: a second turn in the
+    // same direction turned back, snap or smooth, and the camera kept an
+    // authored height (owner, 2026-10-13; the game's own state read from its
+    // memory on a Mac: platform 3, 6dof 0 — with "Quest", 6dof 1). The Quest
+    // and the Quest 2 it was written for both pass that comparison, and which
+    // of the two it is it asks OVRPlugin afterwards (ovrp_GetSystemHeadsetType2,
+    // still a Quest 2). For this title only: every other guest keeps the model
+    // it was brought up with.
+    if (t && strcmp(t, "redmatter2") == 0 && !strcmp(f->name, "MODEL")) return "Quest";
+    // Vader Immortal I (x2108775495884888, UE 4.19) the same way: its
+    // FAndroidMisc::SetVersionInfo sets IsRunningOnSantaCruz only for maker
+    // "Oculus" with model "Quest", "Monterey" or "Standalone HMD", compared
+    // whole. Off, the game still decided a shader precompile was due (its save
+    // compares FOpenGLProgramBinaryCache's version hash) but read its progress
+    // from UVRUtils::GetQuestShaderPrecompilePercent, which answers 0 off a
+    // Quest — the loading panel stayed for good. The flag also picks the Quest
+    // device profile and the Quest branch of its materials.
+    // Episodes II and III are the same engine and the same check.
+    if (t && (strcmp(t, "x2108775495884888") == 0 || strcmp(t, "x2223615721048141") == 0 ||
+              strcmp(t, "x2426206484098337") == 0) && !strcmp(f->name, "MODEL")) return "Quest";
     return f->sval;
 }
 
 // Interned jstrings for constant object fields, parallel to g_fields so the
 // table itself stays const. A static final String read twice is the same object
 // in Java, and some callers do compare identity.
-#define KLJ_MAX_FIELDS 128
+// Sized to sit AHEAD of the table, not behind it: an entry past the end falls
+// to the uncached path, which mints an unpinned jstring per read — the exact
+// use-after-retire the pinning above exists to prevent. The table has already
+// grown past 128 once; 256 is a 2 KB array, so there is no reason to keep it
+// tight enough to be overtaken again.
+#define KLJ_MAX_FIELDS 256
 static void *g_field_cache[KLJ_MAX_FIELDS];
 
 
@@ -1601,6 +2288,11 @@ static klj_val *klj_find_write(void *obj, void *fid) {
     return NULL;
 }
 
+klj_val klj_field_written(void *obj, void *fid) {
+    const klj_val *value=klj_find_write(obj,fid);
+    return value ? *value : (klj_val){0};
+}
+
  void klj_field_store(void *obj, void *fid, klj_val v) {
     klj_wanted *w = fid;
     if (!w || w < g_wanted || w >= g_wanted + KLJ_MAX_WANTED) {
@@ -1609,6 +2301,10 @@ static klj_val *klj_find_write(void *obj, void *fid) {
     kl_egl_report(stderr);
         kl_fatal_prepare(); abort();
     }
+    // Sentry's Breadcrumbs are filled field by field, one for every event the
+    // game logs, and nothing ever reads them back: kept, they filled this
+    // table in Arizona Sunshine 2's first level and ended the run.
+    if (klj_drop_sentry(w)) return;
     klj_val *slot = klj_find_write(obj, fid);
     if (!slot) {
         if (g_nfield_writes == KLJ_MAX_FIELD_WRITES) {
@@ -1669,7 +2365,38 @@ static klj_val klj_field_value(void *obj, void *fid, char want) {
         if (want == 'F' || want == 'D') return (klj_val){.d = f->dval};
         return (klj_val){.j = (uint64_t)f->ival};
     }
+    // Epic Online Services' enum constants (EOSOverlay$BrowserStatus.BEGIN_LOAD,
+    // EOSLog$Level.*, ...). libEOSSDK reads every constant of its Java enums
+    // at init and keeps them as global refs to hand back into its own Java
+    // half — which is not here, so nothing ever looks inside them. What does
+    // matter is that each constant is a distinct, stable, non-null object of
+    // its own class, so one per (class, name) jfieldID, pinned for the
+    // process. Narrowed to the EOS package and to the enum shape (a static
+    // field whose type is its own class) so nothing else is answered blindly.
+    if (w->kind == 'F' && want == 'L'
+        && strncmp(w->cls, "com/epicgames/mobile/eossdk/", 28) == 0
+        && w->sig[0] == 'L' && strncmp(w->sig + 1, w->cls, strlen(w->cls)) == 0
+        && strcmp(w->sig + 1 + strlen(w->cls), ";") == 0) {
+        static void *eos_consts[KLJ_MAX_WANTED];
+        size_t idx = (size_t)(w - g_wanted);
+        if (!eos_consts[idx]) {
+            eos_consts[idx] = kl_jni_new_object(w->cls);
+            klj_as_object(eos_consts[idx])->pinned = 1;
+            KLJ_LOG("EOS enum constant %s.%s -> fresh pinned object", w->cls, w->name);
+        }
+        return (klj_val){.l = eos_consts[idx]};
+    }
+    {   // The Horizon Platform reply object: kl_jni_net.c owns its shape.
+        klj_val hz;
+        if (klj_horizon_message_field(obj, w->cls, w->name, w->sig, &hz)) return hz;
+        if (klj_ue4_media_track_field(obj, w->cls, w->name, w->sig, &hz)) return hz;
+    }
+    if (klj_drop_sentry(w)) return (klj_val){0};
     KLJ_LOG("no host value for field %s.%s %s", w->cls, w->name, w->sig);
+    if (!g_permissive && klj_soft_unknown()) {
+        KLJ_LOG("  ...answered with zero (KL_JNI_SOFT_UNKNOWN, the profile for untested games)");
+        return (klj_val){0};
+    }
     if (!g_permissive) {
         fprintf(stderr, "[jni] this is a work item — add it to g_fields.\n");
         kl_jni_report(stderr);
@@ -1712,6 +2439,42 @@ static klj_val klj_GameActivity_sdkInt(void) {
 
 
 static const klj_field g_fields[] = {
+    // Space Atlas VR: the avatar SDK reads this platform constant before
+    // checking permission. This supplies the name, not a permission grant.
+    KLJ_FSTR("android/Manifest$permission", "READ_EXTERNAL_STORAGE",
+             "android.permission.READ_EXTERNAL_STORAGE"),
+    KLJ_FSTR("android/Manifest$permission", "WRITE_EXTERNAL_STORAGE",
+             "android.permission.WRITE_EXTERNAL_STORAGE"),
+    // UE4.27's two GameActivity inner classes, whose objects kl_jni_ue4.c hands
+    // back from AndroidThunkJava_GetInputDeviceInfo and
+    // ...LocalNotificationGetLaunchNotification. The engine reads these fields
+    // IMMEDIATELY after the call returns, so binding the methods without the
+    // fields would only move the abort one line down, from "no host
+    // implementation" to "no host value for field" — see the note in
+    // kl_jni_ue4.c.
+    //
+    // InputDeviceInfo: the synthetic Touch pair this runtime presents. Vendor
+    // and product are 0, which is what the real GameActivity fills in when its
+    // own InputDevice lookup fails — and there is no Android InputDevice behind
+    // this one. The name and descriptor are stable strings so the engine's
+    // controller mapping sees one device, not a new one per frame.
+    KLJ_FINT("com/epicgames/ue4/GameActivity$InputDeviceInfo", "vendorId",     0),
+    KLJ_FINT("com/epicgames/ue4/GameActivity$InputDeviceInfo", "productId",    0),
+    KLJ_FINT("com/epicgames/ue4/GameActivity$InputDeviceInfo", "controllerId", 0),
+    KLJ_FSTR("com/epicgames/ue4/GameActivity$InputDeviceInfo", "name",       "Oculus Touch"),
+    KLJ_FSTR("com/epicgames/ue4/GameActivity$InputDeviceInfo", "descriptor", "klepton:touch"),
+    // LaunchNotification: this app was launched from the Home View, never from
+    // a notification. `used` false is what keeps the game instance out of a
+    // notification-handling path with nothing behind it.
+    {.cls = "com/epicgames/ue4/GameActivity$LaunchNotification",
+     .name = "used", .sig = "Z", .ival = 0},
+    KLJ_FSTR("com/epicgames/ue4/GameActivity$LaunchNotification", "event", ""),
+    KLJ_FINT("com/epicgames/ue4/GameActivity$LaunchNotification", "fireDate", 0),
+    KLJ_FINT("android/view/PointerIcon", "TYPE_DEFAULT", 1000),
+    KLJ_FINT("android/view/PointerIcon", "TYPE_ARROW", 1000),
+    KLJ_FINT("android/view/PointerIcon", "TYPE_NULL", 0),
+    KLJ_FINT("android/view/PointerIcon", "TYPE_CUSTOM", -1),
+    {"android/graphics/Bitmap$Config", "ARGB_8888", "Landroid/graphics/Bitmap$Config;", NULL, 0, 0, klj_BitmapConfig_argb8888},
     // Audio. The PROPERTY_* values are the real Android key strings, so the
     // getProperty implementation can match on them rather than on our own names.
     KLJ_FSTR("android/media/AudioManager", "PROPERTY_OUTPUT_SAMPLE_RATE",
@@ -1723,8 +2486,25 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/content/DialogInterface", "BUTTON_POSITIVE", -1),
     KLJ_FINT("android/content/DialogInterface", "BUTTON_NEGATIVE", -2),
     KLJ_FINT("android/content/DialogInterface", "BUTTON_NEUTRAL",  -3),
+    KLJ_FINT("android/media/AudioManager", "GET_DEVICES_INPUTS",  1),
     KLJ_FINT("android/media/AudioManager", "GET_DEVICES_OUTPUTS", 2),
+    KLJ_FINT("android/media/AudioManager", "GET_DEVICES_ALL",     3),
     KLJ_FINT("android/media/AudioManager", "STREAM_MUSIC", 3),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUILTIN_SPEAKER", 2),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLUETOOTH_A2DP", 8),
+    KLJ_FINT("android/bluetooth/BluetoothAdapter", "STATE_OFF",         10),
+    KLJ_FINT("android/bluetooth/BluetoothAdapter", "STATE_TURNING_ON",  11),
+    KLJ_FINT("android/bluetooth/BluetoothAdapter", "STATE_ON",          12),
+    KLJ_FINT("android/bluetooth/BluetoothAdapter", "STATE_TURNING_OFF", 13),
+    // Audio focus and AudioAttributes (AOSP values), read by the API-26
+    // requestAudioFocus path in runtime/jni/kl_jni_window.c.
+    KLJ_FINT("android/media/AudioManager", "AUDIOFOCUS_GAIN", 1),
+    KLJ_FINT("android/media/AudioManager", "AUDIOFOCUS_REQUEST_FAILED", 0),
+    KLJ_FINT("android/media/AudioManager", "AUDIOFOCUS_REQUEST_GRANTED", 1),
+    KLJ_FINT("android/media/AudioAttributes", "USAGE_MEDIA", 1),
+    KLJ_FINT("android/media/AudioAttributes", "USAGE_GAME", 14),
+    KLJ_FINT("android/media/AudioAttributes", "CONTENT_TYPE_MUSIC", 2),
+    KLJ_FINT("android/media/AudioAttributes", "CONTENT_TYPE_SONIFICATION", 4),
     // MediaFormat colour constants — Unity's AndroidVideoMedia reads these off
     // the decoded video format to set up the output colour conversion. Values
     // are the AOSP MediaFormat definitions.
@@ -1748,6 +2528,54 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_TI_FormatYUV420PackedSemiPlanar", 0x7F000100),
     KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_FormatYUV420PackedSemiPlanar", 39),
     KLJ_FINT("android/media/MediaCodecInfo$CodecCapabilities", "COLOR_FormatYUV420PackedPlanar",     20),
+
+    // AudioDeviceInfo.TYPE_*. A caller that walks getDevices() does not read
+    // getType() for its own sake — it reads it to COMPARE, and a comparison
+    // needs both sides. Batman: Arkham Shadow dies on exactly that shape: one
+    // getDevices(GET_DEVICES_OUTPUTS), one getType() on the device we answer
+    // with, and then a GetStaticFieldID for TYPE_BLUETOOTH_A2DP to compare it
+    // against — which we had no value for, so the whole process aborted for
+    // want of the number 8. The comparison is going to FAIL either way (we
+    // report the built-in speaker), and that is the correct outcome; what was
+    // wrong was dying instead of answering.
+    //
+    // So the whole documented family goes in, not just the one name the trace
+    // happened to reach. These are fixed platform constants, identical on every
+    // Android release that defines them, and a caller classifying an output
+    // typically tests several in a row — adding them one abort at a time would
+    // cost a failed run per constant. Values from AudioDeviceInfo (API 23+,
+    // with the later BLE/eARC additions).
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_UNKNOWN",              0),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUILTIN_EARPIECE",     1),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUILTIN_SPEAKER",      2),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_WIRED_HEADSET",        3),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_WIRED_HEADPHONES",     4),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_LINE_ANALOG",          5),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_LINE_DIGITAL",         6),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLUETOOTH_SCO",        7),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLUETOOTH_A2DP",       8),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_HDMI",                 9),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_HDMI_ARC",            10),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_USB_DEVICE",          11),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_USB_ACCESSORY",       12),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_DOCK",                13),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_FM",                  14),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUILTIN_MIC",         15),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_FM_TUNER",            16),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_TV_TUNER",            17),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_TELEPHONY",           18),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_AUX_LINE",            19),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_IP",                  20),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUS",                 21),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_USB_HEADSET",         22),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_HEARING_AID",         23),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BUILTIN_SPEAKER_SAFE",24),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_REMOTE_SUBMIX",       25),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLE_HEADSET",         26),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLE_SPEAKER",         27),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_HDMI_EARC",           29),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_BLE_BROADCAST",       30),
+    KLJ_FINT("android/media/AudioDeviceInfo", "TYPE_DOCK_ANALOG",         31),
 
     // View.SYSTEM_UI_FLAG_* and the window flag behind them. Real Android
     // values: Unity ORs these together and hands the result straight back to
@@ -1787,6 +2615,11 @@ static const klj_field g_fields[] = {
     // flag, and nothing would report it.
     KLJ_FSTR("android/content/Intent", "ACTION_BATTERY_CHANGED",
              "android.intent.action.BATTERY_CHANGED"),
+    // Opening a link or another app (DreamSpace's Spotify button builds
+    // `new Intent(); setAction(ACTION_VIEW); setData(Uri.parse(url))` and starts
+    // it). Without the constant the run ended there (2026-10-16). What the
+    // intent then meets is klj_Context_startActivity.
+    KLJ_FSTR("android/content/Intent", "ACTION_VIEW", "android.intent.action.VIEW"),
 
     KLJ_FSTR("android/os/Environment", "MEDIA_MOUNTED", "mounted"),
     KLJ_FFN("android/net/Uri", "EMPTY", "Landroid/net/Uri;", klj_Uri_EMPTY),
@@ -1895,6 +2728,20 @@ static const klj_field g_fields[] = {
     // for one field again — the declared type and libunity's erased one.
     KLJ_FFN("com/unity3d/player/UnityPlayer", "currentContext", "Landroid/content/Context;", klj_currentActivity_field),
     KLJ_FFN("com/unity3d/player/UnityPlayer", "currentContext", "Ljava/lang/Object;", klj_currentActivity_field),
+    // The other direction: the activity's handle on the player it constructed.
+    // UnityPlayerActivity.smali declares
+    //   .field protected mUnityPlayer:Lcom/unity3d/player/UnityPlayer;
+    // and sets it in onCreate. A C# plugin reaching the player does
+    //   UnityPlayer.currentActivity.Get<AndroidJavaObject>("mUnityPlayer")
+    // which arrives here through ReflectionHelper.getFieldID with the ERASED
+    // Ljava/lang/Object; — the same two-spellings-of-one-field shape as
+    // currentActivity above, so both are listed and both call one function.
+    // Paint the Town Red stops here on its first guest frame without it, one
+    // read after registerInputDeviceListener.
+    KLJ_FFN("com/unity3d/player/UnityPlayerActivity", "mUnityPlayer",
+            "Lcom/unity3d/player/UnityPlayer;", klj_mUnityPlayer_field),
+    KLJ_FFN("com/unity3d/player/UnityPlayerActivity", "mUnityPlayer",
+            "Ljava/lang/Object;", klj_mUnityPlayer_field),
     KLJ_FFN("android/graphics/PorterDuff$Mode", "CLEAR", "Landroid/graphics/PorterDuff$Mode;", klj_porterduff_clear),
 
     KLJ_FFN("android/content/pm/PackageItemInfo", "metaData", "Landroid/os/Bundle;", klj_metaData_field),
@@ -1909,6 +2756,12 @@ static const klj_field g_fields[] = {
     // below the app's targetSdkVersion of 30, so Unity takes the compatibility
     // paths the title actually shipped against. Revisit if a path needs 30+.
     KLJ_FINT("android/os/Build$VERSION", "SDK_INT", 29),
+    // ...and its preview twin, which Unreal 5.3 (Pinball FX VR) reads right
+    // after SDK_INT. It is 0 on every SHIPPED Android build and non-zero only
+    // on a developer preview, which this device is declared not to be; the
+    // engine adds it to SDK_INT to get an effective API level, so 0 is both the
+    // truthful answer and the one that leaves SDK_INT meaning what it says.
+    KLJ_FINT("android/os/Build$VERSION", "PREVIEW_SDK_INT", 0),
     // UE4's GameActivity copies SDK_INT into a static of its own in its class
     // initializer and then branches on THAT everywhere (13 sites in RE4's
     // GameActivity alone). A guest whose Java we stand in for never runs that
@@ -2006,6 +2859,12 @@ static const klj_field g_fields[] = {
     KLJ_FINT("android/media/MediaRouter", "ROUTE_TYPE_LIVE_AUDIO", 1),
     KLJ_FINT("android/media/MediaRouter", "ROUTE_TYPE_LIVE_VIDEO", 2),
     KLJ_FINT("android/media/MediaRouter", "ROUTE_TYPE_USER",       8388608),
+
+    // Unity's internetReachability compares getActiveNetworkInfo().getType()
+    // against these two to decide LocalAreaNetwork vs CarrierDataNetwork.
+    // android-34 android.jar values, like the MediaRouter block above.
+    KLJ_FINT("android/net/ConnectivityManager", "TYPE_MOBILE", 0),
+    KLJ_FINT("android/net/ConnectivityManager", "TYPE_WIFI",   1),
 
     KLJ_FSTR("android/provider/Settings$Secure", "ANDROID_ID", "android_id"),
 
@@ -2122,7 +2981,7 @@ const klj_binding *const klj_binding_tables[] = {
     klj_bind_electra,
     klj_bind_fmod,
     klj_bind_jkxr,
-    klj_bind_bhaptics,
+    klj_bind_haptics,
     NULL,
 };
 
@@ -2137,12 +2996,12 @@ typedef struct { void *functions; } klj_env_t;
 static pthread_key_t  g_env_key;
 static void klj_build_tables(void);
 static void klj_init(void) {
-    pthread_key_create(&g_env_key, free);
+    kl_key_create_or_die(&g_env_key, free, "the per-thread JNIEnv");
     // The defaults are relative literals; the setters resolve what they are
     // given, so this covers the case where nothing set them.
     g_assets_dir     = klj_abspath(g_assets_dir);
     (void)kl_jni_files_dir();   // resolve now, so the report below prints it
-    g_apk_path       = klj_abspath(g_apk_path);
+    (void)kl_jni_apk_path();    // resolves KL_APK / the default, absolutised
     g_native_lib_dir = klj_abspath(g_native_lib_dir);
     // Raw opens of "<apk>/assets/..." (Unity's split assets) are served from
     // the unpacked tree: g_assets_dir points at "<unpacked>/assets", so the
@@ -2168,6 +3027,7 @@ void *kl_jni_env(void) {
     klj_env_t *e = pthread_getspecific(g_env_key);
     if (!e) {
         e = calloc(1, sizeof *e);
+        if (!e) abort();
         e->functions = g_env_vtable;
         pthread_setspecific(g_env_key, e);
         kl_thread_init();
@@ -2287,6 +3147,8 @@ static void klj_build_tables(void) {
     ENV(NewDirectByteBuffer,     klj_NewDirectByteBuffer);
     ENV(GetDirectBufferAddress,  klj_GetDirectBufferAddress);
     ENV(GetDirectBufferCapacity, klj_GetDirectBufferCapacity);
+    ENV(GetPrimitiveArrayCritical, klj_GetPrimitiveArrayCritical);
+    ENV(ReleasePrimitiveArrayCritical, klj_ReleasePrimitiveArrayCritical);
     ENV(NewObjectArray,          klj_NewObjectArray);
     ENV(GetObjectArrayElement,   klj_GetObjectArrayElement);
     ENV(SetObjectArrayElement,   klj_SetObjectArrayElement);
@@ -2323,4 +3185,220 @@ static void klj_build_tables(void) {
     VM(GetEnv,                      klj_GetEnv);
     VM(DestroyJavaVM,               klj_DestroyJavaVM);
 #undef VM
+}
+
+// ---------------------------------------------- the object-lifetime gate
+// `make jniobj`, in `make check`. Milliseconds, no guest, no window.
+//
+// Two facts about the object model, both learned the expensive way — each was
+// a boot that died hundreds of lines from the binding that actually caused it:
+//
+//  1. A binding that CACHES its answer in a host static must pin it. The
+//     object is allocated inside whatever local frame the first caller had
+//     open; that frame's pop retires the slot, the static keeps the pointer,
+//     and the next caller is handed a jobject we no longer recognise. Paint
+//     the Town Red VR's boot aborted in GetObjectClass on exactly that
+//     pointer — the int[] from InputDevice.getDeviceIds(), four calls after it
+//     was built.
+//
+//  2. Unity's C# side asks for these methods with ERASED spellings, and the
+//     erased call must produce the same tagged object the exact one does.
+//     `AndroidJavaObject.CallStatic<AndroidJavaObject>("getDeviceIds")` spells
+//     the return `Ljava/lang/Object;`; the same call with a null or
+//     object-typed argument erases that end too. All three spellings resolve
+//     to one binding, so all three must come back with the same identity.
+//
+// The subject is the InputDevice family because it is where both defects were
+// found and because it exercises every return shape at once: a primitive
+// array, an object, a string, an int and a boolean.
+int kl_jni_object_lifetime_selftest(FILE *out) {
+    int fails = 0, checks = 0;
+#define OBJ_CHECK(cond, ...) do { \
+        checks++; \
+        if (!(cond)) { fprintf(out, "  FAIL: " __VA_ARGS__); fprintf(out, "\n"); fails++; } \
+    } while (0)
+
+    void *env = kl_jni_env();
+    void *cls = klj_class_object("android/view/InputDevice");
+
+    // ---- 1. the cached int[] outlives the frame it was built in ----
+    void *mid_exact = klj_want(cls, "getDeviceIds", "()[I", 'M');
+    klj_PushLocalFrame(env, 16);
+    klj_val r1 = klj_call_a(env, cls, mid_exact, NULL, 'L');
+    klj_PopLocalFrame(env, NULL);
+    OBJ_CHECK(klj_as_object(r1.l) != NULL,
+              "the int[] from getDeviceIds()[I did not survive the local frame it "
+              "was built in — a host static holding a jobject must go through "
+              "klj_host_cache, or the next caller gets a retired slot");
+
+    // ---- 2. the ERASED return answers with the SAME object ----
+    void *mid_er = klj_want(cls, "getDeviceIds", "()Ljava/lang/Object;", 'M');
+    klj_val r2 = klj_call_a(env, cls, mid_er, NULL, 'L');
+    OBJ_CHECK(klj_as_object(r2.l) != NULL,
+              "getDeviceIds()Ljava/lang/Object; — the erased spelling Unity's C# "
+              "uses — did not return a tagged jobject");
+    OBJ_CHECK(r2.l == r1.l,
+              "the erased and exact spellings of getDeviceIds returned DIFFERENT "
+              "objects; Unity keys its joystick slots on that identity");
+
+    // ...and it is an int[], which is what GetObjectClass has to be able to say:
+    // Unity builds its AndroidJavaObject wrapper out of exactly this answer.
+    if (klj_as_object(r2.l)) {
+        void *k = klj_GetObjectClass(env, r2.l);
+        const char *kn = klj_class_name(k);
+        OBJ_CHECK(strcmp(kn, "[I") == 0,
+                  "GetObjectClass on the int[] said \"%s\", not \"[I\"", kn);
+        OBJ_CHECK(klj_GetArrayLength(env, r2.l) == 2,
+                  "the device-id array is %d long, not 2 (the two Touch controllers)",
+                  (int)klj_GetArrayLength(env, r2.l));
+        int32_t ids[2] = {0, 0};
+        klj_GetIntArrayRegion(env, r2.l, 0, 2, ids);
+        OBJ_CHECK(ids[0] == 8 && ids[1] == 9,
+                  "the device ids read back as [%d, %d], not [8, 9] — the ids are "
+                  "stable on purpose", ids[0], ids[1]);
+    }
+
+    // ---- 3. getDevice(int) through the erased return, across a frame ----
+    void *mid_dev = klj_want(cls, "getDevice", "(I)Ljava/lang/Object;", 'M');
+    klj_jvalue av[2];
+    av[0].i = 8;
+    klj_PushLocalFrame(env, 16);
+    klj_val dev = klj_call_a(env, cls, mid_dev, av, 'L');
+    klj_PopLocalFrame(env, NULL);
+    OBJ_CHECK(klj_as_object(dev.l) != NULL,
+              "getDevice(8) through the erased return did not survive its frame");
+
+    if (klj_as_object(dev.l)) {
+        const char *dn = klj_class_name(klj_GetObjectClass(env, dev.l));
+        OBJ_CHECK(strcmp(dn, "android/view/InputDevice") == 0,
+                  "getDevice(8) answered an object of class \"%s\"", dn);
+
+        // Everything Rewired asks the device afterwards, in the spellings C#
+        // produces: a String return erased to Object, and the primitives, which
+        // cannot be erased and so must still match exactly.
+        void *mid_name = klj_want(cls, "getName", "()Ljava/lang/Object;", 'm');
+        klj_val nm = klj_call_a(env, dev.l, mid_name, NULL, 'L');
+        const char *nms = klj_str(nm.l);
+        OBJ_CHECK(nms && strcmp(nms, "Oculus Touch Controller - Left") == 0,
+                  "getName() erased to Object answered \"%s\"", nms ? nms : "(null)");
+
+        void *mid_desc = klj_want(cls, "getDescriptor", "()Ljava/lang/Object;", 'm');
+        klj_val ds = klj_call_a(env, dev.l, mid_desc, NULL, 'L');
+        const char *dss = klj_str(ds.l);
+        OBJ_CHECK(dss && strcmp(dss, "klepton-touch-l") == 0,
+                  "getDescriptor() erased to Object answered \"%s\"", dss ? dss : "(null)");
+
+        void *mid_pid = klj_want(cls, "getProductId", "()I", 'm');
+        void *mid_vid = klj_want(cls, "getVendorId",  "()I", 'm');
+        void *mid_vrt = klj_want(cls, "isVirtual",    "()Z", 'm');
+        OBJ_CHECK((int32_t)klj_call_a(env, dev.l, mid_pid, NULL, 'I').j == 0,
+                  "getProductId() is not 0 — the Touch controllers are not USB devices");
+        OBJ_CHECK((int32_t)klj_call_a(env, dev.l, mid_vid, NULL, 'I').j == 0,
+                  "getVendorId() is not 0");
+        OBJ_CHECK((klj_call_a(env, dev.l, mid_vrt, NULL, 'Z').j & 1) == 0,
+                  "isVirtual() is true — these are physical controllers");
+
+        // hasKeys, with BOTH ends erased: the argument spelled Ljava/lang/Object;
+        // (an int[] held in an `object`) and the return spelled the same. That is
+        // the one call needing the argument tier and the return tier at once.
+        void *keys = klj_new_array('I', NULL, 3);
+        ((int32_t *)klj_arr(keys)->data)[0] = 96;    // BUTTON_A
+        ((int32_t *)klj_arr(keys)->data)[1] = 97;    // BUTTON_B
+        ((int32_t *)klj_arr(keys)->data)[2] = 99;    // BUTTON_X
+        void *mid_keys = klj_want(cls, "hasKeys",
+                                  "(Ljava/lang/Object;)Ljava/lang/Object;", 'm');
+        av[0].l = keys;
+        klj_val hk = klj_call_a(env, dev.l, mid_keys, av, 'L');
+        OBJ_CHECK(klj_as_object(hk.l) != NULL,
+                  "hasKeys() with the argument AND the return erased to Object did "
+                  "not resolve — the loose tier wants identical arguments and the "
+                  "assignability tier wanted an identical return, and this call "
+                  "needs both relaxations at once");
+        if (klj_as_object(hk.l)) {
+            const char *hn = klj_class_name(klj_GetObjectClass(env, hk.l));
+            OBJ_CHECK(strcmp(hn, "[Z") == 0,
+                      "hasKeys() answered an object of class \"%s\", not \"[Z\"", hn);
+            OBJ_CHECK(klj_GetArrayLength(env, hk.l) == 3,
+                      "hasKeys() answered %d flags for 3 keys — Rewired indexes it "
+                      "positionally", (int)klj_GetArrayLength(env, hk.l));
+            uint8_t flags[3] = {1, 1, 1};
+            klj_GetBooleanArrayRegion(env, hk.l, 0, 3, flags);
+            OBJ_CHECK(!flags[0] && !flags[1] && !flags[2],
+                      "hasKeys() claimed a Touch controller carries an Android "
+                      "keymap; Rewired reads that as a DualShock 4");
+        }
+    }
+
+    // ---- 4. the lookup the guest made with NO signature ----
+    //
+    // Unity's AndroidJNIHelper.GetMethodID has an optional `signature`
+    // parameter, and bHaptics' Unity wrapper omits it for five of its methods.
+    // The id must still come back carrying the REAL signature, or the call it
+    // is used for has no return kind and no argument list.
+    void *bh = klj_class_object("com/bhaptics/bhapticsunity/BhapticsManagerWrapper");
+
+    void *mid_nosig = klj_want(bh, "refreshPairing", "", 'm');
+    OBJ_CHECK(strcmp(((klj_wanted *)mid_nosig)->sig, "()V") == 0,
+              "refreshPairing asked with NO signature was issued with sig \"%s\", "
+              "not \"()V\" — the call would decode no arguments and report return "
+              "kind '?'", ((klj_wanted *)mid_nosig)->sig);
+
+    // ...and it interns to the SAME id as the fully-spelled lookup, so a guest
+    // that asks both ways does not get two entries for one method.
+    OBJ_CHECK(klj_want(bh, "refreshPairing", "()V", 'm') == mid_nosig,
+              "the signed and unsigned spellings of refreshPairing were issued as "
+              "two different jmethodIDs");
+
+    // The call itself: through the 'V' slot, which is the one that warned.
+    klj_call_a(env, bh, mid_nosig, NULL, 'V');
+
+    void *mid_user = klj_want(bh, "isBhapticsUser", "", 'm');
+    OBJ_CHECK(strcmp(((klj_wanted *)mid_user)->sig, "()Z") == 0,
+              "isBhapticsUser asked with NO signature was issued with sig \"%s\"",
+              ((klj_wanted *)mid_user)->sig);
+    OBJ_CHECK((klj_call_a(env, bh, mid_user, NULL, 'Z').j & 1) == 0,
+              "isBhapticsUser() answered true — there is no bHaptics hardware here");
+
+    // An overloaded name is REFUSED rather than guessed: isPlayingByEventId is
+    // declared for both int and String, and marshalling one as the other is how
+    // a name-only lookup turns into a wrong answer instead of a stop.
+    void *mid_amb = klj_want(bh, "isPlayingByEventId", "", 'm');
+    OBJ_CHECK(((klj_wanted *)mid_amb)->sig[0] == 0,
+              "isPlayingByEventId asked with NO signature resolved to \"%s\"; it is "
+              "overloaded and must be refused, not picked by table order",
+              ((klj_wanted *)mid_amb)->sig);
+
+    // A name nothing implements resolves to nothing, and stays empty.
+    void *mid_none = klj_want(bh, "stopInt", "", 'm');
+    OBJ_CHECK(((klj_wanted *)mid_none)->sig[0] == 0,
+              "an unbound name asked with NO signature was given sig \"%s\"",
+              ((klj_wanted *)mid_none)->sig);
+
+    // ---- 5. an argument spelled as the guest's own activity class ----
+    //
+    // Unity's reflection helper spells a parameter as the class of the object
+    // it passes, dotted, so WebSettings.getDefaultUserAgent(Context) is asked
+    // for with UnityPlayerActivity in the slot. The row is declared as Java
+    // declares it and is reached through the assignability tier — and the game
+    // that asks (Real VR Fishing, fix 37) is one nobody here can run, so this
+    // is where the spelling is held to. Resolved before it is called: a call
+    // that resolves to nothing ends the process instead of failing a check.
+    static const char ua_sig[] = "(Lcom.unity3d.player.UnityPlayerActivity;)Ljava/lang/String;";
+    int ua_bound = klj_resolve_binding("android/webkit/WebSettings",
+                                       "getDefaultUserAgent", ua_sig) != NULL;
+    OBJ_CHECK(ua_bound, "WebSettings.getDefaultUserAgent%s resolves to no binding", ua_sig);
+    if (ua_bound) {
+        void *ws = klj_class_object("android/webkit/WebSettings");
+        klj_jvalue ua_arg[1] = {{0}};
+        const char *ua = klj_str(klj_call_a(env, ws, klj_want(ws, "getDefaultUserAgent", ua_sig, 'M'),
+                                            ua_arg, 'L').l);
+        const char *model = kl_jni_build_string("MODEL");
+        OBJ_CHECK(ua && model && strstr(ua, model),
+                  "getDefaultUserAgent answered \"%s\", which does not name the "
+                  "model Build.MODEL does (\"%s\")", ua ? ua : "(null)", model ? model : "(null)");
+    }
+
+    fprintf(out, "  %d checks, %d failed\n", checks, fails);
+#undef OBJ_CHECK
+    return fails == 0;
 }

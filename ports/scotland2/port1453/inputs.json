@@ -1,0 +1,633 @@
+{
+  "schema": 1,
+  "status": "experimental source port; component builds and host fixtures in progress; not packaged or headset validated",
+  "game": {
+    "version": "1.45.3_30054",
+    "versionCode": 3237,
+    "unity": "6.3",
+    "metadataVersion": 39,
+    "files": {
+      "libil2cpp.so": "bb560407d856fdd8f00ac3026967b5b10c3af4dbcfa3650ac3fa41d58a3744eb",
+      "libunity.so": "4bd2583ea13fa77b13a5ff22ddc4508347f54a087c62995efe19ff8d944cef43",
+      "global-metadata.dat": "34859f9dbfeb2dcd5f6ebe3ce64d682c836bcf40c97b2055f414a151dba9c5b8"
+    }
+  },
+  "sources": [
+    {
+      "name": "bshook",
+      "repository": "QuestPackageManager/beatsaber-hook",
+      "ref": "v9.3.0",
+      "commit": "27b667a3aa2fac8f478c2c86aa1e0ceb3cdf1756",
+      "url": "https://codeload.github.com/QuestPackageManager/beatsaber-hook/zip/27b667a3aa2fac8f478c2c86aa1e0ceb3cdf1756",
+      "file": "bshook-27b667a3aa2f.zip",
+      "sha256": "3dc135b9027b049d08dcc33b01e213d19e7ab93e3ced1377409b0cc537cd1e12"
+    },
+    {
+      "name": "customtypes",
+      "repository": "QuestPackageManager/Il2CppQuestTypePatching",
+      "ref": "v0.21.2",
+      "commit": "869bdc45518e319aa05763a6410d305b64694c4b",
+      "url": "https://codeload.github.com/QuestPackageManager/Il2CppQuestTypePatching/zip/869bdc45518e319aa05763a6410d305b64694c4b",
+      "file": "customtypes-869bdc45518e.zip",
+      "sha256": "463557035846ca56bc31a283915701f2508e4a3121a1f50b309428a3b274477a"
+    },
+    {
+      "name": "lapiz",
+      "repository": "raineaeternal/Lapiz",
+      "ref": "v0.3.7",
+      "commit": "ac2f7b1331c1a038787f259555d0ab0fbc8970c3",
+      "url": "https://codeload.github.com/raineaeternal/Lapiz/zip/ac2f7b1331c1a038787f259555d0ab0fbc8970c3",
+      "file": "lapiz-ac2f7b1331c1.zip",
+      "sha256": "900073ce59fea83d0767f56b0c1f36ac533d77f26c777fb79475d4a56e44859f"
+    },
+    {
+      "name": "bsml",
+      "repository": "bsq-ports/Quest-BSML",
+      "ref": "v0.6.5",
+      "commit": "63643df7ba0ec7cbb87d972460f3374013c7f58f",
+      "url": "https://codeload.github.com/bsq-ports/Quest-BSML/zip/63643df7ba0ec7cbb87d972460f3374013c7f58f",
+      "file": "bsml-63643df7ba0e.zip",
+      "sha256": "1f0cf58a63492b1b25477067f95119f2026dc406137e9b2eb5b6d574e8969905"
+    },
+    {
+      "name": "songcore",
+      "repository": "raineaeternal/Quest-SongCore",
+      "ref": "v1.3.5",
+      "commit": "f309c82a405a07fe6def38ff4327401559f63aec",
+      "url": "https://codeload.github.com/raineaeternal/Quest-SongCore/zip/f309c82a405a07fe6def38ff4327401559f63aec",
+      "file": "songcore-f309c82a405a.zip",
+      "sha256": "857decea848e58bebd743490b69b3b123d3f8956904361b9d0d3a18f816e9d2c"
+    },
+    {
+      "name": "playlistcore",
+      "repository": "Metalit/PlaylistCore",
+      "ref": "v1.7.2",
+      "commit": "7b88a3eb03a8f4eefad8c51f89c69de680c55def",
+      "url": "https://codeload.github.com/Metalit/PlaylistCore/zip/7b88a3eb03a8f4eefad8c51f89c69de680c55def",
+      "file": "playlistcore-7b88a3eb03a8.zip",
+      "sha256": "dab813da20fddef31592681475047f4a41c4129d7c4ab48774a9391fe4c40c9b"
+    },
+    {
+      "name": "songdownloader",
+      "repository": "darknight1050/SongDownloader",
+      "ref": "v0.9.1",
+      "commit": "237816de03a919c9f34eea1d16c4e1d8c66ff792",
+      "url": "https://codeload.github.com/darknight1050/SongDownloader/zip/237816de03a919c9f34eea1d16c4e1d8c66ff792",
+      "file": "songdownloader-237816de03a9.zip",
+      "sha256": "f160a1693251eba551db824ff84a0ec3f1efd5c1ce183ec4824e231f9682b8f9"
+    },
+    {
+      "name": "unicode",
+      "repository": "Metalit/UnicodeQuest",
+      "ref": "v0.1.8",
+      "commit": "fe45a1f57f3bc8e0faf98d198dced5aa3d5c3746",
+      "url": "https://codeload.github.com/Metalit/UnicodeQuest/zip/fe45a1f57f3bc8e0faf98d198dced5aa3d5c3746",
+      "file": "unicode-fe45a1f57f3b.zip",
+      "sha256": "bf5bebafaa6806a2b71cb4b2cf7cf71de276d550d05473f4071f9ab49a176ecd"
+    },
+    {
+      "name": "datakeeper",
+      "repository": "Metalit/PlayerDataKeeper",
+      "ref": "v0.2.7",
+      "commit": "5d08762c56ee855febb052e8e503038da760f25c",
+      "url": "https://codeload.github.com/Metalit/PlayerDataKeeper/zip/5d08762c56ee855febb052e8e503038da760f25c",
+      "file": "datakeeper-5d08762c56ee.zip",
+      "sha256": "2076ade81723e8e9ab242c11ab4e1e48450a15d20bc07ea3a4f2b891209b9b23"
+    },
+    {
+      "name": "metacore",
+      "repository": "Metalit/MetaCore",
+      "ref": "v2.0.6",
+      "commit": "7b59035dcde74af2f42efd7c793fbfa06a6cb0ee",
+      "url": "https://codeload.github.com/Metalit/MetaCore/zip/7b59035dcde74af2f42efd7c793fbfa06a6cb0ee",
+      "file": "metacore-7b59035dcde7.zip",
+      "sha256": "0fac56cfb3b4f2a34e1073f8db1bcd32c18a251c5ccfd259e3389d8282dad6e6"
+    },
+    {
+      "name": "metacore-bs",
+      "repository": "Metalit/MetaCoreBS",
+      "ref": "v1.0.1",
+      "commit": "d7f83ce6ba67de8a3669b4e744af7a50f75c5d0a",
+      "url": "https://codeload.github.com/Metalit/MetaCoreBS/zip/d7f83ce6ba67de8a3669b4e744af7a50f75c5d0a",
+      "file": "metacore-bs-d7f83ce6ba67.zip",
+      "sha256": "d8ae82fe04e577eb85a575386dd742a6e370fc6c2c193d3546d010a3b3d96c5d"
+    },
+    {
+      "name": "bettersongsearch",
+      "repository": "bsq-ports/BetterSongSearchQuest",
+      "ref": "v2.3.0-bs-1.45.3",
+      "commit": "e4447d8af22943af9997f390fb6ee93c77120dab",
+      "url": "https://codeload.github.com/bsq-ports/BetterSongSearchQuest/zip/e4447d8af22943af9997f390fb6ee93c77120dab",
+      "file": "bettersongsearch-e4447d8af229.zip",
+      "sha256": "9fcf6e2e8a0e030f30b7d7a6d55b1445832bd757eb46a387d9cce464b2848be2"
+    },
+    {
+      "name": "bs-cordl",
+      "repository": "QuestPackageManager/bs-cordl",
+      "ref": "version/v4503_0_0",
+      "commit": "61cd6b3497c5da55e03857399a2fc5a7648dc2a7",
+      "url": "https://codeload.github.com/QuestPackageManager/bs-cordl/zip/61cd6b3497c5da55e03857399a2fc5a7648dc2a7",
+      "file": "bs-cordl-61cd6b3497c5.zip",
+      "sha256": "45f6b3d913e0d9557379763404a3f32bd5f3092e9c177cba7a80b8756e5b9d6e"
+    },
+    {
+      "name": "paperlog",
+      "repository": "Fernthedev/paperlog",
+      "ref": "v4.8.0",
+      "commit": "669bd706f4c72b857bc78db6a02b3157366416ed",
+      "url": "https://codeload.github.com/Fernthedev/paperlog/zip/669bd706f4c72b857bc78db6a02b3157366416ed",
+      "file": "paperlog-669bd706f4c7.zip",
+      "sha256": "b0adb5db2adaa1321eb53044c7195e0968a02d7a4aa7642f7b832268c0ee7098"
+    },
+    {
+      "name": "flamingo",
+      "repository": "QuestPackageManager/Flamingo",
+      "ref": "v1.2.1",
+      "commit": "5f5b84a5f4309a13cb17e2ba69b711e5163d34e1",
+      "url": "https://codeload.github.com/QuestPackageManager/Flamingo/zip/5f5b84a5f4309a13cb17e2ba69b711e5163d34e1",
+      "file": "flamingo-5f5b84a5f430.zip",
+      "sha256": "fe6ababefbacf9450c5b33c571871e93e1dc8761e8e648f76e278840c88df910"
+    },
+    {
+      "name": "web-utils",
+      "repository": "bsq-ports/WebUtils",
+      "ref": "v0.6.9",
+      "commit": "2b8f03988c7acc290e79cfc6f84f163ed94506a3",
+      "url": "https://codeload.github.com/bsq-ports/WebUtils/zip/2b8f03988c7acc290e79cfc6f84f163ed94506a3",
+      "file": "web-utils-2b8f03988c7a.zip",
+      "sha256": "b1cbbc23a940f572a5542314e70698d3621d484c82177247d41a0bcd3ae59656"
+    },
+    {
+      "name": "song-details",
+      "repository": "bsq-ports/SongDetails",
+      "ref": "v1.0.5",
+      "commit": "712ac42f1bd4bd4a6c8bb44d25111fd67b526cbf",
+      "url": "https://codeload.github.com/bsq-ports/SongDetails/zip/712ac42f1bd4bd4a6c8bb44d25111fd67b526cbf",
+      "file": "song-details-712ac42f1bd4.zip",
+      "sha256": "358e056762d6b4325d9099bd9e7e1c24ac44a2c5c3fd07900555402ca84e79e3"
+    },
+    {
+      "name": "reflectcpp",
+      "repository": "kodenamekrak/reflectcpp-qpm",
+      "ref": "v0.25.0",
+      "commit": "015370344a380ba6058a1fcf1eca28f5ce60c10e",
+      "url": "https://codeload.github.com/kodenamekrak/reflectcpp-qpm/zip/015370344a380ba6058a1fcf1eca28f5ce60c10e",
+      "file": "reflectcpp-015370344a38.zip",
+      "sha256": "4db1a794ecf8a32b57e46587ba5fe85ac2eb60977eb0431c7b4ec80ab16168b8"
+    },
+    {
+      "name": "config-utils",
+      "repository": "darknight1050/config-utils",
+      "ref": "v3.0.0",
+      "commit": "847697f5601932604598fe2dfce323be8ff72415",
+      "url": "https://codeload.github.com/darknight1050/config-utils/zip/847697f5601932604598fe2dfce323be8ff72415",
+      "file": "config-utils-847697f56019.zip",
+      "sha256": "001695118317890288c4c03c8c0be4e8a8cbe9fac76b1f66fd8b8f23dba49222"
+    },
+    {
+      "name": "rapidjson-macros",
+      "repository": "Metalit/RapidjsonMacros",
+      "ref": "version/v3_0_0",
+      "commit": "f3a4f961ade276fcf29ed1d218619ddd0acfc4f8",
+      "url": "https://codeload.github.com/Metalit/RapidjsonMacros/zip/f3a4f961ade276fcf29ed1d218619ddd0acfc4f8",
+      "file": "rapidjson-macros-f3a4f961ade2.zip",
+      "sha256": "96425a2b8ffda75c7ccbb3d06bc0a8afce85a5aa1213fe23740a572ee051e7e3"
+    },
+    {
+      "name": "fmt",
+      "version": "11.0.2",
+      "url": "https://codeload.github.com/fmtlib/fmt/zip/refs/tags/11.0.2",
+      "sha256": "7aa4b58e361de10b8e5d7b6c18aebd98be1886ab3efe43e368527a75cd504ae4",
+      "file": "fmt-11.0.2.zip",
+      "patch": "ports/scotland2/port1453/patches/fmt.patch"
+    },
+    {
+      "name": "beatsaverplusplus",
+      "repository": "bsq-ports/BeatSaverPlusPlus",
+      "ref": "v0.2.4",
+      "commit": "dee78687d7db6590a33f40d8d9059bd81eaa27fd",
+      "url": "https://codeload.github.com/bsq-ports/BeatSaverPlusPlus/zip/dee78687d7db6590a33f40d8d9059bd81eaa27fd",
+      "file": "beatsaverplusplus-dee78687d7db.zip",
+      "sha256": "393ef2df5961af96d02830a495eeaeb809c54ed80e6fcb3e8ddd3375c0d871bb"
+    }
+  ],
+  "ndk": {
+    "package": "ndk;29.0.14206865",
+    "url": "https://dl.google.com/android/repository/android-ndk-r29-darwin.zip",
+    "size": 1049519838,
+    "checksum": "03d29fbb57e3c05a7d53597dd011d856c1456a4f",
+    "checksumType": "sha1",
+    "sha256": "ce5e4b100ec5fe5be4eb3edcb2c02528824ff9cda3860f5304619be6c3da34d3"
+  },
+  "libil2cpp": {
+    "version": "0.5.0",
+    "url": "https://cdn.frozenalex.com/libil2cpp_0.5.0.zip",
+    "sha256": "331dd3964cb44762477f34a0e2234286095e1632cf3665d5fe19bb8967444f5a"
+  },
+  "excludedMods": [
+    "FakeId"
+  ],
+  "airbuds": {
+    "version": "2.0.2",
+    "status": "No upstream 1.45.3 release; actual source requires SDK/API adaptation"
+  },
+  "packages": [
+    {
+      "id": "beatsaverplusplus",
+      "version": "0.2.4",
+      "url": "https://github.com/bsq-ports/BeatSaverPlusPlus/releases/download/v0.2.4/BeatSaverPlusPlus.qmod",
+      "file": "beatsaverplusplus-0.2.4.qmod",
+      "sha256": "06ad6a384fc8c44dae244e18131c9c7a039a3f90824565220f3095d6f213ee95",
+      "libraryFiles": [
+        "libbeatsaverplusplus.so",
+        "libzip.so"
+      ],
+      "earlyModFiles": [],
+      "lateModFiles": []
+    },
+    {
+      "id": "metacore",
+      "version": "2.0.6",
+      "url": "https://github.com/Metalit/MetaCore/releases/download/v2.0.6/MetaCore.qmod",
+      "file": "metacore-2.0.6.qmod",
+      "sha256": "a6709572db971bcbd91c19784e278a39fb49c9a9af37db54d9ed650e563cb88d",
+      "libraryFiles": [],
+      "earlyModFiles": [
+        "libmetacore.so"
+      ],
+      "lateModFiles": []
+    },
+    {
+      "id": "tinyxml2",
+      "version": "10.0.0",
+      "url": "https://github.com/MillzyDev/NDK-tinyxml2/releases/download/v10.0.0/tinyxml2.qmod",
+      "file": "tinyxml2-10.0.0.qmod",
+      "sha256": "dd4af8b43a251a7f96fc86a2e2e0801a1405d452497b30cbeab438142e56797a",
+      "libraryFiles": [
+        "libtinyxml2.so"
+      ],
+      "earlyModFiles": [],
+      "lateModFiles": []
+    },
+    {
+      "id": "web-utils",
+      "version": "0.6.9",
+      "url": "https://github.com/bsq-ports/WebUtils/releases/download/v0.6.9/WebUtils.qmod",
+      "file": "web-utils-0.6.9.qmod",
+      "sha256": "8acebe93dbac29cf095c46d37c47c524cd6e61512b09cda908449df918b0029e",
+      "libraryFiles": [
+        "libweb-utils.so"
+      ],
+      "earlyModFiles": [],
+      "lateModFiles": []
+    },
+    {
+      "id": "song-details",
+      "version": "1.0.5",
+      "url": "https://github.com/bsq-ports/SongDetails/releases/download/v1.0.5/SongDetails.qmod",
+      "file": "song-details-1.0.5.qmod",
+      "sha256": "dea6f8509338545f5fe5abbc916ae2fe96d2e4aff34718386c105cf5b90f066a",
+      "libraryFiles": [
+        "libsongdetails.so"
+      ],
+      "earlyModFiles": [],
+      "lateModFiles": []
+    },
+    {
+      "id": "flamingo",
+      "version": "1.2.1",
+      "url": "https://github.com/QuestPackageManager/Flamingo/releases/download/v1.2.1/flamingo.qmod",
+      "file": "flamingo-1.2.1.qmod",
+      "sha256": "b1a01e13a62b64ded05e93574f2fca6a225a879bcc21fa88012d18f8152b81a9",
+      "libraryFiles": [
+        "libflamingo.so"
+      ],
+      "earlyModFiles": [],
+      "lateModFiles": []
+    },
+    {
+      "id": "custom-types",
+      "version": "0.21.2",
+      "url": "https://github.com/QuestPackageManager/Il2CppQuestTypePatching/releases/download/v0.21.2/CustomTypes.qmod",
+      "file": "custom-types-0.21.2.qmod",
+      "sha256": "46dbc5b3cce7c63087777f80549d8d0a360f9090e534bef53d7eee0352788072",
+      "libraryFiles": [
+        "libcustom-types.so"
+      ],
+      "earlyModFiles": [],
+      "lateModFiles": []
+    },
+    {
+      "id": "paper2_scotland2",
+      "version": "4.8.0",
+      "url": "https://github.com/Fernthedev/paperlog/releases/download/v4.8.0/paper2_scotland2.qmod",
+      "file": "paper2_scotland2-4.8.0.qmod",
+      "sha256": "e46c815577d52b115119335cae5ec49e184be1f2f8affd5f67fa4c295788781a",
+      "libraryFiles": [
+        "libpaper2_scotland2.so"
+      ],
+      "earlyModFiles": [],
+      "lateModFiles": []
+    },
+    {
+      "id": "reflectcpp",
+      "version": "0.25.0",
+      "url": "https://github.com/kodenamekrak/reflectcpp-qpm/releases/download/v0.25.0/reflectcpp.qmod",
+      "file": "reflectcpp-0.25.0.qmod",
+      "sha256": "4261f5a7b9ee8845379408313dab657a419b35062d066a40025a216c758e1cc5",
+      "libraryFiles": [
+        "libreflectcpp.so"
+      ],
+      "earlyModFiles": [],
+      "lateModFiles": []
+    },
+    {
+      "id": "beatsaber-hook",
+      "version": "9.3.0",
+      "url": "https://github.com/QuestPackageManager/beatsaber-hook/releases/download/v9.3.0/beatsaber-hook.qmod",
+      "file": "beatsaber-hook-9.3.0.qmod",
+      "sha256": "9dbf9cc33a4b5fc858a6d0228361bbf55ca2236f42572bd229de8ae7df2a8a47",
+      "libraryFiles": [
+        "libbeatsaber-hook.so"
+      ],
+      "earlyModFiles": [],
+      "lateModFiles": []
+    },
+    {
+      "id": "bsml",
+      "version": "0.6.5",
+      "url": "https://github.com/bsq-ports/Quest-BSML/releases/download/v0.6.5/BSML.qmod",
+      "file": "bsml-0.6.5.qmod",
+      "sha256": "46ab28c691137db586e199835e7a350bb356ee5727a83e285bdf60985a910175",
+      "libraryFiles": [],
+      "earlyModFiles": [
+        "libbsml.so"
+      ],
+      "lateModFiles": []
+    },
+    {
+      "id": "songcore",
+      "version": "1.3.5",
+      "url": "https://github.com/raineaeternal/Quest-SongCore/releases/download/v1.3.5/SongCore.qmod",
+      "file": "songcore-1.3.5.qmod",
+      "sha256": "e07b150bfadf939611b1335701986682a32f2b2c3aca331241170b5e883206ab",
+      "libraryFiles": [],
+      "earlyModFiles": [],
+      "lateModFiles": [
+        "libsongcore.so"
+      ]
+    },
+    {
+      "id": "lapiz",
+      "version": "0.3.7",
+      "url": "https://github.com/raineaeternal/Lapiz/releases/download/v0.3.7/Lapiz.qmod",
+      "file": "lapiz-0.3.7.qmod",
+      "sha256": "e9eef69eb2da117a3f20350b7c4f55cf88abbc8f6bea8fe4ecf08c367dac5ea0",
+      "libraryFiles": [],
+      "earlyModFiles": [
+        "liblapiz.so"
+      ],
+      "lateModFiles": []
+    },
+    {
+      "id": "playlistcore",
+      "version": "1.7.2",
+      "url": "https://github.com/Metalit/PlaylistCore/releases/download/v1.7.2/PlaylistCore.qmod",
+      "file": "playlistcore-1.7.2.qmod",
+      "sha256": "fa9b0bb765f9046a00bd93453f9f28db34e103a69a90733f379aec97e9d42c1e",
+      "libraryFiles": [],
+      "earlyModFiles": [],
+      "lateModFiles": [
+        "libplaylistcore.so"
+      ]
+    },
+    {
+      "id": "songdownloader",
+      "version": "0.9.1",
+      "url": "https://github.com/darknight1050/SongDownloader/releases/download/v0.9.1/SongDownloader.qmod",
+      "file": "songdownloader-0.9.1.qmod",
+      "sha256": "3af0678ce45386a9b0454654da5ad3206ebef515d4ba2fd10b202a0c1f8f9308",
+      "libraryFiles": [],
+      "earlyModFiles": [],
+      "lateModFiles": [
+        "libsongdownloader.so"
+      ]
+    },
+    {
+      "id": "unicode",
+      "version": "0.1.8",
+      "url": "https://github.com/Metalit/UnicodeQuest/releases/download/v0.1.8/Unicode.qmod",
+      "file": "unicode-0.1.8.qmod",
+      "sha256": "9eb9291ab74cb304279b4618a2bc0e31dcb9ad1e6b4835c934d6b3ea36cd6f96",
+      "libraryFiles": [],
+      "earlyModFiles": [],
+      "lateModFiles": [
+        "libunicode.so"
+      ]
+    },
+    {
+      "id": "datakeeper",
+      "version": "0.2.7",
+      "url": "https://github.com/Metalit/PlayerDataKeeper/releases/download/v0.2.7/PlayerDataKeeper.qmod",
+      "file": "datakeeper-0.2.7.qmod",
+      "sha256": "7cf32265f277cd1e94db90069ad954e41a0e92e767cf54098c392e2577ffeb55",
+      "libraryFiles": [],
+      "earlyModFiles": [
+        "libdatakeeper.so"
+      ],
+      "lateModFiles": []
+    },
+    {
+      "id": "metacore-bs",
+      "version": "1.0.1",
+      "url": "https://github.com/Metalit/MetaCoreBS/releases/download/v1.0.1/MetaCoreBS.qmod",
+      "file": "metacore-bs-1.0.1.qmod",
+      "sha256": "bd22d5a8971c77bd826d3eb8b0eb0ac9f15ca1c3bd243ff0f6db8f5eac5a942e",
+      "libraryFiles": [],
+      "earlyModFiles": [
+        "libmetacore-bs.so"
+      ],
+      "lateModFiles": []
+    },
+    {
+      "id": "BetterSongSearch",
+      "version": "2.3.0",
+      "url": "https://github.com/bsq-ports/BetterSongSearchQuest/releases/download/v2.3.0-bs-1.45.3/BetterSongSearch.qmod",
+      "file": "BetterSongSearch-2.3.0.qmod",
+      "sha256": "48c339359bf7192dac5936fe4a539b84fe7df7bdc04f899acfd6184fe263e4c7",
+      "libraryFiles": [],
+      "earlyModFiles": [],
+      "lateModFiles": [
+        "libBetterSongSearch.so"
+      ]
+    }
+  ],
+  "airbudsSource": {
+    "repository": "zilewang7/Beat-Saber-Airbuds-Search",
+    "commit": "7b6d223b85631a2bd96753dad6a64bb82927a09d",
+    "version": "2.0.2",
+    "selection": "All root entries except third-party; unused Encryption.cpp excluded; OpenSSL is supplied by shared verified HTTPS library",
+    "selectedArchiveSha256": "f0b3d26dde215443d98dbb77ed4721bf137e3163ffe90d6b5d164f928a5c148a",
+    "selectedArchiveBytes": 9144320
+  },
+  "patches": [
+    {
+      "module": "airbuds-search",
+      "files": [
+        "include/Configuration.hpp",
+        "include/ConfigurationStore.hpp",
+        "include/UI/FlowCoordinators/AirbudsSearchFlowCoordinator.hpp",
+        "include/Utils.hpp",
+        "include/main.hpp",
+        "src/Airbuds/AirbudsClient.cpp",
+        "src/Configuration.cpp",
+        "src/SpriteCache.cpp",
+        "src/UI/TableViewCells/AirbudsPlaylistTableViewCell.cpp",
+        "src/UI/TableViewCells/AirbudsTrackHeaderTableViewCell.cpp",
+        "src/UI/TableViewCells/AirbudsTrackTableViewCell.cpp",
+        "src/UI/TableViewCells/CustomSongTableViewCell.cpp",
+        "src/UI/TableViewCells/DownloadHistoryTableViewCell.cpp",
+        "src/UI/TableViewCells/FriendListTableViewCell.cpp",
+        "src/UI/ViewControllers/MainViewController.cpp",
+        "src/UI/ViewControllers/SettingsViewController.cpp",
+        "src/Utils.cpp",
+        "src/main.cpp"
+      ],
+      "patchSha256": "3876a813bc84b4672b70845e78984f9340c522b44e0c9caae93bd0b0699456e2"
+    },
+    {
+      "module": "beatsaverplusplus",
+      "files": [
+        "include/Utils.hpp",
+        "shared/macros.hpp",
+        "src/Utils.cpp"
+      ],
+      "patchSha256": "8d617e0bc0a8b29f25a3bb0e1add9e1e65cf47fcebebacf4cbeae2a75d37c2c2"
+    },
+    {
+      "module": "bshook",
+      "files": [
+        "shared/capstone.hpp",
+        "shared/hooking.hpp",
+        "src/tests/hooking.cpp",
+        "src/utils.cpp"
+      ],
+      "patchSha256": "6ec899078a1bbaa9986fca3f05850838977a0c8ba919660e913ea028cc96db70"
+    },
+    {
+      "module": "bsml",
+      "files": [
+        "include/hooking.hpp"
+      ],
+      "patchSha256": "beba07bece4012c949a3fcd2a27d050361bb6d00a59a94ef0573d365cd8d4935"
+    },
+    {
+      "module": "customtypes",
+      "files": [
+        "src/register.cpp"
+      ],
+      "patchSha256": "30e054a3ac9610bf9760dd29810f9d93f89225de6312a9e7bbb734c15757a6b4"
+    },
+    {
+      "module": "datakeeper",
+      "files": [
+        "include/hooks.hpp",
+        "src/main.cpp"
+      ],
+      "patchSha256": "7e305c4f1cddbb712f90e30186d3e113ae4d6af775bf15c03f86577a51195aaa"
+    },
+    {
+      "module": "flamingo",
+      "files": [
+        "src/installer.cpp"
+      ],
+      "patchSha256": "4ae5e3a445ec15edb8677aa7e3d9bda5d69c681215083a5cc00525b2f31f2f68"
+    },
+    {
+      "module": "fmt",
+      "files": [
+        "include/fmt/base.h"
+      ],
+      "patchSha256": "e65b67aca7825c6635cbfa1cf31afecb20e1fc97d72e89a52eab58167e7db1b7"
+    },
+    {
+      "module": "lapiz",
+      "files": [
+        "include/utilities/hooking.hpp"
+      ],
+      "patchSha256": "e77532a6017e69a6cb39c7ab027c9db7249eb0b74aca9273ee03023f12b3984e"
+    },
+    {
+      "module": "metacore",
+      "files": [
+        "include/hooks.hpp",
+        "src/hooks.cpp"
+      ],
+      "patchSha256": "f6d31d32e1f151a9c88b83378802cf513f3a82717210450ec9f92364b2490c24"
+    },
+    {
+      "module": "metacore-bs",
+      "files": [
+        "include/hooks.hpp"
+      ],
+      "patchSha256": "48dd66f90347455af4e40e237b1833c676cd0f9df35f7625af57756bb666e356"
+    },
+    {
+      "module": "song-details",
+      "files": [
+        "src/Data/DataGetter.cpp",
+        "src/Data/SongDetailsContainer.cpp",
+        "src/SongDetails.cpp",
+        "src/Utils.cpp"
+      ],
+      "patchSha256": "0e0305b5a583a32dacc79b79af55f5949f0e71c8c9cccc562349780b5caecced"
+    },
+    {
+      "module": "songcore",
+      "files": [
+        "include/hooking.hpp",
+        "src/SongLoader/NavigationControllerUpdater.cpp"
+      ],
+      "patchSha256": "d0309fc2e704075e42fd1aa8575aed304f3e70784e43e07908089a8c97a89ac0"
+    },
+    {
+      "module": "songdownloader",
+      "files": [
+        "include/CustomTypes/DownloadSongsSearchViewController.hpp",
+        "include/Utils/ResponseValidation.hpp",
+        "shared/BeatSaverAPI.hpp",
+        "shared/ScoreSaberAPI.hpp",
+        "src/BeatSaverAPI.cpp",
+        "src/CustomTypes/DownloadSongsSearchViewController.cpp",
+        "src/CustomTypes/SearchEntry.cpp",
+        "src/ScoreSaberAPI.cpp",
+        "src/Utils/WebUtils.cpp"
+      ],
+      "patchSha256": "344a924a18714f2e362388d7a7f400f53a2032c28f68ca933c62f933c0c789f2"
+    },
+    {
+      "module": "unicode",
+      "files": [
+        "src/main.cpp"
+      ],
+      "patchSha256": "d787e503b72e3d9b20dcc99d8d29e376922874cc9a2062a5427143ad001427ad"
+    },
+    {
+      "module": "web-utils",
+      "files": [
+        "shared/DownloaderUtility.hpp",
+        "shared/Response.hpp",
+        "src/DownloaderUtility.cpp"
+      ],
+      "patchSha256": "17f0856a3382221f51daafa11c429350772b2ae47e4629119db232b8a479a2f7"
+    }
+  ],
+  "linkReferences": [
+    {
+      "file": "libsl2.so",
+      "url": "https://github.com/sc2ad/scotland2/releases/download/v0.1.7/libsl2.so",
+      "sha256": "3c34627ede42c9281a0d28147bc222424c5dc451263a14c7a9ab6a88331890fe",
+      "scope": "Original Android link-time reference only. The native Scotland2 loader remains the implementation installed in the app."
+    }
+  ]
+}

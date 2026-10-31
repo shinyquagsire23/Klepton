@@ -1,0 +1,51 @@
+{
+  "version": "0.3.0",
+  "sharedDir": "shared",
+  "dependenciesDir": "extern",
+  "info": {
+    "name": "BeatSaverPlusPlus",
+    "id": "beatsaverplusplus",
+    "version": "0.1.0",
+    "url": "https://github.com/bsq-ports/BeatSaverPlusPlus",
+    "additionalData": {
+      "overrideSoName": "libbeatsaverplusplus.so",
+      "cmake": false
+    }
+  },
+  "workspace": {
+    "scripts": {
+      "qmod": [
+        "pwsh ./scripts/build.ps1",
+        "qpm qmod manifest",
+        "pwsh ./scripts/createqmod.ps1 BeatSaverPlusPlus"
+      ]
+    },
+    "qmodIncludeDirs": [],
+    "qmodIncludeFiles": [],
+    "qmodOutput": null
+  },
+  "dependencies": [
+    {
+      "id": "paper2_scotland2",
+      "versionRange": "^4.0.0",
+      "additionalData": {}
+    },
+    {
+      "id": "zip",
+      "versionRange": "^1.7.4",
+      "additionalData": {
+        "private": true
+      }
+    },
+    {
+      "id": "web-utils",
+      "versionRange": "^0.6.0",
+      "additionalData": {}
+    },
+    {
+      "id": "beatsaber-hook",
+      "versionRange": "*",
+      "additionalData": {}
+    }
+  ]
+}

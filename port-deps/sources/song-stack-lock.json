@@ -1,0 +1,23 @@
+[
+  {
+    "name": "lapiz",
+    "repository": "raineaeternal/Lapiz",
+    "tag": "v0.2.23",
+    "commit": "dce1d785d6aa7a8b61918c2210815ba25ec2391c",
+    "sha256": "3877124b2b2308f23aa0edcf42c6976ea99d3743d2c788f29d117ac6a9b3540c"
+  },
+  {
+    "name": "bsml",
+    "repository": "bsq-ports/Quest-BSML",
+    "tag": "v0.4.55",
+    "commit": "4987a88698becce955e44301fd4d573fc9180c2f",
+    "sha256": "c21267915d773dc48f225c44f50a2e94f57e5d98e8107bffb3275658c95656b1"
+  },
+  {
+    "name": "songcore",
+    "repository": "raineaeternal/Quest-SongCore",
+    "tag": "v1.1.24",
+    "commit": "4556891fb93a2a71549df11404074589daf8b31d",
+    "sha256": "6481e3ab2d7837ed8c4b0d116b6636252b08c09891bd5c7bbef2354c80c74d44"
+  }
+]

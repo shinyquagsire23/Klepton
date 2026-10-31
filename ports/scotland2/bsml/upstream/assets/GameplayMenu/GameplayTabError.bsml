@@ -1,0 +1,7 @@
+﻿<bg xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='https://raw.githubusercontent.com/RedBrumbler/Quest-BSML-Docs/gh-pages/schema.xsd'>
+    <modifier-container pref-width='65'>
+        <vertical>
+            <text text='Error loading gameplay tab.' />
+        </vertical>
+    </modifier-container>
+</bg>

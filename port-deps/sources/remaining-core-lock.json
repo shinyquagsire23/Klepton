@@ -1,0 +1,26 @@
+[
+  {
+    "name": "datakeeper",
+    "repository": "Metalit/PlayerDataKeeper",
+    "tag": "v0.2.5",
+    "commit": "53a7e2d9f99a2e67ac325cadd40121196722fb0e",
+    "archive": "datakeeper-53a7e2d.tar.gz",
+    "sha256": "cc1ea31c26ca4605eb73542ff91002f8e292110f24dfa5c514054142e3489755"
+  },
+  {
+    "name": "unicode",
+    "repository": "Metalit/UnicodeQuest",
+    "tag": "v0.1.7",
+    "commit": "0cf6d1eefcf2175778e27261bd2fc1e6d604ea8a",
+    "archive": "unicode-0cf6d1e.tar.gz",
+    "sha256": "1327cb015babc19653fe073a572019598e658d17802c95475786ea89e26902a5"
+  },
+  {
+    "name": "fakeid",
+    "repository": "DanTheMan827-BeatSaber/Quest.FakeID",
+    "tag": "v0.1.9+1.40.8_7379",
+    "commit": "32747ab2496a148815c0abad0cd1f634d4398ba1",
+    "archive": "fakeid-32747ab.tar.gz",
+    "sha256": "6052eccbdb23e9cfc592fa53858eaa07edca534911503f41b22eab9d0b86ec6f"
+  }
+]

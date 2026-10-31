@@ -1,0 +1,16 @@
+{
+    "_QPVersion": "0.1.1",
+    "name": "WebUtils",
+    "id": "web-utils",
+    "author": "RedBrumbler",
+    "version": "${version}",
+    "packageId": "com.beatgames.beatsaber",
+    "isLibrary": true,
+    "description": "library to provide easier ways of downloading things from the web",
+    "dependencies": [],
+    "lateModFiles": [],
+    "libraryFiles": [
+      "${binary}"
+    ],
+    "fileCopies": []
+  }
