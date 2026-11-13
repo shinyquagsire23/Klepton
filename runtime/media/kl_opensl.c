@@ -32,6 +32,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread/qos.h>
 #include "klepton.h"
 #include "kl_env.h"
 #include "kl_audio.h"
@@ -42,6 +43,8 @@ typedef int32_t  SLresult;
 typedef uint32_t SLboolean;
 
 #define SL_RESULT_SUCCESS            0
+#define SL_RESULT_PARAMETER_INVALID  13
+#define SL_RESULT_BUFFER_INSUFFICIENT 7
 #define SL_RESULT_FEATURE_UNSUPPORTED 12
 #define SL_BOOLEAN_FALSE             0
 #define SL_OBJECT_STATE_REALIZED     2
@@ -179,10 +182,28 @@ typedef struct {
     SLuint32 formatType, numChannels, samplesPerSec, bitsPerSample,
              containerSize, channelMask, endianness;
 } SLDataFormat_PCM;
+
+// SLAndroidDataFormat_PCM_EX — SLDataFormat_PCM with one field appended, and
+// the reason Batman: Arkham Shadow's first audible run was half-speed static.
+//
+// Oboe opens OpenSL with PCM_EX (formatType 0x4) whenever the requested format
+// is Float, which is what Wwise on Meta's EPS spatialiser asks for. A host that
+// only recognises formatType 2 falls through to whatever defaults it seeded —
+// for us 48000 Hz / 2 ch / 16 bit, which is precisely what an ordinary int16
+// player looks like, so the log line agreed with itself and lied. The
+// `representation` field is the ONLY thing that separates the two; read it.
+typedef struct {
+    SLuint32 formatType, numChannels, samplesPerSec, bitsPerSample,
+             containerSize, channelMask, endianness, representation;
+} SLAndroidDataFormat_PCM_EX;
 typedef struct { void *pLocator; void *pFormat; } SLDataSource;
 typedef struct { void *pLocator; void *pFormat; } SLDataSink;   // same shape
 
 #define SL_DATAFORMAT_PCM 2
+#define SL_ANDROID_DATAFORMAT_PCM_EX 0x4
+#define SL_ANDROID_PCM_REPRESENTATION_SIGNED_INT   0x1
+#define SL_ANDROID_PCM_REPRESENTATION_UNSIGNED_INT 0x2
+#define SL_ANDROID_PCM_REPRESENTATION_FLOAT        0x3
 
 // ---- objects ----
 #define KL_SL_QUEUE 16
@@ -209,7 +230,7 @@ typedef struct kl_sl_player {
     unsigned generation;                    // bumped on every re-creation
 
     unsigned rate, channels, bits;          // from the PCM format
-    int      mixes;                          // 1: feed kl_audio; 0: usleep-pace only
+    kl_audio_fmt fmt;                       // ...and its sample encoding
     unsigned long consumed;
 } kl_sl_player;
 
@@ -267,10 +288,38 @@ static kl_sl_recorder g_recorder;
 // (kl_audio_write_src, the same per-source path Steam Link's two streams use).
 #define KL_SL_MAX_PLAYERS 4
 static kl_sl_player g_players[KL_SL_MAX_PLAYERS];
-static int          g_audio_users;     // players that opened kl_audio (refcount)
-static unsigned     g_device_rate;     // the rate the device was opened at (first player)
 static pthread_mutex_t g_players_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long g_buffers_consumed;
+static unsigned long g_enqueued;        // Enqueue() calls the guest made
+static unsigned long g_enqueue_full;    // ...and the ones we refused, queue full
+static unsigned long g_callbacks;       // buffer-queue callbacks we delivered
+
+// A heartbeat, not a report. Everything below is already counted; none of it
+// has ever been printed on device, because the end-of-run report only runs on a
+// clean exit of the synthetic lifecycle and a headset build is killed or
+// backgrounded instead. It is driven from the app's own [hb] ticker rather than
+// from the feeder thread on purpose: "the player was never created" is one of
+// the answers we need, and a heartbeat that lives inside the player cannot give
+// it.
+void kl_opensl_heartbeat(FILE *f) {
+    // The first live player speaks for the set; the counters are global.
+    const kl_sl_player *p = NULL;
+    int nstarted = 0;
+    for (int i = 0; i < KL_SL_MAX_PLAYERS; i++)
+        if (g_players[i].started) { nstarted++; if (!p) p = &g_players[i]; }
+    if (!p) {
+        fprintf(f, "  [sl] heartbeat: no audio player has ever been created "
+                   "(the guest never asked OpenSL for an output)\n");
+        return;
+    }
+    fprintf(f, "  [sl] heartbeat: %d player(s), first state=%s queued=%u enqueued=%lu (full %lu) "
+               "consumed=%lu callbacks=%lu  (%u Hz, %u ch, %u bit, %s)\n",
+            nstarted, p->state == SL_PLAYSTATE_PLAYING ? "PLAYING"
+          : p->state == SL_PLAYSTATE_PAUSED  ? "PAUSED"  : "STOPPED",
+            p->count, g_enqueued, g_enqueue_full, g_buffers_consumed, g_callbacks,
+            p->rate, p->channels, p->bits, kl_audio_fmt_name(p->fmt));
+    kl_audio_heartbeat(f);
+}
 
 // Resolve the owning player from an interface pointer. The object interface
 // pointer IS the player (obj_vt is the first field); the play/bq/cfg pointers sit
@@ -320,6 +369,12 @@ static void *feeder(void *arg) {
 #endif
     kl_sl_player *p = arg;
     kl_thread_init();
+    // Same argument as kl_aaudio.c's feeder: this thread calls the guest's
+    // mixer and then blocks for one buffer's playback, so a preemption lands
+    // in the output as a hole. A plain pthread_attr is QOS_CLASS_UNSPECIFIED,
+    // which on Apple silicon is the tier the scheduler may satisfy from an
+    // efficiency core.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     pthread_mutex_lock(&p->lock);
     while (p->running) {
         if (p->state != SL_PLAYSTATE_PLAYING || p->count == 0) {
@@ -334,7 +389,7 @@ static void *feeder(void *arg) {
         SLuint32 size = p->q[p->head].size;
         p->head = (p->head + 1) % KL_SL_QUEUE;
         p->count--;
-        unsigned frame = (p->channels * p->bits) / 8;
+        unsigned frame = p->channels * kl_audio_fmt_bytes(p->fmt);
         if (!frame) frame = 4;
         unsigned rate = p->rate ? p->rate : 48000;
         unsigned generation = p->generation;
@@ -349,7 +404,7 @@ static void *feeder(void *arg) {
         // draining) leaves the remainder to be paced the old way. That keeps one
         // code path for both cases: with no audio, `played` is 0 and this is
         // byte-for-byte the usleep loop it replaced.
-        size_t played = (buf && p->mixes) ? kl_audio_write_src(p, buf, size) : 0;
+        size_t played = buf ? kl_audio_write_src(p, buf, size) : 0;
         if (played < size) {
             uint64_t rem = ((uint64_t)size - played) / frame;
             useconds_t us = (useconds_t)(rem * 1000000ull / rate);
@@ -380,7 +435,7 @@ static void *feeder(void *arg) {
 
         p->consumed++;
         g_buffers_consumed++;
-        if (cb) cb((SLBufferQueueItf)&p->bq_vt, cb_ctx);
+        if (cb) { g_callbacks++; cb((SLBufferQueueItf)&p->bq_vt, cb_ctx); }
 
         pthread_mutex_lock(&p->lock);
         p->in_cb = 0;
@@ -398,32 +453,14 @@ static SLresult obj_Realize(SLObjectItf self, SLboolean async) {
     (void)async;
     kl_sl_player *p = obj_as_player(self);
     if (p && !p->started) {
-        // Open the device before the feeder exists, so its first buffer already
-        // has somewhere to go. Only the FIRST player opens it (and fixes the
-        // ring's format); later players mix into that same device by source key.
-        // A failure here is not fatal — the feeder falls back to usleep pacing,
-        // which is what this player did for its whole life before kl_audio.c.
-        // kl_audio has ONE input rate (the ring + per-source mix cursors assume
-        // it). The first player fixes that rate; a later player at the SAME rate
-        // mixes in, but one at a DIFFERENT rate (vampire: UE4's 44.1 kHz output
-        // alongside FMOD's 48 kHz) would advance the mix cursor at the wrong step
-        // and desync the ring — heard as the render callback starving and the
-        // device restarting (the "no render callback for N s" breakup). So a
-        // mismatched-rate player does NOT feed kl_audio; it paces with usleep and
-        // stays silent to the device, which is correct when it is the secondary,
-        // near-silent output (UE4's here). Same-rate players mix as before.
-        if (g_audio_users == 0) {
-            kl_audio_open(p->rate, p->channels, p->bits);
-            g_device_rate = p->rate;
-            p->mixes = 1;
-        } else {
-            p->mixes = (p->rate == g_device_rate);
-            if (!p->mixes)
-                fprintf(stderr, "  [sl] player #%d at %u Hz != device %u Hz — pacing "
-                        "silently (not mixed) to avoid ring desync\n",
-                        (int)(p - g_players), p->rate, g_device_rate);
-        }
-        g_audio_users++;
+        // Open this player's SOURCE before the feeder exists, so its first buffer
+        // already has somewhere to go. Every player is its own source to the sink,
+        // at its own rate and encoding (a UE4 title can run UE4's own 44.1 kHz
+        // output alongside FMOD's 48 kHz) — kl_audio.h says which one owns the output and how the
+        // others are paced (KL_AUDIO_MIX_SOURCES=1 mixes them instead). A failure
+        // here is not fatal: the feeder falls back to usleep pacing, which is what
+        // this player did for its whole life before kl_audio.c.
+        kl_audio_open_src_fmt(p, "opensl", p->rate, p->channels, p->fmt);
         p->started = p->running = 1;
         pthread_create(&p->thread, NULL, feeder, p);
     }
@@ -469,21 +506,23 @@ static const struct SLObjectItf_ g_obj_vt = {
 };
 
 // ---- SLPlayItf ----
-static int any_player_playing(void) {
-    for (int i = 0; i < KL_SL_MAX_PLAYERS; i++)
-        if (g_players[i].started && g_players[i].state == SL_PLAYSTATE_PLAYING)
-            return 1;
-    return 0;
-}
 static SLresult play_SetPlayState(SLPlayItf self, SLuint32 state) {
     kl_sl_player *p = KL_SL_PLAY_P(self);
+    // Once per distinct state. "Did the guest ever start the stream?" is one
+    // bit, and without this line no device log can answer it.
+    static SLuint32 said = (SLuint32)-1;
+    if (state != said) {
+        said = state;
+        fprintf(stderr, "  [sl] SetPlayState(%s)\n",
+                state == SL_PLAYSTATE_PLAYING ? "PLAYING"
+              : state == SL_PLAYSTATE_PAUSED  ? "PAUSED" : "STOPPED");
+    }
     // Before the lock, and before waiting: the feeder may be parked inside
     // kl_audio_write waiting for the ring to drain, and that wait only ends
     // when the sink stops being "playing". Doing this after player_wait_cb
-    // would be waiting for a thread we have not yet told to stop. The device is
-    // SHARED across players, so this briefly unblocks every feeder — the others
-    // re-check their own state (still PLAYING) and carry on once it resumes.
-    if (state != SL_PLAYSTATE_PLAYING) kl_audio_pause();
+    // would be waiting for a thread we have not yet told to stop. Per player:
+    // each is its own source, so pausing one never silences another.
+    if (state != SL_PLAYSTATE_PLAYING) kl_audio_pause_src(p);
     pthread_mutex_lock(&p->lock);
     p->state = state;
     pthread_cond_signal(&p->wake);
@@ -494,11 +533,9 @@ static SLresult play_SetPlayState(SLPlayItf self, SLuint32 state) {
     // The queued audio is dropped rather than drained, for the same reason the
     // callback wait above exists: the guest stops precisely when it is about to
     // release the buffers it enqueued, and real OpenSL does not go on playing
-    // them. Draining would sound better and be wrong. Only PAUSE/FLUSH the
-    // shared device when NO other player is left playing, or one output stopping
-    // would silence the others (vampire's FMOD would die when UE4's stops).
-    if (state == SL_PLAYSTATE_PLAYING || any_player_playing()) kl_audio_play();
-    else                                                       kl_audio_flush();
+    // them. Draining would sound better and be wrong.
+    if (state == SL_PLAYSTATE_PLAYING) kl_audio_play_src(p);
+    else                               kl_audio_flush_src(p);
     fprintf(stderr, "  [sl] play state -> %s\n",
             state == SL_PLAYSTATE_PLAYING ? "PLAYING" :
             state == SL_PLAYSTATE_PAUSED  ? "PAUSED" : "STOPPED");
@@ -523,9 +560,11 @@ static SLresult bq_Enqueue(SLBufferQueueItf self, const void *buf, SLuint32 size
     kl_sl_player *p = KL_SL_BQ_P(self);
     pthread_mutex_lock(&p->lock);
     if (p->count == KL_SL_QUEUE) {
+        g_enqueue_full++;
         pthread_mutex_unlock(&p->lock);
         return SL_RESULT_FEATURE_UNSUPPORTED;   // queue full; FMOD retries
     }
+    g_enqueued++;
     p->q[p->tail].buf = buf;
     p->q[p->tail].size = size;
     p->tail = (p->tail + 1) % KL_SL_QUEUE;
@@ -558,14 +597,69 @@ static const struct SLBufferQueueItf_ g_bq_vt = {
 };
 
 // ---- SLAndroidConfigurationItf ----
+//
+// "Recorded, not applied" was only ever half true: nothing was recorded, and
+// GetConfiguration refused every key with SL_RESULT_FEATURE_UNSUPPORTED. That
+// refusal is what silenced Batman.
+//
+// On Android these keys always HAVE a value — the ones the guest never set have
+// the platform default — so `unsupported` is not the conservative answer here,
+// it is a claim the interface exists and holds nothing, which is not a state
+// real OpenSL can be in. And a caller is entitled to treat it as fatal: the
+// oboe 1.7.0 built into libMetaXRAudioWwise.so does exactly that. Its
+// finishCommonOpen reads SL_ANDROID_KEY_PERFORMANCE_MODE, and on a nonzero SL
+// result it returns that result rather than shrugging (upstream oboe only
+// warns), so open() gives ErrorInternal, the Meta endpoint sink's device
+// creation remaps it to eps code 25 — printed as the maddeningly unrelated
+// "Unsupported format" — and Wwise ends the run with no sink at all.
+//
+// So: record what the guest sets, hand it back, and answer an unset key with
+// the documented default rather than a refusal. All the android* keys are
+// 32-bit.
+#define KL_SL_CFG_MAX 8
+static struct { char key[40]; uint32_t val; } g_cfg[KL_SL_CFG_MAX];
+static unsigned g_ncfg;
+
 static SLresult cfg_Set(SLConfigItf s, const char *k, const void *v, SLuint32 n) {
-    (void)s; (void)v; (void)n;
-    fprintf(stderr, "  [sl] SetConfiguration(\"%s\") — recorded, not applied\n",
-            k ? k : "?");
+    (void)s;
+    if (!k) return SL_RESULT_PARAMETER_INVALID;
+    uint32_t val = (v && n >= 4) ? *(const uint32_t *)v : 0;
+    unsigned i = 0;
+    for (; i < g_ncfg; i++) if (strcmp(g_cfg[i].key, k) == 0) break;
+    if (i == g_ncfg && g_ncfg < KL_SL_CFG_MAX) {
+        snprintf(g_cfg[g_ncfg].key, sizeof g_cfg[0].key, "%s", k);
+        g_ncfg++;
+    }
+    if (i < KL_SL_CFG_MAX) g_cfg[i].val = val;
+    fprintf(stderr, "  [sl] SetConfiguration(\"%s\") = %u — recorded, and readable back\n",
+            k, val);
     return SL_RESULT_SUCCESS;
 }
+
 static SLresult cfg_Get(SLConfigItf s, const char *k, SLuint32 *n, void *v) {
-    (void)s; (void)k; (void)v; if (n) *n = 0; return SL_RESULT_FEATURE_UNSUPPORTED;
+    (void)s;
+    if (!k || !n) return SL_RESULT_PARAMETER_INVALID;
+    uint32_t val = 0;                       // the platform default for every
+                                            // android* key we serve: performance
+                                            // mode NONE, stream type MEDIA(3) is
+                                            // the one exception and nobody reads it
+    int known = 0;
+    for (unsigned i = 0; i < g_ncfg; i++)
+        if (strcmp(g_cfg[i].key, k) == 0) { val = g_cfg[i].val; known = 1; break; }
+    // pValue NULL is the size query.
+    if (!v) { *n = 4; return SL_RESULT_SUCCESS; }
+    if (*n < 4) { *n = 4; return SL_RESULT_BUFFER_INSUFFICIENT; }
+    *(uint32_t *)v = val;
+    *n = 4;
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "  [sl] GetConfiguration(\"%s\") -> %u (%s). A refusal here is "
+                        "fatal to oboe's OpenSL open, which is how a live stream "
+                        "became \"Unsupported format\" three layers up.\n",
+                k, val, known ? "as the guest set it" : "platform default, never set");
+    }
+    return SL_RESULT_SUCCESS;
 }
 static const struct SLConfigItf_ g_cfg_vt = { cfg_Set, cfg_Get };
 
@@ -585,7 +679,7 @@ static SLresult eng_CreateOutputMix(SLEngineItf self, SLObjectItf *out, SLuint32
 // memmove through a null pointer, several layers from the actual mistake.
 static void player_stop(kl_sl_player *p) {
     if (!p->started) return;
-    kl_audio_pause();          // so a feeder parked in kl_audio_write can be joined
+    kl_audio_pause_src(p);     // so a feeder parked in kl_audio_write can be joined
     pthread_mutex_lock(&p->lock);
     p->running = 0;
     p->state = SL_PLAYSTATE_STOPPED;
@@ -594,12 +688,7 @@ static void player_stop(kl_sl_player *p) {
     pthread_mutex_unlock(&p->lock);
     pthread_join(p->thread, NULL);
     p->started = 0;
-    // The device is shared: close it only when the LAST player is gone, and if
-    // others remain, un-pause it so their feeders resume (the pause above hit
-    // every feeder, not just this one's).
-    if (g_audio_users > 0) g_audio_users--;
-    if (g_audio_users == 0) kl_audio_close();   // only after the join: feeder is the producer
-    else if (any_player_playing()) kl_audio_play();
+    kl_audio_close_src(p);     // only after the join: the feeder is the producer
     pthread_mutex_destroy(&p->lock);
     pthread_cond_destroy(&p->wake);
     pthread_cond_destroy(&p->cb_done);
@@ -639,7 +728,7 @@ static SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *out,
     p->bq_vt = &g_bq_vt;
     p->cfg_vt = &g_cfg_vt;
     p->state = SL_PLAYSTATE_STOPPED;
-    p->rate = 48000; p->channels = 2; p->bits = 16;
+    p->rate = 48000; p->channels = 2; p->bits = 16; p->fmt = KL_AUDIO_S16;
     pthread_mutex_init(&p->lock, NULL);
     pthread_cond_init(&p->wake, NULL);
     pthread_cond_init(&p->cb_done, NULL);
@@ -649,14 +738,51 @@ static SLresult eng_CreateAudioPlayer(SLEngineItf self, SLObjectItf *out,
     SLDataSource *s = src;
     if (s && s->pFormat) {
         SLDataFormat_PCM *f = s->pFormat;
-        if (f->formatType == SL_DATAFORMAT_PCM) {
+        if (f->formatType == SL_DATAFORMAT_PCM ||
+            f->formatType == SL_ANDROID_DATAFORMAT_PCM_EX) {
             p->rate = f->samplesPerSec / 1000;
             p->channels = f->numChannels;
             p->bits = f->bitsPerSample;
+            // Plain PCM has no representation field and means signed integer at
+            // every width but 8; PCM_EX carries one, and reading past the end of
+            // a plain-PCM struct to find it is how this would go wrong the other
+            // way. So the width mapping is shared and only PCM_EX overrides it.
+            unsigned rep = f->formatType == SL_ANDROID_DATAFORMAT_PCM_EX
+                         ? ((SLAndroidDataFormat_PCM_EX *)f)->representation
+                         : SL_ANDROID_PCM_REPRESENTATION_SIGNED_INT;
+            switch (p->bits) {
+            case 8:  p->fmt = KL_AUDIO_U8;  break;
+            case 24: p->fmt = KL_AUDIO_S24; break;
+            case 32: p->fmt = KL_AUDIO_S32; break;
+            default: p->fmt = KL_AUDIO_S16; break;
+            }
+            if (rep == SL_ANDROID_PCM_REPRESENTATION_FLOAT) {
+                if (p->bits == 32) {
+                    p->fmt = KL_AUDIO_F32;
+                } else {
+                    // A float representation at any other width is not something
+                    // Android defines. Say so rather than reading it as ints.
+                    fprintf(stderr, "  [sl] PCM_EX claims float at %u bit, which "
+                                    "is not a format — treating it as 32-bit float\n",
+                            p->bits);
+                    p->bits = 32;
+                    p->fmt = KL_AUDIO_F32;
+                }
+            } else if (rep == SL_ANDROID_PCM_REPRESENTATION_UNSIGNED_INT && p->bits != 8) {
+                fprintf(stderr, "  [sl] PCM_EX asks for unsigned %u-bit, which we "
+                                "only implement at 8 — playing it as signed\n", p->bits);
+            }
+        } else {
+            fprintf(stderr, "  [sl] audio source format type 0x%x is neither PCM "
+                            "nor PCM_EX — keeping the 48000/2/s16 default\n",
+                    f->formatType);
         }
     }
-    fprintf(stderr, "  [sl] audio player: %u Hz, %u ch, %u bit\n",
-            p->rate, p->channels, p->bits);
+    // The format is on this line because 48000/2/16 is
+    // both the truth for FMOD and the default we fall back to for everyone else,
+    // so a line without the encoding cannot tell a parsed format from a guess.
+    fprintf(stderr, "  [sl] audio player: %u Hz, %u ch, %u bit, %s\n",
+            p->rate, p->channels, p->bits, kl_audio_fmt_name(p->fmt));
     if (out) *out = (SLObjectItf)p;
     return SL_RESULT_SUCCESS;
 }
@@ -1072,9 +1198,12 @@ void kl_opensl_report(FILE *f) {
         if (g_players[i].started) { nstarted++; if (!rep) rep = &g_players[i]; }
     if (!rep && !g_nsl && !g_buffers_consumed) return;
     fprintf(f, "\n=== OpenSL ES ===\n");
-    fprintf(f, "  buffers consumed: %lu  (%u player(s); first %u Hz, %u ch, %u bit)\n",
+    fprintf(f, "  buffers consumed: %lu  (%u player(s); first %u Hz, %u ch, %u bit, %s)\n",
             g_buffers_consumed, nstarted, rep ? rep->rate : 0,
-            rep ? rep->channels : 0, rep ? rep->bits : 0);
+            rep ? rep->channels : 0, rep ? rep->bits : 0,
+            rep ? kl_audio_fmt_name(rep->fmt) : "-");
+    fprintf(f, "  enqueued: %lu (%lu refused, queue full), callbacks delivered: %lu\n",
+            g_enqueued, g_enqueue_full, g_callbacks);
     if (g_recorder.filled)
         fprintf(f, "  recorder: %lu buffer(s) filled (%u Hz, %u ch, %u bit <- mic %u Hz/%u ch)\n",
                 g_recorder.filled, g_recorder.rate, g_recorder.channels, g_recorder.bits,

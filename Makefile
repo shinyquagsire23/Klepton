@@ -15,10 +15,11 @@ RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
-# RUNTIME_SHIP — everything that links the runtime needs them.
-LDLIBS  := -lz -framework AudioToolbox \
+# RUNTIME_SHIP — everything that links the runtime needs them. CoreAudio is the
+# mic-capture path's device query (kl_audio.c, TARGET_OS_OSX only).
+LDLIBS  := -lz -framework AudioToolbox -framework CoreAudio \
            -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-           -framework CoreFoundation -framework AVFoundation -framework Foundation -framework CoreAudio
+           -framework CoreFoundation -framework AVFoundation -framework Foundation
 # The host/ship split is a source-list boundary, not a runtime getenv.
 #
 # RUNTIME_SHIP is everything that goes into the visionOS app bundle. It is the
@@ -565,7 +566,7 @@ build/t_fove: tests/t_fove.c $(RUNTIME) $(RUNTIME_HDRS)
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps build/t_fove build/t_x18race build/klepton-ld
+check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps build/t_fove build/t_x18race build/klepton-ld build/t_audio
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@./build/t_x18race > build/x18race.log 2>&1 || { cat build/x18race.log; exit 1; }
 	@head -1 build/x18race.log && tail -1 build/x18race.log
@@ -589,6 +590,8 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@head -3 build/haptics.log && tail -1 build/haptics.log
 	@./build/t_fove > build/fove.log 2>&1 || { cat build/fove.log; exit 1; }
 	@head -1 build/fove.log && tail -1 build/fove.log
+	@./build/t_audio > build/audio.log 2>&1 || { cat build/audio.log; exit 1; }
+	@grep -E '=== audio|RMS error|PCM_EX 48000/2/32 float' build/audio.log && tail -1 build/audio.log
 	@$(MAKE) -s ovrpabi
 # The opus roundtrip is the one gate here that RUNS guest code rather than
 # inspecting it, so it is worth keeping wherever it exists — but libunityopus.so
@@ -993,6 +996,17 @@ glcaps: build/t_glcaps
 reproject: build/t_reproject
 	@./build/t_reproject
 
+# The guest's sample format. A float32 guest played as int16 is half-speed
+# static in one ear, and the [sl] log line it produced was indistinguishable
+# from a correct int16 player's — so the gate has to be a test, not a read.
+build/t_audio: tests/t_audio.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_audio.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: audio
+audio: build/t_audio
+	@./build/t_audio
+
 # The haptics seam's model, with no guest and no headset: the three
 # OVRPlugin entry points AS THE GUEST RESOLVES THEM (through kl_ovrp_sym, so
 # the struct returns go through the real sret thunk), the queue behind them,
@@ -1004,6 +1018,20 @@ build/t_haptics: tests/t_haptics.c $(RUNTIME) $(RUNTIME_HDRS)
 .PHONY: haptics
 haptics: build/t_haptics
 	@./build/t_haptics
+
+# The block-seam harness. Models the guest's mixer — a copy-callback in front of
+# an asynchronous producer — so the AAudio path can be measured on the host,
+# where a title's own mixer may stay silent. See tests/t_aaudio.c. Real time, so
+# it takes as many seconds as it is given (20 by default), which is why it is
+# NOT in `check`. It opens the real output device, at +-1 LSB — lit, and
+# inaudible.
+build/t_aaudio: tests/t_aaudio.c $(RUNTIME) $(RUNTIME_HDRS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_aaudio.c $(RUNTIME) $(LDLIBS)
+
+.PHONY: aaudio
+aaudio: build/t_aaudio
+	@./build/t_aaudio
 
 # ...and the half t_haptics cannot see: whether our implementations agree with
 # the REAL libOVRPlugin.so about which arguments are OUT-parameters. Offline —

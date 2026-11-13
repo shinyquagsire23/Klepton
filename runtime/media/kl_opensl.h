@@ -17,4 +17,9 @@ void *kl_opensl_sym(const char *name);
 // What FMOD looked up and what it called. The work list, same as kl_egl_report.
 void kl_opensl_report(FILE *f);
 
+// Whether the guest is feeding the stream, and whether what it feeds is silence.
+// Printed periodically from the app's [hb] ticker, because a headset run never
+// reaches the report above.
+void kl_opensl_heartbeat(FILE *f);
+
 #endif
