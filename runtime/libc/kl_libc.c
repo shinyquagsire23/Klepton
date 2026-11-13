@@ -1492,6 +1492,32 @@ static const char *kl_guest_path_inner(const char *path, char *buf, size_t cap) 
             // A prefix match is not a path match: /sdcardiskette is neither
             // /sdcard nor under it.
             if (path[n] != '/' && path[n] != '\0') continue;
+            // <external>/Android/obb/<our package> IS the OBB directory on
+            // Android — getObbDir() names that very path — so it has to land
+            // where kl_jni_obb_dir() put the OBBs, not under the files root
+            // the rest of external storage maps to. Unity answers Java's
+            // getObbDirs() itself, but a title that spells the path out (Apex
+            // Construct's AssetBundle OBB) otherwise opens a directory that
+            // does not exist and never loads its first scene. For a target
+            // whose obb dir already is Android/obb/<package> the two agree.
+            // The package is asked for only once the path is under
+            // Android/obb: its answer is cached on first use, and a caller this
+            // early in boot (every /sdcard path passes here) could cache the
+            // fallback before the manifest is known.
+            const char *pkg = strncmp(path + n, "/Android/obb/", 13) == 0
+                                ? kl_jni_guest_package() : NULL;
+            if (pkg && *pkg) {
+                char obbpath[512];
+                snprintf(obbpath, sizeof obbpath, "/Android/obb/%s", pkg);
+                size_t on = strlen(obbpath);
+                if (strncmp(path + n, obbpath, on) == 0 &&
+                    (path[n + on] == '/' || path[n + on] == '\0')) {
+                    const char *obbdir = kl_jni_obb_dir();
+                    snprintf(buf, cap, "%s%s", obbdir, path + n + on);
+                    kl_casefix(buf, strlen(obbdir));
+                    return buf;
+                }
+            }
             snprintf(buf, cap, "%s%s", g_ext_target, path + n);
             // iOS is case-sensitive; the guest mixes case (DATA vs data). Rewrite
             // the suffix to the on-disk spelling, past the known-good target prefix.
