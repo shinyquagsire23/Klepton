@@ -224,6 +224,23 @@ getrandom isnan
 mmap madvise sysinfo
 warnx fopen64 fseeko64 ftello64 __fwrite_chk exit _exit chdir
 """.split())
+# The signal NUMBER entry points, which carry the Linux<->Darwin SIGUSR2/SIGSYS
+# swap (kl_sig_to_darwin in kl_libc.c).
+SPECIAL |= set("kill raise signal sigwait sigsuspend sigpending".split())
+# The path family: a forward hands Darwin the guest's spelling of the path (and
+# Linux AT_* numbering), and fstatat writes Darwin's struct stat.
+SPECIAL |= set("""
+fstatat faccessat mkdtemp rmdir remove chmod chown lchown truncate mkfifo
+readlink symlink link utimes utime unlinkat mkdirat fchmodat fchownat
+readlinkat renameat symlinkat utimensat freopen
+""".split())
+# Numbering or semantics a forward gets wrong (FP_* order, mincore's reserved
+# bits, mallopt's parameters, popen of getprop), and names Darwin lacks.
+SPECIAL |= set("""
+__fpclassifyd wcscasecmp wcsncasecmp popen pclose statfs64 execlp mincore
+mallopt roundl sched_setscheduler sched_getscheduler clock_nanosleep
+__strlcat_chk __strlcpy_chk __poll_chk timezone
+""".split())
 
 # Excluded from the table but NOT hand-written anywhere: names we deliberately
 # leave unresolved, so the loader's per-import trampoline aborts BY NAME if the

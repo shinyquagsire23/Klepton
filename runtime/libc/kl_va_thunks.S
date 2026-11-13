@@ -126,3 +126,19 @@ _\name:
 KL_LDTHUNK klv_strtold,   strtod
 KL_LDTHUNK klv_wcstold,   wcstod
 KL_LDTHUNK klv_strtold_l, strtod_l
+
+// ---- long double in AND out ----
+// roundl takes its binary128 argument in q0 and returns one there too. The C
+// half (kl_f128_roundl, kl_libc_slink.c) works on the bits in x0:x1.
+    .globl _klv_roundl
+    .p2align 2
+_klv_roundl:
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    fmov    x0, d0
+    fmov    x1, v0.d[1]
+    bl      _kl_f128_roundl
+    fmov    d0, x0
+    fmov    v0.d[1], x1
+    ldp     x29, x30, [sp], #16
+    ret

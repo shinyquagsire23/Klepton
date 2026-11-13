@@ -38,6 +38,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <math.h>
+#include <malloc/malloc.h>
 #include <pthread.h>
 #include <wchar.h>
 #include "klepton.h"
@@ -48,6 +49,7 @@ int   kl_open_flags(int linux_flags);       // kl_libc.c
 ssize_t kl_shim_read(int fd, void *buf, size_t n);  // kl_shim.c
 const char *kl_guest_path(const char *path, char *buf, size_t cap);
 void  kl_fatal_prepare(void);
+void  kl_errno_set(int darwin_errno);    // kl_libc.c
 
 #include "../guest/kl_obbmap.h"
 #define GUEST_PATH(p) char _kp[1024]; const char *_p = kl_guest_path((p), _kp, sizeof _kp)
@@ -812,20 +814,28 @@ int   klb_fwide(void *f, int mode)         { return fwide(kl_host_file(f), mode)
 //
 // What is NOT reproduced is the 64-bit counter: eventfd accumulates, this
 // queues datagrams. eventfd_read below drains everything pending and sums it,
-// which matches for every use Qt makes of it. A guest using eventfd as a
-// SEMAPHORE (EFD_SEMAPHORE) would see different behaviour — none does, and the
-// flag is refused below rather than ignored.
+// which matches for every use Qt makes of it.
+//
+// EFD_SEMAPHORE (Valve's tier0: CThreadMultiWaitSemaphore, eventfd(0,
+// EFD_SEMAPHORE|EFD_CLOEXEC|EFD_NONBLOCK), fatal if refused) is where the
+// datagram queue is actually the RIGHT shape: a semaphore eventfd's read takes
+// ONE unit and answers 1, and a queue of datagrams each carrying 1 — what
+// Release() writes, 8 bytes of value 1 — hands out exactly one per read() and
+// stays readable while any are left. What it cannot do is split one write of
+// N>1 into N units; tier0 never writes anything but 1. The socket's buffers are
+// raised so a burst of releases does not fill Darwin's small datagram queue.
 #define LX_EFD_SEMAPHORE 1
 #define LX_EFD_CLOEXEC   0x80000
 #define LX_EFD_NONBLOCK  0x800
 
 int klb_eventfd(unsigned int initval, int flags) {
-    if (flags & LX_EFD_SEMAPHORE) {   // see above: we do not implement counting
-        errno = EINVAL;
-        return -1;
-    }
     int s = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (s < 0) return -1;
+    if (flags & LX_EFD_SEMAPHORE) {   // see above: one datagram per unit
+        int sz = 256 * 1024;
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
+    }
 
     // A name is needed only long enough to bind and connect; the connection
     // outlives the unlink, so nothing is left in the filesystem.
@@ -1099,4 +1109,107 @@ void klb___pthread_cleanup_pop(void *c, int execute) {
     if (!rec) return;
     g_cleanups = rec->prev;
     if (execute && rec->routine) rec->routine(rec->arg);
+}
+
+// ------------------------------------------------ more libc surface
+//
+// Each one is either a same-meaning rebuild out of what Darwin has or an
+// honest refusal with the errno the caller already handles; none invents an
+// answer. Half-Life: Alyx's Android launcher is the guest that reached for
+// most of them.
+
+// The kernel tid of ANOTHER thread. A guest pthread_t here is Darwin's
+// pthread_t (klb_pthread_self), and the id is the one klb_gettid reports for
+// the same thread, so the two doors agree about who a thread is.
+int klb_pthread_gettid_np(pthread_t t) {
+    uint64_t tid = 0;
+    if (pthread_threadid_np(t, &tid) != 0) return -1;
+    return (int)tid;
+}
+
+// AT_FDCWD is -100 on Linux and -2 on Darwin, and the two flag bits move:
+// AT_SYMLINK_NOFOLLOW 0x100 -> 0x20, AT_EACCESS 0x200 -> 0x10. A cwd-relative
+// or absolute path goes through the same guest-path mapping access() uses.
+int klb_faccessat(int dirfd, const char *path, int mode, int flags) {
+    if (flags & ~0x300) { errno = EINVAL; return -1; }
+    int df = 0;
+    if (flags & 0x100) df |= AT_SYMLINK_NOFOLLOW;
+    if (flags & 0x200) df |= AT_EACCESS;
+    if (dirfd == -100) dirfd = AT_FDCWD;
+    GUEST_PATH(path);
+    int r = faccessat(dirfd, _p, mode, df);
+    // Into the slot a cached __errno() pointer reads, too (kl_errno_set): the
+    // Half-Life: Alyx launcher's faccessat self-test holds that pointer across the call and
+    // read back the EOPNOTSUPP it had written itself instead of ENOENT.
+    if (r) kl_errno_set(errno);
+    return r;
+}
+
+// mkdtemp was a raw forward, so a template spelled the guest's way (/sdcard,
+// /data/...) went to Darwin as written and failed; and a failure left the
+// errno slot a cached __errno() pointer reads untouched. Like mkstemp's
+// callers, the template is rewritten in place: the host path is made and the
+// XXXXXX the kernel chose is copied back into the guest's own buffer.
+char *klb_mkdtemp(char *tmpl) {
+    if (!tmpl) { kl_errno_set(EINVAL); return NULL; }
+    char kp[1024];
+    const char *hp = kl_guest_path(tmpl, kp, sizeof kp);
+    char host[1024];
+    snprintf(host, sizeof host, "%s", hp);
+    if (!mkdtemp(host)) {
+        int e = errno;
+        fprintf(stderr, "  [klepton] mkdtemp(\"%s\") -> %s\n", tmpl, strerror(e));
+        kl_errno_set(e);
+        return NULL;
+    }
+    size_t tl = strlen(tmpl), hl = strlen(host);
+    if (hl >= 6 && tl >= 6) memcpy(tmpl + tl - 6, host + hl - 6, 6);
+    return tmpl;
+}
+
+// Same bit-0 meaning on both ("page is resident"); Darwin also sets
+// referenced/modified bits Linux leaves reserved, so they are cleared rather
+// than handed to a caller that may test the whole byte. The vector is in
+// Darwin pages, which is the size sysconf(_SC_PAGESIZE) already reports.
+int klb_mincore(void *addr, size_t len, unsigned char *vec) {
+    if (mincore(addr, len, (char *)vec) != 0) return -1;
+    size_t pg = (size_t)getpagesize(), n = (len + pg - 1) / pg;
+    for (size_t i = 0; i < n; i++) vec[i] &= 1;
+    return 0;
+}
+
+// bionic answers 1 for a parameter it applied and 0 for one it did not.
+//
+// Two of bionic's parameters describe behaviour Darwin's allocator already has
+// or can perform, and those are answered for what they are:
+//   M_DECAY_TIME (-100) = 1: "return freed pages to the system over time" —
+//     Darwin's zones do exactly that on their own schedule (madvise of free
+//     spans), so decay is on; = 0 ("never decay") cannot be had, and says so.
+//   M_PURGE (-101): "release free pages now" — malloc_zone_pressure_relief on
+//     every zone is that operation.
+// Every other parameter (arena counts, cache sizes, tagging levels) has no
+// Darwin counterpart and gets 0, which every caller treats as "not supported".
+// Half-Life: Alyx's launcher requires the decay answer: a 0 there is its fatal
+// "guest-memory-native-decay-install failed" (guard exit 125).
+int klb_mallopt(int param, int value) {
+    if (param == -100) return value != 0;
+    if (param == -101) { malloc_zone_pressure_relief(NULL, 0); return 1; }
+    return 0;
+}
+
+// roundl on IEEE binary128 bits (Linux/aarch64 long double; see
+// kl_f64_to_f128). The thunk klv_roundl moves q0 into x0:x1 and back. Round half
+// away from zero on the magnitude: add half an ulp of the integer position and
+// truncate the fraction bits; a carry into the exponent is exactly right.
+__uint128_t kl_f128_roundl(__uint128_t x) {
+    const __uint128_t sign = (__uint128_t)1 << 127;
+    __uint128_t mag = x & ~sign;
+    int e = (int)((uint64_t)(mag >> 112) & 0x7fff) - 16383;
+    if (e >= 112) return x;                              // integral, inf or nan
+    if (e < -1) return x & sign;                         // |x| < 0.5 -> +-0
+    if (e == -1) return (x & sign) | ((__uint128_t)16383 << 112);   // -> +-1
+    int frac = 112 - e;
+    mag += (__uint128_t)1 << (frac - 1);
+    mag &= ~(((__uint128_t)1 << frac) - 1);
+    return (x & sign) | mag;
 }
