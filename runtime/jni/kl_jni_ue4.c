@@ -399,6 +399,7 @@ static klj_val klj_GA_getSupportedRefreshRates(void *env, void *self, const klj_
     static void *arr;
     if (!arr) {
         arr = klj_new_array('I', NULL, 1);
+        kl_jni_pin_object(arr);   // cached for the run: pinned, or a frame pop retires it (kl_jni_pin_object)
         int32_t *v = klj_arr(arr)->data;
         v[0] = 90;
     }
@@ -464,6 +465,16 @@ static klj_val klj_MsgBox_show(void *env, void *self, const klj_val *a, int n) {
             g_ue4_msg_caption, g_ue4_msg_text,
             g_ue4_msg_buttons[0] ? g_ue4_msg_buttons : "(none)");
     return (klj_val){.j = 0};
+}
+
+// AndroidThunkJava_GetAndroidId() -> Settings.Secure.ANDROID_ID, which UE4
+// turns into its device id. Unity reads the same setting through
+// Settings.Secure.getString, so both answer klj_android_id() (kl_jni_net.c).
+// Dash Dash World aborted here at boot.
+static klj_val klj_GA_getAndroidId(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    extern const char *klj_android_id(void);
+    return (klj_val){.l = kl_jni_new_string(klj_android_id())};
 }
 
 // ---- Unreal Engine 4: com.epicgames.ue4.MediaPlayer14 ----------------------
@@ -911,6 +922,8 @@ const klj_binding klj_bind_ue4[] = {
     {"com/epicgames/ue4/MediaPlayer14", "updateVideoFrame",
      "(I)Lcom/epicgames/ue4/MediaPlayer14$FrameUpdateInfo;", klj_MP14_updateVideoFrame},
     {"com/epicgames/ue4/MediaPlayer14", "selectTrack", "(I)V", klj_MP14_selectTrack},
+    {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_GetAndroidId",
+     "()Ljava/lang/String;", klj_GA_getAndroidId},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_IsOculusMobileApplication",
      "()Z", klj_GA_isOculusMobile},
     {"com/epicgames/ue4/GameActivity", "AndroidThunkJava_HasMetaDataKey",

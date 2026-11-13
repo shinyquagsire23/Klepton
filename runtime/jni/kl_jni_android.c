@@ -1238,7 +1238,7 @@ void kl_jni_set_native_lib_dir(const char *dir) { g_native_lib_dir = klj_abspath
 // "no splits" to a caller that checks length.
  klj_val klj_appinfo_splitSourceDirs(void) {
     static void *empty;
-    if (!empty) empty = klj_new_array('L', "java/lang/String", 0);
+    if (!empty) { empty = klj_new_array('L', "java/lang/String", 0); kl_jni_pin_object(empty); }
     return (klj_val){.l = empty};
 }
 
@@ -1441,6 +1441,8 @@ static klj_val klj_Context_getObbDirs(void *env, void *self, const klj_val *a, i
     if (!dirs) {
         dirs = klj_new_array('L', "java/io/File", 1);
         ((void **)klj_arr(dirs)->data)[0] = klj_new_file(klj_obb_dir());
+        kl_jni_pin_object(dirs);   // cached for the run: pinned, or a frame pop retires it (kl_jni_pin_object)
+        kl_jni_pin_object(((void **)klj_arr(dirs)->data)[0]);
     }
     return (klj_val){.l = dirs};
 }

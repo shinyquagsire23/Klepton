@@ -392,13 +392,18 @@ static klj_val klj_MessageQueue_next(void *env, void *self, const klj_val *a, in
     return (o && strcmp(o->cls, "android/os/Message") == 0) ? o->data : NULL;
 }
 
-// obtainMessage(what) — Android recycles these from a pool; we allocate, because
-// the pool is an allocation optimisation and nothing observable depends on it.
+// obtainMessage(what) and obtainMessage(what, arg1, arg2) — Android recycles
+// these from a pool; we allocate, because the pool is an allocation
+// optimisation and nothing observable depends on it. The three-int form is how
+// Unity's AndroidVideoMedia asks its handler thread for the decoder's
+// SurfaceTexture (End Space): without it the request is never posted.
 static klj_val klj_Handler_obtainMessage(void *env, void *self, const klj_val *a, int n) {
     (void)env;
     klj_message *m = calloc(1, sizeof *m);
     if (!m) return (klj_val){.l = NULL};
     m->what   = n > 0 ? (int32_t)a[0].j : 0;
+    m->arg1   = n > 1 ? (int32_t)a[1].j : 0;
+    m->arg2   = n > 2 ? (int32_t)a[2].j : 0;
     m->target = self;                       // sendToTarget() needs to find it back
     void *obj = klj_new_object_data("android/os/Message", m);
     // Pinned because it is queued and outlives the frame that made it — and
@@ -422,10 +427,10 @@ static klj_val klj_Handler_obtainMessage(void *env, void *self, const klj_val *a
     klj_field_store(obj, klj_want(klj_class_object("android/os/Message"), "what", "I", 'f'),
                     (klj_val){.j = (uint64_t)(int64_t)m->what});
     klj_field_store(obj, klj_want(klj_class_object("android/os/Message"), "arg1", "I", 'f'),
-                    (klj_val){.j = 0});
+                    (klj_val){.j = (uint64_t)(int64_t)m->arg1});
     klj_field_store(obj, klj_want(klj_class_object("android/os/Message"), "arg2", "I", 'f'),
-                    (klj_val){.j = 0});
-    KLJ_LOG("Handler.obtainMessage(what=%d)", m->what);
+                    (klj_val){.j = (uint64_t)(int64_t)m->arg2});
+    KLJ_LOG("Handler.obtainMessage(what=%d, arg1=%d, arg2=%d)", m->what, m->arg1, m->arg2);
     return (klj_val){.l = obj};
 }
 
@@ -702,6 +707,7 @@ const klj_binding klj_bind_looper[] = {
     // HandlerThread gets a real thread of its own, because the guest blocks
     // waiting on it. See the looper section above.
     {"android/os/Handler", "obtainMessage", "(I)Landroid/os/Message;", klj_Handler_obtainMessage},
+    {"android/os/Handler", "obtainMessage", "(III)Landroid/os/Message;", klj_Handler_obtainMessage},
     {"android/os/Message", "sendToTarget", "()V", klj_Message_sendToTarget},
     {"android/view/Choreographer", "getInstance", "()Landroid/view/Choreographer;", klj_Choreographer_getInstance},
     {"android/view/Choreographer", "postFrameCallback", "(Landroid/view/Choreographer$FrameCallback;)V", klj_Choreographer_postFrameCallback},

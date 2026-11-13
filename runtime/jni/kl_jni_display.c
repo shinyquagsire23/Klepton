@@ -145,6 +145,8 @@ static klj_val klj_Display_getSupportedModes(void *env, void *self, const klj_va
         modes = klj_new_array('L', "android/view/Display$Mode", 1);
         void **slot = klj_arr(modes)->data;
         slot[0] = klj_new_object_data("android/view/Display$Mode", NULL);
+        kl_jni_pin_object(modes);   // cached for the run: pinned, or a frame pop retires it (kl_jni_pin_object)
+        kl_jni_pin_object(slot[0]);
     }
     return (klj_val){.l = modes};
 }
