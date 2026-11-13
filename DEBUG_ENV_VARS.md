@@ -2443,6 +2443,10 @@ except its own control vars (next section).
   launch is made a first launch. Set `=0` when the headset has to come off with a
   capture or a debugger still attached. Either way the phase change is logged
   (`[app] scene phase -> …`).
+- `KL_UNITY_QUIT=0` — ignore a Unity guest's quit. By default, when
+  `nativeRender` returns false (after having returned true at least once), the app
+  `_exit(0)`s, as Android's `if (!nativeRender()) finish();` would — that is where
+  `Application.Quit` lands. Logged as `[guest] nativeRender returned false`.
 - `KL_SYNC_GUEST=1` — drive the guest inline on the compositor thread, i.e.
   P5b's shape before the guest moved to its own thread. The clock P5.4's device numbers were taken
   against, and the A/B for anything that looks like a pacing regression.
