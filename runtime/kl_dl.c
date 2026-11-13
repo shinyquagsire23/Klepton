@@ -18,6 +18,7 @@
 #include "kl_mediandk.h"
 #include "kl_vulkan.h"
 #include "kl_aaudio.h"
+#include "kl_ndk.h"
 #include "kl_openxr.h"
 
 #define KL_MAX_IMAGES 64
@@ -494,6 +495,7 @@ int kl_can_dlopen(const char *path) {
     return kl_egl_claims(path)  || kl_opensl_claims(path)   || kl_ovrp_claims(path) ||
            kl_ovrplat_claims(path) || kl_mediandk_claims(path) ||
            kl_vulkan_claims(path) || kl_aaudio_claims(path) ||
+           kl_ndk_claims(path)    ||
            kl_openxr_claims(path) || kl_core_shim_claims(path) || kl_can_load(path);
 }
 
@@ -738,6 +740,11 @@ void *klb_dlopen(const char *path, int flags) {
     // which is why this door was missing for so long.)
     void *aa = kl_aaudio_dlopen(path);
     if (aa) return aa;
+    // libandroid.so, the same shape as the AAudio line above: FMOD's Android
+    // file layer dlopens it by name rather than importing it, and there is no
+    // libandroid.so on disk to fall through to. See kl_ndk_dlopen.
+    void *ndk = kl_ndk_dlopen(path);
+    if (ndk) return ndk;
     // The OpenXR loader. This one is NOT like the lines above it: the file
     // really is in the guest tree, so this must come first to keep the real
     // Khronos loader from loading successfully and then failing at the Android
@@ -842,6 +849,7 @@ void *klb_dlsym(void *handle, const char *name) {
     if (kl_mediandk_is_handle(handle)) return kl_mediandk_sym(name);
     if (kl_vulkan_is_handle(handle)) return kl_vulkan_sym(name);
     if (kl_aaudio_is_handle(handle)) return kl_aaudio_sym(name);
+    if (kl_ndk_is_handle(handle)) return kl_ndk_sym(name);
     if (kl_openxr_is_handle(handle)) return kl_openxr_sym(name);
     // A core system-library handle (libc.so &c.) resolves like RTLD_DEFAULT: the
     // shim serves libc, and the global image search covers anything a guest .so

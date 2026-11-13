@@ -86,6 +86,17 @@ void *kl_jni_class(const char *name);
 // defaults to UnityPlayerActivity; the SDL3 target overrides it.
 void *kl_jni_activity(void);
 void kl_jni_set_activity_class(const char *cls);
+
+// The one UnityPlayer instance, for exactly the same reason the activity is a
+// singleton. kl_driver.c used to make a fresh `new UnityPlayer` per
+// lifecycle call — initJni got one, the nativeRecreateGfxState/Resume/Render
+// sequence got another — which real Android never does:
+// UnityPlayerActivity.onCreate constructs ONE and keeps it in mUnityPlayer
+// (UnityPlayerActivity.smali:121). A guest that reaches the player through
+// the activity's field and compares it with the `thiz` it was called on gets
+// two different objects, and a guest that reads that field at all needs it to
+// point at something. Both kl_driver.c call sites take their `thiz` from here.
+void *kl_jni_unity_player(void);
 void *kl_jni_new_string(const char *utf8);
 // A java/lang/String[] — what SDL3's nativeRunMain takes as argv, and what the
 // real SteamLink activity fills from the launching intent's "sArgs" extra.
@@ -274,6 +285,16 @@ void kl_jni_soft_input_close(int canceled);
 // pass. See the implementation's comment for why a runtime failure here is
 // invisible from everywhere else.
 int  kl_jni_soft_input_selftest(FILE *out);
+// The object model: host-cached jobjects survive a local frame, and every
+// erased spelling of a call answers with the same tagged object. tests/t_jniobj.c.
+int  kl_jni_object_lifetime_selftest(FILE *out);
+
+// The same gate for UE's GameActivity keyboard, which is what answers the four
+// calls above when the guest is an Unreal one — `make uevk`, in `make check`.
+// Same terms: no guest, no window, no headset. It publishes its own natives
+// through the real guest-native resolver seam and drives the real
+// AndroidThunkJava_* bindings. Returns non-zero on pass.
+int  kl_jni_ue_keyboard_selftest(FILE *out);
 
 // Fire the pending Choreographer frame callback, if the guest posted one. There is
 // no vsync source here, so the host's frame pump defines what a frame is. One-shot,

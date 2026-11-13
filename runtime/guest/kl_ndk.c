@@ -22,6 +22,7 @@
 // For kl_jni_locale_parts — AConfiguration and java.util.Locale are two doors
 // onto one fact and must not answer differently.
 #include "kl_jni.h"
+#include "kl_env.h"
 #include "kl_openxr.h"   // the XR surface-swapchain seam, for ANativeWindow_fromSurface
 
 // ================================================================== ALooper
@@ -384,7 +385,18 @@ static void *kl_AAssetManager_open(void *mgr, const char *fname, int mode) {
     snprintf(path, sizeof path, "%s/%s", g_asset_root, fname);
     FILE *f = fopen(path, "rb");
     if (!f) f = kl_obbmap_fopen(path, "rb");   // audio banks live only in the OBB
-    if (!f) return NULL;
+    // A miss is NAMED. Android returns NULL here too, but the guest's report of
+    // it is several layers away and mentions no path at all — FMOD turns it into
+    // "ERR_FILE_NOTFOUND" against a bank that is sitting in assets/, which says
+    // nothing about which directory was searched. One line here is the whole
+    // difference between that and a fixable fact.
+    if (!f) {
+        static int said;
+        if (said++ < 16)
+            fprintf(stderr, "  [ndk] AAssetManager_open(\"%s\") -> not found "
+                            "under %s\n", fname ? fname : "(null)", g_asset_root);
+        return NULL;
+    }
     kl_asset *a = calloc(1, sizeof *a);
     if (!a) { fclose(f); return NULL; }
     fseeko(f, 0, SEEK_END);
@@ -450,10 +462,36 @@ static void kl_AAsset_close(kl_asset *a) {
     free(a->buf);
     free(a);
 }
-// The 32-bit spelling. Both exist in the NDK and the newer SDL3 in the VR build
+// The 32-bit spellings. Both exist in the NDK and the newer SDL3 in the VR build
 // imports this one; truncating is what Android does too, and no asset here is
 // anywhere near 2 GB.
 static int kl_AAsset_getLength(kl_asset *a) { return a ? (int)a->len : -1; }
+// AAsset_seek was the one member of this family with no cell, and an import
+// with no cell is not a silent zero — kl_image.c binds it to a stub that aborts
+// BY NAME the moment it is called. libAkSoundEngine imports exactly this
+// spelling (never AAsset_seek64) and calls it from CAkAPKLocation::ReadBlocking,
+// so any Wwise title whose banks live in the APK rather than an OBB would have
+// taken that abort on its first bank read. Batman: Arkham Shadow's banks are in
+// the OBB, which is the only reason the hole was still open.
+static long kl_AAsset_seek(kl_asset *a, long off, int whence) {
+    int64_t r = kl_AAsset_seek64(a, off, whence);
+    return (long)r;
+}
+
+// What is left to read from HERE, which is the length minus the cursor — not
+// the length. A guest that seeks and then asks would otherwise be told the file
+// is longer than it is.
+static int64_t kl_AAsset_getRemainingLength64(kl_asset *a) {
+    if (!a || !a->f) return 0;
+    off_t pos = ftello(a->f);
+    if (pos < 0 || (int64_t)pos > a->len) return 0;
+    return a->len - (int64_t)pos;
+}
+
+// "Is the whole asset already in memory?" — false unless getBuffer has run and
+// cached it. Android answers this about an mmapped uncompressed entry; here the
+// honest answer is whether OUR buffer exists.
+static int kl_AAsset_isAllocated(kl_asset *a) { return a && a->buf ? 1 : 0; }
 
 // Directory enumeration. Android returns FILE names only — no subdirectories,
 // no "." or ".." — and returns NULL to end iteration, which is also how the
@@ -463,20 +501,34 @@ static int kl_AAsset_getLength(kl_asset *a) { return a ? (int)a->len : -1; }
 // matching that exactly is what keeps a bug ours rather than theirs.
 typedef struct { DIR *d; char name[256]; } kl_assetdir;
 
+// A MISSING directory is NOT a NULL AAssetDir. Android's AAssetManager_openDir
+// hands back a live handle for any name — AssetManager2 builds the file list by
+// filtering the APK's zip index, so a directory nobody packed simply filters
+// down to nothing and the handle enumerates zero names. NULL comes back only
+// when the manager itself is unusable. Java's AssetManager.list() shows the same
+// contract from the other side: an empty array, never an exception.
+//
+// Returning NULL here is therefore a false "no such manager", and it is not a
+// cosmetic difference. Wwise asks exactly this question:
+// `CAkFileHelpers::SetBasePath` (libAkSoundEngine 0x5450c) stores the base path
+// into both of its file locations and THEN calls
+// `AAssetManager_openDir(basePath)` purely as an existence probe — NULL makes
+// the whole call return AK_Fail. Batman: Arkham Shadow's SoundBanks base path is "Android/",
+// which lives in the OBB and is in nobody's APK — on a Quest that openDir still
+// answers with an empty handle and SetBasePath succeeds, while here it answered
+// NULL and SetBasePath failed. Any Wwise title with out-of-APK banks hits this.
 static void *kl_AAssetManager_openDir(void *mgr, const char *dirname) {
     (void)mgr;
     char path[1200];
     snprintf(path, sizeof path, "%s/%s", g_asset_root, dirname && *dirname ? dirname : ".");
-    DIR *d = opendir(path);
-    if (!d) return NULL;
     kl_assetdir *ad = calloc(1, sizeof *ad);
-    if (!ad) { closedir(d); return NULL; }
-    ad->d = d;
+    if (!ad) return NULL;
+    ad->d = opendir(path);           // NULL is fine: an empty enumeration, as Android does
     return ad;
 }
 
 static const char *kl_AAssetDir_getNextFileName(kl_assetdir *ad) {
-    if (!ad || !ad->d) return NULL;
+    if (!ad || !ad->d) return NULL;  // no such directory enumerates as empty
     for (struct dirent *e; (e = readdir(ad->d)) != NULL; ) {
         if (e->d_name[0] == '.') continue;           // skip . .. and dotfiles
         if (e->d_type == DT_DIR) continue;           // files only, as Android does
@@ -579,6 +631,144 @@ static const char *kl_ASensor_getVendor(const kl_sensor *s) { return s ? s->vend
 static int   kl_ASensor_getType(const kl_sensor *s)         { return s ? s->type : -1 /* ASENSOR_TYPE_INVALID */; }
 static float kl_ASensor_getResolution(const kl_sensor *s)   { return s ? s->resolution : 0.0f; }
 static int   kl_ASensor_getMinDelay(const kl_sensor *s)     { return s ? s->min_delay_us : 0; }
+
+// =================================================================== AInput
+// Unreal Engine 4's import set added this family (18 names). The design rule
+// is the sensor queue's: an EMPTY queue is the truth and invented events are
+// not, so getEvent answers "no events" until a host input source exists —
+// but the queue object, its looper wiring, and every accessor are real, so a
+// source added later is storage and a write() to the wake pipe, not new ABI.
+//
+// Where the queue pointer comes from: on Android the framework creates the
+// AInputQueue and hands it to the app's glue (APP_CMD_INPUT_CHANGED); the app
+// never allocates one. That hand-off does not exist here yet, so today no
+// guest ever holds a queue — the symbols bind, and that is the whole job for
+// now. kl_ndk_input_queue() is the single host-owned queue for the day a
+// caller (a native_app_glue host, a host event injector) needs one.
+enum {
+    AINPUT_EVENT_TYPE_KEY    = 1,
+    AINPUT_EVENT_TYPE_MOTION = 2,
+};
+
+#define KL_INPUT_MAX_POINTERS 8
+#define KL_INPUT_MAX_EVENTS   64
+
+typedef struct {
+    int32_t  type, source, device_id;
+    union {
+        struct { int32_t action, flags, key_code, meta_state; } key;
+        struct {
+            int32_t action, button_state;
+            size_t  count;
+            struct { int32_t id; float x, y; } pts[KL_INPUT_MAX_POINTERS];
+        } motion;
+    } u;
+} kl_input_event;
+
+typedef struct kl_input_queue {
+    kl_looper       *looper;
+    int              ident;
+    kl_looper_cb     cb;
+    void            *data;
+    int              pipe_r, pipe_w;   // never written: no input source yet
+    kl_input_event   ev[KL_INPUT_MAX_EVENTS];
+    unsigned         head, tail;       // ring; head == tail means empty
+    pthread_mutex_t  lock;
+} kl_input_queue;
+
+static kl_input_queue *kl_input_queue_new(void) {
+    kl_input_queue *q = calloc(1, sizeof *q);
+    if (!q) return NULL;
+    int p[2];
+    if (pipe(p) != 0) { free(q); return NULL; }
+    fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL, 0) | O_NONBLOCK);
+    fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL, 0) | O_NONBLOCK);
+    q->pipe_r = p[0]; q->pipe_w = p[1];
+    pthread_mutex_init(&q->lock, NULL);
+    return q;
+}
+
+void *kl_ndk_input_queue(void) {
+    static kl_input_queue *q;
+    static pthread_mutex_t once_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&once_lock);
+    if (!q) q = kl_input_queue_new();
+    pthread_mutex_unlock(&once_lock);
+    return q;
+}
+
+// attachLooper registers the queue's fd with the looper, exactly like the
+// sensor queue does: nothing will ever be readable while there is no input
+// source, but the caller's poll-ident bookkeeping then matches Android's, and
+// a future source only has to make the pipe readable to wake polls.
+static void kl_AInputQueue_attachLooper(kl_input_queue *q, kl_looper *looper,
+                                        int ident, kl_looper_cb cb, void *data) {
+    if (!q) return;
+    q->looper = looper; q->ident = ident; q->cb = cb; q->data = data;
+    if (looper) kl_ALooper_addFd(looper, q->pipe_r, ident, ALOOPER_EVENT_INPUT, cb, data);
+}
+
+static void kl_AInputQueue_detachLooper(kl_input_queue *q) {
+    if (!q) return;
+    if (q->looper) kl_ALooper_removeFd(q->looper, q->pipe_r);
+    q->looper = NULL;
+}
+
+// Non-blocking, as bionic's is: the blocking half of input dispatch is the
+// looper poll, not getEvent. 0 = no event pending (the standing answer while
+// the queue is empty); 1 = an event was copied out. The returned pointer is
+// owned by the QUEUE — ring storage, valid until the ring wraps past it —
+// matching Android's "valid until the next getEvent" closely enough for a
+// caller that consumes synchronously.
+static int32_t kl_AInputQueue_getEvent(kl_input_queue *q, kl_input_event **out) {
+    if (!q || !out) return -EINVAL;
+    pthread_mutex_lock(&q->lock);
+    if (q->head == q->tail) { pthread_mutex_unlock(&q->lock); return 0; }
+    *out = &q->ev[q->tail % KL_INPUT_MAX_EVENTS];
+    q->tail++;
+    pthread_mutex_unlock(&q->lock);
+    return 1;
+}
+
+// 0 = not consumed: pre-dispatch is the IME's first look at a key, and with no
+// IME here nothing eats keys before the app sees them.
+static int32_t kl_AInputQueue_preDispatchEvent(kl_input_queue *q, kl_input_event *e) {
+    (void)q; (void)e;
+    return 0;
+}
+
+static void kl_AInputQueue_finishEvent(kl_input_queue *q, kl_input_event *e, int handled) {
+    (void)q; (void)e; (void)handled;
+}
+
+// The accessors read a real struct rather than refusing, because the day they
+// are reached the event is real — and until then they are unreachable, since
+// no caller can obtain an event from an empty queue. NULL is answered with
+// the family's invalid value, not a fault.
+static int32_t kl_AInputEvent_getType(const kl_input_event *e)     { return e ? e->type : -1; }
+static int32_t kl_AInputEvent_getSource(const kl_input_event *e)   { return e ? e->source : 0; }
+static int32_t kl_AInputEvent_getDeviceId(const kl_input_event *e) { return e ? e->device_id : -1; }
+
+static int32_t kl_AKeyEvent_getAction(const kl_input_event *e)    { return e ? e->u.key.action : -1; }
+static int32_t kl_AKeyEvent_getFlags(const kl_input_event *e)     { return e ? e->u.key.flags : 0; }
+static int32_t kl_AKeyEvent_getKeyCode(const kl_input_event *e)   { return e ? e->u.key.key_code : 0; }
+static int32_t kl_AKeyEvent_getMetaState(const kl_input_event *e) { return e ? e->u.key.meta_state : 0; }
+
+static int32_t kl_AMotionEvent_getAction(const kl_input_event *e)      { return e ? e->u.motion.action : -1; }
+static int32_t kl_AMotionEvent_getButtonState(const kl_input_event *e) { return e ? e->u.motion.button_state : 0; }
+static size_t  kl_AMotionEvent_getPointerCount(const kl_input_event *e){ return e ? e->u.motion.count : 0; }
+static int32_t kl_AMotionEvent_getPointerId(const kl_input_event *e, size_t i) {
+    if (!e || i >= e->u.motion.count) return -1;
+    return e->u.motion.pts[i].id;
+}
+static float kl_AMotionEvent_getX(const kl_input_event *e, size_t i) {
+    if (!e || i >= e->u.motion.count) return 0.0f;
+    return e->u.motion.pts[i].x;
+}
+static float kl_AMotionEvent_getY(const kl_input_event *e, size_t i) {
+    if (!e || i >= e->u.motion.count) return 0.0f;
+    return e->u.motion.pts[i].y;
+}
 
 // ============================================================ AConfiguration
 // An AConfiguration is Android's ResTable_config — locale, orientation, density,
@@ -708,6 +898,21 @@ static const struct { const char *name; void *fn; } g_ndk[] = {
     N("AAsset_read",            kl_AAsset_read),
     N("AAsset_getLength64",     kl_AAsset_getLength64),
     N("AAsset_seek64",          kl_AAsset_seek64),
+    // AAsset_seek is the OLD spelling, not a second function: the NDK declares
+    // it `off_t`, and off_t on arm64 Android IS 64-bit — so this is the same
+    // function rather than a narrowing copy of it, exactly as getSamplesPerFrame
+    // is getChannelCount in kl_aaudio.c. FMOD's asset layer probes for the 32-bit
+    // names and abandons AAssetManager entirely at the first NULL: with
+    // AAssetManager_open and AAsset_read served and this one missing, every
+    // `file:///android_asset/*.bank` in HARD BULLET came back ERR_FILE_NOTFOUND
+    // without one open() ever being attempted.
+    N("AAsset_seek",            kl_AAsset_seek),
+    // ...and its neighbours in the same 32-bit family, for the same reason. A
+    // prober that gets past seek and stops at the next NULL has learned nothing
+    // this tree could not have told it.
+    N("AAsset_getRemainingLength64", kl_AAsset_getRemainingLength64),
+    N("AAsset_getRemainingLength",   kl_AAsset_getRemainingLength64),
+    N("AAsset_isAllocated",     kl_AAsset_isAllocated),
     N("AAsset_close",           kl_AAsset_close),
     N("AAsset_getLength",       kl_AAsset_getLength),
     N("AAsset_getBuffer",       kl_AAsset_getBuffer),
@@ -733,6 +938,25 @@ static const struct { const char *name; void *fn; } g_ndk[] = {
     N("ASensor_getResolution",                kl_ASensor_getResolution),
     N("ASensor_getMinDelay",                  kl_ASensor_getMinDelay),
 
+    N("AInputQueue_attachLooper",     kl_AInputQueue_attachLooper),
+    N("AInputQueue_detachLooper",     kl_AInputQueue_detachLooper),
+    N("AInputQueue_getEvent",         kl_AInputQueue_getEvent),
+    N("AInputQueue_preDispatchEvent", kl_AInputQueue_preDispatchEvent),
+    N("AInputQueue_finishEvent",      kl_AInputQueue_finishEvent),
+    N("AInputEvent_getType",          kl_AInputEvent_getType),
+    N("AInputEvent_getSource",        kl_AInputEvent_getSource),
+    N("AInputEvent_getDeviceId",      kl_AInputEvent_getDeviceId),
+    N("AKeyEvent_getAction",          kl_AKeyEvent_getAction),
+    N("AKeyEvent_getFlags",           kl_AKeyEvent_getFlags),
+    N("AKeyEvent_getKeyCode",         kl_AKeyEvent_getKeyCode),
+    N("AKeyEvent_getMetaState",       kl_AKeyEvent_getMetaState),
+    N("AMotionEvent_getAction",       kl_AMotionEvent_getAction),
+    N("AMotionEvent_getButtonState",  kl_AMotionEvent_getButtonState),
+    N("AMotionEvent_getPointerCount", kl_AMotionEvent_getPointerCount),
+    N("AMotionEvent_getPointerId",    kl_AMotionEvent_getPointerId),
+    N("AMotionEvent_getX",            kl_AMotionEvent_getX),
+    N("AMotionEvent_getY",            kl_AMotionEvent_getY),
+
     N("AConfiguration_new",              kl_AConfiguration_new),
     N("AConfiguration_delete",           kl_AConfiguration_delete),
     N("AConfiguration_fromAssetManager", kl_AConfiguration_fromAssetManager),
@@ -749,4 +973,56 @@ void *kl_ndk_lookup(const char *name) {
     for (size_t i = 0; i < sizeof g_ndk / sizeof g_ndk[0]; i++)
         if (strcmp(g_ndk[i].name, name) == 0) return g_ndk[i].fn;
     return NULL;
+}
+
+// ---------------------------------------------------------------------------
+// libandroid.so — the DLOPEN door onto the same table.
+//
+// Every name above already reaches the guest through the IMPORT door: a guest
+// image that DT_NEEDEDs libandroid.so has its undefined `AAssetManager_open`
+// bound at relocation time by kl_ndk_lookup, with no file ever opened. That is
+// how libunity and libgame get here, and it is why this door was missing.
+//
+// FMOD does not import them. Its Android file layer `dlopen("libandroid.so")`s
+// at runtime and dlsyms `AAssetManager_fromJava` / `AAssetManager_open` /
+// `AAsset_*` out of the handle, and there is no libandroid.so in a guest tree
+// to fall through to — so the dlopen failed, FMOD's asset layer never came up,
+// and every bank load returned ERR_FILE_NOTFOUND against files that are sitting
+// right there in assets/. The failure surfaced four layers away, as
+//
+//   E/Unity: BankLoadException: [FMOD] Could not load bank
+//            'file:///android_asset/Master.strings.bank' : ERR_FILE_NOTFOUND
+//
+// which is exactly the shape kl_aaudio.c's own dlopen door was added for: a
+// synthetic handle has to come first because there is nothing on disk behind it.
+static const char g_ndk_handle[] = "kl-ndk-libandroid";
+
+int kl_ndk_claims(const char *soname) {
+    if (!soname) return 0;
+    const char *b = strrchr(soname, '/');
+    b = b ? b + 1 : soname;
+    return strcmp(b, "libandroid.so") == 0;
+}
+
+void *kl_ndk_dlopen(const char *soname) {
+    if (!kl_ndk_claims(soname)) return NULL;
+    fprintf(stderr, "  [ndk] guest dlopen(\"libandroid.so\") -> synthetic NDK handle\n");
+    return (void *)g_ndk_handle;
+}
+
+int kl_ndk_is_handle(const void *h) { return h == (const void *)g_ndk_handle; }
+
+// NULL for a name we do not serve, and that is deliberate: libandroid.so is a
+// large surface and callers probe it (FMOD checks for AAsset_openFileDescriptor
+// before using it). A NULL is how a prober learns the answer. Unlike the AAudio
+// door there is no named stub here, because kl_ndk_lookup's table IS the list of
+// what this tree implements — a name outside it has no handler to name.
+void *kl_ndk_sym(const char *name) {
+    void *fn = name ? kl_ndk_lookup(name) : NULL;
+    // The synthetic handle short-circuits klb_dlsym before its own tracer runs,
+    // so KL_TRACE_DLSYM would otherwise show the dlopen and nothing after it.
+    if (kl_env_on("KL_TRACE_DLSYM", 0))
+        fprintf(stderr, "  [ndk] dlsym(\"%s\") -> %s\n", name ? name : "(null)",
+                fn ? "served" : "NULL");
+    return fn;
 }
