@@ -115,6 +115,21 @@ reads the OBB out of the guest's userdata directory:
 | `bonelab` | `obb/` | `main.2974` + `patch.2974`, `.com.StressLevelZero.BONELAB.obb` |
 | `re4` | `Android/obb/com.Armature.VR4/` | `main.203` + `patch.203`, `.com.Armature.VR4.obb` |
 
+The runtime does not unpack the OBB. `runtime/guest/kl_obbmap.c` indexes it and
+serves each STORED entry by its loose path. `stat`/`access`/`opendir` see
+virtual entries, and an open returns a real fd on the OBB whose reads are
+translated into that entry's byte window. **Every open door has to ask
+`kl_obbmap_open` first**: `openat` and `__open_2` (`kl_libc_slink.c`), plain
+`open` (`klh_open`, `kl_va_handlers.c`) and `fopen` (`kl_obbmap_fopen`).
+
+Symptom when a door is missing: the trace (`KL_TRACE_FS=1`, or the viewer's log)
+shows `stat(...) ok` / `access(...) ok` for a file and then
+`open(...) FAILED: No such file or directory` for the same path. The guest
+finds the file but cannot read it. Seen on RE4: UE4 opens its paks through
+FORTIFY's `__open_2`, but the Bink library calls plain `open()` for its `.bk2`
+movies, so before `klh_open` asked the OBB map, the movie panels (e.g. the
+Comfort Mode preview) stayed black.
+
 ---
 
 ## ANGLE

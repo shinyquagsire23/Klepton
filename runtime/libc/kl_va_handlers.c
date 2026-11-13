@@ -11,6 +11,7 @@
 #include <sys/ioctl.h>
 #include "kl_va.h"
 #include "klepton.h"
+#include "../guest/kl_obbmap.h"
 
 // Darwin arm64's va_list is a bare char*, so a marshalled buffer *is* a va_list.
 #define KL_MARSHAL(fmt, va, mode)                                        \
@@ -218,7 +219,15 @@ int klh_open(const char *path, int flags, kl_va *va) {
             }
         }
     }
-    int fd = open(kl_guest_path(path, kp, sizeof kp), kl_open_flags(flags), (int)kl_va_gp(va));
+    // The OBB read-through, as openat and __open_2 do: UE4 itself opens its paks
+    // through FORTIFY's __open_2, but a third-party library built without
+    // FORTIFY calls plain open() — RE4's Bink player asks for its .bk2 movies
+    // (stored inside the OBB) here, and without this they are ENOENT and the
+    // movie panels stay black.
+    const char *gp = kl_guest_path(path, kp, sizeof kp);
+    int vfd = kl_obbmap_open(gp, kl_open_flags(flags));
+    if (vfd >= 0) { kl_fs_trace_open(path, flags, vfd); return vfd; }
+    int fd = open(gp, kl_open_flags(flags), (int)kl_va_gp(va));
     kl_fs_trace_open(path, flags, fd);
     return fd;
 }

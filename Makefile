@@ -624,7 +624,14 @@ check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot bu
 	@if [ -x "$(NDK_CC)" ]; then echo "=== guest differential ===" && \
 	   $(MAKE) -s guest | grep -E 'x18 sites|identical to the host|lost '; \
 	 else echo "=== guest differential: SKIPPED (set ANDROID_NDK_HOME) ==="; fi
-	@echo "=== il2cpp runtime ===" && ./build/t_il2cpp $(LIBS)/libil2cpp.so $(TARGET)/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log
+# libil2cpp.so exists only on Unity IL2CPP titles. A UE4, SDL or native guest
+# has nothing to point t_il2cpp at, and failing here stopped every gate after
+# it. Skip loudly, as the opus gate does: a missing library is a property of
+# the guest, not a regression.
+	@echo "=== il2cpp runtime ===" && if [ -f $(LIBS)/libil2cpp.so ]; then \
+	  ./build/t_il2cpp $(LIBS)/libil2cpp.so $(TARGET)/assets/bin/Data/Managed > build/il2cpp.log && tail -4 build/il2cpp.log; \
+	else echo "  SKIPPED: $(LIBS) has no libil2cpp.so (not a Unity IL2CPP title)."; \
+	     echo "  The guest-entry gate below still runs its own entry points."; fi
 	@echo "=== guest entry (JNI_OnLoad, initJni) ===" && ./build/m_boot $(LIBS) > build/boot.log 2>/dev/null && \
 	  grep -E 'guard verified|DLC enumeration|JNI_OnLoad returned|registered com|load returned|natives registered:|ids requested:|EXIT CRITERION' build/boot.log
 
