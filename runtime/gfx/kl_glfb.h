@@ -99,6 +99,21 @@ void kl_glfb_gl_census(FILE *f);
 // black" and "the guest never drew into the eye texture" are the same symptom
 // and completely different work.
 void kl_glfb_draw_census(FILE *f);
+// glProgramBinary loads, and how many the driver refused to link. A rejected
+// binary is an unlinked program the guest will use anyway.
+void kl_glfb_program_binary_census(FILE *f);
+
+// The generation of klfb_rewrite_glsl's OUTPUT, which belongs to a guest's
+// shader cache exactly as much as the driver's build does. A guest's
+// ProgramBinaryCache stores the compiled form of the GLSL WE handed ANGLE, not
+// the GLSL the guest wrote, so a change to any rewrite rule leaves every cached
+// blob a compiled copy of the old text. It is folded into kl_app.c's
+// shader_cache_guard fingerprint beside the OS build, so bumping it drops the
+// caches once per install, on every target. BUMP IT whenever
+// klfb_rewrite_glsl emits different text.
+//
+//   1  the rewrite rules up to and including the per-stage int precision
+#define KL_GLFB_REWRITE_GEN 1
 
 // The eye-texture seam, texture identity out. kl_ovrp's SetupEyeTexture2 calls
 // this with the GL texture name Unity handed down; the capture finds "the

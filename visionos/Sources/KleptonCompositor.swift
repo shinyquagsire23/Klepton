@@ -1119,6 +1119,58 @@ final class KleptonCompositor {
             qy.withUnsafeMutableBufferPointer { kl_glfb_foveation_quality($0.baseAddress, zones, edge) }
             source = "synthetic, edge rate \(String(format: "%.2f", edge))"
         }
+
+        // ---- The rate floor: a rasterization rate is a mip level ----
+        //
+        // A rasterization rate map does not only thin the fragments. The
+        // fragment shader runs in PHYSICAL space, so `dFdx`/`dFdy` — and every
+        // texture LOD Metal derives from them — measure physical pixels, not
+        // screen pixels, and nothing renormalizes them. A zone rasterized at
+        // rate `r` therefore samples a mip level `log2(1/r)` HIGHER than the
+        // same surface would unfoveated: rate 0.5 is +1 level, 0.25 is +2, and
+        // this display's own peripheral rates (about 0.12 in x and 0.10 in y)
+        // are +3.1 and +3.3 levels, a tenfold over-blur.
+        //
+        // The display's curve is right for the compositor's own drawable. It is
+        // not automatically right for a guest that renders one eye through a GL
+        // driver that has never heard of it and picks its LODs from those
+        // derivatives. Transplanted raw, the periphery of every textured surface
+        // goes soft, and because the curve is screen-fixed the soft band slides
+        // over the scene as the head pitches, with a visible seam wherever a
+        // zone boundary steps the LOD. In Beat Saber's menu, looking down puts a
+        // blurred band across the top of the view, crossed by one or two
+        // horizontal lines; looking up clears it.
+        //
+        // Flooring the per-zone rate bounds that at a stated number of mip
+        // levels while keeping most of the saving: the floor is the deepest
+        // over-blur we are willing to hand the guest, not an off switch for
+        // foveation. On the measured curve, 0.50 takes the worst bias from +3.3
+        // to +1.0 and the fragment count from about 29% to about 49% of the
+        // unfoveated eye. KL_VRR_FLOOR=0.01 restores the display's raw curve.
+        let rateFloor: Float = min(1.0, max(0.01, klEnvFloat("KL_VRR_FLOOR", 0.5)))
+        func bias(_ q: [Float]) -> Double {
+            guard let m = q.min(), m > 0 else { return 0 }
+            return log2(1.0 / Double(m))
+        }
+        func frac(_ a: [Float], _ b: [Float]) -> Double {
+            guard !a.isEmpty, !b.isEmpty else { return 1 }
+            let ma = Double(a.reduce(0, +)) / Double(a.count)
+            let mb = Double(b.reduce(0, +)) / Double(b.count)
+            return ma * mb
+        }
+        let rawBiasX = bias(qx), rawBiasY = bias(qy), rawFrac = frac(qx, qy)
+        if rateFloor > 0.01 {
+            for i in qx.indices { qx[i] = max(qx[i], rateFloor) }
+            for i in qy.indices { qy[i] = max(qy[i], rateFloor) }
+        }
+        NSLog("%@", "[cp] foveation LOD: rate floor "
+              + String(format: "%.2f", rateFloor)
+              + " — worst mip bias x +\(String(format: "%.2f", rawBiasX)) -> "
+              + "+\(String(format: "%.2f", bias(qx))), y +\(String(format: "%.2f", rawBiasY)) -> "
+              + "+\(String(format: "%.2f", bias(qy)))"
+              + "; fragments \(String(format: "%.1f", 100 * rawFrac))% -> "
+              + "\(String(format: "%.1f", 100 * frac(qx, qy)))% "
+              + "(KL_VRR_FLOOR=0.01 restores the display's raw curve)")
         // `__sampleCount:` is the pointer-taking initializer as Swift imports
         // it; the array-taking spelling does not exist here.
         let layer = qx.withUnsafeBufferPointer { hp in
