@@ -16,6 +16,7 @@
 // and BOTH drivers call it.
 #include "kl_guestpoke.h"
 #include "klepton.h"
+#include "kl_guestpatch.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -98,6 +99,32 @@ static size_t unity_version_at(const char *b, size_t n, size_t i, int want_rev) 
 // carries a revision is one this binary was built from rather than one it merely
 // mentions. The bare-string scan stays as the fallback, so a guest whose libunity
 // has no stamped revision behaves exactly as it did before.
+// Does the LOADED libunity carry unity-texunit-mask (kl_guestpatch.c)? Asked
+// of the image as it is mapped, not of a flag: on the headset the patch was
+// written offline by klepton-ld and nothing at run time remembers that, and on
+// the host the loader may have been told KL_GUEST_PATCH=0. kl_glfb masks
+// sampler units only when this says yes, because the two halves have to agree
+// — a shader sampling unit 3 while Unity bound the texture to 35 is the same
+// black surface the patch exists to fix.
+struct tu_ctx { const uint8_t *base; size_t span; };
+static uint32_t *tu_at(void *c_, uint64_t va) {
+    struct tu_ctx *c = c_;
+    if (va + 4 > c->span) return NULL;
+    return (uint32_t *)(uintptr_t)(c->base + va);
+}
+int kl_texunit_mask_active(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+    kl_image *u = kl_find_image("libunity.so");
+    if (!u) return 0;                              // asked too early: do not cache
+    struct tu_ctx c = { (const uint8_t *)kl_base(u), kl_span(u) };
+    v = kl_gp_texunit_state(tu_at, &c) == 2;
+    fprintf(stderr, "  [poke] texture units: %s\n", v
+            ? "libunity masks them & 31 at the bind; sampler uniforms are masked to match"
+            : "libunity is not masked (unity-texunit-mask not applied); sampler units pass through");
+    return v;
+}
+
 static const char *unity_version(void) {
     static char ver[32];
     static int done;

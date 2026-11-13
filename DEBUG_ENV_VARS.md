@@ -431,7 +431,14 @@ every time they fire, with the address and the instruction each replaces.
 
 - `KL_GUEST_PATCH=0` — apply none of them. The A/B for every row: with it VRChat
   stops on its "Under Construction" screen exactly as it did before.
-- `KL_GUEST_PATCH_OFF=<name>[,<name>]` — turn off one by name. The names are
+- `KL_GUEST_PATCH_OFF=<name>[,<name>]` — turn off one by name. Three apply to
+  Unity titles and are FOUND in its libunity rather than measured per
+  build: `unity-texunit-mask` (texture units taken `& 31` at Unity's bind,
+  with kl_glfb masking sampler uniforms to match — the fix for "Invalid
+  texture unit!"), `unity-no-compute` (SystemInfo.supportsComputeShaders is
+  false) and `unity-cpu-skinning` (the GLES
+  GPU-skinning capability is cleared, so skinned meshes are skinned on the CPU
+  instead of vanishing; 2021.3 builds). The measured ones are
   `vrchat-under-construction`, `vrchat-min-client-version`, `vrchat-multipass`
   and `vrchat-fbo-context-guard`. `vrchat-min-client-version` is the one to
   reach for, because it is a real version check against VRChat's own API (the

@@ -524,10 +524,305 @@ static int turned_off(const char *name) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// unity-texunit-mask: FOUND, not measured — the one row in this file that is.
+//
+// Unity's GLES backend caps texture units at min(GL_MAX_COMBINED_TEXTURE_IMAGE_
+// UNITS, 32) and sizes its GL state cache to that (bound name and target per
+// unit, 32 words each), while HLSLCC bakes sampler units ABOVE 31 into shaders
+// that carry many uniforms: a sampler's unit is its explicit location, and the
+// samplers come after everything else. Unity refuses those binds ("OpenGL
+// Error: Invalid texture unit!") and the sampler reads whatever unit 0 left
+// behind: black surfaces, tofu text. Raising the cap (kl_guestpoke.c) lets the
+// binds through and overruns the cache — Iron Rebellion bound draw framebuffer
+// 0xffffffff for it. Measured on six titles from 2019.1 to 2022.3.
+//
+// Every program's sampler units are ONE contiguous block (they are its last
+// locations), so `unit & 31` is collision-free inside any program. Applied at
+// both ends it keeps every unit under 32: here, in the function that owns the
+// reject — `mov wU, wArg` -> `and wU, wArg, #31` on its way in, before the cap
+// check and every cache write — and in kl_glfb's glUniform1i for sampler-typed
+// uniforms, which asks kl_gp_texunit_state() whether THIS image carries it.
+//
+// The same shape in every build measured (the rows in kl_guestpoke.c): the
+// error string, one adrp+add that loads it, a `cmp wCap, wU` / `b.ls` into
+// that block, and a `mov wU, w<arg>` earlier in the function. Anything else is
+// refused by name and the image is left alone. KL_GUEST_PATCH_OFF=
+// unity-texunit-mask turns it off.
+
+static const char k_texunit_msg[] = "OpenGL Error: Invalid texture unit!";
+
+static int gp_byte(kl_gp_at at, void *ctx, uint64_t va, uint8_t *out) {
+    uint32_t *w = at(ctx, va & ~3ull);
+    if (!w) return 0;
+    *out = (uint8_t)(*w >> (8 * (va & 3)));
+    return 1;
+}
+
+// The guard, located: where the unit register is defined, and what is there
+// now. 0 = not this shape (or no string), 1 = the original `mov`, 2 = already
+// masked. *def_va and *orig receive the site and the word to restore it to.
+static int texunit_find(kl_gp_at at, void *ctx, uint64_t *def_va, uint32_t *mov_word,
+                        uint32_t *and_word, const char **why) {
+    // 1. the string. It sits in the first LOAD with the code, which starts at 0.
+    const size_t n = sizeof k_texunit_msg;           // with the NUL: a whole string
+    uint64_t str = 0; int found = 0;
+    for (uint64_t va = 0; at(ctx, va & ~3ull); va++) {
+        size_t k = 0; uint8_t b;
+        while (k < n && gp_byte(at, ctx, va + k, &b) && b == (uint8_t)k_texunit_msg[k]) k++;
+        if (k == n) { str = va; found = 1; break; }
+    }
+    if (!found) { *why = "no \"Invalid texture unit\" string"; return 0; }
+
+    // 2. its one reference: add xD, xS, #lo12 with adrp xS, page a few words back.
+    uint64_t ref = 0;
+    for (uint64_t va = 0; at(ctx, va); va += 4) {
+        uint32_t w = *at(ctx, va);
+        if ((w & 0xFFC00000u) != 0x91000000u) continue;              // add x, x, #imm
+        if (((w >> 10) & 0xfff) != (str & 0xfff)) continue;
+        unsigned rn = (w >> 5) & 31;
+        for (int back = 1; back <= 8 && va >= (uint64_t)back * 4; back++) {
+            uint32_t *pw = at(ctx, va - back * 4);
+            if (!pw || (*pw & 0x9F000000u) != 0x90000000u || (*pw & 31) != rn) continue;
+            int64_t imm = (int64_t)((((*pw >> 5) & 0x7FFFF) << 2) | ((*pw >> 29) & 3));
+            if (imm & (1ll << 20)) imm -= (1ll << 21);
+            if ((((va - back * 4) & ~0xfffull) + (uint64_t)(imm << 12)) == (str & ~0xfffull)) {
+                ref = va; break;
+            }
+        }
+        if (ref) break;
+    }
+    if (!ref) { *why = "no adrp+add of the string"; return 0; }
+
+    // 3. the guard: a b.ls landing just before the reference, and the cmp before it.
+    uint64_t cmp_va = 0; unsigned unit = 32;
+    for (uint64_t va = ref; va >= 4 && ref - va < 4096; va -= 4) {
+        uint32_t *pw = at(ctx, va);
+        if (!pw) break;
+        uint32_t w = *pw;
+        if ((w & 0xFF000010u) != 0x54000000u || (w & 0xf) != 0x9) continue;   // b.ls
+        int64_t off = (int64_t)((w >> 5) & 0x7FFFF);
+        if (off & (1ll << 18)) off -= (1ll << 19);
+        uint64_t tgt = va + (uint64_t)(off * 4);
+        if (tgt > ref || ref - tgt > 64) continue;
+        uint32_t *pc = at(ctx, va - 4);
+        if (!pc || (*pc & 0xFFE0FC1Fu) != 0x6B00001Fu) continue;         // cmp wN, wM
+        cmp_va = va - 4; unit = (*pc >> 16) & 31;
+        break;
+    }
+    if (!cmp_va) { *why = "no cmp/b.ls guard into the reject"; return 0; }
+
+    // 4. where the unit register was set. Nothing between there and the cmp
+    //    may name it as a destination (low five bits) — conservative, so a
+    //    store through it refuses too, which is the safe direction.
+    for (uint64_t va = cmp_va - 4; cmp_va - va <= 64 * 4; va -= 4) {
+        uint32_t *pw = at(ctx, va);
+        if (!pw) break;
+        uint32_t w = *pw;
+        if (w == 0xd65f03c0u) break;                                       // ret: left the function
+        if ((w & 0xFFE0FFE0u) == 0x2A0003E0u && (w & 31) == unit) {      // mov wU, wM
+            unsigned src = (w >> 16) & 31;
+            if (src > 7) { *why = "the unit is not moved from an argument"; return 0; }
+            *def_va = va; *mov_word = w;
+            *and_word = 0x12001000u | (src << 5) | unit;                  // and wU, wM, #31
+            return 1;
+        }
+        if ((w & 0xFFFFFC00u) == 0x12001000u && (w & 31) == unit) {      // and wU, wM, #31
+            unsigned src = (w >> 5) & 31;
+            *def_va = va; *and_word = w;
+            *mov_word = 0x2A0003E0u | (src << 16) | unit;
+            return 2;
+        }
+        if ((w & 31) == unit) { *why = "the unit register is written between its "
+                                       "definition and the cap check"; return 0; }
+        if (va < 4) break;
+    }
+    *why = "no `mov wU, w<arg>` before the cap check";
+    return 0;
+}
+
+int kl_gp_texunit_state(kl_gp_at at, void *ctx) {
+    uint64_t def; uint32_t mov, and_; const char *why = NULL;
+    return texunit_find(at, ctx, &def, &mov, &and_, &why);
+}
+
+static unsigned texunit_apply(const char *base, kl_gp_at at, void *ctx) {
+    if (turned_off("unity-texunit-mask")) {
+        fprintf(stderr, "  [patch] unity-texunit-mask: OFF (KL_GUEST_PATCH_OFF)\n");
+        return 0;
+    }
+    uint64_t def = 0; uint32_t mov = 0, and_ = 0; const char *why = "?";
+    int st = texunit_find(at, ctx, &def, &mov, &and_, &why);
+    if (st == 0) {
+        fprintf(stderr, "  [patch] unity-texunit-mask: SKIPPED — %s in %s; the image "
+                        "is untouched\n", why, base);
+        return 0;
+    }
+    if (st == 2) return 0;                         // a second pass over one image
+    *at(ctx, def) = and_;
+    fprintf(stderr, "  [patch] unity-texunit-mask: applied to %s — texture units are "
+                    "taken & 31 at the bind (0x%llx: 0x%08x -> 0x%08x)\n",
+            base, (unsigned long long)def, mov, and_);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// unity-no-compute: FOUND, like unity-texunit-mask above.
+//
+// Unity's GLES device marks compute as supported from the GL VERSION alone: at
+// ES 3.1+ it sets bit 0x4000 (compute) in the shader-requirement mask it keeps
+// at caps+0xd0, unconditionally, and only then reads the storage and compute
+// limits — so no answer we give to those queries can take it back, and
+// describing ES 3.0 instead costs the post-processing stack (kl_egl.c). But
+// ANGLE here is ES 3.0 and has no compute stage at all: glCreateShader(
+// COMPUTE) is INVALID_ENUM, every compute shader fails ("GLSL compilation
+// failed, no infolog"), and GPU skinning with it ("Internal-Skinning.compute:
+// Kernel … invalid") — so every skinned mesh is simply not drawn. Iron
+// Rebellion's enemy mechs were invisible for exactly this (349k errors a run).
+//
+// The `orr wN|xN, …, #0x4000` that sets the bit sits beside the first limit
+// query, MAX_SHADER_STORAGE_BUFFER_BINDINGS (`mov w0, #0x90dd`), in every build
+// measured (2019.2.18 .. 2021.3.9), followed by its store into the mask. It
+// becomes a nop: Unity then reports no compute, skins on the CPU, and takes a
+// shader's fallback SubShader instead of one that needs a compute stage.
+//
+// A title whose required shaders need compute reported would lose them to
+// this; KL_GUEST_PATCH_OFF=unity-no-compute turns it off for such a game.
+
+static int nocompute_find(kl_gp_at at, void *ctx, uint64_t *site, uint32_t *word,
+                          const char **why) {
+    const uint32_t k_mov_ssbo = 0x52800000u | (0x90ddu << 5);   // mov w0, #0x90dd
+    uint64_t q = 0; unsigned nq = 0;
+    for (uint64_t va = 0; at(ctx, va); va += 4)
+        if (*at(ctx, va) == k_mov_ssbo) { if (!nq) q = va; nq++; }
+    if (nq != 1) { *why = nq ? "the storage-buffer query appears more than once"
+                             : "no storage-buffer query (mov w0, #0x90dd)"; return 0; }
+    for (int d = -16; d <= 8; d++) {
+        if (d < 0 && q < (uint64_t)(-d) * 4) continue;
+        uint64_t va = q + (int64_t)d * 4;
+        uint32_t *pw = at(ctx, va);
+        if (!pw) continue;
+        uint32_t w = *pw;
+        unsigned rd = w & 31;
+        uint32_t want32 = 0x32120000u | (rd << 5) | rd;              // orr wN, wN, #0x4000
+        uint32_t want64 = 0xB2720000u | (rd << 5) | rd;              // orr xN, xN, #0x4000
+        if (w != want32 && w != want64 && w != 0xD503201Fu) continue;
+        if (w == 0xD503201Fu) continue;                              // a nop proves nothing
+        for (int s = 1; s <= 3; s++) {                               // ...and its store
+            uint32_t *ps = at(ctx, va + s * 4);
+            if (!ps) break;
+            uint32_t sw = *ps;
+            int is_str = (w == want32) ? ((sw & 0xFFC00000u) == 0xB9000000u)
+                                       : ((sw & 0xFFC00000u) == 0xF9000000u);
+            if (is_str && (sw & 31) == rd) { *site = va; *word = w; return 1; }
+        }
+    }
+    // Already patched? The mask's store with no orr before it, and a nop where
+    // one was, is what a second pass over one image looks like.
+    *why = "no `orr …, #0x4000` and store beside the storage-buffer query";
+    return 0;
+}
+
+static unsigned nocompute_apply(const char *base, kl_gp_at at, void *ctx) {
+    if (turned_off("unity-no-compute")) {
+        fprintf(stderr, "  [patch] unity-no-compute: OFF (KL_GUEST_PATCH_OFF)\n");
+        return 0;
+    }
+    uint64_t site = 0; uint32_t w = 0; const char *why = "?";
+    if (!nocompute_find(at, ctx, &site, &w, &why)) {
+        fprintf(stderr, "  [patch] unity-no-compute: SKIPPED — %s in %s; the image is "
+                        "untouched\n", why, base);
+        return 0;
+    }
+    *at(ctx, site) = 0xD503201Fu;
+    fprintf(stderr, "  [patch] unity-no-compute: applied to %s — compute is not reported, "
+                    "so skinning runs on the CPU (0x%llx: 0x%08x -> nop)\n",
+            base, (unsigned long long)site, w);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// unity-cpu-skinning: FOUND, for the 2021.3 and 2019.4 shapes.
+//
+// unity-no-compute clears SystemInfo.supportsComputeShaders, but that is NOT
+// what decides skinning. IsGPUSkinningEnabled() (Iron Rebellion's libunity
+// 0x76e614) is PlayerSettings.gpuSkinning && (caps+0x414 & 0x01); with it on,
+// every skinned mesh goes to the GfxDevice — bits 0x20/0x40 of the same word
+// pick its compute skinner (Internal-Skinning.compute, which fails here like
+// every compute shader), and with those clear it asks for a pose buffer the
+// GLES device cannot make ("Failed to create GPU skin pose buffer!"). Either
+// way the mesh is never drawn: Iron Rebellion's enemy mechs, traced in the
+// simulator with lldb. The GLES device sets the word from the version alone —
+// `mov wN, #0xf1` / `str wN, [caps, #0x414]` right after the same ES-3.1-level
+// test (`mov wM, #0x3838` mask) that sets the compute bit — and stores 0 below
+// 3.1. Storing 0x90 drops bit 0 and the two variant bits and keeps the rest, so
+// GPU skinning is off and Unity skins on the CPU, as it does on any device
+// without it. 2019.4 has the same store at caps+0x408 (I Expect You To Die's
+// libunity 0x3ed434, read by IsGPUSkinningEnabled at 0x50eb10), behind the
+// level test written as `sub wT, wL, #0xb` / `cmp wT, #0x3`; both are taken.
+// Without it, unity-no-compute alone leaves 2019.4 dispatching the skinning
+// kernels that cannot compile, and its hands and lighter are never drawn.
+static int cpuskin_find(kl_gp_at at, void *ctx, uint64_t *site, uint32_t *word,
+                        const char **why) {
+    unsigned n = 0;
+    for (uint64_t va = 0; at(ctx, va); va += 4) {
+        uint32_t w = *at(ctx, va);
+        if ((w & 0xFFFFFFE0u) != 0x52801E20u) continue;              // mov wN, #0xf1
+        unsigned rd = w & 31;
+        int stored = 0;
+        for (int s = 1; s <= 3 && !stored; s++) {
+            uint32_t *ps = at(ctx, va + s * 4);
+            stored = ps && (*ps & 0xFFC00000u) == 0xB9000000u && (*ps & 31) == rd;
+        }
+        int gated = 0;
+        for (int b = 1; b <= 14 && !gated && va >= (uint64_t)b * 4; b++) {
+            uint32_t *pb = at(ctx, va - b * 4);
+            if (!pb) break;
+            gated = (*pb & 0xFFFFFFE0u) == 0x52870700u;               // mov wM, #0x3838
+            // 2019.4: `sub wT, wL, #0xb` / `cmp wT, #0x3` / `b.hs` — the same
+            // ES-3.1-level test, written as a range check on the level enum.
+            if (!gated && (*pb & 0xFFFFFC00u) == 0x51002C00u) {      // sub wT, wL, #0xb
+                uint32_t *pc = at(ctx, va - b * 4 + 4);
+                unsigned t = *pb & 31;
+                gated = pc && *pc == (0x71000C1Fu | (t << 5));      // cmp wT, #0x3
+            }
+        }
+        if (stored && gated) { if (!n) { *site = va; *word = w; } n++; }
+    }
+    if (n == 1) return 1;
+    *why = n ? "the skinning-caps store appears more than once"
+             : "no level-gated `mov wN, #0xf1` store";
+    return 0;
+}
+
+static unsigned cpuskin_apply(const char *base, kl_gp_at at, void *ctx) {
+    if (turned_off("unity-cpu-skinning")) {
+        fprintf(stderr, "  [patch] unity-cpu-skinning: OFF (KL_GUEST_PATCH_OFF)\n");
+        return 0;
+    }
+    uint64_t site = 0; uint32_t w = 0; const char *why = "?";
+    if (!cpuskin_find(at, ctx, &site, &w, &why)) {
+        fprintf(stderr, "  [patch] unity-cpu-skinning: SKIPPED — %s in %s; the image is "
+                        "untouched\n", why, base);
+        return 0;
+    }
+    uint32_t to = 0x52801200u | (w & 31);                             // mov wN, #0x90
+    *at(ctx, site) = to;
+    fprintf(stderr, "  [patch] unity-cpu-skinning: applied to %s — skinned meshes are "
+                    "skinned on the CPU (0x%llx: 0x%08x -> 0x%08x)\n",
+            base, (unsigned long long)site, w, to);
+    return 1;
+}
+
 unsigned kl_guest_patch_apply(const char *path, kl_gp_at at, void *ctx) {
     if (!kl_env_on("KL_GUEST_PATCH", 1)) return 0;
     const char *base = basename_of(path);
     unsigned applied = 0;
+    if (strcmp(base, "libunity.so") == 0) {
+        applied += texunit_apply(base, at, ctx);
+        applied += nocompute_apply(base, at, ctx);
+        applied += cpuskin_apply(base, at, ctx);
+    }
 
     for (size_t i = 0; i < KL_GP_N; i++) {
         const kl_gp_patch *p = &k_patches[i];
