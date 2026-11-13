@@ -1148,12 +1148,6 @@ static uint64_t klovrp_GetBoundaryGeometry3(int type, float *points, int *count)
     if (count) *count = 0;
     return (uint64_t)(int64_t)OVRP_FAIL_UNSUPPORTED;
 }
-static uint64_t klovrp_GetBoundaryDimensions2(int type, float *out) {
-    (void)type;
-    ovrp_hit("ovrp_GetBoundaryDimensions2");
-    if (out) memset(out, 0, 3 * sizeof(float));
-    return (uint64_t)(int64_t)OVRP_FAIL_UNSUPPORTED;
-}
 static uint64_t klovrp_TestBoundaryNode2(int node, int type, void *result) {
     (void)node; (void)type;
     ovrp_hit("ovrp_TestBoundaryNode2");
@@ -1165,11 +1159,6 @@ static uint64_t klovrp_TestBoundaryPoint2(const float *point, int type, void *re
     ovrp_hit("ovrp_TestBoundaryPoint2");
     if (result) memset(result, 0, 32);
     return (uint64_t)(int64_t)OVRP_FAIL_UNSUPPORTED;
-}
-static uint64_t klovrp_GetBoundaryVisible2(int *out) {
-    ovrp_hit("ovrp_GetBoundaryVisible2");
-    if (out) *out = 0;
-    return OVRP_SUCCESS;
 }
 static uint64_t klovrp_SetBoundaryVisible2(int visible) {
     (void)visible;
@@ -10573,10 +10562,8 @@ static const struct { const char *name; void *fn; } g_ovrp_impl[] = {
     {"ovrp_GetEyeTextureArraySupported",  (void *)klovrp_GetEyeTextureArraySupported},
     {"ovrp_GetBoundaryConfigured2", (void *)klovrp_GetBoundaryConfigured2},
     {"ovrp_GetBoundaryGeometry3", (void *)klovrp_GetBoundaryGeometry3},
-    {"ovrp_GetBoundaryDimensions2", (void *)klovrp_GetBoundaryDimensions2},
     {"ovrp_TestBoundaryNode2", (void *)klovrp_TestBoundaryNode2},
     {"ovrp_TestBoundaryPoint2", (void *)klovrp_TestBoundaryPoint2},
-    {"ovrp_GetBoundaryVisible2", (void *)klovrp_GetBoundaryVisible2},
     {"ovrp_SetBoundaryVisible2", (void *)klovrp_SetBoundaryVisible2},
     {"ovrp_GetAppHasVrFocus2", (void *)klovrp_GetAppHasVrFocus2},
     {"ovrp_GetUserPresent2", (void *)klovrp_GetUserPresent2},

@@ -2877,7 +2877,7 @@ int kl_jni_object_lifetime_selftest(FILE *out) {
               ((klj_wanted *)mid_amb)->sig);
 
     // A name nothing implements resolves to nothing, and stays empty.
-    void *mid_none = klj_want(bh, "stopInt", "", 'm');
+    void *mid_none = klj_want(bh, "noSuchMethod", "", 'm');
     OBJ_CHECK(((klj_wanted *)mid_none)->sig[0] == 0,
               "an unbound name asked with NO signature was given sig \"%s\"",
               ((klj_wanted *)mid_none)->sig);
