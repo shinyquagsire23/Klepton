@@ -11,6 +11,7 @@
 //   klovrp_GetNodePoseState_impl(step=w0, nodeId=w1, out=x2)
 //   klovrp_GetControllerState2_impl(mask=w0, out=x1)
 //   klovrp_GetControllerHapticsDesc_impl(mask=w0, out=x1)
+//   klovrp_GetAppPerfStats_impl(out=x0)          — takes no declared args at all
 
     .text
     .globl  _klovrp_GetNodePoseState_entry
@@ -32,3 +33,8 @@ _klovrp_GetControllerHapticsDesc_entry:
 _klovrp_GetControllerState_entry:
     mov     x1, x8
     b       _klovrp_GetControllerState_impl
+
+    .globl  _klovrp_GetAppPerfStats_entry
+_klovrp_GetAppPerfStats_entry:
+    mov     x0, x8
+    b       _klovrp_GetAppPerfStats_impl
