@@ -736,7 +736,15 @@ static int kl_socket(int domain, int type, int protocol) {
                             "(interface scan uses getifaddrs, not this socket)\n", fd);
         return fd;
     }
+    // Linux folds SOCK_NONBLOCK (0x800) and SOCK_CLOEXEC (0x80000) into the type,
+    // and bionic code uses them (libcurl opens every connection that way). Darwin
+    // has neither and refuses the type outright (EPROTOTYPE), so take them off
+    // and apply them with fcntl once the socket exists.
+    const int lx_nonblock = type & 0x800, lx_cloexec = type & 0x80000;
+    type &= ~(0x800 | 0x80000);
     int fd = socket(domain, type, protocol);
+    if (fd >= 0 && lx_nonblock) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    if (fd >= 0 && lx_cloexec) fcntl(fd, F_SETFD, FD_CLOEXEC);
     if (fd >= 0) kl_grow_sock_buffers(fd);
     // Darwin traffic-class marking for the guest's UDP sockets. Steam Link's
     // AV stream is plain UDP; stamped NET_SERVICE_TYPE_RV ("responsive
