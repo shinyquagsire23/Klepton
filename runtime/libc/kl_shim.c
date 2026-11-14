@@ -29,6 +29,7 @@
 #include <libgen.h>
 #include <fnmatch.h>    // libunity (1.40) — every FNM_* number matches Linux's
 #include <pthread.h>
+#include "../kl_import.h"
 #ifdef __APPLE__
 #include <pthread/qos.h>   // pthread_set_qos_class_self_np for the receive-thread boost
 #endif
@@ -2404,6 +2405,8 @@ static const kl_entry g_shim[] = {
     E("fesetround", fesetround),
 
     E("__klepton_unresolved", kl_unresolved),
+    // A guest asking the person for a file (kl_import.h); looked up by name.
+    E("klepton_import_file", klepton_import_file), E("klepton_import_status", klepton_import_status),
 };
 
 // Tier 0: a diagnostic's own answer, consulted before everything else and NULL

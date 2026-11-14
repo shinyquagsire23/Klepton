@@ -64,7 +64,8 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \
            runtime/media/kl_menu_font.S \
-           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c
+           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c \
+           runtime/kl_import.c
 RUNTIME_DIAG := runtime/diag/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 

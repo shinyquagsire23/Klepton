@@ -2,6 +2,7 @@ import SwiftUI
 import Foundation
 import CompositorServices
 import UIKit
+import UniformTypeIdentifiers
 
 // The visionOS host app (Swift for the platform layer).
 //
@@ -237,6 +238,7 @@ struct KleptonApp: App {
 
     init() {
         KleptonBattery.shared.start()
+        kl_import_frontend(1)   // this app shows a guest's file requests (kl_import.h)
     }
 
     var body: some Scene {
@@ -257,6 +259,14 @@ struct KleptonApp: App {
         WindowGroup(id: "kbentry") { KeyboardEntryView() }
             .defaultSize(width: 560, height: 240)
             .windowResizability(.contentSize)
+
+        // A guest's request for a file (kl_import.h): the system picker, in a
+        // window opened in front of the viewer like the text-entry one. Nothing
+        // opens it unless a guest asks.
+        WindowGroup(id: "kimport") { ImportView() }
+            .defaultSize(width: 560, height: 260)
+            .windowResizability(.contentSize)
+            .restorationBehavior(.disabled)   // a request belongs to the run that made it
 
         ImmersiveSpace(id: Immersive.id) {
             CompositorLayer(configuration: KleptonStageConfiguration()) { layerRenderer in
@@ -354,6 +364,118 @@ struct KeyboardEntryView: View {
     }
 }
 
+// The guest's file request being shown (kl_import.h): one at a time.
+final class ImportState: ObservableObject {
+    static let shared = ImportState()
+    @Published var open = false
+    @Published var ticket: Int32 = 0
+    var title = ""
+    var extensions: [String] = []
+    var dest = ""
+
+    func take() -> Bool {
+        var t = [CChar](repeating: 0, count: 160), e = [CChar](repeating: 0, count: 160)
+        var d = [CChar](repeating: 0, count: 1024)
+        let n = kl_import_take(&t, t.count, &e, e.count, &d, d.count)
+        guard n > 0 else { return false }
+        ticket = n
+        title = String(cString: t)
+        extensions = String(cString: e).split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+        dest = String(cString: d)
+        NSLog("[import] ticket \(n): \(title)")
+        return true
+    }
+
+    func finish(_ status: Int32) {
+        guard ticket > 0 else { return }
+        kl_import_finish(ticket, status)
+        ticket = 0
+    }
+}
+
+// The system file picker for a guest's request. Any file may be chosen (an
+// extension without a registered type would otherwise hide what the person
+// is looking for); the extensions are named in the window so they know which.
+struct ImportView: View {
+    @ObservedObject private var st = ImportState.shared
+    @State private var picking = false
+    @State private var message = ""
+    @Environment(\.dismissWindow) private var dismissWindow
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Text(st.title).font(.headline).multilineTextAlignment(.center)
+            if !st.extensions.isEmpty {
+                Text("A " + st.extensions.map { "." + $0 }.joined(separator: ", ") + " file, from Files or iCloud Drive.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if !message.isEmpty { Text(message).font(.caption) }
+            HStack {
+                Button("Choose File") { picking = true }
+                Button("Cancel", role: .cancel) { close(Int32(KL_IMPORT_CANCELLED)) }
+            }
+        }
+        .padding(28)
+        .frame(minWidth: 480)
+        .fileImporter(isPresented: $picking, allowedContentTypes: [.item]) { result in
+            switch result {
+            case .success(let url): copy(url)
+            case .failure(let err):
+                message = "Could not open that: \(err.localizedDescription)"
+            }
+        }
+        .onAppear {
+            st.open = true
+            if st.ticket == 0 { dismissWindow(id: "kimport"); return }   // no request: a stray window
+            start()
+        }
+        .onChange(of: st.ticket) { _, t in if t > 0 { start() } }
+        .onDisappear {
+            st.open = false
+            st.finish(Int32(KL_IMPORT_CANCELLED))   // closed without a choice
+        }
+    }
+
+    // KL_IMPORT_TEST_FILE=<path>: a run with nobody to tap the picker takes that
+    // file, through the same copy (the simulator gate for kl_import.h).
+    private func start() {
+        message = ""
+        if let f = ProcessInfo.processInfo.environment["KL_IMPORT_TEST_FILE"], !f.isEmpty {
+            copy(URL(fileURLWithPath: f))
+        } else {
+            picking = true
+        }
+    }
+
+    private func copy(_ url: URL) {
+        guard st.ticket > 0 else { return }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let to = URL(fileURLWithPath: st.dest)
+        let part = to.appendingPathExtension("part")
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: to.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? fm.removeItem(at: part)
+            try fm.copyItem(at: url, to: part)
+            try? fm.removeItem(at: to)
+            try fm.moveItem(at: part, to: to)
+            NSLog("[import] copied \(url.lastPathComponent) for ticket \(st.ticket)")
+            close(Int32(KL_IMPORT_COPIED))
+        } catch {
+            try? fm.removeItem(at: part)
+            NSLog("[import] copy failed: \(error)")
+            message = "Could not copy that file: \(error.localizedDescription)"
+            st.finish(Int32(KL_IMPORT_FAILED))
+        }
+    }
+
+    private func close(_ status: Int32) {
+        st.finish(status)
+        dismissWindow(id: "kimport")
+    }
+}
+
 struct BootView: View {
     @State private var log = ""
     @State private var status = "idle"
@@ -437,6 +559,12 @@ struct BootView: View {
                     }
                     kbFocused = true
                 }
+            }
+
+            // A guest asked for a file (klepton_import_file): open the picker window.
+            // (an open window picks the request up itself: ImportView's onChange)
+            if ImportState.shared.ticket == 0, ImportState.shared.take(), !ImportState.shared.open {
+                openWindow(id: "kimport")
             }
 
             if kl_app_vrlink_pending() != 0, !handedOff {
