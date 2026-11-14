@@ -2037,6 +2037,7 @@ X(klb_accept4) X(klb_pipe2) X(klb_dup2) X(klb_dup3) X(klb_memfd_create) X(klb_cl
 X(klb_inotify_init) X(klb_inotify_init1)
 X(klb_inotify_add_watch) X(klb_inotify_rm_watch)
 X(klb___assert2) X(klb___FD_CLR_chk) X(klb___fgets_chk)
+X(klb___fread_chk) X(klb_nftw) X(klb_execvp) X(klb_arc4random_uniform) X(klb_llabs) X(klb_labs) X(klb___memchr_chk)
 X(klb___pthread_cleanup_push) X(klb___pthread_cleanup_pop)
 #undef X
 extern char **environ;
@@ -2244,6 +2245,8 @@ static const kl_entry g_shim[] = {
     E("inotify_rm_watch", klb_inotify_rm_watch),
     E("__assert2", klb___assert2),
     E("__FD_CLR_chk", klb___FD_CLR_chk), E("__fgets_chk", klb___fgets_chk),
+    E("__fread_chk", klb___fread_chk), E("nftw", klb_nftw),
+    E("execvp", klb_execvp), E("arc4random_uniform", klb_arc4random_uniform), E("llabs", klb_llabs), E("labs", klb_labs), E("__memchr_chk", klb___memchr_chk),
     E("__pthread_cleanup_push", klb___pthread_cleanup_push),
     E("__pthread_cleanup_pop", klb___pthread_cleanup_pop),
     // The standard streams are `FILE *` VARIABLES in bionic, so the table entry
