@@ -107,6 +107,7 @@ const char *kl_app_assets_dir(void) { return g_assets[0] ? g_assets : NULL; }
 static void app_phase(const char *p);
 
 const char *kl_app_log_path(void) { return g_log; }
+static int g_log_capped;   // set once the log file is stdout/stderr (open_log)
 const char *kl_app_status(void)   { return g_status; }
 
 static int have(const char *p) { struct stat st; return p && *p && stat(p, &st) == 0; }
@@ -614,10 +615,36 @@ static int open_log(void) {
         return 0;
     }
     if (!freopen(g_log, "w", stdout)) return 1;
+    // O_APPEND so log_cap_check can cut the file under live writers: every
+    // write then lands at the CURRENT end instead of a stale offset past it.
+    int fl = fcntl(fileno(stdout), F_GETFL);
+    if (fl != -1) fcntl(fileno(stdout), F_SETFL, fl | O_APPEND);
     setvbuf(stdout, NULL, _IOLBF, 0);
     dup2(fileno(stdout), STDERR_FILENO);   // the guest's own writes(2) land here too
     setvbuf(stderr, NULL, _IOLBF, 0);
+    g_log_capped = 1;
     return 0;
+}
+
+// The boot log's size cap, enforced from the heartbeat. Nothing else bounds it:
+// one per-frame trace line ran a single simulator session to 60 GB. Past the
+// cap the file is cut back to its first half, which keeps the boot (what the
+// in-window report exists to show), followed by a marker and whatever comes
+// after, which is the live tail a crash leaves. KL_LOG_MAX_MB=0 turns it off.
+static void log_cap_check(void) {
+    if (!g_log_capped) return;
+    static long long cap = -1;
+    if (cap < 0) cap = (long long)kl_env_int("KL_LOG_MAX_MB", 512) << 20;
+    if (cap <= 0) return;
+    struct stat st;
+    if (fstat(STDOUT_FILENO, &st) != 0 || st.st_size <= cap) return;
+    fflush(NULL);
+    if (ftruncate(STDOUT_FILENO, cap / 2) != 0) return;
+    static unsigned cuts;
+    fprintf(stderr, "\n[log] ---- cut #%u: %lld MB dropped to stay under "
+                    "KL_LOG_MAX_MB=%lld; output resumes below ----\n",
+            ++cuts, (long long)(st.st_size - cap / 2) >> 20, cap >> 20);
+    fflush(stderr);
 }
 
 // A heartbeat on its own thread, because three different failures look identical
@@ -704,6 +731,7 @@ static void *heartbeat(void *arg) {
         // end-of-run report never prints on a headset (the app is killed, not
         // exited), so this is the only audio census a device log carries.
         if (ticks % 40 == 0) { kl_opensl_heartbeat(stderr); fflush(stderr); }
+        if (ticks % 8 == 0) log_cap_check();
         ticks++;
         struct timespec iv = { 0, 250000000 };  // nanosleep: usleep is EINVAL at >= 1e6
         nanosleep(&iv, NULL);

@@ -4234,6 +4234,12 @@ typedef struct {
     int      next_index;      // round-robin, which is all "which is free" means
                               // here: nothing else reads these images yet
     int      eye;             // which eye this swapchain was registered as, -1 if not
+    unsigned eye_said;        // (layer,eye) pairs whose "<- swapchain" line has
+                              // printed, bit layer*2+eye. NOT `eye` above: an
+                              // array swapchain (one slice per eye, Unity's
+                              // layout) flips `eye` 0->1->0 every frame, and
+                              // keying the line on that flip printed two lines
+                              // a frame for the whole run (a 60 GB boot log).
     int      mtl_eye;         // ...and which eye its images were BACKED as, -1 if
                               // none. Separate from `eye` because every
                               // projection layer's views claim an eye and only
@@ -6241,6 +6247,9 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
             if (!sc->session || sc->session->gfx != KLXR_GFX_VULKAN)
                 for (int k = 0; k < sc->count; k++)
                     kl_glfb_note_eye_texture(sc->eye, k, sc->tex[k]);
+            unsigned said_bit = li * 2 + v < 32 ? 1u << (li * 2 + v) : 0;
+            if (!said_bit || (sc->eye_said & said_bit)) continue;
+            sc->eye_said |= said_bit;
             const XrRect2Di *r = &proj->views[v].subImage.imageRect;
             char imgs[96];
             if (sc->session && sc->session->gfx == KLXR_GFX_VULKAN)
