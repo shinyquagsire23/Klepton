@@ -145,5 +145,7 @@
 	     on a headset that is often not tethered to the Mac that built it. -->
 	<key>UIFileSharingEnabled</key>
 	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 </dict>
 </plist>
