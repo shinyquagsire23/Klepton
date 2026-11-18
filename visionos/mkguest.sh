@@ -87,6 +87,12 @@ for NAME in $LIBS; do
   <key>MinimumOSVersion</key><string>26.0</string>
 </dict></plist>
 EOF
+    # Ad-hoc signed here, as a bundle once its Info.plist exists: a simulator build
+    # embeds it without signing it, and the visionOS 27 simulator refuses an
+    # unsigned library ("Trying to load an unsigned library"). Signing the bundle
+    # (not the bare binary) makes the identifier its CFBundleIdentifier, which
+    # Xcode keeps when it re-signs on copy and App Store validation requires (90334).
+    codesign -s - -f "$FW" 2>/dev/null
   done
   rm -rf "$OUT/$NAME.xcframework"
   FWARGS=()
