@@ -29,6 +29,7 @@
 #include <libgen.h>
 #include <fnmatch.h>    // libunity (1.40) — every FNM_* number matches Linux's
 #include <pthread.h>
+#include "../kl_import.h"
 #ifdef __APPLE__
 #include <pthread/qos.h>   // pthread_set_qos_class_self_np for the receive-thread boost
 #endif
@@ -736,7 +737,15 @@ static int kl_socket(int domain, int type, int protocol) {
                             "(interface scan uses getifaddrs, not this socket)\n", fd);
         return fd;
     }
+    // Linux folds SOCK_NONBLOCK (0x800) and SOCK_CLOEXEC (0x80000) into the type,
+    // and bionic code uses them (libcurl opens every connection that way). Darwin
+    // has neither and refuses the type outright (EPROTOTYPE), so take them off
+    // and apply them with fcntl once the socket exists.
+    const int lx_nonblock = type & 0x800, lx_cloexec = type & 0x80000;
+    type &= ~(0x800 | 0x80000);
     int fd = socket(domain, type, protocol);
+    if (fd >= 0 && lx_nonblock) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    if (fd >= 0 && lx_cloexec) fcntl(fd, F_SETFD, FD_CLOEXEC);
     if (fd >= 0) kl_grow_sock_buffers(fd);
     // Darwin traffic-class marking for the guest's UDP sockets. Steam Link's
     // AV stream is plain UDP; stamped NET_SERVICE_TYPE_RV ("responsive
@@ -2037,6 +2046,7 @@ X(klb_accept4) X(klb_pipe2) X(klb_dup2) X(klb_dup3) X(klb_memfd_create) X(klb_cl
 X(klb_inotify_init) X(klb_inotify_init1)
 X(klb_inotify_add_watch) X(klb_inotify_rm_watch)
 X(klb___assert2) X(klb___FD_CLR_chk) X(klb___fgets_chk)
+X(klb___fread_chk) X(klb_nftw) X(klb_execvp) X(klb_arc4random_uniform) X(klb_llabs) X(klb_labs) X(klb___memchr_chk)
 X(klb___pthread_cleanup_push) X(klb___pthread_cleanup_pop)
 #undef X
 extern char **environ;
@@ -2244,6 +2254,8 @@ static const kl_entry g_shim[] = {
     E("inotify_rm_watch", klb_inotify_rm_watch),
     E("__assert2", klb___assert2),
     E("__FD_CLR_chk", klb___FD_CLR_chk), E("__fgets_chk", klb___fgets_chk),
+    E("__fread_chk", klb___fread_chk), E("nftw", klb_nftw),
+    E("execvp", klb_execvp), E("arc4random_uniform", klb_arc4random_uniform), E("llabs", klb_llabs), E("labs", klb_labs), E("__memchr_chk", klb___memchr_chk),
     E("__pthread_cleanup_push", klb___pthread_cleanup_push),
     E("__pthread_cleanup_pop", klb___pthread_cleanup_pop),
     // The standard streams are `FILE *` VARIABLES in bionic, so the table entry
@@ -2393,6 +2405,8 @@ static const kl_entry g_shim[] = {
     E("fesetround", fesetround),
 
     E("__klepton_unresolved", kl_unresolved),
+    // A guest asking the person for a file (kl_import.h); looked up by name.
+    E("klepton_import_file", klepton_import_file), E("klepton_import_status", klepton_import_status),
 };
 
 // Tier 0: a diagnostic's own answer, consulted before everything else and NULL

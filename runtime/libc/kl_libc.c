@@ -991,6 +991,33 @@ int klb_fstatat(int dirfd, const char *p, bionic_stat *b, int flags) {
     if (!r) stat_to_bionic(&s, b);
     return r;
 }
+// nftw (GoldenEye VR). Darwin has it, but the callback's struct stat is the
+// host layout and the type flags are numbered differently from bionic's
+// (bionic: F 0, D 1, DNR 2, DP 3, NS 4, SL 5, SLN 6; Darwin: NS 3, SL 4, DP 5).
+// The walk flags (PHYS 1, MOUNT 2, DEPTH 4, CHDIR 8) and struct FTW match.
+#include <ftw.h>
+typedef int (*kl_bionic_nftw_fn)(const char *, const bionic_stat *, int, struct FTW *);
+static __thread kl_bionic_nftw_fn t_nftw_fn;
+static int nftw_tramp(const char *p, const struct stat *s, int type, struct FTW *f) {
+    int bt = type;
+    switch (type) {
+        case FTW_NS: bt = 4; break;
+        case FTW_SL: bt = 5; break;
+        case FTW_DP: bt = 3; break;
+        default: break;
+    }
+    bionic_stat b; memset(&b, 0, sizeof b);
+    if (s && type != FTW_NS) stat_to_bionic(s, &b);
+    return t_nftw_fn(p, &b, bt, f);
+}
+int klb_nftw(const char *dir, kl_bionic_nftw_fn fn, int fds, int flags) {
+    char kp[1024]; const char *q = kl_guest_path(dir, kp, sizeof kp);
+    kl_bionic_nftw_fn prev = t_nftw_fn; t_nftw_fn = fn;
+    int r = nftw(q, nftw_tramp, fds, flags);
+    t_nftw_fn = prev;
+    return r;
+}
+
 int klb_fstat(int fd, bionic_stat *b)        { long long osz; int handled;
                                                if (kl_obbmap_fstat_size(fd, &osz, &handled), handled) {
                                                    struct stat s; memset(&s, 0, sizeof s);

@@ -1076,6 +1076,26 @@ size_t klb___fwrite_chk(const void *buf, size_t size, size_t count,
     return fwrite(buf, size, count, kl_host_file(stream));
 }
 
+// The read half of the pair above (GoldenEye VR imports it).
+size_t klb___fread_chk(void *buf, size_t size, size_t count,
+                       void *stream, size_t cap) {
+    if (size && count > (size_t)-1 / size) chk_fail("__fread_chk", (size_t)-1, cap);
+    size_t want = size * count;
+    if (want > cap) chk_fail("__fread_chk", want, cap);
+    return fread(buf, size, count, kl_host_file(stream));
+}
+
+// Same signature on both sides; missing only because no earlier guest asked.
+int klb_execvp(const char *file, char *const argv[]) { return execvp(file, argv); }
+uint32_t klb_arc4random_uniform(uint32_t n) { return arc4random_uniform(n); }
+long long klb_llabs(long long v) { return llabs(v); }
+long klb_labs(long v) { return labs(v); }
+// bionic FORTIFY memchr: the read must stay inside the object (GoldenEye VR debug build).
+void *klb___memchr_chk(const void *s, int c, size_t n, size_t cap) {
+    if (n > cap) chk_fail("__memchr_chk", n, cap);
+    return memchr(s, c, n);
+}
+
 // ---- __pthread_cleanup_push / _pop ----
 //
 // bionic's shape, and it is not glibc's: the cleanup record is allocated by the
