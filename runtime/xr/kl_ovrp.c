@@ -1213,13 +1213,22 @@ KLOVRP_OUT_TRUE(GetTrackingOrientationEnabled2)
 KLOVRP_OUT_TRUE(GetTrackingIPDEnabled2)
 #undef KLOVRP_OUT_TRUE
 
+static int g_hand_tracking_lost[2];
+
+static int klovrp_node_tracking_valid(int node) {
+    if (node == 3 || node == 12)
+        return !__atomic_load_n(&g_hand_tracking_lost[0], __ATOMIC_ACQUIRE);
+    if (node == 4 || node == 13)
+        return !__atomic_load_n(&g_hand_tracking_lost[1], __ATOMIC_ACQUIRE);
+    return 1;
+}
+
 // Another node-first predicate, real 0x16f4b0 is the same (int node, int *out)
 // shape as GetNodePresent2 — w0=node, x1=out. Orientation IS tracked for
 // every node we report poses for.
 static uint64_t klovrp_GetNodeOrientationTracked2(int node, int *out) {
     ovrp_hit("ovrp_GetNodeOrientationTracked2");
-    (void)node;
-    if (out) *out = 1;
+    if (out) *out = klovrp_node_tracking_valid(node);
     return OVRP_SUCCESS;
 }
 
@@ -2430,7 +2439,7 @@ static uint64_t klovrp_GetTrackingOriginType2(int *out) {
 static uint64_t node_tracked(const char *name, int n, uint32_t *out) {
     ovrp_hit(name);
     ovrp_log_arg(name, n, __builtin_return_address(0));
-    *out = 1;
+    *out = klovrp_node_tracking_valid(n);
     return OVRP_SUCCESS;
 }
 static uint64_t klovrp_GetNodePositionTracked2(int n, uint32_t *o) {
@@ -2470,11 +2479,13 @@ typedef struct {
     // the seqlock, the per-frame freeze and the per-step ring alike. 0 means
     // "no frontend stamped this", which is every host run.
     uint64_t tag;
+    int touch_basis;         // the frontend supplied the guest's Touch frame
 } klovrp_pose;
 static klovrp_pose g_head_pose = {
     0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
     0,   // motion_valid: nothing has been published, so there is nothing to know
     0,   // tag: no frontend has stamped a push
+    0,   // touch_basis: the head has no controller basis
 };
 static int g_head_set;              // has a frontend ever written a head pose?
 // The two hands, published by the same frontend in the same breath. Declared
@@ -3692,7 +3703,7 @@ void kl_ovrp_set_head_pose(float px, float py, float pz,
     g_raw_head_have = 1;
     klovrp_origin_capture(py);
     py -= klovrp_origin_y();
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     v.tag = __atomic_load_n(&g_head_tag_next, __ATOMIC_ACQUIRE);
     klovrp_derive_motion(&v, &g_head_hist, klovrp_head_time_next());
 
@@ -4055,7 +4066,7 @@ static klovrp_pose klovrp_step_hand(int step, int hand) {
         p = klovrp_hand(hand);
     // Here and not in klovrp_hand: this is the OVRPlugin guest's read.
     // kl_ovrp_hand_motion is kl_openxr's and must keep the grip.
-    klovrp_grip_to_touch(&p, hand);
+    if (!p.touch_basis) klovrp_grip_to_touch(&p, hand);
     return p;
 }
 
@@ -5176,13 +5187,14 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
                              float avx, float avy, float avz) {
     if ((unsigned)hand > 1) return;
     py -= klovrp_origin_y();          // the same space the head is filed in
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1, 0 };
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, vx, vy, vz, avx, avy, avz, 1, 0, 0 };
 // A measured velocity is authoritative — nothing is derived here. The
     // history still advances, so a publisher that later drops to the pose-only
     // call differentiates against the right previous sample instead of a gap.
     klovrp_hist_note(&g_hand_hist[hand], &v, 0);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_hand_tracking_lost[hand], 0, __ATOMIC_RELEASE);
     float e[3]; klovrp_pose_euler_deg(&v, e);
     float pp[3] = { px, py, pz };
     kl_ovrp_ctrl_trace("published", hand, e, pp);
@@ -5203,25 +5215,50 @@ static int klovrp_hand_present(int hand) {
     static int inview = -1;
     if (inview < 0) inview = kl_env_on("KL_OVRP_HANDS_IN_VIEW", 0);
     if (inview) return 1;
-    return __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE) ? 1 : 0;
+    return __atomic_load_n(&g_hand_set[hand], __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&g_hand_tracking_lost[hand], __ATOMIC_ACQUIRE);
 }
-void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
-                           float qx, float qy, float qz, float qw) {
+static void publish_hand_pose_at(int hand, float px, float py, float pz,
+                                  float qx, float qy, float qz, float qw,
+                                  double time_s, int touch_basis) {
     if ((unsigned)hand > 1) return;
     py -= klovrp_origin_y();          // the same space the head is filed in
-    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0 };
-    klovrp_derive_motion(&v, &g_hand_hist[hand], 0);
+    klovrp_pose v = { px, py, pz, qx, qy, qz, qw, 0, 0, 0, 0, 0, 0, 0, 0, touch_basis };
+    klovrp_derive_motion(&v, &g_hand_hist[hand], time_s);
     klovrp_pose_write(&g_hand_pose[hand], &v);
     __atomic_store_n(&g_hand_set[hand], 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_hand_tracking_lost[hand], 0, __ATOMIC_RELEASE);
     float e[3]; klovrp_pose_euler_deg(&v, e);
     float pp[3] = { px, py, pz };
     kl_ovrp_ctrl_trace("published", hand, e, pp);
+}
+
+void kl_ovrp_set_hand_pose_at(int hand, float px, float py, float pz,
+                              float qx, float qy, float qz, float qw, double time_s) {
+    publish_hand_pose_at(hand, px, py, pz, qx, qy, qz, qw, time_s, 0);
+}
+
+void kl_ovrp_set_touch_hand_pose_at(int hand, float px, float py, float pz,
+                                    float qx, float qy, float qz, float qw, double time_s) {
+    publish_hand_pose_at(hand, px, py, pz, qx, qy, qz, qw, time_s, 1);
+}
+
+void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
+                           float qx, float qy, float qz, float qw) {
+    kl_ovrp_set_hand_pose_at(hand, px, py, pz, qx, qy, qz, qw, 0);
+}
+
+void kl_ovrp_clear_hand_tracking(int hand) {
+    if ((unsigned)hand > 1) return;
+    if (!__atomic_exchange_n(&g_hand_tracking_lost[hand], 1, __ATOMIC_ACQ_REL))
+        memset(&g_hand_hist[hand], 0, sizeof g_hand_hist[hand]);
 }
 
 // Is the velocity in the latched hand sample a measurement, or is it the
 // "we do not know" that OpenXR spells velocityFlags == 0?
 int kl_ovrp_hand_motion_known(int hand) {
     if ((unsigned)hand > 1) return 0;
+    if (__atomic_load_n(&g_hand_tracking_lost[hand], __ATOMIC_ACQUIRE)) return 0;
     return g_hand_pose[hand].motion_valid;
 }
 
@@ -5678,6 +5715,10 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
             hand.pz = head.pz + oz;
         } else {
             hand = klovrp_step_hand(step, h);
+        }
+        if (!klovrp_node_tracking_valid(node)) {
+            hand.vx = hand.vy = hand.vz = 0;
+            hand.avx = hand.avy = hand.avz = 0;
         }
         klovrp_dump_vrdevice();
         klovrp_hand_sweep(&head, &hand);

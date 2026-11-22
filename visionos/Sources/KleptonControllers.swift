@@ -19,15 +19,15 @@
 //  controllers at the tracker's delivery rate rather than the display's, and a
 //  pose repeated across three frames of a 90 Hz picture does not read as
 //  latency, it reads as the hands running at 30 Hz.
-//    * **Hands**, always. `HandTrackingProvider`'s skeleton supplies the grip
+//    * **Hands**, when tracked. `HandTrackingProvider`'s skeleton supplies the grip
 //      pose (the middle-finger metacarpal, so a hilt is gripped rather than
 //      swinging off the wrist), and the index trigger comes from the system's
 //      own pinch recogniser through `LayerRenderer.onSpatialEvent` — not from
 //      our arithmetic on two fingertip joints, which was tried twice and was
 //      unstable both times. The fingertip distance survives as the trigger's
 //      analog value and as the fallback if no spatial event ever arrives.
-//      No other button exists on a hand, but a trigger is the one a menu
-//      clicks with.
+//      SUPERHOT instead uses an independent three-finger curl and fingertip
+//      pinch to expose both Touch triggers.
 //
 //  So this file is a merge, not a switch: Sense wins per hand where it is
 //  present, hands fill in the rest, and a Sense controller that is paired for
@@ -411,6 +411,125 @@ struct KLSenseTune {
 }
 
 final class KleptonControllers {
+    private let superhotBareHands = klEnvOn(
+        "KL_SUPERHOT_BARE_HANDS", default: String(cString: kl_app_target_name_or_default()) == "superhot")
+    private let superhotAlignHands = klEnvOn("KL_SUPERHOT_ALIGN_HANDS", default: false)
+    private var bareHandGestures = Array(repeating: BareHandGestures(profile: SuperhotHandProfile.gestures), count: 2)
+    private var superhotWristFit: [(SIMD3<Float>, simd_quatf)?] = [nil, nil]
+
+    private static func bareHandSample(_ anchor: HandAnchor) -> BareHandGestures.Sample? {
+        guard let skeleton = anchor.handSkeleton else { return nil }
+        func position(_ name: HandSkeleton.JointName) -> SIMD3<Float> {
+            let value = skeleton.joint(name).anchorFromJointTransform.columns.3
+            return SIMD3(value.x, value.y, value.z)
+        }
+        func finger(_ base: HandSkeleton.JointName, _ middle: HandSkeleton.JointName,
+                    _ tip: HandSkeleton.JointName) -> BareHandGestures.Finger {
+            .init(base: position(base), middle: position(middle), tip: position(tip))
+        }
+        // A curled hand can occlude a finger. Use ARKit's estimated joints
+        // while the hand anchor is tracked, like the Kanojo recognizer.
+        return .init(wrist: position(.wrist),
+                     middle: finger(.middleFingerKnuckle, .middleFingerIntermediateBase, .middleFingerTip),
+                     ring: finger(.ringFingerKnuckle, .ringFingerIntermediateBase, .ringFingerTip),
+                     little: finger(.littleFingerKnuckle, .littleFingerIntermediateBase, .littleFingerTip),
+                     pinchGap: simd_distance(position(.indexFingerTip), position(.thumbTip)))
+    }
+
+    private func publishBareHand(_ hand: Int, position: SIMD3<Float>?,
+                                 orientation: simd_quatf?, sample: BareHandGestures.Sample?,
+                                 at time: TimeInterval, touchBasis: Bool = false) {
+        var input = KleptonHandState()
+        if let p = position, let q = orientation,
+           p.x.isFinite, p.y.isFinite, p.z.isFinite, q.length.isFinite, q.length > 0.001 {
+            let controls = bareHandGestures[hand].update(sample, at: time)
+            pinchHeld[hand] = controls.trigger
+            let rotation = simd_normalize(q)
+            if touchBasis {
+                kl_ovrp_set_touch_hand_pose_at(Int32(hand), p.x, p.y, p.z,
+                    rotation.imag.x, rotation.imag.y, rotation.imag.z, rotation.real, time)
+            } else {
+                kl_ovrp_set_hand_pose_at(Int32(hand), p.x, p.y, p.z,
+                    rotation.imag.x, rotation.imag.y, rotation.imag.z, rotation.real, time)
+            }
+            input.position = p
+            input.orientation = rotation
+            if controls.grip {
+                input.handTrigger = 1
+                input.buttons |= hand == 0 ? OVRPRawButton.lHandTrigger : OVRPRawButton.rHandTrigger
+            }
+            if controls.trigger {
+                input.indexTrigger = 1
+                let bit = hand == 0 ? OVRPRawButton.lIndexTrigger : OVRPRawButton.rIndexTrigger
+                input.buttons |= bit
+                input.touches = bit
+            }
+        } else {
+            bareHandGestures[hand].reset()
+            pinchHeld[hand] = false
+            gripOffset[hand] = nil
+            superhotWristFit[hand] = nil
+            kl_ovrp_clear_hand_tracking(Int32(hand))
+        }
+        kl_ovrp_set_controller_input(Int32(hand), input.buttons, input.touches,
+                                     input.indexTrigger, input.handTrigger, 0, 0)
+        lock.lock(); state[hand] = input; lock.unlock()
+    }
+
+    private func alignedSuperhotPose(_ anchor: HandAnchor, hand: Int) -> (SIMD3<Float>, simd_quatf)? {
+        guard superhotAlignHands else { return nil }
+        let origin = anchor.originFromAnchorTransform
+        let wristRotation = simd_quatf(origin)
+        let wristPosition = SIMD3(origin.columns.3.x, origin.columns.3.y, origin.columns.3.z)
+        if !pinchHeld[hand], let skeleton = anchor.handSkeleton {
+            let joints = [HandSkeleton.JointName.wrist, .indexFingerKnuckle,
+                          .middleFingerKnuckle, .littleFingerKnuckle].map { skeleton.joint($0) }
+            if joints.allSatisfy(\.isTracked) {
+                let points = joints.map { joint -> SIMD3<Float> in
+                    let p = joint.anchorFromJointTransform.columns.3
+                    return SIMD3(p.x, p.y, p.z)
+                }
+                let palm = SuperhotHandProfile.Palm(wrist: points[0], index: points[1],
+                                                      middle: points[2], little: points[3])
+                if let fit = SuperhotHandProfile.touchPose(palm, hand: hand) {
+                    let last = superhotWristFit[hand] ?? fit
+                    let blend = SuperhotHandProfile.poseBlend
+                    superhotWristFit[hand] = (last.0 + (fit.0 - last.0) * blend,
+                                              simd_slerp(last.1, fit.1, blend))
+                }
+            }
+        }
+        return superhotWristFit[hand].map { (wristPosition + wristRotation.act($0.0), wristRotation * $0.1) }
+    }
+
+    #if targetEnvironment(simulator)
+    struct SuperhotReplayFrame: Decodable {
+        struct Hand: Decodable {
+            let position: SIMD3<Float>
+            let orientation: SIMD4<Float>
+            let joints: BareHandGestures.Sample
+            // Wrist followed by four joints each for index, middle, ring,
+            // little and thumb, all in simulator tracking space.
+            let referenceSkeleton: [SIMD3<Float>]?
+        }
+        let left: Hand?
+        let right: Hand?
+    }
+
+    func replaySuperhotHands(_ frame: SuperhotReplayFrame?, at time: TimeInterval) {
+        for (hand, sample) in [frame?.left, frame?.right].enumerated() {
+            var fit: (SIMD3<Float>, simd_quatf)? = nil
+            if superhotAlignHands, let points = sample?.referenceSkeleton, points.count == 21 {
+                let palm = SuperhotHandProfile.Palm(wrist: points[0], index: points[1],
+                                                      middle: points[5], little: points[13])
+                fit = SuperhotHandProfile.touchPose(palm, hand: hand)
+            }
+            publishBareHand(hand, position: fit?.0 ?? sample?.position,
+                                 orientation: fit?.1 ?? sample.map { simd_quatf(vector: $0.orientation) },
+                                 sample: sample?.joints, at: time, touchBasis: fit != nil)
+        }
+    }
+    #endif
     // 0 = left, 1 = right, matching kl_ovrp's hand indices (nodes 3 and 4).
     private var state: [KleptonHandState] = [KleptonHandState(), KleptonHandState()]
 
@@ -1865,8 +1984,17 @@ final class KleptonControllers {
 
             let accPose = sensePose(hand: hand, at: presentationTime)
             if let accPose {
+                if superhotBareHands { bareHandGestures[hand].reset() }
                 st.position = accPose.0; st.orientation = accPose.1
                 st.linearVelocity = accPose.2; st.angularVelocity = accPose.3
+            } else if superhotBareHands && !st.fromController {
+                let anchor = hand == 0 ? leftHand : rightHand
+                let fit = anchor.flatMap { alignedSuperhotPose($0, hand: hand) }
+                let pose = fit ?? anchor.map { gripPose($0, hand: hand) }
+                publishBareHand(hand, position: pose?.0, orientation: pose?.1,
+                                     sample: anchor.flatMap { Self.bareHandSample($0) }, at: presentationTime,
+                                     touchBasis: fit != nil)
+                continue
             } else if let anchor = (hand == 0 ? leftHand : rightHand) {
                 let (p, q) = gripPose(anchor, hand: hand)
                 st.position = p; st.orientation = q
@@ -1926,6 +2054,7 @@ final class KleptonControllers {
                 // never saw it, and a menu gated on "press trigger" waited
                 // forever. Push the buttons; only the pose stays synthesised.
                 if st.fromController {
+                    if superhotBareHands { bareHandGestures[hand].reset() }
                     kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
                                                  st.indexTrigger, st.handTrigger,
                                                  st.stick.x, st.stick.y)
