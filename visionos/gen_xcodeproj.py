@@ -236,7 +236,8 @@ for _stack in (_icon_base, f"{_icon_base}-launcher"):
 SWIFT = ["KleptonApp.swift", "KleptonCompositor.swift", "KleptonControllers.swift",
          "KleptonAudio.swift", "KleptonShell.swift", "KleptonTuning.swift",
          "KleptonChroma.swift", "KleptonMic.swift",
-         "KleptonLauncher.swift", "KleptonHL1.swift"]
+         "KleptonLauncher.swift", "KleptonHL1.swift", "BareHandGestures.swift",
+         "BareHandProfile.swift", "SuperhotHandProfile.swift"]
 swift = [{"name": s, "ref": oid(f"FS{i}"), "bld": oid(f"BS{i}")} for i, s in enumerate(SWIFT)]
 
 swift_buildfiles = "\n".join(

@@ -152,6 +152,14 @@ int kl_ovrp_head_predict_delta(double time_s, float *quat4, float *pos3);
 
 void kl_ovrp_set_hand_pose(int hand, float px, float py, float pz,
                            float qx, float qy, float qz, float qw);
+// Publish a tracked pose on the provider's prediction clock, or explicitly
+// mark the hand untracked and discard its velocity history.
+void kl_ovrp_set_hand_pose_at(int hand, float px, float py, float pz,
+                              float qx, float qy, float qz, float qw, double time_s);
+// For frontends that fitted this pose directly in the OVRPlugin Touch basis.
+void kl_ovrp_set_touch_hand_pose_at(int hand, float px, float py, float pz,
+                                    float qx, float qy, float qz, float qw, double time_s);
+void kl_ovrp_clear_hand_tracking(int hand);
 
 // ...and the same pose WITH its motion. ovrpPoseStatef carries velocity and
 // angular velocity beside the pose (kl_ovrp.c documents the layout), libunity

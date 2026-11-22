@@ -86,6 +86,7 @@ typedef struct {
     // — and both engines report a missing OBB by carrying on.
     const char *obb;
     kl_guest_kind kind;
+    const char *bare_hand_profile; // NULL uses the default hand input behavior
 } kl_target;
 
 // NULL if the name is not in the table. `kl_target_names()` is for the error

@@ -73,6 +73,9 @@ const char *kl_app_target_name(void) { return g_target ? g_target->name : "(unco
 const char *kl_app_target_name_or_default(void) {
     return g_target ? g_target->name : kl_env_str("KL_TARGET", KL_TARGET_DEFAULT);
 }
+const char *kl_app_target_bare_hand_profile(void) {
+    return g_target ? g_target->bare_hand_profile : NULL;
+}
 int kl_app_target_is_steamlink(void) {
     return g_target && g_target->kind == KL_GUEST_STEAMLINK;
 }
