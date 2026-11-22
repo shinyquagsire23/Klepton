@@ -33,6 +33,7 @@ every guest and `mkangle.sh` writes it once, into Frameworks/ itself.
 """
 import sys
 import shlex
+import json
 
 TARGETS = {
     "beatsaber": {
@@ -98,6 +99,7 @@ TARGETS = {
         "kind":    "unity",
         "product": "KleptonSuperhot",
         "display": "SUPERHOT",
+        "bare_hand_profile": "superhot",
     },
     "bonelab": {
         # BONELAB — Unity 2021.3.16f1 + IL2CPP, and the same front door again
@@ -748,7 +750,7 @@ def c_table():
         "// cannot disagree about which tree, which APK or which boot sequence a",
         "// target means. See runtime/kl_target.h for the struct these expand into.",
         "",
-        "// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, userdata, obb, kind)",
+        "// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, userdata, obb, kind, bare_hand_profile)",
         "#ifndef KL_TARGET_ROW",
         "#error \"include this through runtime/kl_target.c\"",
         "#endif",
@@ -760,9 +762,10 @@ def c_table():
         # `userdata` defaults to the row name — one profile per target is the
         # rule, and a row only states it to KEEP a directory a previous naming
         # created (steamlink-vr).
-        out.append('KL_TARGET_ROW("%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", %s)'
+        profile = json.dumps(t["bare_hand_profile"]) if "bare_hand_profile" in t else "NULL"
+        out.append('KL_TARGET_ROW("%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", %s, %s)'
                    % (name, t["tree"], t["apk"], t["assets"], t["srcdir"],
-                      t["entry"], t.get("userdata", name), t["obb"], kind))
+                      t["entry"], t.get("userdata", name), t["obb"], kind, profile))
     out += ["", '#define KL_TARGET_DEFAULT_NAME "%s"' % DEFAULT, ""]
     return "\n".join(out)
 

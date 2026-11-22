@@ -26,8 +26,8 @@
 //      our arithmetic on two fingertip joints, which was tried twice and was
 //      unstable both times. The fingertip distance survives as the trigger's
 //      analog value and as the fallback if no spatial event ever arrives.
-//      SUPERHOT instead uses an independent three-finger curl and fingertip
-//      pinch to expose both Touch triggers.
+//      Targets with a bare-hand profile use a finger curl and independent
+//      fingertip pinch to expose both Touch triggers.
 //
 //  So this file is a merge, not a switch: Sense wins per hand where it is
 //  present, hands fill in the rest, and a Sense controller that is paired for
@@ -411,11 +411,16 @@ struct KLSenseTune {
 }
 
 final class KleptonControllers {
-    private let superhotBareHands = klEnvOn(
-        "KL_SUPERHOT_BARE_HANDS", default: String(cString: kl_app_target_name_or_default()) == "superhot")
-    private let superhotAlignHands = klEnvOn("KL_SUPERHOT_ALIGN_HANDS", default: false)
-    private var bareHandGestures = Array(repeating: BareHandGestures(profile: SuperhotHandProfile.gestures), count: 2)
-    private var superhotWristFit: [(SIMD3<Float>, simd_quatf)?] = [nil, nil]
+    private let palmCalibration: BareHandPalmCalibration?
+    private var bareHandGestures: [BareHandGestures]?
+    private var wristFit: [(SIMD3<Float>, simd_quatf)?] = [nil, nil]
+
+    init(bareHandProfile: BareHandProfile?) {
+        palmCalibration = bareHandProfile?.palmCalibration
+        bareHandGestures = bareHandProfile.map {
+            Array(repeating: BareHandGestures(profile: $0.gestures), count: 2)
+        }
+    }
 
     private static func bareHandSample(_ anchor: HandAnchor) -> BareHandGestures.Sample? {
         guard let skeleton = anchor.handSkeleton else { return nil }
@@ -441,8 +446,8 @@ final class KleptonControllers {
                                  at time: TimeInterval, touchBasis: Bool = false) {
         var input = KleptonHandState()
         if let p = position, let q = orientation,
-           p.x.isFinite, p.y.isFinite, p.z.isFinite, q.length.isFinite, q.length > 0.001 {
-            let controls = bareHandGestures[hand].update(sample, at: time)
+           p.x.isFinite, p.y.isFinite, p.z.isFinite, q.length.isFinite, q.length > 0.001,
+           let controls = bareHandGestures?[hand].update(sample, at: time) {
             pinchHeld[hand] = controls.trigger
             let rotation = simd_normalize(q)
             if touchBasis {
@@ -465,10 +470,10 @@ final class KleptonControllers {
                 input.touches = bit
             }
         } else {
-            bareHandGestures[hand].reset()
+            bareHandGestures?[hand].reset()
             pinchHeld[hand] = false
             gripOffset[hand] = nil
-            superhotWristFit[hand] = nil
+            wristFit[hand] = nil
             kl_ovrp_clear_hand_tracking(Int32(hand))
         }
         kl_ovrp_set_controller_input(Int32(hand), input.buttons, input.touches,
@@ -476,8 +481,8 @@ final class KleptonControllers {
         lock.lock(); state[hand] = input; lock.unlock()
     }
 
-    private func alignedSuperhotPose(_ anchor: HandAnchor, hand: Int) -> (SIMD3<Float>, simd_quatf)? {
-        guard superhotAlignHands else { return nil }
+    private func alignedBareHandPose(_ anchor: HandAnchor, hand: Int) -> (SIMD3<Float>, simd_quatf)? {
+        guard let palmCalibration else { return nil }
         let origin = anchor.originFromAnchorTransform
         let wristRotation = simd_quatf(origin)
         let wristPosition = SIMD3(origin.columns.3.x, origin.columns.3.y, origin.columns.3.z)
@@ -489,45 +494,27 @@ final class KleptonControllers {
                     let p = joint.anchorFromJointTransform.columns.3
                     return SIMD3(p.x, p.y, p.z)
                 }
-                let palm = SuperhotHandProfile.Palm(wrist: points[0], index: points[1],
-                                                      middle: points[2], little: points[3])
-                if let fit = SuperhotHandProfile.touchPose(palm, hand: hand) {
-                    let last = superhotWristFit[hand] ?? fit
-                    let blend = SuperhotHandProfile.poseBlend
-                    superhotWristFit[hand] = (last.0 + (fit.0 - last.0) * blend,
+                let palm = BareHandPalmCalibration.Palm(wrist: points[0], index: points[1],
+                                                        middle: points[2], little: points[3])
+                if let fit = palmCalibration.touchPose(palm, hand: hand) {
+                    let last = wristFit[hand] ?? fit
+                    let blend = palmCalibration.blend
+                    wristFit[hand] = (last.0 + (fit.0 - last.0) * blend,
                                               simd_slerp(last.1, fit.1, blend))
                 }
             }
         }
-        return superhotWristFit[hand].map { (wristPosition + wristRotation.act($0.0), wristRotation * $0.1) }
+        return wristFit[hand].map { (wristPosition + wristRotation.act($0.0), wristRotation * $0.1) }
     }
 
     #if targetEnvironment(simulator)
-    struct SuperhotReplayFrame: Decodable {
-        struct Hand: Decodable {
-            let position: SIMD3<Float>
-            let orientation: SIMD4<Float>
-            let joints: BareHandGestures.Sample
-            // Wrist followed by four joints each for index, middle, ring,
-            // little and thumb, all in simulator tracking space.
-            let referenceSkeleton: [SIMD3<Float>]?
-        }
-        let left: Hand?
-        let right: Hand?
-    }
-
-    func replaySuperhotHands(_ frame: SuperhotReplayFrame?, at time: TimeInterval) {
-        for (hand, sample) in [frame?.left, frame?.right].enumerated() {
-            var fit: (SIMD3<Float>, simd_quatf)? = nil
-            if superhotAlignHands, let points = sample?.referenceSkeleton, points.count == 21 {
-                let palm = SuperhotHandProfile.Palm(wrist: points[0], index: points[1],
-                                                      middle: points[5], little: points[13])
-                fit = SuperhotHandProfile.touchPose(palm, hand: hand)
-            }
-            publishBareHand(hand, position: fit?.0 ?? sample?.position,
-                                 orientation: fit?.1 ?? sample.map { simd_quatf(vector: $0.orientation) },
-                                 sample: sample?.joints, at: time, touchBasis: fit != nil)
-        }
+    func replayBareHand(_ hand: Int, position: SIMD3<Float>?, orientation: simd_quatf?,
+                        sample: BareHandGestures.Sample?, palm: BareHandPalmCalibration.Palm?,
+                        at time: TimeInterval) {
+        guard bareHandGestures != nil else { return }
+        let fit = palm.flatMap { palmCalibration?.touchPose($0, hand: hand) }
+        publishBareHand(hand, position: fit?.0 ?? position, orientation: fit?.1 ?? orientation,
+                        sample: sample, at: time, touchBasis: fit != nil)
     }
     #endif
     // 0 = left, 1 = right, matching kl_ovrp's hand indices (nodes 3 and 4).
@@ -1075,13 +1062,9 @@ final class KleptonControllers {
         // of what was happening: buttons released, triggers at 0, stick
         // CENTRED, at whatever rate the poll outran the device.
         //
-        // Both of the bugs that were reported as separate are this: SUPERHOT
-        // retriggering its grab sound over and over while an object was held
-        // (the grip read press/release/press, so the guest heard a new grab
-        // each time), and Steam Link's stick snapping back to centre while
-        // forward was held. One is a button and one is an axis, which is what
-        // made them look like two problems; nil means "unchanged", and the only
-        // faithful reading of it is to leave the last sample alone.
+        // Clearing on nil caused repeated grab sounds while holding an object
+        // and stick snaps while holding forward. Nil means "unchanged":
+        // preserve both the button and axis samples until new input arrives.
         //
         // Poses are deliberately NOT cleared here: they belong to the ARKit
         // stream, which reports its own `.removed`. Clearing them on the
@@ -1984,12 +1967,12 @@ final class KleptonControllers {
 
             let accPose = sensePose(hand: hand, at: presentationTime)
             if let accPose {
-                if superhotBareHands { bareHandGestures[hand].reset() }
+                bareHandGestures?[hand].reset()
                 st.position = accPose.0; st.orientation = accPose.1
                 st.linearVelocity = accPose.2; st.angularVelocity = accPose.3
-            } else if superhotBareHands && !st.fromController {
+            } else if bareHandGestures != nil && !st.fromController {
                 let anchor = hand == 0 ? leftHand : rightHand
-                let fit = anchor.flatMap { alignedSuperhotPose($0, hand: hand) }
+                let fit = anchor.flatMap { alignedBareHandPose($0, hand: hand) }
                 let pose = fit ?? anchor.map { gripPose($0, hand: hand) }
                 publishBareHand(hand, position: pose?.0, orientation: pose?.1,
                                      sample: anchor.flatMap { Self.bareHandSample($0) }, at: presentationTime,
@@ -2054,7 +2037,7 @@ final class KleptonControllers {
                 // never saw it, and a menu gated on "press trigger" waited
                 // forever. Push the buttons; only the pose stays synthesised.
                 if st.fromController {
-                    if superhotBareHands { bareHandGestures[hand].reset() }
+                    bareHandGestures?[hand].reset()
                     kl_ovrp_set_controller_input(Int32(hand), st.buttons, st.touches,
                                                  st.indexTrigger, st.handTrigger,
                                                  st.stick.x, st.stick.y)

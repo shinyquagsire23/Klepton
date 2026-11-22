@@ -124,6 +124,8 @@ const char *kl_app_target_name(void);
 // the build's compile-time default, honouring a KL_TARGET override. Lets the
 // launcher UI identify itself on the first render, not only after a boot.
 const char *kl_app_target_name_or_default(void);
+// The configured target's optional bare-hand controller profile ID.
+const char *kl_app_target_bare_hand_profile(void);
 int         kl_app_target_is_steamlink(void);
 // Whether this target should open the immersive space FULLY immersive by default
 // (no passthrough) rather than .mixed. True for the native OpenXR VR kind

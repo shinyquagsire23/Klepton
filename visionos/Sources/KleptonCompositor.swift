@@ -334,7 +334,7 @@ final class KleptonCompositor {
     private let arSession = ARKitSession()
     private let worldTracking = WorldTrackingProvider()
     private let handTracking = HandTrackingProvider()
-    private let controllers = KleptonControllers()
+    private let controllers: KleptonControllers
     private var arRunning = false
 
     // How much work reprojection is doing, sampled for the log.
@@ -516,6 +516,11 @@ final class KleptonCompositor {
 
     init(_ layerRenderer: LayerRenderer) {
         self.layerRenderer = layerRenderer
+
+        let profile = kl_app_target_bare_hand_profile().flatMap {
+            BareHandProfile.configured(String(cString: $0), flag: klEnvOn)
+        }
+        controllers = KleptonControllers(bareHandProfile: profile)
 
         // The system's own pinch, rather than our arithmetic on two fingertip
         // joints. `onSpatialEvent` is how a fully-immersive Metal app is told

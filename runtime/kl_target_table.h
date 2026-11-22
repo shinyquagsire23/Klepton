@@ -6,29 +6,29 @@
 // cannot disagree about which tree, which APK or which boot sequence a
 // target means. See runtime/kl_target.h for the struct these expand into.
 
-// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, userdata, obb, kind)
+// KL_TARGET_ROW(name, tree, apk, assets, libdir, entry_lib, userdata, obb, kind, bare_hand_profile)
 #ifndef KL_TARGET_ROW
 #error "include this through runtime/kl_target.c"
 #endif
 
-KL_TARGET_ROW("beatsaber", "beatsaber", "beatsaber.apk", "beatsaber/assets", "beatsaber/lib/arm64-v8a", "libmain", "beatsaber", "obb", KL_GUEST_UNITY)
-KL_TARGET_ROW("bonelab", "bonelab", "bonelab.apk", "bonelab/assets", "bonelab/lib/arm64-v8a", "libmain", "bonelab", "obb", KL_GUEST_UNITY)
-KL_TARGET_ROW("cs1", "cs1", "cs1.apk", "cs1/assets", "cs1/lib/arm64-v8a", "libxash", "cs1", "obb", KL_GUEST_SDL2)
-KL_TARGET_ROW("hl1", "hl1", "hl1.apk", "hl1/assets", "hl1/lib/arm64-v8a", "libxash", "hl1", "obb", KL_GUEST_GLES3JNI)
-KL_TARGET_ROW("hl2", "hl2", "hl2.apk", "hl2/assets", "hl2/lib/arm64-v8a", "liblauncher", "hl2", "obb", KL_GUEST_SDL2)
-KL_TARGET_ROW("intotheradius", "intotheradius", "intotheradius.apk", "intotheradius/assets", "intotheradius/lib/arm64-v8a", "libUE4", "intotheradius", "Android/obb/com.CMGames.IntoTheRadius", KL_GUEST_UE4)
-KL_TARGET_ROW("jkxr_ja", "jkxr", "jkxr.apk", "jkxr/assets", "jkxr/lib/arm64-v8a", "libopenjk_ja", "jkxr_ja", "obb", KL_GUEST_JKXR)
-KL_TARGET_ROW("jkxr_jo", "jkxr", "jkxr.apk", "jkxr/assets", "jkxr/lib/arm64-v8a", "libopenjk_jo", "jkxr_jo", "obb", KL_GUEST_JKXR)
-KL_TARGET_ROW("openbrush", "openbrush", "openbrush.apk", "openbrush/assets", "openbrush/lib/arm64-v8a", "libmain", "openbrush", "obb", KL_GUEST_UNITY)
-KL_TARGET_ROW("portal", "portal", "portal.apk", "portal/assets", "portal/lib/arm64-v8a", "liblauncher", "portal", "obb", KL_GUEST_SDL2)
-KL_TARGET_ROW("re4", "re4", "re4.apk", "re4/assets", "re4/lib/arm64-v8a", "libUE4", "re4", "Android/obb/com.Armature.VR4", KL_GUEST_UE4)
-KL_TARGET_ROW("redmatter2", "redmatter2", "redmatter2.apk", "redmatter2/assets", "redmatter2/lib/arm64-v8a", "libUE4", "redmatter2", "Android/obb/com.VerticalRobot.RedMatter2", KL_GUEST_UE4)
-KL_TARGET_ROW("steamlink-vr", "steamlink-vr", "steamlink-vr.apk", "steamlink-vr/assets", "steamlink-vr/lib/arm64-v8a", "libvrlink_scene", "steamlink", "obb", KL_GUEST_STEAMLINK)
-KL_TARGET_ROW("superhot", "superhot", "superhot.apk", "superhot/assets", "superhot/lib/arm64-v8a", "libmain", "superhot", "obb", KL_GUEST_UNITY)
-KL_TARGET_ROW("vampire", "vampire", "vampire.apk", "vampire/assets", "vampire/lib/arm64-v8a", "libUE4", "vampire", "Android/obb/com.fasttravelgames.lollipop", KL_GUEST_UE4)
-KL_TARGET_ROW("vicecity", "vicecity", "vicecity.apk", "vicecity/assets", "vicecity/lib/arm64-v8a", "libmiamivr", "vicecity", "obb", KL_GUEST_NATIVE)
-KL_TARGET_ROW("vrchat", "vrchat", "vrchat.apk", "vrchat/assets", "vrchat/lib/arm64-v8a", "libmain", "vrchat", "obb", KL_GUEST_UNITY)
-KL_TARGET_ROW("zix", "zix", "zix.apk", "zix/assets", "zix/lib/arm64-v8a", "libmain", "zix", "obb", KL_GUEST_UNITY)
+KL_TARGET_ROW("beatsaber", "beatsaber", "beatsaber.apk", "beatsaber/assets", "beatsaber/lib/arm64-v8a", "libmain", "beatsaber", "obb", KL_GUEST_UNITY, NULL)
+KL_TARGET_ROW("bonelab", "bonelab", "bonelab.apk", "bonelab/assets", "bonelab/lib/arm64-v8a", "libmain", "bonelab", "obb", KL_GUEST_UNITY, NULL)
+KL_TARGET_ROW("cs1", "cs1", "cs1.apk", "cs1/assets", "cs1/lib/arm64-v8a", "libxash", "cs1", "obb", KL_GUEST_SDL2, NULL)
+KL_TARGET_ROW("hl1", "hl1", "hl1.apk", "hl1/assets", "hl1/lib/arm64-v8a", "libxash", "hl1", "obb", KL_GUEST_GLES3JNI, NULL)
+KL_TARGET_ROW("hl2", "hl2", "hl2.apk", "hl2/assets", "hl2/lib/arm64-v8a", "liblauncher", "hl2", "obb", KL_GUEST_SDL2, NULL)
+KL_TARGET_ROW("intotheradius", "intotheradius", "intotheradius.apk", "intotheradius/assets", "intotheradius/lib/arm64-v8a", "libUE4", "intotheradius", "Android/obb/com.CMGames.IntoTheRadius", KL_GUEST_UE4, NULL)
+KL_TARGET_ROW("jkxr_ja", "jkxr", "jkxr.apk", "jkxr/assets", "jkxr/lib/arm64-v8a", "libopenjk_ja", "jkxr_ja", "obb", KL_GUEST_JKXR, NULL)
+KL_TARGET_ROW("jkxr_jo", "jkxr", "jkxr.apk", "jkxr/assets", "jkxr/lib/arm64-v8a", "libopenjk_jo", "jkxr_jo", "obb", KL_GUEST_JKXR, NULL)
+KL_TARGET_ROW("openbrush", "openbrush", "openbrush.apk", "openbrush/assets", "openbrush/lib/arm64-v8a", "libmain", "openbrush", "obb", KL_GUEST_UNITY, NULL)
+KL_TARGET_ROW("portal", "portal", "portal.apk", "portal/assets", "portal/lib/arm64-v8a", "liblauncher", "portal", "obb", KL_GUEST_SDL2, NULL)
+KL_TARGET_ROW("re4", "re4", "re4.apk", "re4/assets", "re4/lib/arm64-v8a", "libUE4", "re4", "Android/obb/com.Armature.VR4", KL_GUEST_UE4, NULL)
+KL_TARGET_ROW("redmatter2", "redmatter2", "redmatter2.apk", "redmatter2/assets", "redmatter2/lib/arm64-v8a", "libUE4", "redmatter2", "Android/obb/com.VerticalRobot.RedMatter2", KL_GUEST_UE4, NULL)
+KL_TARGET_ROW("steamlink-vr", "steamlink-vr", "steamlink-vr.apk", "steamlink-vr/assets", "steamlink-vr/lib/arm64-v8a", "libvrlink_scene", "steamlink", "obb", KL_GUEST_STEAMLINK, NULL)
+KL_TARGET_ROW("superhot", "superhot", "superhot.apk", "superhot/assets", "superhot/lib/arm64-v8a", "libmain", "superhot", "obb", KL_GUEST_UNITY, "superhot")
+KL_TARGET_ROW("vampire", "vampire", "vampire.apk", "vampire/assets", "vampire/lib/arm64-v8a", "libUE4", "vampire", "Android/obb/com.fasttravelgames.lollipop", KL_GUEST_UE4, NULL)
+KL_TARGET_ROW("vicecity", "vicecity", "vicecity.apk", "vicecity/assets", "vicecity/lib/arm64-v8a", "libmiamivr", "vicecity", "obb", KL_GUEST_NATIVE, NULL)
+KL_TARGET_ROW("vrchat", "vrchat", "vrchat.apk", "vrchat/assets", "vrchat/lib/arm64-v8a", "libmain", "vrchat", "obb", KL_GUEST_UNITY, NULL)
+KL_TARGET_ROW("zix", "zix", "zix.apk", "zix/assets", "zix/lib/arm64-v8a", "libmain", "zix", "obb", KL_GUEST_UNITY, NULL)
 
 #define KL_TARGET_DEFAULT_NAME "beatsaber"
 

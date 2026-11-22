@@ -16,7 +16,31 @@ enum SuperhotHandGestureTest {
     }
 
     static func main() {
-        var gestures = BareHandGestures(profile: SuperhotHandProfile.gestures)
+        func select(_ id: String, _ flags: [String: Bool] = [:]) -> BareHandProfile? {
+            BareHandProfile.configured(id) { flag, fallback in flags[flag] ?? fallback }
+        }
+
+        let profile = select("superhot")!
+        precondition(profile.palmCalibration == nil, "Palm calibration is opt-in")
+        precondition(select("unconfigured", ["KL_BARE_HANDS": true]) == nil,
+                     "An override cannot enable a target without a profile")
+        precondition(select("superhot", ["KL_BARE_HANDS": false]) == nil,
+                     "The generic override can disable bare-hand emulation")
+        precondition(select("superhot", ["KL_SUPERHOT_BARE_HANDS": false]) == nil,
+                     "The legacy SUPERHOT override still works")
+        precondition(select("superhot", ["KL_SUPERHOT_ALIGN_HANDS": true])?.palmCalibration != nil,
+                     "Existing SUPERHOT alignment runs remain supported")
+        let calibration = select("superhot", ["KL_BARE_HAND_ALIGN": true])!.palmCalibration!
+        for (hand, authored) in [calibration.left, calibration.right].enumerated() {
+            let shift = SIMD3<Float>(0.05, -0.08, 0.13)
+            let observed = BareHandPalmCalibration.Palm(wrist: authored.wrist + shift,
+                index: authored.index + shift, middle: authored.middle + shift, little: authored.little + shift)
+            let pose = calibration.touchPose(observed, hand: hand)!
+            precondition(simd_length(pose.0 - shift) < 0.0001 && abs(pose.1.real) > 0.9999,
+                         "The profile fits each palm in its own Touch frame")
+        }
+
+        var gestures = BareHandGestures(profile: profile.gestures)
         func check(_ time: TimeInterval, curl: Int, gap: Float?,
                    grip: Bool, trigger: Bool, _ explanation: String) {
             let actual = gestures.update(sample(curl: curl, gap: gap), at: time)
@@ -42,6 +66,6 @@ enum SuperhotHandGestureTest {
         check(0.380, curl: 3, gap: 0.055, grip: true, trigger: false, "A fresh squeeze engages")
         check(0.390, curl: 0, gap: 0.055, grip: true, trigger: false, "A transient open sample keeps grip")
         check(0.460, curl: 0, gap: 0.055, grip: false, trigger: false, "Sustained opening releases grip")
-        print("PASS: lighter pinch, minimum trigger pulse, independent grip, release and rearm")
+        print("PASS: profile selection and palm fitting, lighter pinch, independent grip, release and rearm")
     }
 }

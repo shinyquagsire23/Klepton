@@ -69,6 +69,12 @@ apps embed *different* guest frameworks, so pointing one at the other's target
 stops at `kl_app_configure` with "missing guest libraries" rather than
 misbehaving.
 
+The optional `bare_hand_profile` field in `targets.py` selects a grip and
+trigger mapping after the active target is configured. Targets without a
+profile use the existing hand input behavior. `KL_BARE_HANDS=0` disables an
+assigned profile, and `KL_BARE_HAND_ALIGN=1` enables its palm calibration
+when one is provided. Physical controllers retain priority per hand.
+
 ## What lives where, and why
 
 |  | where | why |
