@@ -1215,12 +1215,29 @@ KLOVRP_OUT_TRUE(GetTrackingIPDEnabled2)
 
 static int g_hand_tracking_lost[2];
 
+enum {
+    OVRP_NODE_HAND_LEFT = 3,
+    OVRP_NODE_HAND_RIGHT = 4,
+    OVRP_NODE_CONTROLLER_LEFT = 12,
+    OVRP_NODE_CONTROLLER_RIGHT = 13,
+};
+
+static int klovrp_hand_index_for_node(int node) {
+    switch (node) {
+        case OVRP_NODE_HAND_LEFT:
+        case OVRP_NODE_CONTROLLER_LEFT:
+            return 0;
+        case OVRP_NODE_HAND_RIGHT:
+        case OVRP_NODE_CONTROLLER_RIGHT:
+            return 1;
+        default:
+            return -1;
+    }
+}
+
 static int klovrp_node_tracking_valid(int node) {
-    if (node == 3 || node == 12)
-        return !__atomic_load_n(&g_hand_tracking_lost[0], __ATOMIC_ACQUIRE);
-    if (node == 4 || node == 13)
-        return !__atomic_load_n(&g_hand_tracking_lost[1], __ATOMIC_ACQUIRE);
-    return 1;
+    int hand = klovrp_hand_index_for_node(node);
+    return hand < 0 || !__atomic_load_n(&g_hand_tracking_lost[hand], __ATOMIC_ACQUIRE);
 }
 
 // Another node-first predicate, real 0x16f4b0 is the same (int node, int *out)
@@ -5662,6 +5679,7 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
     klovrp_ifs_observe(&head);
     const klovrp_pose *p = &head;
     klovrp_pose hand, eye;
+    int h = klovrp_hand_index_for_node(node);
     if (node == 0 || node == 1) {
     // EyeLeft/EyeRight. The head pose displaced by this eye's own offset,
         // rotated into the world by the head's orientation — this pair IS the
@@ -5681,7 +5699,7 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
               ? klovrp_qmul(&head, klovrp_eye_rot(node, rq)) : head;
         eye.px = head.px + ox; eye.py = head.py + oy; eye.pz = head.pz + oz;
         p = &eye;
-    } else if (node == 3 || node == 4 || node == 12 || node == 13) {
+    } else if (h >= 0) {
         // HandLeft/HandRight (3/4) AND ControllerLeft/ControllerRight (12/13).
         // Both name the same physical thing on this platform: the controller we
         // synthesise from hand tracking (or a Sense accessory). A Unity title
@@ -5690,7 +5708,6 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
         // node 12/13 fell through to `p = &head` below — so olar's controllers
         // were pinned to the head pose and moved only when the head moved,
         // while the aim/select the guest built on them never tracked the hands.
-        int h = (node == 3 || node == 12) ? 0 : 1;
         // KL_OVRP_HANDS_IN_VIEW=1: park both hands at a fixed spot well inside
         // the *current head's* frustum, overriding whatever the frontend last
         // wrote. Answers one question and only one — does the guest draw
@@ -5716,7 +5733,7 @@ uint64_t klovrp_GetNodePoseState_impl(int step, int node, void *out) {
         } else {
             hand = klovrp_step_hand(step, h);
         }
-        if (!klovrp_node_tracking_valid(node)) {
+        if (__atomic_load_n(&g_hand_tracking_lost[h], __ATOMIC_ACQUIRE)) {
             hand.vx = hand.vy = hand.vz = 0;
             hand.avx = hand.avy = hand.avz = 0;
         }
